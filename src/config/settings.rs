@@ -54,7 +54,7 @@ impl Settings {
         let settings = toml::from_str(&content)?;
         Ok(settings)
     }
-    
+
     /// Create development settings
     pub fn development() -> Self {
         Settings {

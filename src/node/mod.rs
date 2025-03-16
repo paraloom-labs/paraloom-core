@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::Settings;
-use crate::network::{NetworkManager, Message};
+use crate::network::{Message, NetworkManager};
 use crate::resource::ResourceMonitor;
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType, ResourceContribution};
 
@@ -51,33 +51,33 @@ impl Node {
     /// Create a new node
     pub fn new(settings: Settings) -> Result<Self> {
         let network = NetworkManager::new(&settings)?;
-        
+
         let node_type = match settings.node.node_type.as_str() {
             "ResourceProvider" => NodeType::ResourceProvider,
             "Coordinator" => NodeType::Coordinator,
             "Bridge" => NodeType::Bridge,
             _ => NodeType::ResourceProvider,
         };
-        
+
         let node_id = network.local_peer_id();
-        
+
         // Create resource monitor
         let resource_monitor = ResourceMonitor::new(
             settings.node.max_cpu_usage,
             settings.node.max_memory_usage,
-            settings.node.max_storage_usage
+            settings.node.max_storage_usage,
         );
-        
+
         // Initial empty resource contribution
         let resources = resource_monitor.get_contribution();
-        
+
         let node_info = NodeInfo {
             id: node_id.clone(),
             node_type,
             resources,
             address: settings.network.listen_address.clone(),
         };
-        
+
         let node = Node {
             settings,
             network: Arc::new(network),
@@ -85,38 +85,38 @@ impl Node {
             node_info,
             resource_monitor,
         };
-        
+
         Ok(node)
     }
-    
+
     /// Run the node
     pub async fn run(&self) -> Result<()> {
         info!("Starting node: {:?}", self.node_info);
-        
+
         // Start resource monitor
         self.resource_monitor.start().await?;
-        
+
         // Check for GPU information
         if let Some(gpu_info) = self.resource_monitor.check_gpu() {
             info!("Detected GPU: {}", gpu_info);
         }
-        
+
         // Set event handler
         let mut network = NetworkManager::new(&self.settings)?;
         network.set_handler(Arc::new(self.clone()));
-        
+
         // Parse the listen address
         let listen_address = self.settings.network.listen_address.parse()?;
-        
+
         // Start network
         network.start(listen_address).await?;
-        
+
         // Update status
         {
             let mut status = self.status.lock().await;
             *status = NodeStatus::Running;
         }
-        
+
         // Periodically update resource information
         let status = self.status.clone();
         loop {
@@ -130,7 +130,7 @@ impl Node {
                         info.resources = updated_resources;
                         // You can broadcast this information to the network if needed
                     }
-                    
+
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                 }
                 _ => {
@@ -139,10 +139,10 @@ impl Node {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Stop the node
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping node");
@@ -163,7 +163,7 @@ impl Clone for Node {
             resource_monitor: ResourceMonitor::new(
                 self.settings.node.max_cpu_usage,
                 self.settings.node.max_memory_usage,
-                self.settings.node.max_storage_usage
+                self.settings.node.max_storage_usage,
             ),
         }
     }
