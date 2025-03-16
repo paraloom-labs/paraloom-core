@@ -12,7 +12,7 @@ impl PeerDiscovery {
     pub fn new() -> Self {
         PeerDiscovery
     }
-    
+
     /// Add a discovered peer
     pub fn add_peer(&self, peer_id: NodeId, info: NodeInfo) {
         info!("Discovered peer: {} - {:?}", peer_id, info);

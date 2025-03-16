@@ -2,21 +2,15 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use libp2p::futures::StreamExt;
 use libp2p::{
     core::upgrade,
-    identity,
-    noise,
-    tcp,
-    mplex,
-    Transport,
-    PeerId,
-    Swarm,
     gossipsub::{self, Gossipsub, MessageAuthenticity},
+    identity, mplex, noise,
     swarm::SwarmBuilder,
-    Multiaddr
+    tcp, Multiaddr, PeerId, Swarm, Transport,
 };
-use libp2p::futures::StreamExt;
-use log::{info, debug};
+use log::{debug, info};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -47,36 +41,33 @@ impl NetworkManager {
         // Create a random PeerId
         let local_key = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(local_key.public());
-        
+
         info!("Local peer ID: {}", local_peer_id);
-        
+
         // Create a transport
         let transport = tcp::tokio::Transport::new(tcp::Config::default())
             .upgrade(upgrade::Version::V1)
-            .authenticate(noise::NoiseAuthenticated::xx(&local_key)
-                .map_err(|e| anyhow!("Noise error: {}", e))?)
+            .authenticate(
+                noise::NoiseAuthenticated::xx(&local_key)
+                    .map_err(|e| anyhow!("Noise error: {}", e))?,
+            )
             .multiplex(mplex::MplexConfig::new())
             .boxed();
-            
+
         // Create a Gossipsub behavior
         let gossipsub_config = gossipsub::GossipsubConfig::default();
-        
+
         // Build the Gossipsub behavior
-        let gossipsub = Gossipsub::new(
-            MessageAuthenticity::Signed(local_key),
-            gossipsub_config,
-        ).map_err(|e| anyhow!("Gossipsub error: {}", e))?;
-        
+        let gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key), gossipsub_config)
+            .map_err(|e| anyhow!("Gossipsub error: {}", e))?;
+
         // Set up message channel
         let (tx, rx) = mpsc::channel(100);
-        
+
         // Build the Swarm
-        let swarm = SwarmBuilder::with_tokio_executor(
-            transport,
-            gossipsub,
-            local_peer_id.clone()
-        ).build();
-        
+        let swarm =
+            SwarmBuilder::with_tokio_executor(transport, gossipsub, local_peer_id.clone()).build();
+
         Ok(NetworkManager {
             peer_id: local_peer_id,
             swarm: Arc::new(Mutex::new(swarm)),
@@ -85,33 +76,33 @@ impl NetworkManager {
             handler: None,
         })
     }
-    
+
     /// Set the event handler
     pub fn set_handler(&mut self, handler: Arc<dyn NetworkEventHandler>) {
         self.handler = Some(handler);
     }
-    
+
     /// Start the network manager
     pub async fn start(&self, listen_address: Multiaddr) -> Result<()> {
         let mut swarm = self.swarm.lock().await;
-        
+
         // Listen on the given address
         swarm.listen_on(listen_address.clone())?;
         info!("Listening on {}", listen_address);
-        
+
         // Clone values for the task
         let swarm_clone = self.swarm.clone();
         let receiver_clone = self.message_receiver.clone();
         let handler_clone = self.handler.clone();
-        
+
         // Spawn task to handle events
         tokio::spawn(async move {
             Self::run_event_loop(swarm_clone, receiver_clone, handler_clone).await;
         });
-        
+
         Ok(())
     }
-    
+
     /// Run the event loop
     async fn run_event_loop(
         swarm: Arc<Mutex<Swarm<Gossipsub>>>,
@@ -119,7 +110,7 @@ impl NetworkManager {
         handler: Option<Arc<dyn NetworkEventHandler>>,
     ) {
         info!("Starting network event loop");
-        
+
         loop {
             tokio::select! {
                 // Handle Swarm events
@@ -132,7 +123,7 @@ impl NetworkManager {
                         None => break,
                     }
                 },
-                
+
                 // Handle incoming messages
                 message = async {
                     let mut receiver = receiver.lock().await;
@@ -151,16 +142,18 @@ impl NetworkManager {
                 }
             }
         }
-        
+
         info!("Network event loop terminated");
     }
-    
+
     /// Send a message to a peer
     pub async fn send_message(&self, peer: NodeId, message: Message) -> Result<()> {
-        self.message_sender.send((peer, message)).await
+        self.message_sender
+            .send((peer, message))
+            .await
             .map_err(|e| anyhow!("Failed to send message: {}", e))
     }
-    
+
     /// Get local peer ID
     pub fn local_peer_id(&self) -> NodeId {
         NodeId(self.peer_id.to_bytes())

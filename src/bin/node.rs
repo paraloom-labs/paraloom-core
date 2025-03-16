@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use log::{info, error};
+use log::{error, info};
 use paraloom::config::Settings;
 use paraloom::node::Node;
 
@@ -20,7 +20,7 @@ enum Commands {
         /// Path to config file
         #[arg(short, long, default_value = "config.toml")]
         config: String,
-        
+
         /// Run in development mode
         #[arg(long)]
         dev: bool,
@@ -30,13 +30,13 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    
+
     let cli = Cli::parse();
-    
+
     match cli.command {
         Commands::Start { config, dev } => {
             info!("Starting Paraloom node...");
-            
+
             let settings = if dev {
                 info!("Using development settings");
                 Settings::development()
@@ -50,10 +50,10 @@ async fn main() -> Result<()> {
                     }
                 }
             };
-            
+
             let node = Node::new(settings)?;
             node.run().await?;
-            
+
             Ok(())
         }
     }

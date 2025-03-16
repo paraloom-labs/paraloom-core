@@ -1,8 +1,8 @@
 //! P2P networking module
 
-pub mod protocol;
 mod discovery;
 mod message;
+pub mod protocol;
 
-pub use protocol::NetworkManager;
 pub use message::Message;
+pub use protocol::NetworkManager;
