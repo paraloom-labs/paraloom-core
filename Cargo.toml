@@ -24,7 +24,7 @@ path = "src/bin/node_test.rs"
 
 [dependencies]
 # Core networking
-libp2p = { version = "0.50.0", features = ["tokio", "tcp", "noise", "mplex", "gossipsub"] }
+libp2p = { version = "0.51.4", features = ["tokio", "tcp", "noise", "mplex", "gossipsub"] }
 tokio = { version = "1.25.0", features = ["full"] }
 
 # Serialization & Data handling
