@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::config::Settings;
 use crate::network::{Message, NetworkManager};
 use crate::resource::ResourceMonitor;
-use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType, ResourceContribution};
+use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 
 /// Node implementation
 pub struct Node {

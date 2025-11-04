@@ -1,10 +1,10 @@
 //! System resource monitoring
 
 use anyhow::Result;
-use log::{info, warn};
+use log::info;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::{CpuExt, DiskExt, NetworkExt, System, SystemExt};
+use sysinfo::{DiskExt, System, SystemExt};
 use tokio::time;
 
 use crate::types::ResourceContribution;
@@ -95,7 +95,7 @@ impl ResourceMonitor {
     async fn update_contribution(
         system: Arc<Mutex<System>>,
         contribution: Arc<Mutex<ResourceContribution>>,
-        max_cpu_usage: u8,
+        _max_cpu_usage: u8,
         max_memory_usage: u8,
         max_storage_usage: u64,
     ) {

@@ -22,10 +22,20 @@ path = "src/bin/resource_test.rs"
 name = "node_test"
 path = "src/bin/node_test.rs"
 
+[[bin]]
+name = "dashboard"
+path = "src/bin/dashboard.rs"
+
 [dependencies]
 # Core networking
 libp2p = { version = "0.50.0", features = ["tokio", "tcp", "noise", "mplex", "gossipsub"] }
 tokio = { version = "1.25.0", features = ["full"] }
+
+# Web server - compatible versions
+axum = "0.6"
+tower = "0.4"
+tower-http = { version = "0.4", features = ["fs", "cors"] }
+hyper = "0.14"
 
 # Serialization & Data handling
 serde = { version = "1.0.152", features = ["derive"] }

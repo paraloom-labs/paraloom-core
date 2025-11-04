@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use log::info;
-use paraloom::{config::Settings, resource::ResourceMonitor};
+use paraloom::resource::ResourceMonitor;
 
 #[tokio::main]
 async fn main() -> Result<()> {
