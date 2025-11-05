@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Settings;
 use crate::coordinator::Coordinator;
-use crate::network::{Message, NetworkManager};
+use crate::network::{Message, NetworkManager, ResultRequest, ResultResponse};
 use crate::resource::ResourceMonitor;
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
@@ -74,6 +74,34 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             }
         }
         Ok(())
+    }
+
+    async fn handle_result_request(&self, source: NodeId, request: ResultRequest) -> Result<ResultResponse> {
+        info!("Received result request from {}", source);
+        if let Some(coordinator) = &self.coordinator {
+            match coordinator.handle_task_result(request.result).await {
+                Ok(_) => {
+                    info!("Task result processed successfully");
+                    Ok(ResultResponse {
+                        success: true,
+                        message: "Result received and processed".to_string(),
+                    })
+                }
+                Err(e) => {
+                    log::error!("Failed to process task result: {}", e);
+                    Ok(ResultResponse {
+                        success: false,
+                        message: format!("Error processing result: {}", e),
+                    })
+                }
+            }
+        } else {
+            log::warn!("Received result request but this node is not a coordinator");
+            Ok(ResultResponse {
+                success: false,
+                message: "This node is not a coordinator".to_string(),
+            })
+        }
     }
 }
 

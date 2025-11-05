@@ -38,9 +38,13 @@ path = "src/bin/submit_task.rs"
 name = "web-demo"
 path = "src/bin/web_demo.rs"
 
+[[bin]]
+name = "benchmark-reqresp"
+path = "src/bin/benchmark_reqresp.rs"
+
 [dependencies]
 # Core networking
-libp2p = { version = "0.50.0", features = ["tokio", "tcp", "noise", "mplex", "gossipsub"] }
+libp2p = { version = "0.50.0", features = ["tokio", "tcp", "noise", "mplex", "gossipsub", "request-response", "macros"] }
 tokio = { version = "1.25.0", features = ["full"] }
 
 # Web server - compatible versions
