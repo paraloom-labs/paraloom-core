@@ -51,26 +51,20 @@ async fn submit_task(
         algorithm: req.algorithm,
     };
 
-    // Spawn task submission in background to avoid blocking API
-    let coordinator = state.coordinator.clone();
-    tokio::spawn(async move {
-        match coordinator.submit_task(task_type).await {
-            Ok(task_id) => {
-                log::info!("API: Task submitted successfully: {}", task_id);
-            }
-            Err(e) => {
-                log::error!("API: Failed to submit task: {}", e);
-            }
+    // Submit task synchronously (sequential chunk sending has timeout protection)
+    match state.coordinator.submit_task(task_type).await {
+        Ok(task_id) => {
+            log::info!("API: Task submitted successfully: {}", task_id);
+            Ok(Json(SubmitTaskResponse {
+                task_id,
+                status: "submitted".to_string(),
+            }))
         }
-    });
-
-    // Return immediately with a placeholder ID
-    let temp_id = "pending".to_string();
-    log::info!("API: Task queued");
-    Ok(Json(SubmitTaskResponse {
-        task_id: temp_id,
-        status: "queued".to_string(),
-    }))
+        Err(e) => {
+            log::error!("API: Failed to submit task: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn get_task_status(
