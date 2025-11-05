@@ -61,6 +61,11 @@ impl DashboardState {
         nodes.insert(web_info.id.clone(), web_info);
     }
 
+    pub fn clear_nodes(&self) {
+        let mut nodes = self.nodes.lock().unwrap();
+        nodes.clear();
+    }
+
     pub fn get_stats(&self) -> NetworkStats {
         let nodes = self.nodes.lock().unwrap();
 

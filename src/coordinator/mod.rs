@@ -69,6 +69,11 @@ impl Coordinator {
         info!("======================================");
     }
 
+    /// Get all connected peers from the network
+    pub async fn get_connected_peers(&self) -> Vec<NodeId> {
+        self.network.connected_peers().await
+    }
+
     /// Submit a new task
     pub async fn submit_task(&self, task_type: TaskType) -> Result<TaskId> {
         let task = Task::new(task_type.clone());
@@ -92,24 +97,44 @@ impl Coordinator {
             v.clone()
         };
 
-        // Assign chunks to validators
+        // Assign and send chunks to validators
         for (i, mut chunk) in chunks.into_iter().enumerate() {
             let validator_id = validators[i % validators.len()].clone();
             chunk.assigned_to = Some(format!("{:?}", validator_id));
             chunk.status = TaskStatus::Assigned;
 
-            // Track parent relationship
-            let mut parent_tasks = self.parent_tasks.lock().await;
-            parent_tasks.insert(chunk.id.clone(), parent_id.clone());
+            // Track parent relationship and active task
+            {
+                let mut parent_tasks = self.parent_tasks.lock().await;
+                parent_tasks.insert(chunk.id.clone(), parent_id.clone());
+            }
+            {
+                let mut active = self.active_tasks.lock().await;
+                active.insert(chunk.id.clone(), chunk.clone());
+            }
 
-            // Send TaskRequest
+            // Send TaskRequest (with brief timeout, non-blocking)
             let msg = Message::TaskRequest { task: chunk.clone() };
             info!("Sending task chunk {} to validator (chunk {} of {})", chunk.id, i+1, chunks_len);
-            self.network.send_message(validator_id, msg).await?;
 
-            // Track active task
-            let mut active = self.active_tasks.lock().await;
-            active.insert(chunk.id.clone(), chunk);
+            // Send with timeout to prevent hanging
+            let network = self.network.clone();
+            let send_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(1),
+                network.send_message(validator_id.clone(), msg)
+            ).await;
+
+            match send_result {
+                Ok(Ok(_)) => {
+                    log::debug!("Successfully sent chunk {} to validator", chunk.id);
+                }
+                Ok(Err(e)) => {
+                    log::error!("Failed to send chunk {}: {}", chunk.id, e);
+                }
+                Err(_) => {
+                    log::error!("Timeout sending chunk {} to validator {:?}", chunk.id, validator_id);
+                }
+            }
         }
 
         info!("All {} task chunks distributed to validators", chunks_len);
