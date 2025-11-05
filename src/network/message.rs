@@ -19,4 +19,22 @@ pub enum Message {
         /// Resources being contributed
         resources: crate::types::ResourceContribution,
     },
+
+    // Task-related messages
+
+    /// Coordinator -> Validator: Execute this task
+    TaskRequest {
+        task: crate::task::Task,
+    },
+
+    /// Validator -> Coordinator: Task completed
+    TaskResponse {
+        result: crate::task::TaskResult,
+    },
+
+    /// Validator -> Coordinator: Task failed
+    TaskError {
+        task_id: String,
+        error: String,
+    },
 }

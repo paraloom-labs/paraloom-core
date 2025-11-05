@@ -18,3 +18,11 @@ target/
 
 .vscode
 .DS_Store
+
+# Paraloom specific
+data/
+*.log
+/tmp/
+config/*-temp.toml
+*.MD
+*.sh
