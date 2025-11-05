@@ -7,7 +7,7 @@ listen_address = "/ip4/0.0.0.0/tcp/9002"
 # Coordinator's local network IP address
 # Update this with your coordinator's IP
 bootstrap_nodes = [
-    "/ip4/192.168.1.103/tcp/9001"
+    "/ip4/192.168.1.15/tcp/9001/p2p/12D3KooWEw7s2voqF2G9KBwQKu5beDuB7P2orpRMcXZ9joiV8A8r"
 ]
 
 enable_mdns = true
@@ -15,7 +15,7 @@ enable_mdns = true
 [node]
 node_type = "ResourceProvider"
 max_cpu_usage = 80
-max_memory_usage = 70
+max_memory_usage = 80
 max_storage_usage = 10240
 
 [storage]

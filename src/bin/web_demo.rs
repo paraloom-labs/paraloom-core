@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordinator_task = tokio::spawn(async move {
         let mut settings = Settings::development();
         settings.node.node_type = "Coordinator".to_string();
-        settings.network.listen_address = "/ip4/127.0.0.1/tcp/9001".to_string();
+        settings.network.listen_address = "/ip4/0.0.0.0/tcp/9001".to_string();
         settings.network.bootstrap_nodes = vec![];
 
         let node = Node::new(settings).expect("Failed to create coordinator node");
@@ -35,6 +35,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Add coordinator node info to dashboard
         dashboard_state.add_node(&node.node_info());
+
+        // Periodically update dashboard with connected peers
+        let dashboard_clone = dashboard_state.clone();
+        let coordinator_clone = coordinator.clone();
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(5)).await;
+
+                // Clear old nodes and refresh
+                dashboard_clone.clear_nodes();
+
+                // Add coordinator node
+                dashboard_clone.add_node(&node_clone.node_info());
+
+                // Get connected peers from coordinator
+                let peers = coordinator_clone.get_connected_peers().await;
+                log::info!("Dashboard update: {} connected peers", peers.len());
+
+                // For each peer, create a node info for dashboard
+                for peer in peers {
+                    use paraloom::types::{NodeInfo, NodeType, ResourceContribution};
+                    let peer_info = NodeInfo {
+                        id: peer.clone(),
+                        node_type: NodeType::ResourceProvider,
+                        resources: ResourceContribution {
+                            cpu_cores: 12,  // Will be updated when we receive actual info
+                            memory_mb: 16000,
+                            storage_mb: 10240,
+                            bandwidth_kbps: 10000,
+                        },
+                        address: "remote".to_string(),
+                    };
+                    dashboard_clone.add_node(&peer_info);
+                }
+            }
+        });
 
         println!("Coordinator started on port 9001");
         println!("Dashboard starting on http://localhost:8080\n");
