@@ -7,7 +7,10 @@ use libp2p::{
     core::upgrade,
     gossipsub::{self, Gossipsub, MessageAuthenticity, IdentTopic},
     identity, mplex, noise,
-    swarm::SwarmBuilder,
+
+
+    request_response::{RequestResponse, RequestResponseEvent, RequestResponseMessage},
+    swarm::{NetworkBehaviour, SwarmBuilder},
     tcp, Multiaddr, PeerId, Swarm, Transport,
 };
 use log::{debug, info};
@@ -18,21 +21,36 @@ use crate::config::Settings;
 use crate::types::NodeId;
 
 use super::message::Message;
+use super::req_resp::{create_result_protocol, ResultCodec, ResultRequest, ResultResponse};
 
 // Global topic for all paraloom messages
 const PARALOOM_TOPIC: &str = "paraloom/v1";
+
+#[derive(NetworkBehaviour)]
+pub struct ParaloomBehaviour {
+    pub gossipsub: Gossipsub,
+    pub request_response: RequestResponse<ResultCodec>,
+}
 
 /// Network event handler
 #[async_trait]
 pub trait NetworkEventHandler: Send + Sync {
     /// Handle a message from the network
     async fn handle_message(&self, source: NodeId, message: Message) -> Result<()>;
+
+    async fn handle_result_request(&self, _source: NodeId, _request: ResultRequest) -> Result<ResultResponse> {
+        log::warn!("Received result request but handler not implemented");
+        Ok(ResultResponse {
+            success: false,
+            message: "Handler not implemented".to_string(),
+        })
+    }
 }
 
 /// Network manager
 pub struct NetworkManager {
     peer_id: PeerId,
-    swarm: Arc<Mutex<Swarm<Gossipsub>>>,
+    swarm: Arc<Mutex<Swarm<ParaloomBehaviour>>>,
     message_sender: mpsc::Sender<(NodeId, Message)>,
     message_receiver: Arc<Mutex<mpsc::Receiver<(NodeId, Message)>>>,
     handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
@@ -70,15 +88,22 @@ impl NetworkManager {
             .map_err(|e| anyhow!("Gossipsub config error: {}", e))?;
 
         // Build the Gossipsub behavior
-        let gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key), gossipsub_config)
+        let gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key.clone()), gossipsub_config)
             .map_err(|e| anyhow!("Gossipsub error: {}", e))?;
+
+        let request_response = create_result_protocol();
+
+        let behaviour = ParaloomBehaviour {
+            gossipsub,
+            request_response,
+        };
 
         // Set up message channel
         let (tx, rx) = mpsc::channel(100);
 
-        // Build the Swarm
+        // Build the Swarm with combined behavior
         let swarm =
-            SwarmBuilder::with_tokio_executor(transport, gossipsub, local_peer_id.clone()).build();
+            SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id.clone()).build();
 
         Ok(NetworkManager {
             peer_id: local_peer_id,
@@ -128,7 +153,7 @@ impl NetworkManager {
 
         // Subscribe to the paraloom topic
         let topic = IdentTopic::new(PARALOOM_TOPIC);
-        swarm.behaviour_mut().subscribe(&topic)
+        swarm.behaviour_mut().gossipsub.subscribe(&topic)
             .map_err(|e| anyhow!("Failed to subscribe to topic: {}", e))?;
         info!("Subscribed to topic: {}", PARALOOM_TOPIC);
 
@@ -152,7 +177,7 @@ impl NetworkManager {
 
     /// Run the event loop
     async fn run_event_loop(
-        swarm: Arc<Mutex<Swarm<Gossipsub>>>,
+        swarm: Arc<Mutex<Swarm<ParaloomBehaviour>>>,
         receiver: Arc<Mutex<mpsc::Receiver<(NodeId, Message)>>>,
         handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
         connected_peers: Arc<Mutex<Vec<PeerId>>>,
@@ -195,32 +220,85 @@ impl NetworkManager {
                                 libp2p::swarm::SwarmEvent::Dialing(peer_id) => {
                                     info!("Dialing peer: {:?}", peer_id);
                                 }
-                                libp2p::swarm::SwarmEvent::Behaviour(gossip_event) => {
-                                    // Check if this is a Message event
-                                    if let gossipsub::GossipsubEvent::Message {
-                                        propagation_source: peer_id,
-                                        message,
-                                        ..
-                                    } = gossip_event {
-                                        info!("Received gossipsub message from peer: {}", peer_id);
+                                libp2p::swarm::SwarmEvent::Behaviour(behaviour_event) => {
+                                    match behaviour_event {
+                                        ParaloomBehaviourEvent::Gossipsub(gossip_event) => {
+                                            if let gossipsub::GossipsubEvent::Message {
+                                                propagation_source: peer_id,
+                                                message,
+                                                ..
+                                            } = gossip_event {
+                                                info!("Received gossipsub message from peer: {}", peer_id);
 
-                                        // Deserialize the message
-                                        match bincode::deserialize::<Message>(&message.data) {
-                                            Ok(msg) => {
-                                                let source = NodeId(peer_id.to_bytes());
-                                                let handler_lock = handler.lock().await;
-                                                if let Some(h) = handler_lock.as_ref() {
-                                                    if let Err(e) = h.handle_message(source, msg).await {
-                                                        log::error!("Error handling message: {}", e);
+                                                // Deserialize the message
+                                                match bincode::deserialize::<Message>(&message.data) {
+                                                    Ok(msg) => {
+                                                        let source = NodeId(peer_id.to_bytes());
+                                                        let handler_lock = handler.lock().await;
+                                                        if let Some(h) = handler_lock.as_ref() {
+                                                            if let Err(e) = h.handle_message(source, msg).await {
+                                                                log::error!("Error handling message: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("Failed to deserialize message: {}", e);
                                                     }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                log::error!("Failed to deserialize message: {}", e);
+                                            } else {
+                                                debug!("Gossipsub event: {:?}", gossip_event);
                                             }
                                         }
-                                    } else {
-                                        debug!("Gossipsub event: {:?}", gossip_event);
+
+                                        ParaloomBehaviourEvent::RequestResponse(req_resp_event) => {
+                                            match req_resp_event {
+                                                RequestResponseEvent::Message { peer, message } => {
+                                                    match message {
+                                                        RequestResponseMessage::Request { request, channel, .. } => {
+                                                            info!("Received result request from validator: {}", peer);
+                                                            let source = NodeId(peer.to_bytes());
+                                                            let handler_lock = handler.lock().await;
+
+                                                            let response = if let Some(h) = handler_lock.as_ref() {
+                                                                match h.handle_result_request(source, request).await {
+                                                                    Ok(resp) => resp,
+                                                                    Err(e) => {
+                                                                        log::error!("Error handling result request: {}", e);
+                                                                        ResultResponse {
+                                                                            success: false,
+                                                                            message: format!("Error: {}", e),
+                                                                        }
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                ResultResponse {
+                                                                    success: false,
+                                                                    message: "No handler registered".to_string(),
+                                                                }
+                                                            };
+
+                                                            let mut swarm_lock = swarm.lock().await;
+                                                            if let Err(e) = swarm_lock.behaviour_mut().request_response.send_response(channel, response) {
+                                                                log::error!("Failed to send response: {:?}", e);
+                                                            }
+                                                        }
+
+                                                        RequestResponseMessage::Response { response, .. } => {
+                                                            info!("Result acknowledged by coordinator: {:?}", response);
+                                                        }
+                                                    }
+                                                }
+                                                RequestResponseEvent::OutboundFailure { peer, error, .. } => {
+                                                    log::error!("Request-response outbound failure to {:?}: {:?}", peer, error);
+                                                }
+                                                RequestResponseEvent::InboundFailure { peer, error, .. } => {
+                                                    log::error!("Request-response inbound failure from {:?}: {:?}", peer, error);
+                                                }
+                                                _ => {
+                                                    debug!("Request-response event: {:?}", req_resp_event);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {
@@ -244,7 +322,7 @@ impl NetworkManager {
                                 Ok(data) => {
                                     let topic = IdentTopic::new(PARALOOM_TOPIC);
                                     let mut swarm_lock = swarm.lock().await;
-                                    if let Err(e) = swarm_lock.behaviour_mut().publish(topic, data) {
+                                    if let Err(e) = swarm_lock.behaviour_mut().gossipsub.publish(topic, data) {
                                         log::error!("Failed to publish message: {}", e);
                                     } else {
                                         info!("Published message to gossipsub");
@@ -270,6 +348,20 @@ impl NetworkManager {
             .send((NodeId(vec![]), message))
             .await
             .map_err(|e| anyhow!("Failed to send message: {}", e))
+    }
+
+    pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
+        let peer_id = PeerId::from_bytes(&peer.0)
+            .map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+
+        let mut swarm = self.swarm.lock().await;
+        let request_id = swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer_id, request);
+
+        info!("Sent result request to peer {}: {:?}", peer_id, request_id);
+        Ok(())
     }
 
     /// Get local peer ID

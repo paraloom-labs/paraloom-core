@@ -1,6 +1,6 @@
 //! Validator node logic
 
-use crate::network::{Message, NetworkManager};
+use crate::network::{Message, NetworkManager, ResultRequest};
 use crate::task::{ResultData, Task, TaskResult, TaskType};
 use crate::types::NodeId;
 use anyhow::Result;
@@ -44,14 +44,12 @@ impl Validator {
             Ok(result) => {
                 info!("Task completed: {} in {}ms", result.task_id, result.execution_time_ms);
 
-                // Send result back to coordinator
-                let msg = Message::TaskResponse { result };
-                self.network.send_message(source, msg).await?;
+                let request = ResultRequest { result };
+                self.network.send_result_request(source, request).await?;
             }
             Err(e) => {
                 info!("Task failed: {} - {}", task.id, e);
 
-                // Send error back to coordinator
                 let msg = Message::TaskError {
                     task_id: task.id,
                     error: e.to_string(),
