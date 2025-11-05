@@ -26,6 +26,18 @@ path = "src/bin/node_test.rs"
 name = "dashboard"
 path = "src/bin/dashboard.rs"
 
+[[bin]]
+name = "task-demo"
+path = "src/bin/task_demo.rs"
+
+[[bin]]
+name = "submit-task"
+path = "src/bin/submit_task.rs"
+
+[[bin]]
+name = "web-demo"
+path = "src/bin/web_demo.rs"
+
 [dependencies]
 # Core networking
 libp2p = { version = "0.50.0", features = ["tokio", "tcp", "noise", "mplex", "gossipsub"] }
@@ -60,6 +72,10 @@ toml = "0.7.3"
 futures = "0.3.26"
 async-trait = "0.1.64"
 once_cell = "1.17.1"
+uuid = { version = "1.3", features = ["v4", "serde"] }
+
+# Cryptography
+sha2 = "0.10"
 
 # Other
 sysinfo = "0.29.0"
