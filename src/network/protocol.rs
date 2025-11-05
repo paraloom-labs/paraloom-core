@@ -58,8 +58,16 @@ impl NetworkManager {
             .multiplex(mplex::MplexConfig::new())
             .boxed();
 
-        // Create a Gossipsub behavior
-        let gossipsub_config = gossipsub::GossipsubConfig::default();
+        // Create a Gossipsub behavior with custom config for small networks
+        let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
+            .heartbeat_interval(std::time::Duration::from_secs(1)) // More frequent mesh updates
+            .mesh_outbound_min(1) // Minimum outbound connections (down from 2)
+            .mesh_n_low(1)     // Minimum 1 peer in mesh (down from 4)
+            .mesh_n(2)         // Optimal 2 peers in mesh (down from 6)
+            .mesh_n_high(3)    // Maximum 3 peers in mesh (down from 12)
+            .validation_mode(gossipsub::ValidationMode::Permissive) // Accept all messages
+            .build()
+            .map_err(|e| anyhow!("Gossipsub config error: {}", e))?;
 
         // Build the Gossipsub behavior
         let gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key), gossipsub_config)
