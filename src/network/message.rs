@@ -25,6 +25,7 @@ pub enum Message {
     /// Coordinator -> Validator: Execute this task
     TaskRequest {
         task: crate::task::Task,
+        coordinator_id: crate::types::NodeId,
     },
 
     /// Validator -> Coordinator: Task completed

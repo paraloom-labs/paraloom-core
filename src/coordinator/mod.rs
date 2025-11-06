@@ -114,7 +114,11 @@ impl Coordinator {
             }
 
             // Send TaskRequest (with brief timeout, non-blocking)
-            let msg = Message::TaskRequest { task: chunk.clone() };
+            let coordinator_id = self.network.local_peer_id();
+            let msg = Message::TaskRequest {
+                task: chunk.clone(),
+                coordinator_id,
+            };
             info!("Sending task chunk {} to validator (chunk {} of {})", chunk.id, i+1, chunks_len);
 
             // Send with timeout to prevent hanging
