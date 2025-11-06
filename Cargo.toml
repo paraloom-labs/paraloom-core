@@ -44,7 +44,7 @@ path = "src/bin/benchmark_reqresp.rs"
 
 [dependencies]
 # Core networking
-libp2p = { version = "0.50.0", features = ["tokio", "tcp", "noise", "mplex", "gossipsub", "request-response", "macros"] }
+libp2p = { version = "0.56.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "gossipsub", "request-response", "macros"] }
 tokio = { version = "1.25.0", features = ["full"] }
 
 # Web server - compatible versions
