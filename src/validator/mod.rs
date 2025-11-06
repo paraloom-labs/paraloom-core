@@ -30,13 +30,8 @@ impl Validator {
     }
 
     /// Handle incoming task request
-    pub async fn handle_task_request(&self, task: Task, source: NodeId) -> Result<()> {
+    pub async fn handle_task_request(&self, task: Task, coordinator_id: NodeId) -> Result<()> {
         info!("Validator received task: {} from coordinator", task.id);
-
-        // Update coordinator if not set
-        if self.coordinator_id.is_none() {
-            // Use the source as coordinator
-        }
 
         // Execute task
         info!("Executing task: {}", task.id);
@@ -45,7 +40,7 @@ impl Validator {
                 info!("Task completed: {} in {}ms", result.task_id, result.execution_time_ms);
 
                 let request = ResultRequest { result };
-                self.network.send_result_request(source, request).await?;
+                self.network.send_result_request(coordinator_id.clone(), request).await?;
             }
             Err(e) => {
                 info!("Task failed: {} - {}", task.id, e);
@@ -54,7 +49,7 @@ impl Validator {
                     task_id: task.id,
                     error: e.to_string(),
                 };
-                self.network.send_message(source, msg).await?;
+                self.network.send_message(coordinator_id, msg).await?;
             }
         }
 

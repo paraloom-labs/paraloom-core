@@ -56,10 +56,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             }
 
             // Task-related messages
-            Message::TaskRequest { task } => {
+            Message::TaskRequest { task, coordinator_id } => {
                 if let Some(validator) = &self.validator {
                     let validator = validator.lock().await;
-                    validator.handle_task_request(task, source).await?;
+                    validator.handle_task_request(task, coordinator_id).await?;
                 }
             }
             Message::TaskResponse { result } => {
