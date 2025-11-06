@@ -5,13 +5,11 @@ use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::{
     core::upgrade,
-    gossipsub::{self, Gossipsub, MessageAuthenticity, IdentTopic},
-    identity, mplex, noise,
-
-
-    request_response::{RequestResponse, RequestResponseEvent, RequestResponseMessage},
-    swarm::{NetworkBehaviour, SwarmBuilder},
-    tcp, Multiaddr, PeerId, Swarm, Transport,
+    gossipsub::{self, Behaviour as Gossipsub, MessageAuthenticity, IdentTopic},
+    identity, noise, quic, yamux,
+    request_response::{Behaviour as RequestResponse, Event as RequestResponseEvent, Message as RequestResponseMessage},
+    swarm::{NetworkBehaviour, Swarm},
+    tcp, Multiaddr, PeerId, Transport,
 };
 use log::{debug, info};
 use std::sync::Arc;
@@ -66,29 +64,33 @@ impl NetworkManager {
 
         info!("Local peer ID: {}", local_peer_id);
 
-        // Create a transport
-        let transport = tcp::tokio::Transport::new(tcp::Config::default())
+        // Create TCP transport
+        let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default())
             .upgrade(upgrade::Version::V1)
             .authenticate(
-                noise::NoiseAuthenticated::xx(&local_key)
+                noise::Config::new(&local_key)
                     .map_err(|e| anyhow!("Noise error: {}", e))?,
             )
-            .multiplex(mplex::MplexConfig::new())
+            .multiplex(yamux::Config::default())
+            .boxed();
+
+        // Create QUIC transport (has built-in encryption)
+        let quic_transport = quic::tokio::Transport::new(quic::Config::new(&local_key));
+
+        // Combine TCP and QUIC transports using or_transport
+        let transport = tcp_transport
+            .or_transport(quic_transport)
+            .map(|either, _| match either {
+                futures::future::Either::Left((peer_id, muxer)) => (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)),
+                futures::future::Either::Right((peer_id, muxer)) => (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)),
+            })
             .boxed();
 
         // Create a Gossipsub behavior with custom config for small networks
-        let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
-            .heartbeat_interval(std::time::Duration::from_secs(1)) // More frequent mesh updates
-            .mesh_outbound_min(1) // Minimum outbound connections (down from 2)
-            .mesh_n_low(1)     // Minimum 1 peer in mesh (down from 4)
-            .mesh_n(2)         // Optimal 2 peers in mesh (down from 6)
-            .mesh_n_high(3)    // Maximum 3 peers in mesh (down from 12)
-            .validation_mode(gossipsub::ValidationMode::Permissive) // Accept all messages
-            .build()
-            .map_err(|e| anyhow!("Gossipsub config error: {}", e))?;
+        let gossipsub_config = gossipsub::Config::default();
 
         // Build the Gossipsub behavior
-        let gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key.clone()), gossipsub_config)
+        let mut gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key.clone()), gossipsub_config)
             .map_err(|e| anyhow!("Gossipsub error: {}", e))?;
 
         let request_response = create_result_protocol();
@@ -102,8 +104,7 @@ impl NetworkManager {
         let (tx, rx) = mpsc::channel(100);
 
         // Build the Swarm with combined behavior
-        let swarm =
-            SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id.clone()).build();
+        let swarm = Swarm::new(transport, behaviour, local_peer_id.clone(), libp2p::swarm::Config::with_tokio_executor());
 
         Ok(NetworkManager {
             peer_id: local_peer_id,
@@ -217,13 +218,13 @@ impl NetworkManager {
                                 libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                     log::warn!("Outgoing connection error to {:?}: {}", peer_id, error);
                                 }
-                                libp2p::swarm::SwarmEvent::Dialing(peer_id) => {
+                                libp2p::swarm::SwarmEvent::Dialing { peer_id, connection_id: _ } => {
                                     info!("Dialing peer: {:?}", peer_id);
                                 }
                                 libp2p::swarm::SwarmEvent::Behaviour(behaviour_event) => {
                                     match behaviour_event {
                                         ParaloomBehaviourEvent::Gossipsub(gossip_event) => {
-                                            if let gossipsub::GossipsubEvent::Message {
+                                            if let gossipsub::Event::Message {
                                                 propagation_source: peer_id,
                                                 message,
                                                 ..
@@ -252,7 +253,7 @@ impl NetworkManager {
 
                                         ParaloomBehaviourEvent::RequestResponse(req_resp_event) => {
                                             match req_resp_event {
-                                                RequestResponseEvent::Message { peer, message } => {
+                                                RequestResponseEvent::Message { peer, message, connection_id: _ } => {
                                                     match message {
                                                         RequestResponseMessage::Request { request, channel, .. } => {
                                                             info!("=== RECEIVED RESULT REQUEST ===");
@@ -299,19 +300,19 @@ impl NetworkManager {
                                                         }
                                                     }
                                                 }
-                                                RequestResponseEvent::OutboundFailure { peer, request_id, error } => {
+                                                RequestResponseEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                                                     log::error!("=== REQUEST-RESPONSE OUTBOUND FAILURE ===");
                                                     log::error!("Peer: {:?}", peer);
                                                     log::error!("Request ID: {:?}", request_id);
                                                     log::error!("Error: {:?}", error);
                                                 }
-                                                RequestResponseEvent::InboundFailure { peer, request_id, error } => {
+                                                RequestResponseEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                                                     log::error!("=== REQUEST-RESPONSE INBOUND FAILURE ===");
                                                     log::error!("Peer: {:?}", peer);
                                                     log::error!("Request ID: {:?}", request_id);
                                                     log::error!("Error: {:?}", error);
                                                 }
-                                                RequestResponseEvent::ResponseSent { peer, request_id } => {
+                                                RequestResponseEvent::ResponseSent { peer, request_id, connection_id: _ } => {
                                                     info!("=== RESPONSE SENT SUCCESSFULLY ===");
                                                     info!("To peer: {}", peer);
                                                     info!("Request ID: {:?}", request_id);
