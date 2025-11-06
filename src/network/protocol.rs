@@ -255,13 +255,19 @@ impl NetworkManager {
                                                 RequestResponseEvent::Message { peer, message } => {
                                                     match message {
                                                         RequestResponseMessage::Request { request, channel, .. } => {
-                                                            info!("Received result request from validator: {}", peer);
+                                                            info!("=== RECEIVED RESULT REQUEST ===");
+                                                            info!("From validator: {}", peer);
+                                                            info!("Task ID: {}", request.result.task_id);
+
                                                             let source = NodeId(peer.to_bytes());
                                                             let handler_lock = handler.lock().await;
 
                                                             let response = if let Some(h) = handler_lock.as_ref() {
                                                                 match h.handle_result_request(source, request).await {
-                                                                    Ok(resp) => resp,
+                                                                    Ok(resp) => {
+                                                                        info!("Handler processed result successfully");
+                                                                        resp
+                                                                    }
                                                                     Err(e) => {
                                                                         log::error!("Error handling result request: {}", e);
                                                                         ResultResponse {
@@ -271,28 +277,44 @@ impl NetworkManager {
                                                                     }
                                                                 }
                                                             } else {
+                                                                log::warn!("No handler registered");
                                                                 ResultResponse {
                                                                     success: false,
                                                                     message: "No handler registered".to_string(),
                                                                 }
                                                             };
 
+                                                            info!("Sending response: success={}", response.success);
                                                             let mut swarm_lock = swarm.lock().await;
                                                             if let Err(e) = swarm_lock.behaviour_mut().request_response.send_response(channel, response) {
                                                                 log::error!("Failed to send response: {:?}", e);
+                                                            } else {
+                                                                info!("=== RESPONSE SENT ===");
                                                             }
                                                         }
 
                                                         RequestResponseMessage::Response { response, .. } => {
-                                                            info!("Result acknowledged by coordinator: {:?}", response);
+                                                            info!("=== RECEIVED RESPONSE FROM COORDINATOR ===");
+                                                            info!("Success: {}, Message: {}", response.success, response.message);
                                                         }
                                                     }
                                                 }
-                                                RequestResponseEvent::OutboundFailure { peer, error, .. } => {
-                                                    log::error!("Request-response outbound failure to {:?}: {:?}", peer, error);
+                                                RequestResponseEvent::OutboundFailure { peer, request_id, error } => {
+                                                    log::error!("=== REQUEST-RESPONSE OUTBOUND FAILURE ===");
+                                                    log::error!("Peer: {:?}", peer);
+                                                    log::error!("Request ID: {:?}", request_id);
+                                                    log::error!("Error: {:?}", error);
                                                 }
-                                                RequestResponseEvent::InboundFailure { peer, error, .. } => {
-                                                    log::error!("Request-response inbound failure from {:?}: {:?}", peer, error);
+                                                RequestResponseEvent::InboundFailure { peer, request_id, error } => {
+                                                    log::error!("=== REQUEST-RESPONSE INBOUND FAILURE ===");
+                                                    log::error!("Peer: {:?}", peer);
+                                                    log::error!("Request ID: {:?}", request_id);
+                                                    log::error!("Error: {:?}", error);
+                                                }
+                                                RequestResponseEvent::ResponseSent { peer, request_id } => {
+                                                    info!("=== RESPONSE SENT SUCCESSFULLY ===");
+                                                    info!("To peer: {}", peer);
+                                                    info!("Request ID: {:?}", request_id);
                                                 }
                                                 _ => {
                                                     debug!("Request-response event: {:?}", req_resp_event);
@@ -354,13 +376,23 @@ impl NetworkManager {
         let peer_id = PeerId::from_bytes(&peer.0)
             .map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
 
+        info!("=== SENDING RESULT REQUEST ===");
+        info!("Target peer: {}", peer_id);
+        info!("Task ID: {}", request.result.task_id);
+
         let mut swarm = self.swarm.lock().await;
+
+        // Check if peer is connected
+        let is_connected = swarm.is_connected(&peer_id);
+        info!("Is peer connected? {}", is_connected);
+
         let request_id = swarm
             .behaviour_mut()
             .request_response
             .send_request(&peer_id, request);
 
-        info!("Sent result request to peer {}: {:?}", peer_id, request_id);
+        info!("Request ID: {:?}", request_id);
+        info!("=== REQUEST SENT ===");
         Ok(())
     }
 

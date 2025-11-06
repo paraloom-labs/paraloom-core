@@ -6,7 +6,7 @@ listen_address = "/ip4/0.0.0.0/tcp/9002"
 
 # Coordinator's local network IP address
 bootstrap_nodes = [
-    "/ip4/192.168.1.15/tcp/9001/p2p/12D3KooWSX7eeypZJSQqjXELTPGPWwo5cs4XmsTtsozp9ZwxQJfJ"
+    "/ip4/192.168.1.15/tcp/9001/p2p/12D3KooWSCw1rxqFcibGkMGJ67VhXnX7nCat3i8gkQeV9Gd1jbgd"
 ]
 
 enable_mdns = true
