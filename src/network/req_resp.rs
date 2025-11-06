@@ -1,8 +1,9 @@
 //! Request-Response protocol for reliable result collection
 
-use libp2p::request_response::{ProtocolSupport, RequestResponse, RequestResponseCodec};
+use libp2p::request_response::{ProtocolSupport, RequestResponse, RequestResponseCodec, RequestResponseConfig};
 use serde::{Deserialize, Serialize};
 use std::io;
+use std::time::Duration;
 use async_trait::async_trait;
 use futures::prelude::*;
 
@@ -95,9 +96,13 @@ impl RequestResponseCodec for ResultCodec {
 
 /// Create a new RequestResponse behavior for result collection
 pub fn create_result_protocol() -> RequestResponse<ResultCodec> {
+    let mut config = RequestResponseConfig::default();
+    config.set_request_timeout(Duration::from_secs(60));  // Increase timeout to 60 seconds
+    config.set_connection_keep_alive(Duration::from_secs(30));  // Keep connection alive for 30 seconds
+
     RequestResponse::new(
         ResultCodec,
         std::iter::once((RESULT_PROTOCOL.to_string(), ProtocolSupport::Full)),
-        Default::default(),
+        config,
     )
 }
