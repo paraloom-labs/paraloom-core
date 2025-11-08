@@ -21,15 +21,12 @@ jobs:
             clang \
             libclang-dev \
             cmake \
-            libc++-dev \
-            libc++abi-dev \
-            libstdc++-12-dev \
             libsnappy-dev \
             liblz4-dev \
             libzstd-dev \
             zlib1g-dev \
             libbz2-dev
-      
+
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
