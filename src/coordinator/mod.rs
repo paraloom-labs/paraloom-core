@@ -200,10 +200,21 @@ impl Coordinator {
         // Check if all chunks completed
         let parent_tasks = self.parent_tasks.lock().await;
         if let Some(parent_id) = parent_tasks.get(&result.task_id) {
-            if self.all_chunks_completed(parent_id, &results, &parent_tasks).await {
-                info!("All chunks completed for task: {}", parent_id);
-                self.aggregate_results(parent_id).await?;
+            let parent_id_clone = parent_id.clone();
+
+            // Check if all chunks are done
+            let all_done = self.all_chunks_completed(&parent_id_clone, &results, &parent_tasks).await;
+            drop(parent_tasks); // Release lock before aggregation
+            drop(results); // Release lock before aggregation
+
+            if all_done {
+                info!("All chunks completed for task: {}", parent_id_clone);
+                self.aggregate_results(&parent_id_clone).await?;
+            } else {
+                info!("Waiting for more chunks... (parent: {})", parent_id_clone);
             }
+        } else {
+            info!("No parent task found for chunk: {}", result.task_id);
         }
 
         Ok(())
@@ -233,56 +244,87 @@ impl Coordinator {
 
     /// Aggregate results from all chunks
     async fn aggregate_results(&self, parent_id: &str) -> Result<()> {
-        let results = self.results.lock().await;
-        let parent_tasks = self.parent_tasks.lock().await;
+        info!("╔═══════════════════════════════════════════╗");
+        info!("║         AGGREGATING RESULTS               ║");
+        info!("╚═══════════════════════════════════════════╝");
 
-        // Get all chunk results
-        let mut chunk_results: Vec<_> = results
-            .iter()
-            .filter(|(task_id, _)| {
-                parent_tasks
-                    .get(task_id.as_str())
-                    .map(|pid| pid == parent_id)
-                    .unwrap_or(false)
-            })
-            .map(|(_, result)| result.clone())
-            .collect();
+        // Clone the data and release locks immediately
+        let chunk_results: Vec<TaskResult> = {
+            let results = self.results.lock().await;
+            let parent_tasks = self.parent_tasks.lock().await;
 
-        // Sort by task_id to ensure consistent ordering
-        chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            let mut chunk_results: Vec<_> = results
+                .iter()
+                .filter(|(task_id, _)| {
+                    parent_tasks
+                        .get(task_id.as_str())
+                        .map(|pid| pid == parent_id)
+                        .unwrap_or(false)
+                })
+                .map(|(_, result)| result.clone())
+                .collect();
+
+            // Sort by task_id to ensure consistent ordering
+            chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            chunk_results
+        }; // Locks are dropped here
+
+        info!("Received {} chunk results for parent task {}", chunk_results.len(), parent_id);
 
         // Merge results based on task type
         if !chunk_results.is_empty() {
+            info!("Processing {} chunk results...", chunk_results.len());
             match &chunk_results[0].data {
                 ResultData::Hashes { .. } => {
                     let mut all_hashes = Vec::new();
                     let mut max_time = 0u64;
+                    let mut total_time = 0u64;
 
-                    for result in &chunk_results {
+                    for (i, result) in chunk_results.iter().enumerate() {
                         let ResultData::Hashes { hashes, .. } = &result.data;
+                        info!("   Chunk {}: {} hashes in {}ms", i+1, hashes.len(), result.execution_time_ms);
                         all_hashes.extend(hashes.clone());
                         max_time = max_time.max(result.execution_time_ms);
+                        total_time += result.execution_time_ms;
                     }
 
-                    info!(
-                        "Aggregated {} hashes in {}ms (parallel execution time)",
-                        all_hashes.len(),
-                        max_time
-                    );
+                    info!("");
+                    info!("TASK COMPLETED SUCCESSFULLY!");
+                    info!("Total hashes computed: {}", all_hashes.len());
+                    info!("Parallel execution time: {}ms (slowest chunk)", max_time.max(1));
+                    info!("Total chunk time: {}ms (sum of all)", total_time);
+
+                    // Show first 5 hashes as examples
+                    info!("");
+                    info!("Sample results (first 5):");
+                    for (num, hash) in all_hashes.iter().take(5) {
+                        info!("   {} -> {}", num, hash);
+                    }
 
                     // Estimate single-node time (approximate)
-                    let estimated_single_node_time = all_hashes.len() as u64 * max_time
-                        / chunk_results.len() as u64;
-                    let speedup = estimated_single_node_time as f64 / max_time as f64;
-
-                    info!(
-                        "Estimated speedup: {:.2}x ({}ms single-node vs {}ms parallel)",
-                        speedup,
-                        estimated_single_node_time,
+                    let avg_time = if max_time > 0 {
                         max_time
-                    );
+                    } else {
+                        1 // Avoid division by zero
+                    };
+                    let estimated_single_node_time = all_hashes.len() as u64 * avg_time
+                        / chunk_results.len() as u64;
+                    let speedup = if max_time > 0 {
+                        estimated_single_node_time as f64 / max_time as f64
+                    } else {
+                        chunk_results.len() as f64
+                    };
+
+                    info!("");
+                    info!("Performance:");
+                    info!("   Estimated single-node time: ~{}ms", estimated_single_node_time);
+                    info!("   Actual parallel time: {}ms", max_time.max(1));
+                    info!("   Speedup: ~{:.2}x faster", speedup);
+                    info!("");
                 }
             }
+        } else {
+            log::warn!("No chunk results found for task {}", parent_id);
         }
 
         Ok(())
