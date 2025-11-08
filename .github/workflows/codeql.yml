@@ -1,12 +1,14 @@
 name: CodeQL Analysis
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  schedule:
-    - cron: '0 6 * * 1'  # Weekly on Monday at 6am UTC
+  workflow_dispatch:  # Manual trigger only
+  # Disabled
+  # push:
+  #   branches: [ main ]
+  # pull_request:
+  #   branches: [ main ]
+  # schedule:
+  #   - cron: '0 6 * * 1'  # Weekly on Monday at 6am UTC
 
 jobs:
   analyze:
@@ -32,8 +34,10 @@ jobs:
           languages: ${{ matrix.language }}
           queries: security-extended,security-and-quality
 
-      - name: Install Protocol Buffers Compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang libclang-dev cmake
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@v2
