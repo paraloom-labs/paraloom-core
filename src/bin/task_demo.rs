@@ -38,8 +38,7 @@ async fn main() -> Result<()> {
     let mut val1_settings = Settings::development();
     val1_settings.node.node_type = "ResourceProvider".to_string();
     val1_settings.network.listen_address = "/ip4/127.0.0.1/tcp/9002".to_string();
-    val1_settings.network.bootstrap_nodes =
-        vec!["/ip4/127.0.0.1/tcp/9001".to_string()];
+    val1_settings.network.bootstrap_nodes = vec!["/ip4/127.0.0.1/tcp/9001".to_string()];
 
     let validator1 = Node::new(val1_settings)?;
 
@@ -56,8 +55,7 @@ async fn main() -> Result<()> {
     let mut val2_settings = Settings::development();
     val2_settings.node.node_type = "ResourceProvider".to_string();
     val2_settings.network.listen_address = "/ip4/127.0.0.1/tcp/9003".to_string();
-    val2_settings.network.bootstrap_nodes =
-        vec!["/ip4/127.0.0.1/tcp/9001".to_string()];
+    val2_settings.network.bootstrap_nodes = vec!["/ip4/127.0.0.1/tcp/9001".to_string()];
 
     let validator2 = Node::new(val2_settings)?;
 

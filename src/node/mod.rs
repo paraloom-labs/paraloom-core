@@ -56,7 +56,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             }
 
             // Task-related messages
-            Message::TaskRequest { task, coordinator_id } => {
+            Message::TaskRequest {
+                task,
+                coordinator_id,
+            } => {
                 if let Some(validator) = &self.validator {
                     let validator = validator.lock().await;
                     validator.handle_task_request(task, coordinator_id).await?;
@@ -76,7 +79,11 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         Ok(())
     }
 
-    async fn handle_result_request(&self, source: NodeId, request: ResultRequest) -> Result<ResultResponse> {
+    async fn handle_result_request(
+        &self,
+        source: NodeId,
+        request: ResultRequest,
+    ) -> Result<ResultResponse> {
         info!("Received result request from {}", source);
         if let Some(coordinator) = &self.coordinator {
             match coordinator.handle_task_result(request.result).await {
@@ -187,8 +194,13 @@ impl Node {
 
         // Connect to bootstrap nodes
         if !self.settings.network.bootstrap_nodes.is_empty() {
-            info!("Connecting to {} bootstrap nodes", self.settings.network.bootstrap_nodes.len());
-            self.network.connect_to_bootstrap(self.settings.network.bootstrap_nodes.clone()).await?;
+            info!(
+                "Connecting to {} bootstrap nodes",
+                self.settings.network.bootstrap_nodes.len()
+            );
+            self.network
+                .connect_to_bootstrap(self.settings.network.bootstrap_nodes.clone())
+                .await?;
 
             // Wait a bit for connection to establish
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
@@ -199,7 +211,10 @@ impl Node {
             };
 
             let peers = self.network.connected_peers().await;
-            info!("Sending discovery message to {} connected peers", peers.len());
+            info!(
+                "Sending discovery message to {} connected peers",
+                peers.len()
+            );
 
             for peer in peers {
                 if let Err(e) = self.network.send_message(peer, discovery_msg.clone()).await {
@@ -207,7 +222,10 @@ impl Node {
                 }
             }
 
-            info!("Discovery broadcast complete for {:?}", self.node_info.node_type);
+            info!(
+                "Discovery broadcast complete for {:?}",
+                self.node_info.node_type
+            );
         }
 
         // Update status

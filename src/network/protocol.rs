@@ -5,11 +5,14 @@ use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::{
     core::upgrade,
-    gossipsub::{self, Behaviour as Gossipsub, MessageAuthenticity, IdentTopic},
-    identity, noise, quic, yamux,
-    request_response::{Behaviour as RequestResponse, Event as RequestResponseEvent, Message as RequestResponseMessage},
+    gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
+    identity, noise, quic,
+    request_response::{
+        Behaviour as RequestResponse, Event as RequestResponseEvent,
+        Message as RequestResponseMessage,
+    },
     swarm::{NetworkBehaviour, Swarm},
-    tcp, Multiaddr, PeerId, Transport,
+    tcp, yamux, Multiaddr, PeerId, Transport,
 };
 use log::{debug, info};
 use std::sync::Arc;
@@ -36,7 +39,11 @@ pub trait NetworkEventHandler: Send + Sync {
     /// Handle a message from the network
     async fn handle_message(&self, source: NodeId, message: Message) -> Result<()>;
 
-    async fn handle_result_request(&self, _source: NodeId, _request: ResultRequest) -> Result<ResultResponse> {
+    async fn handle_result_request(
+        &self,
+        _source: NodeId,
+        _request: ResultRequest,
+    ) -> Result<ResultResponse> {
         log::warn!("Received result request but handler not implemented");
         Ok(ResultResponse {
             success: false,
@@ -68,8 +75,7 @@ impl NetworkManager {
         let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default())
             .upgrade(upgrade::Version::V1)
             .authenticate(
-                noise::Config::new(&local_key)
-                    .map_err(|e| anyhow!("Noise error: {}", e))?,
+                noise::Config::new(&local_key).map_err(|e| anyhow!("Noise error: {}", e))?,
             )
             .multiplex(yamux::Config::default())
             .boxed();
@@ -81,8 +87,12 @@ impl NetworkManager {
         let transport = tcp_transport
             .or_transport(quic_transport)
             .map(|either, _| match either {
-                futures::future::Either::Left((peer_id, muxer)) => (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)),
-                futures::future::Either::Right((peer_id, muxer)) => (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer)),
+                futures::future::Either::Left((peer_id, muxer)) => {
+                    (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer))
+                }
+                futures::future::Either::Right((peer_id, muxer)) => {
+                    (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer))
+                }
             })
             .boxed();
 
@@ -90,8 +100,11 @@ impl NetworkManager {
         let gossipsub_config = gossipsub::Config::default();
 
         // Build the Gossipsub behavior
-        let mut gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key.clone()), gossipsub_config)
-            .map_err(|e| anyhow!("Gossipsub error: {}", e))?;
+        let mut gossipsub = Gossipsub::new(
+            MessageAuthenticity::Signed(local_key.clone()),
+            gossipsub_config,
+        )
+        .map_err(|e| anyhow!("Gossipsub error: {}", e))?;
 
         let request_response = create_result_protocol();
 
@@ -104,7 +117,12 @@ impl NetworkManager {
         let (tx, rx) = mpsc::channel(100);
 
         // Build the Swarm with combined behavior
-        let swarm = Swarm::new(transport, behaviour, local_peer_id.clone(), libp2p::swarm::Config::with_tokio_executor());
+        let swarm = Swarm::new(
+            transport,
+            behaviour,
+            local_peer_id.clone(),
+            libp2p::swarm::Config::with_tokio_executor(),
+        );
 
         Ok(NetworkManager {
             peer_id: local_peer_id,
@@ -154,7 +172,10 @@ impl NetworkManager {
 
         // Subscribe to the paraloom topic
         let topic = IdentTopic::new(PARALOOM_TOPIC);
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&topic)
             .map_err(|e| anyhow!("Failed to subscribe to topic: {}", e))?;
         info!("Subscribed to topic: {}", PARALOOM_TOPIC);
 
@@ -170,7 +191,13 @@ impl NetworkManager {
 
         // Spawn task to handle events
         tokio::spawn(async move {
-            Self::run_event_loop(swarm_clone, receiver_clone, handler_clone, connected_peers_clone).await;
+            Self::run_event_loop(
+                swarm_clone,
+                receiver_clone,
+                handler_clone,
+                connected_peers_clone,
+            )
+            .await;
         });
 
         Ok(())
@@ -374,8 +401,7 @@ impl NetworkManager {
     }
 
     pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
-        let peer_id = PeerId::from_bytes(&peer.0)
-            .map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
 
         info!("=== SENDING RESULT REQUEST ===");
         info!("Target peer: {}", peer_id);

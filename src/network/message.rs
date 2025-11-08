@@ -21,7 +21,6 @@ pub enum Message {
     },
 
     // Task-related messages
-
     /// Coordinator -> Validator: Execute this task
     TaskRequest {
         task: crate::task::Task,
@@ -29,13 +28,8 @@ pub enum Message {
     },
 
     /// Validator -> Coordinator: Task completed
-    TaskResponse {
-        result: crate::task::TaskResult,
-    },
+    TaskResponse { result: crate::task::TaskResult },
 
     /// Validator -> Coordinator: Task failed
-    TaskError {
-        task_id: String,
-        error: String,
-    },
+    TaskError { task_id: String, error: String },
 }

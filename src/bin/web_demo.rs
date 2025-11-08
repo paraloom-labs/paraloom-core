@@ -8,8 +8,8 @@
 
 use paraloom::{
     node::Node,
+    web::{server::start_dashboard_with_coordinator, DashboardState},
     Settings,
-    web::{DashboardState, server::start_dashboard_with_coordinator},
 };
 use tokio::time::{sleep, Duration};
 
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         id: peer.clone(),
                         node_type: NodeType::ResourceProvider,
                         resources: ResourceContribution {
-                            cpu_cores: 12,  // Will be updated when we receive actual info
+                            cpu_cores: 12, // Will be updated when we receive actual info
                             memory_mb: 16000,
                             storage_mb: 10240,
                             bandwidth_kbps: 10000,
@@ -94,11 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // Start dashboard with coordinator integration
-        if let Err(e) = start_dashboard_with_coordinator(
-            dashboard_state,
-            coordinator,
-            8080
-        ).await {
+        if let Err(e) = start_dashboard_with_coordinator(dashboard_state, coordinator, 8080).await {
             eprintln!("Dashboard server error: {}", e);
         }
 
@@ -113,9 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut settings = Settings::development();
         settings.node.node_type = "ResourceProvider".to_string();
         settings.network.listen_address = "/ip4/127.0.0.1/tcp/9002".to_string();
-        settings.network.bootstrap_nodes = vec![
-            "/ip4/127.0.0.1/tcp/9001".to_string(),
-        ];
+        settings.network.bootstrap_nodes = vec!["/ip4/127.0.0.1/tcp/9001".to_string()];
 
         let node = Node::new(settings).expect("Failed to create validator 1");
         println!("Validator 1 started on port 9002");
@@ -133,9 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut settings = Settings::development();
         settings.node.node_type = "ResourceProvider".to_string();
         settings.network.listen_address = "/ip4/127.0.0.1/tcp/9003".to_string();
-        settings.network.bootstrap_nodes = vec![
-            "/ip4/127.0.0.1/tcp/9001".to_string(),
-        ];
+        settings.network.bootstrap_nodes = vec!["/ip4/127.0.0.1/tcp/9001".to_string()];
 
         let node = Node::new(settings).expect("Failed to create validator 2");
         println!("Validator 2 started on port 9003\n");

@@ -1,11 +1,11 @@
 //! Request-Response protocol for reliable result collection
 
-use libp2p::request_response::{Codec, ProtocolSupport, Behaviour as RequestResponse, Config};
+use async_trait::async_trait;
+use futures::prelude::*;
+use libp2p::request_response::{Behaviour as RequestResponse, Codec, Config, ProtocolSupport};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
-use async_trait::async_trait;
-use futures::prelude::*;
 
 use crate::task::TaskResult;
 
@@ -45,8 +45,7 @@ impl Codec for ResultCodec {
     {
         let mut buf = Vec::new();
         io.read_to_end(&mut buf).await?;
-        bincode::deserialize(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn read_response<T>(
@@ -59,8 +58,7 @@ impl Codec for ResultCodec {
     {
         let mut buf = Vec::new();
         io.read_to_end(&mut buf).await?;
-        bincode::deserialize(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn write_request<T>(
@@ -72,8 +70,8 @@ impl Codec for ResultCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data = bincode::serialize(&req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data =
+            bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -87,8 +85,8 @@ impl Codec for ResultCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data = bincode::serialize(&res)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data =
+            bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -97,8 +95,7 @@ impl Codec for ResultCodec {
 /// Create a new RequestResponse behavior for result collection
 pub fn create_result_protocol() -> RequestResponse<ResultCodec> {
     let protocols = [(RESULT_PROTOCOL, ProtocolSupport::Full)];
-    let cfg = Config::default()
-        .with_request_timeout(Duration::from_secs(60));
+    let cfg = Config::default().with_request_timeout(Duration::from_secs(60));
 
     RequestResponse::with_codec(ResultCodec, protocols.iter().cloned(), cfg)
 }

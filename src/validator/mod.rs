@@ -37,10 +37,15 @@ impl Validator {
         info!("Executing task: {}", task.id);
         match self.execute_task(task.clone()).await {
             Ok(result) => {
-                info!("Task completed: {} in {}ms", result.task_id, result.execution_time_ms);
+                info!(
+                    "Task completed: {} in {}ms",
+                    result.task_id, result.execution_time_ms
+                );
 
                 let request = ResultRequest { result };
-                self.network.send_result_request(coordinator_id.clone(), request).await?;
+                self.network
+                    .send_result_request(coordinator_id.clone(), request)
+                    .await?;
             }
             Err(e) => {
                 info!("Task failed: {} - {}", task.id, e);
@@ -67,7 +72,10 @@ impl Validator {
                 algorithm,
             } => {
                 let count = end - start + 1;
-                info!("Calculating {} hashes ({} to {}) using {}", count, start, end, algorithm);
+                info!(
+                    "Calculating {} hashes ({} to {}) using {}",
+                    count, start, end, algorithm
+                );
 
                 let mut hashes = Vec::new();
                 for i in start..=end {

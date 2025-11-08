@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::coordinator::Coordinator;
-use crate::task::{TaskType, TaskId};
+use crate::task::{TaskId, TaskType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitTaskRequest {

@@ -3,9 +3,9 @@
 use anyhow::Result;
 use clap::Parser;
 use log::info;
+use paraloom::config::Settings;
 use paraloom::network::NetworkManager;
 use paraloom::task::{Task, TaskType};
-use paraloom::config::Settings;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -47,10 +47,7 @@ async fn main() -> Result<()> {
     let network_arc = Arc::new(network);
 
     // Parse coordinator address
-    let coordinator_addr = format!(
-        "/ip4/127.0.0.1/tcp/9001/p2p/{}",
-        cli.coordinator
-    );
+    let coordinator_addr = format!("/ip4/127.0.0.1/tcp/9001/p2p/{}", cli.coordinator);
 
     info!("Connecting to coordinator: {}", coordinator_addr);
 
@@ -59,7 +56,9 @@ async fn main() -> Result<()> {
     network_arc.start(listen_addr).await?;
 
     // Connect to coordinator
-    network_arc.connect_to_bootstrap(vec![coordinator_addr]).await?;
+    network_arc
+        .connect_to_bootstrap(vec![coordinator_addr])
+        .await?;
 
     // Wait for connection
     sleep(Duration::from_secs(2)).await;
