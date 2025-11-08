@@ -75,6 +75,63 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     coordinator.handle_task_error(task_id, error).await?;
                 }
             }
+
+            // Privacy-related messages (placeholder handlers)
+            Message::ShieldedTransaction { transaction } => {
+                info!("Received shielded transaction: {}", transaction.id());
+                // TODO: Process shielded transaction
+            }
+            Message::VerificationRequest {
+                task_id,
+                transaction_id,
+                chunk,
+            } => {
+                info!(
+                    "Received verification request: task={}, tx={}",
+                    task_id, transaction_id
+                );
+                // TODO: Verify chunk and send result
+                let _ = chunk; // Suppress warning
+            }
+            Message::VerificationResult {
+                task_id,
+                validator_id,
+                result,
+            } => {
+                info!(
+                    "Received verification result: task={}, validator={:?}",
+                    task_id, validator_id
+                );
+                // TODO: Aggregate verification results
+                let _ = result; // Suppress warning
+            }
+            Message::PoolStateQuery => {
+                info!("Received pool state query from {}", source);
+                // TODO: Send pool state response
+            }
+            Message::PoolStateResponse {
+                merkle_root,
+                total_supply,
+                commitment_count,
+            } => {
+                info!(
+                    "Received pool state: root={:?}, supply={}, commitments={}",
+                    merkle_root, total_supply, commitment_count
+                );
+            }
+            Message::NullifierQuery { nullifier } => {
+                info!("Received nullifier query: {:?}", nullifier);
+                // TODO: Check if nullifier is spent and send response
+            }
+            Message::NullifierResponse {
+                nullifier,
+                is_spent,
+            } => {
+                info!(
+                    "Received nullifier response: {:?}, spent={}",
+                    nullifier, is_spent
+                );
+            }
         }
         Ok(())
     }

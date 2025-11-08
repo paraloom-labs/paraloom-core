@@ -76,6 +76,7 @@ uuid = { version = "1.3", features = ["v4", "serde"] }
 
 # Cryptography
 sha2 = "0.10"
+hex = "0.4"
 
 # Other
 sysinfo = "0.29.0"

@@ -98,7 +98,7 @@ fn test_result_request_response() {
 
     let serialized = bincode::serialize(&response).unwrap();
     let deserialized: ResultResponse = bincode::deserialize(&serialized).unwrap();
-    assert_eq!(deserialized.success, true);
+    assert!(deserialized.success);
     assert_eq!(deserialized.message, "Task received");
 }
 
