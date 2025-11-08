@@ -15,7 +15,15 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang libclang-dev cmake
+          sudo apt-get install -y \
+            build-essential \
+            protobuf-compiler \
+            clang \
+            libclang-dev \
+            cmake \
+            libc++-dev \
+            libc++abi-dev \
+            libstdc++-12-dev
       
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
