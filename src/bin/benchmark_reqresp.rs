@@ -67,7 +67,7 @@ async fn run_benchmark(num_validators: usize) -> Result<()> {
             };
 
             tokio::time::sleep(tokio::time::Duration::from_millis(process_delay_ms)).await;
-            if let Ok(_) = coordinator_clone.handle_task_result(result).await {
+            if coordinator_clone.handle_task_result(result).await.is_ok() {
                 let mut count = processed_clone.lock().await;
                 *count += 1;
             }

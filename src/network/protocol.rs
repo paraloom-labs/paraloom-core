@@ -100,7 +100,7 @@ impl NetworkManager {
         let gossipsub_config = gossipsub::Config::default();
 
         // Build the Gossipsub behavior
-        let mut gossipsub = Gossipsub::new(
+        let gossipsub = Gossipsub::new(
             MessageAuthenticity::Signed(local_key.clone()),
             gossipsub_config,
         )
@@ -120,7 +120,7 @@ impl NetworkManager {
         let swarm = Swarm::new(
             transport,
             behaviour,
-            local_peer_id.clone(),
+            local_peer_id,
             libp2p::swarm::Config::with_tokio_executor(),
         );
 
@@ -343,9 +343,6 @@ impl NetworkManager {
                                                     info!("=== RESPONSE SENT SUCCESSFULLY ===");
                                                     info!("To peer: {}", peer);
                                                     info!("Request ID: {:?}", request_id);
-                                                }
-                                                _ => {
-                                                    debug!("Request-response event: {:?}", req_resp_event);
                                                 }
                                             }
                                         }

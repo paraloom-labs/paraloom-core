@@ -39,6 +39,12 @@ pub struct DashboardState {
     pub start_time: std::time::Instant,
 }
 
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DashboardState {
     pub fn new() -> Self {
         Self {

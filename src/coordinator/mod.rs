@@ -167,7 +167,7 @@ impl Coordinator {
                 let validators = self.validators.lock().await;
                 let num_validators = validators.len().max(1);
                 let total = end - start + 1;
-                let chunk_size = (total + num_validators as u64 - 1) / num_validators as u64;
+                let chunk_size = total.div_ceil(num_validators as u64);
 
                 let mut chunks = Vec::new();
                 let mut current_start = *start;
