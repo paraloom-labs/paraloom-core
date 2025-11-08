@@ -23,10 +23,6 @@ name = "node_test"
 path = "src/bin/node_test.rs"
 
 [[bin]]
-name = "dashboard"
-path = "src/bin/dashboard.rs"
-
-[[bin]]
 name = "task-demo"
 path = "src/bin/task_demo.rs"
 

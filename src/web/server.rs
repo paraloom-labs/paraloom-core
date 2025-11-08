@@ -8,8 +8,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 
 use crate::types::{NodeInfo, ResourceContribution};
@@ -69,12 +69,8 @@ impl DashboardState {
     pub fn get_stats(&self) -> NetworkStats {
         let nodes = self.nodes.lock().unwrap();
 
-        let total_cpu_cores: u32 = nodes.values()
-            .map(|n| n.resources.cpu_cores as u32)
-            .sum();
-        let total_memory_mb: u64 = nodes.values()
-            .map(|n| n.resources.memory_mb)
-            .sum();
+        let total_cpu_cores: u32 = nodes.values().map(|n| n.resources.cpu_cores as u32).sum();
+        let total_memory_mb: u64 = nodes.values().map(|n| n.resources.memory_mb).sum();
 
         NetworkStats {
             total_nodes: nodes.len(),
@@ -97,16 +93,16 @@ async fn get_nodes(Extension(state): Extension<DashboardState>) -> Json<Vec<WebN
 }
 
 async fn dashboard() -> Html<String> {
-    let html = std::fs::read_to_string("web/dashboard.html")
-        .unwrap_or_else(|_| {
-            r#"<!DOCTYPE html>
+    let html = std::fs::read_to_string("web/dashboard.html").unwrap_or_else(|_| {
+        r#"<!DOCTYPE html>
 <html><head><title>Paraloom Dashboard</title></head>
 <body style="background: #000; color: #0f0; font-family: monospace; padding: 20px;">
 <h1>Paraloom Dashboard</h1>
 <p>Dashboard file not found: web/dashboard.html</p>
 <p>Please create the dashboard HTML file.</p>
-</body></html>"#.to_string()
-        });
+</body></html>"#
+            .to_string()
+    });
     Html(html)
 }
 

@@ -60,7 +60,7 @@ impl Coordinator {
         }
 
         for (i, peer) in peers.iter().enumerate() {
-            info!("  Registering validator {}: {}", i+1, peer);
+            info!("  Registering validator {}: {}", i + 1, peer);
             self.register_validator(peer.clone()).await;
         }
 
@@ -119,14 +119,20 @@ impl Coordinator {
                 task: chunk.clone(),
                 coordinator_id,
             };
-            info!("Sending task chunk {} to validator (chunk {} of {})", chunk.id, i+1, chunks_len);
+            info!(
+                "Sending task chunk {} to validator (chunk {} of {})",
+                chunk.id,
+                i + 1,
+                chunks_len
+            );
 
             // Send with timeout to prevent hanging
             let network = self.network.clone();
             let send_result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(1),
-                network.send_message(validator_id.clone(), msg)
-            ).await;
+                network.send_message(validator_id.clone(), msg),
+            )
+            .await;
 
             match send_result {
                 Ok(Ok(_)) => {
@@ -136,7 +142,11 @@ impl Coordinator {
                     log::error!("Failed to send chunk {}: {}", chunk.id, e);
                 }
                 Err(_) => {
-                    log::error!("Timeout sending chunk {} to validator {:?}", chunk.id, validator_id);
+                    log::error!(
+                        "Timeout sending chunk {} to validator {:?}",
+                        chunk.id,
+                        validator_id
+                    );
                 }
             }
         }
@@ -203,7 +213,9 @@ impl Coordinator {
             let parent_id_clone = parent_id.clone();
 
             // Check if all chunks are done
-            let all_done = self.all_chunks_completed(&parent_id_clone, &results, &parent_tasks).await;
+            let all_done = self
+                .all_chunks_completed(&parent_id_clone, &results, &parent_tasks)
+                .await;
             drop(parent_tasks); // Release lock before aggregation
             drop(results); // Release lock before aggregation
 
@@ -269,7 +281,11 @@ impl Coordinator {
             chunk_results
         }; // Locks are dropped here
 
-        info!("Received {} chunk results for parent task {}", chunk_results.len(), parent_id);
+        info!(
+            "Received {} chunk results for parent task {}",
+            chunk_results.len(),
+            parent_id
+        );
 
         // Merge results based on task type
         if !chunk_results.is_empty() {
@@ -282,7 +298,12 @@ impl Coordinator {
 
                     for (i, result) in chunk_results.iter().enumerate() {
                         let ResultData::Hashes { hashes, .. } = &result.data;
-                        info!("   Chunk {}: {} hashes in {}ms", i+1, hashes.len(), result.execution_time_ms);
+                        info!(
+                            "   Chunk {}: {} hashes in {}ms",
+                            i + 1,
+                            hashes.len(),
+                            result.execution_time_ms
+                        );
                         all_hashes.extend(hashes.clone());
                         max_time = max_time.max(result.execution_time_ms);
                         total_time += result.execution_time_ms;
@@ -291,7 +312,10 @@ impl Coordinator {
                     info!("");
                     info!("TASK COMPLETED SUCCESSFULLY!");
                     info!("Total hashes computed: {}", all_hashes.len());
-                    info!("Parallel execution time: {}ms (slowest chunk)", max_time.max(1));
+                    info!(
+                        "Parallel execution time: {}ms (slowest chunk)",
+                        max_time.max(1)
+                    );
                     info!("Total chunk time: {}ms (sum of all)", total_time);
 
                     // Show first 5 hashes as examples
@@ -307,8 +331,8 @@ impl Coordinator {
                     } else {
                         1 // Avoid division by zero
                     };
-                    let estimated_single_node_time = all_hashes.len() as u64 * avg_time
-                        / chunk_results.len() as u64;
+                    let estimated_single_node_time =
+                        all_hashes.len() as u64 * avg_time / chunk_results.len() as u64;
                     let speedup = if max_time > 0 {
                         estimated_single_node_time as f64 / max_time as f64
                     } else {
@@ -317,7 +341,10 @@ impl Coordinator {
 
                     info!("");
                     info!("Performance:");
-                    info!("   Estimated single-node time: ~{}ms", estimated_single_node_time);
+                    info!(
+                        "   Estimated single-node time: ~{}ms",
+                        estimated_single_node_time
+                    );
                     info!("   Actual parallel time: {}ms", max_time.max(1));
                     info!("   Speedup: ~{:.2}x faster", speedup);
                     info!("");

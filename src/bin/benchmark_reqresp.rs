@@ -1,13 +1,13 @@
 //! Benchmark: Coordinator result processing performance
 
+use anyhow::Result;
+use paraloom::config::Settings;
 use paraloom::coordinator::Coordinator;
 use paraloom::network::NetworkManager;
-use paraloom::task::{TaskResult, ResultData};
-use paraloom::config::Settings;
+use paraloom::task::{ResultData, TaskResult};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -115,11 +115,17 @@ async fn run_benchmark(num_validators: usize) -> Result<()> {
     let ratio = elapsed_ms as f64 / sequential_time_ms as f64;
 
     if ratio < 0.3 {
-        println!("  EXCELLENT: Highly concurrent ({:.1}x faster than sequential)", 1.0 / ratio);
+        println!(
+            "  EXCELLENT: Highly concurrent ({:.1}x faster than sequential)",
+            1.0 / ratio
+        );
     } else if ratio < 0.6 {
         println!("  GOOD: Good concurrency ({:.1}x faster)", 1.0 / ratio);
     } else if ratio < 0.9 {
-        println!("  PARTIAL: Some concurrency but bottlenecks exist ({:.1}x faster)", 1.0 / ratio);
+        println!(
+            "  PARTIAL: Some concurrency but bottlenecks exist ({:.1}x faster)",
+            1.0 / ratio
+        );
     } else {
         println!("  BAD: Mostly sequential (only {:.1}x faster)", 1.0 / ratio);
     }
