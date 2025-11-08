@@ -1,11 +1,12 @@
 name: Build Release Binaries
 
 on:
-  push:
-    branches: [ main ] 
-    tags:
-      - 'v*'
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger only
+  # Disabled
+  # push:
+  #   branches: [ main ]
+  tags:
+    - 'v*'  # Auto-run on version tags
 
 jobs:
   build:
@@ -15,10 +16,10 @@ jobs:
       matrix:
         include:
           # Only Windows for now
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: paraloom-node.exe
-            asset_name: paraloom-node-windows-amd64.exe
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact_name: paraloom-node.exe
+          #   asset_name: paraloom-node-windows-amd64.exe
 
           # Uncomment when Linux/Mac builds are fixed:
           # - os: ubuntu-latest
@@ -43,6 +44,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang libclang-dev cmake
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install protobuf cmake
 
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows-latest'
