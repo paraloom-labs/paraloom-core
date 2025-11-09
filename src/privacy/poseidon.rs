@@ -54,7 +54,7 @@ pub fn poseidon_hash_fields(inputs: &[Fr]) -> Fr {
     let mut hasher = Sha256::new();
     for input in inputs {
         let bigint = input.into_bigint();
-        hasher.update(&bigint.to_bytes_le());
+        hasher.update(bigint.to_bytes_le());
     }
     let hash = hasher.finalize();
     Fr::from_le_bytes_mod_order(&hash[..])

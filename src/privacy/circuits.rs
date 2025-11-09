@@ -25,6 +25,11 @@ pub const MAX_INPUTS: usize = 2;
 /// Maximum number of outputs in a transfer
 pub const MAX_OUTPUTS: usize = 2;
 
+/// Merkle path element: (hash, is_left)
+type MerklePathElement = ([u8; 32], bool);
+/// Merkle path: vector of path elements
+type MerklePath = Vec<MerklePathElement>;
+
 /// Transfer circuit for private-to-private transactions
 ///
 /// Public inputs (visible on-chain):
@@ -49,7 +54,7 @@ pub struct TransferCircuit {
     // Private witness (secret)
     pub input_values: Vec<Option<u64>>,
     pub input_randomness: Vec<Option<[u8; 32]>>,
-    pub input_paths: Vec<Option<Vec<([u8; 32], bool)>>>, // (hash, is_left)
+    pub input_paths: Vec<Option<MerklePath>>,
     pub output_values: Vec<Option<u64>>,
     pub output_randomness: Vec<Option<[u8; 32]>>,
     pub recipient_addresses: Vec<Option<[u8; 32]>>,
@@ -284,6 +289,7 @@ fn compute_hash_gadget(
 // Helper to convert Boolean bits to field variable
 use ark_r1cs_std::boolean::Boolean;
 
+#[allow(dead_code)]
 trait BitsToField {
     fn le_bits_to_fp_var(bits: &[Boolean<Fr>]) -> Result<FpVar<Fr>, SynthesisError>;
 }
