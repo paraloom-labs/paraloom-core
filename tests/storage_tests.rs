@@ -37,8 +37,16 @@ fn test_task_storage_roundtrip() {
 
     match (&deserialized.task_type, &task.task_type) {
         (
-            TaskType::HashCalculation { start: s1, end: e1, algorithm: a1 },
-            TaskType::HashCalculation { start: s2, end: e2, algorithm: a2 },
+            TaskType::HashCalculation {
+                start: s1,
+                end: e1,
+                algorithm: a1,
+            },
+            TaskType::HashCalculation {
+                start: s2,
+                end: e2,
+                algorithm: a2,
+            },
         ) => {
             assert_eq!(s1, s2);
             assert_eq!(e1, e2);

@@ -2,17 +2,44 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feature/privacy-layer, feature/solana-bridge ]
   pull_request:
     branches: [ main ]
 
 jobs:
-  build:
+  format-and-lint:
+    name: Format & Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
-      - name: Install dependencies
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+      - name: Clippy warnings
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -33,34 +60,176 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
-          components: rustfmt, clippy
-      
-      - name: Check formatting
-        uses: actions-rs/cargo@v1
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
         with:
-          command: fmt
-          args: --all -- --check
-      
-      - name: Clippy
-        uses: actions-rs/cargo@v1
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
         with:
-          command: clippy
-          args: -- -D warnings
-      
-      - name: Build
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build all features
         uses: actions-rs/cargo@v1
         with:
           command: build
-      
-      - name: Test
+          args: --all-features
+
+  test-core:
+    name: Core Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            protobuf-compiler \
+            clang \
+            libclang-dev \
+            cmake \
+            libsnappy-dev \
+            liblz4-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libbz2-dev
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run core tests
         uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --all-features
+
+  test-privacy:
+    name: Privacy Layer Tests (103 tests)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            protobuf-compiler \
+            clang \
+            libclang-dev \
+            cmake \
+            libsnappy-dev \
+            liblz4-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libbz2-dev
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run privacy layer tests
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --lib privacy -- --test-threads=1
+
+      - name: Run privacy integration tests
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --lib privacy::integration_tests -- --nocapture
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: [test-core, test-privacy]
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            protobuf-compiler \
+            clang \
+            libclang-dev \
+            cmake \
+            libsnappy-dev \
+            liblz4-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libbz2-dev
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
 
       - name: Install tarpaulin
         run: cargo install cargo-tarpaulin
 
-      - name: Generate coverage
+      - name: Generate coverage report
         run: cargo tarpaulin --out Xml --all-features --workspace
 
       - name: Upload coverage to Codecov
