@@ -1,36 +1,20 @@
-//! Pedersen commitment scheme implementation
+//! Commitment scheme wrapper
 //!
-//! A Pedersen commitment allows committing to a value without revealing it.
-//! C = vG + rH where:
-//! - v is the value
-//! - r is random blinding factor
-//! - G, H are generator points
-//!
-//! For now, this is a simplified hash-based version.
-//! Production would use elliptic curve cryptography.
+//! This module provides a high-level interface for commitments.
+//! The actual cryptographic implementation is in the pedersen module.
 
+use crate::privacy::pedersen;
 use crate::privacy::types::{Commitment, Note};
-use sha2::{Digest, Sha256};
 
-/// Commitment generator - simplified version
+/// Commitment generator using Pedersen commitments
 pub struct CommitmentGenerator;
 
 impl CommitmentGenerator {
     /// Create a commitment to a value with randomness
     ///
-    /// In production, this would be: C = value*G + randomness*H
-    /// For now, we use: C = Hash(value || randomness || salt)
+    /// Uses Pedersen commitment: C = value*G + randomness*H
     pub fn commit(value: u64, randomness: &[u8; 32]) -> Commitment {
-        let mut hasher = Sha256::new();
-        hasher.update(value.to_le_bytes());
-        hasher.update(randomness);
-        hasher.update(b"COMMITMENT_SALT");
-
-        let result = hasher.finalize();
-        let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&result);
-
-        Commitment(commitment)
+        pedersen::commit(value, randomness)
     }
 
     /// Create a commitment from a note
@@ -39,14 +23,17 @@ impl CommitmentGenerator {
     }
 
     /// Verify a commitment opens to a specific value
-    /// (Used during verification - validator checks this)
     pub fn verify_opening(
         commitment: &Commitment,
         value: u64,
         randomness: &[u8; 32],
     ) -> bool {
-        let computed = Self::commit(value, randomness);
-        commitment == &computed
+        pedersen::verify(commitment, value, randomness)
+    }
+
+    /// Generate cryptographically secure randomness for commitments
+    pub fn generate_randomness() -> [u8; 32] {
+        pedersen::generate_randomness()
     }
 }
 
@@ -77,21 +64,9 @@ impl CommitmentBuilder {
         self
     }
 
-    /// Generate random blinding factor
+    /// Generate cryptographically secure random blinding factor
     pub fn random_blinding(mut self) -> Self {
-        // In production, use a cryptographically secure RNG
-        // For now, use a simple hash-based approach
-        let mut hasher = Sha256::new();
-        hasher.update(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .to_le_bytes());
-
-        let result = hasher.finalize();
-        let mut randomness = [0u8; 32];
-        randomness.copy_from_slice(&result);
-
+        let randomness = CommitmentGenerator::generate_randomness();
         self.randomness = Some(randomness);
         self
     }
