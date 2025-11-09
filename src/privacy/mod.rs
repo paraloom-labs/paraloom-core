@@ -15,6 +15,7 @@ pub mod pedersen;
 pub mod pool;
 pub mod poseidon;
 pub mod proof;
+pub mod sparse_merkle;
 pub mod transaction;
 pub mod types;
 pub mod verification;
@@ -25,6 +26,7 @@ pub use circuits::{
 };
 pub use commitment::{CommitmentBuilder, CommitmentGenerator};
 pub use merkle::MerkleTree;
+pub use sparse_merkle::{MemoryStats, SparseMerkleTree, SPARSE_TREE_DEPTH};
 pub use nullifier::NullifierSet;
 pub use pool::ShieldedPool;
 pub use proof::{ProofVerifier, VerificationChunk, VerificationResult};
