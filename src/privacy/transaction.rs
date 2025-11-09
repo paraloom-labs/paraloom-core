@@ -158,10 +158,8 @@ impl TransferTx {
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
 
-        let output_commitments: Vec<Commitment> = output_notes
-            .iter()
-            .map(|note| note.commitment())
-            .collect();
+        let output_commitments: Vec<Commitment> =
+            output_notes.iter().map(|note| note.commitment()).collect();
 
         let range_proofs: Vec<RangeProof> = output_notes
             .iter()
@@ -372,12 +370,7 @@ mod tests {
         let note1 = Note::new(ShieldedAddress([10u8; 32]), 500, [1u8; 32]);
         let note2 = Note::new(ShieldedAddress([20u8; 32]), 490, [2u8; 32]);
 
-        let tx = TransferTx::new(
-            nullifiers,
-            vec![note1, note2],
-            [0u8; 32],
-            10,
-        );
+        let tx = TransferTx::new(nullifiers, vec![note1, note2], [0u8; 32], 10);
 
         assert_eq!(tx.input_nullifiers.len(), 2);
         assert_eq!(tx.output_notes.len(), 2);
@@ -390,13 +383,7 @@ mod tests {
         let nullifier = Nullifier([1u8; 32]);
         let to_public = vec![5u8; 32];
 
-        let tx = WithdrawTx::new(
-            nullifier,
-            1000,
-            to_public,
-            [0u8; 32],
-            10,
-        );
+        let tx = WithdrawTx::new(nullifier, 1000, to_public, [0u8; 32], 10);
 
         assert_eq!(tx.amount, 1000);
         assert_eq!(tx.fee, 10);

@@ -21,10 +21,8 @@ pub const SPARSE_TREE_DEPTH: usize = 32;
 
 /// Default hash for empty nodes (hash of "PARALOOM_EMPTY_NODE")
 pub const EMPTY_NODE_HASH: [u8; 32] = [
-    0x7e, 0x87, 0x24, 0x3f, 0x92, 0x1a, 0xc5, 0x68,
-    0xd1, 0x42, 0x9e, 0xf3, 0xba, 0x76, 0x5c, 0x18,
-    0x3d, 0xa4, 0x91, 0x6f, 0xe2, 0x55, 0xc8, 0x7b,
-    0x2e, 0x61, 0xd9, 0x4c, 0xaf, 0x72, 0x35, 0x98,
+    0x7e, 0x87, 0x24, 0x3f, 0x92, 0x1a, 0xc5, 0x68, 0xd1, 0x42, 0x9e, 0xf3, 0xba, 0x76, 0x5c, 0x18,
+    0x3d, 0xa4, 0x91, 0x6f, 0xe2, 0x55, 0xc8, 0x7b, 0x2e, 0x61, 0xd9, 0x4c, 0xaf, 0x72, 0x35, 0x98,
 ];
 
 /// Sparse Merkle Tree
@@ -168,10 +166,7 @@ impl SparseMerkleTree {
             let empty_hash = self.empty_hashes[level];
 
             // Group nodes by parent
-            let mut parent_indices: Vec<u64> = current_level
-                .keys()
-                .map(|&idx| idx / 2)
-                .collect();
+            let mut parent_indices: Vec<u64> = current_level.keys().map(|&idx| idx / 2).collect();
             parent_indices.sort_unstable();
             parent_indices.dedup();
 
@@ -190,7 +185,10 @@ impl SparseMerkleTree {
         }
 
         // Root is at index 0 of the top level
-        current_level.get(&0).copied().unwrap_or(self.empty_hashes[self.depth])
+        current_level
+            .get(&0)
+            .copied()
+            .unwrap_or(self.empty_hashes[self.depth])
     }
 
     /// Get Merkle path for a leaf at given index

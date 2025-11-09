@@ -23,11 +23,7 @@ impl CommitmentGenerator {
     }
 
     /// Verify a commitment opens to a specific value
-    pub fn verify_opening(
-        commitment: &Commitment,
-        value: u64,
-        randomness: &[u8; 32],
-    ) -> bool {
+    pub fn verify_opening(commitment: &Commitment, value: u64, randomness: &[u8; 32]) -> bool {
         pedersen::verify(commitment, value, randomness)
     }
 
@@ -137,14 +133,26 @@ mod tests {
         let commitment = CommitmentGenerator::commit(value, &randomness);
 
         // Correct opening should verify
-        assert!(CommitmentGenerator::verify_opening(&commitment, value, &randomness));
+        assert!(CommitmentGenerator::verify_opening(
+            &commitment,
+            value,
+            &randomness
+        ));
 
         // Wrong value should not verify
-        assert!(!CommitmentGenerator::verify_opening(&commitment, 6000, &randomness));
+        assert!(!CommitmentGenerator::verify_opening(
+            &commitment,
+            6000,
+            &randomness
+        ));
 
         // Wrong randomness should not verify
         let wrong_randomness = [101u8; 32];
-        assert!(!CommitmentGenerator::verify_opening(&commitment, value, &wrong_randomness));
+        assert!(!CommitmentGenerator::verify_opening(
+            &commitment,
+            value,
+            &wrong_randomness
+        ));
     }
 
     #[test]
@@ -175,9 +183,7 @@ mod tests {
 
     #[test]
     fn test_commitment_builder_missing_value() {
-        let result = CommitmentBuilder::new()
-            .randomness([1u8; 32])
-            .build();
+        let result = CommitmentBuilder::new().randomness([1u8; 32]).build();
 
         assert!(result.is_err());
     }

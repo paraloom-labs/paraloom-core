@@ -167,7 +167,9 @@ impl ShieldedPool {
 
         // For now, we can't easily get the index without storing it
         // This is a simplification - production would track indices
-        Err(anyhow!("Path retrieval not implemented - requires index tracking"))
+        Err(anyhow!(
+            "Path retrieval not implemented - requires index tracking"
+        ))
     }
 
     /// Check if a nullifier has been spent

@@ -45,10 +45,7 @@ impl CircuitMetrics {
 }
 
 /// Benchmark a circuit and return metrics
-pub fn benchmark_circuit<C>(
-    circuit: C,
-    name: &str,
-) -> CircuitMetrics
+pub fn benchmark_circuit<C>(circuit: C, name: &str) -> CircuitMetrics
 where
     C: ark_relations::r1cs::ConstraintSynthesizer<Fr>,
 {
@@ -58,7 +55,9 @@ where
 
     // Measure constraint generation time
     let start = Instant::now();
-    circuit.generate_constraints(cs.clone()).expect("Constraint generation failed");
+    circuit
+        .generate_constraints(cs.clone())
+        .expect("Constraint generation failed");
     let constraint_gen_time_ms = start.elapsed().as_millis();
 
     // Get circuit statistics
@@ -82,7 +81,10 @@ where
     println!("Variables: {}", num_variables);
     println!("Public inputs: {}", num_public_inputs);
     println!("Constraint gen time: {} ms", constraint_gen_time_ms);
-    println!("Est. proof time (modern CPU): {} ms", estimated_proof_time_ms);
+    println!(
+        "Est. proof time (modern CPU): {} ms",
+        estimated_proof_time_ms
+    );
     println!("Est. proof time (Pi 4): {} ms", estimated_pi4_time_ms);
 
     metrics
@@ -93,12 +95,7 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
     println!("\nCIRCUIT COMPLEXITY ANALYSIS");
 
     // Benchmark Deposit circuit
-    let deposit_circuit = DepositCircuit::with_witness(
-        [1u8; 32],
-        1000,
-        [2u8; 32],
-        [3u8; 32],
-    );
+    let deposit_circuit = DepositCircuit::with_witness([1u8; 32], 1000, [2u8; 32], [3u8; 32]);
     let deposit_metrics = benchmark_circuit(deposit_circuit, "DepositCircuit");
 
     // Benchmark Transfer circuit (1-in-1-out)
@@ -113,7 +110,8 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
         vec![[6u8; 32]],
         vec![[7u8; 32]],
     );
-    let transfer_1x1_metrics = benchmark_circuit(transfer_circuit_1x1, "TransferCircuit (1-in-1-out)");
+    let transfer_1x1_metrics =
+        benchmark_circuit(transfer_circuit_1x1, "TransferCircuit (1-in-1-out)");
 
     // Benchmark Transfer circuit (2-in-2-out) - max complexity
     let transfer_circuit_2x2 = TransferCircuit::with_witness(
@@ -130,7 +128,8 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
         vec![[12u8; 32], [13u8; 32]],
         vec![[14u8; 32], [15u8; 32]],
     );
-    let transfer_2x2_metrics = benchmark_circuit(transfer_circuit_2x2, "TransferCircuit (2-in-2-out)");
+    let transfer_2x2_metrics =
+        benchmark_circuit(transfer_circuit_2x2, "TransferCircuit (2-in-2-out)");
 
     // Benchmark Withdraw circuit
     let withdraw_circuit = WithdrawCircuit::with_witness(
@@ -172,13 +171,28 @@ impl BenchmarkSuite {
         println!("Withdraw:       {:>8}", self.withdraw.num_constraints);
 
         println!("\nEstimated Proof Time on Raspberry Pi 4:");
-        println!("Deposit:        {:>8} ms", self.deposit.estimated_pi4_time_ms);
-        println!("Transfer (1x1): {:>8} ms", self.transfer_1x1.estimated_pi4_time_ms);
-        println!("Transfer (2x2): {:>8} ms", self.transfer_2x2.estimated_pi4_time_ms);
-        println!("Withdraw:       {:>8} ms", self.withdraw.estimated_pi4_time_ms);
+        println!(
+            "Deposit:        {:>8} ms",
+            self.deposit.estimated_pi4_time_ms
+        );
+        println!(
+            "Transfer (1x1): {:>8} ms",
+            self.transfer_1x1.estimated_pi4_time_ms
+        );
+        println!(
+            "Transfer (2x2): {:>8} ms",
+            self.transfer_2x2.estimated_pi4_time_ms
+        );
+        println!(
+            "Withdraw:       {:>8} ms",
+            self.withdraw.estimated_pi4_time_ms
+        );
 
         // Check if any circuit exceeds 10 second target on Pi 4
-        let max_time = self.transfer_2x2.estimated_pi4_time_ms.max(self.withdraw.estimated_pi4_time_ms);
+        let max_time = self
+            .transfer_2x2
+            .estimated_pi4_time_ms
+            .max(self.withdraw.estimated_pi4_time_ms);
         println!("\nTarget: <10,000 ms on Pi 4");
         if max_time < 10_000 {
             println!("All circuits meet target!");
@@ -203,12 +217,7 @@ mod tests {
 
     #[test]
     fn test_benchmark_deposit_circuit() {
-        let circuit = DepositCircuit::with_witness(
-            [1u8; 32],
-            1000,
-            [2u8; 32],
-            [3u8; 32],
-        );
+        let circuit = DepositCircuit::with_witness([1u8; 32], 1000, [2u8; 32], [3u8; 32]);
 
         let metrics = benchmark_circuit(circuit, "DepositCircuit");
 

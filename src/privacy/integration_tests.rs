@@ -4,9 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::privacy::{
-        pedersen, DepositTx, Note, Nullifier, ShieldedAddress, ShieldedPool,
-    };
+    use crate::privacy::{pedersen, DepositTx, Note, Nullifier, ShieldedAddress, ShieldedPool};
 
     /// Test full deposit flow: User deposits → Commitment added to pool
     #[tokio::test]
@@ -104,7 +102,11 @@ mod tests {
         let alice_change_randomness = pedersen::generate_randomness();
 
         let bob_note = Note::new(bob_address.clone(), transfer_amount, bob_randomness);
-        let alice_change_note = Note::new(alice_address.clone(), change_amount, alice_change_randomness);
+        let alice_change_note = Note::new(
+            alice_address.clone(),
+            change_amount,
+            alice_change_randomness,
+        );
 
         println!(
             "Transfer: {} to Bob, {} change to Alice",
@@ -113,12 +115,19 @@ mod tests {
 
         // Process transfer
         let result = pool
-            .transfer(vec![input_nullifier.clone()], vec![bob_note, alice_change_note])
+            .transfer(
+                vec![input_nullifier.clone()],
+                vec![bob_note, alice_change_note],
+            )
             .await;
 
         assert!(result.is_ok(), "Transfer should succeed");
         let output_commitments = result.unwrap();
-        assert_eq!(output_commitments.len(), 2, "Should have 2 output commitments");
+        assert_eq!(
+            output_commitments.len(),
+            2,
+            "Should have 2 output commitments"
+        );
 
         // Verify pool state
         assert_eq!(pool.commitment_count().await, 3); // 1 input + 2 outputs
@@ -130,10 +139,7 @@ mod tests {
 
         // Verify nullifier was spent
         let nullifiers_spent = pool.spent_count().await;
-        assert_eq!(
-            nullifiers_spent, 1,
-            "Should have 1 spent nullifier"
-        );
+        assert_eq!(nullifiers_spent, 1, "Should have 1 spent nullifier");
 
         println!("Transfer successful");
         println!("   Outputs: {}", output_commitments.len());
@@ -152,10 +158,18 @@ mod tests {
         let initial_amount = 1000u64;
         let randomness = pedersen::generate_randomness();
 
-        let deposit = DepositTx::new(vec![0x42; 32], initial_amount, owner_address.clone(), randomness, 10);
+        let deposit = DepositTx::new(
+            vec![0x42; 32],
+            initial_amount,
+            owner_address.clone(),
+            randomness,
+            10,
+        );
 
         let note = deposit.output_note.clone();
-        pool.deposit(note.clone(), initial_amount - 10).await.unwrap();
+        pool.deposit(note.clone(), initial_amount - 10)
+            .await
+            .unwrap();
 
         println!("Setup: Deposited {} tokens", initial_amount - 10);
 
@@ -171,7 +185,9 @@ mod tests {
 
         // Process withdrawal
         let recipient_address = [0x99u8; 32]; // Solana address to receive funds
-        let result = pool.withdraw(nullifier.clone(), withdraw_amount + fee, &recipient_address).await;
+        let result = pool
+            .withdraw(nullifier.clone(), withdraw_amount + fee, &recipient_address)
+            .await;
         assert!(result.is_ok(), "Withdrawal should succeed");
 
         // Verify state
@@ -229,9 +245,12 @@ mod tests {
         let bob_note = Note::new(bob_address.clone(), 300, bob_randomness);
         let alice_change_note = Note::new(alice_address.clone(), 680, alice_change_randomness);
 
-        pool.transfer(vec![alice_nullifier], vec![bob_note.clone(), alice_change_note.clone()])
-            .await
-            .unwrap();
+        pool.transfer(
+            vec![alice_nullifier],
+            vec![bob_note.clone(), alice_change_note.clone()],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(pool.commitment_count().await, 3);
         assert_eq!(pool.total_supply().await, 990);
@@ -249,9 +268,12 @@ mod tests {
         let charlie_note = Note::new(charlie_address.clone(), 100, charlie_randomness);
         let bob_change_note = Note::new(bob_address.clone(), 190, bob_change_randomness);
 
-        pool.transfer(vec![bob_nullifier], vec![charlie_note.clone(), bob_change_note.clone()])
-            .await
-            .unwrap();
+        pool.transfer(
+            vec![bob_nullifier],
+            vec![charlie_note.clone(), bob_change_note.clone()],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(pool.commitment_count().await, 5);
         assert_eq!(pool.total_supply().await, 990);
@@ -264,7 +286,9 @@ mod tests {
             Nullifier::derive(&alice_change_note.commitment(), &alice_change_randomness);
 
         let alice_public_address = [0xAAu8; 32]; // Alice's Solana address
-        pool.withdraw(alice_change_nullifier, 510, &alice_public_address).await.unwrap();
+        pool.withdraw(alice_change_nullifier, 510, &alice_public_address)
+            .await
+            .unwrap();
 
         assert_eq!(pool.commitment_count().await, 5);
         let final_supply = pool.total_supply().await;
@@ -305,13 +329,17 @@ mod tests {
         let nullifier = Nullifier::derive(&note.commitment(), &randomness);
         let output_note = Note::new(address.clone(), 990, pedersen::generate_randomness());
 
-        let result = pool.transfer(vec![nullifier.clone()], vec![output_note]).await;
+        let result = pool
+            .transfer(vec![nullifier.clone()], vec![output_note])
+            .await;
         assert!(result.is_ok(), "First spend should succeed");
         println!("First spend succeeded");
 
         // Try to spend again - should fail
         let output_note2 = Note::new(address.clone(), 990, pedersen::generate_randomness());
-        let result2 = pool.transfer(vec![nullifier.clone()], vec![output_note2]).await;
+        let result2 = pool
+            .transfer(vec![nullifier.clone()], vec![output_note2])
+            .await;
 
         assert!(result2.is_err(), "Double-spend should be prevented!");
         println!("Double-spend prevented: {:?}", result2.err());

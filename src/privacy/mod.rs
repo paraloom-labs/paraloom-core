@@ -10,9 +10,9 @@ pub mod batch;
 pub mod circuit_benchmark;
 pub mod circuits;
 
+pub mod commitment;
 #[cfg(test)]
 mod integration_tests;
-pub mod commitment;
 pub mod merkle;
 pub mod nullifier;
 pub mod pedersen;
@@ -30,10 +30,10 @@ pub use circuits::{
 };
 pub use commitment::{CommitmentBuilder, CommitmentGenerator};
 pub use merkle::MerkleTree;
-pub use sparse_merkle::{MemoryStats, SparseMerkleTree, SPARSE_TREE_DEPTH};
 pub use nullifier::NullifierSet;
 pub use pool::ShieldedPool;
 pub use proof::{ProofVerifier, VerificationChunk, VerificationResult};
+pub use sparse_merkle::{MemoryStats, SparseMerkleTree, SPARSE_TREE_DEPTH};
 pub use transaction::{DepositTx, ShieldedTransaction, TrackedTransaction, TransferTx, WithdrawTx};
 pub use types::{Commitment, MerklePath, Note, Nullifier, ShieldedAddress, ViewingKey};
 pub use verification::{

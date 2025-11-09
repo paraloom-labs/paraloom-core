@@ -11,12 +11,10 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::{
-    alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar, uint8::UInt8,
-    ToBitsGadget, ToBytesGadget,
+    alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar, uint8::UInt8, ToBitsGadget,
+    ToBytesGadget,
 };
-use ark_relations::r1cs::{
-    ConstraintSynthesizer, ConstraintSystemRef, SynthesisError,
-};
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
@@ -106,26 +104,18 @@ impl TransferCircuit {
 impl ConstraintSynthesizer<Fr> for TransferCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Allocate public inputs
-        let merkle_root_var = UInt8::new_input_vec(
-            cs.clone(),
-            &self.merkle_root.unwrap_or([0u8; 32]),
-        )?;
+        let merkle_root_var =
+            UInt8::new_input_vec(cs.clone(), &self.merkle_root.unwrap_or([0u8; 32]))?;
 
         let mut nullifier_vars = Vec::new();
         for nullifier in &self.nullifiers {
-            let null_var = UInt8::new_input_vec(
-                cs.clone(),
-                &nullifier.unwrap_or([0u8; 32]),
-            )?;
+            let null_var = UInt8::new_input_vec(cs.clone(), &nullifier.unwrap_or([0u8; 32]))?;
             nullifier_vars.push(null_var);
         }
 
         let mut output_commitment_vars = Vec::new();
         for commitment in &self.output_commitments {
-            let comm_var = UInt8::new_input_vec(
-                cs.clone(),
-                &commitment.unwrap_or([0u8; 32]),
-            )?;
+            let comm_var = UInt8::new_input_vec(cs.clone(), &commitment.unwrap_or([0u8; 32]))?;
             output_commitment_vars.push(comm_var);
         }
 
@@ -133,47 +123,34 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         let mut input_value_vars = Vec::new();
         for value in &self.input_values {
             let val_var = FpVar::new_witness(cs.clone(), || {
-                value
-                    .map(Fr::from)
-                    .ok_or(SynthesisError::AssignmentMissing)
+                value.map(Fr::from).ok_or(SynthesisError::AssignmentMissing)
             })?;
             input_value_vars.push(val_var);
         }
 
         let mut input_randomness_vars = Vec::new();
         for randomness in &self.input_randomness {
-            let rand_var = UInt8::new_witness_vec(
-                cs.clone(),
-                &randomness.unwrap_or([0u8; 32]),
-            )?;
+            let rand_var = UInt8::new_witness_vec(cs.clone(), &randomness.unwrap_or([0u8; 32]))?;
             input_randomness_vars.push(rand_var);
         }
 
         let mut output_value_vars = Vec::new();
         for value in &self.output_values {
             let val_var = FpVar::new_witness(cs.clone(), || {
-                value
-                    .map(Fr::from)
-                    .ok_or(SynthesisError::AssignmentMissing)
+                value.map(Fr::from).ok_or(SynthesisError::AssignmentMissing)
             })?;
             output_value_vars.push(val_var);
         }
 
         let mut output_randomness_vars = Vec::new();
         for randomness in &self.output_randomness {
-            let rand_var = UInt8::new_witness_vec(
-                cs.clone(),
-                &randomness.unwrap_or([0u8; 32]),
-            )?;
+            let rand_var = UInt8::new_witness_vec(cs.clone(), &randomness.unwrap_or([0u8; 32]))?;
             output_randomness_vars.push(rand_var);
         }
 
         let mut recipient_address_vars = Vec::new();
         for address in &self.recipient_addresses {
-            let addr_var = UInt8::new_witness_vec(
-                cs.clone(),
-                &address.unwrap_or([0u8; 32]),
-            )?;
+            let addr_var = UInt8::new_witness_vec(cs.clone(), &address.unwrap_or([0u8; 32]))?;
             recipient_address_vars.push(addr_var);
         }
 
@@ -372,10 +349,8 @@ impl Default for DepositCircuit {
 impl ConstraintSynthesizer<Fr> for DepositCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public input: output commitment
-        let commitment_var = UInt8::new_input_vec(
-            cs.clone(),
-            &self.output_commitment.unwrap_or([0u8; 32]),
-        )?;
+        let commitment_var =
+            UInt8::new_input_vec(cs.clone(), &self.output_commitment.unwrap_or([0u8; 32]))?;
 
         // Private witness
         let value_var = FpVar::new_witness(cs.clone(), || {
@@ -384,15 +359,11 @@ impl ConstraintSynthesizer<Fr> for DepositCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        let randomness_var = UInt8::new_witness_vec(
-            cs.clone(),
-            &self.randomness.unwrap_or([0u8; 32]),
-        )?;
+        let randomness_var =
+            UInt8::new_witness_vec(cs.clone(), &self.randomness.unwrap_or([0u8; 32]))?;
 
-        let recipient_var = UInt8::new_witness_vec(
-            cs.clone(),
-            &self.recipient.unwrap_or([0u8; 32]),
-        )?;
+        let recipient_var =
+            UInt8::new_witness_vec(cs.clone(), &self.recipient.unwrap_or([0u8; 32]))?;
 
         // Constraint: Verify commitment is correctly computed
         let mut commitment_data = Vec::new();
@@ -459,15 +430,10 @@ impl Default for WithdrawCircuit {
 impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public inputs
-        let merkle_root_var = UInt8::new_input_vec(
-            cs.clone(),
-            &self.merkle_root.unwrap_or([0u8; 32]),
-        )?;
+        let merkle_root_var =
+            UInt8::new_input_vec(cs.clone(), &self.merkle_root.unwrap_or([0u8; 32]))?;
 
-        let nullifier_var = UInt8::new_input_vec(
-            cs.clone(),
-            &self.nullifier.unwrap_or([0u8; 32]),
-        )?;
+        let nullifier_var = UInt8::new_input_vec(cs.clone(), &self.nullifier.unwrap_or([0u8; 32]))?;
 
         let withdraw_amount_var = FpVar::new_input(cs.clone(), || {
             self.withdraw_amount
@@ -482,10 +448,8 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        let input_randomness_var = UInt8::new_witness_vec(
-            cs.clone(),
-            &self.input_randomness.unwrap_or([0u8; 32]),
-        )?;
+        let input_randomness_var =
+            UInt8::new_witness_vec(cs.clone(), &self.input_randomness.unwrap_or([0u8; 32]))?;
 
         // Constraint 1: Verify input value >= withdraw amount
         // input_value - withdraw_amount >= 0
@@ -614,7 +578,11 @@ mod tests {
 
         // Should synthesize without errors
         let result = circuit.generate_constraints(cs.clone());
-        assert!(result.is_ok(), "Circuit synthesis failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Circuit synthesis failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -628,7 +596,11 @@ mod tests {
         let cs = ConstraintSystem::<Fr>::new_ref();
 
         let result = circuit.generate_constraints(cs);
-        assert!(result.is_ok(), "Deposit circuit synthesis failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Deposit circuit synthesis failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -651,7 +623,11 @@ mod tests {
         let cs = ConstraintSystem::<Fr>::new_ref();
 
         let result = circuit.generate_constraints(cs);
-        assert!(result.is_ok(), "Withdraw circuit synthesis failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Withdraw circuit synthesis failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]

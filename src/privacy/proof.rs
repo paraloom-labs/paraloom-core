@@ -39,14 +39,10 @@ pub enum VerificationChunk {
     },
 
     /// Verify output commitments are well-formed
-    OutputCommitments {
-        commitments: Vec<Commitment>,
-    },
+    OutputCommitments { commitments: Vec<Commitment> },
 
     /// Verify nullifiers are unique
-    NullifierUniqueness {
-        nullifiers: Vec<Nullifier>,
-    },
+    NullifierUniqueness { nullifiers: Vec<Nullifier> },
 
     /// Verify Merkle proof
     MerkleProof {
@@ -250,14 +246,9 @@ mod tests {
 
     #[test]
     fn test_output_commitments_chunk() {
-        let commitments = vec![
-            Commitment([1u8; 32]),
-            Commitment([2u8; 32]),
-        ];
+        let commitments = vec![Commitment([1u8; 32]), Commitment([2u8; 32])];
 
-        let chunk = VerificationChunk::OutputCommitments {
-            commitments,
-        };
+        let chunk = VerificationChunk::OutputCommitments { commitments };
 
         assert!(chunk.verify().is_valid());
     }
@@ -282,10 +273,7 @@ mod tests {
 
     #[test]
     fn test_nullifier_uniqueness() {
-        let nullifiers = vec![
-            Nullifier([1u8; 32]),
-            Nullifier([2u8; 32]),
-        ];
+        let nullifiers = vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])];
 
         let chunk = VerificationChunk::NullifierUniqueness { nullifiers };
 
@@ -309,12 +297,7 @@ mod tests {
         let nullifiers = vec![Nullifier([1u8; 32])];
         let note = Note::new(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
 
-        let tx = TransferTx::new(
-            nullifiers,
-            vec![note],
-            [0u8; 32],
-            10,
-        );
+        let tx = TransferTx::new(nullifiers, vec![note], [0u8; 32], 10);
 
         let chunks = ProofVerifier::create_verification_chunks(&tx);
 

@@ -282,8 +282,14 @@ mod tests {
 
         let mut r1 = [0u8; 32];
         let mut r2 = [0u8; 32];
-        r1_scalar.into_bigint().serialize_compressed(&mut r1[..]).unwrap();
-        r2_scalar.into_bigint().serialize_compressed(&mut r2[..]).unwrap();
+        r1_scalar
+            .into_bigint()
+            .serialize_compressed(&mut r1[..])
+            .unwrap();
+        r2_scalar
+            .into_bigint()
+            .serialize_compressed(&mut r2[..])
+            .unwrap();
 
         let c1_point = {
             let v_scalar = Fr::from(v1);
@@ -304,7 +310,10 @@ mod tests {
         let v_sum = v1 + v2;
         let r_sum_scalar = r1_scalar + r2_scalar;
         let mut r_sum = [0u8; 32];
-        r_sum_scalar.into_bigint().serialize_compressed(&mut r_sum[..]).unwrap();
+        r_sum_scalar
+            .into_bigint()
+            .serialize_compressed(&mut r_sum[..])
+            .unwrap();
 
         let c_sum_point = {
             let v_scalar = Fr::from(v_sum);

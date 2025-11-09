@@ -236,8 +236,16 @@ async fn test_nullifier_set_integration() {
     assert!(!nullifier_set.insert(nullifier1.clone()).await);
 
     // Batch check
-    assert!(nullifier_set.check_batch(std::slice::from_ref(&nullifier2)).await);
-    assert!(!nullifier_set.check_batch(std::slice::from_ref(&nullifier1)).await);
+    assert!(
+        nullifier_set
+            .check_batch(std::slice::from_ref(&nullifier2))
+            .await
+    );
+    assert!(
+        !nullifier_set
+            .check_batch(std::slice::from_ref(&nullifier1))
+            .await
+    );
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@
 //! This is especially important for Raspberry Pi validators.
 
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_groth16::{Proof, PreparedVerifyingKey, VerifyingKey};
+use ark_groth16::{PreparedVerifyingKey, Proof, VerifyingKey};
 use ark_relations::r1cs::SynthesisError;
 use ark_snark::SNARK;
 

@@ -90,16 +90,17 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // Process transaction if privacy is enabled
                 if let Some(pool) = &self.shielded_pool {
                     match transaction {
-                        crate::privacy::transaction::ShieldedTransaction::Deposit(tx) => {
-                            match pool.deposit(tx.output_note.clone(), tx.amount - tx.fee).await {
-                                Ok(commitment) => {
-                                    info!("Deposit successful: commitment={}", commitment.to_hex());
-                                }
-                                Err(e) => {
-                                    info!("Deposit failed: {}", e);
-                                }
+                        crate::privacy::transaction::ShieldedTransaction::Deposit(tx) => match pool
+                            .deposit(tx.output_note.clone(), tx.amount - tx.fee)
+                            .await
+                        {
+                            Ok(commitment) => {
+                                info!("Deposit successful: commitment={}", commitment.to_hex());
                             }
-                        }
+                            Err(e) => {
+                                info!("Deposit failed: {}", e);
+                            }
+                        },
                         crate::privacy::transaction::ShieldedTransaction::Transfer(tx) => {
                             match pool
                                 .transfer(tx.input_nullifiers.clone(), tx.output_notes.clone())
@@ -114,7 +115,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                             }
                         }
                         crate::privacy::transaction::ShieldedTransaction::Withdraw(tx) => {
-                            match pool.withdraw(tx.input_nullifier.clone(), tx.amount, &tx.to_public).await {
+                            match pool
+                                .withdraw(tx.input_nullifier.clone(), tx.amount, &tx.to_public)
+                                .await
+                            {
                                 Ok(()) => {
                                     info!("Withdrawal successful: {} lamports", tx.amount);
                                 }

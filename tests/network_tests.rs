@@ -1,5 +1,5 @@
 use paraloom::network::{Message, ResultRequest, ResultResponse};
-use paraloom::task::{Task, TaskResult, TaskType, ResultData};
+use paraloom::task::{ResultData, Task, TaskResult, TaskType};
 use paraloom::types::{NodeId, NodeInfo, NodeType, ResourceContribution};
 
 #[test]
@@ -34,7 +34,10 @@ fn test_task_request_message() {
     let deserialized: Message = bincode::deserialize(&serialized).unwrap();
 
     match deserialized {
-        Message::TaskRequest { task: t, coordinator_id } => {
+        Message::TaskRequest {
+            task: t,
+            coordinator_id,
+        } => {
             assert_eq!(t.id, task.id);
             assert_eq!(coordinator_id, NodeId(b"coordinator-1".to_vec()));
         }

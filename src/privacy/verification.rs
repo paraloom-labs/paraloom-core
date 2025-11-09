@@ -249,7 +249,10 @@ impl VerificationCoordinator {
     }
 
     /// Check if transaction has reached consensus
-    pub async fn check_consensus(&self, transaction_id: &str) -> Result<Option<VerificationResult>> {
+    pub async fn check_consensus(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<VerificationResult>> {
         let aggregators = self.aggregators.read().await;
         let aggregator = aggregators
             .get(transaction_id)
@@ -367,12 +370,8 @@ mod tests {
     async fn test_coordinator_register_validators() {
         let coordinator = VerificationCoordinator::new();
 
-        coordinator
-            .register_validator(NodeId(vec![1]))
-            .await;
-        coordinator
-            .register_validator(NodeId(vec![2]))
-            .await;
+        coordinator.register_validator(NodeId(vec![1])).await;
+        coordinator.register_validator(NodeId(vec![2])).await;
 
         let validators = coordinator.validators.read().await;
         assert_eq!(validators.len(), 2);
@@ -384,9 +383,7 @@ mod tests {
 
         // Register validators
         for i in 0..10 {
-            coordinator
-                .register_validator(NodeId(vec![i]))
-                .await;
+            coordinator.register_validator(NodeId(vec![i])).await;
         }
 
         // Create transfer transaction

@@ -169,16 +169,25 @@ mod tests {
         let nullifier3 = Nullifier([3u8; 32]);
 
         // All new - should pass
-        assert!(set.check_batch(&[nullifier1.clone(), nullifier2.clone()]).await);
+        assert!(
+            set.check_batch(&[nullifier1.clone(), nullifier2.clone()])
+                .await
+        );
 
         // Insert one
         set.insert(nullifier1.clone()).await;
 
         // Batch with spent nullifier - should fail
-        assert!(!set.check_batch(&[nullifier1.clone(), nullifier3.clone()]).await);
+        assert!(
+            !set.check_batch(&[nullifier1.clone(), nullifier3.clone()])
+                .await
+        );
 
         // Batch with only new nullifiers - should pass
-        assert!(set.check_batch(&[nullifier2.clone(), nullifier3.clone()]).await);
+        assert!(
+            set.check_batch(&[nullifier2.clone(), nullifier3.clone()])
+                .await
+        );
     }
 
     #[tokio::test]
