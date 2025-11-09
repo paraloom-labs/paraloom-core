@@ -7,7 +7,11 @@
 //! - Merkle tree for commitment tracking
 
 pub mod batch;
+pub mod circuit_benchmark;
 pub mod circuits;
+
+#[cfg(test)]
+mod integration_tests;
 pub mod commitment;
 pub mod merkle;
 pub mod nullifier;
