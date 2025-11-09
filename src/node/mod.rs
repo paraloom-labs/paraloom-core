@@ -9,7 +9,10 @@ use tokio::sync::Mutex;
 use crate::config::Settings;
 use crate::coordinator::Coordinator;
 use crate::network::{Message, NetworkManager, ResultRequest, ResultResponse};
+use crate::privacy::pool::ShieldedPool;
+use crate::privacy::verification::VerificationCoordinator;
 use crate::resource::ResourceMonitor;
+use crate::storage::PrivacyStorage;
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
 
@@ -22,6 +25,10 @@ pub struct Node {
     resource_monitor: Arc<ResourceMonitor>,
     coordinator: Option<Arc<Coordinator>>,
     validator: Option<Arc<Mutex<Validator>>>,
+    // Privacy layer
+    privacy_storage: Option<Arc<PrivacyStorage>>,
+    shielded_pool: Option<Arc<ShieldedPool>>,
+    verification_coordinator: Option<Arc<VerificationCoordinator>>,
 }
 
 #[async_trait]
@@ -74,6 +81,165 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 if let Some(coordinator) = &self.coordinator {
                     coordinator.handle_task_error(task_id, error).await?;
                 }
+            }
+
+            // Privacy-related messages
+            Message::ShieldedTransaction { transaction } => {
+                info!("Received shielded transaction: {}", transaction.id());
+
+                // Process transaction if privacy is enabled
+                if let Some(pool) = &self.shielded_pool {
+                    match transaction {
+                        crate::privacy::transaction::ShieldedTransaction::Deposit(tx) => match pool
+                            .deposit(tx.output_note.clone(), tx.amount - tx.fee)
+                            .await
+                        {
+                            Ok(commitment) => {
+                                info!("Deposit successful: commitment={}", commitment.to_hex());
+                            }
+                            Err(e) => {
+                                info!("Deposit failed: {}", e);
+                            }
+                        },
+                        crate::privacy::transaction::ShieldedTransaction::Transfer(tx) => {
+                            match pool
+                                .transfer(tx.input_nullifiers.clone(), tx.output_notes.clone())
+                                .await
+                            {
+                                Ok(commitments) => {
+                                    info!("Transfer successful: {} outputs", commitments.len());
+                                }
+                                Err(e) => {
+                                    info!("Transfer failed: {}", e);
+                                }
+                            }
+                        }
+                        crate::privacy::transaction::ShieldedTransaction::Withdraw(tx) => {
+                            match pool
+                                .withdraw(tx.input_nullifier.clone(), tx.amount, &tx.to_public)
+                                .await
+                            {
+                                Ok(()) => {
+                                    info!("Withdrawal successful: {} lamports", tx.amount);
+                                }
+                                Err(e) => {
+                                    info!("Withdrawal failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    info!("Privacy not enabled, ignoring transaction");
+                }
+            }
+            Message::VerificationRequest {
+                task_id,
+                transaction_id,
+                chunk,
+            } => {
+                info!(
+                    "Received verification request: task={}, tx={}",
+                    task_id, transaction_id
+                );
+
+                // Verify chunk and send result
+                let result = chunk.verify();
+
+                let response = Message::VerificationResult {
+                    task_id,
+                    validator_id: self.node_info.id.clone(),
+                    result,
+                };
+
+                // Send result back to source
+                if let Err(e) = self.network.send_message(source.clone(), response).await {
+                    info!("Failed to send verification result: {}", e);
+                }
+            }
+            Message::VerificationResult {
+                task_id,
+                validator_id,
+                result,
+            } => {
+                info!(
+                    "Received verification result: task={}, validator={:?}",
+                    task_id, validator_id
+                );
+
+                // Aggregate verification result if coordinator is enabled
+                if let Some(coord) = &self.verification_coordinator {
+                    let task_result = crate::privacy::verification::VerificationTaskResult {
+                        task_id,
+                        validator: validator_id,
+                        result,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    };
+
+                    if let Err(e) = coord.submit_result(task_result).await {
+                        info!("Failed to submit verification result: {}", e);
+                    }
+                }
+            }
+            Message::PoolStateQuery => {
+                info!("Received pool state query from {}", source);
+
+                if let Some(pool) = &self.shielded_pool {
+                    let merkle_root = pool.root().await;
+                    let total_supply = pool.total_supply().await;
+                    let commitment_count = pool.commitment_count().await;
+
+                    let response = Message::PoolStateResponse {
+                        merkle_root,
+                        total_supply,
+                        commitment_count,
+                    };
+
+                    if let Err(e) = self.network.send_message(source.clone(), response).await {
+                        info!("Failed to send pool state response: {}", e);
+                    }
+                } else {
+                    info!("Privacy not enabled, cannot respond to pool state query");
+                }
+            }
+            Message::PoolStateResponse {
+                merkle_root,
+                total_supply,
+                commitment_count,
+            } => {
+                info!(
+                    "Received pool state: root={:?}, supply={}, commitments={}",
+                    merkle_root, total_supply, commitment_count
+                );
+            }
+            Message::NullifierQuery { nullifier } => {
+                info!("Received nullifier query: {:?}", nullifier);
+
+                if let Some(pool) = &self.shielded_pool {
+                    let is_spent = pool.is_spent(&nullifier).await;
+
+                    let response = Message::NullifierResponse {
+                        nullifier,
+                        is_spent,
+                    };
+
+                    if let Err(e) = self.network.send_message(source.clone(), response).await {
+                        info!("Failed to send nullifier response: {}", e);
+                    }
+                } else {
+                    info!("Privacy not enabled, cannot respond to nullifier query");
+                }
+            }
+            Message::NullifierResponse {
+                nullifier,
+                is_spent,
+            } => {
+                info!(
+                    "Received nullifier response: {:?}, spent={}",
+                    nullifier, is_spent
+                );
             }
         }
         Ok(())
@@ -158,6 +324,7 @@ impl Node {
             None
         };
 
+        // Privacy layer will be initialized in run() if enabled
         let node = Node {
             settings,
             network: network_arc,
@@ -166,6 +333,9 @@ impl Node {
             resource_monitor: Arc::new(resource_monitor),
             coordinator,
             validator,
+            privacy_storage: None,
+            shielded_pool: None,
+            verification_coordinator: None,
         };
 
         Ok(node)
@@ -299,6 +469,9 @@ impl Clone for Node {
             resource_monitor: self.resource_monitor.clone(),
             coordinator: self.coordinator.clone(),
             validator: self.validator.clone(),
+            privacy_storage: self.privacy_storage.clone(),
+            shielded_pool: self.shielded_pool.clone(),
+            verification_coordinator: self.verification_coordinator.clone(),
         }
     }
 }

@@ -1,4 +1,4 @@
-use paraloom::task::{Task, TaskResult, TaskStatus, TaskType, ResultData};
+use paraloom::task::{ResultData, Task, TaskResult, TaskStatus, TaskType};
 
 #[test]
 fn test_task_serialization() {
@@ -29,10 +29,7 @@ fn test_task_result_serialization() {
         task_id: "test-task-123".to_string(),
         execution_time_ms: 500,
         data: ResultData::Hashes {
-            hashes: vec![
-                (1, "hash1".to_string()),
-                (2, "hash2".to_string()),
-            ],
+            hashes: vec![(1, "hash1".to_string()), (2, "hash2".to_string())],
             count: 2,
         },
     };
@@ -49,7 +46,16 @@ fn test_task_result_serialization() {
     assert_eq!(result.execution_time_ms, deserialized.execution_time_ms);
 
     match (&result.data, &deserialized.data) {
-        (ResultData::Hashes { hashes: h1, count: c1 }, ResultData::Hashes { hashes: h2, count: c2 }) => {
+        (
+            ResultData::Hashes {
+                hashes: h1,
+                count: c1,
+            },
+            ResultData::Hashes {
+                hashes: h2,
+                count: c2,
+            },
+        ) => {
             assert_eq!(c1, c2);
             assert_eq!(h1.len(), h2.len());
             assert_eq!(h1, h2);
