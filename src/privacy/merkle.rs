@@ -5,6 +5,7 @@
 //! without revealing which one.
 
 use crate::privacy::types::{Commitment, MerklePath};
+use crate::storage::PrivacyStorage;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,21 +21,41 @@ pub struct MerkleTree {
     leaves: Arc<RwLock<Vec<[u8; 32]>>>,
     /// Cached root
     cached_root: Arc<RwLock<Option<[u8; 32]>>>,
+    /// Optional persistent storage
+    storage: Option<Arc<PrivacyStorage>>,
 }
 
 impl MerkleTree {
-    /// Create a new Merkle tree with default depth
+    /// Create a new Merkle tree with default depth (in-memory only)
     pub fn new() -> Self {
         Self::with_depth(DEFAULT_TREE_DEPTH)
     }
 
-    /// Create a new Merkle tree with specific depth
+    /// Create a new Merkle tree with specific depth (in-memory only)
     pub fn with_depth(depth: usize) -> Self {
         MerkleTree {
             depth,
             leaves: Arc::new(RwLock::new(Vec::new())),
             cached_root: Arc::new(RwLock::new(None)),
+            storage: None,
         }
+    }
+
+    /// Create a Merkle tree with persistent storage
+    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
+        // Load existing commitments from storage
+        let commitments = storage.get_all_commitments()?;
+        let leaves: Vec<[u8; 32]> = commitments.iter().map(|c| *c.as_bytes()).collect();
+
+        // Load cached root if available
+        let cached_root = storage.get_merkle_root()?;
+
+        Ok(MerkleTree {
+            depth: DEFAULT_TREE_DEPTH,
+            leaves: Arc::new(RwLock::new(leaves)),
+            cached_root: Arc::new(RwLock::new(cached_root)),
+            storage: Some(storage),
+        })
     }
 
     /// Insert a commitment as a leaf
@@ -43,6 +64,11 @@ impl MerkleTree {
         let mut leaves = self.leaves.write().await;
         let index = leaves.len();
         leaves.push(*commitment.as_bytes());
+
+        // Persist to storage if available
+        if let Some(storage) = &self.storage {
+            let _ = storage.insert_commitment(index as u64, commitment);
+        }
 
         // Invalidate cached root
         let mut cached_root = self.cached_root.write().await;
@@ -60,6 +86,11 @@ impl MerkleTree {
 
         for commitment in commitments {
             leaves.push(*commitment.as_bytes());
+        }
+
+        // Persist to storage if available
+        if let Some(storage) = &self.storage {
+            let _ = storage.insert_commitments_batch(start_index as u64, commitments);
         }
 
         // Invalidate cached root
@@ -86,6 +117,11 @@ impl MerkleTree {
         // Cache it
         let mut cached_root = self.cached_root.write().await;
         *cached_root = Some(root);
+
+        // Persist root to storage if available
+        if let Some(storage) = &self.storage {
+            let _ = storage.set_merkle_root(&root);
+        }
 
         root
     }
@@ -218,6 +254,7 @@ impl Clone for MerkleTree {
             depth: self.depth,
             leaves: Arc::clone(&self.leaves),
             cached_root: Arc::clone(&self.cached_root),
+            storage: self.storage.clone(),
         }
     }
 }

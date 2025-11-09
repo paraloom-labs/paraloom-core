@@ -4,6 +4,7 @@
 //! the note cannot be spent again. The nullifier set tracks all revealed nullifiers.
 
 use crate::privacy::types::Nullifier;
+use crate::storage::PrivacyStorage;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -12,14 +13,29 @@ use tokio::sync::RwLock;
 pub struct NullifierSet {
     /// The set of all nullifiers that have been revealed
     nullifiers: Arc<RwLock<HashSet<Nullifier>>>,
+    /// Optional persistent storage
+    storage: Option<Arc<PrivacyStorage>>,
 }
 
 impl NullifierSet {
-    /// Create a new empty nullifier set
+    /// Create a new empty nullifier set (in-memory only)
     pub fn new() -> Self {
         NullifierSet {
             nullifiers: Arc::new(RwLock::new(HashSet::new())),
+            storage: None,
         }
+    }
+
+    /// Create a nullifier set with persistent storage
+    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
+        // Load existing nullifiers from storage
+        let nullifiers_vec = storage.get_all_nullifiers()?;
+        let nullifiers_set: HashSet<Nullifier> = nullifiers_vec.into_iter().collect();
+
+        Ok(NullifierSet {
+            nullifiers: Arc::new(RwLock::new(nullifiers_set)),
+            storage: Some(storage),
+        })
     }
 
     /// Check if a nullifier has been revealed (spent)
@@ -32,7 +48,16 @@ impl NullifierSet {
     /// Returns true if successfully added, false if already exists
     pub async fn insert(&self, nullifier: Nullifier) -> bool {
         let mut set = self.nullifiers.write().await;
-        set.insert(nullifier)
+        let inserted = set.insert(nullifier.clone());
+
+        // Persist to storage if available and if newly inserted
+        if inserted {
+            if let Some(storage) = &self.storage {
+                let _ = storage.insert_nullifier(&nullifier);
+            }
+        }
+
+        inserted
     }
 
     /// Batch check multiple nullifiers
@@ -47,11 +72,22 @@ impl NullifierSet {
     pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> usize {
         let mut set = self.nullifiers.write().await;
         let mut count = 0;
+        let mut new_nullifiers = Vec::new();
+
         for nullifier in nullifiers {
-            if set.insert(nullifier) {
+            if set.insert(nullifier.clone()) {
                 count += 1;
+                new_nullifiers.push(nullifier);
             }
         }
+
+        // Persist to storage if available
+        if !new_nullifiers.is_empty() {
+            if let Some(storage) = &self.storage {
+                let _ = storage.insert_nullifiers_batch(&new_nullifiers);
+            }
+        }
+
         count
     }
 
@@ -85,6 +121,7 @@ impl Clone for NullifierSet {
     fn clone(&self) -> Self {
         NullifierSet {
             nullifiers: Arc::clone(&self.nullifiers),
+            storage: self.storage.clone(),
         }
     }
 }

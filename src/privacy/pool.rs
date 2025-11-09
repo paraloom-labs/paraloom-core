@@ -8,6 +8,7 @@
 use crate::privacy::merkle::MerkleTree;
 use crate::privacy::nullifier::NullifierSet;
 use crate::privacy::types::{Commitment, Note, Nullifier};
+use crate::storage::PrivacyStorage;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,17 +28,41 @@ pub struct ShieldedPool {
 
     /// Total shielded supply (in lamports)
     total_supply: Arc<RwLock<u64>>,
+
+    /// Optional persistent storage
+    storage: Option<Arc<PrivacyStorage>>,
 }
 
 impl ShieldedPool {
-    /// Create a new empty shielded pool
+    /// Create a new empty shielded pool (in-memory only)
     pub fn new() -> Self {
         ShieldedPool {
             commitment_tree: MerkleTree::new(),
             nullifier_set: NullifierSet::new(),
             notes: Arc::new(RwLock::new(HashMap::new())),
             total_supply: Arc::new(RwLock::new(0)),
+            storage: None,
         }
+    }
+
+    /// Create a shielded pool with persistent storage
+    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self> {
+        // Load Merkle tree from storage
+        let commitment_tree = MerkleTree::with_storage(storage.clone()).await?;
+
+        // Load nullifier set from storage
+        let nullifier_set = NullifierSet::with_storage(storage.clone()).await?;
+
+        // Load total supply from storage
+        let total_supply = storage.get_total_supply()?;
+
+        Ok(ShieldedPool {
+            commitment_tree,
+            nullifier_set,
+            notes: Arc::new(RwLock::new(HashMap::new())),
+            total_supply: Arc::new(RwLock::new(total_supply)),
+            storage: Some(storage),
+        })
     }
 
     /// Deposit funds into the shielded pool
@@ -46,7 +71,7 @@ impl ShieldedPool {
         // Create commitment
         let commitment = note.commitment();
 
-        // Add to commitment tree
+        // Add to commitment tree (auto-persists if storage available)
         let _index = self.commitment_tree.insert(&commitment).await;
 
         // Store note
@@ -56,6 +81,11 @@ impl ShieldedPool {
         // Update total supply
         let mut supply = self.total_supply.write().await;
         *supply += amount;
+
+        // Persist total supply to storage if available
+        if let Some(storage) = &self.storage {
+            storage.set_total_supply(*supply)?;
+        }
 
         Ok(commitment)
     }
@@ -72,7 +102,7 @@ impl ShieldedPool {
             return Err(anyhow!("Double-spend detected: nullifier already used"));
         }
 
-        // Add nullifiers to prevent future double-spending
+        // Add nullifiers to prevent future double-spending (auto-persists if storage available)
         self.nullifier_set.insert_batch(input_nullifiers).await;
 
         // Create output commitments
@@ -81,7 +111,7 @@ impl ShieldedPool {
 
         for note in output_notes {
             let commitment = note.commitment();
-            self.commitment_tree.insert(&commitment).await;
+            self.commitment_tree.insert(&commitment).await; // Auto-persists if storage available
             notes_map.insert(commitment.clone(), note);
             output_commitments.push(commitment);
         }
@@ -102,7 +132,7 @@ impl ShieldedPool {
             return Err(anyhow!("Double-spend: nullifier already used"));
         }
 
-        // Add nullifier
+        // Add nullifier (auto-persists if storage available)
         self.nullifier_set.insert(nullifier).await;
 
         // Decrease total supply
@@ -111,6 +141,11 @@ impl ShieldedPool {
             return Err(anyhow!("Insufficient shielded supply"));
         }
         *supply -= amount;
+
+        // Persist total supply to storage if available
+        if let Some(storage) = &self.storage {
+            storage.set_total_supply(*supply)?;
+        }
 
         Ok(())
     }
@@ -193,6 +228,7 @@ impl Clone for ShieldedPool {
             nullifier_set: self.nullifier_set.clone(),
             notes: Arc::clone(&self.notes),
             total_supply: Arc::clone(&self.total_supply),
+            storage: self.storage.clone(),
         }
     }
 }
