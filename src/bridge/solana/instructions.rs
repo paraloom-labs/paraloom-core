@@ -25,6 +25,7 @@ pub mod discriminators {
     pub const INITIALIZE: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237];
     pub const DEPOSIT: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
     pub const WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
+    pub const UPDATE_MERKLE_ROOT: [u8; 8] = [240, 174, 252, 99, 208, 105, 45, 104];
     #[allow(dead_code)]
     pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
     #[allow(dead_code)]
@@ -35,8 +36,23 @@ pub mod discriminators {
 pub fn create_initialize_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
+    initial_merkle_root: [u8; 32],
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+
+    #[derive(BorshSerialize)]
+    struct InitializeData {
+        initial_merkle_root: [u8; 32],
+    }
+
+    let data = InitializeData {
+        initial_merkle_root,
+    };
+
+    let mut instruction_data = discriminators::INITIALIZE.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
 
     let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
 
@@ -47,7 +63,7 @@ pub fn create_initialize_instruction(
             AccountMeta::new(*authority, true),
             AccountMeta::new_readonly(system_program_id, false),
         ],
-        data: discriminators::INITIALIZE.to_vec(),
+        data: instruction_data,
     })
 }
 
@@ -105,6 +121,7 @@ pub fn create_withdraw_instruction(
     proof: Vec<u8>,
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (nullifier_pda, _nullifier_bump) = derive_nullifier_account(program_id, &nullifier);
     let recipient_pubkey = Pubkey::new_from_array(recipient);
 
     let data = WithdrawInstructionData {
@@ -125,9 +142,40 @@ pub fn create_withdraw_instruction(
         accounts: vec![
             AccountMeta::new(bridge_state_pda, false),
             AccountMeta::new(*bridge_vault, false),
+            AccountMeta::new(nullifier_pda, false), // Nullifier account (will be created)
             AccountMeta::new(recipient_pubkey, false),
-            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(*authority, true),
             AccountMeta::new_readonly(system_program_id, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create update merkle root instruction
+pub fn create_update_merkle_root_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    new_merkle_root: [u8; 32],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+
+    #[derive(BorshSerialize)]
+    struct UpdateMerkleRootData {
+        new_merkle_root: [u8; 32],
+    }
+
+    let data = UpdateMerkleRootData { new_merkle_root };
+
+    let mut instruction_data = discriminators::UPDATE_MERKLE_ROOT.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(*authority, true),
         ],
         data: instruction_data,
     })
@@ -141,6 +189,11 @@ pub fn derive_bridge_vault(program_id: &Pubkey) -> (Pubkey, u8) {
 /// Derive bridge state PDA
 pub fn derive_bridge_state(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"bridge_state"], program_id)
+}
+
+/// Derive nullifier account PDA
+pub fn derive_nullifier_account(program_id: &Pubkey, nullifier: &[u8; 32]) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"nullifier", nullifier.as_ref()], program_id)
 }
 
 #[cfg(test)]
@@ -183,6 +236,23 @@ mod tests {
         assert!(ix.is_ok());
         let instruction = ix.unwrap();
         assert_eq!(instruction.program_id, program_id);
-        assert_eq!(instruction.accounts.len(), 5);
+        assert_eq!(instruction.accounts.len(), 6); // Updated: now includes nullifier account
+    }
+
+    #[test]
+    fn test_derive_nullifier_account() {
+        let program_id = Pubkey::new_unique();
+        let nullifier = [1u8; 32];
+
+        let (pda1, _) = derive_nullifier_account(&program_id, &nullifier);
+        let (pda2, _) = derive_nullifier_account(&program_id, &nullifier);
+
+        // Same nullifier should produce same PDA
+        assert_eq!(pda1, pda2);
+
+        // Different nullifier should produce different PDA
+        let different_nullifier = [2u8; 32];
+        let (pda3, _) = derive_nullifier_account(&program_id, &different_nullifier);
+        assert_ne!(pda1, pda3);
     }
 }

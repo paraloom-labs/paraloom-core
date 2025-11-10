@@ -42,10 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Insufficient balance. Need at least 0.001 SOL".into());
     }
 
-    // Create initialize instruction
+    // Create initialize instruction with initial merkle root
     println!("Creating initialize instruction...");
-    let ix = create_initialize_instruction(&program_id, &authority.pubkey())?;
-    println!("Instruction created\n");
+    // Initial merkle root is the empty tree root (all zeros for now)
+    // In production, this should come from a trusted setup
+    let initial_merkle_root = [0u8; 32];
+    let ix = create_initialize_instruction(&program_id, &authority.pubkey(), initial_merkle_root)?;
+    println!("Instruction created with initial merkle root: {:?}\n", &initial_merkle_root[..8]);
 
     // Get recent blockhash
     println!("Getting recent blockhash...");

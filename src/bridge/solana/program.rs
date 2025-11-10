@@ -195,6 +195,47 @@ impl ProgramInterface {
             .get_slot()
             .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get slot: {}", e)))
     }
+
+    /// Update Merkle root on Solana program
+    /// This should be called after processing deposits to sync the on-chain state
+    pub async fn update_merkle_root(&self, new_merkle_root: [u8; 32]) -> Result<String> {
+        log::info!("Updating merkle root to: {:?}", &new_merkle_root[..8]);
+
+        // Verify we have authority keypair
+        let authority = self.authority_keypair.as_ref().ok_or_else(|| {
+            BridgeError::ConfigError("No authority keypair configured".to_string())
+        })?;
+
+        // Create update merkle root instruction
+        let instruction = super::create_update_merkle_root_instruction(
+            &self.program_id,
+            &authority.pubkey(),
+            new_merkle_root,
+        )?;
+
+        // Get recent blockhash
+        let recent_blockhash = self
+            .rpc_client
+            .get_latest_blockhash()
+            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get blockhash: {}", e)))?;
+
+        // Create and sign transaction
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&authority.pubkey()),
+            &[authority],
+            recent_blockhash,
+        );
+
+        // Send transaction
+        let signature = self
+            .rpc_client
+            .send_and_confirm_transaction(&transaction)
+            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to send transaction: {}", e)))?;
+
+        log::info!("Merkle root updated successfully: {}", signature);
+        Ok(signature.to_string())
+    }
 }
 
 #[cfg(test)]

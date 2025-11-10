@@ -76,14 +76,83 @@ impl ResultSubmitter {
         Ok(signature)
     }
 
-    /// Verify withdrawal proof
+    /// Verify withdrawal proof with real zkSNARK verification
     async fn verify_withdrawal_proof(&self, request: &WithdrawalRequest) -> Result<()> {
+        use crate::privacy::{bytes_to_field, deserialize_proof, Groth16ProofSystem};
+        use ark_bls12_381::Fr;
+
         if request.proof.is_empty() {
             return Err(BridgeError::InvalidTransaction("Missing proof".to_string()));
         }
 
         log::debug!("Verifying withdrawal proof ({} bytes)", request.proof.len());
+
+        // Deserialize proof
+        let proof = deserialize_proof(&request.proof).map_err(|e| {
+            BridgeError::InvalidTransaction(format!("Failed to deserialize proof: {}", e))
+        })?;
+
+        // Get current Merkle root from pool
+        let merkle_root = self.pool.root().await;
+        let merkle_root_field = bytes_to_field(&merkle_root).map_err(|e| {
+            BridgeError::InvalidTransaction(format!("Invalid Merkle root: {}", e))
+        })?;
+
+        // Convert nullifier to field element
+        let nullifier_field = bytes_to_field(&request.nullifier).map_err(|e| {
+            BridgeError::InvalidTransaction(format!("Invalid nullifier: {}", e))
+        })?;
+
+        // Convert amount to field element
+        let amount_field = Fr::from(request.amount);
+
+        // Public inputs for verification
+        let public_inputs = vec![merkle_root_field, nullifier_field, amount_field];
+
+        // Load verifying key (for MVP, we'll use a test key)
+        // TODO: Load from config/storage in production
+        let vk = Self::load_withdraw_verifying_key()?;
+
+        // Verify proof
+        let valid = Groth16ProofSystem::verify(&vk, &public_inputs, &proof).map_err(|e| {
+            BridgeError::InvalidTransaction(format!("Proof verification error: {}", e))
+        })?;
+
+        if !valid {
+            return Err(BridgeError::InvalidTransaction(
+                "Proof verification failed".to_string(),
+            ));
+        }
+
+        log::info!("Withdrawal proof verified successfully");
         Ok(())
+    }
+
+    /// Load withdraw circuit verifying key
+    /// TODO: Move to config/storage management
+    fn load_withdraw_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bls12_381::Bls12_381>>
+    {
+        // For Phase 2.5, we'll generate keys on-the-fly
+        // In production, these should be loaded from trusted setup
+        use crate::privacy::{Groth16ProofSystem, WithdrawCircuit};
+        use ark_std::rand::rngs::StdRng;
+        use ark_std::rand::SeedableRng;
+
+        let mut rng = StdRng::seed_from_u64(0u64);
+        let circuit = WithdrawCircuit {
+            merkle_root: Some([0u8; 32]),
+            nullifier: Some([0u8; 32]),
+            withdraw_amount: Some(0u64),
+            input_value: Some(0u64),
+            input_randomness: Some([0u8; 32]),
+            input_path: None,
+        };
+
+        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).map_err(|e| {
+            BridgeError::InvalidTransaction(format!("Failed to setup circuit: {}", e))
+        })?;
+
+        Ok(vk)
     }
 
     /// Submit withdrawal transaction to Solana
