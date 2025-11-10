@@ -39,6 +39,16 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          sudo apt-get clean
+          df -h
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -61,23 +71,10 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: "paraloom-ci"
 
       - name: Build all features
         uses: actions-rs/cargo@v1
@@ -114,23 +111,10 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: "paraloom-ci"
 
       - name: Run core tests
         uses: actions-rs/cargo@v1
@@ -167,23 +151,10 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Cache cargo registry
-        uses: actions/cache@v3
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v3
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v3
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: "paraloom-ci"
 
       - name: Run privacy layer tests
         uses: actions-rs/cargo@v1
