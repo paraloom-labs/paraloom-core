@@ -2,11 +2,9 @@ name: Build Release Binaries
 
 on:
   workflow_dispatch:  # Manual trigger only
-  # Disabled
-  # push:
-  #   branches: [ main ]
-  tags:
-    - 'v*'  # Auto-run on version tags
+  push:
+    tags:
+      - 'v*'  # Auto-run on version tags
 
 jobs:
   build:
@@ -15,17 +13,16 @@ jobs:
     strategy:
       matrix:
         include:
-          # Only Windows for now
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: paraloom-node
+            asset_name: paraloom-node-linux-amd64
+
+          # Uncomment when Windows/Mac builds are needed:
           # - os: windows-latest
           #   target: x86_64-pc-windows-msvc
           #   artifact_name: paraloom-node.exe
           #   asset_name: paraloom-node-windows-amd64.exe
-
-          # Uncomment when Linux/Mac builds are fixed:
-          # - os: ubuntu-latest
-          #   target: x86_64-unknown-linux-gnu
-          #   artifact_name: paraloom-node
-          #   asset_name: paraloom-node-linux-amd64
           #
           # - os: macos-latest
           #   target: x86_64-apple-darwin
