@@ -183,6 +183,6 @@ mod tests {
         assert!(ix.is_ok());
         let instruction = ix.unwrap();
         assert_eq!(instruction.program_id, program_id);
-        assert_eq!(instruction.accounts.len(), 4);
+        assert_eq!(instruction.accounts.len(), 5);
     }
 }
