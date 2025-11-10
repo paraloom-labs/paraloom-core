@@ -201,7 +201,7 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Generate coverage report
-        run: cargo tarpaulin --out Xml --workspace --no-default-features --exclude-files "src/bridge/solana/*" --exclude-files "src/bin/*" --timeout 300
+        run: cargo tarpaulin --out Xml --lib --tests --timeout 300
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
