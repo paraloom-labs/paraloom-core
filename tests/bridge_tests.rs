@@ -26,6 +26,8 @@ async fn test_bridge_with_pool() {
         program_id: "test_program".to_string(),
         poll_interval_secs: 10,
         start_block: Some(0),
+        authority_keypair_path: None,
+        bridge_vault: None,
     };
 
     let pool = Arc::new(ShieldedPool::new());

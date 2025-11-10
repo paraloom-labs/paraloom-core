@@ -35,7 +35,7 @@ pub enum BridgeError {
     Network(String),
 
     #[error("Configuration error: {0}")]
-    Config(String),
+    ConfigError(String),
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;

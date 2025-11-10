@@ -7,16 +7,18 @@ use crate::privacy::ShieldedPool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use super::ProgramInterface;
+
 /// Result submitter for withdrawal transactions
 pub struct ResultSubmitter {
-    /// Bridge configuration
-    config: BridgeConfig,
-
     /// Privacy pool for verification
     pool: Arc<ShieldedPool>,
 
     /// Bridge statistics
     stats: Arc<RwLock<BridgeStats>>,
+
+    /// Program interface for Solana interactions
+    program: ProgramInterface,
 }
 
 impl ResultSubmitter {
@@ -25,12 +27,14 @@ impl ResultSubmitter {
         config: BridgeConfig,
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
-    ) -> Self {
-        Self {
-            config,
+    ) -> Result<Self> {
+        let program = ProgramInterface::new(config)?;
+
+        Ok(Self {
             pool,
             stats,
-        }
+            program,
+        })
     }
 
     /// Submit a withdrawal request to Solana
@@ -78,9 +82,7 @@ impl ResultSubmitter {
         // This should verify the withdrawal circuit proof
 
         if request.proof.is_empty() {
-            return Err(BridgeError::InvalidTransaction(
-                "Missing proof".to_string(),
-            ));
+            return Err(BridgeError::InvalidTransaction("Missing proof".to_string()));
         }
 
         // For now, accept any non-empty proof
@@ -90,28 +92,25 @@ impl ResultSubmitter {
 
     /// Submit withdrawal transaction to Solana
     async fn submit_to_solana(&self, request: &WithdrawalRequest) -> Result<String> {
-        // TODO: Implement actual Solana transaction submission
-        // This will:
-        // 1. Create Solana transaction calling withdraw instruction
-        // 2. Sign transaction
-        // 3. Send to Solana RPC
-        // 4. Wait for confirmation
-        // 5. Return transaction signature
-
-        // For now, return mock signature
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mock_signature = format!("withdraw_{}_{}", request.amount, timestamp);
-
-        log::info!(
-            "Would submit to Solana: {} lamports to {:?}",
+        log::debug!(
+            "Submitting to Solana: {} lamports to {:?}",
             request.amount,
             &request.recipient[..8]
         );
 
-        Ok(mock_signature)
+        // Submit via program interface
+        let signature = self
+            .program
+            .submit_withdrawal(
+                request.recipient,
+                request.amount,
+                request.nullifier,
+                &request.proof,
+            )
+            .await?;
+
+        log::info!("Transaction submitted to Solana: {}", signature);
+        Ok(signature)
     }
 
     /// Batch submit multiple withdrawals (optimization)
@@ -139,16 +138,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitter_creation() {
-        let config = BridgeConfig::default();
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
         let pool = Arc::new(ShieldedPool::new());
         let stats = Arc::new(RwLock::new(BridgeStats::default()));
 
-        let _submitter = ResultSubmitter::new(config, pool, stats);
+        let result = ResultSubmitter::new(config, pool, stats);
+        // Will succeed even without keypair, just won't be able to submit
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_submit_withdrawal() {
-        let config = BridgeConfig::default();
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
         let pool = Arc::new(ShieldedPool::new());
         let stats = Arc::new(RwLock::new(BridgeStats::default()));
 
@@ -169,16 +176,19 @@ mod tests {
             proof: vec![0u8; 32], // Mock proof
         };
 
-        let submitter = ResultSubmitter::new(config, pool, stats);
+        let submitter = ResultSubmitter::new(config, pool, stats).unwrap();
         let result = submitter.submit(request).await;
 
-        // Should succeed (mock implementation)
-        assert!(result.is_ok());
+        // Will fail without keypair configured
+        assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_batch_submit() {
-        let config = BridgeConfig::default();
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
         let pool = Arc::new(ShieldedPool::new());
         let stats = Arc::new(RwLock::new(BridgeStats::default()));
 
@@ -199,9 +209,10 @@ mod tests {
             },
         ];
 
-        let submitter = ResultSubmitter::new(config, pool, stats);
+        let submitter = ResultSubmitter::new(config, pool, stats).unwrap();
         let result = submitter.batch_submit(requests).await;
 
+        // Will succeed but return empty vec (all fail without keypair)
         assert!(result.is_ok());
     }
 }

@@ -48,7 +48,7 @@ impl Bridge {
             self.config.clone(),
             pool,
             Arc::clone(&self.stats),
-        ));
+        )?);
 
         Ok(())
     }
@@ -83,7 +83,7 @@ impl Bridge {
         if let Some(ref bridge) = self.solana_bridge {
             bridge.submit_withdrawal(request).await
         } else {
-            Err(BridgeError::Config(
+            Err(BridgeError::ConfigError(
                 "Solana bridge not initialized".to_string(),
             ))
         }

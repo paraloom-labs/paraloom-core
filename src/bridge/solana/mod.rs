@@ -1,9 +1,16 @@
 //! Solana bridge implementation
 
+mod instructions;
+mod keypair;
 mod listener;
 mod program;
 mod submitter;
 
+pub use instructions::{
+    create_deposit_instruction, create_initialize_instruction, create_withdraw_instruction,
+    derive_bridge_state, derive_bridge_vault,
+};
+pub use keypair::load_keypair_from_file;
 pub use listener::EventListener;
 pub use program::ProgramInterface;
 pub use submitter::ResultSubmitter;
@@ -25,6 +32,7 @@ pub struct SolanaBridge {
     program: ProgramInterface,
 
     /// Bridge statistics
+    #[allow(dead_code)]
     stats: Arc<RwLock<BridgeStats>>,
 }
 
@@ -34,17 +42,17 @@ impl SolanaBridge {
         config: BridgeConfig,
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
-    ) -> Self {
-        let program = ProgramInterface::new(config.clone());
+    ) -> Result<Self> {
+        let program = ProgramInterface::new(config.clone())?;
         let listener = EventListener::new(config.clone(), pool.clone(), Arc::clone(&stats));
-        let submitter = ResultSubmitter::new(config, pool, Arc::clone(&stats));
+        let submitter = ResultSubmitter::new(config, pool, Arc::clone(&stats))?;
 
-        Self {
+        Ok(Self {
             listener,
             submitter,
             program,
             stats,
-        }
+        })
     }
 
     /// Start bridge services

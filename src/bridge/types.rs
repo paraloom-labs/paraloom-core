@@ -69,6 +69,12 @@ pub struct BridgeConfig {
 
     /// Enable bridge (can be disabled for testing)
     pub enabled: bool,
+
+    /// Bridge authority keypair path (for signing withdrawals)
+    pub authority_keypair_path: Option<String>,
+
+    /// Bridge vault address (PDA for holding funds)
+    pub bridge_vault: Option<String>,
 }
 
 impl Default for BridgeConfig {
@@ -79,6 +85,8 @@ impl Default for BridgeConfig {
             poll_interval_secs: 5,
             start_block: None,
             enabled: false,
+            authority_keypair_path: None,
+            bridge_vault: None,
         }
     }
 }

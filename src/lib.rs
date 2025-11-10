@@ -1,3 +1,5 @@
+// Bridge module for cross-chain interactions
+#[cfg(feature = "solana-bridge")]
 pub mod bridge;
 pub mod config;
 pub mod coordinator;
