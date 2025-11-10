@@ -28,3 +28,9 @@ config/*-temp.toml
 *.sh.env
 *.sh
 .env
+
+# Solana test files
+test-ledger/
+*-keypair.json
+*.keypair
+id.json

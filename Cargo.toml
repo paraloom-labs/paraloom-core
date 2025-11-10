@@ -47,6 +47,18 @@ path = "src/bin/web_demo.rs"
 name = "benchmark-reqresp"
 path = "src/bin/benchmark_reqresp.rs"
 
+[[bin]]
+name = "bridge-init"
+path = "src/bin/bridge_init.rs"
+
+[[bin]]
+name = "test-deposit"
+path = "src/bin/test_deposit.rs"
+
+[[bin]]
+name = "test-withdraw"
+path = "src/bin/test_withdraw.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh"]

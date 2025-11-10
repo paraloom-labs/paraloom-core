@@ -4,7 +4,7 @@
 
 use anchor_lang::prelude::*;
 
-declare_id!("2ifjwWddF7SzqMQGDatN5Bzq43W3gLhVPDW3EVxqfcJf");
+declare_id!("DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco");
 
 #[program]
 pub mod paraloom_program {
@@ -29,15 +29,14 @@ pub mod paraloom_program {
     pub fn deposit(
         ctx: Context<Deposit>,
         amount: u64,
-        recipient: [u8; 32], // Shielded address
-        randomness: [u8; 32], // Commitment randomness
+        recipient: [u8; 32],
+        randomness: [u8; 32],
     ) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
 
         require!(!bridge_state.paused, BridgeError::BridgePaused);
         require!(amount > 0, BridgeError::InvalidAmount);
 
-        // Transfer SOL from user to bridge
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
             &ctx.accounts.bridge_vault.key(),
@@ -53,11 +52,9 @@ pub mod paraloom_program {
             ],
         )?;
 
-        // Update state
         bridge_state.total_deposited += amount;
         bridge_state.deposit_count += 1;
 
-        // Emit deposit event
         emit!(DepositEvent {
             depositor: ctx.accounts.depositor.key(),
             amount,
@@ -85,19 +82,28 @@ pub mod paraloom_program {
         require!(amount > 0, BridgeError::InvalidAmount);
         require!(!proof.is_empty(), BridgeError::InvalidProof);
 
-        // Check bridge has enough balance
         let vault_balance = ctx.accounts.bridge_vault.lamports();
         require!(vault_balance >= amount, BridgeError::InsufficientFunds);
 
-        // Transfer SOL from bridge to recipient
-        **ctx.accounts.bridge_vault.try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.recipient.try_borrow_mut_lamports()? += amount;
+        let vault_bump = ctx.bumps.bridge_vault;
+        let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
+        let signer_seeds = &[&seeds[..]];
 
-        // Update state
+        anchor_lang::system_program::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.bridge_vault.to_account_info(),
+                    to: ctx.accounts.recipient.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount,
+        )?;
+
         bridge_state.total_withdrawn += amount;
         bridge_state.withdrawal_count += 1;
 
-        // Emit withdrawal event
         emit!(WithdrawalEvent {
             recipient: ctx.accounts.recipient.key(),
             amount,
@@ -129,8 +135,6 @@ pub mod paraloom_program {
     }
 }
 
-// Contexts
-
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
@@ -157,7 +161,11 @@ pub struct Deposit<'info> {
     )]
     pub bridge_state: Account<'info, BridgeState>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"bridge_vault"],
+        bump
+    )]
     pub bridge_vault: SystemAccount<'info>,
 
     #[account(mut)]
@@ -175,13 +183,19 @@ pub struct Withdraw<'info> {
     )]
     pub bridge_state: Account<'info, BridgeState>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"bridge_vault"],
+        bump
+    )]
     pub bridge_vault: SystemAccount<'info>,
 
     #[account(mut)]
     pub recipient: SystemAccount<'info>,
 
     pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -197,8 +211,6 @@ pub struct Pause<'info> {
     pub authority: Signer<'info>,
 }
 
-// State
-
 #[account]
 #[derive(InitSpace)]
 pub struct BridgeState {
@@ -210,14 +222,12 @@ pub struct BridgeState {
     pub paused: bool,
 }
 
-// Events
-
 #[event]
 pub struct DepositEvent {
     pub depositor: Pubkey,
     pub amount: u64,
-    pub recipient: [u8; 32],    // Shielded address
-    pub randomness: [u8; 32],   // For commitment
+    pub recipient: [u8; 32],
+    pub randomness: [u8; 32],
     pub timestamp: i64,
     pub deposit_id: u64,
 }
@@ -230,8 +240,6 @@ pub struct WithdrawalEvent {
     pub timestamp: i64,
     pub withdrawal_id: u64,
 }
-
-// Errors
 
 #[error_code]
 pub enum BridgeError {
