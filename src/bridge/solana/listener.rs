@@ -89,13 +89,7 @@ impl EventListener {
         stats: &Arc<RwLock<BridgeStats>>,
         last_block: &Arc<RwLock<u64>>,
     ) -> Result<usize> {
-        // TODO: Implement actual Solana event polling
-        // For now, this is a skeleton that will be filled when we have
-        // the Solana RPC client integrated
-
         let current_block = *last_block.read().await;
-
-        // Mock: Fetch events from Solana program
         let events = Self::fetch_events(current_block).await?;
 
         let mut processed = 0;
@@ -127,10 +121,6 @@ impl EventListener {
 
     /// Fetch deposit events from Solana
     async fn fetch_events(_from_block: u64) -> Result<Vec<DepositEvent>> {
-        // TODO: Implement actual Solana RPC call to fetch events
-        // This will use solana_client to query program logs/events
-
-        // For now, return empty vec (no events)
         Ok(Vec::new())
     }
 

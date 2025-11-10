@@ -25,4 +25,6 @@ data/
 /tmp/
 config/*-temp.toml
 *.MD
+*.sh.env
 *.sh
+.env

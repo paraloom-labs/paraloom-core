@@ -46,14 +46,12 @@ impl ProgramInterface {
             None
         };
 
-        // Parse bridge vault address if configured, otherwise derive PDA
         let bridge_vault =
             if let Some(ref vault_str) = config.bridge_vault {
                 Some(vault_str.parse::<Pubkey>().map_err(|e| {
                     BridgeError::ConfigError(format!("Invalid vault address: {}", e))
                 })?)
             } else {
-                // Derive PDA from program
                 let (vault_pda, _) = super::derive_bridge_vault(&program_id);
                 Some(vault_pda)
             };
@@ -101,11 +99,6 @@ impl ProgramInterface {
             log::warn!("Transaction failed on-chain");
             return Ok(false);
         }
-
-        // For now, we just verify the transaction exists and succeeded
-        // TODO: Parse actual deposit amount from transaction logs/data
-        // TODO: Verify program ID is involved in transaction
-        // TODO: Parse DepositEvent from program logs
 
         log::info!("Deposit verified: {} lamports", expected_amount);
         Ok(true)

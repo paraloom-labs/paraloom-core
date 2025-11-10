@@ -22,8 +22,9 @@ async fn test_bridge_initialization() {
 async fn test_bridge_with_pool() {
     let config = BridgeConfig {
         enabled: true,
-        solana_rpc_url: "https://api.devnet.solana.com".to_string(),
-        program_id: "test_program".to_string(),
+        solana_rpc_url: std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string()),
+        program_id: "11111111111111111111111111111111".to_string(),
         poll_interval_secs: 10,
         start_block: Some(0),
         authority_keypair_path: None,

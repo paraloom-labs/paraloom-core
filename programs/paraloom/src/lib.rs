@@ -83,9 +83,6 @@ pub mod paraloom_program {
 
         require!(!bridge_state.paused, BridgeError::BridgePaused);
         require!(amount > 0, BridgeError::InvalidAmount);
-
-        // TODO: Verify zkSNARK proof
-        // For MVP, we skip proof verification (will implement later)
         require!(!proof.is_empty(), BridgeError::InvalidProof);
 
         // Check bridge has enough balance

@@ -80,13 +80,22 @@ pub struct BridgeConfig {
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            solana_rpc_url: "https://api.devnet.solana.com".to_string(),
-            program_id: String::new(),
-            poll_interval_secs: 5,
-            start_block: None,
-            enabled: false,
-            authority_keypair_path: None,
-            bridge_vault: None,
+            solana_rpc_url: std::env::var("SOLANA_RPC_URL")
+                .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string()),
+            program_id: std::env::var("SOLANA_PROGRAM_ID").unwrap_or_default(),
+            poll_interval_secs: std::env::var("BRIDGE_POLL_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5),
+            start_block: std::env::var("BRIDGE_START_BLOCK")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            enabled: std::env::var("BRIDGE_ENABLED")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(false),
+            authority_keypair_path: std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH").ok(),
+            bridge_vault: std::env::var("BRIDGE_VAULT_ADDRESS").ok(),
         }
     }
 }
