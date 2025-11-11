@@ -59,10 +59,7 @@ async fn test_withdrawal_consensus_with_validators() {
     log::info!("  Commitment: {:?}", hex::encode(commitment.as_bytes()));
 
     let root_after_deposit = pool.root().await;
-    log::info!(
-        "  New merkle root: {:?}\n",
-        hex::encode(root_after_deposit)
-    );
+    log::info!("  New merkle root: {:?}\n", hex::encode(root_after_deposit));
 
     // Step 3: Create withdrawal transaction with proof
     log::info!("Step 3: Creating withdrawal transaction...");
