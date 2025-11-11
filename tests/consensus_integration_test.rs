@@ -59,10 +59,10 @@ async fn test_multi_validator_consensus_success() {
         .unwrap();
 
     // Simulate 8 validators voting "Valid" (should reach 7/10 consensus)
-    for i in 0..8 {
+    for validator in validators.iter().take(8) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Valid,
             timestamp: 1234567890,
         };
@@ -70,10 +70,10 @@ async fn test_multi_validator_consensus_success() {
     }
 
     // Simulate 2 validators voting "Invalid"
-    for i in 8..10 {
+    for validator in validators.iter().skip(8).take(2) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Invalid {
                 reason: "Test rejection".to_string(),
             },
@@ -128,10 +128,10 @@ async fn test_multi_validator_consensus_rejection() {
         .unwrap();
 
     // Simulate 3 validators voting "Valid"
-    for i in 0..3 {
+    for validator in validators.iter().take(3) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Valid,
             timestamp: 1234567890,
         };
@@ -139,10 +139,10 @@ async fn test_multi_validator_consensus_rejection() {
     }
 
     // Simulate 7 validators voting "Invalid" (should reach 7/10 rejection consensus)
-    for i in 3..10 {
+    for validator in validators.iter().skip(3).take(7) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Invalid {
                 reason: "Proof verification failed".to_string(),
             },
@@ -192,10 +192,10 @@ async fn test_byzantine_fault_tolerance() {
         .unwrap();
 
     // 7 honest validators vote Valid
-    for i in 0..7 {
+    for validator in validators.iter().take(7) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Valid,
             timestamp: 1234567890,
         };
@@ -203,10 +203,10 @@ async fn test_byzantine_fault_tolerance() {
     }
 
     // 3 Byzantine validators vote Invalid (trying to disrupt)
-    for i in 7..10 {
+    for validator in validators.iter().skip(7).take(3) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Invalid {
                 reason: "Byzantine attack".to_string(),
             },
@@ -257,10 +257,10 @@ async fn test_reputation_updates_after_consensus() {
         .unwrap();
 
     // 8 validators vote Valid (will align with consensus)
-    for i in 0..8 {
+    for validator in validators.iter().take(8) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Valid,
             timestamp: 1234567890,
         };
@@ -268,10 +268,10 @@ async fn test_reputation_updates_after_consensus() {
     }
 
     // 2 validators vote Invalid (will disagree with consensus)
-    for i in 8..10 {
+    for validator in validators.iter().skip(8).take(2) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Invalid {
                 reason: "Disagreement".to_string(),
             },
@@ -388,10 +388,10 @@ async fn test_timeout_handling() {
         .unwrap();
 
     // Only 5 validators respond (not enough for consensus)
-    for i in 0..5 {
+    for validator in validators.iter().take(5) {
         let result = WithdrawalVerificationResult {
             request_id: request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote: VerificationVote::Valid,
             timestamp: 1234567890,
         };
@@ -561,10 +561,10 @@ async fn test_reputation_bounds() {
             .unwrap();
 
         // Validators 0-8 vote Valid (9 validators = consensus)
-        for i in 0..9 {
+        for validator in validators.iter().take(9) {
             let result = WithdrawalVerificationResult {
                 request_id: request.request_id.clone(),
-                validator: validators[i].clone(),
+                validator: validator.clone(),
                 vote: VerificationVote::Valid,
                 timestamp: 1234567890,
             };

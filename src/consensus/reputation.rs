@@ -155,15 +155,15 @@ impl ReputationTracker {
     /// Register a new validator
     pub async fn register_validator(&self, node_id: NodeId) {
         let mut metrics = self.metrics.write().await;
-        if !metrics.contains_key(&node_id) {
+        metrics.entry(node_id.clone()).or_insert_with(|| {
             let validator_metrics = ValidatorMetrics::new(node_id.clone());
             log::info!(
                 "Registered validator for reputation tracking: {:?} (reputation: {})",
                 node_id,
                 validator_metrics.reputation
             );
-            metrics.insert(node_id, validator_metrics);
-        }
+            validator_metrics
+        });
     }
 
     /// Unregister a validator

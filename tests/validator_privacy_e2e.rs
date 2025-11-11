@@ -32,7 +32,7 @@ async fn test_withdrawal_consensus_with_validators() {
     let pool = Arc::new(ShieldedPool::new());
     let initial_root = pool.root().await;
     log::info!("PASS: Privacy pool initialized");
-    log::info!("  Initial merkle root: {:?}\n", hex::encode(&initial_root));
+    log::info!("  Initial merkle root: {:?}\n", hex::encode(initial_root));
 
     // Step 2: Create a deposit
     log::info!("Step 2: Creating shielded deposit...");
@@ -61,7 +61,7 @@ async fn test_withdrawal_consensus_with_validators() {
     let root_after_deposit = pool.root().await;
     log::info!(
         "  New merkle root: {:?}\n",
-        hex::encode(&root_after_deposit)
+        hex::encode(root_after_deposit)
     );
 
     // Step 3: Create withdrawal transaction with proof
@@ -75,8 +75,8 @@ async fn test_withdrawal_consensus_with_validators() {
     let nullifier = Nullifier::derive(&note.commitment(), &spending_key);
 
     log::info!("  Withdrawal amount: {} lamports", withdrawal_amount);
-    log::info!("  Nullifier: {:?}", hex::encode(&nullifier.0));
-    log::info!("  Recipient: {:?}", hex::encode(&recipient));
+    log::info!("  Nullifier: {:?}", hex::encode(nullifier.0));
+    log::info!("  Recipient: {:?}", hex::encode(recipient));
 
     // Create WithdrawTx (this contains the zkSNARK proof)
     let withdrawal_tx = WithdrawTx::new(
@@ -142,7 +142,7 @@ async fn test_withdrawal_consensus_with_validators() {
     // 4. Send back Valid/Invalid vote
 
     // Simulate 9 validators voting Valid (honest validators)
-    for i in 0..9 {
+    for (i, validator) in validators.iter().enumerate().take(9) {
         log::info!("  Validator {}: Verifying proof...", i);
 
         // Each validator independently verifies
@@ -160,7 +160,7 @@ async fn test_withdrawal_consensus_with_validators() {
 
         let result = WithdrawalVerificationResult {
             request_id: verification_request.request_id.clone(),
-            validator: validators[i].clone(),
+            validator: validator.clone(),
             vote,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

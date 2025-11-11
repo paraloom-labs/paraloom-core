@@ -190,7 +190,7 @@ impl LeaderSelector {
             .cloned()
             .collect();
 
-        validators.sort_by(|a, b| b.selection_weight().cmp(&a.selection_weight()));
+        validators.sort_by_key(|b| std::cmp::Reverse(b.selection_weight()));
         validators
     }
 
