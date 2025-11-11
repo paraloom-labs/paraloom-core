@@ -34,3 +34,4 @@ test-ledger/
 *-keypair.json
 *.keypair
 id.json
+/devnet-validators

@@ -6,7 +6,7 @@ use anchor_lang::prelude::*;
 
 declare_id!("DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco");
 
-pub const MIN_VALIDATOR_STAKE: u64 = 10_000_000_000;
+pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
 #[program]
 pub mod paraloom_program {
