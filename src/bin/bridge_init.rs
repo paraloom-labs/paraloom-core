@@ -48,7 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production, this should come from a trusted setup
     let initial_merkle_root = [0u8; 32];
     let ix = create_initialize_instruction(&program_id, &authority.pubkey(), initial_merkle_root)?;
-    println!("Instruction created with initial merkle root: {:?}\n", &initial_merkle_root[..8]);
+    println!(
+        "Instruction created with initial merkle root: {:?}\n",
+        &initial_merkle_root[..8]
+    );
 
     // Get recent blockhash
     println!("Getting recent blockhash...");

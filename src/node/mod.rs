@@ -241,6 +241,92 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     nullifier, is_spent
                 );
             }
+
+            // Consensus messages
+            Message::WithdrawalVerificationRequest { request } => {
+                info!(
+                    "Received withdrawal verification request: {}",
+                    request.request_id
+                );
+
+                // Verify withdrawal zkSNARK proof if privacy pool is available
+                let vote = if let Some(pool) = &self.shielded_pool {
+                    match self.verify_withdrawal_proof(&request, pool).await {
+                        Ok(true) => {
+                            info!(
+                                "Withdrawal proof verified successfully: {}",
+                                request.request_id
+                            );
+                            crate::consensus::withdrawal::VerificationVote::Valid
+                        }
+                        Ok(false) => {
+                            log::warn!(
+                                "Withdrawal proof verification failed: {}",
+                                request.request_id
+                            );
+                            crate::consensus::withdrawal::VerificationVote::Invalid {
+                                reason: "Proof verification failed".to_string(),
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Error verifying withdrawal proof {}: {}",
+                                request.request_id,
+                                e
+                            );
+                            crate::consensus::withdrawal::VerificationVote::Invalid {
+                                reason: format!("Verification error: {}", e),
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!("Privacy pool not available, cannot verify proof");
+                    crate::consensus::withdrawal::VerificationVote::Invalid {
+                        reason: "Privacy pool not available".to_string(),
+                    }
+                };
+
+                // Send verification result back to source (coordinator)
+                let result = crate::consensus::withdrawal::WithdrawalVerificationResult {
+                    request_id: request.request_id,
+                    validator: self.node_info.id.clone(),
+                    vote,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                };
+
+                let response = Message::WithdrawalVerificationResult { result };
+                if let Err(e) = self.network.send_message(source.clone(), response).await {
+                    log::error!("Failed to send verification result: {}", e);
+                }
+            }
+            Message::WithdrawalVerificationResult { result } => {
+                info!(
+                    "Received withdrawal verification result: {}",
+                    result.request_id
+                );
+            }
+            Message::ValidatorRegistration {
+                validator_id,
+                stake_amount,
+                pubkey,
+            } => {
+                info!(
+                    "Validator registered: {:?}, stake: {}, pubkey: {:?}",
+                    validator_id, stake_amount, pubkey
+                );
+            }
+            Message::ValidatorUnregistration { validator_id } => {
+                info!("Validator unregistered: {:?}", validator_id);
+            }
+            Message::ValidatorHeartbeat {
+                validator_id,
+                timestamp,
+            } => {
+                info!("Validator heartbeat: {:?} at {}", validator_id, timestamp);
+            }
         }
         Ok(())
     }
@@ -455,6 +541,99 @@ impl Node {
     /// Get node info
     pub fn node_info(&self) -> NodeInfo {
         self.node_info.clone()
+    }
+
+    /// Verify withdrawal zkSNARK proof
+    async fn verify_withdrawal_proof(
+        &self,
+        request: &crate::consensus::withdrawal::WithdrawalVerificationRequest,
+        pool: &Arc<crate::privacy::pool::ShieldedPool>,
+    ) -> Result<bool> {
+        use crate::privacy::{bytes_to_field, deserialize_proof, Groth16ProofSystem};
+        use ark_bls12_381::Fr;
+
+        // Deserialize proof
+        let proof = match deserialize_proof(&request.proof) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Failed to deserialize proof: {}", e);
+                return Ok(false);
+            }
+        };
+
+        // Get current Merkle root from pool
+        let merkle_root = pool.root().await;
+        let merkle_root_field = match bytes_to_field(&merkle_root) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("Invalid Merkle root: {}", e);
+                return Ok(false);
+            }
+        };
+
+        // Convert nullifier to field element
+        let nullifier_field = match bytes_to_field(&request.nullifier) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("Invalid nullifier: {}", e);
+                return Ok(false);
+            }
+        };
+
+        // Convert amount to field element
+        let amount_field = Fr::from(request.amount);
+
+        // Public inputs for verification
+        let public_inputs = vec![merkle_root_field, nullifier_field, amount_field];
+
+        // Load verifying key (for MVP, generate on-the-fly)
+        let vk = match self.load_withdraw_verifying_key() {
+            Ok(k) => k,
+            Err(e) => {
+                log::error!("Failed to load verifying key: {}", e);
+                return Ok(false);
+            }
+        };
+
+        // Verify proof
+        match Groth16ProofSystem::verify(&vk, &public_inputs, &proof) {
+            Ok(valid) => {
+                log::debug!(
+                    "Withdrawal proof verification result for {}: {}",
+                    request.request_id,
+                    valid
+                );
+                Ok(valid)
+            }
+            Err(e) => {
+                log::error!("Proof verification error: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Load withdraw circuit verifying key
+    fn load_withdraw_verifying_key(
+        &self,
+    ) -> Result<ark_groth16::VerifyingKey<ark_bls12_381::Bls12_381>> {
+        use crate::privacy::{Groth16ProofSystem, WithdrawCircuit};
+        use ark_std::rand::rngs::StdRng;
+        use ark_std::rand::SeedableRng;
+
+        // For MVP, generate keys on-the-fly
+        // In production, these should be loaded from trusted setup
+        let mut rng = StdRng::seed_from_u64(0u64);
+        let circuit = WithdrawCircuit {
+            merkle_root: Some([0u8; 32]),
+            nullifier: Some([0u8; 32]),
+            withdraw_amount: Some(0u64),
+            input_value: Some(0u64),
+            input_randomness: Some([0u8; 32]),
+            input_path: None,
+        };
+
+        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng)?;
+        Ok(vk)
     }
 }
 

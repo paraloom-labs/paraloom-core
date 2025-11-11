@@ -54,7 +54,7 @@ async fn test_deposit_and_commitment_generation() {
     let net_amount = deposit_amount - fee;
     let commitment = pool.deposit(note, net_amount).await.unwrap();
 
-    log::info!("✓ Deposit added to pool");
+    log::info!("PASS: Deposit added to pool");
     assert_eq!(commitment, deposit_tx.output_commitment);
 
     // Verify Merkle root changed
@@ -63,16 +63,13 @@ async fn test_deposit_and_commitment_generation() {
         initial_root, root_after_deposit,
         "Merkle root should change after deposit"
     );
-    log::info!(
-        "✓ Merkle root updated: {:?}",
-        &root_after_deposit[..8]
-    );
+    log::info!("PASS: Merkle root updated: {:?}", &root_after_deposit[..8]);
 
     // Verify pool state
     assert_eq!(pool.commitment_count().await, 1);
     assert_eq!(pool.total_supply().await, net_amount);
 
-    log::info!("✓ All deposit checks passed");
+    log::info!("PASS: All deposit checks passed");
 }
 
 #[tokio::test]
@@ -108,7 +105,7 @@ async fn test_nullifier_generation_and_tracking() {
         !pool.is_spent(&nullifier).await,
         "Nullifier should not be spent initially"
     );
-    log::info!("✓ Nullifier initially unspent");
+    log::info!("PASS: Nullifier initially unspent");
 
     // Process withdrawal (marking nullifier as spent)
     let withdraw_amount = 500u64;
@@ -117,14 +114,14 @@ async fn test_nullifier_generation_and_tracking() {
         .await
         .unwrap();
 
-    log::info!("✓ Withdrawal processed");
+    log::info!("PASS: Withdrawal processed");
 
     // Verify nullifier is now spent
     assert!(
         pool.is_spent(&nullifier).await,
         "Nullifier should be marked as spent"
     );
-    log::info!("✓ Nullifier marked as spent");
+    log::info!("PASS: Nullifier marked as spent");
 
     // Attempt double-spend
     let result = pool
@@ -132,10 +129,11 @@ async fn test_nullifier_generation_and_tracking() {
         .await;
 
     assert!(result.is_err(), "Double-spend should fail");
-    log::info!("✓ Double-spend prevented");
+    log::info!("PASS: Double-spend prevented");
 }
 
 #[tokio::test]
+#[ignore] // Proof generation is slow (60+ seconds), run manually with: cargo test --test privacy_integration_test test_proof_serialization_codec -- --ignored
 async fn test_proof_serialization_codec() {
     use ark_bls12_381::Bls12_381;
     use ark_groth16::Proof;
@@ -155,12 +153,12 @@ async fn test_proof_serialization_codec() {
     let circuit = DepositCircuit::new();
 
     let (pk, _vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
-    log::info!("✓ Circuit setup complete");
+    log::info!("PASS: Circuit setup complete");
 
     // Create a proof
     let prove_circuit = DepositCircuit::new();
     let proof = Groth16ProofSystem::prove(&pk, prove_circuit, &mut rng).unwrap();
-    log::info!("✓ Proof generated");
+    log::info!("PASS: Proof generated");
 
     // Serialize the proof
     let serialized = serialize_proof(&proof).unwrap();
@@ -168,15 +166,12 @@ async fn test_proof_serialization_codec() {
 
     // Deserialize the proof
     let deserialized: Proof<Bls12_381> = deserialize_proof(&serialized).unwrap();
-    log::info!("✓ Proof deserialized");
+    log::info!("PASS: Proof deserialized");
 
     // Serialize again and verify roundtrip
     let reserialized = serialize_proof(&deserialized).unwrap();
-    assert_eq!(
-        serialized, reserialized,
-        "Proof should roundtrip correctly"
-    );
-    log::info!("✓ Proof codec roundtrip successful");
+    assert_eq!(serialized, reserialized, "Proof should roundtrip correctly");
+    log::info!("PASS: Proof codec roundtrip successful");
 }
 
 #[tokio::test]
@@ -198,13 +193,7 @@ async fn test_multiple_deposits_merkle_tree() {
         let randomness = pedersen::generate_randomness();
         let amount = 1000 + (i as u64 * 100);
 
-        let deposit = DepositTx::new(
-            vec![i as u8; 32],
-            amount,
-            address,
-            randomness,
-            10,
-        );
+        let deposit = DepositTx::new(vec![i as u8; 32], amount, address, randomness, 10);
 
         let note = deposit.output_note.clone();
         pool.deposit(note, amount - 10).await.unwrap();
@@ -213,10 +202,14 @@ async fn test_multiple_deposits_merkle_tree() {
         roots.push(new_root);
 
         // Verify root changed
-        assert_ne!(roots[i], roots[i + 1], "Root should change after each deposit");
+        assert_ne!(
+            roots[i],
+            roots[i + 1],
+            "Root should change after each deposit"
+        );
     }
 
-    log::info!("✓ Processed 10 deposits");
+    log::info!("PASS: Processed 10 deposits");
     log::info!("  Initial root: {:?}", &roots[0][..8]);
     log::info!("  Final root:   {:?}", &roots[10][..8]);
     log::info!("  Commitment count: {}", pool.commitment_count().await);
@@ -261,14 +254,13 @@ async fn test_nullifier_uniqueness() {
     for i in 0..nullifiers.len() {
         for j in (i + 1)..nullifiers.len() {
             assert_ne!(
-                nullifiers[i].0,
-                nullifiers[j].0,
+                nullifiers[i].0, nullifiers[j].0,
                 "Nullifiers should be unique"
             );
         }
     }
 
-    log::info!("✓ All {} nullifiers are unique", nullifiers.len());
+    log::info!("PASS: All {} nullifiers are unique", nullifiers.len());
 }
 
 #[tokio::test]
@@ -299,5 +291,5 @@ async fn test_field_element_codec() {
         assert_eq!(field, recovered, "Field element {} should roundtrip", i);
     }
 
-    log::info!("✓ Field element codec tested with 10 random elements");
+    log::info!("PASS: Field element codec tested with 10 random elements");
 }

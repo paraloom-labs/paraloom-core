@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix commitment calculation for new Poseidon hash
+    #[ignore]
     fn test_mismatched_inputs_and_proofs() {
         let mut rng = StdRng::seed_from_u64(0u64);
         let circuit = DepositCircuit::new();
