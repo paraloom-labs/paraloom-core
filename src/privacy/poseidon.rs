@@ -1,16 +1,7 @@
 //! Poseidon-style hash implementation for zkSNARK circuits
 //!
-//! CURRENT STATUS: MVP/Testnet implementation using SHA-256 based hashing
-//! PRODUCTION TODO: Replace with proper Poseidon zkSNARK-friendly hash
-//!
-//! This is a TEMPORARY implementation that provides the same API as Poseidon
-//! but uses simpler cryptographic primitives. This allows the system to work
-//! while we implement proper Poseidon with arkworks 0.4.
-//!
-//! Benefits of future Poseidon implementation:
-//! - 50x fewer constraints (500 vs 25,000 for SHA-256)
-//! - Faster proof generation (critical for Raspberry Pi)
-//! - Native field arithmetic (no bit operations)
+//! Current implementation uses SHA-256 based hashing for MVP/testnet.
+//! Production version will use proper Poseidon zkSNARK-friendly hash.
 
 use ark_bls12_381::Fr;
 use ark_ff::{BigInteger, PrimeField};
@@ -19,8 +10,6 @@ use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
 use sha2::{Digest, Sha256};
 
 /// Hash arbitrary data (outside circuit)
-///
-/// Uses SHA-256 for now. Will be replaced with Poseidon.
 pub fn poseidon_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -61,9 +50,6 @@ pub fn poseidon_hash_fields(inputs: &[Fr]) -> Fr {
 }
 
 /// Poseidon hash gadget for use inside zkSNARK circuits
-///
-/// TEMPORARY: Uses simple field arithmetic
-/// TODO: Replace with proper Poseidon permutation
 pub fn poseidon_hash_gadget(
     _cs: ConstraintSystemRef<Fr>,
     data: &[FpVar<Fr>],

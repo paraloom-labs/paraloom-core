@@ -73,4 +73,31 @@ pub enum Message {
         nullifier: crate::privacy::types::Nullifier,
         is_spent: bool,
     },
+
+    // Consensus-related messages
+    /// Withdrawal verification request (broadcast to all validators)
+    WithdrawalVerificationRequest {
+        request: crate::consensus::withdrawal::WithdrawalVerificationRequest,
+    },
+
+    /// Withdrawal verification result (validator -> coordinator)
+    WithdrawalVerificationResult {
+        result: crate::consensus::withdrawal::WithdrawalVerificationResult,
+    },
+
+    /// Validator registration announcement
+    ValidatorRegistration {
+        validator_id: crate::types::NodeId,
+        stake_amount: u64,
+        pubkey: Option<String>,
+    },
+
+    /// Validator unregistration announcement
+    ValidatorUnregistration { validator_id: crate::types::NodeId },
+
+    /// Validator heartbeat (liveness check)
+    ValidatorHeartbeat {
+        validator_id: crate::types::NodeId,
+        timestamp: u64,
+    },
 }
