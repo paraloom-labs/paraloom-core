@@ -1,3 +1,12 @@
+[workspace]
+members = [
+    "."
+]
+exclude = [
+    "programs/paraloom"  # Separate build - has different Anchor/Solana version requirements
+]
+resolver = "2"
+
 [package]
 name = "paraloom"
 version = "0.1.0"
@@ -37,6 +46,22 @@ path = "src/bin/web_demo.rs"
 [[bin]]
 name = "benchmark-reqresp"
 path = "src/bin/benchmark_reqresp.rs"
+
+[[bin]]
+name = "bridge-init"
+path = "src/bin/bridge_init.rs"
+
+[[bin]]
+name = "test-deposit"
+path = "src/bin/test_deposit.rs"
+
+[[bin]]
+name = "test-withdraw"
+path = "src/bin/test_withdraw.rs"
+
+[features]
+default = ["solana-bridge"]
+solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh"]
 
 [dependencies]
 # Core networking
@@ -89,6 +114,13 @@ ark-snark = "0.4"
 ark-relations = "0.4"
 ark-r1cs-std = "0.4"
 ark-crypto-primitives = "0.4"
+
+# Solana dependencies (optional, enabled with solana-bridge feature)
+# Using newer version to avoid dependency conflicts with arkworks
+solana-client = { version = "2.0", optional = true }
+solana-sdk = { version = "2.0", optional = true }
+solana-transaction-status = { version = "2.0", optional = true }
+borsh = { version = "1.5", optional = true }
 
 # Other
 sysinfo = "0.29.0"

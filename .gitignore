@@ -25,4 +25,13 @@ data/
 /tmp/
 config/*-temp.toml
 *.MD
+*.sh.env
 *.sh
+.env
+
+# Solana test files
+test-ledger/
+*-keypair.json
+*.keypair
+id.json
+/devnet-validators
