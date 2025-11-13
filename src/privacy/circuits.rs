@@ -245,24 +245,32 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
 /// - Poseidon: ~500 constraints (50x improvement!)
 ///
 /// This is CRITICAL for Raspberry Pi proof generation.
-fn compute_hash_gadget(
+pub fn compute_hash_gadget(
     cs: ConstraintSystemRef<Fr>,
     data: &[UInt8<Fr>],
 ) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
     // Convert bytes to field elements
     // Group bytes into chunks of 31 (safe for BLS12-381 field)
+    // This MUST match the native poseidon_hash_bytes implementation exactly!
     const CHUNK_SIZE: usize = 31;
     let mut field_vars = Vec::new();
 
     for chunk in data.chunks(CHUNK_SIZE) {
-        // Convert chunk to FpVar
-        let mut bytes_as_bits = Vec::new();
-        for byte in chunk {
-            bytes_as_bits.extend_from_slice(&byte.to_bits_le()?);
+        // Pad chunk to 32 bytes with zeros (matching native implementation)
+        let mut padded_chunk = chunk.to_vec();
+        while padded_chunk.len() < 32 {
+            padded_chunk.push(UInt8::constant(0));
         }
 
-        // Reconstruct as field element from bits
-        let field_var = Boolean::le_bits_to_fp_var(&bytes_as_bits)?;
+        // Convert 32 bytes to field element using little-endian interpretation
+        // This matches Fr::from_le_bytes_mod_order in native implementation
+        let mut field_bits = Vec::new();
+        for byte in &padded_chunk {
+            field_bits.extend_from_slice(&byte.to_bits_le()?);
+        }
+
+        // Reconstruct as field element from little-endian bits
+        let field_var = Boolean::le_bits_to_fp_var(&field_bits)?;
         field_vars.push(field_var);
     }
 
@@ -287,7 +295,7 @@ fn compute_hash_gadget(
 use ark_r1cs_std::boolean::Boolean;
 
 #[allow(dead_code)]
-trait BitsToField {
+pub trait BitsToField {
     fn le_bits_to_fp_var(bits: &[Boolean<Fr>]) -> Result<FpVar<Fr>, SynthesisError>;
 }
 
@@ -390,6 +398,7 @@ pub struct WithdrawCircuit {
     pub input_value: Option<u64>,
     pub input_randomness: Option<[u8; 32]>,
     pub input_path: Option<Vec<([u8; 32], bool)>>,
+    pub secret: Option<[u8; 32]>,
 }
 
 impl WithdrawCircuit {
@@ -401,6 +410,7 @@ impl WithdrawCircuit {
             input_value: None,
             input_randomness: None,
             input_path: None,
+            secret: None,
         }
     }
 
@@ -411,6 +421,7 @@ impl WithdrawCircuit {
         withdraw_amount: u64,
         input_value: u64,
         input_randomness: [u8; 32],
+        secret: [u8; 32],
         input_path: Vec<([u8; 32], bool)>,
     ) -> Self {
         WithdrawCircuit {
@@ -420,6 +431,7 @@ impl WithdrawCircuit {
             input_value: Some(input_value),
             input_randomness: Some(input_randomness),
             input_path: Some(input_path),
+            secret: Some(secret),
         }
     }
 }
@@ -451,8 +463,19 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
+        // Create byte representation of value (8 bytes for u64)
+        let input_value_bytes = UInt8::new_witness_vec(
+            cs.clone(),
+            &self
+                .input_value
+                .unwrap_or(0)
+                .to_le_bytes(),
+        )?;
+
         let input_randomness_var =
             UInt8::new_witness_vec(cs.clone(), &self.input_randomness.unwrap_or([0u8; 32]))?;
+
+        let secret_var = UInt8::new_witness_vec(cs.clone(), &self.secret.unwrap_or([0u8; 32]))?;
 
         // Constraint 1: Verify input value >= withdraw amount
         // input_value - withdraw_amount >= 0
@@ -460,13 +483,19 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // Range proof ensures difference is non-negative
 
         // Constraint 2: Verify input commitment is in tree
+        // Compute commitment = hash(value || randomness)
+        // Use 8-byte representation of u64, NOT 32-byte field element
+        let mut input_commitment_data = Vec::new();
+        input_commitment_data.extend_from_slice(&input_value_bytes);
+        input_commitment_data.extend_from_slice(&input_randomness_var);
+
+        let commitment = compute_hash_gadget(cs.clone(), &input_commitment_data)?;
+
+        // Verify Merkle proof
+        // Start with commitment and climb the tree
+        let mut current_hash = commitment.clone();
+
         if let Some(path) = &self.input_path {
-            let mut input_commitment_data = Vec::new();
-            input_commitment_data.extend_from_slice(&input_value_var.to_bytes()?);
-            input_commitment_data.extend_from_slice(&input_randomness_var);
-
-            let mut current_hash = compute_hash_gadget(cs.clone(), &input_commitment_data)?;
-
             for (sibling_hash, is_left) in path {
                 let sibling_var = UInt8::constant_vec(sibling_hash);
 
@@ -481,14 +510,18 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
 
                 current_hash = compute_hash_gadget(cs.clone(), &combined)?;
             }
-
-            current_hash.enforce_equal(&merkle_root_var)?;
         }
 
-        // Constraint 3: Verify nullifier
+        // For empty path, current_hash == commitment
+        // After climbing tree, current_hash must equal merkle_root
+        current_hash.enforce_equal(&merkle_root_var)?;
+
+        // Constraint 3: Verify nullifier derivation
+        // Nullifier = hash(commitment || secret)
+        // This prevents linking nullifier to commitment without knowing the secret
         let mut nullifier_preimage = Vec::new();
-        nullifier_preimage.extend_from_slice(&input_value_var.to_bytes()?);
-        nullifier_preimage.extend_from_slice(&input_randomness_var);
+        nullifier_preimage.extend_from_slice(&commitment);
+        nullifier_preimage.extend_from_slice(&secret_var);
 
         let computed_nullifier = compute_hash_gadget(cs, &nullifier_preimage)?;
         computed_nullifier.enforce_equal(&nullifier_var)?;
@@ -612,6 +645,7 @@ mod tests {
         let withdraw_amount = 500u64;
         let input_value = 1000u64;
         let input_randomness = [3u8; 32];
+        let secret = [6u8; 32];
         let input_path = vec![([4u8; 32], true), ([5u8; 32], false)];
 
         let circuit = WithdrawCircuit::with_witness(
@@ -620,6 +654,7 @@ mod tests {
             withdraw_amount,
             input_value,
             input_randomness,
+            secret,
             input_path,
         );
         let cs = ConstraintSystem::<Fr>::new_ref();

@@ -6,6 +6,7 @@ use crate::privacy::circuits::Groth16ProofSystem;
 use crate::privacy::transaction::{DepositTx, TransferTx, WithdrawTx};
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
 use ark_bls12_381::{Bls12_381, Fr};
+use ark_ff::ToConstraintField;
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
@@ -241,21 +242,19 @@ impl ProofVerifier {
             }
         };
 
-        // Prepare public inputs: [merkle_root (32 bytes), nullifier (32 bytes), amount (1 Fr)]
-        // Each byte becomes a field element
+        // Prepare public inputs (5 field elements total)
+        // UInt8::new_input_vec in circuit packs 32 bytes into 2 field elements
         let mut public_inputs = Vec::new();
 
-        // Add merkle_root (32 Fr elements)
-        for byte in tx.merkle_root {
-            public_inputs.push(Fr::from(byte as u64));
-        }
+        // Merkle root: 32 bytes → 2 Fr elements
+        let root_fes: Vec<Fr> = tx.merkle_root.to_field_elements().unwrap();
+        public_inputs.extend(root_fes);
 
-        // Add nullifier (32 Fr elements)
-        for byte in tx.input_nullifier.0 {
-            public_inputs.push(Fr::from(byte as u64));
-        }
+        // Nullifier: 32 bytes → 2 Fr elements
+        let null_fes: Vec<Fr> = tx.input_nullifier.0.to_field_elements().unwrap();
+        public_inputs.extend(null_fes);
 
-        // Add amount (1 Fr element)
+        // Amount: 1 Fr element
         public_inputs.push(Fr::from(tx.amount));
 
         // Verify the zkSNARK proof

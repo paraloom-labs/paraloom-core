@@ -36,6 +36,9 @@ test-ledger/
 id.json
 /devnet-validators
 
+# Py Test
+*.py
+
 # zkSNARK keys and proofs
 keys/
 *.key

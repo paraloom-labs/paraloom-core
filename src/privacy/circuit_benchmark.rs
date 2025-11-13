@@ -133,12 +133,13 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
 
     // Benchmark Withdraw circuit
     let withdraw_circuit = WithdrawCircuit::with_witness(
-        [1u8; 32],
-        [2u8; 32],
-        500,
-        1000,
-        [3u8; 32],
-        vec![([4u8; 32], true), ([5u8; 32], false)],
+        [1u8; 32],   // merkle_root
+        [2u8; 32],   // nullifier
+        500,         // withdraw_amount
+        1000,        // input_value
+        [3u8; 32],   // input_randomness
+        [6u8; 32],   // secret
+        vec![([4u8; 32], true), ([5u8; 32], false)],  // merkle_path
     );
     let withdraw_metrics = benchmark_circuit(withdraw_circuit, "WithdrawCircuit");
 

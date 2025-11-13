@@ -113,7 +113,7 @@ ark-groth16 = "0.4"
 ark-snark = "0.4"
 ark-relations = "0.4"
 ark-r1cs-std = "0.4"
-ark-crypto-primitives = "0.4"
+ark-crypto-primitives = { version = "0.4", features = ["r1cs", "sponge"] }
 
 # Solana dependencies (optional, enabled with solana-bridge feature)
 # Using newer version to avoid dependency conflicts with arkworks

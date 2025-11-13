@@ -1,5 +1,6 @@
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
+use ark_ff::ToConstraintField;
+use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::thread_rng;
 use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
@@ -23,6 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("INPUT_VALUE").expect("INPUT_VALUE environment variable required");
     let input_randomness_hex = std::env::var("INPUT_RANDOMNESS")
         .expect("INPUT_RANDOMNESS environment variable required (hex string)");
+    let secret_hex = std::env::var("SECRET")
+        .expect("SECRET environment variable required (hex string)");
     let merkle_path_json =
         std::env::var("MERKLE_PATH").expect("MERKLE_PATH environment variable required (JSON)");
 
@@ -38,6 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_randomness = hex::decode(&input_randomness_hex)?;
     let mut input_randomness_bytes = [0u8; 32];
     input_randomness_bytes.copy_from_slice(&input_randomness);
+
+    let secret = hex::decode(&secret_hex)?;
+    let mut secret_bytes = [0u8; 32];
+    secret_bytes.copy_from_slice(&secret);
 
     let amount: u64 = amount_str.parse()?;
     let input_value: u64 = input_value_str.parse()?;
@@ -74,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         amount,
         input_value,
         input_randomness_bytes,
+        secret_bytes,
         merkle_path,
     );
 
@@ -101,21 +109,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verifying_key_bytes = fs::read(VERIFYING_KEY_PATH)?;
         let verifying_key = VerifyingKey::<Bls12_381>::deserialize_compressed(&verifying_key_bytes[..])?;
 
+        // Prepare public inputs (5 field elements total)
+        // UInt8::new_input_vec packs 32 bytes into 2 field elements
         let mut public_inputs = Vec::new();
-        for byte in merkle_root_bytes {
-            public_inputs.push(Fr::from(byte as u64));
-        }
-        for byte in nullifier_bytes {
-            public_inputs.push(Fr::from(byte as u64));
-        }
+
+        // Merkle root: 32 bytes → 2 Fr elements
+        let root_fes: Vec<Fr> = merkle_root_bytes.to_field_elements().unwrap();
+        public_inputs.extend(root_fes);
+
+        // Nullifier: 32 bytes → 2 Fr elements
+        let null_fes: Vec<Fr> = nullifier_bytes.to_field_elements().unwrap();
+        public_inputs.extend(null_fes);
+
+        // Amount: 1 Fr element
         public_inputs.push(Fr::from(amount));
+
+        println!("Public inputs prepared: {} field elements", public_inputs.len());
 
         let is_valid = Groth16ProofSystem::verify(&verifying_key, &public_inputs, &proof)?;
 
         if is_valid {
-            println!("Local verification: SUCCESS");
+            println!("✓ Local verification: SUCCESS");
         } else {
-            println!("Local verification: FAILED");
+            println!("✗ Local verification: FAILED");
             return Err("Proof verification failed".into());
         }
     }
