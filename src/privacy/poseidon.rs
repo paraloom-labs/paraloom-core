@@ -41,15 +41,7 @@ fn get_poseidon_config() -> &'static PoseidonConfig<Fr> {
         );
 
         // PoseidonConfig::new expects all usize
-        PoseidonConfig::new(
-            full_rounds,
-            partial_rounds,
-            alpha,
-            mds,
-            ark,
-            rate,
-            capacity,
-        )
+        PoseidonConfig::new(full_rounds, partial_rounds, alpha, mds, ark, rate, capacity)
     })
 }
 
@@ -256,6 +248,9 @@ mod tests {
 
         // Different data should produce different hash
         let hash3 = poseidon_hash_bytes(b"Different data");
-        assert_ne!(hash1, hash3, "Different inputs should produce different hashes");
+        assert_ne!(
+            hash1, hash3,
+            "Different inputs should produce different hashes"
+        );
     }
 }

@@ -30,8 +30,7 @@ fn test_poseidon_gadget_matches_native() {
     // Create witness variables for the input
     // IMPORTANT: Convert u64 to bytes directly, not through FpVar
     let input_value_bytes = UInt8::new_witness_vec(cs.clone(), &input_value.to_le_bytes()).unwrap();
-    let input_randomness_var =
-        UInt8::new_witness_vec(cs.clone(), &input_randomness[..]).unwrap();
+    let input_randomness_var = UInt8::new_witness_vec(cs.clone(), &input_randomness[..]).unwrap();
 
     // Combine into bytes
     let mut input_bytes = input_value_bytes;
@@ -39,7 +38,11 @@ fn test_poseidon_gadget_matches_native() {
 
     // Debug: Check what bytes we're hashing
     let input_bytes_values: Vec<u8> = input_bytes.iter().map(|b| b.value().unwrap()).collect();
-    println!("\nCircuit input bytes ({} bytes): {}", input_bytes_values.len(), hex::encode(&input_bytes_values));
+    println!(
+        "\nCircuit input bytes ({} bytes): {}",
+        input_bytes_values.len(),
+        hex::encode(&input_bytes_values)
+    );
 
     // Compute hash in circuit
     let circuit_hash_bytes = compute_hash_gadget(cs.clone(), &input_bytes).unwrap();

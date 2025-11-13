@@ -180,7 +180,9 @@ impl ProofVerifier {
                 .expect("Failed to deserialize verifying key")
         });
 
-        WITHDRAWAL_VERIFYING_KEY.get().ok_or_else(|| "Verifying key not loaded".to_string())
+        WITHDRAWAL_VERIFYING_KEY
+            .get()
+            .ok_or_else(|| "Verifying key not loaded".to_string())
     }
 
     /// Verify a deposit transaction

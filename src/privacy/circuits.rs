@@ -464,13 +464,8 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         })?;
 
         // Create byte representation of value (8 bytes for u64)
-        let input_value_bytes = UInt8::new_witness_vec(
-            cs.clone(),
-            &self
-                .input_value
-                .unwrap_or(0)
-                .to_le_bytes(),
-        )?;
+        let input_value_bytes =
+            UInt8::new_witness_vec(cs.clone(), &self.input_value.unwrap_or(0).to_le_bytes())?;
 
         let input_randomness_var =
             UInt8::new_witness_vec(cs.clone(), &self.input_randomness.unwrap_or([0u8; 32]))?;

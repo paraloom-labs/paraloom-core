@@ -54,7 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(VERIFYING_KEY_PATH, &verifying_key_bytes)?;
 
     println!("\n=== Setup Complete! ===");
-    println!("Proving key: {} ({} bytes)", PROVING_KEY_PATH, proving_key_bytes.len());
+    println!(
+        "Proving key: {} ({} bytes)",
+        PROVING_KEY_PATH,
+        proving_key_bytes.len()
+    );
     println!(
         "Verifying key: {} ({} bytes)",
         VERIFYING_KEY_PATH,

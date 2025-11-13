@@ -57,7 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("export INPUT_VALUE={}", input_value);
     println!("export INPUT_RANDOMNESS={}", hex::encode(&input_randomness));
     println!("export SECRET={}", hex::encode(&secret));
-    println!("export MERKLE_PATH='{}'", serde_json::to_string(&merkle_path)?);
+    println!(
+        "export MERKLE_PATH='{}'",
+        serde_json::to_string(&merkle_path)?
+    );
     println!();
 
     println!("=== Run Proof Generation ===\n");

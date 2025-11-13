@@ -15,8 +15,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== Withdrawal Proof Generator ===\n");
 
-    let nullifier_hex = std::env::var("NULLIFIER")
-        .expect("NULLIFIER environment variable required (hex string)");
+    let nullifier_hex =
+        std::env::var("NULLIFIER").expect("NULLIFIER environment variable required (hex string)");
     let amount_str = std::env::var("AMOUNT").expect("AMOUNT environment variable required");
     let merkle_root_hex = std::env::var("MERKLE_ROOT")
         .expect("MERKLE_ROOT environment variable required (hex string)");
@@ -24,8 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("INPUT_VALUE").expect("INPUT_VALUE environment variable required");
     let input_randomness_hex = std::env::var("INPUT_RANDOMNESS")
         .expect("INPUT_RANDOMNESS environment variable required (hex string)");
-    let secret_hex = std::env::var("SECRET")
-        .expect("SECRET environment variable required (hex string)");
+    let secret_hex =
+        std::env::var("SECRET").expect("SECRET environment variable required (hex string)");
     let merkle_path_json =
         std::env::var("MERKLE_PATH").expect("MERKLE_PATH environment variable required (JSON)");
 
@@ -107,7 +107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if Path::new(VERIFYING_KEY_PATH).exists() {
         println!("\nVerifying proof locally...");
         let verifying_key_bytes = fs::read(VERIFYING_KEY_PATH)?;
-        let verifying_key = VerifyingKey::<Bls12_381>::deserialize_compressed(&verifying_key_bytes[..])?;
+        let verifying_key =
+            VerifyingKey::<Bls12_381>::deserialize_compressed(&verifying_key_bytes[..])?;
 
         // Prepare public inputs (5 field elements total)
         // UInt8::new_input_vec packs 32 bytes into 2 field elements
@@ -124,7 +125,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Amount: 1 Fr element
         public_inputs.push(Fr::from(amount));
 
-        println!("Public inputs prepared: {} field elements", public_inputs.len());
+        println!(
+            "Public inputs prepared: {} field elements",
+            public_inputs.len()
+        );
 
         let is_valid = Groth16ProofSystem::verify(&verifying_key, &public_inputs, &proof)?;
 
