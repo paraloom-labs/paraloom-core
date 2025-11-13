@@ -1,16 +1,15 @@
 //! Zero-knowledge proof system interface
 //!
-//! This is a placeholder interface for the ZK proof system.
-//! In production, this would use libraries like:
-//! - bellman (for Groth16)
-//! - arkworks (for various proof systems)
-//! - halo2 (for recursive proofs)
-//!
-//! For now, we define the interface that validators will use.
+//! Implements Groth16 zkSNARK verification for withdrawal proofs using Arkworks.
 
+use crate::privacy::circuits::Groth16ProofSystem;
 use crate::privacy::transaction::{DepositTx, TransferTx, WithdrawTx};
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
+use ark_bls12_381::{Bls12_381, Fr};
+use ark_groth16::{Proof, VerifyingKey};
+use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 /// Proof verification result
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -158,10 +157,31 @@ impl VerificationChunk {
     }
 }
 
+/// Global verifying key for withdrawal proofs
+/// Loaded once from disk and cached for all verifications
+static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bls12_381>> = OnceLock::new();
+
 /// ZK Proof verifier interface
 pub struct ProofVerifier;
 
 impl ProofVerifier {
+    /// Load withdrawal verifying key from disk (cached)
+    fn get_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, String> {
+        WITHDRAWAL_VERIFYING_KEY.get_or_init(|| {
+            let key_path = std::env::var("WITHDRAWAL_VERIFYING_KEY_PATH")
+                .unwrap_or_else(|_| "keys/withdraw_verifying.key".to_string());
+
+            let key_bytes = std::fs::read(&key_path)
+                .map_err(|e| format!("Failed to read verifying key from {}: {}", key_path, e))
+                .expect("Verifying key file not found");
+
+            VerifyingKey::<Bls12_381>::deserialize_compressed(&key_bytes[..])
+                .expect("Failed to deserialize verifying key")
+        });
+
+        WITHDRAWAL_VERIFYING_KEY.get().ok_or_else(|| "Verifying key not loaded".to_string())
+    }
+
     /// Verify a deposit transaction
     pub fn verify_deposit(_tx: &DepositTx) -> VerificationResult {
         // Placeholder: Deposits don't need ZK proofs (public -> private)
@@ -190,17 +210,79 @@ impl ProofVerifier {
         VerificationResult::Valid
     }
 
-    /// Verify a withdraw transaction
+    /// Verify a withdraw transaction with real zkSNARK proof
     pub fn verify_withdraw(tx: &WithdrawTx) -> VerificationResult {
-        // In production, verify ZK proof of nullifier ownership
+        // Basic structure validation
         if !tx.verify() {
             return VerificationResult::Invalid {
-                reason: "Invalid withdraw transaction".to_string(),
+                reason: "Invalid withdraw transaction structure".to_string(),
             };
         }
 
-        // Placeholder: Accept for now
-        VerificationResult::Valid
+        // Load verifying key
+        let verifying_key = match Self::get_verifying_key() {
+            Ok(vk) => vk,
+            Err(e) => {
+                log::error!("Failed to load verifying key: {}", e);
+                return VerificationResult::Invalid {
+                    reason: format!("Verifying key not available: {}", e),
+                };
+            }
+        };
+
+        // Deserialize proof from bytes
+        let proof = match Proof::<Bls12_381>::deserialize_compressed(&tx.zk_proof[..]) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Failed to deserialize proof: {}", e);
+                return VerificationResult::Invalid {
+                    reason: format!("Invalid proof format: {}", e),
+                };
+            }
+        };
+
+        // Prepare public inputs: [merkle_root (32 bytes), nullifier (32 bytes), amount (1 Fr)]
+        // Each byte becomes a field element
+        let mut public_inputs = Vec::new();
+
+        // Add merkle_root (32 Fr elements)
+        for byte in tx.merkle_root {
+            public_inputs.push(Fr::from(byte as u64));
+        }
+
+        // Add nullifier (32 Fr elements)
+        for byte in tx.input_nullifier.0 {
+            public_inputs.push(Fr::from(byte as u64));
+        }
+
+        // Add amount (1 Fr element)
+        public_inputs.push(Fr::from(tx.amount));
+
+        // Verify the zkSNARK proof
+        match Groth16ProofSystem::verify(verifying_key, &public_inputs, &proof) {
+            Ok(true) => {
+                log::info!(
+                    "zkSNARK proof verified successfully for nullifier: {:?}",
+                    hex::encode(tx.input_nullifier.0)
+                );
+                VerificationResult::Valid
+            }
+            Ok(false) => {
+                log::warn!(
+                    "zkSNARK proof verification failed for nullifier: {:?}",
+                    hex::encode(tx.input_nullifier.0)
+                );
+                VerificationResult::Invalid {
+                    reason: "zkSNARK proof verification failed".to_string(),
+                }
+            }
+            Err(e) => {
+                log::error!("zkSNARK verification error: {}", e);
+                VerificationResult::Invalid {
+                    reason: format!("Verification error: {}", e),
+                }
+            }
+        }
     }
 
     /// Split verification into chunks for distributed processing

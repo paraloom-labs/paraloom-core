@@ -35,3 +35,8 @@ test-ledger/
 *.keypair
 id.json
 /devnet-validators
+
+# zkSNARK keys and proofs
+keys/
+*.key
+*_proof.bin
