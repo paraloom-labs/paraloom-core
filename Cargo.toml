@@ -59,6 +59,10 @@ path = "src/bin/test_deposit.rs"
 name = "test-withdraw"
 path = "src/bin/test_withdraw.rs"
 
+[[bin]]
+name = "compute-demo"
+path = "src/bin/compute_demo.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh"]
