@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main, feature/privacy-layer, feature/solana-bridge ]
+    branches: [ main, feature/privacy-layer, feature/solana-bridge, 'feature/zksnark-verification' ]
   pull_request:
     branches: [ main ]
 

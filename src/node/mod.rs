@@ -630,6 +630,7 @@ impl Node {
             input_value: Some(0u64),
             input_randomness: Some([0u8; 32]),
             input_path: None,
+            secret: Some([0u8; 32]),
         };
 
         let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng)?;
