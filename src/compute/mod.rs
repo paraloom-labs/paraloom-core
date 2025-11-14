@@ -48,8 +48,10 @@
 pub mod engine;
 pub mod executor;
 pub mod job;
+pub mod manager;
 
 // Re-export main types
 pub use engine::WasmEngine;
 pub use executor::{ExecutorStats, JobExecutor};
 pub use job::{ComputeJob, JobId, JobResult, JobStatus, ResourceLimits};
+pub use manager::{JobManager, ManagerStats, ValidatorCapacity, ValidatorId};
