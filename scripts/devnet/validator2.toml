@@ -1,0 +1,14 @@
+# Devnet Validator 2 Configuration
+[network]
+listen_address = "/ip4/0.0.0.0/tcp/9102"
+bootstrap_nodes = ["/ip4/127.0.0.1/tcp/9101"]
+enable_mdns = true
+
+[node]
+node_type = "ResourceProvider"
+max_cpu_usage = 80
+max_memory_usage = 70
+max_storage_usage = 10240
+
+[storage]
+data_dir = "./data/devnet/validator2"

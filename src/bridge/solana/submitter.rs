@@ -167,72 +167,40 @@ impl ResultSubmitter {
 
     /// Verify withdrawal proof on single node (no consensus)
     async fn verify_single_node(&self, request: &WithdrawalRequest) -> Result<()> {
-        use crate::privacy::{bytes_to_field, deserialize_proof, Groth16ProofSystem};
-        use ark_bls12_381::Fr;
-
-        // Deserialize proof
-        let proof = deserialize_proof(&request.proof).map_err(|e| {
-            BridgeError::InvalidTransaction(format!("Failed to deserialize proof: {}", e))
-        })?;
+        use crate::privacy::proof::ProofVerifier;
+        use crate::privacy::transaction::WithdrawTx;
+        use crate::privacy::Nullifier;
 
         // Get current Merkle root from pool
         let merkle_root = self.pool.root().await;
-        let merkle_root_field = bytes_to_field(&merkle_root)
-            .map_err(|e| BridgeError::InvalidTransaction(format!("Invalid Merkle root: {}", e)))?;
 
-        // Convert nullifier to field element
-        let nullifier_field = bytes_to_field(&request.nullifier)
-            .map_err(|e| BridgeError::InvalidTransaction(format!("Invalid nullifier: {}", e)))?;
+        // Create WithdrawTx for verification
+        let withdraw_tx = WithdrawTx {
+            tx_id: uuid::Uuid::new_v4().to_string(),
+            input_nullifier: Nullifier(request.nullifier),
+            amount: request.amount,
+            to_public: request.recipient.to_vec(),
+            zk_proof: request.proof.clone(),
+            merkle_root,
+            fee: request.fee,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
 
-        // Convert amount to field element
-        let amount_field = Fr::from(request.amount);
+        // Verify using ProofVerifier
+        let result = ProofVerifier::verify_withdraw(&withdraw_tx);
 
-        // Public inputs for verification
-        let public_inputs = vec![merkle_root_field, nullifier_field, amount_field];
-
-        // Load verifying key (for MVP, we'll use a test key)
-        let vk = Self::load_withdraw_verifying_key()?;
-
-        // Verify proof
-        let valid = Groth16ProofSystem::verify(&vk, &public_inputs, &proof).map_err(|e| {
-            BridgeError::InvalidTransaction(format!("Proof verification error: {}", e))
-        })?;
-
-        if !valid {
-            return Err(BridgeError::InvalidTransaction(
-                "Proof verification failed".to_string(),
-            ));
+        if !result.is_valid() {
+            return Err(BridgeError::InvalidTransaction(format!(
+                "Withdrawal proof verification failed: {:?}",
+                result
+            )));
         }
 
         log::info!("Withdrawal proof verified successfully (single node)");
         Ok(())
-    }
-
-    /// Load withdraw circuit verifying key
-    /// In production, this should be loaded from trusted setup
-    fn load_withdraw_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bls12_381::Bls12_381>>
-    {
-        // For Phase 2.5, we'll generate keys on-the-fly
-        // In production, these should be loaded from trusted setup
-        use crate::privacy::{Groth16ProofSystem, WithdrawCircuit};
-        use ark_std::rand::rngs::StdRng;
-        use ark_std::rand::SeedableRng;
-
-        let mut rng = StdRng::seed_from_u64(0u64);
-        let circuit = WithdrawCircuit {
-            merkle_root: Some([0u8; 32]),
-            nullifier: Some([0u8; 32]),
-            withdraw_amount: Some(0u64),
-            input_value: Some(0u64),
-            input_randomness: Some([0u8; 32]),
-            input_path: None,
-        };
-
-        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).map_err(|e| {
-            BridgeError::InvalidTransaction(format!("Failed to setup circuit: {}", e))
-        })?;
-
-        Ok(vk)
     }
 
     /// Submit withdrawal transaction to Solana

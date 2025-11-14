@@ -106,9 +106,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Privacy transaction verified\n");
 
-    println!("Creating zkSNARK proof (mock)...");
-    let mock_proof = vec![0u8; 192];
-    println!("Proof size: {} bytes\n", mock_proof.len());
+    // Load zkSNARK proof
+    println!("Loading zkSNARK proof...");
+    let proof_path = std::env::var("WITHDRAWAL_PROOF_PATH")
+        .unwrap_or_else(|_| "withdrawal_proof.bin".to_string());
+
+    let proof = std::fs::read(&proof_path).map_err(|e| {
+        format!(
+            "Failed to read proof from {}: {}.\n\
+             Please generate proof first using:\n\
+             cargo run --bin generate_withdrawal_proof",
+            proof_path, e
+        )
+    })?;
+
+    println!("Proof loaded: {} bytes\n", proof.len());
 
     println!("Creating on-chain withdrawal instruction...");
     let ix = create_withdraw_instruction(
@@ -118,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         recipient_pubkey.to_bytes(),
         *nullifier.as_bytes(),
         amount,
-        mock_proof,
+        proof,
     )?;
 
     println!("Getting recent blockhash...");
