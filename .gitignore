@@ -43,3 +43,7 @@ id.json
 keys/
 *.key
 *_proof.bin
+# Runtime files
+pids/
+logs/
+data/
