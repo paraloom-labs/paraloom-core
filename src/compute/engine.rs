@@ -34,9 +34,15 @@ impl WasmEngine {
         // Set memory limits at engine level
         config.max_wasm_stack(2 * 1024 * 1024); // 2MB stack
 
+        // Enable epoch interruption for timeouts
+        config.epoch_interruption(true);
+
+        // Enable fuel consumption tracking for instruction counting
+        config.consume_fuel(true);
+
         let engine = Engine::new(&config)?;
 
-        info!("WASM engine initialized with security settings");
+        info!("WASM engine initialized with security settings, epoch interruption, and fuel tracking");
 
         Ok(Self { engine })
     }
@@ -132,6 +138,9 @@ impl WasmEngine {
             memory.write(&mut store, input_ptr as usize, &job.input_data)?;
         }
 
+        // Get initial fuel to calculate consumption
+        let initial_fuel = store.get_fuel().unwrap_or(0);
+
         // Execute the function with timeout
         let result = match self.execute_with_timeout(
             &mut store,
@@ -141,22 +150,39 @@ impl WasmEngine {
             Duration::from_secs(job.timeout_secs),
         ) {
             Ok(output_ptr) => {
+                // Calculate instruction count from fuel consumption
+                let remaining_fuel = store.get_fuel().unwrap_or(0);
+                let instructions_executed = initial_fuel.saturating_sub(remaining_fuel);
+
                 // Read output data from memory
-                let output_len = 1024; // TODO: Get actual output length from return value
+                // The output_ptr is the starting position, we need to determine length
+                // For now, read up to 64KB or until we hit zeros (depends on contract)
+                let max_output_size = 65536; // 64KB max output
+                let output_len = if output_ptr >= 0 && (output_ptr as usize) < memory.data_size(&store) {
+                    // Read a reasonable amount of data
+                    // In real scenarios, the WASM module should return length or use a convention
+                    std::cmp::min(max_output_size, memory.data_size(&store) - (output_ptr as usize))
+                } else {
+                    0
+                };
+
                 let mut output_data = vec![0u8; output_len];
-                memory.read(&store, output_ptr as usize, &mut output_data)?;
+                if output_len > 0 {
+                    memory.read(&store, output_ptr as usize, &mut output_data)?;
+                }
 
                 let execution_time = start_time.elapsed().as_millis() as u64;
                 let memory_used = memory.data_size(&store) as u64;
 
-                debug!("Job {} completed successfully in {}ms", job.id, execution_time);
+                debug!("Job {} completed successfully in {}ms, {} instructions executed",
+                       job.id, execution_time, instructions_executed);
 
                 JobResult::success(
                     job.id.clone(),
                     output_data,
                     execution_time,
                     memory_used,
-                    0, // TODO: Track actual instruction count
+                    instructions_executed,
                 )
             }
             Err(e) => {
@@ -176,21 +202,23 @@ impl WasmEngine {
     fn create_store_with_limits(
         &self,
         max_memory_bytes: u64,
-        _max_instructions: u64,
+        max_instructions: u64,
     ) -> Result<Store<ResourceLimiterImpl>> {
-        // Set memory limit (WASM pages are 64KB = 65536 bytes)
-        let memory_limit_pages = (max_memory_bytes / 65536) as usize;
-
-        debug!("Creating store with memory limit: {} pages ({} bytes)",
-               memory_limit_pages, max_memory_bytes);
+        debug!("Creating store with memory limit: {} bytes, instruction limit: {}",
+               max_memory_bytes, max_instructions);
 
         let limiter = ResourceLimiterImpl {
-            memory_limit_pages,
+            memory_limit_bytes: max_memory_bytes as usize,
         };
 
         let mut store = Store::new(&self.engine, limiter);
-        // The store's data (ResourceLimiterImpl) automatically acts as the limiter
-        store.limiter(|state| state as &mut dyn ResourceLimiter);
+
+        // Set the limiter on the store
+        store.limiter(|state| state);
+
+        // Set fuel limit for instruction counting
+        // Each fuel unit roughly corresponds to one WASM instruction
+        store.set_fuel(max_instructions)?;
 
         Ok(store)
     }
@@ -212,12 +240,38 @@ impl WasmEngine {
         func: &TypedFunc<(i32, i32), i32>,
         input_ptr: i32,
         input_len: i32,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<i32> {
-        // TODO: Implement proper timeout mechanism
-        // For now, just execute directly
-        func.call(store, (input_ptr, input_len))
-            .map_err(|e| anyhow!("WASM execution error: {}", e))
+        // Set epoch deadline for timeout
+        // Deadline is current epoch + timeout in ticks (1 tick = 1ms approximately)
+        let timeout_ticks = timeout.as_millis() as u64;
+        store.set_epoch_deadline(timeout_ticks);
+
+        // Start epoch incrementing in background
+        let engine_handle = self.engine.clone();
+        let timeout_duration = timeout;
+        let epoch_thread = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < timeout_duration {
+                engine_handle.increment_epoch();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        // Execute the function
+        let result = func.call(store, (input_ptr, input_len))
+            .map_err(|e| {
+                if e.to_string().contains("epoch") {
+                    anyhow!("WASM execution timeout after {:?}", timeout)
+                } else {
+                    anyhow!("WASM execution error: {}", e)
+                }
+            });
+
+        // Clean up epoch thread (it will finish naturally)
+        drop(epoch_thread);
+
+        result
     }
 }
 
@@ -229,7 +283,7 @@ impl Default for WasmEngine {
 
 /// Resource limiter implementation
 struct ResourceLimiterImpl {
-    memory_limit_pages: usize,
+    memory_limit_bytes: usize,
 }
 
 impl ResourceLimiter for ResourceLimiterImpl {
@@ -239,17 +293,17 @@ impl ResourceLimiter for ResourceLimiterImpl {
         desired: usize,
         _maximum: Option<usize>,
     ) -> anyhow::Result<bool> {
-        // Allow memory growth if within limits
-        let allowed = desired <= self.memory_limit_pages;
+        // In modern Wasmtime, parameters are in BYTES, not pages
+        let allowed = desired <= self.memory_limit_bytes;
 
         if !allowed {
             warn!(
-                "Memory limit would be exceeded: desired {} pages, limit {} pages",
-                desired, self.memory_limit_pages
+                "Memory limit would be exceeded: desired {} bytes, limit {} bytes",
+                desired, self.memory_limit_bytes
             );
         } else {
-            debug!("Memory growing from {} to {} pages (limit: {})",
-                   current, desired, self.memory_limit_pages);
+            debug!("Memory growing from {} to {} bytes (limit: {})",
+                   current, desired, self.memory_limit_bytes);
         }
 
         Ok(allowed)
@@ -292,7 +346,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix ResourceLimiter integration with Wasmtime v26
     fn test_valid_wasm_module() {
         let engine = WasmEngine::new().unwrap();
 
