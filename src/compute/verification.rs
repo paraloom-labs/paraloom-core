@@ -254,9 +254,56 @@ impl VerificationCoordinator {
         let requests = self.requests.read().await;
         let results = self.results.read().await;
 
+        let total_results: usize = results.values().map(|v| v.len()).sum();
+
+        // Analyze current verifications for consensus state
+        let mut consensus_agreements = 0;
+        let mut consensus_disagreements = 0;
+        let mut insufficient_results = 0;
+
+        for (_job_id, validator_results) in results.iter() {
+            if validator_results.len() < CONSENSUS_THRESHOLD {
+                insufficient_results += 1;
+                continue;
+            }
+
+            // Check if we have consensus (simplified check)
+            let output_hashes: Vec<_> = validator_results
+                .iter()
+                .filter_map(|r| r.result.output_data.as_ref().map(|d| d.clone()))
+                .collect();
+
+            if output_hashes.is_empty() {
+                continue;
+            }
+
+            // Count matching outputs
+            let mut hash_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+            for hash in output_hashes {
+                *hash_counts.entry(hash).or_insert(0) += 1;
+            }
+
+            let max_agreement = hash_counts.values().max().copied().unwrap_or(0);
+            if max_agreement >= CONSENSUS_THRESHOLD {
+                consensus_agreements += 1;
+            } else {
+                consensus_disagreements += 1;
+            }
+        }
+
+        let avg_validators = if !requests.is_empty() {
+            results.values().map(|v| v.len()).sum::<usize>() as f64 / requests.len() as f64
+        } else {
+            0.0
+        };
+
         VerificationStats {
             active_verifications: requests.len(),
-            total_results_collected: results.values().map(|v| v.len()).sum(),
+            total_results_collected: total_results,
+            consensus_agreements,
+            consensus_disagreements,
+            insufficient_results,
+            average_validators_per_job: avg_validators,
         }
     }
 }
@@ -272,6 +319,10 @@ impl Default for VerificationCoordinator {
 pub struct VerificationStats {
     pub active_verifications: usize,
     pub total_results_collected: usize,
+    pub consensus_agreements: usize,
+    pub consensus_disagreements: usize,
+    pub insufficient_results: usize,
+    pub average_validators_per_job: f64,
 }
 
 #[cfg(test)]

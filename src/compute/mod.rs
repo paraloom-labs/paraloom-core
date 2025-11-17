@@ -55,6 +55,7 @@ pub mod verification;
 // Re-export main types
 pub use distribution::{
     CapacityAnnouncement, CoordinatorStats, JobAssignment, JobCoordinator, ValidatorJobFetcher,
+    DEFAULT_JOB_TIMEOUT_SECS, MAX_JOB_RETRIES,
 };
 pub use engine::WasmEngine;
 pub use executor::{ExecutorStats, JobExecutor};

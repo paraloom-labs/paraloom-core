@@ -216,12 +216,45 @@ impl JobExecutor {
     pub fn get_stats(&self) -> ExecutorStats {
         let pending_count = self.pending_jobs.lock().unwrap().len();
         let active_count = self.active_jobs.lock().unwrap().len();
-        let completed_count = self.completed_results.lock().unwrap().len();
+        let completed = self.completed_results.lock().unwrap();
+
+        // Calculate aggregate metrics from completed jobs
+        let mut failed_count = 0;
+        let mut total_exec_time = 0u64;
+        let mut total_memory = 0u64;
+        let mut total_instructions = 0u64;
+        let mut completed_count = 0;
+
+        for result in completed.values() {
+            match result.status {
+                JobStatus::Completed => {
+                    completed_count += 1;
+                    total_exec_time += result.execution_time_ms;
+                    total_memory += result.memory_used_bytes;
+                    total_instructions += result.instructions_executed;
+                }
+                JobStatus::Failed { .. } => {
+                    failed_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let avg_exec_time = if completed_count > 0 {
+            total_exec_time / completed_count as u64
+        } else {
+            0
+        };
 
         ExecutorStats {
             pending_jobs: pending_count,
             active_jobs: active_count,
             completed_jobs: completed_count,
+            failed_jobs: failed_count,
+            total_execution_time_ms: total_exec_time,
+            average_execution_time_ms: avg_exec_time,
+            total_memory_used_bytes: total_memory,
+            total_instructions_executed: total_instructions,
         }
     }
 
@@ -245,6 +278,11 @@ pub struct ExecutorStats {
     pub pending_jobs: usize,
     pub active_jobs: usize,
     pub completed_jobs: usize,
+    pub failed_jobs: usize,
+    pub total_execution_time_ms: u64,
+    pub average_execution_time_ms: u64,
+    pub total_memory_used_bytes: u64,
+    pub total_instructions_executed: u64,
 }
 
 #[cfg(test)]
