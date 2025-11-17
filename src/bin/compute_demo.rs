@@ -1,16 +1,14 @@
 //! Compute layer demonstration
 //!
-//! This demo shows the distributed compute capabilities:
-//! - Multiple validators registering with capacity
-//! - Job submission and distribution
-//! - Load balancing across validators
-//! - Result aggregation
+//! This demo shows REAL WASM execution with:
+//! - JobExecutor with real WasmEngine
+//! - Multiple WASM programs executing concurrently
+//! - Resource limits (memory, instructions, timeout)
+//! - Real execution metrics
 
 use anyhow::Result;
 use log::info;
-use paraloom::compute::{
-    ComputeJob, JobManager, JobStatus, ResourceLimits, ValidatorCapacity,
-};
+use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -19,136 +17,137 @@ async fn main() -> Result<()> {
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    info!("=== Paraloom Distributed Compute Demo ===\n");
+    info!("=== Paraloom Real WASM Execution Demo ===\n");
 
-    // Create job manager
-    let manager = JobManager::new();
+    // Create executor with real WASM engine
+    let executor = JobExecutor::new()?;
+    info!("✓ JobExecutor created with WasmEngine\n");
 
-    // Register 3 validators with different capacities
-    info!("1. Registering validators...");
-    manager.register_validator(ValidatorCapacity::new(
-        "validator1".to_string(),
-        8,    // 8 CPU cores
-        16384, // 16GB RAM
-        4,    // Max 4 concurrent jobs
-    ))?;
+    // Start the executor
+    executor.start().await?;
+    info!("✓ Executor started, processing jobs...\n");
 
-    manager.register_validator(ValidatorCapacity::new(
-        "validator2".to_string(),
-        4,    // 4 CPU cores
-        8192, // 8GB RAM
-        2,    // Max 2 concurrent jobs
-    ))?;
+    // Demo 1: Simple arithmetic
+    info!("1. Simple WASM execution (returns 42)...");
+    let wat1 = r#"
+        (module
+            (memory (export "memory") 1)
+            (func (export "execute") (param i32 i32) (result i32)
+                i32.const 42
+            )
+        )
+    "#;
+    let wasm1 = wat::parse_str(wat1)?;
+    let job1 = ComputeJob::new(wasm1, vec![], ResourceLimits::default());
+    let job_id1 = executor.submit_job(job1)?;
+    info!("  Job submitted: {}", job_id1);
 
-    manager.register_validator(ValidatorCapacity::new(
-        "validator3".to_string(),
-        16,   // 16 CPU cores
-        32768, // 32GB RAM
-        8,    // Max 8 concurrent jobs
-    ))?;
+    // Demo 2: Sum input bytes
+    info!("\n2. Memory operation (sum input bytes)...");
+    let wat2 = r#"
+        (module
+            (memory (export "memory") 1)
+            (func (export "execute") (param i32 i32) (result i32)
+                (local $i i32)
+                (local $sum i32)
+                (local.set $sum (i32.const 0))
+                (block $break
+                    (loop $continue
+                        (br_if $break (i32.ge_u (local.get $i) (local.get 1)))
+                        (local.set $sum
+                            (i32.add
+                                (local.get $sum)
+                                (i32.load8_u (i32.add (local.get 0) (local.get $i)))
+                            )
+                        )
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br $continue)
+                    )
+                )
+                (local.get $sum)
+            )
+        )
+    "#;
+    let wasm2 = wat::parse_str(wat2)?;
+    let job2 = ComputeJob::new(wasm2, vec![10, 20, 30, 40], ResourceLimits::default());
+    let job_id2 = executor.submit_job(job2)?;
+    info!("  Job submitted: {} (input: [10, 20, 30, 40])", job_id2);
 
-    print_stats(&manager);
+    // Demo 3: Multiple concurrent jobs
+    info!("\n3. Submitting 5 concurrent jobs...");
+    let wat3 = r#"
+        (module
+            (memory (export "memory") 1)
+            (func (export "execute") (param i32 i32) (result i32)
+                (local.get 1)
+            )
+        )
+    "#;
+    let wasm3 = wat::parse_str(wat3)?;
 
-    // Submit 7 compute jobs
-    info!("\n2. Submitting compute jobs...");
-    let mut job_ids = Vec::new();
-
-    for i in 0..7 {
+    let mut concurrent_jobs = Vec::new();
+    for i in 0..5 {
         let job = ComputeJob::new(
-            vec![0x00, 0x61, 0x73, 0x6d], // WASM bytecode
-            vec![i],                       // Input data
+            wasm3.clone(),
+            vec![i; i as usize],
             ResourceLimits::default(),
         );
-
-        let job_id = manager.submit_job(job)?;
-        info!("  Submitted job {}: {}", i + 1, job_id);
-        job_ids.push(job_id);
+        let job_id = executor.submit_job(job)?;
+        concurrent_jobs.push(job_id.clone());
+        info!("  Job {} submitted: {}", i + 1, job_id);
     }
 
-    print_stats(&manager);
+    // Wait for all jobs to complete
+    info!("\n4. Waiting for jobs to complete...");
+    let all_jobs = vec![job_id1, job_id2]
+        .into_iter()
+        .chain(concurrent_jobs)
+        .collect::<Vec<_>>();
 
-    // Assign jobs to validators (load balancing)
-    info!("\n3. Assigning jobs to validators (load balancing)...");
-    let assignments = manager.assign_jobs()?;
-
-    for assignment in &assignments {
-        info!(
-            "  Job {} → {}",
-            &assignment.job_id[..8],
-            assignment.validator_id
-        );
-    }
-
-    print_stats(&manager);
-
-    // Show load distribution
-    info!("\n4. Load distribution:");
-    let stats = manager.get_stats();
-    info!(
-        "  Total capacity: {} jobs across {} validators",
-        stats.total_capacity, stats.active_validators
-    );
-    info!(
-        "  Active jobs: {} | Pending: {}",
-        stats.active_jobs, stats.pending_jobs
-    );
-
-    // Simulate job execution by submitting results
-    info!("\n5. Simulating job execution...");
-    sleep(Duration::from_millis(500)).await;
-
-    for (idx, job_id) in job_ids.iter().enumerate() {
-        let result = paraloom::compute::JobResult::success(
-            job_id.clone(),
-            vec![42u8; 10], // Output data
-            100 + (idx as u64 * 10), // Execution time
-            1024,           // Memory used
-            50000,          // Instructions executed
-        );
-
-        manager.submit_result(result)?;
-        info!("  ✓ Job {} completed", idx + 1);
-    }
-
-    print_stats(&manager);
-
-    // Check final status
-    info!("\n6. Final status:");
-    for (idx, job_id) in job_ids.iter().enumerate() {
-        if let Some(status) = manager.get_job_status(job_id) {
-            info!("  Job {}: {:?}", idx + 1, status);
-        }
-    }
-
-    // Get results
-    info!("\n7. Retrieving results...");
     let mut completed = 0;
-    for job_id in &job_ids {
-        if let Some(result) = manager.get_result(job_id) {
-            if result.status == JobStatus::Completed {
-                completed += 1;
-                info!(
-                    "  Job result: {} bytes output, {}ms execution",
-                    result.output_data.as_ref().map(|d| d.len()).unwrap_or(0),
-                    result.execution_time_ms
-                );
+    for job_id in &all_jobs {
+        if let Some(result) = wait_for_result(&executor, job_id).await {
+            completed += 1;
+            match result.status {
+                JobStatus::Completed => {
+                    info!(
+                        "  ✓ Job {} completed: {}ms, {} bytes memory, {} instructions",
+                        &job_id[..8],
+                        result.execution_time_ms,
+                        result.memory_used_bytes,
+                        result.instructions_executed
+                    );
+                }
+                JobStatus::Failed { ref error } => {
+                    info!("  ✗ Job {} failed: {}", &job_id[..8], error);
+                }
+                _ => {}
             }
         }
     }
 
+    // Show final stats
+    info!("\n5. Final statistics:");
+    let stats = executor.get_stats();
+    info!("  Total jobs: {}", all_jobs.len());
+    info!("  Completed: {}", completed);
+    info!("  Pending: {}", stats.pending_jobs);
+    info!("  Active: {}", stats.active_jobs);
+
     info!("\n=== Demo Complete ===");
-    info!("Successfully executed {}/{} jobs across {} validators",
-          completed, job_ids.len(), stats.active_validators);
+    info!("Successfully executed {} WASM programs with real WasmEngine!", completed);
 
     Ok(())
 }
 
-fn print_stats(manager: &JobManager) {
-    let stats = manager.get_stats();
-    info!("  Stats: {} validators | {} active jobs | {} pending | {} completed",
-          stats.active_validators,
-          stats.active_jobs,
-          stats.pending_jobs,
-          stats.completed_jobs
-    );
+// Helper to wait for job completion
+async fn wait_for_result(executor: &JobExecutor, job_id: &str) -> Option<paraloom::compute::JobResult> {
+    let job_id_string = job_id.to_string();
+    for _ in 0..100 {
+        if let Some(result) = executor.get_job_result(&job_id_string) {
+            return Some(result);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    None
 }
