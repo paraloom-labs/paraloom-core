@@ -21,4 +21,4 @@ anchor-lang = "0.31"
 
 [dev-dependencies]
 solana-program-test = "1.17"
-solana-sdk = "1.17"
+solana-sdk = "1.18.26"
