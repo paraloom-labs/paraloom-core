@@ -134,7 +134,8 @@ pub struct JobCoordinator {
     validators: Arc<RwLock<HashMap<ValidatorId, CapacityAnnouncement>>>,
 
     /// Pending job assignments waiting to be fetched
-    pending_assignments: Arc<RwLock<HashMap<JobId, JobAssignment>>>,
+    /// Note: Public for integration testing
+    pub pending_assignments: Arc<RwLock<HashMap<JobId, JobAssignment>>>,
 
     /// Active assignments (validator has fetched the job)
     active_assignments: Arc<RwLock<HashMap<JobId, JobAssignment>>>,
@@ -311,7 +312,9 @@ impl JobCoordinator {
                                 pending_count
                             };
 
-                            if current_load < validator.max_concurrent_jobs && current_load < best_load {
+                            if current_load < validator.max_concurrent_jobs
+                                && current_load < best_load
+                            {
                                 best_load = current_load;
                                 best_validator = Some(validator);
                             }
@@ -319,13 +322,16 @@ impl JobCoordinator {
 
                         if let Some(validator) = best_validator {
                             // Create retried assignment with incremented retry count
-                            let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                            let new_assignment =
+                                old_assignment.retry(validator.validator_id.clone());
                             pending.insert(job_id.clone(), new_assignment);
                             reassigned_jobs.push(job_id.clone());
 
                             info!(
                                 "Reassigned job {} to validator {} (retry {})",
-                                job_id, validator.validator_id, old_assignment.retry_count + 1
+                                job_id,
+                                validator.validator_id,
+                                old_assignment.retry_count + 1
                             );
                         } else {
                             warn!("No available validators to reassign job {}", job_id);
@@ -377,7 +383,9 @@ impl JobCoordinator {
                                 pending_count + active_count
                             };
 
-                            if current_load < validator.max_concurrent_jobs && current_load < best_load {
+                            if current_load < validator.max_concurrent_jobs
+                                && current_load < best_load
+                            {
                                 best_load = current_load;
                                 best_validator = Some(validator);
                             }
@@ -385,7 +393,8 @@ impl JobCoordinator {
 
                         if let Some(validator) = best_validator {
                             // Create retried assignment and add to pending
-                            let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                            let new_assignment =
+                                old_assignment.retry(validator.validator_id.clone());
                             drop(pending); // Release pending read lock
                             let mut pending_write = self.pending_assignments.write().await;
                             pending_write.insert(job_id.clone(), new_assignment);
@@ -393,7 +402,9 @@ impl JobCoordinator {
 
                             info!(
                                 "Reassigned active job {} to validator {} (retry {})",
-                                job_id, validator.validator_id, old_assignment.retry_count + 1
+                                job_id,
+                                validator.validator_id,
+                                old_assignment.retry_count + 1
                             );
                         } else {
                             warn!("No available validators to reassign active job {}", job_id);
@@ -453,7 +464,9 @@ impl JobCoordinator {
                                 pending_count
                             };
 
-                            if current_load < validator.max_concurrent_jobs && current_load < best_load {
+                            if current_load < validator.max_concurrent_jobs
+                                && current_load < best_load
+                            {
                                 best_load = current_load;
                                 best_validator = Some(validator);
                             }
@@ -461,13 +474,16 @@ impl JobCoordinator {
 
                         if let Some(validator) = best_validator {
                             // Create retried assignment with incremented retry count
-                            let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                            let new_assignment =
+                                old_assignment.retry(validator.validator_id.clone());
                             pending.insert(job_id.clone(), new_assignment);
                             reassigned_count += 1;
 
                             info!(
                                 "Reassigned job {} to validator {} (retry {})",
-                                job_id, validator.validator_id, old_assignment.retry_count + 1
+                                job_id,
+                                validator.validator_id,
+                                old_assignment.retry_count + 1
                             );
                         } else {
                             warn!("No available validators to reassign job {}", job_id);
@@ -518,7 +534,9 @@ impl JobCoordinator {
                                 pending_count + active_count
                             };
 
-                            if current_load < validator.max_concurrent_jobs && current_load < best_load {
+                            if current_load < validator.max_concurrent_jobs
+                                && current_load < best_load
+                            {
                                 best_load = current_load;
                                 best_validator = Some(validator);
                             }
@@ -526,7 +544,8 @@ impl JobCoordinator {
 
                         if let Some(validator) = best_validator {
                             // Create retried assignment and add to pending
-                            let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                            let new_assignment =
+                                old_assignment.retry(validator.validator_id.clone());
                             drop(pending); // Release pending read lock
                             let mut pending_write = self.pending_assignments.write().await;
                             pending_write.insert(job_id.clone(), new_assignment);
@@ -534,7 +553,9 @@ impl JobCoordinator {
 
                             info!(
                                 "Reassigned active job {} to validator {} (retry {})",
-                                job_id, validator.validator_id, old_assignment.retry_count + 1
+                                job_id,
+                                validator.validator_id,
+                                old_assignment.retry_count + 1
                             );
                         } else {
                             warn!("No available validators to reassign active job {}", job_id);
@@ -851,7 +872,10 @@ mod tests {
         assert_eq!(stats_before.pending_assignments, 2);
 
         // Handle v1 failure
-        let reassigned = coordinator.handle_validator_failure(&"v1".to_string()).await.unwrap();
+        let reassigned = coordinator
+            .handle_validator_failure(&"v1".to_string())
+            .await
+            .unwrap();
         assert_eq!(reassigned, 2);
 
         // Check that jobs were reassigned to v2
