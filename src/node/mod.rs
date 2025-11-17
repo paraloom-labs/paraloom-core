@@ -327,6 +327,24 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             } => {
                 info!("Validator heartbeat: {:?} at {}", validator_id, timestamp);
             }
+
+            // Compute-related messages (stub handlers for now)
+            Message::ComputeJobRequest { .. } => {
+                info!("Received compute job request from {}", source);
+                // TODO: Handle compute job submission
+            }
+            Message::ComputeJobResponse { .. } => {
+                info!("Received compute job response from {}", source);
+                // TODO: Handle compute job response
+            }
+            Message::ComputeJobQuery { .. } => {
+                info!("Received compute job query from {}", source);
+                // TODO: Handle compute job query
+            }
+            Message::ComputeJobResult { .. } => {
+                info!("Received compute job result from {}", source);
+                // TODO: Handle compute job result
+            }
         }
         Ok(())
     }
