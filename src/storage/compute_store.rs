@@ -46,7 +46,8 @@ impl ComputeStorage {
         let cf_completed = ColumnFamilyDescriptor::new(CF_COMPLETED_RESULTS, Options::default());
 
         // Open database with column families
-        let db = DB::open_cf_descriptors(&options, path, vec![cf_pending, cf_active, cf_completed])?;
+        let db =
+            DB::open_cf_descriptors(&options, path, vec![cf_pending, cf_active, cf_completed])?;
 
         Ok(ComputeStorage { db: Arc::new(db) })
     }
@@ -122,7 +123,10 @@ impl ComputeStorage {
             .cf_handle(CF_PENDING_JOBS)
             .ok_or_else(|| anyhow!("Pending jobs CF not found"))?;
 
-        let count = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start).count();
+        let count = self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .count();
         Ok(count)
     }
 
@@ -200,7 +204,10 @@ impl ComputeStorage {
             .cf_handle(CF_ACTIVE_JOBS)
             .ok_or_else(|| anyhow!("Active jobs CF not found"))?;
 
-        let count = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start).count();
+        let count = self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .count();
         Ok(count)
     }
 
@@ -278,7 +285,10 @@ impl ComputeStorage {
             .cf_handle(CF_COMPLETED_RESULTS)
             .ok_or_else(|| anyhow!("Completed results CF not found"))?;
 
-        let count = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start).count();
+        let count = self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .count();
         Ok(count)
     }
 
@@ -396,13 +406,7 @@ mod tests {
         storage.mark_job_active(&job).unwrap();
 
         // Store result
-        let result = crate::compute::JobResult::success(
-            job_id.clone(),
-            vec![42],
-            100,
-            1024,
-            50000,
-        );
+        let result = crate::compute::JobResult::success(job_id.clone(), vec![42], 100, 1024, 50000);
 
         storage.store_result(&result).unwrap();
         assert_eq!(storage.count_active_jobs().unwrap(), 0);

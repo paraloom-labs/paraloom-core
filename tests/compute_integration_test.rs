@@ -26,12 +26,7 @@ fn test_distributed_compute_workflow() {
         .unwrap();
 
     manager
-        .register_validator(ValidatorCapacity::new(
-            "validator2".to_string(),
-            4,
-            8192,
-            2,
-        ))
+        .register_validator(ValidatorCapacity::new("validator2".to_string(), 4, 8192, 2))
         .unwrap();
 
     manager
@@ -93,13 +88,7 @@ fn test_distributed_compute_workflow() {
 
     // Submit results
     for job_id in &job_ids {
-        let result = JobResult::success(
-            job_id.clone(),
-            vec![42; 10],
-            100,
-            1024,
-            50000,
-        );
+        let result = JobResult::success(job_id.clone(), vec![42; 10], 100, 1024, 50000);
         manager.submit_result(result).unwrap();
     }
 
@@ -124,21 +113,11 @@ fn test_load_balancing_priority() {
 
     // Register validators with different capacities
     manager
-        .register_validator(ValidatorCapacity::new(
-            "small".to_string(),
-            2,
-            4096,
-            1,
-        ))
+        .register_validator(ValidatorCapacity::new("small".to_string(), 2, 4096, 1))
         .unwrap();
 
     manager
-        .register_validator(ValidatorCapacity::new(
-            "large".to_string(),
-            16,
-            32768,
-            8,
-        ))
+        .register_validator(ValidatorCapacity::new("large".to_string(), 16, 32768, 8))
         .unwrap();
 
     // Submit 2 jobs
@@ -169,12 +148,7 @@ fn test_validator_capacity_limits() {
 
     // Register validator with max 2 jobs
     manager
-        .register_validator(ValidatorCapacity::new(
-            "limited".to_string(),
-            4,
-            8192,
-            2,
-        ))
+        .register_validator(ValidatorCapacity::new("limited".to_string(), 4, 8192, 2))
         .unwrap();
 
     // Submit 3 jobs
@@ -200,12 +174,7 @@ fn test_job_status_tracking() {
     let manager = JobManager::new();
 
     manager
-        .register_validator(ValidatorCapacity::new(
-            "test".to_string(),
-            4,
-            8192,
-            2,
-        ))
+        .register_validator(ValidatorCapacity::new("test".to_string(), 4, 8192, 2))
         .unwrap();
 
     // Create and submit job
@@ -214,29 +183,20 @@ fn test_job_status_tracking() {
     manager.submit_job(job).unwrap();
 
     // Check pending status
-    assert_eq!(
-        manager.get_job_status(&job_id),
-        Some(JobStatus::Pending)
-    );
+    assert_eq!(manager.get_job_status(&job_id), Some(JobStatus::Pending));
 
     // Assign job
     manager.assign_jobs().unwrap();
 
     // Check running status
-    assert_eq!(
-        manager.get_job_status(&job_id),
-        Some(JobStatus::Running)
-    );
+    assert_eq!(manager.get_job_status(&job_id), Some(JobStatus::Running));
 
     // Submit result
     let result = JobResult::success(job_id.clone(), vec![42], 100, 1024, 50000);
     manager.submit_result(result).unwrap();
 
     // Check completed status
-    assert_eq!(
-        manager.get_job_status(&job_id),
-        Some(JobStatus::Completed)
-    );
+    assert_eq!(manager.get_job_status(&job_id), Some(JobStatus::Completed));
 }
 
 #[test]
@@ -245,21 +205,11 @@ fn test_multiple_validator_failover() {
 
     // Register 2 validators
     manager
-        .register_validator(ValidatorCapacity::new(
-            "v1".to_string(),
-            4,
-            8192,
-            2,
-        ))
+        .register_validator(ValidatorCapacity::new("v1".to_string(), 4, 8192, 2))
         .unwrap();
 
     manager
-        .register_validator(ValidatorCapacity::new(
-            "v2".to_string(),
-            4,
-            8192,
-            2,
-        ))
+        .register_validator(ValidatorCapacity::new("v2".to_string(), 4, 8192, 2))
         .unwrap();
 
     // Submit 4 jobs (fill both validators)
@@ -272,8 +222,14 @@ fn test_multiple_validator_failover() {
     assert_eq!(assignments.len(), 4);
 
     // Jobs should be distributed
-    let v1_jobs = assignments.iter().filter(|a| a.validator_id == "v1").count();
-    let v2_jobs = assignments.iter().filter(|a| a.validator_id == "v2").count();
+    let v1_jobs = assignments
+        .iter()
+        .filter(|a| a.validator_id == "v1")
+        .count();
+    let v2_jobs = assignments
+        .iter()
+        .filter(|a| a.validator_id == "v2")
+        .count();
 
     assert_eq!(v1_jobs + v2_jobs, 4);
     assert!(v1_jobs == 2 && v2_jobs == 2); // Should be balanced

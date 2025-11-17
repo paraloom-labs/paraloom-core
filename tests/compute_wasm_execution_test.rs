@@ -151,7 +151,10 @@ async fn test_wasm_resource_limit_memory() {
     // Should either fail or complete with low memory usage
     // (depends on Wasmtime's memory management)
     assert!(
-        matches!(result.status, JobStatus::Completed | JobStatus::Failed { .. }),
+        matches!(
+            result.status,
+            JobStatus::Completed | JobStatus::Failed { .. }
+        ),
         "Expected Completed or Failed, got {:?}",
         result.status
     );
@@ -191,7 +194,7 @@ async fn test_wasm_instruction_limit() {
     // Set low instruction limit
     let limits = ResourceLimits {
         max_memory_bytes: 10 * 1024 * 1024, // 10MB
-        max_instructions: 100_000,           // Only 100k instructions
+        max_instructions: 100_000,          // Only 100k instructions
         timeout_secs: 5,
     };
 

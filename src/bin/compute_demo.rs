@@ -135,13 +135,19 @@ async fn main() -> Result<()> {
     info!("  Active: {}", stats.active_jobs);
 
     info!("\n=== Demo Complete ===");
-    info!("Successfully executed {} WASM programs with real WasmEngine!", completed);
+    info!(
+        "Successfully executed {} WASM programs with real WasmEngine!",
+        completed
+    );
 
     Ok(())
 }
 
 // Helper to wait for job completion
-async fn wait_for_result(executor: &JobExecutor, job_id: &str) -> Option<paraloom::compute::JobResult> {
+async fn wait_for_result(
+    executor: &JobExecutor,
+    job_id: &str,
+) -> Option<paraloom::compute::JobResult> {
     let job_id_string = job_id.to_string();
     for _ in 0..100 {
         if let Some(result) = executor.get_job_result(&job_id_string) {

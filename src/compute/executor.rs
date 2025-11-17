@@ -60,8 +60,11 @@ impl JobExecutor {
         let mut pending = self.pending_jobs.lock().unwrap();
         pending.push_back(job);
 
-        debug!("Job {} added to pending queue (total pending: {})",
-               job_id, pending.len());
+        debug!(
+            "Job {} added to pending queue (total pending: {})",
+            job_id,
+            pending.len()
+        );
 
         Ok(job_id)
     }
@@ -163,8 +166,10 @@ impl JobExecutor {
                                 }
                             };
 
-                            info!("Job {} execution completed with status: {:?}",
-                                  job_id, result.status);
+                            info!(
+                                "Job {} execution completed with status: {:?}",
+                                job_id, result.status
+                            );
 
                             // Remove from active jobs
                             {
@@ -185,10 +190,7 @@ impl JobExecutor {
                 }
 
                 // Process completed results
-                Self::process_results(
-                    result_rx.clone(),
-                    completed_results.clone(),
-                ).await;
+                Self::process_results(result_rx.clone(), completed_results.clone()).await;
             }
         });
 

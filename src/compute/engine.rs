@@ -42,7 +42,9 @@ impl WasmEngine {
 
         let engine = Engine::new(&config)?;
 
-        info!("WASM engine initialized with security settings, epoch interruption, and fuel tracking");
+        info!(
+            "WASM engine initialized with security settings, epoch interruption, and fuel tracking"
+        );
 
         Ok(Self { engine })
     }
@@ -51,14 +53,15 @@ impl WasmEngine {
     pub fn execute_job(&self, job: &ComputeJob) -> Result<JobResult> {
         let start_time = Instant::now();
 
-        info!("Executing job {} with WASM bytecode ({} bytes)",
-              job.id, job.wasm_code.len());
+        info!(
+            "Executing job {} with WASM bytecode ({} bytes)",
+            job.id,
+            job.wasm_code.len()
+        );
 
         // Create a new store with resource limits
-        let mut store = self.create_store_with_limits(
-            job.max_memory_bytes,
-            job.max_instructions,
-        )?;
+        let mut store =
+            self.create_store_with_limits(job.max_memory_bytes, job.max_instructions)?;
 
         // Compile the WASM module
         let module = match Module::new(&self.engine, &job.wasm_code) {
@@ -83,7 +86,10 @@ impl WasmEngine {
         let instance = match linker.instantiate(&mut store, &module) {
             Ok(i) => i,
             Err(e) => {
-                warn!("Failed to instantiate WASM module for job {}: {}", job.id, e);
+                warn!(
+                    "Failed to instantiate WASM module for job {}: {}",
+                    job.id, e
+                );
                 return Ok(JobResult::failure(
                     job.id.clone(),
                     format!("WASM instantiation failed: {}", e),
@@ -158,13 +164,17 @@ impl WasmEngine {
                 // The output_ptr is the starting position, we need to determine length
                 // For now, read up to 64KB or until we hit zeros (depends on contract)
                 let max_output_size = 65536; // 64KB max output
-                let output_len = if output_ptr >= 0 && (output_ptr as usize) < memory.data_size(&store) {
-                    // Read a reasonable amount of data
-                    // In real scenarios, the WASM module should return length or use a convention
-                    std::cmp::min(max_output_size, memory.data_size(&store) - (output_ptr as usize))
-                } else {
-                    0
-                };
+                let output_len =
+                    if output_ptr >= 0 && (output_ptr as usize) < memory.data_size(&store) {
+                        // Read a reasonable amount of data
+                        // In real scenarios, the WASM module should return length or use a convention
+                        std::cmp::min(
+                            max_output_size,
+                            memory.data_size(&store) - (output_ptr as usize),
+                        )
+                    } else {
+                        0
+                    };
 
                 let mut output_data = vec![0u8; output_len];
                 if output_len > 0 {
@@ -174,8 +184,10 @@ impl WasmEngine {
                 let execution_time = start_time.elapsed().as_millis() as u64;
                 let memory_used = memory.data_size(&store) as u64;
 
-                debug!("Job {} completed successfully in {}ms, {} instructions executed",
-                       job.id, execution_time, instructions_executed);
+                debug!(
+                    "Job {} completed successfully in {}ms, {} instructions executed",
+                    job.id, execution_time, instructions_executed
+                );
 
                 JobResult::success(
                     job.id.clone(),
@@ -204,8 +216,10 @@ impl WasmEngine {
         max_memory_bytes: u64,
         max_instructions: u64,
     ) -> Result<Store<ResourceLimiterImpl>> {
-        debug!("Creating store with memory limit: {} bytes, instruction limit: {}",
-               max_memory_bytes, max_instructions);
+        debug!(
+            "Creating store with memory limit: {} bytes, instruction limit: {}",
+            max_memory_bytes, max_instructions
+        );
 
         let limiter = ResourceLimiterImpl {
             memory_limit_bytes: max_memory_bytes as usize,
@@ -226,9 +240,13 @@ impl WasmEngine {
     /// Add host functions that WASM modules can import
     fn add_host_functions(&self, linker: &mut Linker<ResourceLimiterImpl>) -> Result<()> {
         // Add a simple logging function
-        linker.func_wrap("env", "log", |_caller: wasmtime::Caller<'_, ResourceLimiterImpl>, param: i32| {
-            debug!("WASM log: {}", param);
-        })?;
+        linker.func_wrap(
+            "env",
+            "log",
+            |_caller: wasmtime::Caller<'_, ResourceLimiterImpl>, param: i32| {
+                debug!("WASM log: {}", param);
+            },
+        )?;
 
         Ok(())
     }
@@ -259,14 +277,13 @@ impl WasmEngine {
         });
 
         // Execute the function
-        let result = func.call(store, (input_ptr, input_len))
-            .map_err(|e| {
-                if e.to_string().contains("epoch") {
-                    anyhow!("WASM execution timeout after {:?}", timeout)
-                } else {
-                    anyhow!("WASM execution error: {}", e)
-                }
-            });
+        let result = func.call(store, (input_ptr, input_len)).map_err(|e| {
+            if e.to_string().contains("epoch") {
+                anyhow!("WASM execution timeout after {:?}", timeout)
+            } else {
+                anyhow!("WASM execution error: {}", e)
+            }
+        });
 
         // Clean up epoch thread (it will finish naturally)
         drop(epoch_thread);
@@ -302,8 +319,10 @@ impl ResourceLimiter for ResourceLimiterImpl {
                 desired, self.memory_limit_bytes
             );
         } else {
-            debug!("Memory growing from {} to {} bytes (limit: {})",
-                   current, desired, self.memory_limit_bytes);
+            debug!(
+                "Memory growing from {} to {} bytes (limit: {})",
+                current, desired, self.memory_limit_bytes
+            );
         }
 
         Ok(allowed)
@@ -361,11 +380,7 @@ mod tests {
 
         let wasm_bytes = wat::parse_str(wat).unwrap();
 
-        let job = ComputeJob::new(
-            wasm_bytes,
-            vec![1, 2, 3, 4],
-            ResourceLimits::default(),
-        );
+        let job = ComputeJob::new(wasm_bytes, vec![1, 2, 3, 4], ResourceLimits::default());
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);

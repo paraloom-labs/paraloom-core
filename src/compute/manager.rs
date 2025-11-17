@@ -176,9 +176,7 @@ impl JobManager {
         };
 
         // Sort by load factor (least loaded first)
-        available_validators.sort_by(|a, b| {
-            a.load_factor().partial_cmp(&b.load_factor()).unwrap()
-        });
+        available_validators.sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
 
         // Assign jobs to validators
         let jobs_to_assign: Vec<_> = pending.drain(..).collect();
@@ -222,9 +220,8 @@ impl JobManager {
                         .cloned()
                         .collect()
                 };
-                available_validators.sort_by(|a, b| {
-                    a.load_factor().partial_cmp(&b.load_factor()).unwrap()
-                });
+                available_validators
+                    .sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
             } else {
                 // No available validators, put job back in queue
                 warn!("No available validators for job {}", job.id);
@@ -241,7 +238,10 @@ impl JobManager {
     pub fn submit_result(&self, result: JobResult) -> Result<()> {
         let job_id = result.job_id.clone();
 
-        info!("Received result for job {} (status: {:?})", job_id, result.status);
+        info!(
+            "Received result for job {} (status: {:?})",
+            job_id, result.status
+        );
 
         // Update validator active jobs
         let assignments = self.assignments.lock().unwrap();
@@ -324,8 +324,12 @@ impl JobManager {
 
         validators.retain(|id, v| {
             let age = now - v.last_heartbeat;
-            if age > 60_000 { // 60 seconds
-                warn!("Removing stale validator {} (last heartbeat: {}ms ago)", id, age);
+            if age > 60_000 {
+                // 60 seconds
+                warn!(
+                    "Removing stale validator {} (last heartbeat: {}ms ago)",
+                    id, age
+                );
                 removed += 1;
                 false
             } else {
@@ -380,12 +384,7 @@ mod tests {
     fn test_validator_registration() {
         let manager = JobManager::new();
 
-        let capacity = ValidatorCapacity::new(
-            "validator1".to_string(),
-            4,
-            8192,
-            2,
-        );
+        let capacity = ValidatorCapacity::new("validator1".to_string(), 4, 8192, 2);
 
         manager.register_validator(capacity).unwrap();
 
@@ -419,12 +418,7 @@ mod tests {
         let manager = JobManager::new();
 
         // Register validator
-        let capacity = ValidatorCapacity::new(
-            "validator1".to_string(),
-            4,
-            8192,
-            2,
-        );
+        let capacity = ValidatorCapacity::new("validator1".to_string(), 4, 8192, 2);
         manager.register_validator(capacity).unwrap();
 
         // Submit job
@@ -450,20 +444,16 @@ mod tests {
         let manager = JobManager::new();
 
         // Register two validators
-        manager.register_validator(ValidatorCapacity::new(
-            "validator1".to_string(), 4, 8192, 2,
-        )).unwrap();
-        manager.register_validator(ValidatorCapacity::new(
-            "validator2".to_string(), 4, 8192, 2,
-        )).unwrap();
+        manager
+            .register_validator(ValidatorCapacity::new("validator1".to_string(), 4, 8192, 2))
+            .unwrap();
+        manager
+            .register_validator(ValidatorCapacity::new("validator2".to_string(), 4, 8192, 2))
+            .unwrap();
 
         // Submit 3 jobs
         for i in 0..3 {
-            let job = ComputeJob::new(
-                vec![i],
-                vec![],
-                ResourceLimits::default(),
-            );
+            let job = ComputeJob::new(vec![i], vec![], ResourceLimits::default());
             manager.submit_job(job).unwrap();
         }
 
@@ -472,10 +462,12 @@ mod tests {
         assert_eq!(assignments.len(), 3);
 
         // Jobs should be distributed across validators
-        let validator1_jobs = assignments.iter()
+        let validator1_jobs = assignments
+            .iter()
             .filter(|a| a.validator_id == "validator1")
             .count();
-        let validator2_jobs = assignments.iter()
+        let validator2_jobs = assignments
+            .iter()
             .filter(|a| a.validator_id == "validator2")
             .count();
 
@@ -486,12 +478,7 @@ mod tests {
 
     #[test]
     fn test_validator_capacity() {
-        let capacity = ValidatorCapacity::new(
-            "test".to_string(),
-            4,
-            8192,
-            2,
-        );
+        let capacity = ValidatorCapacity::new("test".to_string(), 4, 8192, 2);
 
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);

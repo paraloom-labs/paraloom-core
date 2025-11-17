@@ -66,7 +66,7 @@ pub enum JobStatus {
 }
 
 /// Job execution result
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobResult {
     /// Job ID this result belongs to
     pub job_id: JobId,
@@ -106,20 +106,16 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_memory_bytes: 64 * 1024 * 1024,  // 64 MB
-            max_instructions: 1_000_000_000,      // 1 billion instructions
-            timeout_secs: 30,                      // 30 seconds
+            max_memory_bytes: 64 * 1024 * 1024, // 64 MB
+            max_instructions: 1_000_000_000,    // 1 billion instructions
+            timeout_secs: 30,                   // 30 seconds
         }
     }
 }
 
 impl ComputeJob {
     /// Create a new compute job
-    pub fn new(
-        wasm_code: Vec<u8>,
-        input_data: Vec<u8>,
-        limits: ResourceLimits,
-    ) -> Self {
+    pub fn new(wasm_code: Vec<u8>, input_data: Vec<u8>, limits: ResourceLimits) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -206,14 +202,12 @@ impl JobResult {
     }
 
     /// Create a failed job result
-    pub fn failure(
-        job_id: JobId,
-        error: String,
-        execution_time_ms: u64,
-    ) -> Self {
+    pub fn failure(job_id: JobId, error: String, execution_time_ms: u64) -> Self {
         Self {
             job_id,
-            status: JobStatus::Failed { error: error.clone() },
+            status: JobStatus::Failed {
+                error: error.clone(),
+            },
             output_data: None,
             error: Some(error),
             execution_time_ms,
@@ -263,13 +257,7 @@ mod tests {
 
     #[test]
     fn test_job_result_success() {
-        let result = JobResult::success(
-            "job123".to_string(),
-            vec![5, 6, 7, 8],
-            100,
-            1024,
-            50000,
-        );
+        let result = JobResult::success("job123".to_string(), vec![5, 6, 7, 8], 100, 1024, 50000);
 
         assert_eq!(result.status, JobStatus::Completed);
         assert!(result.output_data.is_some());
@@ -278,11 +266,7 @@ mod tests {
 
     #[test]
     fn test_job_result_failure() {
-        let result = JobResult::failure(
-            "job456".to_string(),
-            "Out of memory".to_string(),
-            50,
-        );
+        let result = JobResult::failure("job456".to_string(), "Out of memory".to_string(), 50);
 
         assert!(matches!(result.status, JobStatus::Failed { .. }));
         assert!(result.output_data.is_none());

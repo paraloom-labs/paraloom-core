@@ -167,17 +167,17 @@ impl JobCoordinator {
             let mut active = self.active_assignments.write().await;
             active.insert(job_id.clone(), assignment.clone());
 
-            debug!("Job {} marked as fetched by validator {}", job_id, assignment.validator_id);
+            debug!(
+                "Job {} marked as fetched by validator {}",
+                job_id, assignment.validator_id
+            );
         }
 
         Ok(())
     }
 
     /// Get pending assignment for a validator
-    pub async fn get_pending_jobs_for_validator(
-        &self,
-        validator_id: &ValidatorId,
-    ) -> Vec<JobId> {
+    pub async fn get_pending_jobs_for_validator(&self, validator_id: &ValidatorId) -> Vec<JobId> {
         let pending = self.pending_assignments.read().await;
         pending
             .iter()
@@ -206,7 +206,10 @@ impl JobCoordinator {
 
         CoordinatorStats {
             total_validators: validators.len(),
-            available_validators: validators.values().filter(|v| v.available_capacity() > 0).count(),
+            available_validators: validators
+                .values()
+                .filter(|v| v.available_capacity() > 0)
+                .count(),
             total_capacity: validators.values().map(|v| v.max_concurrent_jobs).sum(),
             current_load: validators.values().map(|v| v.current_load).sum(),
             pending_assignments: pending.len(),

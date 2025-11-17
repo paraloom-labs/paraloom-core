@@ -120,9 +120,7 @@ pub enum Message {
     },
 
     /// Query compute job status
-    ComputeJobQuery {
-        job_id: String,
-    },
+    ComputeJobQuery { job_id: String },
 
     /// Response with compute job result
     ComputeJobResult {
