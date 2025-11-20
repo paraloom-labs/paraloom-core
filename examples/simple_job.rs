@@ -9,14 +9,17 @@ async fn main() {
     let executor = JobExecutor::new().expect("Failed to create executor");
     executor.start().await.expect("Failed to start executor");
 
-    let wasm_code = wat::parse_str(r#"
+    let wasm_code = wat::parse_str(
+        r#"
         (module
             (memory (export "memory") 1)
             (func (export "execute") (param i32 i32) (result i32)
                 i32.const 42
             )
         )
-    "#).expect("Failed to compile WAT");
+    "#,
+    )
+    .expect("Failed to compile WAT");
 
     let job = ComputeJob::new(wasm_code, vec![], ResourceLimits::default());
     let job_id = job.id.clone();

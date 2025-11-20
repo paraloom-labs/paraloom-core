@@ -19,9 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let validator_id = validator_node.node_info().id.to_string();
     println!("   Validator ID: {}", validator_id);
 
-    let validator_handle = tokio::spawn(async move {
-        validator_node.run().await
-    });
+    let validator_handle = tokio::spawn(async move { validator_node.run().await });
 
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
@@ -34,33 +32,30 @@ async fn main() -> anyhow::Result<()> {
     let coordinator_node = Node::new(coord_settings)?;
 
     let coord_clone = coordinator_node.clone();
-    let coord_handle = tokio::spawn(async move {
-        coord_clone.run().await
-    });
+    let coord_handle = tokio::spawn(async move { coord_clone.run().await });
 
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     println!("\nRegistering validator with coordinator...");
-    let capacity = ValidatorCapacity::new(
-        validator_id.clone(),
-        8,
-        16384,
-        10,
-    );
-    coordinator_node.register_compute_validator(capacity).await?;
+    let capacity = ValidatorCapacity::new(validator_id.clone(), 8, 16384, 10);
+    coordinator_node
+        .register_compute_validator(capacity)
+        .await?;
     println!("   Validator registered");
 
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     println!("\nSubmitting job to network...");
-    let wasm_code = wat::parse_str(r#"
+    let wasm_code = wat::parse_str(
+        r#"
         (module
             (memory (export "memory") 1)
             (func (export "execute") (param i32 i32) (result i32)
                 i32.const 42
             )
         )
-    "#)?;
+    "#,
+    )?;
 
     let job = ComputeJob::new(wasm_code, vec![], ResourceLimits::default());
     let job_id = job.id.clone();

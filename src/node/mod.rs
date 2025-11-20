@@ -345,7 +345,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 max_instructions,
                 timeout_secs,
             } => {
-                info!("Received compute job request from {}: job_id={}", source, job_id);
+                info!(
+                    "Received compute job request from {}: job_id={}",
+                    source, job_id
+                );
 
                 if let Some(executor) = &self.compute_executor {
                     // Create compute job
@@ -449,7 +452,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 }
             }
             Message::ComputeJobQuery { job_id } => {
-                info!("Received compute job query from {}: job_id={}", source, job_id);
+                info!(
+                    "Received compute job query from {}: job_id={}",
+                    source, job_id
+                );
 
                 if let Some(executor) = &self.compute_executor {
                     // Check if job exists and get result
@@ -624,21 +630,22 @@ impl Node {
         };
 
         // Initialize compute storage if compute layer is enabled
-        let compute_storage = if node_type == NodeType::ResourceProvider || node_type == NodeType::Coordinator {
-            let storage_path = format!("{}/compute", settings.storage.data_dir);
-            match ComputeStorage::open(&storage_path) {
-                Ok(storage) => {
-                    info!("Compute storage initialized at {}", storage_path);
-                    Some(Arc::new(storage))
+        let compute_storage =
+            if node_type == NodeType::ResourceProvider || node_type == NodeType::Coordinator {
+                let storage_path = format!("{}/compute", settings.storage.data_dir);
+                match ComputeStorage::open(&storage_path) {
+                    Ok(storage) => {
+                        info!("Compute storage initialized at {}", storage_path);
+                        Some(Arc::new(storage))
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to open compute storage: {}", e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    log::warn!("Failed to open compute storage: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Privacy layer will be initialized in run() if enabled
         let node = Node {
@@ -799,7 +806,10 @@ impl Node {
                         // Check if job has a result
                         if let Some(result) = executor_clone.get_job_result(job_id) {
                             // Job is complete, send result to coordinator
-                            info!("Reporting job {} result to coordinator {}", job_id, coordinator_id);
+                            info!(
+                                "Reporting job {} result to coordinator {}",
+                                job_id, coordinator_id
+                            );
 
                             let message = Message::ComputeJobResult {
                                 job_id: result.job_id.clone(),
@@ -810,7 +820,10 @@ impl Node {
                                 instructions_executed: result.instructions_executed,
                             };
 
-                            match network_clone.send_message(coordinator_id.clone(), message).await {
+                            match network_clone
+                                .send_message(coordinator_id.clone(), message)
+                                .await
+                            {
                                 Ok(_) => {
                                     info!("Successfully reported job {} result", job_id);
                                     reported_jobs.insert(job_id.clone());
@@ -957,7 +970,10 @@ impl Node {
 
             // Assign job to a validator
             if let Some(assignment) = coordinator.assign_job(job_id.clone()).await? {
-                info!("Job {} assigned to validator {}", job_id, assignment.validator_id);
+                info!(
+                    "Job {} assigned to validator {}",
+                    job_id, assignment.validator_id
+                );
 
                 // Send job request to the assigned validator
                 let message = Message::ComputeJobRequest {
@@ -975,7 +991,9 @@ impl Node {
                 self.network.send_message(node_id, message).await?;
                 Ok(job_id)
             } else {
-                Err(anyhow::anyhow!("No available validators for job assignment"))
+                Err(anyhow::anyhow!(
+                    "No available validators for job assignment"
+                ))
             }
         } else {
             Err(anyhow::anyhow!("This node is not a coordinator"))

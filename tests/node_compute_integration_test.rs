@@ -54,8 +54,7 @@ async fn test_resource_provider_node_can_execute_jobs() {
     let job_id = job.id.clone();
 
     // Submit job to executor
-    node.submit_compute_job(job)
-        .expect("Failed to submit job");
+    node.submit_compute_job(job).expect("Failed to submit job");
 
     // Wait a bit for execution
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -68,7 +67,9 @@ async fn test_resource_provider_node_can_execute_jobs() {
     println!("Job execution result: {:?}", result);
 
     // Check executor stats
-    let stats = node.get_compute_stats().expect("Should have executor stats");
+    let stats = node
+        .get_compute_stats()
+        .expect("Should have executor stats");
     assert_eq!(stats.active_jobs, 0, "No jobs should be active");
     assert!(
         stats.completed_jobs > 0 || stats.failed_jobs > 0,
@@ -129,11 +130,7 @@ async fn test_coordinator_can_register_validators() {
     // Get coordinator and check validator count
     let coordinator = node.compute_coordinator().unwrap();
     let validators = coordinator.get_validators().await;
-    assert_eq!(
-        validators.len(),
-        1,
-        "Should have one registered validator"
-    );
+    assert_eq!(validators.len(), 1, "Should have one registered validator");
     assert_eq!(validators[0].validator_id, "validator-1");
 
     println!("Successfully registered validator with coordinator");
