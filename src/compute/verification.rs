@@ -190,7 +190,7 @@ impl VerificationCoordinator {
 
             result_groups
                 .entry(key)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(validator_result);
         }
 
@@ -270,7 +270,7 @@ impl VerificationCoordinator {
             // Check if we have consensus (simplified check)
             let output_hashes: Vec<_> = validator_results
                 .iter()
-                .filter_map(|r| r.result.output_data.as_ref().map(|d| d.clone()))
+                .filter_map(|r| r.result.output_data.as_ref().cloned())
                 .collect();
 
             if output_hashes.is_empty() {
