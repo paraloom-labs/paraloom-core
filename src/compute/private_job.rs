@@ -185,8 +185,9 @@ impl PrivateJobResult {
         // Encrypt output
         let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address);
 
-        // Generate zkSNARK proof (TODO: implement proper proof generation)
-        let execution_proof = vec![0u8; 32]; // Placeholder
+        // Generate zkSNARK proof
+        let execution_proof =
+            Self::generate_execution_proof(&result.job_id, &output_data, data_hash, &randomness)?;
 
         Ok(Self {
             job_id,
@@ -206,6 +207,38 @@ impl PrivateJobResult {
     /// Decrypt output data (only job owner can do this)
     pub fn decrypt_output(&self, owner_address: &ShieldedAddress) -> Vec<u8> {
         PrivateComputeJob::decrypt_data(&self.encrypted_output, owner_address)
+    }
+
+    /// Generate zkSNARK execution proof
+    ///
+    /// TODO: This is a simplified version. Full implementation should:
+    /// 1. Load proving key from disk (generated during setup)
+    /// 2. Create proper ComputeCircuit with all witness data
+    /// 3. Generate actual Groth16 proof
+    ///
+    /// For now, we return a placeholder proof hash.
+    fn generate_execution_proof(
+        _job_id: &str,
+        _output_data: &[u8],
+        _output_hash: u64,
+        _randomness: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        use sha2::{Digest, Sha256};
+
+        // TODO: Replace with actual proof generation
+        // let circuit = ComputeCircuit::with_witness(...);
+        // let proof = ComputeProofSystem::prove(&proving_key, circuit, &mut rng)?;
+        // let proof_bytes = serialize_proof(&proof);
+
+        // For now, generate a deterministic placeholder based on inputs
+        let mut hasher = Sha256::new();
+        hasher.update(_job_id.as_bytes());
+        hasher.update(_output_data);
+        hasher.update(&_output_hash.to_le_bytes());
+        hasher.update(_randomness);
+
+        let proof_hash = hasher.finalize();
+        Ok(proof_hash.to_vec())
     }
 }
 
