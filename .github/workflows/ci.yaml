@@ -194,7 +194,7 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     needs: [test-core, test-privacy]
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: false # Disabled due to RAM limitations on free runners
     steps:
       - uses: actions/checkout@v3
 
