@@ -179,7 +179,7 @@ impl JobCoordinator {
     }
 
     /// Calculate actual load for a validator based on assignments
-    async fn get_validator_load(&self, validator_id: &ValidatorId) -> usize {
+    pub async fn get_validator_load(&self, validator_id: &ValidatorId) -> usize {
         let pending = self.pending_assignments.read().await;
         let active = self.active_assignments.read().await;
 
@@ -197,7 +197,7 @@ impl JobCoordinator {
     }
 
     /// Check if validator has available capacity based on actual assignments
-    async fn has_available_capacity(&self, announcement: &CapacityAnnouncement) -> bool {
+    pub async fn has_available_capacity(&self, announcement: &CapacityAnnouncement) -> bool {
         let current_load = self.get_validator_load(&announcement.validator_id).await;
         current_load < announcement.max_concurrent_jobs
     }
