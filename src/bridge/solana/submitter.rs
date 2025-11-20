@@ -264,6 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires zkSNARK keys, run with: cargo test -- --ignored
     async fn test_submit_withdrawal() {
         let config = BridgeConfig {
             program_id: "11111111111111111111111111111111".to_string(),
@@ -297,6 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires zkSNARK keys, run with: cargo test -- --ignored
     async fn test_batch_submit() {
         let config = BridgeConfig {
             program_id: "11111111111111111111111111111111".to_string(),
