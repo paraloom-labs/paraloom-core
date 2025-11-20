@@ -174,7 +174,8 @@ impl PrivateComputeJob {
 
         // Extract nonce from first 12 bytes
         let (nonce_bytes, ciphertext) = encrypted.split_at(12);
-        let nonce_array: [u8; 12] = nonce_bytes.try_into()
+        let nonce_array: [u8; 12] = nonce_bytes
+            .try_into()
             .map_err(|_| anyhow!("Invalid nonce length"))?;
         let nonce = Nonce::from(nonce_array);
 
@@ -366,7 +367,8 @@ impl PrivateJobResult {
             // Serialize proof
             use ark_serialize::CanonicalSerialize;
             let mut proof_bytes = Vec::new();
-            proof.serialize_compressed(&mut proof_bytes)
+            proof
+                .serialize_compressed(&mut proof_bytes)
                 .map_err(|e| anyhow!("Proof serialization failed: {:?}", e))?;
 
             log::info!("Proof size: {} bytes", proof_bytes.len());
@@ -391,10 +393,7 @@ impl PrivateJobResult {
     ///
     /// - If verifying keys exist: Verify real Groth16 proof
     /// - If keys don't exist: Basic format check (for testing/dev)
-    fn verify_execution_proof(
-        proof_bytes: &[u8],
-        output_hash: u64,
-    ) -> Result<bool> {
+    fn verify_execution_proof(proof_bytes: &[u8], output_hash: u64) -> Result<bool> {
         // Check if real keys are available
         if Self::compute_keys_exist() {
             log::info!("Verifying real Groth16 proof");
@@ -404,10 +403,9 @@ impl PrivateJobResult {
 
             // Deserialize proof
             use ark_serialize::CanonicalDeserialize;
-            let proof = ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(
-                proof_bytes,
-            )
-            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            let proof =
+                ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(proof_bytes)
+                    .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
 
             // Prepare public inputs (matching the circuit)
             let dummy_code_hash_bytes = [0u8; 32];
@@ -533,7 +531,10 @@ impl PrivateJobCoordinator {
             PrivateJobResult::verify_execution_proof(&result.execution_proof, result.output_hash)?;
 
         if !proof_valid {
-            log::warn!("zkSNARK proof verification failed for job {}", result.job_id);
+            log::warn!(
+                "zkSNARK proof verification failed for job {}",
+                result.job_id
+            );
             return Ok(false);
         }
 
@@ -757,7 +758,8 @@ mod tests {
         assert_ne!(private_result.encrypted_output, mock_output);
         // Proof can be either placeholder (32 bytes) or real Groth16 (192 bytes)
         assert!(
-            private_result.execution_proof.len() == 32 || private_result.execution_proof.len() == 192,
+            private_result.execution_proof.len() == 32
+                || private_result.execution_proof.len() == 192,
             "Proof size should be 32 or 192 bytes, got {}",
             private_result.execution_proof.len()
         );

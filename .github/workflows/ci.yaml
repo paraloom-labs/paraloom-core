@@ -82,8 +82,8 @@ jobs:
           command: build
           args: --all-features
 
-  test-core:
-    name: Core Tests
+  test-quick:
+    name: Quick Test (All Modules)
     runs-on: ubuntu-latest
     needs: build
     steps:
@@ -126,7 +126,7 @@ jobs:
         with:
           shared-key: "paraloom-ci"
 
-      - name: Run core tests
+      - name: Run all tests (quick check)
         uses: actions-rs/cargo@v1
         with:
           command: test
@@ -134,10 +134,19 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
 
-  test-privacy:
-    name: Privacy Layer Tests (103 tests)
+  test:
+    name: Test (${{ matrix.module }})
     runs-on: ubuntu-latest
-    needs: build
+    needs: test-quick
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - privacy
+          - compute
+          - storage
+          - network
+          - consensus
     steps:
       - uses: actions/checkout@v3
 
@@ -178,22 +187,16 @@ jobs:
         with:
           shared-key: "paraloom-ci"
 
-      - name: Run privacy layer tests
+      - name: Run module tests (thread-safe)
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --lib privacy -- --test-threads=1
+          args: --lib ${{ matrix.module }} --all-features -- --test-threads=1
 
-      - name: Run privacy integration tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --lib privacy::integration_tests -- --nocapture
-
-  test-compute:
-    name: Compute Layer Tests (31 tests)
+  test-binaries:
+    name: Test Binaries
     runs-on: ubuntu-latest
-    needs: build
+    needs: test-quick
     steps:
       - uses: actions/checkout@v3
 
@@ -233,12 +236,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "paraloom-ci"
-
-      - name: Run compute layer tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --lib compute --all-features -- --test-threads=1
 
       - name: Build setup ceremony binary
         uses: actions-rs/cargo@v1
@@ -246,60 +243,16 @@ jobs:
           command: build
           args: --bin setup_compute_ceremony
 
-  test-private-compute:
-    name: Private Compute Tests (11 tests)
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo docker system prune -af
-          sudo apt-get clean
-          df -h
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
-
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "paraloom-ci"
-
-      - name: Run private compute tests
+      - name: Build all binaries
         uses: actions-rs/cargo@v1
         with:
-          command: test
-          args: --lib compute::private_job --all-features
+          command: build
+          args: --bins
 
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    needs: [test-core, test-privacy, test-compute, test-private-compute]
+    needs: [test, test-binaries]
     if: false # Disabled due to RAM limitations on free runners
     steps:
       - uses: actions/checkout@v3
