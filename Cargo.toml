@@ -63,6 +63,10 @@ path = "src/bin/test_withdraw.rs"
 name = "compute-demo"
 path = "src/bin/compute_demo.rs"
 
+[[bin]]
+name = "setup_compute_ceremony"
+path = "src/bin/setup_compute_ceremony.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh"]
@@ -107,6 +111,8 @@ wat = "1.240" # For WASM parsing (compute demo)
 # Cryptography
 sha2 = "0.10"
 hex = "0.4"
+aes-gcm = "0.10"
+rand = "0.8"
 
 # zkSNARK (arkworks ecosystem)
 ark-std = "0.4"
