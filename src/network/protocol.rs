@@ -96,8 +96,10 @@ impl NetworkManager {
             })
             .boxed();
 
-        // Create a Gossipsub behavior with custom config for small networks
-        let gossipsub_config = gossipsub::Config::default();
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .max_transmit_size(10 * 1024 * 1024)
+            .build()
+            .map_err(|e| anyhow!("Failed to build gossipsub config: {}", e))?;
 
         // Build the Gossipsub behavior
         let gossipsub = Gossipsub::new(

@@ -100,4 +100,35 @@ pub enum Message {
         validator_id: crate::types::NodeId,
         timestamp: u64,
     },
+
+    // Compute-related messages
+    /// Submit a compute job for execution
+    ComputeJobRequest {
+        job_id: String,
+        wasm_code: Vec<u8>,
+        input_data: Vec<u8>,
+        max_memory_bytes: u64,
+        max_instructions: u64,
+        timeout_secs: u64,
+    },
+
+    /// Response to compute job submission
+    ComputeJobResponse {
+        job_id: String,
+        accepted: bool,
+        message: String,
+    },
+
+    /// Query compute job status
+    ComputeJobQuery { job_id: String },
+
+    /// Response with compute job result
+    ComputeJobResult {
+        job_id: String,
+        status: crate::compute::JobStatus,
+        output_data: Option<Vec<u8>>,
+        execution_time_ms: u64,
+        memory_used_bytes: u64,
+        instructions_executed: u64,
+    },
 }
