@@ -48,9 +48,8 @@
 //! ```
 
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_ff::PrimeField;
 use ark_groth16::{Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, uint8::UInt8, ToBytesGadget};
+use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, uint8::UInt8};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};

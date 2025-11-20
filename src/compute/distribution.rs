@@ -854,24 +854,30 @@ mod tests {
     async fn test_validator_failure_reassignment() {
         let coordinator = JobCoordinator::new();
 
-        // Register two validators
-        let capacity1 = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
-        let capacity2 = ValidatorCapacity::new("v2".to_string(), 4, 8192, 2);
+        // Register v1 first (will be preferred due to load balancing)
+        let capacity1 = ValidatorCapacity::new("v1".to_string(), 4, 8192, 10);
         coordinator
             .update_validator_capacity(CapacityAnnouncement::new(capacity1, 0))
             .await;
+
+        // Assign 2 jobs while only v1 is available
+        let assignment1 = coordinator.assign_job("job1".to_string()).await.unwrap();
+        let assignment2 = coordinator.assign_job("job2".to_string()).await.unwrap();
+
+        // Verify both jobs went to v1
+        assert_eq!(assignment1.as_ref().unwrap().validator_id, "v1");
+        assert_eq!(assignment2.as_ref().unwrap().validator_id, "v1");
+
+        // Now register v2 for reassignment target
+        let capacity2 = ValidatorCapacity::new("v2".to_string(), 4, 8192, 10);
         coordinator
             .update_validator_capacity(CapacityAnnouncement::new(capacity2, 0))
             .await;
 
-        // Assign jobs to v1
-        coordinator.assign_job("job1".to_string()).await.unwrap();
-        coordinator.assign_job("job2".to_string()).await.unwrap();
-
         let stats_before = coordinator.get_stats().await;
         assert_eq!(stats_before.pending_assignments, 2);
 
-        // Handle v1 failure
+        // Handle v1 failure - should reassign both jobs to v2
         let reassigned = coordinator
             .handle_validator_failure(&"v1".to_string())
             .await
