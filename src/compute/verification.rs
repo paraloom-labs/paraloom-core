@@ -188,10 +188,7 @@ impl VerificationCoordinator {
                 None => vec![], // Failed results group together
             };
 
-            result_groups
-                .entry(key)
-                .or_default()
-                .push(validator_result);
+            result_groups.entry(key).or_default().push(validator_result);
         }
 
         // Find largest group (majority)
