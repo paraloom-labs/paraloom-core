@@ -4224,6 +4224,7 @@ dependencies = [
 name = "paraloom"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "ark-bls12-381",
  "ark-crypto-primitives",
@@ -4248,6 +4249,7 @@ dependencies = [
  "libp2p",
  "log",
  "once_cell",
+ "rand 0.8.5",
  "rocksdb",
  "serde",
  "serde_json",

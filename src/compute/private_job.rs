@@ -89,9 +89,8 @@ impl PrivateComputeJob {
         let input_commitment =
             crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
 
-        // Encrypt input data with owner's public key
-        // TODO: Implement proper encryption (for now, just use XOR with address)
-        let encrypted_input = Self::encrypt_data(&input_data, &owner_address);
+        // Encrypt input data with owner's public key using AES-GCM-256
+        let encrypted_input = Self::encrypt_data(&input_data, &owner_address)?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
 
@@ -127,17 +126,68 @@ impl PrivateComputeJob {
         u64::from_le_bytes(hash[..8].try_into().unwrap())
     }
 
-    /// Simple encryption (TODO: replace with proper encryption)
-    fn encrypt_data(data: &[u8], address: &ShieldedAddress) -> Vec<u8> {
-        data.iter()
-            .enumerate()
-            .map(|(i, &byte)| byte ^ address.0[i % 32])
-            .collect()
+    /// Encrypt data using AES-GCM-256 authenticated encryption
+    ///
+    /// Format: [12-byte nonce][encrypted data][16-byte auth tag]
+    /// The tag is automatically appended by AES-GCM
+    fn encrypt_data(data: &[u8], address: &ShieldedAddress) -> Result<Vec<u8>> {
+        use aes_gcm::{
+            aead::{Aead, KeyInit},
+            Aes256Gcm, Nonce,
+        };
+        use rand::Rng;
+
+        // Use ShieldedAddress as 256-bit encryption key
+        let cipher = Aes256Gcm::new_from_slice(&address.0)
+            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+
+        // Generate random 96-bit nonce
+        let mut rng = rand::thread_rng();
+        let nonce_bytes: [u8; 12] = rng.gen();
+        let nonce = Nonce::from(nonce_bytes);
+
+        // Encrypt data (automatically appends 128-bit auth tag)
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+
+        // Prepend nonce to ciphertext (nonce doesn't need to be secret)
+        let mut result = Vec::with_capacity(12 + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
+
+        Ok(result)
     }
 
-    /// Simple decryption (TODO: replace with proper decryption)
-    pub fn decrypt_data(encrypted: &[u8], address: &ShieldedAddress) -> Vec<u8> {
-        Self::encrypt_data(encrypted, address) // XOR is symmetric
+    /// Decrypt data using AES-GCM-256 authenticated encryption
+    ///
+    /// Expects format: [12-byte nonce][encrypted data][16-byte auth tag]
+    pub fn decrypt_data(encrypted: &[u8], address: &ShieldedAddress) -> Result<Vec<u8>> {
+        use aes_gcm::{
+            aead::{Aead, KeyInit},
+            Aes256Gcm, Nonce,
+        };
+
+        if encrypted.len() < 12 {
+            return Err(anyhow!("Encrypted data too short (missing nonce)"));
+        }
+
+        // Extract nonce from first 12 bytes
+        let (nonce_bytes, ciphertext) = encrypted.split_at(12);
+        let nonce_array: [u8; 12] = nonce_bytes.try_into()
+            .map_err(|_| anyhow!("Invalid nonce length"))?;
+        let nonce = Nonce::from(nonce_array);
+
+        // Use ShieldedAddress as 256-bit decryption key
+        let cipher = Aes256Gcm::new_from_slice(&address.0)
+            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+
+        // Decrypt and verify authentication tag
+        let plaintext = cipher
+            .decrypt(&nonce, ciphertext)
+            .map_err(|e| anyhow!("Decryption failed (wrong key or corrupted data): {}", e))?;
+
+        Ok(plaintext)
     }
 }
 
@@ -149,6 +199,9 @@ pub struct PrivateJobResult {
 
     /// Output data commitment (private - hides actual output)
     pub output_commitment: Commitment,
+
+    /// Output data hash (public - used for proof verification)
+    pub output_hash: u64,
 
     /// Encrypted output data
     pub encrypted_output: Vec<u8>,
@@ -183,7 +236,7 @@ impl PrivateJobResult {
             crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
 
         // Encrypt output
-        let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address);
+        let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address)?;
 
         // Generate zkSNARK proof
         let execution_proof =
@@ -192,6 +245,7 @@ impl PrivateJobResult {
         Ok(Self {
             job_id,
             output_commitment,
+            output_hash: data_hash,
             encrypted_output,
             execution_proof,
             execution_time_ms: result.execution_time_ms,
@@ -205,40 +259,219 @@ impl PrivateJobResult {
     }
 
     /// Decrypt output data (only job owner can do this)
-    pub fn decrypt_output(&self, owner_address: &ShieldedAddress) -> Vec<u8> {
+    pub fn decrypt_output(&self, owner_address: &ShieldedAddress) -> Result<Vec<u8>> {
         PrivateComputeJob::decrypt_data(&self.encrypted_output, owner_address)
+    }
+
+    /// Check if compute proving keys exist
+    fn compute_keys_exist() -> bool {
+        use std::path::Path;
+        let pk_path = Path::new("keys/compute_proving.key");
+        let vk_path = Path::new("keys/compute_verifying.key");
+        pk_path.exists() && vk_path.exists()
+    }
+
+    /// Load compute proving key from disk
+    fn load_proving_key() -> Result<ark_groth16::ProvingKey<ark_bls12_381::Bls12_381>> {
+        use ark_serialize::CanonicalDeserialize;
+        use std::fs;
+
+        let pk_bytes = fs::read("keys/compute_proving.key")
+            .map_err(|e| anyhow!("Failed to read proving key: {}", e))?;
+
+        ark_groth16::ProvingKey::deserialize_compressed(&pk_bytes[..])
+            .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))
+    }
+
+    /// Load compute verifying key from disk
+    fn load_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bls12_381::Bls12_381>> {
+        use ark_serialize::CanonicalDeserialize;
+        use std::fs;
+
+        let vk_bytes = fs::read("keys/compute_verifying.key")
+            .map_err(|e| anyhow!("Failed to read verifying key: {}", e))?;
+
+        ark_groth16::VerifyingKey::deserialize_compressed(&vk_bytes[..])
+            .map_err(|e| anyhow!("Failed to deserialize verifying key: {}", e))
     }
 
     /// Generate zkSNARK execution proof
     ///
-    /// TODO: This is a simplified version. Full implementation should:
-    /// 1. Load proving key from disk (generated during setup)
-    /// 2. Create proper ComputeCircuit with all witness data
-    /// 3. Generate actual Groth16 proof
+    /// - If proving keys exist: Generate real Groth16 proof (output-only for MVP)
+    /// - If keys don't exist: Generate placeholder (for testing/dev)
     ///
-    /// For now, we return a placeholder proof hash.
+    /// To generate keys: `cargo run --bin setup_compute_ceremony`
+    ///
+    /// **Current implementation**: Simplified proof that verifies output commitment only.
+    /// **Future**: Full input-output relationship proof (requires API refactoring)
     fn generate_execution_proof(
         _job_id: &str,
-        _output_data: &[u8],
-        _output_hash: u64,
-        _randomness: &[u8; 32],
+        output_data: &[u8],
+        output_hash: u64,
+        randomness: &[u8; 32],
     ) -> Result<Vec<u8>> {
         use sha2::{Digest, Sha256};
 
-        // TODO: Replace with actual proof generation
-        // let circuit = ComputeCircuit::with_witness(...);
-        // let proof = ComputeProofSystem::prove(&proving_key, circuit, &mut rng)?;
-        // let proof_bytes = serialize_proof(&proof);
+        // Check if real keys are available
+        if Self::compute_keys_exist() {
+            log::info!("Generating real Groth16 proof for output commitment");
 
-        // For now, generate a deterministic placeholder based on inputs
+            // Load proving key
+            let pk = Self::load_proving_key()?;
+
+            // Create simplified circuit with dummy input (output-only proof for MVP)
+            // This proves: output_commitment = commit(hash(output_data), randomness)
+            let dummy_code_hash = [0u8; 32];
+            let dummy_input = vec![0u8];
+            let dummy_input_randomness = [0u8; 32];
+
+            // Calculate dummy input commitment using Poseidon hash (matching circuit)
+            // Circuit constraint: computed_hash = poseidon(hash(data))
+            let dummy_input_hash = PrivateComputeJob::hash_data(&dummy_input);
+            let dummy_input_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
+                &ark_bls12_381::Fr::from(dummy_input_hash),
+            );
+
+            // Calculate output commitment using Poseidon hash (matching circuit)
+            let output_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
+                &ark_bls12_381::Fr::from(output_hash),
+            );
+
+            // Create circuit with witness (all commitments properly calculated)
+            let circuit = crate::compute::ComputeCircuit::with_witness(
+                dummy_code_hash,
+                dummy_input_commitment_fr,
+                output_commitment_fr,
+                dummy_input,
+                dummy_input_randomness,
+                output_data.to_vec(),
+                *randomness,
+            );
+
+            // Generate proof
+            use ark_groth16::Groth16;
+            use ark_snark::SNARK;
+            let mut rng = ark_std::rand::thread_rng();
+
+            let start = std::time::Instant::now();
+            let proof = Groth16::<ark_bls12_381::Bls12_381>::prove(&pk, circuit, &mut rng)
+                .map_err(|e| anyhow!("Proof generation failed: {:?}", e))?;
+
+            let proof_time = start.elapsed();
+            log::info!(
+                "Generated real Groth16 proof in {:.2}s",
+                proof_time.as_secs_f64()
+            );
+
+            // Serialize proof
+            use ark_serialize::CanonicalSerialize;
+            let mut proof_bytes = Vec::new();
+            proof.serialize_compressed(&mut proof_bytes)
+                .map_err(|e| anyhow!("Proof serialization failed: {:?}", e))?;
+
+            log::info!("Proof size: {} bytes", proof_bytes.len());
+            return Ok(proof_bytes);
+        }
+
+        // Fallback: Generate placeholder proof (deterministic hash)
+        log::warn!("Compute proving keys not found, using placeholder proof");
+        log::warn!("Run: cargo run --bin setup_compute_ceremony");
+
         let mut hasher = Sha256::new();
         hasher.update(_job_id.as_bytes());
-        hasher.update(_output_data);
-        hasher.update(_output_hash.to_le_bytes());
-        hasher.update(_randomness);
+        hasher.update(output_data);
+        hasher.update(output_hash.to_le_bytes());
+        hasher.update(randomness);
 
         let proof_hash = hasher.finalize();
         Ok(proof_hash.to_vec())
+    }
+
+    /// Verify zkSNARK execution proof
+    ///
+    /// - If verifying keys exist: Verify real Groth16 proof
+    /// - If keys don't exist: Basic format check (for testing/dev)
+    fn verify_execution_proof(
+        proof_bytes: &[u8],
+        output_hash: u64,
+    ) -> Result<bool> {
+        // Check if real keys are available
+        if Self::compute_keys_exist() {
+            log::info!("Verifying real Groth16 proof");
+
+            // Load verifying key
+            let vk = Self::load_verifying_key()?;
+
+            // Deserialize proof
+            use ark_serialize::CanonicalDeserialize;
+            let proof = ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(
+                proof_bytes,
+            )
+            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+
+            // Prepare public inputs (matching the circuit)
+            let dummy_code_hash_bytes = [0u8; 32];
+
+            // Calculate commitments using Poseidon hash (matching circuit constraints)
+            // Dummy input commitment: poseidon(hash([0u8]))
+            let dummy_input_hash = crate::compute::PrivateComputeJob::hash_data(&[0u8]);
+            let dummy_input_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
+                &ark_bls12_381::Fr::from(dummy_input_hash),
+            );
+
+            // Output commitment: poseidon(hash(output_data))
+            let output_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
+                &ark_bls12_381::Fr::from(output_hash),
+            );
+
+            // Public inputs: code_hash (32 bytes), input_commitment (1 field), output_commitment (1 field)
+            let mut public_inputs = Vec::new();
+
+            // Add code hash as field elements
+            for &byte in &dummy_code_hash_bytes {
+                public_inputs.push(ark_bls12_381::Fr::from(byte as u64));
+            }
+
+            // Add input commitment
+            public_inputs.push(dummy_input_commitment_fr);
+
+            // Add output commitment
+            public_inputs.push(output_commitment_fr);
+
+            // Verify proof
+            use ark_groth16::Groth16;
+            use ark_snark::SNARK;
+
+            let start = std::time::Instant::now();
+            let valid = Groth16::<ark_bls12_381::Bls12_381>::verify(&vk, &public_inputs, &proof)
+                .map_err(|e| anyhow!("Proof verification failed: {:?}", e))?;
+
+            let verify_time = start.elapsed();
+            log::info!(
+                "Groth16 proof verification completed in {:.2}ms: {}",
+                verify_time.as_secs_f64() * 1000.0,
+                if valid { "VALID" } else { "INVALID" }
+            );
+
+            return Ok(valid);
+        }
+
+        // Fallback: Basic format check for placeholder proofs
+        log::warn!("Compute verifying keys not found, using placeholder verification");
+        log::warn!("Run: cargo run --bin setup_compute_ceremony");
+
+        // Accept either:
+        // - Placeholder proofs: SHA256 hashes (32 bytes)
+        // - Real proofs: Groth16 (192 bytes) - but can't verify without keys
+        if proof_bytes.len() != 32 && proof_bytes.len() != 192 {
+            log::warn!(
+                "Invalid proof format (expected 32 or 192 bytes, got {})",
+                proof_bytes.len()
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 }
 
@@ -296,10 +529,11 @@ impl PrivateJobCoordinator {
         log::info!("Verifying private job result: {}", result.job_id);
 
         // Step 1: Verify zkSNARK proof
-        // TODO: Implement actual proof verification
-        // For now, check proof is not empty and has correct length
-        if result.execution_proof.is_empty() || result.execution_proof.len() != 32 {
-            log::warn!("Invalid proof format for job {}", result.job_id);
+        let proof_valid =
+            PrivateJobResult::verify_execution_proof(&result.execution_proof, result.output_hash)?;
+
+        if !proof_valid {
+            log::warn!("zkSNARK proof verification failed for job {}", result.job_id);
             return Ok(false);
         }
 
@@ -382,11 +616,11 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5];
         let address = ShieldedAddress([42u8; 32]);
 
-        let encrypted = PrivateComputeJob::encrypt_data(&data, &address);
-        let decrypted = PrivateComputeJob::decrypt_data(&encrypted, &address);
+        let encrypted = PrivateComputeJob::encrypt_data(&data, &address).unwrap();
+        let decrypted = PrivateComputeJob::decrypt_data(&encrypted, &address).unwrap();
 
         assert_eq!(data, decrypted);
-        assert_ne!(data, encrypted); // Should be different
+        assert_ne!(data, encrypted); // Should be different (includes nonce + tag)
     }
 
     #[tokio::test]
@@ -448,6 +682,7 @@ mod tests {
         let mut result = PrivateJobResult {
             job_id: "test-job".to_string(),
             output_commitment: crate::privacy::Commitment([1u8; 32]),
+            output_hash: 12345u64,
             encrypted_output: vec![1, 2, 3],
             execution_proof: vec![], // Invalid: empty proof
             execution_time_ms: 100,
@@ -520,7 +755,12 @@ mod tests {
 
         // Verify output is encrypted
         assert_ne!(private_result.encrypted_output, mock_output);
-        assert_eq!(private_result.execution_proof.len(), 32); // Should have proof
+        // Proof can be either placeholder (32 bytes) or real Groth16 (192 bytes)
+        assert!(
+            private_result.execution_proof.len() == 32 || private_result.execution_proof.len() == 192,
+            "Proof size should be 32 or 192 bytes, got {}",
+            private_result.execution_proof.len()
+        );
 
         // Step 5: Verify result
         let verified = coordinator.verify_result(&private_result).await;
@@ -532,7 +772,7 @@ mod tests {
         assert!(finalized.is_ok());
 
         // Step 7: Decrypt output (only owner can do this)
-        let decrypted_output = private_result.decrypt_output(&owner_address);
+        let decrypted_output = private_result.decrypt_output(&owner_address).unwrap();
         assert_eq!(decrypted_output, mock_output);
     }
 
@@ -631,7 +871,7 @@ mod tests {
         let output_wrong = vec![4, 3, 2, 1];
 
         // Validator 1 and 2 agree
-        for i in 0..2 {
+        for validator_id in validators.iter().take(2) {
             let result = JobResult {
                 job_id: job_id.clone(),
                 status: JobStatus::Completed,
@@ -642,7 +882,7 @@ mod tests {
                 instructions_executed: 50000,
             };
             verifier
-                .submit_result(&job_id, validators[i].clone(), result)
+                .submit_result(&job_id, validator_id.clone(), result)
                 .await
                 .unwrap();
         }
@@ -794,18 +1034,14 @@ mod tests {
             PrivateJobResult::from_job_result(job_id, job_result, &owner_address).unwrap();
 
         // Decrypt with correct key
-        let decrypted_correct = private_result.decrypt_output(&owner_address);
+        let decrypted_correct = private_result.decrypt_output(&owner_address).unwrap();
         assert_eq!(decrypted_correct, output_data);
 
-        // Decrypt with wrong key - should produce garbage
+        // Decrypt with wrong key - should fail authentication (AES-GCM)
         let decrypted_wrong = private_result.decrypt_output(&wrong_address);
-        assert_ne!(
-            decrypted_wrong, output_data,
-            "Wrong key should not decrypt correctly"
-        );
-        assert_ne!(
-            decrypted_wrong, decrypted_correct,
-            "Different keys should produce different outputs"
+        assert!(
+            decrypted_wrong.is_err(),
+            "Wrong key should fail decryption (authenticated encryption)"
         );
     }
 }
