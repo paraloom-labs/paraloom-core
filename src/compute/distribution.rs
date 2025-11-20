@@ -307,7 +307,7 @@ impl JobCoordinator {
                             let current_load = {
                                 let pending_count = pending
                                     .values()
-                                    .filter(|a| &a.validator_id == &validator.validator_id)
+                                    .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
                                 pending_count
                             };
@@ -374,11 +374,11 @@ impl JobCoordinator {
                             let current_load = {
                                 let pending_count = pending
                                     .values()
-                                    .filter(|a| &a.validator_id == &validator.validator_id)
+                                    .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
                                 let active_count = active
                                     .values()
-                                    .filter(|a| &a.validator_id == &validator.validator_id)
+                                    .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
                                 pending_count + active_count
                             };
@@ -459,7 +459,7 @@ impl JobCoordinator {
                             let current_load = {
                                 let pending_count = pending
                                     .values()
-                                    .filter(|a| &a.validator_id == &validator.validator_id)
+                                    .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
                                 pending_count
                             };
@@ -525,11 +525,11 @@ impl JobCoordinator {
                             let current_load = {
                                 let pending_count = pending
                                     .values()
-                                    .filter(|a| &a.validator_id == &validator.validator_id)
+                                    .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
                                 let active_count = active
                                     .values()
-                                    .filter(|a| &a.validator_id == &validator.validator_id)
+                                    .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
                                 pending_count + active_count
                             };
