@@ -257,14 +257,17 @@
 //! - Use memory limits to prevent resource exhaustion
 //! - Verify results through multi-validator consensus
 
+pub mod compute_circuit;
 pub mod distribution;
 pub mod engine;
 pub mod executor;
 pub mod job;
 pub mod manager;
+pub mod private_job;
 pub mod verification;
 
 // Re-export main types
+pub use compute_circuit::{ComputeCircuit, ComputeProofSystem, MAX_DATA_SIZE};
 pub use distribution::{
     CapacityAnnouncement, CoordinatorStats, JobAssignment, JobCoordinator, ValidatorJobFetcher,
     DEFAULT_JOB_TIMEOUT_SECS, MAX_JOB_RETRIES,
@@ -273,6 +276,7 @@ pub use engine::WasmEngine;
 pub use executor::{ExecutorStats, JobExecutor};
 pub use job::{ComputeJob, JobId, JobResult, JobStatus, ResourceLimits};
 pub use manager::{JobManager, ManagerStats, ValidatorCapacity, ValidatorId};
+pub use private_job::{PrivateComputeJob, PrivateJobCoordinator, PrivateJobResult};
 pub use verification::{
     ConsensusResult, ValidatorResult, VerificationCoordinator, VerificationRequest,
     VerificationStats, CONSENSUS_THRESHOLD, VERIFICATION_VALIDATOR_COUNT,
