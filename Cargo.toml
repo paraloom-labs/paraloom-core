@@ -67,6 +67,10 @@ path = "src/bin/compute_demo.rs"
 name = "setup_compute_ceremony"
 path = "src/bin/setup_compute_ceremony.rs"
 
+[[bin]]
+name = "paraloom"
+path = "src/bin/paraloom_cli.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh"]
