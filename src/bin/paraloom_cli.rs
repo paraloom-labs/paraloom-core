@@ -492,9 +492,8 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             }
 
             // Convert recipient address string to ShieldedAddress
-            let recipient_address: ShieldedAddress = if to.starts_with("paraloom1") {
+            let recipient_address: ShieldedAddress = if let Some(hex_part) = to.strip_prefix("paraloom1") {
                 // Parse paraloom address (hex after paraloom1 prefix)
-                let hex_part = &to[9..]; // Skip "paraloom1"
                 let bytes = hex::decode(hex_part).context("Invalid paraloom address format")?;
 
                 if bytes.len() != 32 {
@@ -853,7 +852,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             // For now, we'll use a simple hash as placeholder
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
-            hasher.update(&private_key);
+            hasher.update(private_key);
             let public_key = hasher.finalize();
 
             // Create address (paraloom1 + hex encoded public key)
@@ -883,7 +882,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             // Save in JSON format for easy parsing
             let key_data = serde_json::json!({
                 "address": address,
-                "private_key": hex::encode(&private_key),
+                "private_key": hex::encode(private_key),
                 "public_key": hex::encode(&public_key[..]),
                 "label": label.unwrap_or_default(),
                 "created_at": std::time::SystemTime::now()
@@ -934,7 +933,7 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 
             // Create resource limits
             let limits = ResourceLimits {
-                max_memory_bytes: (memory as u64) * 1024 * 1024, // MB to bytes
+                max_memory_bytes: memory * 1024 * 1024, // MB to bytes
                 max_instructions: 10_000_000,
                 timeout_secs: timeout,
             };
