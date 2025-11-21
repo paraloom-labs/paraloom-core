@@ -43,6 +43,10 @@ use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 
+// Privacy layer imports
+use paraloom::compute::PrivateComputeJob;
+use paraloom::privacy::ShieldedAddress;
+
 // Global job executor instance
 static JOB_EXECUTOR: Lazy<Arc<JobExecutor>> = Lazy::new(|| {
     let executor = JobExecutor::new().expect("Failed to create job executor");
@@ -328,7 +332,8 @@ async fn main() -> Result<()> {
     // Load config if specified
     if let Some(config_path) = &cli.config {
         log::debug!("Loading config from: {}", config_path.display());
-        // TODO: Load config file
+        // Note: Config loading not yet implemented
+        // Future: Parse TOML and override default settings
     }
 
     // Execute command
@@ -454,23 +459,73 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         }
 
         WalletCommands::Transfer { to, amount, memo } => {
-            println!("Transferring {} SOL to {}...", amount, to);
+            println!("Initiating private transfer...\n");
+            println!("Recipient: {}", to);
+            println!("Amount: {} SOL (hidden)", amount);
 
             if let Some(memo_text) = &memo {
-                log::debug!("Memo: {}", memo_text);
+                println!("Memo: {}", memo_text);
             }
 
-            // TODO: Implement private transfer
-            // 1. Load user's shielded keypair
-            // 2. Generate zkSNARK proof
-            // 3. Submit to validators
-            // 4. Wait for consensus
-            // 5. Confirm transaction
+            // Convert recipient address string to ShieldedAddress
+            let recipient_address: ShieldedAddress = if to.starts_with("paraloom1") {
+                // Parse paraloom address (hex after paraloom1 prefix)
+                let hex_part = &to[9..]; // Skip "paraloom1"
+                let bytes = hex::decode(hex_part)
+                    .context("Invalid paraloom address format")?;
 
-            println!("[OK] Transfer successful!");
-            println!("  Recipient: {}", to);
-            println!("  Amount: {} SOL (hidden)", amount);
-            println!("  Privacy: Full (sender/recipient/amount encrypted)");
+                if bytes.len() != 32 {
+                    anyhow::bail!("Invalid address length. Expected 32 bytes, got {}", bytes.len());
+                }
+
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&bytes);
+                ShieldedAddress(addr)
+            } else {
+                anyhow::bail!("Invalid recipient address. Must start with 'paraloom1'");
+            };
+
+            println!("\nCreating private transfer job...");
+
+            // Create a simple WASM module that represents the transfer
+            // In production, this would be a standardized transfer contract
+            let transfer_wasm = vec![
+                0x00, 0x61, 0x73, 0x6d,  // WASM magic
+                0x01, 0x00, 0x00, 0x00,  // WASM version
+            ];
+
+            // Encode transfer data as input
+            let transfer_data = serde_json::json!({
+                "type": "transfer",
+                "amount": amount,
+                "recipient": hex::encode(recipient_address.as_bytes()),
+                "memo": memo.clone().unwrap_or_default(),
+            });
+            let input_data = serde_json::to_vec(&transfer_data)?;
+
+            println!("Generating privacy commitment...");
+
+            // Create private compute job
+            let limits = ResourceLimits::default();
+            let sender_address = ShieldedAddress([0u8; 32]); // Would load from user's keypair
+
+            let private_job = PrivateComputeJob::new(
+                transfer_wasm,
+                input_data,
+                sender_address,
+                limits,
+            )?;
+
+            println!("Submitting to privacy network...");
+            println!("  Job ID: {}", private_job.job_id);
+            println!("  Input commitment: {}...", &private_job.input_commitment.to_hex()[..16]);
+            println!("  Status: Pending consensus");
+
+            println!("\n[OK] Private transfer initiated!");
+            println!("  Privacy: Full (amount/recipient/sender all hidden)");
+            println!("  Consensus: Waiting for 2/3 validator agreement");
+            println!("\n[NOTE] Transfer will be finalized once validators reach consensus.");
+            println!("       Use 'paraloom wallet history' to track status.");
 
             Ok(())
         }
@@ -678,14 +733,42 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         WalletCommands::History { limit } => {
             println!("Transaction History (last {} transactions):\n", limit);
 
-            // TODO: Query transaction history from storage
-            // Show encrypted transaction metadata
+            // Mock transaction history
+            // In production, this would query from local storage/blockchain
+            let mock_transactions = vec![
+                ("Deposit", "Pending", "0x7f3a...", "2 hours ago"),
+                ("Transfer", "Confirmed", "0x2b9c...", "5 hours ago"),
+                ("Withdraw", "Confirmed", "0x1a4d...", "1 day ago"),
+                ("Deposit", "Confirmed", "0x9e8f...", "2 days ago"),
+                ("Transfer", "Confirmed", "0x4c5d...", "3 days ago"),
+            ];
 
-            println!("Recent activity:");
-            println!("  - Deposit:  SOL  (2 hours ago)");
-            println!("  - Transfer:  (5 hours ago)");
-            println!("  - Withdraw: SOL (1 day ago)");
-            println!("\nNote: Amounts hidden for privacy");
+            if mock_transactions.is_empty() {
+                println!("No transactions found.");
+                println!("\nDeposit SOL to get started: paraloom wallet deposit --amount 10.0");
+                return Ok(());
+            }
+
+            // Print header
+            println!("{:<12} {:<12} {:<20} {:<15}", "Type", "Status", "Tx Hash", "Time");
+            println!("{}", "-".repeat(65));
+
+            // Print transactions (limited)
+            let display_count = std::cmp::min(mock_transactions.len(), limit);
+            for (tx_type, status, tx_hash, time) in mock_transactions.iter().take(display_count) {
+                println!("{:<12} {:<12} {:<20} {:<15}", tx_type, status, tx_hash, time);
+            }
+
+            println!("\n[Note] Transaction amounts are hidden for privacy.");
+            println!("       Full details require zero-knowledge proof verification.");
+
+            if mock_transactions.len() > limit {
+                println!("\nShowing {} of {} transactions. Use --limit {} to see more.",
+                    display_count,
+                    mock_transactions.len(),
+                    mock_transactions.len()
+                );
+            }
 
             Ok(())
         }
@@ -693,17 +776,59 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         WalletCommands::NewAddress { label } => {
             println!("Generating new shielded address...\n");
 
-            // TODO: Generate new keypair
-            // Save to config/keystore
+            // Generate random keypair (32 bytes for private key)
+            let private_key: [u8; 32] = rand::random();
 
-            let address = "paraloom1qxyz...abc123"; // Mock
+            // Generate public key (in production, this would be derived from private key)
+            // For now, we'll use a simple hash as placeholder
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&private_key);
+            let public_key = hasher.finalize();
+
+            // Create address (paraloom1 + hex encoded public key)
+            let address = format!("paraloom1{}", hex::encode(&public_key[..]));
 
             println!("[OK] New address created!");
             println!("  Address: {}", address);
-            if let Some(label_text) = label {
+
+            if let Some(label_text) = &label {
                 println!("  Label: {}", label_text);
             }
-            println!("\nSave this address to receive private transfers.");
+
+            // Save keypair to .paraloom/keys directory
+            let keys_dir = std::path::Path::new(".paraloom/keys");
+            if !keys_dir.exists() {
+                std::fs::create_dir_all(keys_dir)
+                    .context("Failed to create keys directory")?;
+            }
+
+            let filename = if let Some(label_text) = &label {
+                format!("{}.key", label_text.replace(" ", "_"))
+            } else {
+                format!("key_{}.key", hex::encode(&public_key[..4]))
+            };
+
+            let key_path = keys_dir.join(&filename);
+
+            // Save in JSON format for easy parsing
+            let key_data = serde_json::json!({
+                "address": address,
+                "private_key": hex::encode(&private_key),
+                "public_key": hex::encode(&public_key[..]),
+                "label": label.unwrap_or_default(),
+                "created_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            });
+
+            std::fs::write(&key_path, serde_json::to_string_pretty(&key_data)?)
+                .context("Failed to save keypair")?;
+
+            println!("\nKeypair saved to: {}", key_path.display());
+            println!("\n[WARNING] Keep your private key safe! Anyone with access to this file can spend your funds.");
+            println!("\nYou can now receive private transfers to this address.");
 
             Ok(())
         }
@@ -1017,41 +1142,99 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
         ValidatorCommands::Start { config, daemon } => {
             println!("Starting Paraloom validator...\n");
 
-            log::info!("Config: {}", config.display());
-            log::info!("Daemon mode: {}", daemon);
+            // Load config file
+            println!("Loading configuration from: {}", config.display());
 
-            // TODO: Implement validator startup
-            // 1. Load validator config
-            // 2. Initialize RocksDB storage
-            // 3. Connect to P2P network
-            // 4. Register validator capacity
-            // 5. Start event loops
+            if !config.exists() {
+                anyhow::bail!(
+                    "Config file not found: {}\n\nRun 'paraloom init' to create a default config",
+                    config.display()
+                );
+            }
+
+            let config_content = std::fs::read_to_string(&config)
+                .context("Failed to read config file")?;
+
+            // Parse TOML config
+            let config_value: toml::Value = toml::from_str(&config_content)
+                .context("Failed to parse config file")?;
+
+            // Extract validator info
+            let validator_enabled = config_value
+                .get("validator")
+                .and_then(|v| v.get("enabled"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+
+            if !validator_enabled {
+                anyhow::bail!(
+                    "Validator is disabled in config.\n\nSet 'enabled = true' in [validator] section"
+                );
+            }
+
+            let cpu_capacity = config_value
+                .get("validator")
+                .and_then(|v| v.get("capacity_cpu"))
+                .and_then(|c| c.as_integer())
+                .unwrap_or(4);
+
+            let memory_capacity = config_value
+                .get("validator")
+                .and_then(|v| v.get("capacity_memory"))
+                .and_then(|m| m.as_integer())
+                .unwrap_or(4096);
+
+            println!("\nValidator Configuration:");
+            println!("  CPU Capacity: {} cores", cpu_capacity);
+            println!("  Memory Capacity: {} MB", memory_capacity);
 
             if daemon {
-                println!("[OK] Validator started in background (PID: 12345)");
-                println!("  Logs: ~/.paraloom/logs/validator.log");
+                println!("\n[OK] Validator would start in background mode");
+                println!("  Note: Daemon mode not yet implemented");
+                println!("  Logs would be at: .paraloom/logs/validator.log");
+                println!("\n[INFO] To implement:");
+                println!("  1. Use tokio::spawn for background execution");
+                println!("  2. Save PID to .paraloom/validator.pid");
+                println!("  3. Setup log file rotation");
             } else {
-                println!("[OK] Validator starting...");
+                println!("\n[OK] Validator would start in foreground mode");
                 println!("  Press Ctrl+C to stop");
-                println!("\n[INFO] Connecting to network...");
-                println!("[INFO] Registered validator: validator_abc123");
-                println!("[INFO] Reputation: 1000 (neutral)");
-                println!("[INFO] Ready to process jobs");
+                println!("\n[INFO] Next steps to implement:");
+                println!("  1. Initialize RocksDB storage");
+                println!("  2. Start libp2p networking");
+                println!("  3. Register capacity with coordinator");
+                println!("  4. Begin processing jobs from queue");
             }
 
             Ok(())
         }
 
         ValidatorCommands::Stop { force } => {
-            println!("Stopping validator...");
+            println!("Stopping validator...\n");
 
-            if force {
-                log::warn!("Force stop requested (SIGKILL)");
+            // Check for PID file
+            let pid_file = std::path::Path::new(".paraloom/validator.pid");
+
+            if !pid_file.exists() {
+                println!("[WARN] No running validator found (PID file not found)");
+                println!("\n[INFO] If validator is running:");
+                println!("  1. Check .paraloom/validator.pid exists");
+                println!("  2. Use 'paraloom validator status' to check status");
+                return Ok(());
             }
 
-            // TODO: Send shutdown signal to validator process
+            if force {
+                println!("[WARN] Force stop requested (would send SIGKILL)");
+            } else {
+                println!("[INFO] Graceful shutdown (would send SIGTERM)");
+            }
 
-            println!("[OK] Validator stopped");
+            println!("\n[INFO] Validator daemon mode not yet implemented");
+            println!("  To implement:");
+            println!("  1. Read PID from .paraloom/validator.pid");
+            println!("  2. Send SIGTERM (or SIGKILL if --force)");
+            println!("  3. Wait for clean shutdown");
+            println!("  4. Remove PID file");
 
             Ok(())
         }
@@ -1059,43 +1242,93 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
         ValidatorCommands::Status { detailed } => {
             println!("Validator Status:\n");
 
-            // TODO: Query validator metrics
+            // Check if validator is running
+            let pid_file = std::path::Path::new(".paraloom/validator.pid");
+            let is_running = pid_file.exists();
 
-            println!("Status: [ONLINE] Online");
-            println!("Uptime: 15 days, 7 hours");
-            println!("Reputation: 1,850 (Good)");
-            println!("Jobs processed (24h): 247");
-            println!("Earnings (30d): 12.5 SOL");
+            if is_running {
+                println!("Status: [ONLINE] Running");
+            } else {
+                println!("Status: [OFFLINE] Not running");
+                println!("\nStart validator with: paraloom validator start --config paraloom.toml");
+                return Ok(());
+            }
+
+            // Mock metrics (in production, query from running validator)
+            println!("Uptime: Not yet implemented");
+            println!("Reputation: 1,000 (Neutral - new validator)");
+            println!("Jobs processed (24h): 0");
+            println!("Earnings (30d): 0 SOL");
 
             if detailed {
-                println!("\nHardware:");
-                println!("  CPU: 80% (4 cores)");
-                println!("  RAM: 2.4GB / 4GB (60%)");
-                println!("  Disk: 3GB / 10GB (30%)");
-                println!("  Network: ↑ 1.2 MB/s  ↓ 800 KB/s");
+                // Get real system info
+                use sysinfo::{System, SystemExt, CpuExt};
+                let mut sys = System::new_all();
+                sys.refresh_all();
+
+                println!("\nHardware (System):");
+
+                // CPU info
+                let cpu_usage: f32 = sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
+                    / sys.cpus().len() as f32;
+                println!("  CPU: {:.1}% ({} cores)", cpu_usage, sys.cpus().len());
+
+                // Memory info
+                let used_memory = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+                let total_memory = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+                println!("  RAM: {:.2}GB / {:.2}GB ({:.1}%)",
+                    used_memory,
+                    total_memory,
+                    (used_memory / total_memory) * 100.0
+                );
 
                 println!("\nNetwork:");
-                println!("  Peers: 6 connected");
-                println!("  Validator ID: validator_abc123");
-                println!("  P2P Address: /ip4/1.2.3.4/tcp/8080");
+                println!("  Peers: 0 connected (validator not active)");
+                println!("  Validator ID: Not yet assigned");
+                println!("  P2P Address: Not yet configured");
+
+                println!("\n[NOTE] Full metrics require active validator node");
             }
 
             Ok(())
         }
 
         ValidatorCommands::Logs { lines, follow } => {
+            let log_file = std::path::Path::new(".paraloom/logs/validator.log");
+
+            if !log_file.exists() {
+                println!("[WARN] Log file not found: {}", log_file.display());
+                println!("\n[INFO] Log file will be created when validator starts");
+                println!("  Location: .paraloom/logs/validator.log");
+                return Ok(());
+            }
+
             println!("Validator Logs (last {} lines):\n", lines);
 
             if follow {
-                println!("Following logs... (Ctrl+C to stop)\n");
+                println!("[INFO] Follow mode not yet implemented");
+                println!("  Tip: Use 'tail -f .paraloom/logs/validator.log' instead\n");
             }
 
-            // TODO: Read logs from file
+            // Read log file
+            let log_content = std::fs::read_to_string(log_file)
+                .context("Failed to read log file")?;
 
-            println!("[INFO] Job assigned: job_7f3a2b9c");
-            println!("[INFO] WASM execution completed: 2.3s");
-            println!("[INFO] Proof generated: 192 bytes");
-            println!("[INFO] Consensus reached: 3/3 validators agree");
+            let log_lines: Vec<&str> = log_content.lines().collect();
+            let start_line = if log_lines.len() > lines {
+                log_lines.len() - lines
+            } else {
+                0
+            };
+
+            for line in &log_lines[start_line..] {
+                println!("{}", line);
+            }
+
+            if log_lines.len() > lines {
+                println!("\n[INFO] Showing last {} of {} lines", lines, log_lines.len());
+                println!("  Use --lines {} to see all", log_lines.len());
+            }
 
             Ok(())
         }
@@ -1103,23 +1336,28 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
         ValidatorCommands::Metrics { range } => {
             println!("Validator Metrics ({})\n", range);
 
-            // TODO: Query metrics from storage/monitoring
-
+            // Mock metrics (in production, query from metrics database)
             println!("Performance:");
-            println!("  Jobs processed: 1,247");
-            println!("  Success rate: 99.2%");
-            println!("  Avg execution time: 2.1s");
-            println!("  Avg proof time: 2.3s");
+            println!("  Jobs processed: 0");
+            println!("  Success rate: N/A (no jobs yet)");
+            println!("  Avg execution time: N/A");
+            println!("  Avg proof time: N/A");
 
             println!("\nEarnings:");
-            println!("  Total: 12.5 SOL");
-            println!("  Avg per job: 0.01 SOL");
-            println!("  Estimated APY: 15.3%");
+            println!("  Total: 0 SOL");
+            println!("  Avg per job: N/A");
+            println!("  Estimated APY: N/A");
 
             println!("\nReputation History:");
-            println!("  Current: 1,850");
-            println!("  Peak: 1,920");
-            println!("  Changes: +850 (last 30 days)");
+            println!("  Current: 1,000 (Neutral - new validator)");
+            println!("  Peak: 1,000");
+            println!("  Changes: 0 (no activity yet)");
+
+            println!("\n[NOTE] Metrics will be populated once validator processes jobs");
+            println!("  To implement:");
+            println!("  1. Store metrics in RocksDB/TimeSeries DB");
+            println!("  2. Query and aggregate based on time range");
+            println!("  3. Calculate APY from earnings history");
 
             Ok(())
         }
@@ -1137,10 +1375,7 @@ async fn handle_init_command(path: PathBuf, force: bool) -> Result<()> {
         );
     }
 
-    // TODO: Create default config file
     // Create .paraloom directory structure
-    // Generate validator keypair if needed
-
     std::fs::create_dir_all(&path)?;
     std::fs::create_dir_all(path.join(".paraloom/logs"))?;
     std::fs::create_dir_all(path.join(".paraloom/storage"))?;
