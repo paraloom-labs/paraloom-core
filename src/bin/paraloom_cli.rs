@@ -38,6 +38,17 @@ use solana_sdk::{
 #[cfg(feature = "solana-bridge")]
 use std::str::FromStr;
 
+// Compute layer imports
+use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
+use once_cell::sync::Lazy;
+use std::sync::Arc;
+
+// Global job executor instance
+static JOB_EXECUTOR: Lazy<Arc<JobExecutor>> = Lazy::new(|| {
+    let executor = JobExecutor::new().expect("Failed to create job executor");
+    Arc::new(executor)
+});
+
 #[derive(Parser)]
 #[command(name = "paraloom")]
 #[command(author = "Paraloom Team")]
@@ -708,28 +719,49 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             memory,
             fee,
         } => {
-            println!("Submitting private compute job...\n");
+            println!("Submitting compute job...\n");
 
-            log::info!("WASM program: {}", wasm.display());
-            log::info!("Input data: {}", input.display());
-            log::info!("Timeout: {}s", timeout);
-            log::info!("Memory limit: {}MB", memory);
+            println!("WASM program: {}", wasm.display());
+            println!("Input data: {}", input.display());
+            println!("Timeout: {}s", timeout);
+            println!("Memory limit: {}MB\n", memory);
 
-            // TODO: Implement job submission
-            // 1. Load and validate WASM program
-            // 2. Load and encrypt input data
-            // 3. Generate input commitment
-            // 4. Submit to validators
-            // 5. Pay job fee from shielded balance
+            // Load WASM bytecode
+            println!("Loading WASM program...");
+            let wasm_code = std::fs::read(&wasm)
+                .context(format!("Failed to read WASM file: {}", wasm.display()))?;
+            println!("  WASM size: {} bytes", wasm_code.len());
 
-            let job_id = "7f3a2b9c1d4e5f6g"; // Mock
+            // Load input data
+            println!("Loading input data...");
+            let input_data = std::fs::read(&input)
+                .context(format!("Failed to read input file: {}", input.display()))?;
+            println!("  Input size: {} bytes\n", input_data.len());
+
+            // Create resource limits
+            let limits = ResourceLimits {
+                max_memory_bytes: (memory as u64) * 1024 * 1024, // MB to bytes
+                max_instructions: 10_000_000,
+                timeout_secs: timeout,
+            };
+
+            // Create compute job
+            let job = ComputeJob::new(wasm_code, input_data, limits);
+            let job_id = job.id.clone();
+
+            // Submit to executor
+            println!("Submitting job to executor...");
+            JOB_EXECUTOR.submit_job(job)
+                .context("Failed to submit job")?;
+
             let estimated_fee = fee.unwrap_or(0.01);
 
-            println!("[OK] Job submitted successfully!");
+            println!("\n[OK] Job submitted successfully!");
             println!("  Job ID: {}", job_id);
             println!("  Status: Pending");
-            println!("  Fee: {} SOL", estimated_fee);
+            println!("  Estimated fee: {} SOL (payment not yet implemented)", estimated_fee);
             println!("\nUse 'paraloom compute status --job-id {}' to track progress", job_id);
+            println!("Use 'paraloom compute result --job-id {}' to get the result", job_id);
 
             Ok(())
         }
@@ -741,25 +773,73 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
         } => {
             println!("Fetching result for job {}...\n", job_id);
 
-            // TODO: Query job result from validators
-            // Decrypt output with user's private key
+            // Query job result from executor
+            let result = JOB_EXECUTOR.get_job_result(&job_id);
 
-            println!("Job Status: Completed");
-            println!("Validators: 3/3 consensus");
+            match result {
+                Some(job_result) => {
+                    println!("Job Status: {:?}", job_result.status);
 
-            if show_proof {
-                println!("\nzkSNARK Proof:");
-                println!("  Size: 192 bytes");
-                println!("  Verified: [OK]");
-                println!("  Proof hash: 0xabc123...");
-            }
+                    if job_result.execution_time_ms > 0 {
+                        println!("Execution Time: {}ms", job_result.execution_time_ms);
+                    }
 
-            println!("\nDecrypting output...");
+                    if job_result.memory_used_bytes > 0 {
+                        println!("Memory Used: {} bytes ({:.2} MB)",
+                            job_result.memory_used_bytes,
+                            job_result.memory_used_bytes as f64 / 1024.0 / 1024.0
+                        );
+                    }
 
-            if let Some(output_path) = output {
-                println!("[OK] Result saved to: {}", output_path.display());
-            } else {
-                println!("[OK] Result: [15]");
+                    if job_result.instructions_executed > 0 {
+                        println!("Instructions Executed: {}", job_result.instructions_executed);
+                    }
+
+                    if show_proof {
+                        println!("\nzkSNARK Proof:");
+                        println!("  Note: Proof generation not yet implemented");
+                        println!("  Future: Will contain execution correctness proof");
+                    }
+
+                    match job_result.status {
+                        JobStatus::Completed => {
+                            if let Some(output_data) = &job_result.output_data {
+                                println!("\nOutput Data:");
+                                println!("  Size: {} bytes", output_data.len());
+
+                                if let Some(output_path) = output {
+                                    std::fs::write(&output_path, output_data)
+                                        .context("Failed to write output file")?;
+                                    println!("\n[OK] Result saved to: {}", output_path.display());
+                                } else {
+                                    // Try to display as hex if small enough
+                                    if output_data.len() <= 32 {
+                                        println!("  Hex: {}", hex::encode(output_data));
+                                    } else {
+                                        println!("  (use --output to save to file)");
+                                    }
+                                }
+                            } else {
+                                println!("\n[OK] Job completed with no output");
+                            }
+                        }
+                        JobStatus::Failed { error } => {
+                            println!("\n[ERROR] Job failed: {}", error);
+                        }
+                        _ => {
+                            println!("\n[WARN] Job not yet completed");
+                            println!("Use 'paraloom compute status --job-id {}' to track progress", job_id);
+                        }
+                    }
+                }
+                None => {
+                    println!("[ERROR] Job not found: {}", job_id);
+                    println!("\nPossible reasons:");
+                    println!("  - Job ID is incorrect");
+                    println!("  - Job has not been submitted yet");
+                    println!("\nUse 'paraloom compute list' to see all jobs");
+                    anyhow::bail!("Job not found");
+                }
             }
 
             Ok(())
@@ -768,18 +848,77 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
         ComputeCommands::List { status, limit } => {
             println!("Your Compute Jobs:\n");
 
-            if let Some(status_filter) = &status {
-                println!("Filtering by status: {}\n", status_filter);
+            // Get all job results from executor
+            let results = JOB_EXECUTOR.get_all_results();
+
+            if results.is_empty() {
+                println!("No jobs found.");
+                println!("\nSubmit a job with: paraloom compute submit --wasm <file> --input <file>");
+                return Ok(());
             }
 
-            // TODO: Query user's job history
+            // Filter by status if specified
+            let filtered_results: Vec<_> = if let Some(status_filter) = &status {
+                let filter_str = status_filter.to_lowercase();
+                results.into_iter()
+                    .filter(|r| format!("{:?}", r.status).to_lowercase().contains(&filter_str))
+                    .collect()
+            } else {
+                results
+            };
 
-            println!("Job ID          Status      Validators  Age");
-            println!("──────────────  ──────────  ──────────  ──────────");
-            println!("7f3a2b9c...     Completed   3/3         2 hours ago");
-            println!("1a4d5e6f...     Running     2/3         5 min ago");
-            println!("9g8h7i6j...     Pending     0/3         1 min ago");
-            println!("\nShowing {} jobs", std::cmp::min(limit, 3));
+            if filtered_results.is_empty() {
+                println!("No jobs found matching filter: {}", status.unwrap());
+                return Ok(());
+            }
+
+            // Print header
+            println!("{:<20} {:<15} {:<15} {:<15}", "Job ID", "Status", "Exec Time", "Memory Used");
+            println!("{}", "-".repeat(70));
+
+            // Print jobs (limited)
+            let display_count = std::cmp::min(filtered_results.len(), limit);
+            for result in filtered_results.iter().take(display_count) {
+                let job_id_short = if result.job_id.len() > 18 {
+                    format!("{}...", &result.job_id[..15])
+                } else {
+                    result.job_id.clone()
+                };
+
+                let status_str = match &result.status {
+                    JobStatus::Completed => "Completed",
+                    JobStatus::Failed { .. } => "Failed",
+                    JobStatus::Running => "Running",
+                    JobStatus::Pending => "Pending",
+                    JobStatus::Assigned => "Assigned",
+                    JobStatus::TimedOut => "TimedOut",
+                };
+
+                let exec_time = if result.execution_time_ms > 0 {
+                    format!("{}ms", result.execution_time_ms)
+                } else {
+                    "-".to_string()
+                };
+
+                let memory_used = if result.memory_used_bytes > 0 {
+                    format!("{:.2}MB", result.memory_used_bytes as f64 / 1024.0 / 1024.0)
+                } else {
+                    "-".to_string()
+                };
+
+                println!("{:<20} {:<15} {:<15} {:<15}",
+                    job_id_short,
+                    status_str,
+                    exec_time,
+                    memory_used
+                );
+            }
+
+            println!("\nShowing {} of {} jobs", display_count, filtered_results.len());
+
+            if filtered_results.len() > limit {
+                println!("Use --limit {} to see more", filtered_results.len());
+            }
 
             Ok(())
         }
@@ -787,20 +926,86 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
         ComputeCommands::Status { job_id, watch } => {
             if watch {
                 println!("Watching job {}... (Ctrl+C to stop)\n", job_id);
-                // TODO: Implement watch mode with periodic updates
+
+                // Watch mode: poll every second until completed
+                loop {
+                    let status = JOB_EXECUTOR.get_job_status(&job_id);
+
+                    match status {
+                        Some(job_status) => {
+                            print!("\rStatus: {:?}     ", job_status);
+                            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+                            match job_status {
+                                JobStatus::Completed | JobStatus::Failed { .. } | JobStatus::TimedOut => {
+                                    println!("\n\nJob finished!");
+                                    println!("Use 'paraloom compute result --job-id {}' to see details", job_id);
+                                    break;
+                                }
+                                _ => {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                }
+                            }
+                        }
+                        None => {
+                            println!("\n[ERROR] Job not found: {}", job_id);
+                            break;
+                        }
+                    }
+                }
             } else {
                 println!("Job Status: {}\n", job_id);
+
+                let status = JOB_EXECUTOR.get_job_status(&job_id);
+
+                match status {
+                    Some(job_status) => {
+                        println!("Current Status: {:?}", job_status);
+
+                        // Try to get result for more details
+                        if let Some(result) = JOB_EXECUTOR.get_job_result(&job_id) {
+                            println!("\nJob Details:");
+
+                            if result.execution_time_ms > 0 {
+                                println!("  Execution Time: {}ms", result.execution_time_ms);
+                            }
+
+                            if result.memory_used_bytes > 0 {
+                                println!("  Memory Used: {:.2} MB", result.memory_used_bytes as f64 / 1024.0 / 1024.0);
+                            }
+
+                            if result.instructions_executed > 0 {
+                                println!("  Instructions Executed: {}", result.instructions_executed);
+                            }
+
+                            match job_status {
+                                JobStatus::Completed => {
+                                    println!("\n[OK] Job completed successfully!");
+                                    println!("Use 'paraloom compute result --job-id {}' to get output", job_id);
+                                }
+                                JobStatus::Failed { error } => {
+                                    println!("\n[ERROR] Job failed: {}", error);
+                                }
+                                JobStatus::TimedOut => {
+                                    println!("\n[WARN] Job timed out");
+                                }
+                                _ => {
+                                    println!("\n[INFO] Job still in progress...");
+                                    println!("Use 'paraloom compute status --job-id {} --watch' to monitor", job_id);
+                                }
+                            }
+                        } else {
+                            println!("\n[INFO] Job is queued or in progress");
+                            println!("Use 'paraloom compute status --job-id {} --watch' to monitor", job_id);
+                        }
+                    }
+                    None => {
+                        println!("[ERROR] Job not found: {}", job_id);
+                        println!("\nUse 'paraloom compute list' to see all jobs");
+                        anyhow::bail!("Job not found");
+                    }
+                }
             }
-
-            // TODO: Query detailed job status
-
-            println!("Status: Running");
-            println!("Validators:");
-            println!("  - validator_abc: Completed");
-            println!("  - validator_def:  Executing...");
-            println!("  - validator_ghi: Pending");
-            println!("\nConsensus: 1/3 (waiting for 2/3)");
-            println!("Estimated time remaining: ~30 seconds");
 
             Ok(())
         }
