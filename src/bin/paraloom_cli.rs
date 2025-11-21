@@ -798,19 +798,13 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
 
             // Mock transaction history
             // In production, this would query from local storage/blockchain
-            let mock_transactions = vec![
+            let mock_transactions = [
                 ("Deposit", "Pending", "0x7f3a...", "2 hours ago"),
                 ("Transfer", "Confirmed", "0x2b9c...", "5 hours ago"),
                 ("Withdraw", "Confirmed", "0x1a4d...", "1 day ago"),
                 ("Deposit", "Confirmed", "0x9e8f...", "2 days ago"),
                 ("Transfer", "Confirmed", "0x4c5d...", "3 days ago"),
             ];
-
-            if mock_transactions.is_empty() {
-                println!("No transactions found.");
-                println!("\nDeposit SOL to get started: paraloom wallet deposit --amount 10.0");
-                return Ok(());
-            }
 
             // Print header
             println!(
