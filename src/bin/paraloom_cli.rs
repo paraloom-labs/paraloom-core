@@ -26,6 +26,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[cfg(feature = "solana-bridge")]
+use paraloom::bridge::solana::*;
+#[cfg(feature = "solana-bridge")]
+use solana_client::rpc_client::RpcClient;
+#[cfg(feature = "solana-bridge")]
+use solana_sdk::{
+    commitment_config::CommitmentConfig, native_token::LAMPORTS_PER_SOL, pubkey::Pubkey,
+    signature::Signer, transaction::Transaction,
+};
+#[cfg(feature = "solana-bridge")]
+use std::str::FromStr;
+
 #[derive(Parser)]
 #[command(name = "paraloom")]
 #[command(author = "Paraloom Team")]
@@ -92,6 +104,10 @@ enum WalletCommands {
         /// Wallet keypair path
         #[arg(long)]
         keypair: Option<PathBuf>,
+
+        /// Bridge program ID
+        #[arg(long)]
+        program_id: Option<String>,
     },
 
     /// Transfer SOL privately within Paraloom
@@ -122,6 +138,14 @@ enum WalletCommands {
         /// Solana RPC URL (default: devnet)
         #[arg(long)]
         rpc_url: Option<String>,
+
+        /// Authority keypair path
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Bridge program ID
+        #[arg(long)]
+        program_id: Option<String>,
     },
 
     /// Show shielded balance
@@ -129,6 +153,18 @@ enum WalletCommands {
         /// Show detailed breakdown
         #[arg(short, long)]
         detailed: bool,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Wallet keypair path (optional, for Solana balance)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Bridge program ID
+        #[arg(long)]
+        program_id: Option<String>,
     },
 
     /// List transaction history (encrypted)
@@ -255,6 +291,19 @@ enum ValidatorCommands {
     },
 }
 
+fn print_banner() {
+    println!(r#"
+  ____                 _
+ |  _ \ __ _ _ __ __ _| | ___   ___  _ __ ___
+ | |_) / _` | '__/ _` | |/ _ \ / _ \| '_ ` _ \
+ |  __/ (_| | | | (_| | | (_) | (_) | | | | | |
+ |_|   \__,_|_|  \__,_|_|\___/ \___/|_| |_| |_|
+
+ Privacy-preserving distributed computing on Solana
+ True Decentralized Privacy | v0.1.0
+"#);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -286,8 +335,9 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             amount,
             rpc_url,
             keypair,
+            program_id,
         } => {
-            println!("Depositing {} SOL to Paraloom...", amount);
+            println!("Depositing {} SOL to Paraloom...\n", amount);
 
             #[cfg(feature = "solana-bridge")]
             {
@@ -301,22 +351,87 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     .or_else(|| std::env::var("SOLANA_KEYPAIR_PATH").ok().map(PathBuf::from))
                     .context("Wallet keypair not specified. Use --keypair or SOLANA_KEYPAIR_PATH")?;
 
-                log::info!("RPC URL: {}", rpc_url);
-                log::info!("Keypair: {}", keypair_path.display());
-                log::info!("Amount: {} SOL", amount);
+                // Get program ID
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .context("Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID")?;
 
-                // TODO: Implement actual deposit logic
-                // 1. Load Solana keypair
-                // 2. Connect to Solana RPC
-                // 3. Send deposit transaction to bridge program
-                // 4. Wait for confirmation
-                // 5. Generate shielded commitment
-                // 6. Show shielded address
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Depositor Keypair: {}\n", keypair_path.display());
 
-                println!("[OK] Deposit successful!");
-                println!("  Transaction: <tx_signature>");
+                // Parse program ID
+                let program_id = Pubkey::from_str(&program_id_str)
+                    .context("Invalid program ID")?;
+
+                // Load depositor keypair
+                println!("Loading depositor keypair...");
+                let depositor = load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                    .context("Failed to load keypair")?;
+                println!("Depositor Address: {}\n", depositor.pubkey());
+
+                // Create RPC client
+                println!("Connecting to Solana...");
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                // Check depositor balance
+                let balance = client.get_balance(&depositor.pubkey())
+                    .context("Failed to get balance")?;
+                println!("Depositor Balance: {} SOL\n", balance as f64 / LAMPORTS_PER_SOL as f64);
+
+                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
+                if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
+                    anyhow::bail!("Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)", amount);
+                }
+
+                // Derive bridge vault PDA
+                let (bridge_vault, _vault_bump) = derive_bridge_vault(&program_id);
+                println!("Bridge Vault PDA: {}\n", bridge_vault);
+
+                // Generate deposit parameters
+                let recipient = rand::random::<[u8; 32]>(); // Random recipient address in privacy pool
+                let randomness = rand::random::<[u8; 32]>(); // Random blinding factor
+
+                println!("Deposit Amount: {} SOL", amount);
+                println!("Recipient (privacy address): {}", hex::encode(&recipient[..8]));
+                println!("Randomness: {}\n", hex::encode(&randomness[..8]));
+
+                // Create deposit instruction
+                println!("Creating deposit instruction...");
+                let ix = create_deposit_instruction(
+                    &program_id,
+                    &depositor.pubkey(),
+                    &bridge_vault,
+                    deposit_lamports,
+                    recipient,
+                    randomness,
+                ).context("Failed to create deposit instruction")?;
+
+                // Get recent blockhash
+                println!("Getting recent blockhash...");
+                let blockhash = client.get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+
+                // Create and sign transaction
+                println!("Creating and signing transaction...");
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&depositor.pubkey()),
+                    &[&depositor],
+                    blockhash,
+                );
+
+                // Send transaction
+                println!("Sending transaction...");
+                let signature = client.send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Deposit successful!");
+                println!("  Transaction: {}", signature);
                 println!("  Shielded balance: {} SOL", amount);
-                println!("  Shielded address: <address>");
+                println!("  Shielded address: paraloom1{}", hex::encode(&recipient[..16]));
+                println!("\nView transaction:");
+                println!("  solana confirm -v {}", signature);
             }
 
             #[cfg(not(feature = "solana-bridge"))]
@@ -349,29 +464,132 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             Ok(())
         }
 
-        WalletCommands::Withdraw { to, amount, rpc_url } => {
-            println!("Withdrawing {} SOL to {}...", amount, to);
+        WalletCommands::Withdraw {
+            to,
+            amount,
+            rpc_url,
+            keypair,
+            program_id,
+        } => {
+            println!("Withdrawing {} SOL to {}...\n", amount, to);
 
             #[cfg(feature = "solana-bridge")]
             {
+                // Get RPC URL
                 let rpc_url = rpc_url
                     .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
                     .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
 
-                log::info!("RPC URL: {}", rpc_url);
-                log::info!("Destination: {}", to);
-                log::info!("Amount: {} SOL", amount);
+                // Get keypair path
+                let keypair_path = keypair
+                    .or_else(|| std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH").ok().map(PathBuf::from))
+                    .context("Authority keypair not specified. Use --keypair or BRIDGE_AUTHORITY_KEYPAIR_PATH")?;
 
-                // TODO: Implement withdrawal
-                // 1. Generate zkSNARK proof of ownership
-                // 2. Submit proof + nullifier to Solana bridge
-                // 3. Wait for on-chain verification
-                // 4. Confirm SOL transfer
+                // Get program ID
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .context("Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID")?;
 
-                println!("[OK] Withdrawal successful!");
-                println!("  Transaction: <tx_signature>");
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Authority Keypair: {}\n", keypair_path.display());
+
+                // Parse program ID
+                let program_id = Pubkey::from_str(&program_id_str)
+                    .context("Invalid program ID")?;
+
+                // Load authority keypair
+                println!("Loading authority keypair...");
+                let authority = load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                    .context("Failed to load keypair")?;
+                println!("Authority Address: {}\n", authority.pubkey());
+
+                // Create RPC client
+                println!("Connecting to Solana...");
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                // Check authority balance
+                let balance = client.get_balance(&authority.pubkey())
+                    .context("Failed to get balance")?;
+                println!("Authority Balance: {} SOL\n", balance as f64 / LAMPORTS_PER_SOL as f64);
+
+                // Derive bridge vault PDA
+                let (bridge_vault, _vault_bump) = derive_bridge_vault(&program_id);
+                println!("Bridge Vault PDA: {}\n", bridge_vault);
+
+                // Check vault balance
+                let vault_balance = client.get_balance(&bridge_vault)
+                    .context("Failed to get vault balance")?;
+                println!("Bridge Vault Balance: {} SOL\n", vault_balance as f64 / LAMPORTS_PER_SOL as f64);
+
+                let withdrawal_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
+                if vault_balance < withdrawal_lamports {
+                    anyhow::bail!("Insufficient vault balance. Vault has {} SOL, need {} SOL",
+                        vault_balance as f64 / LAMPORTS_PER_SOL as f64, amount);
+                }
+
+                // Parse recipient address
+                let recipient_pubkey = Pubkey::from_str(&to)
+                    .context("Invalid recipient address")?;
+                let recipient = recipient_pubkey.to_bytes();
+
+                println!("Recipient Address: {}", recipient_pubkey);
+
+                // Generate withdrawal parameters
+                let nullifier = rand::random::<[u8; 32]>(); // Unique nullifier for this withdrawal
+                let proof = vec![0u8; 128]; // Mock zkSNARK proof (verification skipped in MVP)
+
+                println!("Withdrawal Amount: {} SOL", amount);
+                println!("Nullifier: {}", hex::encode(&nullifier[..8]));
+                println!("Proof length: {} bytes\n", proof.len());
+
+                // Create withdraw instruction
+                println!("Creating withdraw instruction...");
+                let ix = create_withdraw_instruction(
+                    &program_id,
+                    &authority.pubkey(),
+                    &bridge_vault,
+                    recipient,
+                    nullifier,
+                    withdrawal_lamports,
+                    proof,
+                ).context("Failed to create withdraw instruction")?;
+
+                // Get recent blockhash
+                println!("Getting recent blockhash...");
+                let blockhash = client.get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+
+                // Create and sign transaction
+                println!("Creating and signing transaction...");
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&authority.pubkey()),
+                    &[&authority],
+                    blockhash,
+                );
+
+                // Send transaction
+                println!("Sending transaction...");
+                let signature = client.send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Withdrawal successful!");
+                println!("  Transaction: {}", signature);
                 println!("  Destination: {}", to);
                 println!("  Amount: {} SOL", amount);
+                println!("\nView transaction:");
+                println!("  solana confirm -v {}", signature);
+
+                // Verify balances
+                println!("\nVerifying balances...");
+                let vault_balance_after = client.get_balance(&bridge_vault)
+                    .context("Failed to get vault balance")?;
+                let recipient_balance = client.get_balance(&recipient_pubkey)
+                    .context("Failed to get recipient balance")?;
+
+                println!("  Bridge Vault Balance (after): {} SOL", vault_balance_after as f64 / LAMPORTS_PER_SOL as f64);
+                println!("  Recipient Balance: {} SOL", recipient_balance as f64 / LAMPORTS_PER_SOL as f64);
             }
 
             #[cfg(not(feature = "solana-bridge"))]
@@ -382,22 +600,65 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             Ok(())
         }
 
-        WalletCommands::Balance { detailed } => {
-            println!("Fetching shielded balance...\n");
+        WalletCommands::Balance {
+            detailed,
+            rpc_url,
+            keypair,
+            program_id,
+        } => {
+            println!("Fetching balance...\n");
 
-            // TODO: Query shielded pool for user's commitments
-            // Sum up unspent commitments
+            #[cfg(feature = "solana-bridge")]
+            {
+                // Get RPC URL
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
 
-            let total_balance = 10.5; // Mock data
+                println!("RPC URL: {}", rpc_url);
 
-            println!("Shielded Balance: {} SOL", total_balance);
+                // Create RPC client
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-            if detailed {
-                println!("\nCommitments:");
-                println!("  - 5.0 SOL  (commitment: 0x7f3a...)");
-                println!("  - 3.5 SOL  (commitment: 0x2b9c...)");
-                println!("  - 2.0 SOL  (commitment: 0x1a4d...)");
-                println!("\nTotal: {} SOL", total_balance);
+                // Show bridge vault balance if program_id is provided
+                if let Some(program_id_str) = program_id.or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok()) {
+                    let program_id = Pubkey::from_str(&program_id_str)
+                        .context("Invalid program ID")?;
+                    let (bridge_vault, _) = derive_bridge_vault(&program_id);
+
+                    let vault_balance = client.get_balance(&bridge_vault)
+                        .context("Failed to get vault balance")?;
+
+                    println!("\nBridge Vault Balance:");
+                    println!("  Address: {}", bridge_vault);
+                    println!("  Balance: {} SOL\n", vault_balance as f64 / LAMPORTS_PER_SOL as f64);
+                }
+
+                // Show wallet balance if keypair is provided
+                if let Some(keypair_path) = keypair.or_else(|| std::env::var("SOLANA_KEYPAIR_PATH").ok().map(PathBuf::from)) {
+                    let wallet = load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+
+                    let wallet_balance = client.get_balance(&wallet.pubkey())
+                        .context("Failed to get wallet balance")?;
+
+                    println!("Wallet Balance:");
+                    println!("  Address: {}", wallet.pubkey());
+                    println!("  Balance: {} SOL\n", wallet_balance as f64 / LAMPORTS_PER_SOL as f64);
+                }
+
+                if detailed {
+                    println!("Note: Shielded balance tracking not yet implemented.");
+                    println!("This would show:");
+                    println!("  - Unspent commitments in the privacy pool");
+                    println!("  - Individual commitment values (encrypted)");
+                    println!("  - Transaction history");
+                }
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!("Solana bridge feature not enabled");
             }
 
             Ok(())
@@ -661,6 +922,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 }
 
 async fn handle_init_command(path: PathBuf, force: bool) -> Result<()> {
+    print_banner();
     println!("Initializing Paraloom in {}...\n", path.display());
 
     if !force && path.join("paraloom.toml").exists() {
