@@ -39,8 +39,8 @@ use solana_sdk::{
 use std::str::FromStr;
 
 // Compute layer imports
-use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
 use once_cell::sync::Lazy;
+use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
 use std::sync::Arc;
 
 // Privacy layer imports
@@ -307,7 +307,8 @@ enum ValidatorCommands {
 }
 
 fn print_banner() {
-    println!(r#"
+    println!(
+        r#"
   ____                 _
  |  _ \ __ _ _ __ __ _| | ___   ___  _ __ ___
  | |_) / _` | '__/ _` | |/ _ \ / _ \| '_ ` _ \
@@ -316,7 +317,8 @@ fn print_banner() {
 
  Privacy-preserving distributed computing on Solana
  True Decentralized Privacy | v0.1.0
-"#);
+"#
+    );
 }
 
 #[tokio::main]
@@ -365,25 +367,29 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 // Get keypair path
                 let keypair_path = keypair
                     .or_else(|| std::env::var("SOLANA_KEYPAIR_PATH").ok().map(PathBuf::from))
-                    .context("Wallet keypair not specified. Use --keypair or SOLANA_KEYPAIR_PATH")?;
+                    .context(
+                        "Wallet keypair not specified. Use --keypair or SOLANA_KEYPAIR_PATH",
+                    )?;
 
                 // Get program ID
                 let program_id_str = program_id
                     .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .context("Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID")?;
+                    .context(
+                        "Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID",
+                    )?;
 
                 println!("RPC URL: {}", rpc_url);
                 println!("Program ID: {}", program_id_str);
                 println!("Depositor Keypair: {}\n", keypair_path.display());
 
                 // Parse program ID
-                let program_id = Pubkey::from_str(&program_id_str)
-                    .context("Invalid program ID")?;
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
 
                 // Load depositor keypair
                 println!("Loading depositor keypair...");
-                let depositor = load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
-                    .context("Failed to load keypair")?;
+                let depositor =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
                 println!("Depositor Address: {}\n", depositor.pubkey());
 
                 // Create RPC client
@@ -391,13 +397,20 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
                 // Check depositor balance
-                let balance = client.get_balance(&depositor.pubkey())
+                let balance = client
+                    .get_balance(&depositor.pubkey())
                     .context("Failed to get balance")?;
-                println!("Depositor Balance: {} SOL\n", balance as f64 / LAMPORTS_PER_SOL as f64);
+                println!(
+                    "Depositor Balance: {} SOL\n",
+                    balance as f64 / LAMPORTS_PER_SOL as f64
+                );
 
                 let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
                 if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
-                    anyhow::bail!("Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)", amount);
+                    anyhow::bail!(
+                        "Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)",
+                        amount
+                    );
                 }
 
                 // Derive bridge vault PDA
@@ -409,7 +422,10 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 let randomness = rand::random::<[u8; 32]>(); // Random blinding factor
 
                 println!("Deposit Amount: {} SOL", amount);
-                println!("Recipient (privacy address): {}", hex::encode(&recipient[..8]));
+                println!(
+                    "Recipient (privacy address): {}",
+                    hex::encode(&recipient[..8])
+                );
                 println!("Randomness: {}\n", hex::encode(&randomness[..8]));
 
                 // Create deposit instruction
@@ -421,11 +437,13 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     deposit_lamports,
                     recipient,
                     randomness,
-                ).context("Failed to create deposit instruction")?;
+                )
+                .context("Failed to create deposit instruction")?;
 
                 // Get recent blockhash
                 println!("Getting recent blockhash...");
-                let blockhash = client.get_latest_blockhash()
+                let blockhash = client
+                    .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
 
                 // Create and sign transaction
@@ -439,20 +457,26 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
 
                 // Send transaction
                 println!("Sending transaction...");
-                let signature = client.send_and_confirm_transaction(&tx)
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
                     .context("Failed to send transaction")?;
 
                 println!("\n[OK] Deposit successful!");
                 println!("  Transaction: {}", signature);
                 println!("  Shielded balance: {} SOL", amount);
-                println!("  Shielded address: paraloom1{}", hex::encode(&recipient[..16]));
+                println!(
+                    "  Shielded address: paraloom1{}",
+                    hex::encode(&recipient[..16])
+                );
                 println!("\nView transaction:");
                 println!("  solana confirm -v {}", signature);
             }
 
             #[cfg(not(feature = "solana-bridge"))]
             {
-                anyhow::bail!("Solana bridge feature not enabled. Rebuild with --features solana-bridge");
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
             }
 
             Ok(())
@@ -471,11 +495,13 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             let recipient_address: ShieldedAddress = if to.starts_with("paraloom1") {
                 // Parse paraloom address (hex after paraloom1 prefix)
                 let hex_part = &to[9..]; // Skip "paraloom1"
-                let bytes = hex::decode(hex_part)
-                    .context("Invalid paraloom address format")?;
+                let bytes = hex::decode(hex_part).context("Invalid paraloom address format")?;
 
                 if bytes.len() != 32 {
-                    anyhow::bail!("Invalid address length. Expected 32 bytes, got {}", bytes.len());
+                    anyhow::bail!(
+                        "Invalid address length. Expected 32 bytes, got {}",
+                        bytes.len()
+                    );
                 }
 
                 let mut addr = [0u8; 32];
@@ -490,8 +516,8 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             // Create a simple WASM module that represents the transfer
             // In production, this would be a standardized transfer contract
             let transfer_wasm = vec![
-                0x00, 0x61, 0x73, 0x6d,  // WASM magic
-                0x01, 0x00, 0x00, 0x00,  // WASM version
+                0x00, 0x61, 0x73, 0x6d, // WASM magic
+                0x01, 0x00, 0x00, 0x00, // WASM version
             ];
 
             // Encode transfer data as input
@@ -509,16 +535,15 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             let limits = ResourceLimits::default();
             let sender_address = ShieldedAddress([0u8; 32]); // Would load from user's keypair
 
-            let private_job = PrivateComputeJob::new(
-                transfer_wasm,
-                input_data,
-                sender_address,
-                limits,
-            )?;
+            let private_job =
+                PrivateComputeJob::new(transfer_wasm, input_data, sender_address, limits)?;
 
             println!("Submitting to privacy network...");
             println!("  Job ID: {}", private_job.job_id);
-            println!("  Input commitment: {}...", &private_job.input_commitment.to_hex()[..16]);
+            println!(
+                "  Input commitment: {}...",
+                &private_job.input_commitment.to_hex()[..16]
+            );
             println!("  Status: Pending consensus");
 
             println!("\n[OK] Private transfer initiated!");
@@ -554,20 +579,22 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 // Get program ID
                 let program_id_str = program_id
                     .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .context("Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID")?;
+                    .context(
+                        "Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID",
+                    )?;
 
                 println!("RPC URL: {}", rpc_url);
                 println!("Program ID: {}", program_id_str);
                 println!("Authority Keypair: {}\n", keypair_path.display());
 
                 // Parse program ID
-                let program_id = Pubkey::from_str(&program_id_str)
-                    .context("Invalid program ID")?;
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
 
                 // Load authority keypair
                 println!("Loading authority keypair...");
-                let authority = load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
-                    .context("Failed to load keypair")?;
+                let authority =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
                 println!("Authority Address: {}\n", authority.pubkey());
 
                 // Create RPC client
@@ -575,28 +602,39 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
                 // Check authority balance
-                let balance = client.get_balance(&authority.pubkey())
+                let balance = client
+                    .get_balance(&authority.pubkey())
                     .context("Failed to get balance")?;
-                println!("Authority Balance: {} SOL\n", balance as f64 / LAMPORTS_PER_SOL as f64);
+                println!(
+                    "Authority Balance: {} SOL\n",
+                    balance as f64 / LAMPORTS_PER_SOL as f64
+                );
 
                 // Derive bridge vault PDA
                 let (bridge_vault, _vault_bump) = derive_bridge_vault(&program_id);
                 println!("Bridge Vault PDA: {}\n", bridge_vault);
 
                 // Check vault balance
-                let vault_balance = client.get_balance(&bridge_vault)
+                let vault_balance = client
+                    .get_balance(&bridge_vault)
                     .context("Failed to get vault balance")?;
-                println!("Bridge Vault Balance: {} SOL\n", vault_balance as f64 / LAMPORTS_PER_SOL as f64);
+                println!(
+                    "Bridge Vault Balance: {} SOL\n",
+                    vault_balance as f64 / LAMPORTS_PER_SOL as f64
+                );
 
                 let withdrawal_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
                 if vault_balance < withdrawal_lamports {
-                    anyhow::bail!("Insufficient vault balance. Vault has {} SOL, need {} SOL",
-                        vault_balance as f64 / LAMPORTS_PER_SOL as f64, amount);
+                    anyhow::bail!(
+                        "Insufficient vault balance. Vault has {} SOL, need {} SOL",
+                        vault_balance as f64 / LAMPORTS_PER_SOL as f64,
+                        amount
+                    );
                 }
 
                 // Parse recipient address
-                let recipient_pubkey = Pubkey::from_str(&to)
-                    .context("Invalid recipient address")?;
+                let recipient_pubkey =
+                    Pubkey::from_str(&to).context("Invalid recipient address")?;
                 let recipient = recipient_pubkey.to_bytes();
 
                 println!("Recipient Address: {}", recipient_pubkey);
@@ -619,11 +657,13 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     nullifier,
                     withdrawal_lamports,
                     proof,
-                ).context("Failed to create withdraw instruction")?;
+                )
+                .context("Failed to create withdraw instruction")?;
 
                 // Get recent blockhash
                 println!("Getting recent blockhash...");
-                let blockhash = client.get_latest_blockhash()
+                let blockhash = client
+                    .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
 
                 // Create and sign transaction
@@ -637,7 +677,8 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
 
                 // Send transaction
                 println!("Sending transaction...");
-                let signature = client.send_and_confirm_transaction(&tx)
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
                     .context("Failed to send transaction")?;
 
                 println!("\n[OK] Withdrawal successful!");
@@ -649,13 +690,21 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
 
                 // Verify balances
                 println!("\nVerifying balances...");
-                let vault_balance_after = client.get_balance(&bridge_vault)
+                let vault_balance_after = client
+                    .get_balance(&bridge_vault)
                     .context("Failed to get vault balance")?;
-                let recipient_balance = client.get_balance(&recipient_pubkey)
+                let recipient_balance = client
+                    .get_balance(&recipient_pubkey)
                     .context("Failed to get recipient balance")?;
 
-                println!("  Bridge Vault Balance (after): {} SOL", vault_balance_after as f64 / LAMPORTS_PER_SOL as f64);
-                println!("  Recipient Balance: {} SOL", recipient_balance as f64 / LAMPORTS_PER_SOL as f64);
+                println!(
+                    "  Bridge Vault Balance (after): {} SOL",
+                    vault_balance_after as f64 / LAMPORTS_PER_SOL as f64
+                );
+                println!(
+                    "  Recipient Balance: {} SOL",
+                    recipient_balance as f64 / LAMPORTS_PER_SOL as f64
+                );
             }
 
             #[cfg(not(feature = "solana-bridge"))]
@@ -687,30 +736,44 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
                 // Show bridge vault balance if program_id is provided
-                if let Some(program_id_str) = program_id.or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok()) {
-                    let program_id = Pubkey::from_str(&program_id_str)
-                        .context("Invalid program ID")?;
+                if let Some(program_id_str) =
+                    program_id.or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                {
+                    let program_id =
+                        Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
                     let (bridge_vault, _) = derive_bridge_vault(&program_id);
 
-                    let vault_balance = client.get_balance(&bridge_vault)
+                    let vault_balance = client
+                        .get_balance(&bridge_vault)
                         .context("Failed to get vault balance")?;
 
                     println!("\nBridge Vault Balance:");
                     println!("  Address: {}", bridge_vault);
-                    println!("  Balance: {} SOL\n", vault_balance as f64 / LAMPORTS_PER_SOL as f64);
+                    println!(
+                        "  Balance: {} SOL\n",
+                        vault_balance as f64 / LAMPORTS_PER_SOL as f64
+                    );
                 }
 
                 // Show wallet balance if keypair is provided
-                if let Some(keypair_path) = keypair.or_else(|| std::env::var("SOLANA_KEYPAIR_PATH").ok().map(PathBuf::from)) {
-                    let wallet = load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
-                        .context("Failed to load keypair")?;
+                if let Some(keypair_path) =
+                    keypair.or_else(|| std::env::var("SOLANA_KEYPAIR_PATH").ok().map(PathBuf::from))
+                {
+                    let wallet = load_keypair_from_file(
+                        keypair_path.to_str().context("Invalid keypair path")?,
+                    )
+                    .context("Failed to load keypair")?;
 
-                    let wallet_balance = client.get_balance(&wallet.pubkey())
+                    let wallet_balance = client
+                        .get_balance(&wallet.pubkey())
                         .context("Failed to get wallet balance")?;
 
                     println!("Wallet Balance:");
                     println!("  Address: {}", wallet.pubkey());
-                    println!("  Balance: {} SOL\n", wallet_balance as f64 / LAMPORTS_PER_SOL as f64);
+                    println!(
+                        "  Balance: {} SOL\n",
+                        wallet_balance as f64 / LAMPORTS_PER_SOL as f64
+                    );
                 }
 
                 if detailed {
@@ -750,20 +813,27 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             }
 
             // Print header
-            println!("{:<12} {:<12} {:<20} {:<15}", "Type", "Status", "Tx Hash", "Time");
+            println!(
+                "{:<12} {:<12} {:<20} {:<15}",
+                "Type", "Status", "Tx Hash", "Time"
+            );
             println!("{}", "-".repeat(65));
 
             // Print transactions (limited)
             let display_count = std::cmp::min(mock_transactions.len(), limit);
             for (tx_type, status, tx_hash, time) in mock_transactions.iter().take(display_count) {
-                println!("{:<12} {:<12} {:<20} {:<15}", tx_type, status, tx_hash, time);
+                println!(
+                    "{:<12} {:<12} {:<20} {:<15}",
+                    tx_type, status, tx_hash, time
+                );
             }
 
             println!("\n[Note] Transaction amounts are hidden for privacy.");
             println!("       Full details require zero-knowledge proof verification.");
 
             if mock_transactions.len() > limit {
-                println!("\nShowing {} of {} transactions. Use --limit {} to see more.",
+                println!(
+                    "\nShowing {} of {} transactions. Use --limit {} to see more.",
                     display_count,
                     mock_transactions.len(),
                     mock_transactions.len()
@@ -799,8 +869,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             // Save keypair to .paraloom/keys directory
             let keys_dir = std::path::Path::new(".paraloom/keys");
             if !keys_dir.exists() {
-                std::fs::create_dir_all(keys_dir)
-                    .context("Failed to create keys directory")?;
+                std::fs::create_dir_all(keys_dir).context("Failed to create keys directory")?;
             }
 
             let filename = if let Some(label_text) = &label {
@@ -876,7 +945,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 
             // Submit to executor
             println!("Submitting job to executor...");
-            JOB_EXECUTOR.submit_job(job)
+            JOB_EXECUTOR
+                .submit_job(job)
                 .context("Failed to submit job")?;
 
             let estimated_fee = fee.unwrap_or(0.01);
@@ -884,9 +954,18 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             println!("\n[OK] Job submitted successfully!");
             println!("  Job ID: {}", job_id);
             println!("  Status: Pending");
-            println!("  Estimated fee: {} SOL (payment not yet implemented)", estimated_fee);
-            println!("\nUse 'paraloom compute status --job-id {}' to track progress", job_id);
-            println!("Use 'paraloom compute result --job-id {}' to get the result", job_id);
+            println!(
+                "  Estimated fee: {} SOL (payment not yet implemented)",
+                estimated_fee
+            );
+            println!(
+                "\nUse 'paraloom compute status --job-id {}' to track progress",
+                job_id
+            );
+            println!(
+                "Use 'paraloom compute result --job-id {}' to get the result",
+                job_id
+            );
 
             Ok(())
         }
@@ -910,14 +989,18 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                     }
 
                     if job_result.memory_used_bytes > 0 {
-                        println!("Memory Used: {} bytes ({:.2} MB)",
+                        println!(
+                            "Memory Used: {} bytes ({:.2} MB)",
                             job_result.memory_used_bytes,
                             job_result.memory_used_bytes as f64 / 1024.0 / 1024.0
                         );
                     }
 
                     if job_result.instructions_executed > 0 {
-                        println!("Instructions Executed: {}", job_result.instructions_executed);
+                        println!(
+                            "Instructions Executed: {}",
+                            job_result.instructions_executed
+                        );
                     }
 
                     if show_proof {
@@ -953,7 +1036,10 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                         }
                         _ => {
                             println!("\n[WARN] Job not yet completed");
-                            println!("Use 'paraloom compute status --job-id {}' to track progress", job_id);
+                            println!(
+                                "Use 'paraloom compute status --job-id {}' to track progress",
+                                job_id
+                            );
                         }
                     }
                 }
@@ -978,15 +1064,22 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 
             if results.is_empty() {
                 println!("No jobs found.");
-                println!("\nSubmit a job with: paraloom compute submit --wasm <file> --input <file>");
+                println!(
+                    "\nSubmit a job with: paraloom compute submit --wasm <file> --input <file>"
+                );
                 return Ok(());
             }
 
             // Filter by status if specified
             let filtered_results: Vec<_> = if let Some(status_filter) = &status {
                 let filter_str = status_filter.to_lowercase();
-                results.into_iter()
-                    .filter(|r| format!("{:?}", r.status).to_lowercase().contains(&filter_str))
+                results
+                    .into_iter()
+                    .filter(|r| {
+                        format!("{:?}", r.status)
+                            .to_lowercase()
+                            .contains(&filter_str)
+                    })
                     .collect()
             } else {
                 results
@@ -998,7 +1091,10 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             }
 
             // Print header
-            println!("{:<20} {:<15} {:<15} {:<15}", "Job ID", "Status", "Exec Time", "Memory Used");
+            println!(
+                "{:<20} {:<15} {:<15} {:<15}",
+                "Job ID", "Status", "Exec Time", "Memory Used"
+            );
             println!("{}", "-".repeat(70));
 
             // Print jobs (limited)
@@ -1031,15 +1127,17 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                     "-".to_string()
                 };
 
-                println!("{:<20} {:<15} {:<15} {:<15}",
-                    job_id_short,
-                    status_str,
-                    exec_time,
-                    memory_used
+                println!(
+                    "{:<20} {:<15} {:<15} {:<15}",
+                    job_id_short, status_str, exec_time, memory_used
                 );
             }
 
-            println!("\nShowing {} of {} jobs", display_count, filtered_results.len());
+            println!(
+                "\nShowing {} of {} jobs",
+                display_count,
+                filtered_results.len()
+            );
 
             if filtered_results.len() > limit {
                 println!("Use --limit {} to see more", filtered_results.len());
@@ -1062,9 +1160,14 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                             std::io::Write::flush(&mut std::io::stdout()).ok();
 
                             match job_status {
-                                JobStatus::Completed | JobStatus::Failed { .. } | JobStatus::TimedOut => {
+                                JobStatus::Completed
+                                | JobStatus::Failed { .. }
+                                | JobStatus::TimedOut => {
                                     println!("\n\nJob finished!");
-                                    println!("Use 'paraloom compute result --job-id {}' to see details", job_id);
+                                    println!(
+                                        "Use 'paraloom compute result --job-id {}' to see details",
+                                        job_id
+                                    );
                                     break;
                                 }
                                 _ => {
@@ -1096,17 +1199,26 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                             }
 
                             if result.memory_used_bytes > 0 {
-                                println!("  Memory Used: {:.2} MB", result.memory_used_bytes as f64 / 1024.0 / 1024.0);
+                                println!(
+                                    "  Memory Used: {:.2} MB",
+                                    result.memory_used_bytes as f64 / 1024.0 / 1024.0
+                                );
                             }
 
                             if result.instructions_executed > 0 {
-                                println!("  Instructions Executed: {}", result.instructions_executed);
+                                println!(
+                                    "  Instructions Executed: {}",
+                                    result.instructions_executed
+                                );
                             }
 
                             match job_status {
                                 JobStatus::Completed => {
                                     println!("\n[OK] Job completed successfully!");
-                                    println!("Use 'paraloom compute result --job-id {}' to get output", job_id);
+                                    println!(
+                                        "Use 'paraloom compute result --job-id {}' to get output",
+                                        job_id
+                                    );
                                 }
                                 JobStatus::Failed { error } => {
                                     println!("\n[ERROR] Job failed: {}", error);
@@ -1121,7 +1233,10 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                             }
                         } else {
                             println!("\n[INFO] Job is queued or in progress");
-                            println!("Use 'paraloom compute status --job-id {} --watch' to monitor", job_id);
+                            println!(
+                                "Use 'paraloom compute status --job-id {} --watch' to monitor",
+                                job_id
+                            );
                         }
                     }
                     None => {
@@ -1152,12 +1267,12 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 );
             }
 
-            let config_content = std::fs::read_to_string(&config)
-                .context("Failed to read config file")?;
+            let config_content =
+                std::fs::read_to_string(&config).context("Failed to read config file")?;
 
             // Parse TOML config
-            let config_value: toml::Value = toml::from_str(&config_content)
-                .context("Failed to parse config file")?;
+            let config_value: toml::Value =
+                toml::from_str(&config_content).context("Failed to parse config file")?;
 
             // Extract validator info
             let validator_enabled = config_value
@@ -1262,7 +1377,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
             if detailed {
                 // Get real system info
-                use sysinfo::{System, SystemExt, CpuExt};
+                use sysinfo::{CpuExt, System, SystemExt};
                 let mut sys = System::new_all();
                 sys.refresh_all();
 
@@ -1276,7 +1391,8 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 // Memory info
                 let used_memory = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
                 let total_memory = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-                println!("  RAM: {:.2}GB / {:.2}GB ({:.1}%)",
+                println!(
+                    "  RAM: {:.2}GB / {:.2}GB ({:.1}%)",
                     used_memory,
                     total_memory,
                     (used_memory / total_memory) * 100.0
@@ -1311,8 +1427,8 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             }
 
             // Read log file
-            let log_content = std::fs::read_to_string(log_file)
-                .context("Failed to read log file")?;
+            let log_content =
+                std::fs::read_to_string(log_file).context("Failed to read log file")?;
 
             let log_lines: Vec<&str> = log_content.lines().collect();
             let start_line = if log_lines.len() > lines {
@@ -1326,7 +1442,11 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             }
 
             if log_lines.len() > lines {
-                println!("\n[INFO] Showing last {} of {} lines", lines, log_lines.len());
+                println!(
+                    "\n[INFO] Showing last {} of {} lines",
+                    lines,
+                    log_lines.len()
+                );
                 println!("  Use --lines {} to see all", log_lines.len());
             }
 
