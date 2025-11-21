@@ -492,23 +492,24 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             }
 
             // Convert recipient address string to ShieldedAddress
-            let recipient_address: ShieldedAddress = if let Some(hex_part) = to.strip_prefix("paraloom1") {
-                // Parse paraloom address (hex after paraloom1 prefix)
-                let bytes = hex::decode(hex_part).context("Invalid paraloom address format")?;
+            let recipient_address: ShieldedAddress =
+                if let Some(hex_part) = to.strip_prefix("paraloom1") {
+                    // Parse paraloom address (hex after paraloom1 prefix)
+                    let bytes = hex::decode(hex_part).context("Invalid paraloom address format")?;
 
-                if bytes.len() != 32 {
-                    anyhow::bail!(
-                        "Invalid address length. Expected 32 bytes, got {}",
-                        bytes.len()
-                    );
-                }
+                    if bytes.len() != 32 {
+                        anyhow::bail!(
+                            "Invalid address length. Expected 32 bytes, got {}",
+                            bytes.len()
+                        );
+                    }
 
-                let mut addr = [0u8; 32];
-                addr.copy_from_slice(&bytes);
-                ShieldedAddress(addr)
-            } else {
-                anyhow::bail!("Invalid recipient address. Must start with 'paraloom1'");
-            };
+                    let mut addr = [0u8; 32];
+                    addr.copy_from_slice(&bytes);
+                    ShieldedAddress(addr)
+                } else {
+                    anyhow::bail!("Invalid recipient address. Must start with 'paraloom1'");
+                };
 
             println!("\nCreating private transfer job...");
 
