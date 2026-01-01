@@ -138,7 +138,7 @@ solana-transaction-status = { version = "2.0", optional = true }
 borsh = { version = "1.5", optional = true }
 
 # WASM Runtime (Phase 3: Compute Layer)
-wasmtime = "26.0"
+wasmtime = "36.0"
 
 # Other
 sysinfo = "0.29.0"
