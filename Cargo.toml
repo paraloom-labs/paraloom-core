@@ -71,6 +71,44 @@ path = "src/bin/setup_compute_ceremony.rs"
 name = "paraloom"
 path = "src/bin/paraloom_cli.rs"
 
+# Privacy/zkSNARK binaries
+[[bin]]
+name = "setup-withdrawal-ceremony"
+path = "src/bin/setup_withdrawal_ceremony.rs"
+
+[[bin]]
+name = "compute-poseidon-inputs"
+path = "src/bin/compute_poseidon_inputs.rs"
+
+[[bin]]
+name = "generate-withdrawal-proof"
+path = "src/bin/generate_withdrawal_proof.rs"
+
+[[bin]]
+name = "privacy-deposit"
+path = "src/bin/privacy_deposit.rs"
+
+[[bin]]
+name = "privacy-withdraw"
+path = "src/bin/privacy_withdraw.rs"
+
+[[bin]]
+name = "verify-privacy"
+path = "src/bin/verify_privacy.rs"
+
+# Validator binaries
+[[bin]]
+name = "check-validators"
+path = "src/bin/check_validators.rs"
+
+[[bin]]
+name = "init-validator-registry"
+path = "src/bin/init_validator_registry.rs"
+
+[[bin]]
+name = "register-validator"
+path = "src/bin/register_validator.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh"]

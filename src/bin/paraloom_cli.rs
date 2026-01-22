@@ -199,7 +199,7 @@ enum WalletCommands {
 
 #[derive(Subcommand)]
 enum ComputeCommands {
-    /// Submit private compute job
+    /// Submit compute job
     Submit {
         /// WASM program file
         #[arg(short, long)]
@@ -220,6 +220,10 @@ enum ComputeCommands {
         /// Job fee in SOL
         #[arg(long)]
         fee: Option<f64>,
+
+        /// Enable privacy mode (encrypt input/output, generate zkSNARK proof)
+        #[arg(long)]
+        private: bool,
     },
 
     /// Get job result
@@ -906,13 +910,23 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             timeout,
             memory,
             fee,
+            private,
         } => {
-            println!("Submitting compute job...\n");
+            if private {
+                println!("Submitting PRIVATE compute job...\n");
+            } else {
+                println!("Submitting compute job...\n");
+            }
 
             println!("WASM program: {}", wasm.display());
             println!("Input data: {}", input.display());
             println!("Timeout: {}s", timeout);
-            println!("Memory limit: {}MB\n", memory);
+            println!("Memory limit: {}MB", memory);
+            if private {
+                println!("Privacy mode: ENABLED (input/output encrypted, zkSNARK proof)\n");
+            } else {
+                println!("Privacy mode: disabled\n");
+            }
 
             // Load WASM bytecode
             println!("Loading WASM program...");
@@ -933,21 +947,60 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 timeout_secs: timeout,
             };
 
-            // Create compute job
-            let job = ComputeJob::new(wasm_code, input_data, limits);
-            let job_id = job.id.clone();
+            let job_id: String;
 
-            // Submit to executor
-            println!("Submitting job to executor...");
-            JOB_EXECUTOR
-                .submit_job(job)
-                .context("Failed to submit job")?;
+            if private {
+                // Generate a shielded address for this job (owner address)
+                // In production, this would come from user's wallet
+                let owner_address = ShieldedAddress(rand::random::<[u8; 32]>());
 
-            let estimated_fee = fee.unwrap_or(0.01);
+                println!("Creating private compute job...");
+                println!("  Owner address: paraloom1{}", hex::encode(&owner_address.0[..8]));
 
-            println!("\n[OK] Job submitted successfully!");
-            println!("  Job ID: {}", job_id);
-            println!("  Status: Pending");
+                // Create private compute job
+                let private_job = PrivateComputeJob::new(
+                    wasm_code.clone(),
+                    input_data.clone(),
+                    owner_address,
+                    limits.clone(),
+                ).context("Failed to create private compute job")?;
+
+                job_id = private_job.job_id.clone();
+
+                println!("  Input commitment: {}", hex::encode(&private_job.input_commitment.0[..8]));
+                println!("  Encrypted input size: {} bytes", private_job.encrypted_input.len());
+
+                // Convert to standard job for execution (encrypted)
+                let job = private_job.to_compute_job();
+
+                // Submit to executor
+                println!("\nSubmitting encrypted job to executor...");
+                JOB_EXECUTOR
+                    .submit_job(job)
+                    .context("Failed to submit job")?;
+
+                println!("\n[OK] Private job submitted successfully!");
+                println!("  Job ID: {}", job_id);
+                println!("  Status: Pending");
+                println!("  Privacy: Input encrypted, output will be encrypted");
+                println!("  Proof: zkSNARK proof will be generated on completion");
+            } else {
+                // Create standard (non-private) compute job
+                let job = ComputeJob::new(wasm_code, input_data, limits);
+                job_id = job.id.clone();
+
+                // Submit to executor
+                println!("Submitting job to executor...");
+                JOB_EXECUTOR
+                    .submit_job(job)
+                    .context("Failed to submit job")?;
+
+                println!("\n[OK] Job submitted successfully!");
+                println!("  Job ID: {}", job_id);
+                println!("  Status: Pending");
+            }
+
+            let estimated_fee = fee.unwrap_or(if private { 0.02 } else { 0.01 });
             println!(
                 "  Estimated fee: {} SOL (payment not yet implemented)",
                 estimated_fee
@@ -1514,7 +1567,7 @@ shielded_address = ""  # Generate with: paraloom wallet new-address
 
 [solana]
 rpc_url = "https://api.devnet.solana.com"
-bridge_program_id = "GEwBw4vY7kXtMgHbbGRW4afKzkFPa7Y4cv3xNKvHfUCF"
+bridge_program_id = "DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco"
 
 [storage]
 path = ".paraloom/storage"
