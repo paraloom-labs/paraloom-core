@@ -24,7 +24,9 @@ data/
 *.log
 /tmp/
 config/*-temp.toml
-*.MD
+# Keep README.md and CONTRIBUTING.md, ignore others
+!README.md
+!CONTRIBUTING.md
 *.sh.env
 *.sh
 .env
@@ -47,3 +49,6 @@ keys/
 pids/
 logs/
 data/
+
+# Archive (old docs backup)
+archive/
