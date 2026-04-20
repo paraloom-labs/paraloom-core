@@ -253,4 +253,100 @@ mod tests {
             "Different inputs should produce different hashes"
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Cross-equivalence tests: native ↔ circuit
+    //
+    // These are the primary correctness gate for every future change to
+    // Poseidon parameters, the sponge plumbing, or the circuit gadget.
+    // If any of them break, proofs produced off-chain will fail on-chain
+    // verification (and vice versa).
+    // ──────────────────────────────────────────────────────────────────────
+
+    use ark_std::{rand::SeedableRng, UniformRand};
+
+    /// Evaluate `poseidon_hash_gadget` and return the resulting field value.
+    /// Allocates each input as a witness on a fresh constraint system.
+    fn hash_gadget_value(inputs: &[Fr]) -> Fr {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let vars: Vec<FpVar<Fr>> = inputs
+            .iter()
+            .map(|x| FpVar::new_witness(cs.clone(), || Ok(*x)).unwrap())
+            .collect();
+        let out = poseidon_hash_gadget(cs.clone(), &vars)
+            .expect("gadget synthesis failed");
+        assert!(
+            cs.is_satisfied().unwrap(),
+            "constraint system unsatisfied after Poseidon synthesis"
+        );
+        out.value().expect("gadget output has no value")
+    }
+
+    #[test]
+    fn test_native_matches_circuit_fixed() {
+        // Deterministic, small, easy-to-reason-about inputs.
+        let cases: Vec<Vec<Fr>> = vec![
+            vec![Fr::from(1u64)],
+            vec![Fr::from(1u64), Fr::from(2u64)],
+            vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)],
+            vec![Fr::from(0u64), Fr::from(0u64)],
+            vec![Fr::from(u64::MAX), Fr::from(u64::MAX)],
+        ];
+
+        for inputs in &cases {
+            let native = poseidon_hash_fields(inputs);
+            let circuit = hash_gadget_value(inputs);
+            assert_eq!(
+                native, circuit,
+                "native ↔ circuit divergence for inputs {:?}",
+                inputs
+            );
+        }
+    }
+
+    #[test]
+    fn test_native_matches_circuit_random() {
+        // Deterministic PRNG — reproducible failures.
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+
+        for iter in 0..64 {
+            let n = 1 + (iter % 8); // arities 1..=8
+            let inputs: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
+            let native = poseidon_hash_fields(&inputs);
+            let circuit = hash_gadget_value(&inputs);
+            assert_eq!(
+                native, circuit,
+                "native ↔ circuit divergence at iter={}, arity={}",
+                iter, n
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_input_matches_hash_field() {
+        // `poseidon_hash_field(x)` should be equivalent to
+        // `poseidon_hash_fields(&[x])` — both absorb one element and
+        // squeeze one element. If these drift, the API has two hashes
+        // for the same mathematical operation.
+        let x = Fr::from(42u64);
+        let a = poseidon_hash_field(&x);
+        let b = poseidon_hash_fields(&[x]);
+        assert_eq!(
+            a, b,
+            "poseidon_hash_field(x) must equal poseidon_hash_fields(&[x])"
+        );
+    }
+
+    #[test]
+    fn test_arity_distinguishes_outputs() {
+        // `Poseidon([1, 0])` must not equal `Poseidon([1])` — the
+        // sponge capacity separates arities. This is a sanity check
+        // against accidental padding that collapses distinct inputs.
+        let h1 = poseidon_hash_fields(&[Fr::from(1u64)]);
+        let h2 = poseidon_hash_fields(&[Fr::from(1u64), Fr::from(0u64)]);
+        assert_ne!(
+            h1, h2,
+            "different arities must produce different digests"
+        );
+    }
 }
