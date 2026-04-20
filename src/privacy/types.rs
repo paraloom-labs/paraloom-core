@@ -3,9 +3,8 @@
 use ark_bls12_381::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::privacy::poseidon::{poseidon_commit, poseidon_nullifier};
+use crate::privacy::poseidon::{poseidon_commit, poseidon_merkle_pair, poseidon_nullifier};
 
 /// Serialize an `Fr` to 32 little-endian bytes. BLS12-381 `Fr` is 255-bit,
 /// so the 32-byte buffer always fits and we pad trailing zeros if
@@ -175,21 +174,25 @@ impl MerklePath {
         }
     }
 
-    /// Verify that a leaf is in the tree with given root
+    /// Verify that a leaf is in the tree with given root.
+    ///
+    /// Walks the authentication path hashing each `(left, right)` pair with
+    /// domain-separated Poseidon (`poseidon::domain::MERKLE_PAIR`) — the
+    /// exact same function used by `MerkleTree::hash_pair` and the circuit
+    /// gadget. Any divergence between these three paths would break
+    /// inclusion proofs.
     pub fn verify(&self, leaf: &[u8; 32], root: &[u8; 32]) -> bool {
         let mut current = *leaf;
 
         for (sibling, is_right) in self.path.iter().zip(self.indices.iter()) {
-            let mut hasher = Sha256::new();
-            if *is_right {
-                hasher.update(current);
-                hasher.update(sibling);
+            let (l_bytes, r_bytes) = if *is_right {
+                (&current, sibling)
             } else {
-                hasher.update(sibling);
-                hasher.update(current);
-            }
-            let result = hasher.finalize();
-            current.copy_from_slice(&result);
+                (sibling, &current)
+            };
+            let l = Fr::from_le_bytes_mod_order(l_bytes);
+            let r = Fr::from_le_bytes_mod_order(r_bytes);
+            current = fr_to_bytes_32(poseidon_merkle_pair(l, r));
         }
 
         &current == root
