@@ -2,7 +2,13 @@
 //!
 //! Production-grade implementation using Poseidon permutation.
 //! Poseidon is a zkSNARK-friendly hash function designed for efficiency in circuits.
-//! Uses standard parameters compatible with Zcash Sapling.
+//!
+//! # Parameter set
+//!
+//! See [`params`] for the frozen parameter constants and their provenance.
+//! The set is Poseidon-128 over BLS12-381 `Fr`, S-box x^5, t=3 (rate=2,
+//! capacity=1), R_F=8, R_P=57 — standard 128-bit security per Grassi et al.
+//! (Poseidon paper §5.4, Table 2).
 
 use ark_bls12_381::Fr;
 use ark_crypto_primitives::sponge::{
@@ -14,35 +20,80 @@ use ark_r1cs_std::{fields::fp::FpVar, prelude::*};
 use ark_relations::r1cs::{ConstraintSystemRef, SynthesisError};
 use std::sync::OnceLock;
 
-/// Global Poseidon configuration (cached)
+/// Frozen Poseidon parameters.
+///
+/// These constants define the hash function's algebraic shape and must NEVER
+/// change in a shipped version without an explicit key-version bump and a
+/// matching regeneration of every trusted-setup artifact under `keys/`.
+///
+/// Provenance:
+/// - Reference: Grassi, Khovratovich, Rechberger, Roy, Schofnegger —
+///   "Poseidon: A New Hash Function for Zero-Knowledge Proof Systems"
+///   (USENIX Security '21), §5.4 Table 2.
+/// - Field: BLS12-381 scalar field `Fr` (255-bit prime).
+/// - Matches arkworks' reference parameters via
+///   `find_poseidon_ark_and_mds::<Fr>(255, 2, 8, 57, 0)`.
+///
+/// Keep this module exhaustive: every value fed into `PoseidonConfig::new`
+/// must be sourced from a named constant here, so `tests::test_params_frozen`
+/// can assert the full parameter vector.
+pub mod params {
+    /// Number of full rounds (half at the start, half at the end).
+    pub const FULL_ROUNDS: usize = 8;
+    /// Number of partial rounds (only the first state element goes through
+    /// the S-box).
+    pub const PARTIAL_ROUNDS: usize = 57;
+    /// S-box exponent. `x^5` is invertible over `Fr` (gcd(5, p-1) == 1) and
+    /// gives 128-bit algebraic security at the chosen round counts.
+    pub const ALPHA: u64 = 5;
+    /// Sponge rate — number of field elements absorbed per permutation.
+    pub const RATE: usize = 2;
+    /// Sponge capacity — number of state elements reserved for security.
+    /// State width t = RATE + CAPACITY = 3.
+    pub const CAPACITY: usize = 1;
+    /// Skip count passed to `find_poseidon_ark_and_mds`. Fixed at 0 so the
+    /// Grain LFSR initialisation is deterministic and reproducible.
+    pub const GRAIN_SKIP: u64 = 0;
+}
+
+/// Global Poseidon configuration (cached).
 static POSEIDON_CONFIG: OnceLock<PoseidonConfig<Fr>> = OnceLock::new();
 
-/// Get or initialize Poseidon configuration
-fn get_poseidon_config() -> &'static PoseidonConfig<Fr> {
+/// Canonical Poseidon configuration used by every native and circuit hash.
+///
+/// Built once on first access from the constants in [`params`] and cached
+/// for the lifetime of the process. Panics (via `expect`) only if the
+/// generated ark/MDS tables are structurally invalid — an arkworks
+/// invariant that cannot be violated at runtime with frozen parameters.
+pub fn config() -> &'static PoseidonConfig<Fr> {
     POSEIDON_CONFIG.get_or_init(|| {
         use ark_crypto_primitives::sponge::poseidon::find_poseidon_ark_and_mds;
 
-        // Standard Poseidon parameters for BLS12-381 Fr field
-        // Using parameters from Filecoin/Zcash
-        let full_rounds = 8;
-        let partial_rounds = 57;
-        let alpha = 5u64;
-        let rate = 2; // Can absorb 2 field elements at a time
-        let capacity = 1;
-
-        // Generate optimized MDS matrix and round constants
-        // API expects: (field_size: u64, rate: usize, full_rounds: u64, partial_rounds: u64, skip: u64)
         let (ark, mds) = find_poseidon_ark_and_mds::<Fr>(
             Fr::MODULUS_BIT_SIZE as u64,
-            rate,                  // usize
-            full_rounds as u64,    // u64
-            partial_rounds as u64, // u64
-            0,                     // skip count
+            params::RATE,
+            params::FULL_ROUNDS as u64,
+            params::PARTIAL_ROUNDS as u64,
+            params::GRAIN_SKIP,
         );
 
-        // PoseidonConfig::new expects all usize
-        PoseidonConfig::new(full_rounds, partial_rounds, alpha, mds, ark, rate, capacity)
+        PoseidonConfig::new(
+            params::FULL_ROUNDS,
+            params::PARTIAL_ROUNDS,
+            params::ALPHA,
+            mds,
+            ark,
+            params::RATE,
+            params::CAPACITY,
+        )
     })
+}
+
+/// Deprecated alias retained for internal call sites pending rename.
+/// Prefer [`config`] in new code.
+#[inline]
+fn get_poseidon_config() -> &'static PoseidonConfig<Fr> {
+    config()
 }
 
 /// Hash arbitrary bytes to a field element (outside circuit)
@@ -335,6 +386,57 @@ mod tests {
             a, b,
             "poseidon_hash_field(x) must equal poseidon_hash_fields(&[x])"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Parameter-freeze tests
+    //
+    // These lock the Poseidon parameter set so any unintentional change
+    // fails loudly. Changing any of these values requires regenerating
+    // the trusted-setup artifacts under `keys/` — see
+    // archive/zksnark_implementation_status.md for the procedure.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_params_frozen() {
+        assert_eq!(params::FULL_ROUNDS, 8, "FULL_ROUNDS changed");
+        assert_eq!(params::PARTIAL_ROUNDS, 57, "PARTIAL_ROUNDS changed");
+        assert_eq!(params::ALPHA, 5, "ALPHA changed");
+        assert_eq!(params::RATE, 2, "RATE changed");
+        assert_eq!(params::CAPACITY, 1, "CAPACITY changed");
+        assert_eq!(params::GRAIN_SKIP, 0, "GRAIN_SKIP changed");
+    }
+
+    #[test]
+    fn test_config_uses_frozen_params() {
+        // The runtime config must mirror the compile-time constants
+        // one-for-one. If someone edits `config()` without touching
+        // the `params` module (or vice versa), this fires.
+        let cfg = config();
+        assert_eq!(cfg.full_rounds, params::FULL_ROUNDS);
+        assert_eq!(cfg.partial_rounds, params::PARTIAL_ROUNDS);
+        assert_eq!(cfg.alpha, params::ALPHA);
+        assert_eq!(cfg.rate, params::RATE);
+        assert_eq!(cfg.capacity, params::CAPACITY);
+
+        // State width invariant: t = rate + capacity = 3.
+        let t = cfg.rate + cfg.capacity;
+        assert_eq!(t, 3, "state width t must be 3");
+
+        // Round-constant matrix dimensions encode the round structure.
+        // Total rounds = R_F + R_P = 8 + 57 = 65.
+        let expected_rounds = params::FULL_ROUNDS + params::PARTIAL_ROUNDS;
+        assert_eq!(
+            cfg.ark.len(),
+            expected_rounds,
+            "ark row count must equal total rounds"
+        );
+        // Each ark row has one constant per state element.
+        assert_eq!(cfg.ark[0].len(), t, "ark row width must equal t");
+
+        // MDS matrix is t×t.
+        assert_eq!(cfg.mds.len(), t, "mds row count must equal t");
+        assert_eq!(cfg.mds[0].len(), t, "mds row width must equal t");
     }
 
     #[test]
