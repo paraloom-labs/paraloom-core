@@ -9,9 +9,12 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/paraloom-labs/paraloom-core/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status"/></a>
+  <a href="https://github.com/paraloom-labs/paraloom-core/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build"/></a>
+  <img src="https://img.shields.io/badge/tests-116%20passing-brightgreen" alt="Tests"/>
+  <img src="https://img.shields.io/badge/LOC-21K-blue" alt="Lines of Code"/>
+  <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust"/>
+  <img src="https://img.shields.io/badge/anchor-0.31-purple" alt="Anchor"/>
   <a href="https://github.com/paraloom-labs/paraloom-core/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/></a>
-  <a href="https://explorer.solana.com/address/DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco?cluster=devnet"><img src="https://img.shields.io/badge/devnet-deployed-purple" alt="Devnet"/></a>
 </p>
 
 <p align="center">
@@ -32,6 +35,19 @@ Paraloom combines **Zcash-level transaction privacy** with **distributed computi
 - **Byzantine Consensus** — 7/10 validator threshold, <1s latency
 - **Solana Bridge** — Bidirectional SOL deposits/withdrawals
 
+## Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| zkSNARK privacy layer | ✅ Working | Groth16 + BLS12-381, 192-byte proofs, devnet tested |
+| Solana bridge (Anchor) | ✅ Working | Deployed on devnet, deposit/withdraw end-to-end |
+| Byzantine consensus | ✅ Working | 7/10 threshold, validated on 10-node localnet |
+| Merkle + nullifier set | ✅ Working | Double-spend prevention verified |
+| Private compute (WASM) | 🚧 Alpha | Engine works; encrypted I/O integration in progress |
+| Poseidon hash | ⚠️ MVP | Arkworks-based; production-hardening pending |
+| Trusted setup | ⚠️ MVP | Deterministic seed; MPC ceremony scheduled |
+| Mainnet launch | 🔜 Planned | Awaiting external security audit |
+
 ## Quick Start
 
 ```bash
@@ -45,20 +61,6 @@ cargo test --all
 
 # Try the compute demo
 cargo run --bin compute-demo
-```
-
-## Devnet Deployment
-
-| Component | Address |
-|-----------|---------|
-| **Program ID** | `DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco` |
-
-```bash
-# Configure for devnet
-solana config set --url devnet
-
-# Test deposit
-cargo run --bin test-deposit -- --amount 0.1
 ```
 
 ## Project Structure
@@ -111,6 +113,21 @@ cargo test --all
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
+
+## Development History
+
+`main` uses **squash-merge** — each commit represents a completed feature PR.
+Granular commit history (232+ commits across 6 parallel feature branches) is
+preserved on:
+
+- [`feature/privacy-layer`](../../tree/feature/privacy-layer) — zkSNARK circuits, Pedersen commitments, shielded pool
+- [`feature/solana-bridge`](../../tree/feature/solana-bridge) — Anchor program, PDA design, deposit/withdraw
+- [`feature/zksnark-verification`](../../tree/feature/zksnark-verification) — proof generation, verifier integration
+- [`feature/compute-layer`](../../tree/feature/compute-layer) — WASM engine, job distribution
+- [`feature/compute-privacy-integration`](../../tree/feature/compute-privacy-integration) — encrypted I/O glue
+- [`feature/cli-tool`](../../tree/feature/cli-tool) — `paraloom` CLI
+
+See [Insights → Contributors](../../graphs/contributors) for full contribution breakdown.
 
 ## License
 
