@@ -1,7 +1,22 @@
 //! Privacy-specific types for the shielded pool
 
+use ark_bls12_381::Fr;
+use ark_ff::{BigInteger, PrimeField};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::privacy::poseidon::{poseidon_commit, poseidon_nullifier};
+
+/// Serialize an `Fr` to 32 little-endian bytes. BLS12-381 `Fr` is 255-bit,
+/// so the 32-byte buffer always fits and we pad trailing zeros if
+/// arkworks' `to_bytes_le` emits fewer than 32 bytes.
+fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {
+    let bytes = fr.into_bigint().to_bytes_le();
+    let mut out = [0u8; 32];
+    let len = bytes.len().min(32);
+    out[..len].copy_from_slice(&bytes[..len]);
+    out
+}
 
 /// A shielded address (z-address) - 32 bytes
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -60,16 +75,18 @@ impl Nullifier {
         &self.0
     }
 
-    /// Derive nullifier from commitment and spending key
+    /// Derive nullifier from commitment and spending key.
+    ///
+    /// Uses domain-separated Poseidon (`poseidon::domain::NULLIFIER`) to
+    /// match the circuit-side `poseidon_nullifier_gadget`. Both the
+    /// commitment and the spending key are lifted to `Fr` via modular
+    /// reduction — these inputs are random 32-byte values, so the
+    /// reduction is a safe one-way injection.
     pub fn derive(commitment: &Commitment, spending_key: &[u8; 32]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(commitment.as_bytes());
-        hasher.update(spending_key);
-        let result = hasher.finalize();
-
-        let mut nullifier = [0u8; 32];
-        nullifier.copy_from_slice(&result);
-        Nullifier(nullifier)
+        let c_fr = Fr::from_le_bytes_mod_order(commitment.as_bytes());
+        let s_fr = Fr::from_le_bytes_mod_order(spending_key);
+        let digest = poseidon_nullifier(c_fr, s_fr);
+        Nullifier(fr_to_bytes_32(digest))
     }
 
     /// Convert to hex
@@ -122,18 +139,21 @@ impl Note {
         }
     }
 
-    /// Compute commitment for this note
+    /// Compute commitment for this note.
+    ///
+    /// Uses domain-separated Poseidon (`poseidon::domain::COMMITMENT`) to
+    /// match the circuit-side `poseidon_commit_gadget`. The amount maps
+    /// directly via `Fr::from(u64)`; randomness and recipient are
+    /// 32-byte blobs lifted to `Fr` via modular reduction.
+    ///
+    /// Argument order to the hash function is fixed as
+    /// `(amount, randomness, recipient)` — callers must not reorder.
     pub fn commitment(&self) -> Commitment {
-        let mut hasher = Sha256::new();
-        hasher.update(self.recipient.as_bytes());
-        hasher.update(self.amount.to_le_bytes());
-        hasher.update(self.randomness);
-
-        let result = hasher.finalize();
-        let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&result);
-
-        Commitment(commitment)
+        let amount_fr = Fr::from(self.amount);
+        let randomness_fr = Fr::from_le_bytes_mod_order(&self.randomness);
+        let recipient_fr = Fr::from_le_bytes_mod_order(self.recipient.as_bytes());
+        let digest = poseidon_commit(amount_fr, randomness_fr, recipient_fr);
+        Commitment(fr_to_bytes_32(digest))
     }
 }
 
