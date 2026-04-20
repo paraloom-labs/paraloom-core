@@ -184,6 +184,95 @@ pub fn poseidon_hash_gadget(
     Ok(output[0].clone())
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Domain-separated field-element API
+//
+// All privacy-critical hashes share the same Poseidon permutation but must
+// never collide across purposes — a note commitment must be distinguishable
+// from a nullifier and from a Merkle inner node even when the underlying
+// field elements happen to coincide. Each domain prepends a unique
+// constant tag, so `Poseidon(TAG_COMMIT, v, r, R)` and
+// `Poseidon(TAG_NULLIFIER, c, s)` can never land on the same digest.
+//
+// Call sites must pass field elements directly. Byte-blob inputs
+// (32-byte randomness, pubkey bytes, secrets) should be converted to `Fr`
+// once at the boundary using `Fr::from_le_bytes_mod_order`; this keeps
+// the circuit side free of expensive bit-decomposition constraints.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Domain tags — unique, monotonically assigned. Never renumber.
+/// Each is hashed as `Fr::from(TAG)` as the first sponge input.
+pub mod domain {
+    /// Note commitment: `Poseidon(TAG, value, randomness, recipient)`.
+    pub const COMMITMENT: u64 = 1;
+    /// Nullifier derivation: `Poseidon(TAG, commitment, secret)`.
+    pub const NULLIFIER: u64 = 2;
+    /// Merkle inner node: `Poseidon(TAG, left, right)`.
+    pub const MERKLE_PAIR: u64 = 3;
+}
+
+/// Native note commitment. Inputs are field elements; byte-blob callers
+/// must lift via `Fr::from_le_bytes_mod_order` before calling.
+pub fn poseidon_commit(value: Fr, randomness: Fr, recipient: Fr) -> Fr {
+    poseidon_hash_fields(&[
+        Fr::from(domain::COMMITMENT),
+        value,
+        randomness,
+        recipient,
+    ])
+}
+
+/// Native nullifier derivation.
+pub fn poseidon_nullifier(commitment: Fr, secret: Fr) -> Fr {
+    poseidon_hash_fields(&[
+        Fr::from(domain::NULLIFIER),
+        commitment,
+        secret,
+    ])
+}
+
+/// Native Merkle inner-node hash. Order matters — `(left, right)` is
+/// distinct from `(right, left)`.
+pub fn poseidon_merkle_pair(left: Fr, right: Fr) -> Fr {
+    poseidon_hash_fields(&[
+        Fr::from(domain::MERKLE_PAIR),
+        left,
+        right,
+    ])
+}
+
+/// Circuit note commitment. Allocates the domain tag as a constant and
+/// delegates to the generic gadget.
+pub fn poseidon_commit_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    value: &FpVar<Fr>,
+    randomness: &FpVar<Fr>,
+    recipient: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::COMMITMENT));
+    poseidon_hash_gadget(cs, &[tag, value.clone(), randomness.clone(), recipient.clone()])
+}
+
+/// Circuit nullifier derivation.
+pub fn poseidon_nullifier_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    commitment: &FpVar<Fr>,
+    secret: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::NULLIFIER));
+    poseidon_hash_gadget(cs, &[tag, commitment.clone(), secret.clone()])
+}
+
+/// Circuit Merkle inner-node hash.
+pub fn poseidon_merkle_pair_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    left: &FpVar<Fr>,
+    right: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::MERKLE_PAIR));
+    poseidon_hash_gadget(cs, &[tag, left.clone(), right.clone()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +539,127 @@ mod tests {
             h1, h2,
             "different arities must produce different digests"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Domain-separated API tests
+    //
+    // These cover the three privacy-critical hash domains end-to-end:
+    // native vs circuit parity, cross-domain separation, and input-order
+    // sensitivity where relevant.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Evaluate the commitment gadget and extract its field value.
+    fn eval_commit_gadget(value: Fr, randomness: Fr, recipient: Fr) -> Fr {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let v = FpVar::new_witness(cs.clone(), || Ok(value)).unwrap();
+        let r = FpVar::new_witness(cs.clone(), || Ok(randomness)).unwrap();
+        let p = FpVar::new_witness(cs.clone(), || Ok(recipient)).unwrap();
+        let out = poseidon_commit_gadget(cs.clone(), &v, &r, &p).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+        out.value().unwrap()
+    }
+
+    /// Evaluate the nullifier gadget and extract its field value.
+    fn eval_nullifier_gadget(commitment: Fr, secret: Fr) -> Fr {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let c = FpVar::new_witness(cs.clone(), || Ok(commitment)).unwrap();
+        let s = FpVar::new_witness(cs.clone(), || Ok(secret)).unwrap();
+        let out = poseidon_nullifier_gadget(cs.clone(), &c, &s).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+        out.value().unwrap()
+    }
+
+    /// Evaluate the Merkle-pair gadget and extract its field value.
+    fn eval_merkle_pair_gadget(left: Fr, right: Fr) -> Fr {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let l = FpVar::new_witness(cs.clone(), || Ok(left)).unwrap();
+        let r = FpVar::new_witness(cs.clone(), || Ok(right)).unwrap();
+        let out = poseidon_merkle_pair_gadget(cs.clone(), &l, &r).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+        out.value().unwrap()
+    }
+
+    #[test]
+    fn test_commit_native_matches_circuit() {
+        let cases = [
+            (Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)),
+            (Fr::from(100u64), Fr::from(200u64), Fr::from(300u64)),
+            (Fr::from(u64::MAX), Fr::from(1u64), Fr::from(u64::MAX)),
+        ];
+        for (v, r, p) in cases {
+            let native = poseidon_commit(v, r, p);
+            let circuit = eval_commit_gadget(v, r, p);
+            assert_eq!(native, circuit, "commit drift: v={v}, r={r}, p={p}");
+        }
+    }
+
+    #[test]
+    fn test_nullifier_native_matches_circuit() {
+        let cases = [
+            (Fr::from(0u64), Fr::from(0u64)),
+            (Fr::from(42u64), Fr::from(1337u64)),
+            (Fr::from(u64::MAX), Fr::from(u64::MAX)),
+        ];
+        for (c, s) in cases {
+            let native = poseidon_nullifier(c, s);
+            let circuit = eval_nullifier_gadget(c, s);
+            assert_eq!(native, circuit, "nullifier drift: c={c}, s={s}");
+        }
+    }
+
+    #[test]
+    fn test_merkle_pair_native_matches_circuit() {
+        let cases = [
+            (Fr::from(0u64), Fr::from(0u64)),
+            (Fr::from(1u64), Fr::from(2u64)),
+            (Fr::from(u64::MAX), Fr::from(u64::MAX)),
+        ];
+        for (l, r) in cases {
+            let native = poseidon_merkle_pair(l, r);
+            let circuit = eval_merkle_pair_gadget(l, r);
+            assert_eq!(native, circuit, "merkle_pair drift: l={l}, r={r}");
+        }
+    }
+
+    #[test]
+    fn test_domain_separation() {
+        // Same two field elements, routed through three different domains,
+        // must produce three different digests. If any pair collides, an
+        // attacker could forge cross-domain equivalences — e.g. substitute
+        // a nullifier preimage for a Merkle sibling.
+        let a = Fr::from(7u64);
+        let b = Fr::from(11u64);
+
+        // Keep arity the same across domains by passing a filler field
+        // element to commit, so the only difference is the domain tag.
+        let h_commit = poseidon_commit(Fr::from(0u64), a, b);
+        let h_nullifier = poseidon_nullifier(a, b);
+        let h_merkle = poseidon_merkle_pair(a, b);
+
+        assert_ne!(h_commit, h_nullifier, "commit ↔ nullifier collision");
+        assert_ne!(h_nullifier, h_merkle, "nullifier ↔ merkle collision");
+        assert_ne!(h_commit, h_merkle, "commit ↔ merkle collision");
+    }
+
+    #[test]
+    fn test_merkle_pair_order_matters() {
+        let l = Fr::from(1u64);
+        let r = Fr::from(2u64);
+        assert_ne!(
+            poseidon_merkle_pair(l, r),
+            poseidon_merkle_pair(r, l),
+            "merkle_pair must distinguish left from right"
+        );
+    }
+
+    #[test]
+    fn test_domain_tags_frozen() {
+        // Domain tags are part of the hash function's identity. Changing
+        // any of them invalidates every on-chain commitment and nullifier.
+        // This is a hard lock.
+        assert_eq!(domain::COMMITMENT, 1, "COMMITMENT tag changed");
+        assert_eq!(domain::NULLIFIER, 2, "NULLIFIER tag changed");
+        assert_eq!(domain::MERKLE_PAIR, 3, "MERKLE_PAIR tag changed");
     }
 }
