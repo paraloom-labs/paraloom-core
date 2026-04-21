@@ -19,7 +19,9 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
-use crate::privacy::poseidon::{poseidon_commit_gadget, poseidon_hash_gadget};
+use crate::privacy::poseidon::{
+    self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
+};
 
 /// Maximum number of inputs in a transfer (for batching)
 pub const MAX_INPUTS: usize = 2;
@@ -109,23 +111,44 @@ impl TransferCircuit {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Allocate public inputs
-        let merkle_root_var =
-            UInt8::new_input_vec(cs.clone(), &self.merkle_root.unwrap_or([0u8; 32]))?;
+        // ────────────────────────────────────────────────────────────────
+        // Public inputs — one Fr per entry.
+        //
+        // Previously each of these was 32 UInt8s (~32 public-input slots).
+        // Host callers that send 32-byte buffers must lift them to Fr via
+        // `Fr::from_le_bytes_mod_order` before passing to the verifier.
+        // ────────────────────────────────────────────────────────────────
+        let merkle_root_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .merkle_root
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
         let mut nullifier_vars = Vec::new();
         for nullifier in &self.nullifiers {
-            let null_var = UInt8::new_input_vec(cs.clone(), &nullifier.unwrap_or([0u8; 32]))?;
+            let null_var = FpVar::new_input(cs.clone(), || {
+                Ok(nullifier
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             nullifier_vars.push(null_var);
         }
 
         let mut output_commitment_vars = Vec::new();
         for commitment in &self.output_commitments {
-            let comm_var = UInt8::new_input_vec(cs.clone(), &commitment.unwrap_or([0u8; 32]))?;
+            let comm_var = FpVar::new_input(cs.clone(), || {
+                Ok(commitment
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             output_commitment_vars.push(comm_var);
         }
 
-        // Allocate private witness
+        // ────────────────────────────────────────────────────────────────
+        // Private witnesses — all lifted to FpVar<Fr>. 32-byte blob
+        // witnesses use from_le_bytes_mod_order, matching the host side.
+        // ────────────────────────────────────────────────────────────────
         let mut input_value_vars = Vec::new();
         for value in &self.input_values {
             let val_var = FpVar::new_witness(cs.clone(), || {
@@ -136,7 +159,11 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
 
         let mut input_randomness_vars = Vec::new();
         for randomness in &self.input_randomness {
-            let rand_var = UInt8::new_witness_vec(cs.clone(), &randomness.unwrap_or([0u8; 32]))?;
+            let rand_var = FpVar::new_witness(cs.clone(), || {
+                Ok(randomness
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             input_randomness_vars.push(rand_var);
         }
 
@@ -150,87 +177,112 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
 
         let mut output_randomness_vars = Vec::new();
         for randomness in &self.output_randomness {
-            let rand_var = UInt8::new_witness_vec(cs.clone(), &randomness.unwrap_or([0u8; 32]))?;
+            let rand_var = FpVar::new_witness(cs.clone(), || {
+                Ok(randomness
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             output_randomness_vars.push(rand_var);
         }
 
         let mut recipient_address_vars = Vec::new();
         for address in &self.recipient_addresses {
-            let addr_var = UInt8::new_witness_vec(cs.clone(), &address.unwrap_or([0u8; 32]))?;
+            let addr_var = FpVar::new_witness(cs.clone(), || {
+                Ok(address
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             recipient_address_vars.push(addr_var);
         }
 
-        // CONSTRAINT 1: Verify balance preservation (sum of inputs = sum of outputs)
+        // CONSTRAINT 1: balance preservation (sum inputs == sum outputs).
         let mut input_sum = FpVar::zero();
         for input_val in &input_value_vars {
             input_sum = &input_sum + input_val;
         }
-
         let mut output_sum = FpVar::zero();
         for output_val in &output_value_vars {
             output_sum = &output_sum + output_val;
         }
-
         input_sum.enforce_equal(&output_sum)?;
 
-        // CONSTRAINT 2: Verify input commitments are in Merkle tree
-        // For each input, verify Merkle path from commitment to root
+        // CONSTRAINT 2: input commitments are in the Merkle tree.
+        //
+        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
+        // The input-commitment preimage is only `(value, randomness)`,
+        // whereas `DepositCircuit` and host-side `Note::commitment` use
+        // `(value, randomness, recipient)`. A note produced via deposit
+        // cannot be spent by this circuit — the commitments will not
+        // match. Fixing this is out of scope for the Poseidon migration;
+        // tracked as a follow-up.
         for i in 0..self.input_paths.len() {
             if let Some(path) = &self.input_paths[i] {
-                // Compute input commitment hash
-                let mut input_commitment_data = Vec::new();
-                input_commitment_data.extend_from_slice(&input_value_vars[i].to_bytes()?);
-                input_commitment_data.extend_from_slice(&input_randomness_vars[i]);
+                // Leaf: Poseidon(COMMITMENT_TAG, value, randomness).
+                let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
+                let mut current_hash = poseidon_hash_gadget(
+                    cs.clone(),
+                    &[
+                        commit_tag,
+                        input_value_vars[i].clone(),
+                        input_randomness_vars[i].clone(),
+                    ],
+                )?;
 
-                let mut current_hash = compute_hash_gadget(cs.clone(), &input_commitment_data)?;
-
-                // Traverse Merkle path
+                // Walk the path using the shared Merkle gadget — matches
+                // `MerkleTree::hash_pair` and `MerklePath::verify` on the
+                // host side (privacy::merkle, privacy::types).
                 for (sibling_hash, is_left) in path {
-                    let sibling_var = UInt8::constant_vec(sibling_hash);
+                    let sibling_var =
+                        FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
 
-                    // Combine current hash with sibling based on position
-                    let mut combined = Vec::new();
-                    if *is_left {
-                        combined.extend_from_slice(&current_hash);
-                        combined.extend_from_slice(&sibling_var);
+                    let (l, r) = if *is_left {
+                        (&current_hash, &sibling_var)
                     } else {
-                        combined.extend_from_slice(&sibling_var);
-                        combined.extend_from_slice(&current_hash);
-                    }
+                        (&sibling_var, &current_hash)
+                    };
 
-                    current_hash = compute_hash_gadget(cs.clone(), &combined)?;
+                    current_hash = poseidon_merkle_pair_gadget(cs.clone(), l, r)?;
                 }
 
-                // Final hash should equal Merkle root
                 current_hash.enforce_equal(&merkle_root_var)?;
             }
         }
 
-        // CONSTRAINT 3: Verify nullifiers are correctly derived
-        // Nullifier = Hash(commitment || randomness)
+        // CONSTRAINT 3: nullifier derivation.
+        //
+        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
+        // The preimage is `(value, randomness)`, whereas host-side
+        // `Nullifier::derive` uses `(commitment, spending_key)`. Host
+        // and circuit will not produce matching nullifiers. Tracked as
+        // a follow-up.
         for i in 0..self.nullifiers.len() {
-            let mut nullifier_preimage = Vec::new();
-            nullifier_preimage.extend_from_slice(&input_value_vars[i].to_bytes()?);
-            nullifier_preimage.extend_from_slice(&input_randomness_vars[i]);
-
-            let computed_nullifier = compute_hash_gadget(cs.clone(), &nullifier_preimage)?;
+            let null_tag = FpVar::constant(Fr::from(poseidon::domain::NULLIFIER));
+            let computed_nullifier = poseidon_hash_gadget(
+                cs.clone(),
+                &[
+                    null_tag,
+                    input_value_vars[i].clone(),
+                    input_randomness_vars[i].clone(),
+                ],
+            )?;
             computed_nullifier.enforce_equal(&nullifier_vars[i])?;
         }
 
-        // CONSTRAINT 4: Verify output commitments are correctly computed
-        // Output commitment = Hash(value || randomness || recipient)
+        // CONSTRAINT 4: output commitments match the host-side formula
+        // `Note::commitment` = Poseidon(COMMITMENT_TAG, value, randomness, recipient).
+        // This one IS aligned with DepositCircuit and host types.
         for i in 0..self.output_commitments.len() {
-            let mut output_commitment_data = Vec::new();
-            output_commitment_data.extend_from_slice(&output_value_vars[i].to_bytes()?);
-            output_commitment_data.extend_from_slice(&output_randomness_vars[i]);
-            output_commitment_data.extend_from_slice(&recipient_address_vars[i]);
-
-            let computed_commitment = compute_hash_gadget(cs.clone(), &output_commitment_data)?;
+            let computed_commitment = poseidon_commit_gadget(
+                cs.clone(),
+                &output_value_vars[i],
+                &output_randomness_vars[i],
+                &recipient_address_vars[i],
+            )?;
             computed_commitment.enforce_equal(&output_commitment_vars[i])?;
         }
 
-        // CONSTRAINT 5: Range checks - ensure all values are non-negative
-        // Values come from u64 and fit within field representation
+        // CONSTRAINT 5: range checks — values come from u64 and fit
+        // within Fr, so no explicit range proof is needed here.
 
         Ok(())
     }
