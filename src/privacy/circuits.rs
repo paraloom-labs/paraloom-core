@@ -9,6 +9,7 @@
 //! - WithdrawCircuit: Private → Public withdrawals
 
 use ark_bls12_381::{Bls12_381, Fr};
+use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::{
     alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar, uint8::UInt8, ToBitsGadget,
@@ -18,7 +19,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
-use crate::privacy::poseidon::poseidon_hash_gadget;
+use crate::privacy::poseidon::{poseidon_commit_gadget, poseidon_hash_gadget};
 
 /// Maximum number of inputs in a transfer (for batching)
 pub const MAX_INPUTS: usize = 2;
@@ -359,30 +360,53 @@ impl Default for DepositCircuit {
 
 impl ConstraintSynthesizer<Fr> for DepositCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Public input: output commitment
-        let commitment_var =
-            UInt8::new_input_vec(cs.clone(), &self.output_commitment.unwrap_or([0u8; 32]))?;
+        // Public input: output commitment as a single field element.
+        //
+        // Previously allocated as 32 UInt8s (~256 witness slots plus
+        // bit-decomposition during hashing). The host writes the same
+        // value as 32 little-endian bytes of the Fr — `Note::commitment`
+        // in privacy::types produces exactly that serialization.
+        let commitment_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .output_commitment
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        // Private witness
+        // Private witness: amount as a native field element.
         let value_var = FpVar::new_witness(cs.clone(), || {
             self.value
                 .map(Fr::from)
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        let randomness_var =
-            UInt8::new_witness_vec(cs.clone(), &self.randomness.unwrap_or([0u8; 32]))?;
+        // Private witness: 32-byte randomness lifted to Fr via modular
+        // reduction. This matches the host-side `Note::commitment`
+        // (privacy::types) which does the same lift before calling
+        // `poseidon_commit`.
+        let randomness_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .randomness
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let recipient_var =
-            UInt8::new_witness_vec(cs.clone(), &self.recipient.unwrap_or([0u8; 32]))?;
+        // Private witness: 32-byte recipient address lifted to Fr.
+        let recipient_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .recipient
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        // Constraint: Verify commitment is correctly computed
-        let mut commitment_data = Vec::new();
-        commitment_data.extend_from_slice(&value_var.to_bytes()?);
-        commitment_data.extend_from_slice(&randomness_var);
-        commitment_data.extend_from_slice(&recipient_var);
-
-        let computed_commitment = compute_hash_gadget(cs, &commitment_data)?;
+        // Constraint: commitment_var == Poseidon(TAG, value, randomness, recipient)
+        //
+        // Uses the domain-separated gadget that mirrors `poseidon_commit`
+        // on the host side one-for-one. The input argument order
+        // (value, randomness, recipient) is fixed and must stay aligned
+        // with the host helper.
+        let computed_commitment =
+            poseidon_commit_gadget(cs, &value_var, &randomness_var, &recipient_var)?;
         computed_commitment.enforce_equal(&commitment_var)?;
 
         Ok(())
