@@ -158,6 +158,16 @@ impl VerificationChunk {
     }
 }
 
+/// Default path for the withdrawal verifying key on disk.
+///
+/// Versioned (`_v2`) after the Poseidon migration. The pre-migration
+/// circuit had ~65 UInt8 public inputs and a byte-sponge hash shim;
+/// any key generated against that shape (filename `withdraw_verifying.key`)
+/// is incompatible with the current circuit and will silently fail
+/// verification. Regenerate with `cargo run --bin setup_withdrawal_ceremony`
+/// to produce the `_v2` artifact.
+pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v2.key";
+
 /// Global verifying key for withdrawal proofs
 /// Loaded once from disk and cached for all verifications
 static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bls12_381>> = OnceLock::new();
@@ -170,7 +180,7 @@ impl ProofVerifier {
     fn get_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, String> {
         WITHDRAWAL_VERIFYING_KEY.get_or_init(|| {
             let key_path = std::env::var("WITHDRAWAL_VERIFYING_KEY_PATH")
-                .unwrap_or_else(|_| "keys/withdraw_verifying.key".to_string());
+                .unwrap_or_else(|_| DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH.to_string());
 
             let key_bytes = std::fs::read(&key_path)
                 .map_err(|e| format!("Failed to read verifying key from {}: {}", key_path, e))
