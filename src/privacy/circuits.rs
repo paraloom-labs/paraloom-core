@@ -9,19 +9,16 @@
 //! - WithdrawCircuit: Private → Public withdrawals
 
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_ff::PrimeField;
+use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{
-    alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar, uint8::UInt8, ToBitsGadget,
-    ToBytesGadget,
-};
+use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{
-    self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
-    poseidon_nullifier_gadget,
+    self, poseidon_commit, poseidon_commit_gadget, poseidon_hash_gadget,
+    poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
 };
 
 /// Maximum number of inputs in a transfer (for batching)
@@ -286,86 +283,6 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // within Fr, so no explicit range proof is needed here.
 
         Ok(())
-    }
-}
-
-/// Helper function to compute hash in circuit using Poseidon
-///
-/// Poseidon is a zkSNARK-friendly hash function that produces far fewer
-/// constraints than traditional hashes like SHA-256.
-///
-/// Performance comparison:
-/// - SHA-256: ~25,000 constraints
-/// - Poseidon: ~500 constraints (50x improvement!)
-///
-/// This is CRITICAL for Raspberry Pi proof generation.
-pub fn compute_hash_gadget(
-    cs: ConstraintSystemRef<Fr>,
-    data: &[UInt8<Fr>],
-) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-    // Convert bytes to field elements
-    // Group bytes into chunks of 31 (safe for BLS12-381 field)
-    // This MUST match the native poseidon_hash_bytes implementation exactly!
-    const CHUNK_SIZE: usize = 31;
-    let mut field_vars = Vec::new();
-
-    for chunk in data.chunks(CHUNK_SIZE) {
-        // Pad chunk to 32 bytes with zeros (matching native implementation)
-        let mut padded_chunk = chunk.to_vec();
-        while padded_chunk.len() < 32 {
-            padded_chunk.push(UInt8::constant(0));
-        }
-
-        // Convert 32 bytes to field element using little-endian interpretation
-        // This matches Fr::from_le_bytes_mod_order in native implementation
-        let mut field_bits = Vec::new();
-        for byte in &padded_chunk {
-            field_bits.extend_from_slice(&byte.to_bits_le()?);
-        }
-
-        // Reconstruct as field element from little-endian bits
-        let field_var = Boolean::le_bits_to_fp_var(&field_bits)?;
-        field_vars.push(field_var);
-    }
-
-    // Hash using Poseidon
-    let hash_output = poseidon_hash_gadget(cs.clone(), &field_vars)?;
-
-    // Convert hash output (field element) back to 32 bytes
-    let hash_bytes = hash_output.to_bytes()?;
-
-    // Ensure we have exactly 32 bytes
-    let mut result = hash_bytes;
-    if result.len() < 32 {
-        result.resize(32, UInt8::constant(0));
-    } else if result.len() > 32 {
-        result.truncate(32);
-    }
-
-    Ok(result)
-}
-
-// Helper to convert Boolean bits to field variable
-use ark_r1cs_std::boolean::Boolean;
-
-#[allow(dead_code)]
-pub trait BitsToField {
-    fn le_bits_to_fp_var(bits: &[Boolean<Fr>]) -> Result<FpVar<Fr>, SynthesisError>;
-}
-
-impl BitsToField for Boolean<Fr> {
-    fn le_bits_to_fp_var(bits: &[Boolean<Fr>]) -> Result<FpVar<Fr>, SynthesisError> {
-        // Convert bits to field element
-        let mut result = FpVar::zero();
-        let mut power_of_two = FpVar::constant(Fr::from(1u64));
-
-        for bit in bits {
-            let bit_value = FpVar::from(bit.clone());
-            result += &bit_value * &power_of_two;
-            power_of_two = &power_of_two + &power_of_two; // Double for next bit
-        }
-
-        Ok(result)
     }
 }
 
@@ -782,27 +699,24 @@ mod tests {
         let setup_circuit = DepositCircuit::new();
         let (pk, _vk) = Groth16ProofSystem::setup(setup_circuit, &mut rng).unwrap();
 
-        // Create witness circuit with values that satisfy the constraints
+        // Create witness circuit with values that satisfy the constraints.
         let value = 1000u64;
         let randomness = [42u8; 32];
         let recipient = [1u8; 32];
 
-        // Compute the commitment that the circuit expects
-        // The circuit uses compute_hash_gadget which returns first 32 bytes of input
-        let mut commitment_data = Vec::new();
-        // Add value bytes
-        let value_fr = Fr::from(value);
-        let mut value_bytes = Vec::new();
-        value_fr.serialize_compressed(&mut value_bytes).unwrap();
-        commitment_data.extend_from_slice(&value_bytes);
-        // Add randomness
-        commitment_data.extend_from_slice(&randomness);
-        // Add recipient
-        commitment_data.extend_from_slice(&recipient);
-
-        // Take first 32 bytes as commitment (matching compute_hash_gadget behavior)
+        // Compute the commitment the circuit expects: must equal
+        // poseidon_commit(value, randomness, recipient) — mirror what
+        // `Note::commitment` produces on the host side and what
+        // `poseidon_commit_gadget` computes inside the circuit.
+        let digest = poseidon_commit(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&randomness),
+            Fr::from_le_bytes_mod_order(&recipient),
+        );
+        let digest_bytes = digest.into_bigint().to_bytes_le();
         let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&commitment_data[..32]);
+        let len = digest_bytes.len().min(32);
+        commitment[..len].copy_from_slice(&digest_bytes[..len]);
 
         let proof_circuit = DepositCircuit::with_witness(commitment, value, randomness, recipient);
 
