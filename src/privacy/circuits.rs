@@ -21,6 +21,7 @@ use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{
     self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
+    poseidon_nullifier_gadget,
 };
 
 /// Maximum number of inputs in a transfer (for batching)
@@ -520,11 +521,24 @@ impl Default for WithdrawCircuit {
 
 impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Public inputs
-        let merkle_root_var =
-            UInt8::new_input_vec(cs.clone(), &self.merkle_root.unwrap_or([0u8; 32]))?;
+        // ────────────────────────────────────────────────────────────────
+        // Public inputs — single Fr per slot (was 32 UInt8 each before).
+        // Host lifts 32-byte buffers to Fr via from_le_bytes_mod_order
+        // before handing them to the verifier.
+        // ────────────────────────────────────────────────────────────────
+        let merkle_root_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .merkle_root
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let nullifier_var = UInt8::new_input_vec(cs.clone(), &self.nullifier.unwrap_or([0u8; 32]))?;
+        let nullifier_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .nullifier
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
         let withdraw_amount_var = FpVar::new_input(cs.clone(), || {
             self.withdraw_amount
@@ -532,69 +546,81 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        // Private witness
+        // ────────────────────────────────────────────────────────────────
+        // Private witnesses — lifted to FpVar<Fr>. The old byte-array
+        // witness `input_value_bytes` is gone: Poseidon consumes field
+        // elements, not u64 bytes.
+        // ────────────────────────────────────────────────────────────────
         let input_value_var = FpVar::new_witness(cs.clone(), || {
             self.input_value
                 .map(Fr::from)
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        // Create byte representation of value (8 bytes for u64)
-        let input_value_bytes =
-            UInt8::new_witness_vec(cs.clone(), &self.input_value.unwrap_or(0).to_le_bytes())?;
+        let input_randomness_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .input_randomness
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let input_randomness_var =
-            UInt8::new_witness_vec(cs.clone(), &self.input_randomness.unwrap_or([0u8; 32]))?;
+        let secret_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .secret
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let secret_var = UInt8::new_witness_vec(cs.clone(), &self.secret.unwrap_or([0u8; 32]))?;
-
-        // Constraint 1: Verify input value >= withdraw amount
-        // input_value - withdraw_amount >= 0
+        // CONSTRAINT 1: input_value >= withdraw_amount.
+        // Subtraction forces the witness assignment to produce a
+        // non-negative difference under native field arithmetic; a real
+        // range proof is still a TODO and lives outside this migration.
         let _difference = &input_value_var - &withdraw_amount_var;
-        // Range proof ensures difference is non-negative
 
-        // Constraint 2: Verify input commitment is in tree
-        // Compute commitment = hash(value || randomness)
-        // Use 8-byte representation of u64, NOT 32-byte field element
-        let mut input_commitment_data = Vec::new();
-        input_commitment_data.extend_from_slice(&input_value_bytes);
-        input_commitment_data.extend_from_slice(&input_randomness_var);
+        // CONSTRAINT 2: input commitment is in the Merkle tree.
+        //
+        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
+        // The preimage is `(value, randomness)` — same two-argument
+        // shape as TransferCircuit. DepositCircuit and host-side
+        // `Note::commitment` use the three-argument
+        // `(value, randomness, recipient)` form. Deposited notes cannot
+        // be withdrawn by this circuit without a semantic fix. Tracked
+        // as a follow-up.
+        let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
+        let commitment = poseidon_hash_gadget(
+            cs.clone(),
+            &[
+                commit_tag,
+                input_value_var.clone(),
+                input_randomness_var.clone(),
+            ],
+        )?;
 
-        let commitment = compute_hash_gadget(cs.clone(), &input_commitment_data)?;
-
-        // Verify Merkle proof
-        // Start with commitment and climb the tree
         let mut current_hash = commitment.clone();
 
         if let Some(path) = &self.input_path {
             for (sibling_hash, is_left) in path {
-                let sibling_var = UInt8::constant_vec(sibling_hash);
+                let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
 
-                let mut combined = Vec::new();
-                if *is_left {
-                    combined.extend_from_slice(&current_hash);
-                    combined.extend_from_slice(&sibling_var);
+                let (l, r) = if *is_left {
+                    (&current_hash, &sibling_var)
                 } else {
-                    combined.extend_from_slice(&sibling_var);
-                    combined.extend_from_slice(&current_hash);
-                }
+                    (&sibling_var, &current_hash)
+                };
 
-                current_hash = compute_hash_gadget(cs.clone(), &combined)?;
+                current_hash = poseidon_merkle_pair_gadget(cs.clone(), l, r)?;
             }
         }
 
-        // For empty path, current_hash == commitment
-        // After climbing tree, current_hash must equal merkle_root
         current_hash.enforce_equal(&merkle_root_var)?;
 
-        // Constraint 3: Verify nullifier derivation
-        // Nullifier = hash(commitment || secret)
-        // This prevents linking nullifier to commitment without knowing the secret
-        let mut nullifier_preimage = Vec::new();
-        nullifier_preimage.extend_from_slice(&commitment);
-        nullifier_preimage.extend_from_slice(&secret_var);
-
-        let computed_nullifier = compute_hash_gadget(cs, &nullifier_preimage)?;
+        // CONSTRAINT 3: nullifier = Poseidon(NULLIFIER_TAG, commitment, secret).
+        //
+        // This one IS aligned with host-side `Nullifier::derive`
+        // (privacy::types) — both use the (commitment, secret) preimage.
+        // `poseidon_nullifier_gadget` is the shared implementation.
+        let computed_nullifier =
+            poseidon_nullifier_gadget(cs, &commitment, &secret_var)?;
         computed_nullifier.enforce_equal(&nullifier_var)?;
 
         Ok(())
