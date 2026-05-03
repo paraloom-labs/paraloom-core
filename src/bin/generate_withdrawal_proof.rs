@@ -1,5 +1,5 @@
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_ff::ToConstraintField;
+use ark_ff::PrimeField;
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::thread_rng;
@@ -7,8 +7,8 @@ use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
 use std::fs;
 use std::path::Path;
 
-const PROVING_KEY_PATH: &str = "keys/withdraw_proving.key";
-const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying.key";
+const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v2.key";
+const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v2.key";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -110,20 +110,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verifying_key =
             VerifyingKey::<Bls12_381>::deserialize_compressed(&verifying_key_bytes[..])?;
 
-        // Prepare public inputs (5 field elements total)
-        // UInt8::new_input_vec packs 32 bytes into 2 field elements
-        let mut public_inputs = Vec::new();
-
-        // Merkle root: 32 bytes → 2 Fr elements
-        let root_fes: Vec<Fr> = merkle_root_bytes.to_field_elements().unwrap();
-        public_inputs.extend(root_fes);
-
-        // Nullifier: 32 bytes → 2 Fr elements
-        let null_fes: Vec<Fr> = nullifier_bytes.to_field_elements().unwrap();
-        public_inputs.extend(null_fes);
-
-        // Amount: 1 Fr element
-        public_inputs.push(Fr::from(amount));
+        // Public inputs: 3 Fr total, matching the post-Poseidon
+        // WithdrawCircuit shape — merkle_root, nullifier, amount — each
+        // allocated as a single FpVar::new_input. Byte blobs are lifted
+        // via `Fr::from_le_bytes_mod_order`, which mirrors the circuit's
+        // own reading of the same bytes.
+        let public_inputs = vec![
+            Fr::from_le_bytes_mod_order(&merkle_root_bytes),
+            Fr::from_le_bytes_mod_order(&nullifier_bytes),
+            Fr::from(amount),
+        ];
 
         println!(
             "Public inputs prepared: {} field elements",

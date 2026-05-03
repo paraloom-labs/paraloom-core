@@ -6,7 +6,7 @@ use crate::privacy::circuits::Groth16ProofSystem;
 use crate::privacy::transaction::{DepositTx, TransferTx, WithdrawTx};
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_ff::ToConstraintField;
+use ark_ff::PrimeField;
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,16 @@ impl VerificationChunk {
     }
 }
 
+/// Default path for the withdrawal verifying key on disk.
+///
+/// Versioned (`_v2`) after the Poseidon migration. The pre-migration
+/// circuit had ~65 UInt8 public inputs and a byte-sponge hash shim;
+/// any key generated against that shape (filename `withdraw_verifying.key`)
+/// is incompatible with the current circuit and will silently fail
+/// verification. Regenerate with `cargo run --bin setup_withdrawal_ceremony`
+/// to produce the `_v2` artifact.
+pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v2.key";
+
 /// Global verifying key for withdrawal proofs
 /// Loaded once from disk and cached for all verifications
 static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bls12_381>> = OnceLock::new();
@@ -170,7 +180,7 @@ impl ProofVerifier {
     fn get_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, String> {
         WITHDRAWAL_VERIFYING_KEY.get_or_init(|| {
             let key_path = std::env::var("WITHDRAWAL_VERIFYING_KEY_PATH")
-                .unwrap_or_else(|_| "keys/withdraw_verifying.key".to_string());
+                .unwrap_or_else(|_| DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH.to_string());
 
             let key_bytes = std::fs::read(&key_path)
                 .map_err(|e| format!("Failed to read verifying key from {}: {}", key_path, e))
@@ -244,20 +254,22 @@ impl ProofVerifier {
             }
         };
 
-        // Prepare public inputs (5 field elements total)
-        // UInt8::new_input_vec in circuit packs 32 bytes into 2 field elements
-        let mut public_inputs = Vec::new();
-
-        // Merkle root: 32 bytes → 2 Fr elements
-        let root_fes: Vec<Fr> = tx.merkle_root.to_field_elements().unwrap();
-        public_inputs.extend(root_fes);
-
-        // Nullifier: 32 bytes → 2 Fr elements
-        let null_fes: Vec<Fr> = tx.input_nullifier.0.to_field_elements().unwrap();
-        public_inputs.extend(null_fes);
-
-        // Amount: 1 Fr element
-        public_inputs.push(Fr::from(tx.amount));
+        // Prepare public inputs — 3 field elements total, matching the
+        // WithdrawCircuit shape after the Poseidon migration:
+        //
+        //   [merkle_root_fr, nullifier_fr, withdraw_amount_fr]
+        //
+        // The circuit now allocates each of these as a single
+        // `FpVar::new_input`; byte blobs on the wire are lifted with
+        // `Fr::from_le_bytes_mod_order` to match the on-circuit reading.
+        // (The previous 5-element layout — 2 Fr per 32-byte blob via
+        // `ToConstraintField` — targeted the old byte-sponge circuit
+        // and never agreed with any circuit that actually shipped.)
+        let public_inputs = vec![
+            Fr::from_le_bytes_mod_order(&tx.merkle_root),
+            Fr::from_le_bytes_mod_order(&tx.input_nullifier.0),
+            Fr::from(tx.amount),
+        ];
 
         // Verify the zkSNARK proof
         match Groth16ProofSystem::verify(verifying_key, &public_inputs, &proof) {

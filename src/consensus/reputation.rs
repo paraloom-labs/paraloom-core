@@ -295,7 +295,7 @@ impl ReputationTracker {
         let metrics = self.metrics.read().await;
         let mut validators: Vec<_> = metrics.values().cloned().collect();
 
-        validators.sort_by(|a, b| b.reputation.cmp(&a.reputation));
+        validators.sort_by_key(|v| std::cmp::Reverse(v.reputation));
         validators.truncate(limit);
         validators
     }

@@ -48,8 +48,9 @@
 //! ```
 
 use ark_bls12_381::{Bls12_381, Fr};
+use ark_ff::PrimeField;
 use ark_groth16::{Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, uint8::UInt8};
+use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
@@ -143,14 +144,21 @@ impl Default for ComputeCircuit {
 
 impl ConstraintSynthesizer<Fr> for ComputeCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Allocate public inputs
-        let code_hash_bytes = if let Some(hash) = self.code_hash {
-            hash.to_vec()
-        } else {
-            vec![0u8; 32]
-        };
-
-        let _code_hash_var = UInt8::new_input_vec(cs.clone(), &code_hash_bytes)?;
+        // Public input 1: code hash.
+        //
+        // Structurally allocated as a single `FpVar<Fr>` (was previously
+        // 32 UInt8 slots), matching the rest of the shielded-pool
+        // circuits post-Poseidon-migration. Currently unused in
+        // constraints — the slot is reserved so that, once a
+        // code-authentication constraint is added, the public-input
+        // layout does not shift under existing verifiers. Callers must
+        // pass `Fr::from_le_bytes_mod_order(&code_hash_bytes)`.
+        let _code_hash_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .code_hash
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
         let input_commitment_var = FpVar::new_input(cs.clone(), || {
             self.input_commitment

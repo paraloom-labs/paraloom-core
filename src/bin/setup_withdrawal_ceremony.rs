@@ -4,16 +4,24 @@ use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
 use std::fs;
 use std::path::Path;
 
-const PROVING_KEY_PATH: &str = "keys/withdraw_proving.key";
-const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying.key";
+// Versioned (`_v2`) after the Poseidon migration invalidated every key
+// generated against the pre-migration circuit (byte-sponge hash + ~65
+// UInt8 public inputs). Bumping the filename ensures the loader can't
+// silently pick up a stale key.
+const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v2.key";
+const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v2.key";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    println!("=== Withdrawal Circuit Setup Ceremony ===\n");
-    println!("This will generate proving and verifying keys for the withdrawal circuit.");
+    println!("=== Withdrawal Circuit Setup Ceremony (v2) ===\n");
+    println!("This will generate proving and verifying keys for the");
+    println!("post-Poseidon-migration withdrawal circuit.\n");
+    println!("Pre-migration keys (keys/withdraw_*.key without the _v2 suffix)");
+    println!("are INCOMPATIBLE with the current circuit. They can be deleted");
+    println!("safely once this ceremony completes.\n");
     println!("This is a TRUSTED SETUP. In production, this should be done");
-    println!("         through a multi-party computation ceremony.\n");
+    println!("through a multi-party computation ceremony.\n");
 
     if Path::new(PROVING_KEY_PATH).exists() || Path::new(VERIFYING_KEY_PATH).exists() {
         println!("WARNING: Keys already exist!");

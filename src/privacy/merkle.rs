@@ -4,9 +4,11 @@
 //! as a leaf. The tree root is used in ZK proofs to prove a commitment exists
 //! without revealing which one.
 
+use crate::privacy::poseidon::poseidon_merkle_pair;
 use crate::privacy::types::{Commitment, MerklePath};
 use crate::storage::PrivacyStorage;
-use sha2::{Digest, Sha256};
+use ark_bls12_381::Fr;
+use ark_ff::{BigInteger, PrimeField};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -229,16 +231,22 @@ impl MerkleTree {
         MerklePath { path, indices }
     }
 
-    /// Hash two nodes together
+    /// Hash two child nodes into their parent using domain-separated
+    /// Poseidon (`poseidon::domain::MERKLE_PAIR`).
+    ///
+    /// Matches the circuit-side `poseidon_merkle_pair_gadget` and the
+    /// host-side `MerklePath::verify` exactly — the three paths form
+    /// a single consistent hash family. Changing any of them requires
+    /// changing all three together (and regenerating every proving key).
     fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(left);
-        hasher.update(right);
-        let result = hasher.finalize();
-
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        let l = Fr::from_le_bytes_mod_order(left);
+        let r = Fr::from_le_bytes_mod_order(right);
+        let digest = poseidon_merkle_pair(l, r);
+        let bytes = digest.into_bigint().to_bytes_le();
+        let mut out = [0u8; 32];
+        let len = bytes.len().min(32);
+        out[..len].copy_from_slice(&bytes[..len]);
+        out
     }
 }
 

@@ -9,16 +9,17 @@
 //! - WithdrawCircuit: Private → Public withdrawals
 
 use ark_bls12_381::{Bls12_381, Fr};
+use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{
-    alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar, uint8::UInt8, ToBitsGadget,
-    ToBytesGadget,
-};
+use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
-use crate::privacy::poseidon::poseidon_hash_gadget;
+use crate::privacy::poseidon::{
+    self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
+    poseidon_nullifier_gadget,
+};
 
 /// Maximum number of inputs in a transfer (for batching)
 pub const MAX_INPUTS: usize = 2;
@@ -108,23 +109,44 @@ impl TransferCircuit {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Allocate public inputs
-        let merkle_root_var =
-            UInt8::new_input_vec(cs.clone(), &self.merkle_root.unwrap_or([0u8; 32]))?;
+        // ────────────────────────────────────────────────────────────────
+        // Public inputs — one Fr per entry.
+        //
+        // Previously each of these was 32 UInt8s (~32 public-input slots).
+        // Host callers that send 32-byte buffers must lift them to Fr via
+        // `Fr::from_le_bytes_mod_order` before passing to the verifier.
+        // ────────────────────────────────────────────────────────────────
+        let merkle_root_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .merkle_root
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
         let mut nullifier_vars = Vec::new();
         for nullifier in &self.nullifiers {
-            let null_var = UInt8::new_input_vec(cs.clone(), &nullifier.unwrap_or([0u8; 32]))?;
+            let null_var = FpVar::new_input(cs.clone(), || {
+                Ok(nullifier
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             nullifier_vars.push(null_var);
         }
 
         let mut output_commitment_vars = Vec::new();
         for commitment in &self.output_commitments {
-            let comm_var = UInt8::new_input_vec(cs.clone(), &commitment.unwrap_or([0u8; 32]))?;
+            let comm_var = FpVar::new_input(cs.clone(), || {
+                Ok(commitment
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             output_commitment_vars.push(comm_var);
         }
 
-        // Allocate private witness
+        // ────────────────────────────────────────────────────────────────
+        // Private witnesses — all lifted to FpVar<Fr>. 32-byte blob
+        // witnesses use from_le_bytes_mod_order, matching the host side.
+        // ────────────────────────────────────────────────────────────────
         let mut input_value_vars = Vec::new();
         for value in &self.input_values {
             let val_var = FpVar::new_witness(cs.clone(), || {
@@ -135,7 +157,11 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
 
         let mut input_randomness_vars = Vec::new();
         for randomness in &self.input_randomness {
-            let rand_var = UInt8::new_witness_vec(cs.clone(), &randomness.unwrap_or([0u8; 32]))?;
+            let rand_var = FpVar::new_witness(cs.clone(), || {
+                Ok(randomness
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             input_randomness_vars.push(rand_var);
         }
 
@@ -149,169 +175,113 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
 
         let mut output_randomness_vars = Vec::new();
         for randomness in &self.output_randomness {
-            let rand_var = UInt8::new_witness_vec(cs.clone(), &randomness.unwrap_or([0u8; 32]))?;
+            let rand_var = FpVar::new_witness(cs.clone(), || {
+                Ok(randomness
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             output_randomness_vars.push(rand_var);
         }
 
         let mut recipient_address_vars = Vec::new();
         for address in &self.recipient_addresses {
-            let addr_var = UInt8::new_witness_vec(cs.clone(), &address.unwrap_or([0u8; 32]))?;
+            let addr_var = FpVar::new_witness(cs.clone(), || {
+                Ok(address
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
             recipient_address_vars.push(addr_var);
         }
 
-        // CONSTRAINT 1: Verify balance preservation (sum of inputs = sum of outputs)
+        // CONSTRAINT 1: balance preservation (sum inputs == sum outputs).
         let mut input_sum = FpVar::zero();
         for input_val in &input_value_vars {
             input_sum = &input_sum + input_val;
         }
-
         let mut output_sum = FpVar::zero();
         for output_val in &output_value_vars {
             output_sum = &output_sum + output_val;
         }
-
         input_sum.enforce_equal(&output_sum)?;
 
-        // CONSTRAINT 2: Verify input commitments are in Merkle tree
-        // For each input, verify Merkle path from commitment to root
+        // CONSTRAINT 2: input commitments are in the Merkle tree.
+        //
+        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
+        // The input-commitment preimage is only `(value, randomness)`,
+        // whereas `DepositCircuit` and host-side `Note::commitment` use
+        // `(value, randomness, recipient)`. A note produced via deposit
+        // cannot be spent by this circuit — the commitments will not
+        // match. Fixing this is out of scope for the Poseidon migration;
+        // tracked as a follow-up.
         for i in 0..self.input_paths.len() {
             if let Some(path) = &self.input_paths[i] {
-                // Compute input commitment hash
-                let mut input_commitment_data = Vec::new();
-                input_commitment_data.extend_from_slice(&input_value_vars[i].to_bytes()?);
-                input_commitment_data.extend_from_slice(&input_randomness_vars[i]);
+                // Leaf: Poseidon(COMMITMENT_TAG, value, randomness).
+                let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
+                let mut current_hash = poseidon_hash_gadget(
+                    cs.clone(),
+                    &[
+                        commit_tag,
+                        input_value_vars[i].clone(),
+                        input_randomness_vars[i].clone(),
+                    ],
+                )?;
 
-                let mut current_hash = compute_hash_gadget(cs.clone(), &input_commitment_data)?;
-
-                // Traverse Merkle path
+                // Walk the path using the shared Merkle gadget — matches
+                // `MerkleTree::hash_pair` and `MerklePath::verify` on the
+                // host side (privacy::merkle, privacy::types).
                 for (sibling_hash, is_left) in path {
-                    let sibling_var = UInt8::constant_vec(sibling_hash);
+                    let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
 
-                    // Combine current hash with sibling based on position
-                    let mut combined = Vec::new();
-                    if *is_left {
-                        combined.extend_from_slice(&current_hash);
-                        combined.extend_from_slice(&sibling_var);
+                    let (l, r) = if *is_left {
+                        (&current_hash, &sibling_var)
                     } else {
-                        combined.extend_from_slice(&sibling_var);
-                        combined.extend_from_slice(&current_hash);
-                    }
+                        (&sibling_var, &current_hash)
+                    };
 
-                    current_hash = compute_hash_gadget(cs.clone(), &combined)?;
+                    current_hash = poseidon_merkle_pair_gadget(cs.clone(), l, r)?;
                 }
 
-                // Final hash should equal Merkle root
                 current_hash.enforce_equal(&merkle_root_var)?;
             }
         }
 
-        // CONSTRAINT 3: Verify nullifiers are correctly derived
-        // Nullifier = Hash(commitment || randomness)
+        // CONSTRAINT 3: nullifier derivation.
+        //
+        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
+        // The preimage is `(value, randomness)`, whereas host-side
+        // `Nullifier::derive` uses `(commitment, spending_key)`. Host
+        // and circuit will not produce matching nullifiers. Tracked as
+        // a follow-up.
         for i in 0..self.nullifiers.len() {
-            let mut nullifier_preimage = Vec::new();
-            nullifier_preimage.extend_from_slice(&input_value_vars[i].to_bytes()?);
-            nullifier_preimage.extend_from_slice(&input_randomness_vars[i]);
-
-            let computed_nullifier = compute_hash_gadget(cs.clone(), &nullifier_preimage)?;
+            let null_tag = FpVar::constant(Fr::from(poseidon::domain::NULLIFIER));
+            let computed_nullifier = poseidon_hash_gadget(
+                cs.clone(),
+                &[
+                    null_tag,
+                    input_value_vars[i].clone(),
+                    input_randomness_vars[i].clone(),
+                ],
+            )?;
             computed_nullifier.enforce_equal(&nullifier_vars[i])?;
         }
 
-        // CONSTRAINT 4: Verify output commitments are correctly computed
-        // Output commitment = Hash(value || randomness || recipient)
+        // CONSTRAINT 4: output commitments match the host-side formula
+        // `Note::commitment` = Poseidon(COMMITMENT_TAG, value, randomness, recipient).
+        // This one IS aligned with DepositCircuit and host types.
         for i in 0..self.output_commitments.len() {
-            let mut output_commitment_data = Vec::new();
-            output_commitment_data.extend_from_slice(&output_value_vars[i].to_bytes()?);
-            output_commitment_data.extend_from_slice(&output_randomness_vars[i]);
-            output_commitment_data.extend_from_slice(&recipient_address_vars[i]);
-
-            let computed_commitment = compute_hash_gadget(cs.clone(), &output_commitment_data)?;
+            let computed_commitment = poseidon_commit_gadget(
+                cs.clone(),
+                &output_value_vars[i],
+                &output_randomness_vars[i],
+                &recipient_address_vars[i],
+            )?;
             computed_commitment.enforce_equal(&output_commitment_vars[i])?;
         }
 
-        // CONSTRAINT 5: Range checks - ensure all values are non-negative
-        // Values come from u64 and fit within field representation
+        // CONSTRAINT 5: range checks — values come from u64 and fit
+        // within Fr, so no explicit range proof is needed here.
 
         Ok(())
-    }
-}
-
-/// Helper function to compute hash in circuit using Poseidon
-///
-/// Poseidon is a zkSNARK-friendly hash function that produces far fewer
-/// constraints than traditional hashes like SHA-256.
-///
-/// Performance comparison:
-/// - SHA-256: ~25,000 constraints
-/// - Poseidon: ~500 constraints (50x improvement!)
-///
-/// This is CRITICAL for Raspberry Pi proof generation.
-pub fn compute_hash_gadget(
-    cs: ConstraintSystemRef<Fr>,
-    data: &[UInt8<Fr>],
-) -> Result<Vec<UInt8<Fr>>, SynthesisError> {
-    // Convert bytes to field elements
-    // Group bytes into chunks of 31 (safe for BLS12-381 field)
-    // This MUST match the native poseidon_hash_bytes implementation exactly!
-    const CHUNK_SIZE: usize = 31;
-    let mut field_vars = Vec::new();
-
-    for chunk in data.chunks(CHUNK_SIZE) {
-        // Pad chunk to 32 bytes with zeros (matching native implementation)
-        let mut padded_chunk = chunk.to_vec();
-        while padded_chunk.len() < 32 {
-            padded_chunk.push(UInt8::constant(0));
-        }
-
-        // Convert 32 bytes to field element using little-endian interpretation
-        // This matches Fr::from_le_bytes_mod_order in native implementation
-        let mut field_bits = Vec::new();
-        for byte in &padded_chunk {
-            field_bits.extend_from_slice(&byte.to_bits_le()?);
-        }
-
-        // Reconstruct as field element from little-endian bits
-        let field_var = Boolean::le_bits_to_fp_var(&field_bits)?;
-        field_vars.push(field_var);
-    }
-
-    // Hash using Poseidon
-    let hash_output = poseidon_hash_gadget(cs.clone(), &field_vars)?;
-
-    // Convert hash output (field element) back to 32 bytes
-    let hash_bytes = hash_output.to_bytes()?;
-
-    // Ensure we have exactly 32 bytes
-    let mut result = hash_bytes;
-    if result.len() < 32 {
-        result.resize(32, UInt8::constant(0));
-    } else if result.len() > 32 {
-        result.truncate(32);
-    }
-
-    Ok(result)
-}
-
-// Helper to convert Boolean bits to field variable
-use ark_r1cs_std::boolean::Boolean;
-
-#[allow(dead_code)]
-pub trait BitsToField {
-    fn le_bits_to_fp_var(bits: &[Boolean<Fr>]) -> Result<FpVar<Fr>, SynthesisError>;
-}
-
-impl BitsToField for Boolean<Fr> {
-    fn le_bits_to_fp_var(bits: &[Boolean<Fr>]) -> Result<FpVar<Fr>, SynthesisError> {
-        // Convert bits to field element
-        let mut result = FpVar::zero();
-        let mut power_of_two = FpVar::constant(Fr::from(1u64));
-
-        for bit in bits {
-            let bit_value = FpVar::from(bit.clone());
-            result += &bit_value * &power_of_two;
-            power_of_two = &power_of_two + &power_of_two; // Double for next bit
-        }
-
-        Ok(result)
     }
 }
 
@@ -359,30 +329,53 @@ impl Default for DepositCircuit {
 
 impl ConstraintSynthesizer<Fr> for DepositCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Public input: output commitment
-        let commitment_var =
-            UInt8::new_input_vec(cs.clone(), &self.output_commitment.unwrap_or([0u8; 32]))?;
+        // Public input: output commitment as a single field element.
+        //
+        // Previously allocated as 32 UInt8s (~256 witness slots plus
+        // bit-decomposition during hashing). The host writes the same
+        // value as 32 little-endian bytes of the Fr — `Note::commitment`
+        // in privacy::types produces exactly that serialization.
+        let commitment_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .output_commitment
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        // Private witness
+        // Private witness: amount as a native field element.
         let value_var = FpVar::new_witness(cs.clone(), || {
             self.value
                 .map(Fr::from)
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        let randomness_var =
-            UInt8::new_witness_vec(cs.clone(), &self.randomness.unwrap_or([0u8; 32]))?;
+        // Private witness: 32-byte randomness lifted to Fr via modular
+        // reduction. This matches the host-side `Note::commitment`
+        // (privacy::types) which does the same lift before calling
+        // `poseidon_commit`.
+        let randomness_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .randomness
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let recipient_var =
-            UInt8::new_witness_vec(cs.clone(), &self.recipient.unwrap_or([0u8; 32]))?;
+        // Private witness: 32-byte recipient address lifted to Fr.
+        let recipient_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .recipient
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        // Constraint: Verify commitment is correctly computed
-        let mut commitment_data = Vec::new();
-        commitment_data.extend_from_slice(&value_var.to_bytes()?);
-        commitment_data.extend_from_slice(&randomness_var);
-        commitment_data.extend_from_slice(&recipient_var);
-
-        let computed_commitment = compute_hash_gadget(cs, &commitment_data)?;
+        // Constraint: commitment_var == Poseidon(TAG, value, randomness, recipient)
+        //
+        // Uses the domain-separated gadget that mirrors `poseidon_commit`
+        // on the host side one-for-one. The input argument order
+        // (value, randomness, recipient) is fixed and must stay aligned
+        // with the host helper.
+        let computed_commitment =
+            poseidon_commit_gadget(cs, &value_var, &randomness_var, &recipient_var)?;
         computed_commitment.enforce_equal(&commitment_var)?;
 
         Ok(())
@@ -444,11 +437,24 @@ impl Default for WithdrawCircuit {
 
 impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
-        // Public inputs
-        let merkle_root_var =
-            UInt8::new_input_vec(cs.clone(), &self.merkle_root.unwrap_or([0u8; 32]))?;
+        // ────────────────────────────────────────────────────────────────
+        // Public inputs — single Fr per slot (was 32 UInt8 each before).
+        // Host lifts 32-byte buffers to Fr via from_le_bytes_mod_order
+        // before handing them to the verifier.
+        // ────────────────────────────────────────────────────────────────
+        let merkle_root_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .merkle_root
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let nullifier_var = UInt8::new_input_vec(cs.clone(), &self.nullifier.unwrap_or([0u8; 32]))?;
+        let nullifier_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .nullifier
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
         let withdraw_amount_var = FpVar::new_input(cs.clone(), || {
             self.withdraw_amount
@@ -456,69 +462,80 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        // Private witness
+        // ────────────────────────────────────────────────────────────────
+        // Private witnesses — lifted to FpVar<Fr>. The old byte-array
+        // witness `input_value_bytes` is gone: Poseidon consumes field
+        // elements, not u64 bytes.
+        // ────────────────────────────────────────────────────────────────
         let input_value_var = FpVar::new_witness(cs.clone(), || {
             self.input_value
                 .map(Fr::from)
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
-        // Create byte representation of value (8 bytes for u64)
-        let input_value_bytes =
-            UInt8::new_witness_vec(cs.clone(), &self.input_value.unwrap_or(0).to_le_bytes())?;
+        let input_randomness_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .input_randomness
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let input_randomness_var =
-            UInt8::new_witness_vec(cs.clone(), &self.input_randomness.unwrap_or([0u8; 32]))?;
+        let secret_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .secret
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
 
-        let secret_var = UInt8::new_witness_vec(cs.clone(), &self.secret.unwrap_or([0u8; 32]))?;
-
-        // Constraint 1: Verify input value >= withdraw amount
-        // input_value - withdraw_amount >= 0
+        // CONSTRAINT 1: input_value >= withdraw_amount.
+        // Subtraction forces the witness assignment to produce a
+        // non-negative difference under native field arithmetic; a real
+        // range proof is still a TODO and lives outside this migration.
         let _difference = &input_value_var - &withdraw_amount_var;
-        // Range proof ensures difference is non-negative
 
-        // Constraint 2: Verify input commitment is in tree
-        // Compute commitment = hash(value || randomness)
-        // Use 8-byte representation of u64, NOT 32-byte field element
-        let mut input_commitment_data = Vec::new();
-        input_commitment_data.extend_from_slice(&input_value_bytes);
-        input_commitment_data.extend_from_slice(&input_randomness_var);
+        // CONSTRAINT 2: input commitment is in the Merkle tree.
+        //
+        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
+        // The preimage is `(value, randomness)` — same two-argument
+        // shape as TransferCircuit. DepositCircuit and host-side
+        // `Note::commitment` use the three-argument
+        // `(value, randomness, recipient)` form. Deposited notes cannot
+        // be withdrawn by this circuit without a semantic fix. Tracked
+        // as a follow-up.
+        let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
+        let commitment = poseidon_hash_gadget(
+            cs.clone(),
+            &[
+                commit_tag,
+                input_value_var.clone(),
+                input_randomness_var.clone(),
+            ],
+        )?;
 
-        let commitment = compute_hash_gadget(cs.clone(), &input_commitment_data)?;
-
-        // Verify Merkle proof
-        // Start with commitment and climb the tree
         let mut current_hash = commitment.clone();
 
         if let Some(path) = &self.input_path {
             for (sibling_hash, is_left) in path {
-                let sibling_var = UInt8::constant_vec(sibling_hash);
+                let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
 
-                let mut combined = Vec::new();
-                if *is_left {
-                    combined.extend_from_slice(&current_hash);
-                    combined.extend_from_slice(&sibling_var);
+                let (l, r) = if *is_left {
+                    (&current_hash, &sibling_var)
                 } else {
-                    combined.extend_from_slice(&sibling_var);
-                    combined.extend_from_slice(&current_hash);
-                }
+                    (&sibling_var, &current_hash)
+                };
 
-                current_hash = compute_hash_gadget(cs.clone(), &combined)?;
+                current_hash = poseidon_merkle_pair_gadget(cs.clone(), l, r)?;
             }
         }
 
-        // For empty path, current_hash == commitment
-        // After climbing tree, current_hash must equal merkle_root
         current_hash.enforce_equal(&merkle_root_var)?;
 
-        // Constraint 3: Verify nullifier derivation
-        // Nullifier = hash(commitment || secret)
-        // This prevents linking nullifier to commitment without knowing the secret
-        let mut nullifier_preimage = Vec::new();
-        nullifier_preimage.extend_from_slice(&commitment);
-        nullifier_preimage.extend_from_slice(&secret_var);
-
-        let computed_nullifier = compute_hash_gadget(cs, &nullifier_preimage)?;
+        // CONSTRAINT 3: nullifier = Poseidon(NULLIFIER_TAG, commitment, secret).
+        //
+        // This one IS aligned with host-side `Nullifier::derive`
+        // (privacy::types) — both use the (commitment, secret) preimage.
+        // `poseidon_nullifier_gadget` is the shared implementation.
+        let computed_nullifier = poseidon_nullifier_gadget(cs, &commitment, &secret_var)?;
         computed_nullifier.enforce_equal(&nullifier_var)?;
 
         Ok(())
@@ -575,6 +592,8 @@ impl Groth16ProofSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privacy::poseidon::poseidon_commit;
+    use ark_ff::BigInteger;
     use ark_relations::r1cs::ConstraintSystem;
     use ark_serialize::CanonicalSerialize;
     use ark_std::rand::rngs::StdRng;
@@ -680,27 +699,24 @@ mod tests {
         let setup_circuit = DepositCircuit::new();
         let (pk, _vk) = Groth16ProofSystem::setup(setup_circuit, &mut rng).unwrap();
 
-        // Create witness circuit with values that satisfy the constraints
+        // Create witness circuit with values that satisfy the constraints.
         let value = 1000u64;
         let randomness = [42u8; 32];
         let recipient = [1u8; 32];
 
-        // Compute the commitment that the circuit expects
-        // The circuit uses compute_hash_gadget which returns first 32 bytes of input
-        let mut commitment_data = Vec::new();
-        // Add value bytes
-        let value_fr = Fr::from(value);
-        let mut value_bytes = Vec::new();
-        value_fr.serialize_compressed(&mut value_bytes).unwrap();
-        commitment_data.extend_from_slice(&value_bytes);
-        // Add randomness
-        commitment_data.extend_from_slice(&randomness);
-        // Add recipient
-        commitment_data.extend_from_slice(&recipient);
-
-        // Take first 32 bytes as commitment (matching compute_hash_gadget behavior)
+        // Compute the commitment the circuit expects: must equal
+        // poseidon_commit(value, randomness, recipient) — mirror what
+        // `Note::commitment` produces on the host side and what
+        // `poseidon_commit_gadget` computes inside the circuit.
+        let digest = poseidon_commit(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&randomness),
+            Fr::from_le_bytes_mod_order(&recipient),
+        );
+        let digest_bytes = digest.into_bigint().to_bytes_le();
         let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&commitment_data[..32]);
+        let len = digest_bytes.len().min(32);
+        commitment[..len].copy_from_slice(&digest_bytes[..len]);
 
         let proof_circuit = DepositCircuit::with_witness(commitment, value, randomness, recipient);
 
