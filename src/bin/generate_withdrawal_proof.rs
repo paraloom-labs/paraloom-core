@@ -24,6 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("INPUT_VALUE").expect("INPUT_VALUE environment variable required");
     let input_randomness_hex = std::env::var("INPUT_RANDOMNESS")
         .expect("INPUT_RANDOMNESS environment variable required (hex string)");
+    let input_recipient_hex = std::env::var("INPUT_RECIPIENT")
+        .expect("INPUT_RECIPIENT environment variable required (hex string of the spender's z-address)");
     let secret_hex =
         std::env::var("SECRET").expect("SECRET environment variable required (hex string)");
     let merkle_path_json =
@@ -41,6 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_randomness = hex::decode(&input_randomness_hex)?;
     let mut input_randomness_bytes = [0u8; 32];
     input_randomness_bytes.copy_from_slice(&input_randomness);
+
+    let input_recipient = hex::decode(&input_recipient_hex)?;
+    let mut input_recipient_bytes = [0u8; 32];
+    input_recipient_bytes.copy_from_slice(&input_recipient);
 
     let secret = hex::decode(&secret_hex)?;
     let mut secret_bytes = [0u8; 32];
@@ -81,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         amount,
         input_value,
         input_randomness_bytes,
+        input_recipient_bytes,
         secret_bytes,
         merkle_path,
     );

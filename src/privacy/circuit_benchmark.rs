@@ -144,6 +144,7 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
         500,                                         // withdraw_amount
         1000,                                        // input_value
         [3u8; 32],                                   // input_randomness
+        [22u8; 32],                                  // input_recipient
         [6u8; 32],                                   // secret
         vec![([4u8; 32], true), ([5u8; 32], false)], // merkle_path
     );

@@ -17,8 +17,7 @@ use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{
-    self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
-    poseidon_nullifier_gadget,
+    poseidon_commit_gadget, poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
 };
 
 /// Maximum number of inputs in a transfer (for batching)
@@ -414,6 +413,7 @@ pub struct WithdrawCircuit {
     pub withdraw_amount: Option<u64>,
     pub input_value: Option<u64>,
     pub input_randomness: Option<[u8; 32]>,
+    pub input_recipient: Option<[u8; 32]>,
     pub input_path: Option<Vec<([u8; 32], bool)>>,
     pub secret: Option<[u8; 32]>,
 }
@@ -426,6 +426,7 @@ impl WithdrawCircuit {
             withdraw_amount: None,
             input_value: None,
             input_randomness: None,
+            input_recipient: None,
             input_path: None,
             secret: None,
         }
@@ -438,6 +439,7 @@ impl WithdrawCircuit {
         withdraw_amount: u64,
         input_value: u64,
         input_randomness: [u8; 32],
+        input_recipient: [u8; 32],
         secret: [u8; 32],
         input_path: Vec<([u8; 32], bool)>,
     ) -> Self {
@@ -447,6 +449,7 @@ impl WithdrawCircuit {
             withdraw_amount: Some(withdraw_amount),
             input_value: Some(input_value),
             input_randomness: Some(input_randomness),
+            input_recipient: Some(input_recipient),
             input_path: Some(input_path),
             secret: Some(secret),
         }
@@ -504,6 +507,13 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
+        let input_recipient_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .input_recipient
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+
         let secret_var = FpVar::new_witness(cs.clone(), || {
             Ok(self
                 .secret
@@ -517,23 +527,16 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // range proof is still a TODO and lives outside this migration.
         let _difference = &input_value_var - &withdraw_amount_var;
 
-        // CONSTRAINT 2: input commitment is in the Merkle tree.
-        //
-        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
-        // The preimage is `(value, randomness)` — same two-argument
-        // shape as TransferCircuit. DepositCircuit and host-side
-        // `Note::commitment` use the three-argument
-        // `(value, randomness, recipient)` form. Deposited notes cannot
-        // be withdrawn by this circuit without a semantic fix. Tracked
-        // as a follow-up.
-        let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
-        let commitment = poseidon_hash_gadget(
+        // CONSTRAINT 2: input commitment is in the Merkle tree under
+        // the public `merkle_root`. The commitment is computed with the
+        // same three-argument formula that `DepositCircuit` and host-side
+        // `Note::commitment` use, so any note created by a deposit can be
+        // located here.
+        let commitment = poseidon_commit_gadget(
             cs.clone(),
-            &[
-                commit_tag,
-                input_value_var.clone(),
-                input_randomness_var.clone(),
-            ],
+            &input_value_var,
+            &input_randomness_var,
+            &input_recipient_var,
         )?;
 
         let mut current_hash = commitment.clone();
@@ -720,30 +723,51 @@ mod tests {
 
     #[test]
     fn test_withdraw_circuit_synthesis() {
-        let merkle_root = [1u8; 32];
-        let nullifier = [2u8; 32];
-        let withdraw_amount = 500u64;
-        let input_value = 1000u64;
+        // Construct witnesses that are consistent with the host helpers,
+        // mirroring what test_transfer_circuit_synthesis does. With the
+        // 3-argument input commitment in place, the circuit can locate a
+        // note that was created by the deposit path.
+
+        let input_value = 1_000u64;
         let input_randomness = [3u8; 32];
+        let input_recipient = [7u8; 32];
         let secret = [6u8; 32];
-        let input_path = vec![([4u8; 32], true), ([5u8; 32], false)];
+        let withdraw_amount = 500u64;
+
+        let commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+        );
+        let nullifier_fr =
+            poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+
+        // Two-sibling Merkle path: leaf on the left at depth 0, then on
+        // the right at depth 1. Mirrors the original test's path shape.
+        let sibling_0 = [4u8; 32];
+        let sibling_1 = [5u8; 32];
+        let level_1 = poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling_0));
+        let merkle_root_fr =
+            poseidon_merkle_pair(Fr::from_le_bytes_mod_order(&sibling_1), level_1);
 
         let circuit = WithdrawCircuit::with_witness(
-            merkle_root,
-            nullifier,
+            fr_to_bytes_32(merkle_root_fr),
+            fr_to_bytes_32(nullifier_fr),
             withdraw_amount,
             input_value,
             input_randomness,
+            input_recipient,
             secret,
-            input_path,
+            vec![(sibling_0, true), (sibling_1, false)],
         );
         let cs = ConstraintSystem::<Fr>::new_ref();
 
-        let result = circuit.generate_constraints(cs);
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should succeed");
         assert!(
-            result.is_ok(),
-            "Withdraw circuit synthesis failed: {:?}",
-            result.err()
+            cs.is_satisfied().expect("constraint system query"),
+            "withdraw circuit constraints should be satisfied by host-aligned witnesses"
         );
     }
 
