@@ -622,7 +622,6 @@ mod tests {
     use crate::privacy::poseidon::{poseidon_commit, poseidon_merkle_pair, poseidon_nullifier};
     use ark_ff::BigInteger;
     use ark_relations::r1cs::ConstraintSystem;
-    use ark_serialize::CanonicalSerialize;
     use ark_std::rand::rngs::StdRng;
     use ark_std::rand::SeedableRng;
 
@@ -781,40 +780,43 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_deposit_proof_generation() {
+        // End-to-end exercise of the deposit circuit: trusted setup →
+        // witness construction via the host helpers → proof generation →
+        // public-input verification. Previously \`#[ignore]\`'d because the
+        // public-input layout did not round-trip; with the field-element
+        // public inputs in place since v0.2.0, the verification step runs.
         let mut rng = StdRng::seed_from_u64(0u64);
 
-        // Setup
         let setup_circuit = DepositCircuit::new();
-        let (pk, _vk) = Groth16ProofSystem::setup(setup_circuit, &mut rng).unwrap();
+        let (pk, vk) = Groth16ProofSystem::setup(setup_circuit, &mut rng)
+            .expect("trusted setup should succeed");
 
-        // Create witness circuit with values that satisfy the constraints.
-        let value = 1000u64;
+        let value = 1_000u64;
         let randomness = [42u8; 32];
         let recipient = [1u8; 32];
 
-        // Compute the commitment the circuit expects: must equal
-        // poseidon_commit(value, randomness, recipient) — mirror what
-        // `Note::commitment` produces on the host side and what
-        // `poseidon_commit_gadget` computes inside the circuit.
-        let digest = poseidon_commit(
+        // Commitment computed via the same host helper that
+        // `Note::commitment` uses; the circuit's `poseidon_commit_gadget`
+        // reproduces this value bit-for-bit.
+        let commitment_fr = poseidon_commit(
             Fr::from(value),
             Fr::from_le_bytes_mod_order(&randomness),
             Fr::from_le_bytes_mod_order(&recipient),
         );
-        let digest_bytes = digest.into_bigint().to_bytes_le();
-        let mut commitment = [0u8; 32];
-        let len = digest_bytes.len().min(32);
-        commitment[..len].copy_from_slice(&digest_bytes[..len]);
+        let commitment_bytes = fr_to_bytes_32(commitment_fr);
 
-        let proof_circuit = DepositCircuit::with_witness(commitment, value, randomness, recipient);
+        let proof_circuit =
+            DepositCircuit::with_witness(commitment_bytes, value, randomness, recipient);
+        let proof = Groth16ProofSystem::prove(&pk, proof_circuit, &mut rng)
+            .expect("proof generation should succeed");
 
-        // Prove
-        let proof = Groth16ProofSystem::prove(&pk, proof_circuit, &mut rng);
-        assert!(proof.is_ok(), "Proof generation failed: {:?}", proof.err());
-
-        // Note: Full verification would require proper public input conversion
-        // For now we just verify that proof generation succeeds
+        // Public input layout: a single Fr (the commitment) lifted from
+        // the on-chain 32-byte buffer via `from_le_bytes_mod_order`. Any
+        // change to that convention must be reflected here.
+        let public_inputs = [Fr::from_le_bytes_mod_order(&commitment_bytes)];
+        let verified = Groth16ProofSystem::verify(&vk, &public_inputs, &proof)
+            .expect("verification should not error");
+        assert!(verified, "honestly generated deposit proof must verify");
     }
 }
