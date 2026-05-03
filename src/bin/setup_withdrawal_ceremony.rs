@@ -4,20 +4,22 @@ use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
 use std::fs;
 use std::path::Path;
 
-// Versioned (`_v2`) after the Poseidon migration invalidated every key
-// generated against the pre-migration circuit (byte-sponge hash + ~65
-// UInt8 public inputs). Bumping the filename ensures the loader can't
-// silently pick up a stale key.
-const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v2.key";
-const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v2.key";
+// Versioned (`_v3`) after the v0.3.0 circuit alignment work that
+// extended `WithdrawCircuit` with an `input_recipient` witness so it
+// could locate notes produced by `DepositCircuit`. The constraint
+// system shape changed; the previous `_v2` keys (and the original
+// pre-Poseidon keys) are not interchangeable. Bumping the filename
+// ensures the loader can't silently pick up a stale key.
+const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v3.key";
+const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v3.key";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    println!("=== Withdrawal Circuit Setup Ceremony (v2) ===\n");
+    println!("=== Withdrawal Circuit Setup Ceremony (v3) ===\n");
     println!("This will generate proving and verifying keys for the");
-    println!("post-Poseidon-migration withdrawal circuit.\n");
-    println!("Pre-migration keys (keys/withdraw_*.key without the _v2 suffix)");
+    println!("post-v0.3.0 withdrawal circuit (input_recipient witness).\n");
+    println!("Earlier keys (keys/withdraw_*.key, including the _v2 set)");
     println!("are INCOMPATIBLE with the current circuit. They can be deleted");
     println!("safely once this ceremony completes.\n");
     println!("This is a TRUSTED SETUP. In production, this should be done");

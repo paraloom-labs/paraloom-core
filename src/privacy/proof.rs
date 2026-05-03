@@ -160,13 +160,16 @@ impl VerificationChunk {
 
 /// Default path for the withdrawal verifying key on disk.
 ///
-/// Versioned (`_v2`) after the Poseidon migration. The pre-migration
-/// circuit had ~65 UInt8 public inputs and a byte-sponge hash shim;
-/// any key generated against that shape (filename `withdraw_verifying.key`)
-/// is incompatible with the current circuit and will silently fail
-/// verification. Regenerate with `cargo run --bin setup_withdrawal_ceremony`
-/// to produce the `_v2` artifact.
-pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v2.key";
+/// Versioned (`_v3`) after the v0.3.0 circuit alignment work that
+/// extended `WithdrawCircuit` with an `input_recipient` witness so it
+/// could locate notes produced by `DepositCircuit`. The constraint
+/// system shape changed, so any key generated against the prior
+/// circuit (filenames `withdraw_verifying.key` or
+/// `withdraw_verifying_v2.key`) is incompatible and will fail
+/// verification. Regenerate with
+/// `cargo run --bin setup_withdrawal_ceremony` to produce the `_v3`
+/// artifact.
+pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v3.key";
 
 /// Global verifying key for withdrawal proofs
 /// Loaded once from disk and cached for all verifications
