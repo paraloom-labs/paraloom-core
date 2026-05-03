@@ -819,4 +819,129 @@ mod tests {
             .expect("verification should not error");
         assert!(verified, "honestly generated deposit proof must verify");
     }
+
+    /// Cross-circuit consistency: a note created by Deposit can be spent
+    /// by Transfer, and the note that Transfer produces can in turn be
+    /// withdrawn by Withdraw. Synthesizing each circuit and asserting
+    /// `cs.is_satisfied()` is enough — the whole point of this test is
+    /// that the three circuits agree on commitment, nullifier, and
+    /// Merkle-leaf shapes. A regression in any one of them would surface
+    /// here as an unsatisfied constraint, even before Groth16 setup.
+    #[test]
+    fn test_deposit_transfer_withdraw_e2e() {
+        // ── Step 1: Deposit a note for Alice ──────────────────────────
+        let alice_address = [0xA1u8; 32];
+        let alice_secret = [0xA5u8; 32];
+        let alice_amount = 1_000u64;
+        let alice_randomness = [0x11u8; 32];
+
+        let alice_commitment_fr = poseidon_commit(
+            Fr::from(alice_amount),
+            Fr::from_le_bytes_mod_order(&alice_randomness),
+            Fr::from_le_bytes_mod_order(&alice_address),
+        );
+        let alice_commitment_bytes = fr_to_bytes_32(alice_commitment_fr);
+
+        let deposit = DepositCircuit::with_witness(
+            alice_commitment_bytes,
+            alice_amount,
+            alice_randomness,
+            alice_address,
+        );
+        let cs_deposit = ConstraintSystem::<Fr>::new_ref();
+        deposit
+            .generate_constraints(cs_deposit.clone())
+            .expect("deposit synthesis");
+        assert!(
+            cs_deposit
+                .is_satisfied()
+                .expect("deposit constraint system query"),
+            "deposit constraints unsatisfied"
+        );
+
+        // ── Step 2: Transfer Alice's note to Bob ──────────────────────
+        // Single-leaf Merkle tree with Alice's note as the only leaf and
+        // a public sibling. The transfer circuit must be able to walk
+        // the tree from Alice's commitment to the published root.
+        let sibling_to_alice = [0x55u8; 32];
+        let merkle_root_after_deposit = fr_to_bytes_32(poseidon_merkle_pair(
+            alice_commitment_fr,
+            Fr::from_le_bytes_mod_order(&sibling_to_alice),
+        ));
+
+        let bob_address = [0xB0u8; 32];
+        let bob_randomness = [0x22u8; 32];
+        let bob_amount = alice_amount; // 1-in / 1-out, value-preserving
+
+        let bob_commitment_fr = poseidon_commit(
+            Fr::from(bob_amount),
+            Fr::from_le_bytes_mod_order(&bob_randomness),
+            Fr::from_le_bytes_mod_order(&bob_address),
+        );
+        let bob_commitment_bytes = fr_to_bytes_32(bob_commitment_fr);
+
+        let alice_nullifier_fr = poseidon_nullifier(
+            alice_commitment_fr,
+            Fr::from_le_bytes_mod_order(&alice_secret),
+        );
+        let alice_nullifier_bytes = fr_to_bytes_32(alice_nullifier_fr);
+
+        let transfer = TransferCircuit::with_witness(
+            merkle_root_after_deposit,
+            vec![alice_nullifier_bytes],
+            vec![bob_commitment_bytes],
+            vec![alice_amount],
+            vec![alice_randomness],
+            vec![alice_address],
+            vec![alice_secret],
+            vec![vec![(sibling_to_alice, true)]],
+            vec![bob_amount],
+            vec![bob_randomness],
+            vec![bob_address],
+        );
+        let cs_transfer = ConstraintSystem::<Fr>::new_ref();
+        transfer
+            .generate_constraints(cs_transfer.clone())
+            .expect("transfer synthesis");
+        assert!(
+            cs_transfer
+                .is_satisfied()
+                .expect("transfer constraint system query"),
+            "transfer constraints unsatisfied — deposit→transfer linkage broken"
+        );
+
+        // ── Step 3: Bob withdraws his note ────────────────────────────
+        // New tree containing Bob's commitment as the only leaf.
+        let sibling_to_bob = [0x66u8; 32];
+        let merkle_root_after_transfer = fr_to_bytes_32(poseidon_merkle_pair(
+            bob_commitment_fr,
+            Fr::from_le_bytes_mod_order(&sibling_to_bob),
+        ));
+
+        let bob_secret = [0xB5u8; 32];
+        let bob_nullifier_fr =
+            poseidon_nullifier(bob_commitment_fr, Fr::from_le_bytes_mod_order(&bob_secret));
+        let bob_nullifier_bytes = fr_to_bytes_32(bob_nullifier_fr);
+
+        let withdraw = WithdrawCircuit::with_witness(
+            merkle_root_after_transfer,
+            bob_nullifier_bytes,
+            bob_amount, // withdraw the full value
+            bob_amount,
+            bob_randomness,
+            bob_address,
+            bob_secret,
+            vec![(sibling_to_bob, true)],
+        );
+        let cs_withdraw = ConstraintSystem::<Fr>::new_ref();
+        withdraw
+            .generate_constraints(cs_withdraw.clone())
+            .expect("withdraw synthesis");
+        assert!(
+            cs_withdraw
+                .is_satisfied()
+                .expect("withdraw constraint system query"),
+            "withdraw constraints unsatisfied — transfer→withdraw linkage broken"
+        );
+    }
 }
