@@ -9,7 +9,7 @@
 //! - WithdrawCircuit: Private → Public withdrawals
 
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
@@ -17,8 +17,8 @@ use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{
-    self, poseidon_commit, poseidon_commit_gadget, poseidon_hash_gadget,
-    poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
+    self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
+    poseidon_nullifier_gadget,
 };
 
 /// Maximum number of inputs in a transfer (for batching)
@@ -592,6 +592,8 @@ impl Groth16ProofSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privacy::poseidon::poseidon_commit;
+    use ark_ff::BigInteger;
     use ark_relations::r1cs::ConstraintSystem;
     use ark_serialize::CanonicalSerialize;
     use ark_std::rand::rngs::StdRng;

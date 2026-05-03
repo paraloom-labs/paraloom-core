@@ -201,7 +201,7 @@ impl VerificationCoordinator {
             .as_secs()
             + 60; // 60 second deadline
 
-        for (chunk, validator) in chunks.into_iter().zip(validators.into_iter()) {
+        for (chunk, validator) in chunks.into_iter().zip(validators) {
             let task_id = uuid::Uuid::new_v4().to_string();
             let task = VerificationTask {
                 task_id: task_id.clone(),
