@@ -955,7 +955,10 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 let owner_address = ShieldedAddress(rand::random::<[u8; 32]>());
 
                 println!("Creating private compute job...");
-                println!("  Owner address: paraloom1{}", hex::encode(&owner_address.0[..8]));
+                println!(
+                    "  Owner address: paraloom1{}",
+                    hex::encode(&owner_address.0[..8])
+                );
 
                 // Create private compute job
                 let private_job = PrivateComputeJob::new(
@@ -963,12 +966,19 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                     input_data.clone(),
                     owner_address,
                     limits.clone(),
-                ).context("Failed to create private compute job")?;
+                )
+                .context("Failed to create private compute job")?;
 
                 job_id = private_job.job_id.clone();
 
-                println!("  Input commitment: {}", hex::encode(&private_job.input_commitment.0[..8]));
-                println!("  Encrypted input size: {} bytes", private_job.encrypted_input.len());
+                println!(
+                    "  Input commitment: {}",
+                    hex::encode(&private_job.input_commitment.0[..8])
+                );
+                println!(
+                    "  Encrypted input size: {} bytes",
+                    private_job.encrypted_input.len()
+                );
 
                 // Convert to standard job for execution (encrypted)
                 let job = private_job.to_compute_job();

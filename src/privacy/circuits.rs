@@ -230,8 +230,7 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
                 // `MerkleTree::hash_pair` and `MerklePath::verify` on the
                 // host side (privacy::merkle, privacy::types).
                 for (sibling_hash, is_left) in path {
-                    let sibling_var =
-                        FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
+                    let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
 
                     let (l, r) = if *is_left {
                         (&current_hash, &sibling_var)
@@ -536,8 +535,7 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // This one IS aligned with host-side `Nullifier::derive`
         // (privacy::types) — both use the (commitment, secret) preimage.
         // `poseidon_nullifier_gadget` is the shared implementation.
-        let computed_nullifier =
-            poseidon_nullifier_gadget(cs, &commitment, &secret_var)?;
+        let computed_nullifier = poseidon_nullifier_gadget(cs, &commitment, &secret_var)?;
         computed_nullifier.enforce_equal(&nullifier_var)?;
 
         Ok(())

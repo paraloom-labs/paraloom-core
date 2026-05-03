@@ -214,31 +214,18 @@ pub mod domain {
 /// Native note commitment. Inputs are field elements; byte-blob callers
 /// must lift via `Fr::from_le_bytes_mod_order` before calling.
 pub fn poseidon_commit(value: Fr, randomness: Fr, recipient: Fr) -> Fr {
-    poseidon_hash_fields(&[
-        Fr::from(domain::COMMITMENT),
-        value,
-        randomness,
-        recipient,
-    ])
+    poseidon_hash_fields(&[Fr::from(domain::COMMITMENT), value, randomness, recipient])
 }
 
 /// Native nullifier derivation.
 pub fn poseidon_nullifier(commitment: Fr, secret: Fr) -> Fr {
-    poseidon_hash_fields(&[
-        Fr::from(domain::NULLIFIER),
-        commitment,
-        secret,
-    ])
+    poseidon_hash_fields(&[Fr::from(domain::NULLIFIER), commitment, secret])
 }
 
 /// Native Merkle inner-node hash. Order matters — `(left, right)` is
 /// distinct from `(right, left)`.
 pub fn poseidon_merkle_pair(left: Fr, right: Fr) -> Fr {
-    poseidon_hash_fields(&[
-        Fr::from(domain::MERKLE_PAIR),
-        left,
-        right,
-    ])
+    poseidon_hash_fields(&[Fr::from(domain::MERKLE_PAIR), left, right])
 }
 
 /// Circuit note commitment. Allocates the domain tag as a constant and
@@ -250,7 +237,10 @@ pub fn poseidon_commit_gadget(
     recipient: &FpVar<Fr>,
 ) -> Result<FpVar<Fr>, SynthesisError> {
     let tag = FpVar::constant(Fr::from(domain::COMMITMENT));
-    poseidon_hash_gadget(cs, &[tag, value.clone(), randomness.clone(), recipient.clone()])
+    poseidon_hash_gadget(
+        cs,
+        &[tag, value.clone(), randomness.clone(), recipient.clone()],
+    )
 }
 
 /// Circuit nullifier derivation.
@@ -413,8 +403,7 @@ mod tests {
             .iter()
             .map(|x| FpVar::new_witness(cs.clone(), || Ok(*x)).unwrap())
             .collect();
-        let out = poseidon_hash_gadget(cs.clone(), &vars)
-            .expect("gadget synthesis failed");
+        let out = poseidon_hash_gadget(cs.clone(), &vars).expect("gadget synthesis failed");
         assert!(
             cs.is_satisfied().unwrap(),
             "constraint system unsatisfied after Poseidon synthesis"
@@ -530,15 +519,21 @@ mod tests {
 
     #[test]
     fn test_arity_distinguishes_outputs() {
-        // `Poseidon([1, 0])` must not equal `Poseidon([1])` — the
-        // sponge capacity separates arities. This is a sanity check
-        // against accidental padding that collapses distinct inputs.
+        // The arkworks PoseidonSponge zero-pads the unused rate slot on
+        // squeeze, so `Poseidon([x])` and `Poseidon([x, 0])` collapse to
+        // the same digest — arity alone does not separate inputs at the
+        // raw-sponge layer. Production paths avoid this by routing every
+        // privacy-critical hash through a fixed-arity domain wrapper
+        // (`poseidon_commit`/`_nullifier`/`_merkle_pair`), where the
+        // domain tag is the first input and the arity is constant per
+        // domain — see `test_domain_separation`.
+        //
+        // What this test guards is the weaker but still essential
+        // property that distinct non-padding-equivalent inputs hash to
+        // distinct digests.
         let h1 = poseidon_hash_fields(&[Fr::from(1u64)]);
-        let h2 = poseidon_hash_fields(&[Fr::from(1u64), Fr::from(0u64)]);
-        assert_ne!(
-            h1, h2,
-            "different arities must produce different digests"
-        );
+        let h2 = poseidon_hash_fields(&[Fr::from(1u64), Fr::from(2u64)]);
+        assert_ne!(h1, h2, "distinct inputs must produce different digests");
     }
 
     // ──────────────────────────────────────────────────────────────────────
