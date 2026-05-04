@@ -179,11 +179,14 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // Private witnesses — all lifted to FpVar<Fr>. 32-byte blob
         // witnesses use from_le_bytes_mod_order, matching the host side.
         // ────────────────────────────────────────────────────────────────
+        // Range-constrain every input value to `[0, 2^64)` via bit
+        // decomposition. Together with the matching output range and
+        // the value-conservation check below, this prevents a prover
+        // from inflating a transfer with a near-field-prime "input"
+        // that wraps mod p — the unbounded-mint vector flagged in #60.
         let mut input_value_vars = Vec::new();
         for value in &self.input_values {
-            let val_var = FpVar::new_witness(cs.clone(), || {
-                value.map(Fr::from).ok_or(SynthesisError::AssignmentMissing)
-            })?;
+            let (_bits, val_var) = alloc_u64_witness(cs.clone(), *value)?;
             input_value_vars.push(val_var);
         }
 
@@ -217,11 +220,15 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
             input_secret_vars.push(secret_var);
         }
 
+        // Range-constrain every output value to `[0, 2^64)`. With
+        // both sides bounded, the existing `sum_inputs == sum_outputs`
+        // equality holds in the integers as well as in the field —
+        // 2 inputs + 2 outputs at u64 max are still well below the
+        // BLS12-381 scalar prime, so the field equality cannot be
+        // gamed by a sum that wraps mod p.
         let mut output_value_vars = Vec::new();
         for value in &self.output_values {
-            let val_var = FpVar::new_witness(cs.clone(), || {
-                value.map(Fr::from).ok_or(SynthesisError::AssignmentMissing)
-            })?;
+            let (_bits, val_var) = alloc_u64_witness(cs.clone(), *value)?;
             output_value_vars.push(val_var);
         }
 
