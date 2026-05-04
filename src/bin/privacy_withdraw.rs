@@ -123,6 +123,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Proof loaded: {} bytes\n", proof.len());
 
     println!("Creating on-chain withdrawal instruction...");
+    // `u64::MAX` is the never-expires sentinel; suitable for a manual
+    // demo binary, not for production callers (which compute
+    // `getSlot() + bridge_config.withdrawal_expiration_window_slots`).
+    let expiration_slot = u64::MAX;
     let ix = create_withdraw_instruction(
         &program_id,
         &authority.pubkey(),
@@ -130,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         recipient_pubkey.to_bytes(),
         *nullifier.as_bytes(),
         amount,
+        expiration_slot,
         proof,
     )?;
 
