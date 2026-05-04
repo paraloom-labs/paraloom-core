@@ -98,13 +98,17 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
     let deposit_circuit = DepositCircuit::with_witness([1u8; 32], 1000, [2u8; 32], [3u8; 32]);
     let deposit_metrics = benchmark_circuit(deposit_circuit, "DepositCircuit");
 
-    // Benchmark Transfer circuit (1-in-1-out)
+    // Benchmark Transfer circuit (1-in-1-out). Constraint counts are
+    // independent of the witness values, so dummy bytes are sufficient
+    // here — `with_witness` only feeds the synthesizer.
     let transfer_circuit_1x1 = TransferCircuit::with_witness(
         [1u8; 32],
         vec![[2u8; 32]],
         vec![[3u8; 32]],
         vec![1000],
         vec![[4u8; 32]],
+        vec![[16u8; 32]], // input_recipient
+        vec![[17u8; 32]], // input_secret
         vec![vec![([5u8; 32], true)]],
         vec![1000],
         vec![[6u8; 32]],
@@ -120,6 +124,8 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
         vec![[4u8; 32], [5u8; 32]],
         vec![500, 500],
         vec![[6u8; 32], [7u8; 32]],
+        vec![[18u8; 32], [19u8; 32]], // input_recipients
+        vec![[20u8; 32], [21u8; 32]], // input_secrets
         vec![
             vec![([8u8; 32], true), ([9u8; 32], false)],
             vec![([10u8; 32], true), ([11u8; 32], false)],
@@ -138,6 +144,7 @@ pub fn run_all_benchmarks() -> BenchmarkSuite {
         500,                                         // withdraw_amount
         1000,                                        // input_value
         [3u8; 32],                                   // input_randomness
+        [22u8; 32],                                  // input_recipient
         [6u8; 32],                                   // secret
         vec![([4u8; 32], true), ([5u8; 32], false)], // merkle_path
     );

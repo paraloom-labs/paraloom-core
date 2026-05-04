@@ -1110,6 +1110,7 @@ impl Node {
             withdraw_amount: Some(0u64),
             input_value: Some(0u64),
             input_randomness: Some([0u8; 32]),
+            input_recipient: Some([0u8; 32]),
             input_path: None,
             secret: Some([0u8; 32]),
         };

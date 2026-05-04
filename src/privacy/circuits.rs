@@ -17,8 +17,7 @@ use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{
-    self, poseidon_commit_gadget, poseidon_hash_gadget, poseidon_merkle_pair_gadget,
-    poseidon_nullifier_gadget,
+    poseidon_commit_gadget, poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
 };
 
 /// Maximum number of inputs in a transfer (for batching)
@@ -41,6 +40,8 @@ type MerklePath = Vec<MerklePathElement>;
 /// Private inputs (witness, kept secret):
 /// - input_values: Values of inputs being spent
 /// - input_randomness: Blinding factors for inputs
+/// - input_recipients: Recipient addresses bound into the input commitments
+/// - input_secrets: Spending keys used to derive nullifiers for each input
 /// - input_paths: Merkle paths proving inputs are in tree
 /// - output_values: Values of new outputs
 /// - output_randomness: Blinding factors for outputs
@@ -55,6 +56,8 @@ pub struct TransferCircuit {
     // Private witness (secret)
     pub input_values: Vec<Option<u64>>,
     pub input_randomness: Vec<Option<[u8; 32]>>,
+    pub input_recipients: Vec<Option<[u8; 32]>>,
+    pub input_secrets: Vec<Option<[u8; 32]>>,
     pub input_paths: Vec<Option<MerklePath>>,
     pub output_values: Vec<Option<u64>>,
     pub output_randomness: Vec<Option<[u8; 32]>>,
@@ -73,6 +76,8 @@ impl TransferCircuit {
             output_commitments: vec![None; num_outputs],
             input_values: vec![None; num_inputs],
             input_randomness: vec![None; num_inputs],
+            input_recipients: vec![None; num_inputs],
+            input_secrets: vec![None; num_inputs],
             input_paths: vec![None; num_inputs],
             output_values: vec![None; num_outputs],
             output_randomness: vec![None; num_outputs],
@@ -88,6 +93,8 @@ impl TransferCircuit {
         output_commitments: Vec<[u8; 32]>,
         input_values: Vec<u64>,
         input_randomness: Vec<[u8; 32]>,
+        input_recipients: Vec<[u8; 32]>,
+        input_secrets: Vec<[u8; 32]>,
         input_paths: Vec<Vec<([u8; 32], bool)>>,
         output_values: Vec<u64>,
         output_randomness: Vec<[u8; 32]>,
@@ -99,6 +106,8 @@ impl TransferCircuit {
             output_commitments: output_commitments.into_iter().map(Some).collect(),
             input_values: input_values.into_iter().map(Some).collect(),
             input_randomness: input_randomness.into_iter().map(Some).collect(),
+            input_recipients: input_recipients.into_iter().map(Some).collect(),
+            input_secrets: input_secrets.into_iter().map(Some).collect(),
             input_paths: input_paths.into_iter().map(Some).collect(),
             output_values: output_values.into_iter().map(Some).collect(),
             output_randomness: output_randomness.into_iter().map(Some).collect(),
@@ -165,6 +174,26 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
             input_randomness_vars.push(rand_var);
         }
 
+        let mut input_recipient_vars = Vec::new();
+        for recipient in &self.input_recipients {
+            let recipient_var = FpVar::new_witness(cs.clone(), || {
+                Ok(recipient
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
+            input_recipient_vars.push(recipient_var);
+        }
+
+        let mut input_secret_vars = Vec::new();
+        for secret in &self.input_secrets {
+            let secret_var = FpVar::new_witness(cs.clone(), || {
+                Ok(secret
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?;
+            input_secret_vars.push(secret_var);
+        }
+
         let mut output_value_vars = Vec::new();
         for value in &self.output_values {
             let val_var = FpVar::new_witness(cs.clone(), || {
@@ -204,31 +233,32 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         }
         input_sum.enforce_equal(&output_sum)?;
 
-        // CONSTRAINT 2: input commitments are in the Merkle tree.
-        //
-        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
-        // The input-commitment preimage is only `(value, randomness)`,
-        // whereas `DepositCircuit` and host-side `Note::commitment` use
-        // `(value, randomness, recipient)`. A note produced via deposit
-        // cannot be spent by this circuit — the commitments will not
-        // match. Fixing this is out of scope for the Poseidon migration;
-        // tracked as a follow-up.
-        for i in 0..self.input_paths.len() {
-            if let Some(path) = &self.input_paths[i] {
-                // Leaf: Poseidon(COMMITMENT_TAG, value, randomness).
-                let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
-                let mut current_hash = poseidon_hash_gadget(
-                    cs.clone(),
-                    &[
-                        commit_tag,
-                        input_value_vars[i].clone(),
-                        input_randomness_vars[i].clone(),
-                    ],
-                )?;
+        // Compute each input commitment from its witness components. The
+        // formula matches `DepositCircuit` and host-side `Note::commitment`
+        // exactly: `Poseidon(COMMITMENT_TAG, value, randomness, recipient)`.
+        // The result is reused by the Merkle membership check (constraint 2)
+        // and the nullifier derivation (constraint 3) so the two cannot
+        // drift apart.
+        let mut input_commitment_vars = Vec::with_capacity(input_value_vars.len());
+        for ((value_var, randomness_var), recipient_var) in input_value_vars
+            .iter()
+            .zip(input_randomness_vars.iter())
+            .zip(input_recipient_vars.iter())
+        {
+            let commitment =
+                poseidon_commit_gadget(cs.clone(), value_var, randomness_var, recipient_var)?;
+            input_commitment_vars.push(commitment);
+        }
 
-                // Walk the path using the shared Merkle gadget — matches
-                // `MerkleTree::hash_pair` and `MerklePath::verify` on the
-                // host side (privacy::merkle, privacy::types).
+        // CONSTRAINT 2: each input commitment is in the Merkle tree under
+        // the public `merkle_root`. The Merkle gadget mirrors
+        // `MerkleTree::hash_pair` and `MerklePath::verify` on the host
+        // side (privacy::merkle, privacy::types).
+        for (path_slot, commitment_var) in self.input_paths.iter().zip(input_commitment_vars.iter())
+        {
+            if let Some(path) = path_slot {
+                let mut current_hash = commitment_var.clone();
+
                 for (sibling_hash, is_left) in path {
                     let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
 
@@ -245,24 +275,19 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
             }
         }
 
-        // CONSTRAINT 3: nullifier derivation.
-        //
-        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
-        // The preimage is `(value, randomness)`, whereas host-side
-        // `Nullifier::derive` uses `(commitment, spending_key)`. Host
-        // and circuit will not produce matching nullifiers. Tracked as
-        // a follow-up.
-        for i in 0..self.nullifiers.len() {
-            let null_tag = FpVar::constant(Fr::from(poseidon::domain::NULLIFIER));
-            let computed_nullifier = poseidon_hash_gadget(
-                cs.clone(),
-                &[
-                    null_tag,
-                    input_value_vars[i].clone(),
-                    input_randomness_vars[i].clone(),
-                ],
-            )?;
-            computed_nullifier.enforce_equal(&nullifier_vars[i])?;
+        // CONSTRAINT 3: nullifier = Poseidon(NULLIFIER_TAG, commitment, secret).
+        // Aligned with `WithdrawCircuit` and host-side `Nullifier::derive`
+        // (privacy::types). Using the in-circuit commitment computed above
+        // guarantees that any spend whose commitment passes the Merkle
+        // check also produces the canonical nullifier.
+        for ((commitment_var, secret_var), nullifier_var) in input_commitment_vars
+            .iter()
+            .zip(input_secret_vars.iter())
+            .zip(nullifier_vars.iter())
+        {
+            let computed_nullifier =
+                poseidon_nullifier_gadget(cs.clone(), commitment_var, secret_var)?;
+            computed_nullifier.enforce_equal(nullifier_var)?;
         }
 
         // CONSTRAINT 4: output commitments match the host-side formula
@@ -390,6 +415,7 @@ pub struct WithdrawCircuit {
     pub withdraw_amount: Option<u64>,
     pub input_value: Option<u64>,
     pub input_randomness: Option<[u8; 32]>,
+    pub input_recipient: Option<[u8; 32]>,
     pub input_path: Option<Vec<([u8; 32], bool)>>,
     pub secret: Option<[u8; 32]>,
 }
@@ -402,6 +428,7 @@ impl WithdrawCircuit {
             withdraw_amount: None,
             input_value: None,
             input_randomness: None,
+            input_recipient: None,
             input_path: None,
             secret: None,
         }
@@ -414,6 +441,7 @@ impl WithdrawCircuit {
         withdraw_amount: u64,
         input_value: u64,
         input_randomness: [u8; 32],
+        input_recipient: [u8; 32],
         secret: [u8; 32],
         input_path: Vec<([u8; 32], bool)>,
     ) -> Self {
@@ -423,6 +451,7 @@ impl WithdrawCircuit {
             withdraw_amount: Some(withdraw_amount),
             input_value: Some(input_value),
             input_randomness: Some(input_randomness),
+            input_recipient: Some(input_recipient),
             input_path: Some(input_path),
             secret: Some(secret),
         }
@@ -480,6 +509,13 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
+        let input_recipient_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .input_recipient
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+
         let secret_var = FpVar::new_witness(cs.clone(), || {
             Ok(self
                 .secret
@@ -493,23 +529,16 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // range proof is still a TODO and lives outside this migration.
         let _difference = &input_value_var - &withdraw_amount_var;
 
-        // CONSTRAINT 2: input commitment is in the Merkle tree.
-        //
-        // PRE-EXISTING SEMANTIC BUG (preserved, flagged, not fixed here):
-        // The preimage is `(value, randomness)` — same two-argument
-        // shape as TransferCircuit. DepositCircuit and host-side
-        // `Note::commitment` use the three-argument
-        // `(value, randomness, recipient)` form. Deposited notes cannot
-        // be withdrawn by this circuit without a semantic fix. Tracked
-        // as a follow-up.
-        let commit_tag = FpVar::constant(Fr::from(poseidon::domain::COMMITMENT));
-        let commitment = poseidon_hash_gadget(
+        // CONSTRAINT 2: input commitment is in the Merkle tree under
+        // the public `merkle_root`. The commitment is computed with the
+        // same three-argument formula that `DepositCircuit` and host-side
+        // `Note::commitment` use, so any note created by a deposit can be
+        // located here.
+        let commitment = poseidon_commit_gadget(
             cs.clone(),
-            &[
-                commit_tag,
-                input_value_var.clone(),
-                input_randomness_var.clone(),
-            ],
+            &input_value_var,
+            &input_randomness_var,
+            &input_recipient_var,
         )?;
 
         let mut current_hash = commitment.clone();
@@ -592,45 +621,88 @@ impl Groth16ProofSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privacy::poseidon::poseidon_commit;
+    use crate::privacy::poseidon::{poseidon_commit, poseidon_merkle_pair, poseidon_nullifier};
     use ark_ff::BigInteger;
     use ark_relations::r1cs::ConstraintSystem;
-    use ark_serialize::CanonicalSerialize;
     use ark_std::rand::rngs::StdRng;
     use ark_std::rand::SeedableRng;
 
+    /// Convert a host `Fr` into the 32-byte little-endian buffer used by
+    /// the public-input layer. Mirrors `fr_to_bytes_32` in `privacy::types`
+    /// — kept private to the test module to avoid coupling tests to that
+    /// helper's exact location.
+    fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {
+        let bytes = fr.into_bigint().to_bytes_le();
+        let mut out = [0u8; 32];
+        let len = bytes.len().min(32);
+        out[..len].copy_from_slice(&bytes[..len]);
+        out
+    }
+
     #[test]
     fn test_transfer_circuit_synthesis() {
-        // Create circuit with dummy witness data
-        let merkle_root = [1u8; 32];
-        let nullifiers = vec![[2u8; 32]];
-        let output_commitments = vec![[3u8; 32]];
-        let input_values = vec![1000u64];
-        let input_randomness = vec![[4u8; 32]];
-        let input_paths = vec![vec![([5u8; 32], true)]];
-        let output_values = vec![1000u64];
-        let output_randomness = vec![[6u8; 32]];
-        let recipient_addresses = vec![[7u8; 32]];
+        // Build a satisfiable 1-in / 1-out transfer with witnesses that are
+        // consistent with the host-side derivations in `privacy::types` and
+        // `privacy::poseidon`. Any drift between the circuit and the host
+        // helpers will surface here as `cs.is_satisfied()` returning false.
+
+        let input_value = 1_000u64;
+        let input_randomness = [4u8; 32];
+        let input_recipient = [7u8; 32];
+        let input_secret = [9u8; 32];
+
+        // Input commitment: matches `Note::commitment()` exactly.
+        let input_commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+        );
+
+        // Nullifier: matches `Nullifier::derive(commitment, secret)`.
+        let nullifier_fr = poseidon_nullifier(
+            input_commitment_fr,
+            Fr::from_le_bytes_mod_order(&input_secret),
+        );
+        let nullifier_bytes = fr_to_bytes_32(nullifier_fr);
+
+        // Single-sibling Merkle path with the input on the left.
+        let sibling = [5u8; 32];
+        let sibling_fr = Fr::from_le_bytes_mod_order(&sibling);
+        let merkle_root_fr = poseidon_merkle_pair(input_commitment_fr, sibling_fr);
+        let merkle_root_bytes = fr_to_bytes_32(merkle_root_fr);
+
+        // 1-in / 1-out: output recipient and randomness chosen freely.
+        let output_value = input_value;
+        let output_randomness = [6u8; 32];
+        let output_recipient = [11u8; 32];
+        let output_commitment_fr = poseidon_commit(
+            Fr::from(output_value),
+            Fr::from_le_bytes_mod_order(&output_randomness),
+            Fr::from_le_bytes_mod_order(&output_recipient),
+        );
+        let output_commitment_bytes = fr_to_bytes_32(output_commitment_fr);
 
         let circuit = TransferCircuit::with_witness(
-            merkle_root,
-            nullifiers,
-            output_commitments,
-            input_values,
-            input_randomness,
-            input_paths,
-            output_values,
-            output_randomness,
-            recipient_addresses,
+            merkle_root_bytes,
+            vec![nullifier_bytes],
+            vec![output_commitment_bytes],
+            vec![input_value],
+            vec![input_randomness],
+            vec![input_recipient],
+            vec![input_secret],
+            vec![vec![(sibling, true)]],
+            vec![output_value],
+            vec![output_randomness],
+            vec![output_recipient],
         );
         let cs = ConstraintSystem::<Fr>::new_ref();
 
-        // Should synthesize without errors
-        let result = circuit.generate_constraints(cs.clone());
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should succeed");
         assert!(
-            result.is_ok(),
-            "Circuit synthesis failed: {:?}",
-            result.err()
+            cs.is_satisfied().expect("constraint system query"),
+            "transfer circuit constraints should be satisfied by host-aligned witnesses"
         );
     }
 
@@ -654,30 +726,49 @@ mod tests {
 
     #[test]
     fn test_withdraw_circuit_synthesis() {
-        let merkle_root = [1u8; 32];
-        let nullifier = [2u8; 32];
-        let withdraw_amount = 500u64;
-        let input_value = 1000u64;
+        // Construct witnesses that are consistent with the host helpers,
+        // mirroring what test_transfer_circuit_synthesis does. With the
+        // 3-argument input commitment in place, the circuit can locate a
+        // note that was created by the deposit path.
+
+        let input_value = 1_000u64;
         let input_randomness = [3u8; 32];
+        let input_recipient = [7u8; 32];
         let secret = [6u8; 32];
-        let input_path = vec![([4u8; 32], true), ([5u8; 32], false)];
+        let withdraw_amount = 500u64;
+
+        let commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+        );
+        let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+
+        // Two-sibling Merkle path: leaf on the left at depth 0, then on
+        // the right at depth 1. Mirrors the original test's path shape.
+        let sibling_0 = [4u8; 32];
+        let sibling_1 = [5u8; 32];
+        let level_1 = poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling_0));
+        let merkle_root_fr = poseidon_merkle_pair(Fr::from_le_bytes_mod_order(&sibling_1), level_1);
 
         let circuit = WithdrawCircuit::with_witness(
-            merkle_root,
-            nullifier,
+            fr_to_bytes_32(merkle_root_fr),
+            fr_to_bytes_32(nullifier_fr),
             withdraw_amount,
             input_value,
             input_randomness,
+            input_recipient,
             secret,
-            input_path,
+            vec![(sibling_0, true), (sibling_1, false)],
         );
         let cs = ConstraintSystem::<Fr>::new_ref();
 
-        let result = circuit.generate_constraints(cs);
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should succeed");
         assert!(
-            result.is_ok(),
-            "Withdraw circuit synthesis failed: {:?}",
-            result.err()
+            cs.is_satisfied().expect("constraint system query"),
+            "withdraw circuit constraints should be satisfied by host-aligned witnesses"
         );
     }
 
@@ -691,40 +782,168 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_deposit_proof_generation() {
+        // End-to-end exercise of the deposit circuit: trusted setup →
+        // witness construction via the host helpers → proof generation →
+        // public-input verification. Previously \`#[ignore]\`'d because the
+        // public-input layout did not round-trip; with the field-element
+        // public inputs in place since v0.2.0, the verification step runs.
         let mut rng = StdRng::seed_from_u64(0u64);
 
-        // Setup
         let setup_circuit = DepositCircuit::new();
-        let (pk, _vk) = Groth16ProofSystem::setup(setup_circuit, &mut rng).unwrap();
+        let (pk, vk) = Groth16ProofSystem::setup(setup_circuit, &mut rng)
+            .expect("trusted setup should succeed");
 
-        // Create witness circuit with values that satisfy the constraints.
-        let value = 1000u64;
+        let value = 1_000u64;
         let randomness = [42u8; 32];
         let recipient = [1u8; 32];
 
-        // Compute the commitment the circuit expects: must equal
-        // poseidon_commit(value, randomness, recipient) — mirror what
-        // `Note::commitment` produces on the host side and what
-        // `poseidon_commit_gadget` computes inside the circuit.
-        let digest = poseidon_commit(
+        // Commitment computed via the same host helper that
+        // `Note::commitment` uses; the circuit's `poseidon_commit_gadget`
+        // reproduces this value bit-for-bit.
+        let commitment_fr = poseidon_commit(
             Fr::from(value),
             Fr::from_le_bytes_mod_order(&randomness),
             Fr::from_le_bytes_mod_order(&recipient),
         );
-        let digest_bytes = digest.into_bigint().to_bytes_le();
-        let mut commitment = [0u8; 32];
-        let len = digest_bytes.len().min(32);
-        commitment[..len].copy_from_slice(&digest_bytes[..len]);
+        let commitment_bytes = fr_to_bytes_32(commitment_fr);
 
-        let proof_circuit = DepositCircuit::with_witness(commitment, value, randomness, recipient);
+        let proof_circuit =
+            DepositCircuit::with_witness(commitment_bytes, value, randomness, recipient);
+        let proof = Groth16ProofSystem::prove(&pk, proof_circuit, &mut rng)
+            .expect("proof generation should succeed");
 
-        // Prove
-        let proof = Groth16ProofSystem::prove(&pk, proof_circuit, &mut rng);
-        assert!(proof.is_ok(), "Proof generation failed: {:?}", proof.err());
+        // Public input layout: a single Fr (the commitment) lifted from
+        // the on-chain 32-byte buffer via `from_le_bytes_mod_order`. Any
+        // change to that convention must be reflected here.
+        let public_inputs = [Fr::from_le_bytes_mod_order(&commitment_bytes)];
+        let verified = Groth16ProofSystem::verify(&vk, &public_inputs, &proof)
+            .expect("verification should not error");
+        assert!(verified, "honestly generated deposit proof must verify");
+    }
 
-        // Note: Full verification would require proper public input conversion
-        // For now we just verify that proof generation succeeds
+    /// Cross-circuit consistency: a note created by Deposit can be spent
+    /// by Transfer, and the note that Transfer produces can in turn be
+    /// withdrawn by Withdraw. Synthesizing each circuit and asserting
+    /// `cs.is_satisfied()` is enough — the whole point of this test is
+    /// that the three circuits agree on commitment, nullifier, and
+    /// Merkle-leaf shapes. A regression in any one of them would surface
+    /// here as an unsatisfied constraint, even before Groth16 setup.
+    #[test]
+    fn test_deposit_transfer_withdraw_e2e() {
+        // ── Step 1: Deposit a note for Alice ──────────────────────────
+        let alice_address = [0xA1u8; 32];
+        let alice_secret = [0xA5u8; 32];
+        let alice_amount = 1_000u64;
+        let alice_randomness = [0x11u8; 32];
+
+        let alice_commitment_fr = poseidon_commit(
+            Fr::from(alice_amount),
+            Fr::from_le_bytes_mod_order(&alice_randomness),
+            Fr::from_le_bytes_mod_order(&alice_address),
+        );
+        let alice_commitment_bytes = fr_to_bytes_32(alice_commitment_fr);
+
+        let deposit = DepositCircuit::with_witness(
+            alice_commitment_bytes,
+            alice_amount,
+            alice_randomness,
+            alice_address,
+        );
+        let cs_deposit = ConstraintSystem::<Fr>::new_ref();
+        deposit
+            .generate_constraints(cs_deposit.clone())
+            .expect("deposit synthesis");
+        assert!(
+            cs_deposit
+                .is_satisfied()
+                .expect("deposit constraint system query"),
+            "deposit constraints unsatisfied"
+        );
+
+        // ── Step 2: Transfer Alice's note to Bob ──────────────────────
+        // Single-leaf Merkle tree with Alice's note as the only leaf and
+        // a public sibling. The transfer circuit must be able to walk
+        // the tree from Alice's commitment to the published root.
+        let sibling_to_alice = [0x55u8; 32];
+        let merkle_root_after_deposit = fr_to_bytes_32(poseidon_merkle_pair(
+            alice_commitment_fr,
+            Fr::from_le_bytes_mod_order(&sibling_to_alice),
+        ));
+
+        let bob_address = [0xB0u8; 32];
+        let bob_randomness = [0x22u8; 32];
+        let bob_amount = alice_amount; // 1-in / 1-out, value-preserving
+
+        let bob_commitment_fr = poseidon_commit(
+            Fr::from(bob_amount),
+            Fr::from_le_bytes_mod_order(&bob_randomness),
+            Fr::from_le_bytes_mod_order(&bob_address),
+        );
+        let bob_commitment_bytes = fr_to_bytes_32(bob_commitment_fr);
+
+        let alice_nullifier_fr = poseidon_nullifier(
+            alice_commitment_fr,
+            Fr::from_le_bytes_mod_order(&alice_secret),
+        );
+        let alice_nullifier_bytes = fr_to_bytes_32(alice_nullifier_fr);
+
+        let transfer = TransferCircuit::with_witness(
+            merkle_root_after_deposit,
+            vec![alice_nullifier_bytes],
+            vec![bob_commitment_bytes],
+            vec![alice_amount],
+            vec![alice_randomness],
+            vec![alice_address],
+            vec![alice_secret],
+            vec![vec![(sibling_to_alice, true)]],
+            vec![bob_amount],
+            vec![bob_randomness],
+            vec![bob_address],
+        );
+        let cs_transfer = ConstraintSystem::<Fr>::new_ref();
+        transfer
+            .generate_constraints(cs_transfer.clone())
+            .expect("transfer synthesis");
+        assert!(
+            cs_transfer
+                .is_satisfied()
+                .expect("transfer constraint system query"),
+            "transfer constraints unsatisfied — deposit→transfer linkage broken"
+        );
+
+        // ── Step 3: Bob withdraws his note ────────────────────────────
+        // New tree containing Bob's commitment as the only leaf.
+        let sibling_to_bob = [0x66u8; 32];
+        let merkle_root_after_transfer = fr_to_bytes_32(poseidon_merkle_pair(
+            bob_commitment_fr,
+            Fr::from_le_bytes_mod_order(&sibling_to_bob),
+        ));
+
+        let bob_secret = [0xB5u8; 32];
+        let bob_nullifier_fr =
+            poseidon_nullifier(bob_commitment_fr, Fr::from_le_bytes_mod_order(&bob_secret));
+        let bob_nullifier_bytes = fr_to_bytes_32(bob_nullifier_fr);
+
+        let withdraw = WithdrawCircuit::with_witness(
+            merkle_root_after_transfer,
+            bob_nullifier_bytes,
+            bob_amount, // withdraw the full value
+            bob_amount,
+            bob_randomness,
+            bob_address,
+            bob_secret,
+            vec![(sibling_to_bob, true)],
+        );
+        let cs_withdraw = ConstraintSystem::<Fr>::new_ref();
+        withdraw
+            .generate_constraints(cs_withdraw.clone())
+            .expect("withdraw synthesis");
+        assert!(
+            cs_withdraw
+                .is_satisfied()
+                .expect("withdraw constraint system query"),
+            "withdraw constraints unsatisfied — transfer→withdraw linkage broken"
+        );
     }
 }
