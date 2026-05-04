@@ -314,10 +314,7 @@ mod tests {
         assert_eq!(tree.len().await, 1);
 
         let commitment2 = Commitment([2u8; 32]);
-        let index2 = tree
-            .insert(&commitment2)
-            .await
-            .expect("in-memory insert");
+        let index2 = tree.insert(&commitment2).await.expect("in-memory insert");
         assert_eq!(index2, 1);
         assert_eq!(tree.len().await, 2);
     }

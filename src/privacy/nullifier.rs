@@ -89,10 +89,7 @@ impl NullifierSet {
     /// set only if persistence succeeded. On storage failure no
     /// nullifier in the batch is recorded — the caller is expected to
     /// either retry the entire batch or fail the enclosing transaction.
-    pub async fn insert_batch(
-        &self,
-        nullifiers: Vec<Nullifier>,
-    ) -> Result<usize, anyhow::Error> {
+    pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
 
         let new_nullifiers: Vec<Nullifier> = nullifiers
