@@ -28,11 +28,18 @@ pub struct DepositInstructionData {
     pub randomness: [u8; 32],
 }
 
-/// Instruction data for withdraw
+/// Instruction data for withdraw.
+///
+/// Layout matches the on-chain `withdraw` function exactly:
+/// `(nullifier, amount, expiration_slot, proof)`. The
+/// `expiration_slot` was added in #61 as the time-bound replay-
+/// protection layer; the on-chain program rejects calls where
+/// `Clock::slot > expiration_slot`.
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct WithdrawInstructionData {
     pub nullifier: [u8; 32],
     pub amount: u64,
+    pub expiration_slot: u64,
     pub proof: Vec<u8>,
 }
 
@@ -119,7 +126,16 @@ pub fn create_deposit_instruction(
     })
 }
 
-/// Create withdraw instruction
+/// Create withdraw instruction.
+///
+/// `expiration_slot` is bound at construction time and forwarded to the
+/// on-chain program as part of [`WithdrawInstructionData`]. Callers
+/// typically compute it as `current_slot + withdrawal_expiration_window_slots`
+/// (see [`crate::bridge::BridgeConfig`]). A value in the past is not
+/// rejected here — the program does that — but doing so locally would
+/// be cheaper, and the submitter performs that check before this builder
+/// is reached.
+#[allow(clippy::too_many_arguments)]
 pub fn create_withdraw_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -127,6 +143,7 @@ pub fn create_withdraw_instruction(
     recipient: SolanaAddress,
     nullifier: [u8; 32],
     amount: u64,
+    expiration_slot: u64,
     proof: Vec<u8>,
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
@@ -136,6 +153,7 @@ pub fn create_withdraw_instruction(
     let data = WithdrawInstructionData {
         nullifier,
         amount,
+        expiration_slot,
         proof,
     };
 
@@ -239,6 +257,9 @@ mod tests {
             recipient,
             nullifier,
             1000,
+            // expiration_slot — picked far enough in the future that
+            // the test does not depend on a real `Clock`.
+            u64::MAX,
             proof,
         );
 

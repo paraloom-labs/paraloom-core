@@ -104,18 +104,26 @@ impl ProgramInterface {
         Ok(true)
     }
 
-    /// Submit withdrawal transaction to Solana
+    /// Submit withdrawal transaction to Solana.
+    ///
+    /// `expiration_slot` is the Solana slot past which the on-chain
+    /// program will reject this transaction (#61). The submitter is
+    /// expected to compute it from the bridge config's expiration
+    /// window before calling here.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_withdrawal(
         &self,
         recipient: SolanaAddress,
         amount: u64,
         nullifier: [u8; 32],
+        expiration_slot: u64,
         proof: &[u8],
     ) -> Result<String> {
         log::info!(
-            "Submitting withdrawal: {} lamports to {:?}",
+            "Submitting withdrawal: {} lamports to {:?} (expires at slot {})",
             amount,
-            &recipient[..8]
+            &recipient[..8],
+            expiration_slot
         );
 
         // Verify we have authority keypair
@@ -136,6 +144,7 @@ impl ProgramInterface {
             recipient,
             nullifier,
             amount,
+            expiration_slot,
             proof.to_vec(),
         )?;
 

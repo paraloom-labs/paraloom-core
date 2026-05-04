@@ -203,13 +203,41 @@ impl ResultSubmitter {
         Ok(())
     }
 
-    /// Submit withdrawal transaction to Solana
+    /// Submit withdrawal transaction to Solana.
+    ///
+    /// Performs a local pre-submit check against `request.expiration_slot`
+    /// before paying RPC fees. The on-chain program will reject an
+    /// expired request anyway (#61), but the local check turns a
+    /// late-arriving request into a typed `BridgeError::InvalidTransaction`
+    /// instead of a Solana RPC failure with a less-actionable message.
     async fn submit_to_solana(&self, request: &WithdrawalRequest) -> Result<String> {
         log::debug!(
-            "Submitting to Solana: {} lamports to {:?}",
+            "Submitting to Solana: {} lamports to {:?} (expires at slot {})",
             request.amount,
-            &request.recipient[..8]
+            &request.recipient[..8],
+            request.expiration_slot
         );
+
+        match self.program.get_slot().await {
+            Ok(current_slot) if current_slot > request.expiration_slot => {
+                return Err(BridgeError::InvalidTransaction(format!(
+                    "withdrawal request expired: current slot {} > expiration slot {}",
+                    current_slot, request.expiration_slot
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // If we cannot reach the RPC for `getSlot`, fall through
+                // to submission and let the on-chain check decide. The
+                // alternative — failing here — would mean a transient
+                // RPC blip blocks otherwise-honest withdrawals.
+                log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "skipping local expiration check — getSlot failed: {}",
+                    e
+                );
+            }
+        }
 
         // Submit via program interface
         let signature = self
@@ -218,6 +246,7 @@ impl ResultSubmitter {
                 request.recipient,
                 request.amount,
                 request.nullifier,
+                request.expiration_slot,
                 &request.proof,
             )
             .await?;
@@ -287,6 +316,7 @@ mod tests {
             amount: 500,
             recipient: [0x99u8; 32],
             fee: 10,
+            expiration_slot: u64::MAX,
             proof: vec![0u8; 32], // Mock proof
         };
 
@@ -313,6 +343,7 @@ mod tests {
                 amount: 100,
                 recipient: [0x01u8; 32],
                 fee: 5,
+                expiration_slot: u64::MAX,
                 proof: vec![0u8; 32],
             },
             WithdrawalRequest {
@@ -320,6 +351,7 @@ mod tests {
                 amount: 200,
                 recipient: [0x02u8; 32],
                 fee: 5,
+                expiration_slot: u64::MAX,
                 proof: vec![0u8; 32],
             },
         ];

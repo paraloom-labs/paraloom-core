@@ -79,6 +79,7 @@ async fn test_withdrawal_request_structure() {
         amount: 500,
         recipient: [0x04u8; 32],
         fee: 5,
+        expiration_slot: u64::MAX,
         proof: vec![0u8; 128],
     };
 
