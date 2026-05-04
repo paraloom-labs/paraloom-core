@@ -6,6 +6,14 @@
 //! - Distributed verification across validators
 //! - Merkle tree for commitment tracking
 
+// Regression guard for #59. The original bug was that storage writes
+// in this module silently discarded their `Result` via patterns like
+// `let _ = storage.insert_*()`. Denying `let_underscore_must_use` at
+// the privacy-module root catches the same shape of regression at
+// compile time. Scoped here so it does not disturb intentional
+// fire-and-forget patterns elsewhere in the codebase.
+#![deny(clippy::let_underscore_must_use)]
+
 pub mod batch;
 pub mod circuit_benchmark;
 pub mod circuits;
