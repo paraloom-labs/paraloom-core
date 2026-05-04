@@ -657,8 +657,10 @@ mod tests {
         );
 
         // Nullifier: matches `Nullifier::derive(commitment, secret)`.
-        let nullifier_fr =
-            poseidon_nullifier(input_commitment_fr, Fr::from_le_bytes_mod_order(&input_secret));
+        let nullifier_fr = poseidon_nullifier(
+            input_commitment_fr,
+            Fr::from_le_bytes_mod_order(&input_secret),
+        );
         let nullifier_bytes = fr_to_bytes_32(nullifier_fr);
 
         // Single-sibling Merkle path with the input on the left.
@@ -738,16 +740,14 @@ mod tests {
             Fr::from_le_bytes_mod_order(&input_randomness),
             Fr::from_le_bytes_mod_order(&input_recipient),
         );
-        let nullifier_fr =
-            poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+        let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
 
         // Two-sibling Merkle path: leaf on the left at depth 0, then on
         // the right at depth 1. Mirrors the original test's path shape.
         let sibling_0 = [4u8; 32];
         let sibling_1 = [5u8; 32];
         let level_1 = poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling_0));
-        let merkle_root_fr =
-            poseidon_merkle_pair(Fr::from_le_bytes_mod_order(&sibling_1), level_1);
+        let merkle_root_fr = poseidon_merkle_pair(Fr::from_le_bytes_mod_order(&sibling_1), level_1);
 
         let circuit = WithdrawCircuit::with_witness(
             fr_to_bytes_32(merkle_root_fr),
