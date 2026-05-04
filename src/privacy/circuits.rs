@@ -239,14 +239,14 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // The result is reused by the Merkle membership check (constraint 2)
         // and the nullifier derivation (constraint 3) so the two cannot
         // drift apart.
-        let mut input_commitment_vars = Vec::with_capacity(self.input_values.len());
-        for i in 0..self.input_values.len() {
-            let commitment = poseidon_commit_gadget(
-                cs.clone(),
-                &input_value_vars[i],
-                &input_randomness_vars[i],
-                &input_recipient_vars[i],
-            )?;
+        let mut input_commitment_vars = Vec::with_capacity(input_value_vars.len());
+        for ((value_var, randomness_var), recipient_var) in input_value_vars
+            .iter()
+            .zip(input_randomness_vars.iter())
+            .zip(input_recipient_vars.iter())
+        {
+            let commitment =
+                poseidon_commit_gadget(cs.clone(), value_var, randomness_var, recipient_var)?;
             input_commitment_vars.push(commitment);
         }
 
@@ -254,9 +254,10 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // the public `merkle_root`. The Merkle gadget mirrors
         // `MerkleTree::hash_pair` and `MerklePath::verify` on the host
         // side (privacy::merkle, privacy::types).
-        for i in 0..self.input_paths.len() {
-            if let Some(path) = &self.input_paths[i] {
-                let mut current_hash = input_commitment_vars[i].clone();
+        for (path_slot, commitment_var) in self.input_paths.iter().zip(input_commitment_vars.iter())
+        {
+            if let Some(path) = path_slot {
+                let mut current_hash = commitment_var.clone();
 
                 for (sibling_hash, is_left) in path {
                     let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
@@ -279,13 +280,14 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // (privacy::types). Using the in-circuit commitment computed above
         // guarantees that any spend whose commitment passes the Merkle
         // check also produces the canonical nullifier.
-        for i in 0..self.nullifiers.len() {
-            let computed_nullifier = poseidon_nullifier_gadget(
-                cs.clone(),
-                &input_commitment_vars[i],
-                &input_secret_vars[i],
-            )?;
-            computed_nullifier.enforce_equal(&nullifier_vars[i])?;
+        for ((commitment_var, secret_var), nullifier_var) in input_commitment_vars
+            .iter()
+            .zip(input_secret_vars.iter())
+            .zip(nullifier_vars.iter())
+        {
+            let computed_nullifier =
+                poseidon_nullifier_gadget(cs.clone(), commitment_var, secret_var)?;
+            computed_nullifier.enforce_equal(nullifier_var)?;
         }
 
         // CONSTRAINT 4: output commitments match the host-side formula
