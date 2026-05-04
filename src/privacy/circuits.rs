@@ -11,7 +11,10 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
+use ark_r1cs_std::{
+    alloc::AllocVar, boolean::Boolean, eq::EqGadget, fields::fp::FpVar, fields::FieldVar,
+    uint64::UInt64,
+};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
@@ -19,6 +22,26 @@ use ark_std::rand::{CryptoRng, RngCore};
 use crate::privacy::poseidon::{
     poseidon_commit_gadget, poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
 };
+
+/// Allocate a private witness `u64` and return both the bit-decomposed
+/// `UInt64` (which carries the range constraint as a side effect of
+/// allocation — every bit is enforced to be `{0,1}`) and an `FpVar`
+/// view suitable for use in Poseidon hashes and field arithmetic.
+///
+/// The `FpVar` view is a free linear combination of the bits, so it
+/// adds no extra constraints beyond the 64 boolean constraints UInt64
+/// itself produces. This is the building block that gives every
+/// circuit's value witnesses a hard `[0, 2^64)` upper bound — without
+/// it, a malicious prover can assign `value` to a near-field-prime
+/// integer and forge withdrawals that exceed the deposited supply.
+fn alloc_u64_witness(
+    cs: ConstraintSystemRef<Fr>,
+    value: Option<u64>,
+) -> Result<(UInt64<Fr>, FpVar<Fr>), SynthesisError> {
+    let uint = UInt64::new_witness(cs, || value.ok_or(SynthesisError::AssignmentMissing))?;
+    let fp = Boolean::le_bits_to_fp_var(&uint.to_bits_le())?;
+    Ok((uint, fp))
+}
 
 /// Maximum number of inputs in a transfer (for batching)
 pub const MAX_INPUTS: usize = 2;
@@ -156,11 +179,14 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // Private witnesses — all lifted to FpVar<Fr>. 32-byte blob
         // witnesses use from_le_bytes_mod_order, matching the host side.
         // ────────────────────────────────────────────────────────────────
+        // Range-constrain every input value to `[0, 2^64)` via bit
+        // decomposition. Together with the matching output range and
+        // the value-conservation check below, this prevents a prover
+        // from inflating a transfer with a near-field-prime "input"
+        // that wraps mod p — the unbounded-mint vector flagged in #60.
         let mut input_value_vars = Vec::new();
         for value in &self.input_values {
-            let val_var = FpVar::new_witness(cs.clone(), || {
-                value.map(Fr::from).ok_or(SynthesisError::AssignmentMissing)
-            })?;
+            let (_bits, val_var) = alloc_u64_witness(cs.clone(), *value)?;
             input_value_vars.push(val_var);
         }
 
@@ -194,11 +220,15 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
             input_secret_vars.push(secret_var);
         }
 
+        // Range-constrain every output value to `[0, 2^64)`. With
+        // both sides bounded, the existing `sum_inputs == sum_outputs`
+        // equality holds in the integers as well as in the field —
+        // 2 inputs + 2 outputs at u64 max are still well below the
+        // BLS12-381 scalar prime, so the field equality cannot be
+        // gamed by a sum that wraps mod p.
         let mut output_value_vars = Vec::new();
         for value in &self.output_values {
-            let val_var = FpVar::new_witness(cs.clone(), || {
-                value.map(Fr::from).ok_or(SynthesisError::AssignmentMissing)
-            })?;
+            let (_bits, val_var) = alloc_u64_witness(cs.clone(), *value)?;
             output_value_vars.push(val_var);
         }
 
@@ -367,12 +397,14 @@ impl ConstraintSynthesizer<Fr> for DepositCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
-        // Private witness: amount as a native field element.
-        let value_var = FpVar::new_witness(cs.clone(), || {
-            self.value
-                .map(Fr::from)
-                .ok_or(SynthesisError::AssignmentMissing)
-        })?;
+        // Private witness: amount, range-constrained to `[0, 2^64)` via
+        // bit decomposition. Without this, a malicious prover could
+        // assign `value` to a near-field-prime integer and produce a
+        // commitment whose stored value vastly exceeds the deposited
+        // SOL — the foundation of the unbounded-mint attack the audit
+        // (#60) flagged. The `FpVar` view is the same as before so all
+        // downstream Poseidon hashing and arithmetic is unchanged.
+        let (_value_bits, value_var) = alloc_u64_witness(cs.clone(), self.value)?;
 
         // Private witness: 32-byte randomness lifted to Fr via modular
         // reduction. This matches the host-side `Note::commitment`
@@ -491,16 +523,23 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
+        // Range-constrain the withdraw amount to `[0, 2^64)`. Public
+        // inputs cannot be range-constrained at allocation, so we
+        // commit to a private \`UInt64\` mirror and enforce equality
+        // between the public-input \`FpVar\` and the bit-derived view.
+        // The prover must therefore choose a u64-shaped withdraw amount
+        // before producing a proof; a near-field-prime amount fails
+        // the equality check inside the circuit.
+        let (_withdraw_bits, withdraw_amount_range_var) =
+            alloc_u64_witness(cs.clone(), self.withdraw_amount)?;
+        withdraw_amount_var.enforce_equal(&withdraw_amount_range_var)?;
+
         // ────────────────────────────────────────────────────────────────
         // Private witnesses — lifted to FpVar<Fr>. The old byte-array
         // witness `input_value_bytes` is gone: Poseidon consumes field
         // elements, not u64 bytes.
         // ────────────────────────────────────────────────────────────────
-        let input_value_var = FpVar::new_witness(cs.clone(), || {
-            self.input_value
-                .map(Fr::from)
-                .ok_or(SynthesisError::AssignmentMissing)
-        })?;
+        let (_input_value_bits, input_value_var) = alloc_u64_witness(cs.clone(), self.input_value)?;
 
         let input_randomness_var = FpVar::new_witness(cs.clone(), || {
             Ok(self
@@ -523,11 +562,24 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
-        // CONSTRAINT 1: input_value >= withdraw_amount.
-        // Subtraction forces the witness assignment to produce a
-        // non-negative difference under native field arithmetic; a real
-        // range proof is still a TODO and lives outside this migration.
-        let _difference = &input_value_var - &withdraw_amount_var;
+        // CONSTRAINT 1: input_value >= withdraw_amount, enforced by
+        // committing to a u64-bounded \`change\` witness and binding it
+        // to the field-level subtraction.
+        //
+        // If \`withdraw_amount\` exceeds \`input_value\`, the field
+        // subtraction \`input_value - withdraw_amount\` wraps mod p to
+        // a near-field-prime value far outside \`[0, 2^64)\`, and the
+        // \`change\` u64 cannot satisfy the equality. The circuit
+        // therefore rejects underflow by construction — the
+        // pre-#60 version of this constraint was a no-op that only
+        // ever computed the difference without enforcing anything.
+        let change_value = match (self.input_value, self.withdraw_amount) {
+            (Some(input), Some(withdraw)) => Some(input.saturating_sub(withdraw)),
+            _ => None,
+        };
+        let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;
+        let computed_change = &input_value_var - &withdraw_amount_var;
+        change_var.enforce_equal(&computed_change)?;
 
         // CONSTRAINT 2: input commitment is in the Merkle tree under
         // the public `merkle_root`. The commitment is computed with the
@@ -770,6 +822,106 @@ mod tests {
             cs.is_satisfied().expect("constraint system query"),
             "withdraw circuit constraints should be satisfied by host-aligned witnesses"
         );
+    }
+
+    /// The post-#60 withdraw circuit must reject \`withdraw > input\`.
+    /// Before this fix the field-level subtraction wrapped to a huge
+    /// value and the circuit silently accepted the underflow; the
+    /// range constraint on \`change\` now traps it.
+    #[test]
+    fn test_withdraw_circuit_rejects_underflow() {
+        let input_value = 500u64;
+        let withdraw_amount = 1_000u64; // strictly greater than input
+        let input_randomness = [3u8; 32];
+        let input_recipient = [7u8; 32];
+        let secret = [6u8; 32];
+
+        let commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+        );
+        let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+        let sibling = [4u8; 32];
+        let merkle_root_fr =
+            poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling));
+
+        let circuit = WithdrawCircuit::with_witness(
+            fr_to_bytes_32(merkle_root_fr),
+            fr_to_bytes_32(nullifier_fr),
+            withdraw_amount,
+            input_value,
+            input_randomness,
+            input_recipient,
+            secret,
+            vec![(sibling, true)],
+        );
+        let cs = ConstraintSystem::<Fr>::new_ref();
+
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should still succeed structurally");
+        assert!(
+            !cs.is_satisfied().expect("constraint system query"),
+            "withdraw circuit must reject withdraw_amount > input_value"
+        );
+    }
+
+    /// Property check: every honest \`change\` value in \`[0, input]\`
+    /// produces a satisfiable withdraw circuit. Walks through a fixed
+    /// set of representative values rather than truly randomising —
+    /// this is enough to catch obvious off-by-one and edge regressions
+    /// (zero withdraw, full withdraw, large input near u64::MAX).
+    #[test]
+    fn test_withdraw_circuit_accepts_in_range_values() {
+        let input_randomness = [3u8; 32];
+        let input_recipient = [7u8; 32];
+        let secret = [6u8; 32];
+        let sibling = [4u8; 32];
+
+        let cases: &[(u64, u64)] = &[
+            (1, 0),
+            (1, 1),
+            (1_000, 1),
+            (1_000, 999),
+            (1_000, 1_000),
+            (u64::MAX, 0),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, u64::MAX - 1),
+        ];
+
+        for &(input_value, withdraw_amount) in cases {
+            let commitment_fr = poseidon_commit(
+                Fr::from(input_value),
+                Fr::from_le_bytes_mod_order(&input_randomness),
+                Fr::from_le_bytes_mod_order(&input_recipient),
+            );
+            let nullifier_fr =
+                poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+            let merkle_root_fr =
+                poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling));
+
+            let circuit = WithdrawCircuit::with_witness(
+                fr_to_bytes_32(merkle_root_fr),
+                fr_to_bytes_32(nullifier_fr),
+                withdraw_amount,
+                input_value,
+                input_randomness,
+                input_recipient,
+                secret,
+                vec![(sibling, true)],
+            );
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            circuit
+                .generate_constraints(cs.clone())
+                .expect("constraint synthesis should succeed");
+            assert!(
+                cs.is_satisfied().expect("constraint system query"),
+                "withdraw circuit must accept input={} withdraw={}",
+                input_value,
+                withdraw_amount
+            );
+        }
     }
 
     #[test]
