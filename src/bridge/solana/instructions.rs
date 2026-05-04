@@ -7,10 +7,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    system_program,
 };
-
-// System program ID
-const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
 /// Instruction data for withdraw
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
@@ -54,7 +52,7 @@ pub fn create_initialize_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
+    let system_program_id = system_program::ID;
 
     Ok(Instruction {
         program_id: *program_id,
@@ -96,7 +94,7 @@ pub fn create_deposit_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
+    let system_program_id = system_program::ID;
 
     Ok(Instruction {
         program_id: *program_id,
@@ -135,7 +133,7 @@ pub fn create_withdraw_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
+    let system_program_id = system_program::ID;
 
     Ok(Instruction {
         program_id: *program_id,
