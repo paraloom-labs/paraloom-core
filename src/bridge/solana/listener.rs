@@ -228,12 +228,17 @@ impl EventListener {
     /// recorded history.
     async fn update_lag_metric(state: &PollerState) {
         let rpc = Arc::clone(&state.rpc_client);
-        let current_slot = match tokio::task::spawn_blocking(move || rpc.get_slot()).await {
+        let current_slot = match tokio::task::spawn_blocking(move || {
+            rpc.get_slot()
+                .map_err(|e| BridgeError::SolanaRpc(format!("getSlot: {}", e)))
+        })
+        .await
+        {
             Ok(Ok(slot)) => slot,
             Ok(Err(e)) => {
                 log::warn!(
                     target: "paraloom::bridge::solana",
-                    "skipping lag metric — getSlot failed: {}",
+                    "skipping lag metric — {}",
                     e
                 );
                 return;
@@ -277,6 +282,11 @@ impl EventListener {
         state: &PollerState,
         cursor: Option<Signature>,
     ) -> Result<Vec<DepositEvent>> {
+        // Map the (large) `ClientError` to `BridgeError` inside the
+        // closure so the `Result` that crosses `spawn_blocking`'s
+        // boundary is small — `clippy::result_large_err` flags the
+        // un-mapped variant. The pattern repeats for every RPC call
+        // below.
         let rpc = Arc::clone(&state.rpc_client);
         let program_id = state.program_id;
         let signatures = tokio::task::spawn_blocking(move || {
@@ -289,10 +299,10 @@ impl EventListener {
                     commitment: Some(CommitmentConfig::confirmed()),
                 },
             )
+            .map_err(|e| BridgeError::SolanaRpc(format!("getSignaturesForAddress: {}", e)))
         })
         .await
-        .map_err(|e| BridgeError::SolanaRpc(format!("signature fetch task panicked: {}", e)))?
-        .map_err(|e| BridgeError::SolanaRpc(format!("getSignaturesForAddress: {}", e)))?;
+        .map_err(|e| BridgeError::SolanaRpc(format!("signature fetch task panicked: {}", e)))??;
 
         if signatures.is_empty() {
             return Ok(Vec::new());
@@ -332,6 +342,7 @@ impl EventListener {
             let signature = sig;
             let confirmed = match tokio::task::spawn_blocking(move || {
                 rpc.get_transaction(&signature, LISTENER_TX_ENCODING)
+                    .map_err(|e| BridgeError::SolanaRpc(format!("getTransaction: {}", e)))
             })
             .await
             .map_err(|e| BridgeError::SolanaRpc(format!("getTransaction task panicked: {}", e)))?

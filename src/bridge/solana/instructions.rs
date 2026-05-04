@@ -7,8 +7,14 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    system_program,
 };
+
+/// Solana system program id. The newer `solana_system_interface::program`
+/// crate is the migration target, but going through `solana-sdk` 2.0 the
+/// constant is the all-zeros 32-byte pubkey, which is stable across the
+/// crate split. Defined as a `const` here so the loader cannot panic
+/// at runtime.
+const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 
 /// Instruction data for deposit (Solana → paraloom L2).
 ///
@@ -64,7 +70,7 @@ pub fn create_initialize_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = system_program::ID;
+    let system_program_id = SYSTEM_PROGRAM_ID;
 
     Ok(Instruction {
         program_id: *program_id,
@@ -99,7 +105,7 @@ pub fn create_deposit_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = system_program::ID;
+    let system_program_id = SYSTEM_PROGRAM_ID;
 
     Ok(Instruction {
         program_id: *program_id,
@@ -138,7 +144,7 @@ pub fn create_withdraw_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = system_program::ID;
+    let system_program_id = SYSTEM_PROGRAM_ID;
 
     Ok(Instruction {
         program_id: *program_id,
