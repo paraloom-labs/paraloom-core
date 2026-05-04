@@ -71,8 +71,10 @@ impl ShieldedPool {
         // Create commitment
         let commitment = note.commitment();
 
-        // Add to commitment tree (auto-persists if storage available)
-        let _index = self.commitment_tree.insert(&commitment).await;
+        // Add to commitment tree (auto-persists if storage available).
+        // Storage failure leaves the tree's in-memory state untouched
+        // and propagates here so the deposit fails atomically.
+        let _index = self.commitment_tree.insert(&commitment).await?;
 
         // Store note
         let mut notes = self.notes.write().await;
@@ -102,8 +104,12 @@ impl ShieldedPool {
             return Err(anyhow!("Double-spend detected: nullifier already used"));
         }
 
-        // Add nullifiers to prevent future double-spending (auto-persists if storage available)
-        self.nullifier_set.insert_batch(input_nullifiers).await;
+        // Add nullifiers to prevent future double-spending. If
+        // persistence fails the in-memory set is left untouched and
+        // the transfer is aborted — the alternative would be a half-
+        // committed state where in-memory says spent but disk does
+        // not, opening a double-spend window across restarts.
+        self.nullifier_set.insert_batch(input_nullifiers).await?;
 
         // Create output commitments
         let mut output_commitments = Vec::new();
@@ -111,7 +117,7 @@ impl ShieldedPool {
 
         for note in output_notes {
             let commitment = note.commitment();
-            self.commitment_tree.insert(&commitment).await; // Auto-persists if storage available
+            self.commitment_tree.insert(&commitment).await?;
             notes_map.insert(commitment.clone(), note);
             output_commitments.push(commitment);
         }
@@ -132,8 +138,11 @@ impl ShieldedPool {
             return Err(anyhow!("Double-spend: nullifier already used"));
         }
 
-        // Add nullifier (auto-persists if storage available)
-        self.nullifier_set.insert(nullifier).await;
+        // Add nullifier. Persistence-first ordering means a storage
+        // failure aborts the withdraw before any in-memory mutation,
+        // preventing the disk-vs-memory divergence that would let a
+        // restarted node accept a replay of the same withdrawal.
+        self.nullifier_set.insert(nullifier).await?;
 
         // Decrease total supply
         let mut supply = self.total_supply.write().await;

@@ -44,20 +44,36 @@ impl NullifierSet {
         set.contains(nullifier)
     }
 
-    /// Add a nullifier to the set (mark as spent)
-    /// Returns true if successfully added, false if already exists
-    pub async fn insert(&self, nullifier: Nullifier) -> bool {
+    /// Add a nullifier to the set (mark as spent).
+    ///
+    /// Returns `Ok(true)` if the nullifier is newly inserted, `Ok(false)`
+    /// if it was already present. When persistent storage is configured,
+    /// the on-disk write happens *before* the in-memory mutation; a
+    /// storage failure leaves the in-memory set untouched, so a future
+    /// retry sees the same "already present?" answer it would have seen
+    /// otherwise. This preserves crash-consistency on the spend path —
+    /// the most safety-critical write in the privacy layer.
+    pub async fn insert(&self, nullifier: Nullifier) -> Result<bool, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
-        let inserted = set.insert(nullifier.clone());
 
-        // Persist to storage if available and if newly inserted
-        if inserted {
-            if let Some(storage) = &self.storage {
-                let _ = storage.insert_nullifier(&nullifier);
-            }
+        if set.contains(&nullifier) {
+            return Ok(false);
         }
 
-        inserted
+        if let Some(storage) = &self.storage {
+            storage.insert_nullifier(&nullifier).map_err(|e| {
+                log::error!(
+                    target: "paraloom::privacy::nullifier",
+                    "failed to persist nullifier {}: {} — in-memory set not advanced",
+                    hex::encode(nullifier.as_bytes()),
+                    e
+                );
+                e
+            })?;
+        }
+
+        set.insert(nullifier);
+        Ok(true)
     }
 
     /// Batch check multiple nullifiers
@@ -67,28 +83,43 @@ impl NullifierSet {
         nullifiers.iter().all(|n| !set.contains(n))
     }
 
-    /// Batch insert multiple nullifiers
-    /// Returns the count of successfully inserted (new) nullifiers
-    pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> usize {
+    /// Batch insert multiple nullifiers, returning the count of newly
+    /// added entries. Same crash-consistency contract as
+    /// [`NullifierSet::insert`]: persist first, mutate the in-memory
+    /// set only if persistence succeeded. On storage failure no
+    /// nullifier in the batch is recorded — the caller is expected to
+    /// either retry the entire batch or fail the enclosing transaction.
+    pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
-        let mut count = 0;
-        let mut new_nullifiers = Vec::new();
 
-        for nullifier in nullifiers {
-            if set.insert(nullifier.clone()) {
-                count += 1;
-                new_nullifiers.push(nullifier);
-            }
+        let new_nullifiers: Vec<Nullifier> = nullifiers
+            .into_iter()
+            .filter(|n| !set.contains(n))
+            .collect();
+
+        if new_nullifiers.is_empty() {
+            return Ok(0);
         }
 
-        // Persist to storage if available
-        if !new_nullifiers.is_empty() {
-            if let Some(storage) = &self.storage {
-                let _ = storage.insert_nullifiers_batch(&new_nullifiers);
-            }
+        if let Some(storage) = &self.storage {
+            storage
+                .insert_nullifiers_batch(&new_nullifiers)
+                .map_err(|e| {
+                    log::error!(
+                        target: "paraloom::privacy::nullifier",
+                        "failed to persist nullifier batch ({} new): {} — in-memory set not advanced",
+                        new_nullifiers.len(),
+                        e
+                    );
+                    e
+                })?;
         }
 
-        count
+        let count = new_nullifiers.len();
+        for nullifier in new_nullifiers {
+            set.insert(nullifier);
+        }
+        Ok(count)
     }
 
     /// Get the total count of revealed nullifiers
@@ -135,13 +166,19 @@ mod tests {
         let set = NullifierSet::new();
         let nullifier = Nullifier([1u8; 32]);
 
-        // First insert should succeed
-        assert!(set.insert(nullifier.clone()).await);
+        // First insert should succeed (newly added).
+        assert!(set
+            .insert(nullifier.clone())
+            .await
+            .expect("in-memory insert"));
 
-        // Second insert should fail (already exists)
-        assert!(!set.insert(nullifier.clone()).await);
+        // Second insert should report not-newly-added.
+        assert!(!set
+            .insert(nullifier.clone())
+            .await
+            .expect("in-memory insert"));
 
-        // Set should contain the nullifier
+        // Set should contain the nullifier.
         assert!(set.contains(&nullifier).await);
     }
 
@@ -156,7 +193,9 @@ mod tests {
         assert!(!set.contains(&nullifier2).await);
 
         // After insert
-        set.insert(nullifier1.clone()).await;
+        set.insert(nullifier1.clone())
+            .await
+            .expect("in-memory insert");
         assert!(set.contains(&nullifier1).await);
         assert!(!set.contains(&nullifier2).await);
     }
@@ -175,7 +214,9 @@ mod tests {
         );
 
         // Insert one
-        set.insert(nullifier1.clone()).await;
+        set.insert(nullifier1.clone())
+            .await
+            .expect("in-memory insert");
 
         // Batch with spent nullifier - should fail
         assert!(
@@ -200,12 +241,18 @@ mod tests {
         ];
 
         // First batch insert
-        let count = set.insert_batch(nullifiers.clone()).await;
+        let count = set
+            .insert_batch(nullifiers.clone())
+            .await
+            .expect("in-memory batch insert");
         assert_eq!(count, 3);
         assert_eq!(set.len().await, 3);
 
         // Second batch insert (duplicates)
-        let count = set.insert_batch(nullifiers).await;
+        let count = set
+            .insert_batch(nullifiers)
+            .await
+            .expect("in-memory batch insert");
         assert_eq!(count, 0); // No new inserts
         assert_eq!(set.len().await, 3);
     }
@@ -217,11 +264,15 @@ mod tests {
         assert_eq!(set.len().await, 0);
         assert!(set.is_empty().await);
 
-        set.insert(Nullifier([1u8; 32])).await;
+        set.insert(Nullifier([1u8; 32]))
+            .await
+            .expect("in-memory insert");
         assert_eq!(set.len().await, 1);
         assert!(!set.is_empty().await);
 
-        set.insert(Nullifier([2u8; 32])).await;
+        set.insert(Nullifier([2u8; 32]))
+            .await
+            .expect("in-memory insert");
         assert_eq!(set.len().await, 2);
     }
 
@@ -229,8 +280,12 @@ mod tests {
     async fn test_nullifier_set_clear() {
         let set = NullifierSet::new();
 
-        set.insert(Nullifier([1u8; 32])).await;
-        set.insert(Nullifier([2u8; 32])).await;
+        set.insert(Nullifier([1u8; 32]))
+            .await
+            .expect("in-memory insert");
+        set.insert(Nullifier([2u8; 32]))
+            .await
+            .expect("in-memory insert");
         assert_eq!(set.len().await, 2);
 
         set.clear().await;
@@ -243,7 +298,9 @@ mod tests {
         let set1 = NullifierSet::new();
         let nullifier = Nullifier([42u8; 32]);
 
-        set1.insert(nullifier.clone()).await;
+        set1.insert(nullifier.clone())
+            .await
+            .expect("in-memory insert");
 
         // Clone should share the same underlying data
         let set2 = set1.clone();
@@ -251,7 +308,9 @@ mod tests {
 
         // Insert in set2 should reflect in set1
         let nullifier2 = Nullifier([43u8; 32]);
-        set2.insert(nullifier2.clone()).await;
+        set2.insert(nullifier2.clone())
+            .await
+            .expect("in-memory insert");
         assert!(set1.contains(&nullifier2).await);
     }
 }

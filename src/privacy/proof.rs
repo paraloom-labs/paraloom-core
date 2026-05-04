@@ -278,9 +278,15 @@ impl ProofVerifier {
             );
         })?;
 
-        // First write wins; if a concurrent caller raced us, drop our
-        // copy and read theirs. Either way the cache is now populated.
-        let _ = WITHDRAWAL_VERIFYING_KEY.set(key);
+        // First write wins; if a concurrent caller raced us,
+        // `OnceLock::set` returns our value back as `Err` and we just
+        // drop it. Either way the cache is now populated.
+        if WITHDRAWAL_VERIFYING_KEY.set(key).is_err() {
+            log::debug!(
+                target: "paraloom::privacy::proof",
+                "verifying key was already cached by a concurrent caller"
+            );
+        }
         Ok(WITHDRAWAL_VERIFYING_KEY
             .get()
             .expect("verifying key cache populated above"))

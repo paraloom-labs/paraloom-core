@@ -60,46 +60,67 @@ impl MerkleTree {
         })
     }
 
-    /// Insert a commitment as a leaf
-    /// Returns the index where it was inserted
-    pub async fn insert(&self, commitment: &Commitment) -> usize {
+    /// Insert a commitment as a leaf, returning the index it was placed
+    /// at. When persistent storage is configured, the on-disk write is
+    /// performed *before* the in-memory mutation, so a storage failure
+    /// is observable and leaves the tree's in-memory state unchanged.
+    /// This preserves crash-consistency: a leaf either reaches both
+    /// memory and disk, or neither.
+    pub async fn insert(&self, commitment: &Commitment) -> Result<usize, anyhow::Error> {
         let mut leaves = self.leaves.write().await;
         let index = leaves.len();
-        leaves.push(*commitment.as_bytes());
 
-        // Persist to storage if available
         if let Some(storage) = &self.storage {
-            let _ = storage.insert_commitment(index as u64, commitment);
+            storage.insert_commitment(index as u64, commitment).map_err(|e| {
+                log::error!(
+                    target: "paraloom::privacy::merkle",
+                    "failed to persist commitment at index {}: {} — in-memory state not advanced",
+                    index, e
+                );
+                e
+            })?;
         }
 
-        // Invalidate cached root
+        leaves.push(*commitment.as_bytes());
+
         let mut cached_root = self.cached_root.write().await;
         *cached_root = None;
 
-        index
+        Ok(index)
     }
 
-    /// Batch insert multiple commitments
-    pub async fn insert_batch(&self, commitments: &[Commitment]) -> Vec<usize> {
+    /// Batch insert multiple commitments. Same crash-consistency
+    /// contract as [`MerkleTree::insert`]: persist first, mutate
+    /// memory only if persistence succeeded.
+    pub async fn insert_batch(
+        &self,
+        commitments: &[Commitment],
+    ) -> Result<Vec<usize>, anyhow::Error> {
         let mut leaves = self.leaves.write().await;
         let start_index = leaves.len();
-
         let indices: Vec<usize> = (start_index..start_index + commitments.len()).collect();
+
+        if let Some(storage) = &self.storage {
+            storage
+                .insert_commitments_batch(start_index as u64, commitments)
+                .map_err(|e| {
+                    log::error!(
+                        target: "paraloom::privacy::merkle",
+                        "failed to persist commitment batch starting at index {}: {} — in-memory state not advanced",
+                        start_index, e
+                    );
+                    e
+                })?;
+        }
 
         for commitment in commitments {
             leaves.push(*commitment.as_bytes());
         }
 
-        // Persist to storage if available
-        if let Some(storage) = &self.storage {
-            let _ = storage.insert_commitments_batch(start_index as u64, commitments);
-        }
-
-        // Invalidate cached root
         let mut cached_root = self.cached_root.write().await;
         *cached_root = None;
 
-        indices
+        Ok(indices)
     }
 
     /// Get the current root of the tree
@@ -120,9 +141,21 @@ impl MerkleTree {
         let mut cached_root = self.cached_root.write().await;
         *cached_root = Some(root);
 
-        // Persist root to storage if available
+        // Persist root to storage if available. Unlike leaf inserts,
+        // root persistence is a cache: on restart the tree rebuilds the
+        // root from the stored leaves, so a missed write here costs
+        // a one-time recomputation rather than data loss. We log the
+        // failure loudly so an operator can investigate, but do not
+        // propagate it — read paths that take a root must keep working
+        // even if the disk is misbehaving.
         if let Some(storage) = &self.storage {
-            let _ = storage.set_merkle_root(&root);
+            if let Err(e) = storage.set_merkle_root(&root) {
+                log::warn!(
+                    target: "paraloom::privacy::merkle",
+                    "failed to persist Merkle root cache: {} — recomputation will trigger on next restart",
+                    e
+                );
+            }
         }
 
         root
@@ -276,12 +309,12 @@ mod tests {
         let tree = MerkleTree::new();
         let commitment = Commitment([1u8; 32]);
 
-        let index = tree.insert(&commitment).await;
+        let index = tree.insert(&commitment).await.expect("in-memory insert");
         assert_eq!(index, 0);
         assert_eq!(tree.len().await, 1);
 
         let commitment2 = Commitment([2u8; 32]);
-        let index2 = tree.insert(&commitment2).await;
+        let index2 = tree.insert(&commitment2).await.expect("in-memory insert");
         assert_eq!(index2, 1);
         assert_eq!(tree.len().await, 2);
     }
@@ -295,12 +328,16 @@ mod tests {
         assert_eq!(root1, [0u8; 32]);
 
         // Add commitment
-        tree.insert(&Commitment([1u8; 32])).await;
+        tree.insert(&Commitment([1u8; 32]))
+            .await
+            .expect("in-memory insert");
         let root2 = tree.root().await;
         assert_ne!(root2, [0u8; 32]);
 
         // Add another commitment - root should change
-        tree.insert(&Commitment([2u8; 32])).await;
+        tree.insert(&Commitment([2u8; 32]))
+            .await
+            .expect("in-memory insert");
         let root3 = tree.root().await;
         assert_ne!(root3, root2);
     }
@@ -313,9 +350,9 @@ mod tests {
         let commitment2 = Commitment([2u8; 32]);
         let commitment3 = Commitment([3u8; 32]);
 
-        tree.insert(&commitment1).await;
-        tree.insert(&commitment2).await;
-        tree.insert(&commitment3).await;
+        tree.insert(&commitment1).await.expect("in-memory insert");
+        tree.insert(&commitment2).await.expect("in-memory insert");
+        tree.insert(&commitment3).await.expect("in-memory insert");
 
         // Get path for first commitment
         let path = tree.path(0).await.unwrap();
@@ -337,7 +374,10 @@ mod tests {
             Commitment([3u8; 32]),
         ];
 
-        let indices = tree.insert_batch(&commitments).await;
+        let indices = tree
+            .insert_batch(&commitments)
+            .await
+            .expect("in-memory batch insert");
         assert_eq!(indices, vec![0, 1, 2]);
         assert_eq!(tree.len().await, 3);
     }
@@ -355,8 +395,8 @@ mod tests {
 
         // Insert same commitments in both trees
         for commitment in &commitments {
-            tree1.insert(commitment).await;
-            tree2.insert(commitment).await;
+            tree1.insert(commitment).await.expect("in-memory insert");
+            tree2.insert(commitment).await.expect("in-memory insert");
         }
 
         // Roots should be identical
@@ -367,8 +407,12 @@ mod tests {
     async fn test_merkle_tree_caching() {
         let tree = MerkleTree::new();
 
-        tree.insert(&Commitment([1u8; 32])).await;
-        tree.insert(&Commitment([2u8; 32])).await;
+        tree.insert(&Commitment([1u8; 32]))
+            .await
+            .expect("in-memory insert");
+        tree.insert(&Commitment([2u8; 32]))
+            .await
+            .expect("in-memory insert");
 
         // First root call computes
         let root1 = tree.root().await;
@@ -378,7 +422,9 @@ mod tests {
         assert_eq!(root1, root2);
 
         // Insert invalidates cache
-        tree.insert(&Commitment([3u8; 32])).await;
+        tree.insert(&Commitment([3u8; 32]))
+            .await
+            .expect("in-memory insert");
         let root3 = tree.root().await;
         assert_ne!(root3, root1);
     }
@@ -387,7 +433,9 @@ mod tests {
     async fn test_merkle_path_nonexistent() {
         let tree = MerkleTree::new();
 
-        tree.insert(&Commitment([1u8; 32])).await;
+        tree.insert(&Commitment([1u8; 32]))
+            .await
+            .expect("in-memory insert");
 
         // Path for nonexistent leaf
         let path = tree.path(10).await;

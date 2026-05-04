@@ -205,7 +205,7 @@ async fn test_merkle_tree_integration() {
     ];
 
     for commitment in &commitments {
-        tree.insert(commitment).await;
+        tree.insert(commitment).await.expect("in-memory insert");
     }
 
     let root = tree.root().await;
@@ -227,13 +227,19 @@ async fn test_nullifier_set_integration() {
     assert!(!nullifier_set.contains(&nullifier1).await);
 
     // Add first nullifier
-    assert!(nullifier_set.insert(nullifier1.clone()).await);
+    assert!(nullifier_set
+        .insert(nullifier1.clone())
+        .await
+        .expect("in-memory insert"));
 
     // Should now contain it
     assert!(nullifier_set.contains(&nullifier1).await);
 
     // Duplicate insert should fail
-    assert!(!nullifier_set.insert(nullifier1.clone()).await);
+    assert!(!nullifier_set
+        .insert(nullifier1.clone())
+        .await
+        .expect("in-memory insert"));
 
     // Batch check
     assert!(
