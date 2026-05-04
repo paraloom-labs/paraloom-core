@@ -539,8 +539,7 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // witness `input_value_bytes` is gone: Poseidon consumes field
         // elements, not u64 bytes.
         // ────────────────────────────────────────────────────────────────
-        let (_input_value_bits, input_value_var) =
-            alloc_u64_witness(cs.clone(), self.input_value)?;
+        let (_input_value_bits, input_value_var) = alloc_u64_witness(cs.clone(), self.input_value)?;
 
         let input_randomness_var = FpVar::new_witness(cs.clone(), || {
             Ok(self
