@@ -9,8 +9,24 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 
-// System program ID
-const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+/// Solana system program id. The newer `solana_system_interface::program`
+/// crate is the migration target, but going through `solana-sdk` 2.0 the
+/// constant is the all-zeros 32-byte pubkey, which is stable across the
+/// crate split. Defined as a `const` here so the loader cannot panic
+/// at runtime.
+const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
+
+/// Instruction data for deposit (Solana → paraloom L2).
+///
+/// Layout matches the on-chain Anchor program: the eight-byte
+/// discriminator [`discriminators::DEPOSIT`] is prepended on the wire,
+/// followed by this struct's borsh encoding.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DepositInstructionData {
+    pub amount: u64,
+    pub recipient: [u8; 32],
+    pub randomness: [u8; 32],
+}
 
 /// Instruction data for withdraw
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
@@ -54,7 +70,7 @@ pub fn create_initialize_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
+    let system_program_id = SYSTEM_PROGRAM_ID;
 
     Ok(Instruction {
         program_id: *program_id,
@@ -78,14 +94,7 @@ pub fn create_deposit_instruction(
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
-    #[derive(BorshSerialize)]
-    struct DepositData {
-        amount: u64,
-        recipient: [u8; 32],
-        randomness: [u8; 32],
-    }
-
-    let data = DepositData {
+    let data = DepositInstructionData {
         amount,
         recipient,
         randomness,
@@ -96,7 +105,7 @@ pub fn create_deposit_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
+    let system_program_id = SYSTEM_PROGRAM_ID;
 
     Ok(Instruction {
         program_id: *program_id,
@@ -135,7 +144,7 @@ pub fn create_withdraw_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
-    let system_program_id = SYSTEM_PROGRAM_ID.parse().unwrap();
+    let system_program_id = SYSTEM_PROGRAM_ID;
 
     Ok(Instruction {
         program_id: *program_id,
