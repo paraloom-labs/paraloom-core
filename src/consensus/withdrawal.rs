@@ -19,6 +19,22 @@ pub const MIN_VALIDATORS_FOR_CONSENSUS: usize = 7;
 /// Total validators selected for verification
 pub const TOTAL_VALIDATORS: usize = 10;
 
+/// Default reputation floor for consensus participation. A validator
+/// whose reputation drops below this is excluded from vote aggregation
+/// — they may still submit a vote (the network has no way to stop the
+/// bytes from arriving), but the consensus result is computed as if
+/// they had not. The default sits one notch above
+/// [`reputation::MIN_REPUTATION`] so a validator that bottoms out is
+/// already gated out before any further punishment.
+pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
+
+/// Number of consecutive timeouts after which a validator is considered
+/// persistently unavailable and a `PersistentUnavailability` slashing
+/// event is recorded. Three is small enough to react quickly to a
+/// genuinely offline validator and large enough to absorb a transient
+/// network blip.
+pub const PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK: u64 = 3;
+
 /// Withdrawal verification request
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WithdrawalVerificationRequest {
@@ -140,10 +156,19 @@ impl WithdrawalConsensus {
         Ok(())
     }
 
-    /// Check if consensus has been reached
-    pub async fn has_consensus(&self) -> bool {
-        let votes = self.votes.read().await;
-        votes.len() >= MIN_VALIDATORS_FOR_CONSENSUS
+    /// Check whether consensus has been reached among the eligible
+    /// validators — those whose reputation is at or above
+    /// `min_reputation`. A validator below the threshold is silently
+    /// excluded from the count; their vote may still be in `votes`
+    /// (the network cannot prevent the bytes from arriving) but it
+    /// does not contribute to the quorum.
+    pub async fn has_consensus(
+        &self,
+        reputation_tracker: &ReputationTracker,
+        min_reputation: u64,
+    ) -> bool {
+        let eligible = self.count_eligible_votes(reputation_tracker, min_reputation).await;
+        eligible >= MIN_VALIDATORS_FOR_CONSENSUS
     }
 
     /// Check if consensus deadline has passed
@@ -156,23 +181,81 @@ impl WithdrawalConsensus {
         now > self.deadline
     }
 
-    /// Compute consensus result
-    pub async fn consensus_result(&self) -> Result<VerificationVote> {
+    /// Number of submitted votes whose validators currently sit at or
+    /// above `min_reputation`. Helper for [`has_consensus`] and
+    /// [`consensus_result`] so they share a single eligibility view.
+    async fn count_eligible_votes(
+        &self,
+        reputation_tracker: &ReputationTracker,
+        min_reputation: u64,
+    ) -> usize {
+        let votes = self.votes.read().await;
+        let mut count = 0;
+        for validator in votes.keys() {
+            let reputation = reputation_tracker
+                .get_reputation(validator)
+                .await
+                .unwrap_or(0);
+            if reputation >= min_reputation {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Compute consensus result, filtering out votes from validators
+    /// whose reputation has dropped below `min_reputation`.
+    ///
+    /// The audit (#62) flagged that the previous version aggregated
+    /// every submitted vote regardless of the voter's standing, so a
+    /// validator whose reputation had bottomed out from repeated
+    /// dishonest votes still got to influence the quorum. This version
+    /// snapshots reputation at result-time and counts only votes from
+    /// validators currently in good standing.
+    pub async fn consensus_result(
+        &self,
+        reputation_tracker: &ReputationTracker,
+        min_reputation: u64,
+    ) -> Result<VerificationVote> {
         let votes = self.votes.read().await;
 
-        if votes.len() < MIN_VALIDATORS_FOR_CONSENSUS {
+        // Collect (validator, vote) pairs whose reputation is currently
+        // at or above the threshold.
+        let mut eligible: Vec<&VerificationVote> = Vec::with_capacity(votes.len());
+        let mut excluded = 0usize;
+        for (validator, vote) in votes.iter() {
+            let reputation = reputation_tracker
+                .get_reputation(validator)
+                .await
+                .unwrap_or(0);
+            if reputation >= min_reputation {
+                eligible.push(vote);
+            } else {
+                excluded += 1;
+                log::warn!(
+                    target: "paraloom::consensus",
+                    "vote from low-reputation validator {:?} (rep {}, threshold {}) excluded from consensus on {}",
+                    validator,
+                    reputation,
+                    min_reputation,
+                    self.request_id
+                );
+            }
+        }
+
+        if eligible.len() < MIN_VALIDATORS_FOR_CONSENSUS {
             return Err(anyhow!(
-                "Not enough votes: {} < {}",
-                votes.len(),
-                MIN_VALIDATORS_FOR_CONSENSUS
+                "Not enough eligible votes: {} < {} (excluded {} below reputation {})",
+                eligible.len(),
+                MIN_VALIDATORS_FOR_CONSENSUS,
+                excluded,
+                min_reputation
             ));
         }
 
-        // Count valid vs invalid votes
-        let valid_count = votes.values().filter(|v| v.is_valid()).count();
-        let invalid_count = votes.len() - valid_count;
+        let valid_count = eligible.iter().filter(|v| v.is_valid()).count();
+        let invalid_count = eligible.len() - valid_count;
 
-        // Require 7/10 majority to accept
         if valid_count >= MIN_VALIDATORS_FOR_CONSENSUS {
             Ok(VerificationVote::Valid)
         } else {
@@ -213,6 +296,10 @@ pub struct WithdrawalVerificationCoordinator {
 
     /// Reputation tracker for automatic reputation updates
     reputation_tracker: Arc<ReputationTracker>,
+
+    /// Reputation floor for consensus participation. Configurable so an
+    /// operator can tighten or loosen the gate without recompiling.
+    min_reputation_for_consensus: u64,
 }
 
 impl WithdrawalVerificationCoordinator {
@@ -223,7 +310,19 @@ impl WithdrawalVerificationCoordinator {
             validators: Arc::new(RwLock::new(Vec::new())),
             leader_selector: Arc::new(RwLock::new(LeaderSelector::new())),
             reputation_tracker: Arc::new(ReputationTracker::new()),
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
         }
+    }
+
+    /// Override the reputation floor for consensus participation. Useful
+    /// in tests and for operator-driven retuning at runtime.
+    pub fn set_min_reputation_for_consensus(&mut self, threshold: u64) {
+        self.min_reputation_for_consensus = threshold;
+    }
+
+    /// Read the current reputation floor.
+    pub fn min_reputation_for_consensus(&self) -> u64 {
+        self.min_reputation_for_consensus
     }
 
     /// Register a validator (simple version for backward compatibility)
@@ -371,9 +470,16 @@ impl WithdrawalVerificationCoordinator {
             return Err(anyhow!("Verification timed out"));
         }
 
-        // Check if we have consensus
-        if consensus.has_consensus().await {
-            let result = consensus.consensus_result().await?;
+        // Check if we have consensus among reputation-eligible voters.
+        // Both checks share the coordinator's tracker so the eligibility
+        // view is consistent within a single tick.
+        if consensus
+            .has_consensus(&self.reputation_tracker, self.min_reputation_for_consensus)
+            .await
+        {
+            let result = consensus
+                .consensus_result(&self.reputation_tracker, self.min_reputation_for_consensus)
+                .await?;
             Ok(Some(result))
         } else {
             Ok(None)
@@ -575,7 +681,12 @@ mod tests {
 
         let consensus = WithdrawalConsensus::new(request);
         assert_eq!(consensus.request_id, "test123");
-        assert!(!consensus.has_consensus().await);
+        let tracker = ReputationTracker::new();
+        assert!(
+            !consensus
+                .has_consensus(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -591,20 +702,31 @@ mod tests {
         };
 
         let consensus = WithdrawalConsensus::new(request);
+        let tracker = ReputationTracker::new();
 
-        // Submit 7 valid votes
+        // Submit 7 valid votes from registered validators so they pass
+        // the reputation gate.
         for i in 0..7 {
+            let validator = NodeId(vec![i]);
+            tracker.register_validator(validator.clone()).await;
             consensus
-                .submit_vote(NodeId(vec![i]), VerificationVote::Valid)
+                .submit_vote(validator, VerificationVote::Valid)
                 .await
                 .unwrap();
         }
 
         // Should have consensus
-        assert!(consensus.has_consensus().await);
+        assert!(
+            consensus
+                .has_consensus(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .await
+        );
 
         // Result should be valid
-        let result = consensus.consensus_result().await.unwrap();
+        let result = consensus
+            .consensus_result(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+            .await
+            .unwrap();
         assert!(result.is_valid());
     }
 
@@ -621,12 +743,15 @@ mod tests {
         };
 
         let consensus = WithdrawalConsensus::new(request);
+        let tracker = ReputationTracker::new();
 
-        // Submit 7 invalid votes
+        // Submit 7 invalid votes from registered validators.
         for i in 0..7 {
+            let validator = NodeId(vec![i]);
+            tracker.register_validator(validator.clone()).await;
             consensus
                 .submit_vote(
-                    NodeId(vec![i]),
+                    validator,
                     VerificationVote::Invalid {
                         reason: "Test".to_string(),
                     },
@@ -636,10 +761,17 @@ mod tests {
         }
 
         // Should have consensus
-        assert!(consensus.has_consensus().await);
+        assert!(
+            consensus
+                .has_consensus(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .await
+        );
 
         // Result should be invalid
-        let result = consensus.consensus_result().await.unwrap();
+        let result = consensus
+            .consensus_result(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+            .await
+            .unwrap();
         assert!(!result.is_valid());
     }
 
