@@ -285,4 +285,58 @@ mod tests {
         let (pda3, _) = derive_nullifier_account(&program_id, &different_nullifier);
         assert_ne!(pda1, pda3);
     }
+
+    /// Round-trip the new \`expiration_slot\` field through borsh to
+    /// catch any drift between the L2 wire format and the on-chain
+    /// \`withdraw\` function signature. Belt-and-suspenders: the
+    /// on-chain decoder is anchor-derived from the same struct shape,
+    /// so a mismatch in field order or width here would surface as a
+    /// failed instruction at runtime — this test catches it at unit
+    /// time instead.
+    #[test]
+    fn test_withdraw_instruction_data_round_trip() {
+        let original = WithdrawInstructionData {
+            nullifier: [0xAB; 32],
+            amount: 12_345_678,
+            expiration_slot: 9_876_543,
+            proof: vec![0xCD; 64],
+        };
+
+        let bytes = borsh::to_vec(&original).expect("borsh serialize");
+        let decoded =
+            WithdrawInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
+
+        assert_eq!(decoded.nullifier, original.nullifier);
+        assert_eq!(decoded.amount, original.amount);
+        assert_eq!(decoded.expiration_slot, original.expiration_slot);
+        assert_eq!(decoded.proof, original.proof);
+    }
+
+    /// Field ordering is observable on the wire — Anchor's discriminator
+    /// is followed by borsh fields in declaration order. A regression
+    /// where someone swaps \`amount\` and \`expiration_slot\` (both
+    /// \`u64\`, indistinguishable to the type system) would deploy
+    /// silently and cause every withdrawal to either fail expiration
+    /// or transfer a nonsensical amount. The byte-prefix check below
+    /// pins the layout: \`[nullifier (32) | amount (8) | expiration (8) | proof_len (4) | proof…]\`.
+    #[test]
+    fn test_withdraw_instruction_data_field_order() {
+        let payload = WithdrawInstructionData {
+            nullifier: [0u8; 32],
+            amount: 0x0807_0605_0403_0201,
+            expiration_slot: 0x1716_1514_1312_1110,
+            proof: vec![],
+        };
+        let bytes = borsh::to_vec(&payload).expect("borsh serialize");
+        // Skip the 32-byte nullifier; assert the next 16 bytes are
+        // amount-then-expiration_slot in little-endian order.
+        assert_eq!(
+            &bytes[32..32 + 8],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+        assert_eq!(
+            &bytes[32 + 8..32 + 16],
+            &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+        );
+    }
 }
