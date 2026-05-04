@@ -303,8 +303,7 @@ mod tests {
         };
 
         let bytes = borsh::to_vec(&original).expect("borsh serialize");
-        let decoded =
-            WithdrawInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
+        let decoded = WithdrawInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
 
         assert_eq!(decoded.nullifier, original.nullifier);
         assert_eq!(decoded.amount, original.amount);
