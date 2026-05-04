@@ -199,26 +199,6 @@ impl MerklePath {
     }
 }
 
-/// Amount range proof (proves value is in valid range without revealing it)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RangeProof {
-    /// Proof data (placeholder)
-    pub proof: Vec<u8>,
-}
-
-impl RangeProof {
-    /// Create a placeholder range proof
-    pub fn placeholder() -> Self {
-        RangeProof { proof: Vec::new() }
-    }
-
-    /// Verify the range proof
-    pub fn verify(&self, _commitment: &Commitment) -> bool {
-        // Placeholder - would implement actual verification
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

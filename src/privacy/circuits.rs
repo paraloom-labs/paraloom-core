@@ -825,6 +825,106 @@ mod tests {
         );
     }
 
+    /// The post-#60 withdraw circuit must reject \`withdraw > input\`.
+    /// Before this fix the field-level subtraction wrapped to a huge
+    /// value and the circuit silently accepted the underflow; the
+    /// range constraint on \`change\` now traps it.
+    #[test]
+    fn test_withdraw_circuit_rejects_underflow() {
+        let input_value = 500u64;
+        let withdraw_amount = 1_000u64; // strictly greater than input
+        let input_randomness = [3u8; 32];
+        let input_recipient = [7u8; 32];
+        let secret = [6u8; 32];
+
+        let commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+        );
+        let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+        let sibling = [4u8; 32];
+        let merkle_root_fr =
+            poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling));
+
+        let circuit = WithdrawCircuit::with_witness(
+            fr_to_bytes_32(merkle_root_fr),
+            fr_to_bytes_32(nullifier_fr),
+            withdraw_amount,
+            input_value,
+            input_randomness,
+            input_recipient,
+            secret,
+            vec![(sibling, true)],
+        );
+        let cs = ConstraintSystem::<Fr>::new_ref();
+
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should still succeed structurally");
+        assert!(
+            !cs.is_satisfied().expect("constraint system query"),
+            "withdraw circuit must reject withdraw_amount > input_value"
+        );
+    }
+
+    /// Property check: every honest \`change\` value in \`[0, input]\`
+    /// produces a satisfiable withdraw circuit. Walks through a fixed
+    /// set of representative values rather than truly randomising —
+    /// this is enough to catch obvious off-by-one and edge regressions
+    /// (zero withdraw, full withdraw, large input near u64::MAX).
+    #[test]
+    fn test_withdraw_circuit_accepts_in_range_values() {
+        let input_randomness = [3u8; 32];
+        let input_recipient = [7u8; 32];
+        let secret = [6u8; 32];
+        let sibling = [4u8; 32];
+
+        let cases: &[(u64, u64)] = &[
+            (1, 0),
+            (1, 1),
+            (1_000, 1),
+            (1_000, 999),
+            (1_000, 1_000),
+            (u64::MAX, 0),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, u64::MAX - 1),
+        ];
+
+        for &(input_value, withdraw_amount) in cases {
+            let commitment_fr = poseidon_commit(
+                Fr::from(input_value),
+                Fr::from_le_bytes_mod_order(&input_randomness),
+                Fr::from_le_bytes_mod_order(&input_recipient),
+            );
+            let nullifier_fr =
+                poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+            let merkle_root_fr =
+                poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling));
+
+            let circuit = WithdrawCircuit::with_witness(
+                fr_to_bytes_32(merkle_root_fr),
+                fr_to_bytes_32(nullifier_fr),
+                withdraw_amount,
+                input_value,
+                input_randomness,
+                input_recipient,
+                secret,
+                vec![(sibling, true)],
+            );
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            circuit
+                .generate_constraints(cs.clone())
+                .expect("constraint synthesis should succeed");
+            assert!(
+                cs.is_satisfied().expect("constraint system query"),
+                "withdraw circuit must accept input={} withdraw={}",
+                input_value,
+                withdraw_amount
+            );
+        }
+    }
+
     #[test]
     fn test_groth16_setup() {
         let mut rng = StdRng::seed_from_u64(0u64);

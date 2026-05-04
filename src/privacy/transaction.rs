@@ -5,7 +5,7 @@
 //! 2. Transfer: Private -> Private (shielded transfer)
 //! 3. Withdraw: Private -> Public (burn shielded coins)
 
-use crate::privacy::types::{Commitment, Note, Nullifier, RangeProof, ShieldedAddress};
+use crate::privacy::types::{Commitment, Note, Nullifier, ShieldedAddress};
 use serde::{Deserialize, Serialize};
 
 /// A shielded transaction
@@ -131,9 +131,6 @@ pub struct TransferTx {
     /// Output notes (encrypted for recipients)
     pub output_notes: Vec<Note>,
 
-    /// Range proofs (prove amounts are valid without revealing them)
-    pub range_proofs: Vec<RangeProof>,
-
     /// ZK proof (proves transaction is valid)
     /// Placeholder - will be replaced with actual proof system
     pub zk_proof: Vec<u8>,
@@ -161,11 +158,6 @@ impl TransferTx {
         let output_commitments: Vec<Commitment> =
             output_notes.iter().map(|note| note.commitment()).collect();
 
-        let range_proofs: Vec<RangeProof> = output_notes
-            .iter()
-            .map(|_| RangeProof::placeholder())
-            .collect();
-
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -176,7 +168,6 @@ impl TransferTx {
             input_nullifiers,
             output_commitments,
             output_notes,
-            range_proofs,
             zk_proof: Vec::new(), // Placeholder
             merkle_root,
             fee,
@@ -203,21 +194,6 @@ impl TransferTx {
             }
         }
 
-        // Range proofs must match outputs
-        if self.range_proofs.len() != self.output_notes.len() {
-            return false;
-        }
-
-        true
-    }
-
-    /// Verify range proofs
-    pub fn verify_range_proofs(&self) -> bool {
-        for (proof, commitment) in self.range_proofs.iter().zip(self.output_commitments.iter()) {
-            if !proof.verify(commitment) {
-                return false;
-            }
-        }
         true
     }
 }
@@ -375,7 +351,6 @@ mod tests {
         assert_eq!(tx.input_nullifiers.len(), 2);
         assert_eq!(tx.output_notes.len(), 2);
         assert!(tx.verify_structure());
-        assert!(tx.verify_range_proofs());
     }
 
     #[test]

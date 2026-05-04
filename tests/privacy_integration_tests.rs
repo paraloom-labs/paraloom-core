@@ -107,7 +107,6 @@ async fn test_transfer_transaction_creation() {
     assert_eq!(tx.output_commitments.len(), 2);
     assert_eq!(tx.output_notes.len(), 2);
     assert!(tx.verify_structure());
-    assert!(tx.verify_range_proofs());
 }
 
 #[tokio::test]

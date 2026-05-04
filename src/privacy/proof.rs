@@ -52,12 +52,6 @@ pub enum VerificationChunk {
         path: MerklePath,
         root: [u8; 32],
     },
-
-    /// Verify range proof (amount is valid)
-    RangeProof {
-        commitment: Commitment,
-        proof_data: Vec<u8>,
-    },
 }
 
 impl VerificationChunk {
@@ -141,20 +135,6 @@ impl VerificationChunk {
                         reason: "Merkle path verification failed".to_string(),
                     }
                 }
-            }
-
-            VerificationChunk::RangeProof {
-                commitment: _,
-                proof_data,
-            } => {
-                // Placeholder: In production, verify range proof
-                if proof_data.is_empty() {
-                    // Empty proof is accepted for now (placeholder)
-                    return VerificationResult::Valid;
-                }
-
-                // In production: verify actual range proof
-                VerificationResult::Valid
             }
         }
     }
@@ -310,11 +290,11 @@ impl ProofVerifier {
             };
         }
 
-        if !tx.verify_range_proofs() {
-            return VerificationResult::Invalid {
-                reason: "Range proof verification failed".to_string(),
-            };
-        }
+        // Range checks for input/output amounts are now enforced
+        // inside the TransferCircuit via UInt64 bit decomposition (see
+        // #60); a proof that verifies against the circuit's verifying
+        // key is already a proof that every value fits in `[0, 2^64)`.
+        // No host-level range-proof call is needed here.
 
         // Placeholder: Accept for now
         VerificationResult::Valid
@@ -411,13 +391,9 @@ impl ProofVerifier {
             nullifiers: tx.input_nullifiers.clone(),
         });
 
-        // Chunk 3-N: Range proofs for each output
-        for (commitment, proof) in tx.output_commitments.iter().zip(tx.range_proofs.iter()) {
-            chunks.push(VerificationChunk::RangeProof {
-                commitment: commitment.clone(),
-                proof_data: proof.proof.clone(),
-            });
-        }
+        // Range checks for input/output amounts are enforced inside the
+        // TransferCircuit (#60); the host-level chunked verifier no
+        // longer needs a separate `RangeProof` chunk.
 
         chunks
     }
