@@ -10,6 +10,18 @@ use solana_sdk::{
     system_program,
 };
 
+/// Instruction data for deposit (Solana → paraloom L2).
+///
+/// Layout matches the on-chain Anchor program: the eight-byte
+/// discriminator [`discriminators::DEPOSIT`] is prepended on the wire,
+/// followed by this struct's borsh encoding.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DepositInstructionData {
+    pub amount: u64,
+    pub recipient: [u8; 32],
+    pub randomness: [u8; 32],
+}
+
 /// Instruction data for withdraw
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct WithdrawInstructionData {
@@ -76,14 +88,7 @@ pub fn create_deposit_instruction(
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
-    #[derive(BorshSerialize)]
-    struct DepositData {
-        amount: u64,
-        recipient: [u8; 32],
-        randomness: [u8; 32],
-    }
-
-    let data = DepositData {
+    let data = DepositInstructionData {
         amount,
         recipient,
         randomness,
