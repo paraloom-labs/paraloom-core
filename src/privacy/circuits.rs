@@ -574,7 +574,7 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // pre-#60 version of this constraint was a no-op that only
         // ever computed the difference without enforcing anything.
         let change_value = match (self.input_value, self.withdraw_amount) {
-            (Some(input), Some(withdraw)) => Some(input.checked_sub(withdraw).unwrap_or(0)),
+            (Some(input), Some(withdraw)) => Some(input.saturating_sub(withdraw)),
             _ => None,
         };
         let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;

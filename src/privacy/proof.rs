@@ -377,25 +377,21 @@ impl ProofVerifier {
         }
     }
 
-    /// Split verification into chunks for distributed processing
+    /// Split verification into chunks for distributed processing.
+    ///
+    /// Range checks for input/output amounts are enforced inside the
+    /// TransferCircuit (#60); the host-level chunked verifier no
+    /// longer needs a separate `RangeProof` chunk and so we emit only
+    /// the output-commitment and nullifier-uniqueness chunks here.
     pub fn create_verification_chunks(tx: &TransferTx) -> Vec<VerificationChunk> {
-        let mut chunks = Vec::new();
-
-        // Chunk 1: Output commitments
-        chunks.push(VerificationChunk::OutputCommitments {
-            commitments: tx.output_commitments.clone(),
-        });
-
-        // Chunk 2: Nullifier uniqueness
-        chunks.push(VerificationChunk::NullifierUniqueness {
-            nullifiers: tx.input_nullifiers.clone(),
-        });
-
-        // Range checks for input/output amounts are enforced inside the
-        // TransferCircuit (#60); the host-level chunked verifier no
-        // longer needs a separate `RangeProof` chunk.
-
-        chunks
+        vec![
+            VerificationChunk::OutputCommitments {
+                commitments: tx.output_commitments.clone(),
+            },
+            VerificationChunk::NullifierUniqueness {
+                nullifiers: tx.input_nullifiers.clone(),
+            },
+        ]
     }
 
     /// Aggregate chunk verification results
@@ -471,8 +467,10 @@ mod tests {
 
         let chunks = ProofVerifier::create_verification_chunks(&tx);
 
-        // Should have: outputs, nullifiers, and 1 range proof
-        assert_eq!(chunks.len(), 3);
+        // Should have: output commitments + nullifier uniqueness.
+        // Range checks moved in-circuit in #60, so the host-level
+        // chunked verifier no longer emits a separate range chunk.
+        assert_eq!(chunks.len(), 2);
     }
 
     #[test]
