@@ -523,16 +523,24 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
+        // Range-constrain the withdraw amount to `[0, 2^64)`. Public
+        // inputs cannot be range-constrained at allocation, so we
+        // commit to a private \`UInt64\` mirror and enforce equality
+        // between the public-input \`FpVar\` and the bit-derived view.
+        // The prover must therefore choose a u64-shaped withdraw amount
+        // before producing a proof; a near-field-prime amount fails
+        // the equality check inside the circuit.
+        let (_withdraw_bits, withdraw_amount_range_var) =
+            alloc_u64_witness(cs.clone(), self.withdraw_amount)?;
+        withdraw_amount_var.enforce_equal(&withdraw_amount_range_var)?;
+
         // ────────────────────────────────────────────────────────────────
         // Private witnesses — lifted to FpVar<Fr>. The old byte-array
         // witness `input_value_bytes` is gone: Poseidon consumes field
         // elements, not u64 bytes.
         // ────────────────────────────────────────────────────────────────
-        let input_value_var = FpVar::new_witness(cs.clone(), || {
-            self.input_value
-                .map(Fr::from)
-                .ok_or(SynthesisError::AssignmentMissing)
-        })?;
+        let (_input_value_bits, input_value_var) =
+            alloc_u64_witness(cs.clone(), self.input_value)?;
 
         let input_randomness_var = FpVar::new_witness(cs.clone(), || {
             Ok(self
@@ -555,11 +563,24 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
-        // CONSTRAINT 1: input_value >= withdraw_amount.
-        // Subtraction forces the witness assignment to produce a
-        // non-negative difference under native field arithmetic; a real
-        // range proof is still a TODO and lives outside this migration.
-        let _difference = &input_value_var - &withdraw_amount_var;
+        // CONSTRAINT 1: input_value >= withdraw_amount, enforced by
+        // committing to a u64-bounded \`change\` witness and binding it
+        // to the field-level subtraction.
+        //
+        // If \`withdraw_amount\` exceeds \`input_value\`, the field
+        // subtraction \`input_value - withdraw_amount\` wraps mod p to
+        // a near-field-prime value far outside \`[0, 2^64)\`, and the
+        // \`change\` u64 cannot satisfy the equality. The circuit
+        // therefore rejects underflow by construction — the
+        // pre-#60 version of this constraint was a no-op that only
+        // ever computed the difference without enforcing anything.
+        let change_value = match (self.input_value, self.withdraw_amount) {
+            (Some(input), Some(withdraw)) => Some(input.checked_sub(withdraw).unwrap_or(0)),
+            _ => None,
+        };
+        let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;
+        let computed_change = &input_value_var - &withdraw_amount_var;
+        change_var.enforce_equal(&computed_change)?;
 
         // CONSTRAINT 2: input commitment is in the Merkle tree under
         // the public `merkle_root`. The commitment is computed with the
