@@ -70,6 +70,9 @@ struct PollerState {
     last_signature: Arc<RwLock<Option<Signature>>>,
     seen_signatures: Arc<RwLock<HashSet<Signature>>>,
     last_processed_slot: Arc<RwLock<u64>>,
+    /// Slot count above which the listener emits a warning each poll —
+    /// pulled from [`BridgeConfig::event_lag_warn_threshold_slots`].
+    lag_warn_threshold_slots: u64,
 }
 
 impl EventListener {
@@ -117,6 +120,7 @@ impl EventListener {
             last_signature: Arc::clone(&self.last_signature),
             seen_signatures: Arc::clone(&self.seen_signatures),
             last_processed_slot: Arc::clone(&self.last_processed_slot),
+            lag_warn_threshold_slots: self.config.event_lag_warn_threshold_slots,
         };
         let running = Arc::clone(&self.running);
         let poll_interval = self.config.poll_interval_secs;
@@ -208,7 +212,57 @@ impl EventListener {
             stats_guard.last_block = latest_slot;
         }
 
+        Self::update_lag_metric(state).await;
+
         Ok(processed)
+    }
+
+    /// Pull the current Solana slot, compute the listener's lag against
+    /// the most recently processed slot, persist the lag in
+    /// [`BridgeStats::event_lag_slots`], and warn loudly if the lag
+    /// exceeds the configured threshold.
+    ///
+    /// During the cold-start phase (`last_processed_slot == 0`) the
+    /// warning is suppressed: the listener has not seen any events yet
+    /// and would otherwise report a "lag" equal to the chain's full
+    /// recorded history.
+    async fn update_lag_metric(state: &PollerState) {
+        let rpc = Arc::clone(&state.rpc_client);
+        let current_slot = match tokio::task::spawn_blocking(move || rpc.get_slot()).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(e)) => {
+                log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "skipping lag metric — getSlot failed: {}",
+                    e
+                );
+                return;
+            }
+            Err(e) => {
+                log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "skipping lag metric — getSlot task panicked: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        let last_processed = *state.last_processed_slot.read().await;
+        let lag = current_slot.saturating_sub(last_processed);
+
+        state.stats.write().await.event_lag_slots = lag;
+
+        if last_processed > 0 && lag > state.lag_warn_threshold_slots {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "deposit listener is {} slots behind chain tip (current={}, last_processed={}, threshold={})",
+                lag,
+                current_slot,
+                last_processed,
+                state.lag_warn_threshold_slots
+            );
+        }
     }
 
     /// Fetch deposit events newer than `cursor` from the Solana RPC.

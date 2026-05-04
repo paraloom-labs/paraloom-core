@@ -75,6 +75,13 @@ pub struct BridgeConfig {
 
     /// Bridge vault address (PDA for holding funds)
     pub bridge_vault: Option<String>,
+
+    /// Slot lag (current Solana slot − most recently processed slot) at
+    /// which the deposit listener will start logging a warning each
+    /// poll. ~1500 slots is roughly 10 minutes on Solana mainnet at
+    /// 400ms slot times — high enough to ignore brief network blips,
+    /// low enough that a stuck listener is visible within a few polls.
+    pub event_lag_warn_threshold_slots: u64,
 }
 
 impl Default for BridgeConfig {
@@ -96,6 +103,10 @@ impl Default for BridgeConfig {
                 .unwrap_or(false),
             authority_keypair_path: std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH").ok(),
             bridge_vault: std::env::var("BRIDGE_VAULT_ADDRESS").ok(),
+            event_lag_warn_threshold_slots: std::env::var("BRIDGE_EVENT_LAG_WARN_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1500),
         }
     }
 }
@@ -117,4 +128,9 @@ pub struct BridgeStats {
 
     /// Last processed block
     pub last_block: u64,
+
+    /// Listener event lag in Solana slots, computed each poll as
+    /// `current_slot − last_processed_slot`. Useful as a metric to
+    /// drive operator dashboards or pageable alerts.
+    pub event_lag_slots: u64,
 }
