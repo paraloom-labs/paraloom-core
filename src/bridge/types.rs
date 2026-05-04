@@ -48,6 +48,12 @@ pub struct WithdrawalRequest {
     /// Fee
     pub fee: u64,
 
+    /// Solana slot past which the on-chain program will reject this
+    /// request. Bound at construction time to give every withdrawal a
+    /// finite window — see #61 and the on-chain `WithdrawalExpired`
+    /// error variant.
+    pub expiration_slot: u64,
+
     /// zkSNARK proof
     pub proof: Vec<u8>,
 }
@@ -82,6 +88,13 @@ pub struct BridgeConfig {
     /// 400ms slot times — high enough to ignore brief network blips,
     /// low enough that a stuck listener is visible within a few polls.
     pub event_lag_warn_threshold_slots: u64,
+
+    /// Slots past `getSlot` at which a freshly built `WithdrawalRequest`
+    /// will expire. ~150 slots ≈ 60 seconds on Solana mainnet at
+    /// ~400ms slots — long enough to absorb the round trip through L2
+    /// consensus and the RPC submit, short enough that a leaked
+    /// request becomes useless within ~1 minute. See #61.
+    pub withdrawal_expiration_window_slots: u64,
 }
 
 impl Default for BridgeConfig {
@@ -107,6 +120,12 @@ impl Default for BridgeConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1500),
+            withdrawal_expiration_window_slots: std::env::var(
+                "BRIDGE_WITHDRAWAL_EXPIRATION_WINDOW",
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(150),
         }
     }
 }

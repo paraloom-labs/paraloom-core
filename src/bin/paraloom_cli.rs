@@ -651,8 +651,11 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 println!("Nullifier: {}", hex::encode(&nullifier[..8]));
                 println!("Proof length: {} bytes\n", proof.len());
 
-                // Create withdraw instruction
+                // Create withdraw instruction. The CLI is a manual flow
+                // tool; production callers compute the expiration_slot
+                // from `getSlot() + bridge_config.withdrawal_expiration_window_slots`.
                 println!("Creating withdraw instruction...");
+                let expiration_slot = u64::MAX;
                 let ix = create_withdraw_instruction(
                     &program_id,
                     &authority.pubkey(),
@@ -660,6 +663,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     recipient,
                     nullifier,
                     withdrawal_lamports,
+                    expiration_slot,
                     proof,
                 )
                 .context("Failed to create withdraw instruction")?;

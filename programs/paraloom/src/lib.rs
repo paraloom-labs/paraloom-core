@@ -82,11 +82,24 @@ pub mod paraloom_program {
         Ok(())
     }
 
-    /// Withdraw SOL from the privacy pool
+    /// Withdraw SOL from the privacy pool.
+    ///
+    /// Replay protection has two layers:
+    ///  1. The nullifier-keyed PDA (`seeds = [b"nullifier", nullifier]`)
+    ///     is `init`'d as part of this call. A second submission with
+    ///     the same nullifier — the bit-pattern uniquely identifying
+    ///     the spent note — fails on-chain because the PDA already
+    ///     exists. This is the primary defense.
+    ///  2. The caller commits to an `expiration_slot` at construction
+    ///     time. The program rejects the call if the current Solana
+    ///     slot is past it, so a request that leaks (e.g. through a
+    ///     stale RPC, a forked program state, or a long-running
+    ///     mempool) cannot be submitted indefinitely.
     pub fn withdraw(
         ctx: Context<Withdraw>,
         nullifier: [u8; 32],
         amount: u64,
+        expiration_slot: u64,
         proof: Vec<u8>,
     ) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
@@ -94,6 +107,12 @@ pub mod paraloom_program {
         require!(!bridge_state.paused, BridgeError::BridgePaused);
         require!(amount > 0, BridgeError::InvalidAmount);
         require!(!proof.is_empty(), BridgeError::InvalidProof);
+
+        let current_slot = Clock::get()?.slot;
+        require!(
+            current_slot <= expiration_slot,
+            BridgeError::WithdrawalExpired
+        );
 
         let vault_balance = ctx.accounts.bridge_vault.lamports();
         require!(vault_balance >= amount, BridgeError::InsufficientFunds);
@@ -748,4 +767,7 @@ pub enum BridgeError {
 
     #[msg("Invalid validator")]
     InvalidValidator,
+
+    #[msg("Withdrawal request expired (current slot > expiration_slot)")]
+    WithdrawalExpired,
 }

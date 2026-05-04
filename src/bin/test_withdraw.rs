@@ -71,6 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create withdraw instruction
     println!("Creating withdraw instruction...");
+    // Use a far-future expiration_slot for this manual demo binary;
+    // the production submitter computes its expiration from
+    // `getSlot() + bridge_config.withdrawal_expiration_window_slots`.
+    let expiration_slot = u64::MAX;
     let ix = create_withdraw_instruction(
         &program_id,
         &authority.pubkey(),
@@ -78,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         recipient,
         nullifier,
         withdrawal_amount,
+        expiration_slot,
         proof,
     )?;
     println!("Instruction created\n");
