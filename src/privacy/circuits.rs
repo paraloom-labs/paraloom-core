@@ -11,7 +11,10 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
+use ark_r1cs_std::{
+    alloc::AllocVar, boolean::Boolean, eq::EqGadget, fields::fp::FpVar, fields::FieldVar,
+    uint64::UInt64,
+};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
@@ -19,6 +22,26 @@ use ark_std::rand::{CryptoRng, RngCore};
 use crate::privacy::poseidon::{
     poseidon_commit_gadget, poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
 };
+
+/// Allocate a private witness `u64` and return both the bit-decomposed
+/// `UInt64` (which carries the range constraint as a side effect of
+/// allocation — every bit is enforced to be `{0,1}`) and an `FpVar`
+/// view suitable for use in Poseidon hashes and field arithmetic.
+///
+/// The `FpVar` view is a free linear combination of the bits, so it
+/// adds no extra constraints beyond the 64 boolean constraints UInt64
+/// itself produces. This is the building block that gives every
+/// circuit's value witnesses a hard `[0, 2^64)` upper bound — without
+/// it, a malicious prover can assign `value` to a near-field-prime
+/// integer and forge withdrawals that exceed the deposited supply.
+fn alloc_u64_witness(
+    cs: ConstraintSystemRef<Fr>,
+    value: Option<u64>,
+) -> Result<(UInt64<Fr>, FpVar<Fr>), SynthesisError> {
+    let uint = UInt64::new_witness(cs, || value.ok_or(SynthesisError::AssignmentMissing))?;
+    let fp = Boolean::le_bits_to_fp_var(&uint.to_bits_le())?;
+    Ok((uint, fp))
+}
 
 /// Maximum number of inputs in a transfer (for batching)
 pub const MAX_INPUTS: usize = 2;
@@ -367,12 +390,14 @@ impl ConstraintSynthesizer<Fr> for DepositCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
-        // Private witness: amount as a native field element.
-        let value_var = FpVar::new_witness(cs.clone(), || {
-            self.value
-                .map(Fr::from)
-                .ok_or(SynthesisError::AssignmentMissing)
-        })?;
+        // Private witness: amount, range-constrained to `[0, 2^64)` via
+        // bit decomposition. Without this, a malicious prover could
+        // assign `value` to a near-field-prime integer and produce a
+        // commitment whose stored value vastly exceeds the deposited
+        // SOL — the foundation of the unbounded-mint attack the audit
+        // (#60) flagged. The `FpVar` view is the same as before so all
+        // downstream Poseidon hashing and arithmetic is unchanged.
+        let (_value_bits, value_var) = alloc_u64_witness(cs.clone(), self.value)?;
 
         // Private witness: 32-byte randomness lifted to Fr via modular
         // reduction. This matches the host-side `Note::commitment`
