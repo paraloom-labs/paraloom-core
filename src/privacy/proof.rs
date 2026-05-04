@@ -10,7 +10,9 @@ use ark_ff::PrimeField;
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use thiserror::Error;
 
 /// Proof verification result
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -171,31 +173,117 @@ impl VerificationChunk {
 /// artifact.
 pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v3.key";
 
-/// Global verifying key for withdrawal proofs
-/// Loaded once from disk and cached for all verifications
+/// Errors that can arise when loading the withdrawal verifying key from
+/// disk. Surfacing these as a typed enum (instead of `expect`-style
+/// panics) keeps a misconfigured node from crashing on the verification
+/// path and lets the operator see exactly what failed.
+#[derive(Debug, Error)]
+pub enum KeyLoadError {
+    /// The key file was not present at the resolved path.
+    #[error("verifying key file not found at '{}'", path.display())]
+    NotFound { path: PathBuf },
+
+    /// The key file existed but could not be read (permissions, I/O
+    /// error). The original `io::Error` is preserved for diagnostics.
+    #[error("failed to read verifying key from '{}': {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The bytes on disk did not deserialize into a valid Groth16
+    /// verifying key. This catches truncated files, files written by an
+    /// incompatible toolchain version, and files that point at the wrong
+    /// circuit (a `_v2` key against the current `_v3` circuit, for
+    /// example).
+    #[error("verifying key at '{}' is malformed: {source}", path.display())]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: ark_serialize::SerializationError,
+    },
+}
+
+/// Global verifying key for withdrawal proofs.
+///
+/// Lazily populated on first successful load; subsequent calls reuse the
+/// cached reference. Failed loads do *not* poison the cache — a node
+/// whose key file is restored after a misconfiguration can recover
+/// without a process restart.
 static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bls12_381>> = OnceLock::new();
+
+/// Resolve the on-disk path of the withdrawal verifying key, honoring
+/// the `WITHDRAWAL_VERIFYING_KEY_PATH` environment variable as an
+/// override and falling back to [`DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH`].
+fn resolve_key_path() -> PathBuf {
+    std::env::var_os("WITHDRAWAL_VERIFYING_KEY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH))
+}
+
+/// Load and deserialize a Groth16 verifying key from a specific path.
+///
+/// This is the pure, testable core of the loading logic — given a path,
+/// produce either the key or a typed error explaining what went wrong.
+/// The caching wrapper [`ProofVerifier::get_verifying_key`] composes
+/// this with a global `OnceLock`.
+pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bls12_381>, KeyLoadError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(KeyLoadError::NotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(e) => {
+            return Err(KeyLoadError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+
+    VerifyingKey::<Bls12_381>::deserialize_compressed(&bytes[..]).map_err(|e| {
+        KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })
+}
 
 /// ZK Proof verifier interface
 pub struct ProofVerifier;
 
 impl ProofVerifier {
-    /// Load withdrawal verifying key from disk (cached)
-    fn get_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, String> {
-        WITHDRAWAL_VERIFYING_KEY.get_or_init(|| {
-            let key_path = std::env::var("WITHDRAWAL_VERIFYING_KEY_PATH")
-                .unwrap_or_else(|_| DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH.to_string());
+    /// Load withdrawal verifying key from disk (cached on success).
+    ///
+    /// On a cache hit, returns the cached reference. On a cache miss,
+    /// resolves the configured path, attempts to load and deserialize,
+    /// caches the result on success, and returns a typed
+    /// [`KeyLoadError`] on failure. Failed loads are *not* cached, so a
+    /// node that is reconfigured at runtime can pick up a corrected key
+    /// without restarting.
+    fn get_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, KeyLoadError> {
+        if let Some(vk) = WITHDRAWAL_VERIFYING_KEY.get() {
+            return Ok(vk);
+        }
 
-            let key_bytes = std::fs::read(&key_path)
-                .map_err(|e| format!("Failed to read verifying key from {}: {}", key_path, e))
-                .expect("Verifying key file not found");
+        let path = resolve_key_path();
+        let key = load_verifying_key(&path).inspect_err(|e| {
+            log::error!(
+                target: "paraloom::privacy::proof",
+                "withdrawal verifying key load failed: {}",
+                e
+            );
+        })?;
 
-            VerifyingKey::<Bls12_381>::deserialize_compressed(&key_bytes[..])
-                .expect("Failed to deserialize verifying key")
-        });
-
-        WITHDRAWAL_VERIFYING_KEY
+        // First write wins; if a concurrent caller raced us, drop our
+        // copy and read theirs. Either way the cache is now populated.
+        let _ = WITHDRAWAL_VERIFYING_KEY.set(key);
+        Ok(WITHDRAWAL_VERIFYING_KEY
             .get()
-            .ok_or_else(|| "Verifying key not loaded".to_string())
+            .expect("verifying key cache populated above"))
     }
 
     /// Verify a deposit transaction
@@ -235,13 +323,15 @@ impl ProofVerifier {
             };
         }
 
-        // Load verifying key
+        // Load verifying key. The loader has already logged the failure
+        // with the path that was attempted; here we just propagate the
+        // reason into the structured verification result so the caller
+        // can return an actionable error to the operator.
         let verifying_key = match Self::get_verifying_key() {
             Ok(vk) => vk,
             Err(e) => {
-                log::error!("Failed to load verifying key: {}", e);
                 return VerificationResult::Invalid {
-                    reason: format!("Verifying key not available: {}", e),
+                    reason: format!("verifying key unavailable: {}", e),
                 };
             }
         };
@@ -438,5 +528,60 @@ mod tests {
         let chunk = VerificationChunk::MerkleProof { leaf, path, root };
 
         assert!(chunk.verify().is_valid());
+    }
+
+    // ─── Verifying key load — error path coverage ─────────────────────
+    //
+    // These exercise [`load_verifying_key`] directly rather than the
+    // cached [`ProofVerifier::get_verifying_key`] wrapper, since the
+    // latter relies on a process-wide `OnceLock` that would otherwise
+    // bleed state between tests in the same binary.
+
+    #[test]
+    fn load_verifying_key_missing_file_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does_not_exist.key");
+
+        let err = load_verifying_key(&path).expect_err("missing file must error");
+        match err {
+            KeyLoadError::NotFound { path: reported } => assert_eq!(reported, path),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_verifying_key_truncated_returns_malformed() {
+        // A genuine verifying key serializes to several hundred bytes;
+        // anything visibly short of that fails inside ark-serialize and
+        // surfaces as Malformed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.key");
+        std::fs::write(&path, [0u8; 4]).expect("write truncated key");
+
+        let err = load_verifying_key(&path).expect_err("truncated bytes must error");
+        assert!(
+            matches!(err, KeyLoadError::Malformed { .. }),
+            "expected Malformed, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_verifying_key_random_garbage_returns_malformed() {
+        // Sanity check that arbitrary nonsense of plausible length is
+        // also rejected — caught here rather than in the `expect()` of
+        // the previous implementation. Using a deterministic byte
+        // pattern keeps the test reproducible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garbage.key");
+        let garbage: Vec<u8> = (0..512).map(|i| (i * 31) as u8).collect();
+        std::fs::write(&path, &garbage).expect("write garbage key");
+
+        let err = load_verifying_key(&path).expect_err("garbage bytes must error");
+        assert!(
+            matches!(err, KeyLoadError::Malformed { .. }),
+            "expected Malformed, got {:?}",
+            err
+        );
     }
 }
