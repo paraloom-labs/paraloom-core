@@ -14,11 +14,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Minimum validators required for consensus (7 out of 10)
-pub const MIN_VALIDATORS_FOR_CONSENSUS: usize = 7;
+/// Default minimum validator count for the 7-of-10 BFT consensus.
+/// The actual threshold is configurable per [`WithdrawalConsensus`]
+/// instance and per [`WithdrawalVerificationCoordinator`]; this is
+/// the fallback used when no override is supplied.
+pub const DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS: usize = 7;
 
-/// Total validators selected for verification
-pub const TOTAL_VALIDATORS: usize = 10;
+/// Default validator-set size for the 7-of-10 BFT consensus. Used
+/// only as the divisor in [`WithdrawalConsensus::completion_percentage`]
+/// when no override is supplied.
+pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
+
+/// Backwards-compatible alias for [`DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS`].
+/// Pre-#69 callers imported `MIN_VALIDATORS_FOR_CONSENSUS` directly;
+/// keeping the alias avoids a wire break for external consumers while
+/// the rename ripples through the workspace.
+pub const MIN_VALIDATORS_FOR_CONSENSUS: usize = DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS;
+
+/// Backwards-compatible alias for [`DEFAULT_TOTAL_VALIDATORS`].
+pub const TOTAL_VALIDATORS: usize = DEFAULT_TOTAL_VALIDATORS;
 
 /// Default reputation floor for consensus participation. A validator
 /// whose reputation drops below this is excluded from vote aggregation
@@ -131,11 +145,38 @@ pub struct WithdrawalConsensus {
 
     /// Deadline for consensus (30 seconds)
     pub deadline: u64,
+
+    /// Minimum eligible-vote count required for this consensus to be
+    /// considered reached. Configurable so different validator-set
+    /// sizes can use different BFT thresholds (e.g. 5-of-7 on a small
+    /// devnet, 14-of-20 on a larger network) without recompiling.
+    pub min_validators_for_consensus: usize,
+
+    /// Total validator-set size used as the divisor in
+    /// [`completion_percentage`]. Must agree with the actual size of
+    /// the validator pool the coordinator drew from; mismatch only
+    /// affects the reported percentage, not consensus correctness.
+    pub total_validators: usize,
 }
 
 impl WithdrawalConsensus {
-    /// Create new consensus state
+    /// Create new consensus state with the default 7-of-10 thresholds.
+    /// Use [`Self::new_with_thresholds`] when the coordinator is
+    /// configured for a different validator-set size.
     pub fn new(request: WithdrawalVerificationRequest) -> Self {
+        Self::new_with_thresholds(
+            request,
+            DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+            DEFAULT_TOTAL_VALIDATORS,
+        )
+    }
+
+    /// Create new consensus state with explicit BFT thresholds.
+    pub fn new_with_thresholds(
+        request: WithdrawalVerificationRequest,
+        min_validators_for_consensus: usize,
+        total_validators: usize,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -147,6 +188,8 @@ impl WithdrawalConsensus {
             votes: Arc::new(RwLock::new(HashMap::new())),
             started_at: now,
             deadline: now + 30, // 30 second deadline
+            min_validators_for_consensus,
+            total_validators,
         }
     }
 
@@ -197,7 +240,7 @@ impl WithdrawalConsensus {
         let eligible = self
             .count_eligible_votes(reputation_tracker, min_reputation)
             .await;
-        eligible >= MIN_VALIDATORS_FOR_CONSENSUS
+        eligible >= self.min_validators_for_consensus
     }
 
     /// Check if consensus deadline has passed
@@ -272,11 +315,11 @@ impl WithdrawalConsensus {
             }
         }
 
-        if eligible.len() < MIN_VALIDATORS_FOR_CONSENSUS {
+        if eligible.len() < self.min_validators_for_consensus {
             return Err(anyhow!(
                 "Not enough eligible votes: {} < {} (excluded {} below reputation {})",
                 eligible.len(),
-                MIN_VALIDATORS_FOR_CONSENSUS,
+                self.min_validators_for_consensus,
                 excluded,
                 min_reputation
             ));
@@ -285,13 +328,13 @@ impl WithdrawalConsensus {
         let valid_count = eligible.iter().filter(|v| v.is_valid()).count();
         let invalid_count = eligible.len() - valid_count;
 
-        if valid_count >= MIN_VALIDATORS_FOR_CONSENSUS {
+        if valid_count >= self.min_validators_for_consensus {
             Ok(VerificationVote::Valid)
         } else {
             Ok(VerificationVote::Invalid {
                 reason: format!(
                     "Consensus rejected: {} valid, {} invalid (need {})",
-                    valid_count, invalid_count, MIN_VALIDATORS_FOR_CONSENSUS
+                    valid_count, invalid_count, self.min_validators_for_consensus
                 ),
             })
         }
@@ -300,7 +343,7 @@ impl WithdrawalConsensus {
     /// Get completion percentage
     pub async fn completion_percentage(&self) -> f64 {
         let votes = self.votes.read().await;
-        (votes.len() as f64 / TOTAL_VALIDATORS as f64) * 100.0
+        (votes.len() as f64 / self.total_validators as f64) * 100.0
     }
 
     /// Get vote counts
@@ -339,6 +382,16 @@ pub struct WithdrawalVerificationCoordinator {
     /// Reputation floor for consensus participation. Configurable so an
     /// operator can tighten or loosen the gate without recompiling.
     min_reputation_for_consensus: u64,
+
+    /// Minimum eligible-vote count for the BFT quorum. Coordinator-
+    /// scoped so a single coordinator can run different validator-set
+    /// sizes (e.g. 5-of-7 on devnet, 14-of-20 on mainnet) without a
+    /// recompile.
+    min_validators_for_consensus: usize,
+
+    /// Total validator-set size used as the divisor in
+    /// completion-percentage reporting.
+    total_validators: usize,
 }
 
 impl WithdrawalVerificationCoordinator {
@@ -352,7 +405,44 @@ impl WithdrawalVerificationCoordinator {
             slashing_tracker: Arc::new(SlashingTracker::new()),
             timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
             min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
+            min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+            total_validators: DEFAULT_TOTAL_VALIDATORS,
         }
+    }
+
+    /// Override the BFT thresholds for this coordinator. The two
+    /// values must satisfy `min_validators_for_consensus <= total_validators`;
+    /// the setter logs a warning and silently swaps to defaults if
+    /// that invariant is violated to avoid an unrecoverable
+    /// misconfiguration at runtime.
+    pub fn set_consensus_thresholds(
+        &mut self,
+        min_validators_for_consensus: usize,
+        total_validators: usize,
+    ) {
+        if min_validators_for_consensus == 0
+            || total_validators == 0
+            || min_validators_for_consensus > total_validators
+        {
+            log::warn!(
+                target: "paraloom::consensus",
+                "ignoring invalid consensus thresholds (min={} total={}); falling back to {}/{}",
+                min_validators_for_consensus,
+                total_validators,
+                DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+                DEFAULT_TOTAL_VALIDATORS
+            );
+            self.min_validators_for_consensus = DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS;
+            self.total_validators = DEFAULT_TOTAL_VALIDATORS;
+            return;
+        }
+        self.min_validators_for_consensus = min_validators_for_consensus;
+        self.total_validators = total_validators;
+    }
+
+    /// Read the configured BFT thresholds as `(min_validators, total_validators)`.
+    pub fn consensus_thresholds(&self) -> (usize, usize) {
+        (self.min_validators_for_consensus, self.total_validators)
     }
 
     /// Reference to the slashing-evidence log. Tests and downstream
@@ -509,16 +599,20 @@ impl WithdrawalVerificationCoordinator {
             return Err(anyhow!("No validators available"));
         }
 
-        if validators.len() < MIN_VALIDATORS_FOR_CONSENSUS {
+        if validators.len() < self.min_validators_for_consensus {
             return Err(anyhow!(
                 "Not enough validators: {} < {}",
                 validators.len(),
-                MIN_VALIDATORS_FOR_CONSENSUS
+                self.min_validators_for_consensus
             ));
         }
 
         let request_id = request.request_id.clone();
-        let consensus = WithdrawalConsensus::new(request);
+        let consensus = WithdrawalConsensus::new_with_thresholds(
+            request,
+            self.min_validators_for_consensus,
+            self.total_validators,
+        );
 
         let mut pending = self.pending.write().await;
         pending.insert(request_id.clone(), consensus);
@@ -1209,5 +1303,108 @@ mod tests {
                 SlashingEvidence::Equivocation { .. }
             ));
         }
+    }
+
+    /// Defaults pin the well-known 7-of-10 BFT thresholds; a regression
+    /// that silently changes either default would shift every downstream
+    /// quorum calculation.
+    #[test]
+    fn test_default_consensus_thresholds() {
+        let coordinator = WithdrawalVerificationCoordinator::new();
+        assert_eq!(
+            coordinator.consensus_thresholds(),
+            (
+                DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+                DEFAULT_TOTAL_VALIDATORS
+            )
+        );
+    }
+
+    /// Setter installs a valid 5-of-7 configuration and the
+    /// coordinator stamps the new thresholds onto every subsequently
+    /// created \`WithdrawalConsensus\`. The completion percentage uses
+    /// the new total validator count as its divisor.
+    #[tokio::test]
+    async fn test_set_consensus_thresholds_propagates_to_consensus() {
+        let mut coordinator = WithdrawalVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(5, 7);
+        assert_eq!(coordinator.consensus_thresholds(), (5, 7));
+
+        for i in 0..7 {
+            coordinator.register_validator(NodeId(vec![i])).await;
+        }
+
+        let request = WithdrawalVerificationRequest {
+            request_id: "thresh-cfg".to_string(),
+            nullifier: [1u8; 32],
+            amount: 1,
+            recipient: [0u8; 32],
+            proof: vec![0u8; 32],
+            fee: 0,
+            timestamp: 0,
+        };
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        // Five Valid votes is a quorum at 5-of-7. Confirm via the
+        // pending consensus state directly.
+        for i in 0..5 {
+            coordinator
+                .submit_result(WithdrawalVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: NodeId(vec![i]),
+                    vote: VerificationVote::Valid,
+                    timestamp: 0,
+                })
+                .await
+                .unwrap();
+        }
+        let result = coordinator
+            .check_consensus(&request.request_id)
+            .await
+            .unwrap()
+            .expect("quorum at 5-of-7 must be reached");
+        assert!(result.is_valid());
+
+        // Completion percentage uses the new total of 7 in its
+        // divisor: 5 votes / 7 total ≈ 71%, never the old 50%.
+        let pending = coordinator.pending.read().await;
+        let consensus = pending.get(&request.request_id).unwrap();
+        let pct = consensus.completion_percentage().await;
+        assert!(
+            (pct - (5.0 / 7.0 * 100.0)).abs() < 0.01,
+            "expected ~71%, got {}",
+            pct
+        );
+    }
+
+    /// Invalid threshold combinations (zero, or min > total) must be
+    /// rejected and fall back to the defaults rather than installing
+    /// an unrecoverable configuration.
+    #[test]
+    fn test_set_consensus_thresholds_rejects_invalid() {
+        let mut coordinator = WithdrawalVerificationCoordinator::new();
+
+        coordinator.set_consensus_thresholds(0, 5);
+        assert_eq!(
+            coordinator.consensus_thresholds(),
+            (
+                DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+                DEFAULT_TOTAL_VALIDATORS
+            ),
+            "zero min must fall back to defaults"
+        );
+
+        coordinator.set_consensus_thresholds(8, 5);
+        assert_eq!(
+            coordinator.consensus_thresholds(),
+            (
+                DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+                DEFAULT_TOTAL_VALIDATORS
+            ),
+            "min > total must fall back to defaults"
+        );
     }
 }
