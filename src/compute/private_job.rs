@@ -35,6 +35,7 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -333,8 +334,7 @@ impl PrivateJobResult {
             let dummy_owner = [0u8; 32];
             let dummy_spending_key = [0u8; 32];
 
-            let dummy_input_hash =
-                crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
+            let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
             let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
                 dummy_input_hash,
                 &dummy_input_randomness,
@@ -429,11 +429,10 @@ impl PrivateJobResult {
 
             // Deserialize proof
             use ark_serialize::CanonicalDeserialize;
-            let proof =
-                ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(
-                    proof_bytes.as_slice(),
-                )
-                .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            let proof = ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(
+                proof_bytes.as_slice(),
+            )
+            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
 
             // Public inputs for the v0.4 ComputeCircuit shape:
             //   [code_hash_fr, input_commitment, output_commitment, input_nullifier]
@@ -442,30 +441,26 @@ impl PrivateJobResult {
             // (`code_hash = [0; 32]`, dummy input/owner/spending_key)
             // until the runtime threads real ownership info through;
             // the verifier mirrors those placeholders exactly.
-            let code_hash_fr =
-                ark_bls12_381::Fr::from_le_bytes_mod_order(&[0u8; 32]);
+            let code_hash_fr = ark_bls12_381::Fr::from_le_bytes_mod_order(&[0u8; 32]);
 
             let dummy_input = vec![0u8];
             let dummy_input_randomness = [0u8; 32];
             let dummy_owner = [0u8; 32];
             let dummy_spending_key = [0u8; 32];
 
-            let dummy_input_hash =
-                crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
-            let dummy_input_commitment_fr =
-                crate::compute::ComputeCircuit::compute_commitment(
-                    dummy_input_hash,
-                    &dummy_input_randomness,
-                    &dummy_owner,
-                );
+            let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
+            let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+                dummy_input_hash,
+                &dummy_input_randomness,
+                &dummy_owner,
+            );
 
             // The output commitment is taken from the result struct —
             // the prover serialised it there. Lift the 32-byte buffer
             // to Fr exactly as the circuit's public-input allocation
             // does on its side.
-            let output_commitment_fr = ark_bls12_381::Fr::from_le_bytes_mod_order(
-                result.output_commitment.as_bytes(),
-            );
+            let output_commitment_fr =
+                ark_bls12_381::Fr::from_le_bytes_mod_order(result.output_commitment.as_bytes());
 
             let input_nullifier_fr = crate::compute::ComputeCircuit::compute_nullifier(
                 dummy_input_commitment_fr,

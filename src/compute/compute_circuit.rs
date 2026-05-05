@@ -234,7 +234,8 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
         })?;
 
         let input_nullifier_var = FpVar::new_input(cs.clone(), || {
-            self.input_nullifier.ok_or(SynthesisError::AssignmentMissing)
+            self.input_nullifier
+                .ok_or(SynthesisError::AssignmentMissing)
         })?;
 
         // ── Private witnesses ──
@@ -246,12 +247,10 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
         let owner_address = self.owner_address.unwrap_or([0u8; 32]);
         let spending_key = self.spending_key.unwrap_or([0u8; 32]);
 
-        let input_hash_var = FpVar::new_witness(cs.clone(), || {
-            Ok(Self::hash_data_to_field(&input_data))
-        })?;
-        let output_hash_var = FpVar::new_witness(cs.clone(), || {
-            Ok(Self::hash_data_to_field(&output_data))
-        })?;
+        let input_hash_var =
+            FpVar::new_witness(cs.clone(), || Ok(Self::hash_data_to_field(&input_data)))?;
+        let output_hash_var =
+            FpVar::new_witness(cs.clone(), || Ok(Self::hash_data_to_field(&output_data)))?;
 
         let input_randomness_var = FpVar::new_witness(cs.clone(), || {
             Ok(Fr::from_le_bytes_mod_order(&input_randomness))
@@ -412,18 +411,11 @@ mod tests {
         // Host-side derivation, exactly mirroring the constraints.
         let input_hash = ComputeCircuit::hash_data_to_field(&input_data);
         let output_hash = ComputeCircuit::hash_data_to_field(&output_data);
-        let input_commitment = ComputeCircuit::compute_commitment(
-            input_hash,
-            &input_randomness,
-            &owner,
-        );
-        let output_commitment = ComputeCircuit::compute_commitment(
-            output_hash,
-            &output_randomness,
-            &owner,
-        );
-        let input_nullifier =
-            ComputeCircuit::compute_nullifier(input_commitment, &spending_key);
+        let input_commitment =
+            ComputeCircuit::compute_commitment(input_hash, &input_randomness, &owner);
+        let output_commitment =
+            ComputeCircuit::compute_commitment(output_hash, &output_randomness, &owner);
+        let input_nullifier = ComputeCircuit::compute_nullifier(input_commitment, &spending_key);
 
         let circuit = ComputeCircuit::with_witness(
             code_hash,
