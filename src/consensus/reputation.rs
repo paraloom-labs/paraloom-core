@@ -70,10 +70,7 @@ pub struct ValidatorMetrics {
 impl ValidatorMetrics {
     /// Create new metrics for a validator
     pub fn new(node_id: NodeId) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = crate::utils::now_unix_seconds();
 
         Self {
             node_id,
@@ -97,10 +94,7 @@ impl ValidatorMetrics {
 
     /// Calculate days since last active
     pub fn days_inactive(&self) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = crate::utils::now_unix_seconds();
 
         (now.saturating_sub(self.last_active)) / SECONDS_PER_DAY
     }
@@ -131,10 +125,7 @@ impl ValidatorMetrics {
 
     /// Update last active timestamp
     pub fn mark_active(&mut self) {
-        self.last_active = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        self.last_active = crate::utils::now_unix_seconds();
     }
 }
 

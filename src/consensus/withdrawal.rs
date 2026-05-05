@@ -78,10 +78,7 @@ pub struct WithdrawalVerificationRequest {
 impl WithdrawalVerificationRequest {
     /// Create new verification request from withdrawal
     pub fn from_withdrawal(request: &WithdrawalRequest) -> Self {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = crate::utils::now_unix_seconds();
 
         Self {
             request_id: format!("withdrawal_{}", timestamp),
@@ -177,10 +174,7 @@ impl WithdrawalConsensus {
         min_validators_for_consensus: usize,
         total_validators: usize,
     ) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = crate::utils::now_unix_seconds();
 
         Self {
             request_id: request.request_id.clone(),
@@ -245,11 +239,7 @@ impl WithdrawalConsensus {
 
     /// Check if consensus deadline has passed
     pub fn is_timed_out(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
+        let now = crate::utils::now_unix_seconds();
         now > self.deadline
     }
 
