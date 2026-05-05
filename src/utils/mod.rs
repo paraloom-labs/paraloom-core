@@ -1,5 +1,22 @@
 //! Utility functions
 
+/// Wall-clock seconds since the UNIX epoch.
+///
+/// `SystemTime::now().duration_since(UNIX_EPOCH)` only fails when the
+/// system clock is set before 1970-01-01 — possible in theory on a
+/// catastrophically misconfigured machine, never in practice on a
+/// well-managed validator. The previous code used `.unwrap()` for
+/// this, which would crash the process mid-consensus on such a clock.
+/// `unwrap_or_default()` returns `Duration::ZERO`, equivalent to a
+/// 1970 timestamp; the misconfiguration becomes visible through
+/// "1970-01-01" timestamps in logs and metrics rather than a panic.
+pub fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Convert bytes to a hex string
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
