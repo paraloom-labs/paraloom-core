@@ -96,8 +96,17 @@ impl NetworkManager {
             })
             .boxed();
 
+        // Gossipsub `max_transmit_size` (#69, follow-up to audit #10).
+        // The previous value of 10 MiB allowed any peer to flood the
+        // network with messages larger than any legitimate paraloom
+        // payload — the only realistic gossiped objects are validator
+        // status pings, leader announcements, and small
+        // verification-request notifications, all well under 1 MiB.
+        // A tighter cap shrinks the DoS surface; revisit only if real
+        // measurements show a legitimate use case bumping the ceiling.
+        const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 1024 * 1024;
         let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .max_transmit_size(10 * 1024 * 1024)
+            .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
             .build()
             .map_err(|e| anyhow!("Failed to build gossipsub config: {}", e))?;
 
