@@ -934,4 +934,271 @@ mod tests {
         // 5/10 = 50%
         assert_eq!(consensus.completion_percentage().await, 50.0);
     }
+
+    /// Submitting a second, *disagreeing* vote on the same request
+    /// from the same validator must not silently overwrite the first
+    /// — it must surface as `Equivocation` evidence and the original
+    /// vote must remain authoritative.
+    #[tokio::test]
+    async fn test_submit_vote_detects_equivocation() {
+        let request = WithdrawalVerificationRequest {
+            request_id: "eq-1".to_string(),
+            nullifier: [1u8; 32],
+            amount: 1000,
+            recipient: [2u8; 32],
+            proof: vec![0u8; 32],
+            fee: 0,
+            timestamp: 0,
+        };
+        let consensus = WithdrawalConsensus::new(request);
+        let validator = NodeId(vec![1]);
+
+        // First vote: clean.
+        let evidence = consensus
+            .submit_vote(validator.clone(), VerificationVote::Valid)
+            .await
+            .unwrap();
+        assert!(evidence.is_none());
+
+        // Second vote, disagreeing.
+        let evidence = consensus
+            .submit_vote(
+                validator.clone(),
+                VerificationVote::Invalid {
+                    reason: "flipped".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        match evidence {
+            Some(SlashingEvidence::Equivocation {
+                request_id,
+                previous_vote,
+                new_vote,
+            }) => {
+                assert_eq!(request_id, "eq-1");
+                assert_eq!(previous_vote, VerificationVote::Valid);
+                assert!(matches!(new_vote, VerificationVote::Invalid { .. }));
+            }
+            other => panic!("expected Equivocation, got {:?}", other),
+        }
+
+        // Idempotent re-send of the original vote: no evidence.
+        let evidence = consensus
+            .submit_vote(validator, VerificationVote::Valid)
+            .await
+            .unwrap();
+        assert!(evidence.is_none());
+    }
+
+    /// A low-reputation validator's vote must not contribute to the
+    /// quorum, even if they otherwise hit `submit_vote` cleanly.
+    /// Builds a 10-validator pool, knocks one of them below the
+    /// reputation floor, and verifies that the remaining 9 votes are
+    /// what consensus_result counts.
+    #[tokio::test]
+    async fn test_low_reputation_vote_excluded_from_consensus() {
+        // Hand-roll a tracker so we can drive reputations precisely.
+        let tracker = ReputationTracker::new();
+        let validators: Vec<NodeId> = (0..10).map(|i| NodeId(vec![i as u8])).collect();
+        for v in &validators {
+            tracker.register_validator(v.clone()).await;
+        }
+
+        // Drive validator[0] far below the gate. Each failure subtracts
+        // REPUTATION_DECREASE_FAILURE; loop until below the threshold.
+        for _ in 0..100 {
+            tracker.record_failure(&validators[0]).await.unwrap();
+        }
+        let rep = tracker.get_reputation(&validators[0]).await.unwrap();
+        assert!(
+            rep < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
+            "test setup: validator[0] should be below the gate, got {}",
+            rep
+        );
+
+        let request = WithdrawalVerificationRequest {
+            request_id: "rep-gate".to_string(),
+            nullifier: [1u8; 32],
+            amount: 1,
+            recipient: [0u8; 32],
+            proof: vec![0u8; 32],
+            fee: 0,
+            timestamp: 0,
+        };
+        let consensus = WithdrawalConsensus::new(request);
+
+        // All 10 vote Valid, including the gated one.
+        for v in &validators {
+            consensus
+                .submit_vote(v.clone(), VerificationVote::Valid)
+                .await
+                .unwrap();
+        }
+
+        // The gated validator's vote is excluded — 9 eligible votes
+        // remain, all Valid, well above the 7/10 threshold.
+        assert!(
+            consensus
+                .has_consensus(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .await
+        );
+        let result = consensus
+            .consensus_result(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+            .await
+            .unwrap();
+        assert!(result.is_valid());
+
+        // Now push a second validator below the gate as well — only 8
+        // eligible votes remain, still above the 7/10 threshold.
+        for _ in 0..100 {
+            tracker.record_failure(&validators[1]).await.unwrap();
+        }
+        assert!(
+            consensus
+                .has_consensus(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .await
+        );
+
+        // Push two more (total 4 gated). Only 6 eligible votes remain
+        // — below the 7/10 threshold, so consensus_result errors
+        // rather than returning a result.
+        for _ in 0..100 {
+            tracker.record_failure(&validators[2]).await.unwrap();
+            tracker.record_failure(&validators[3]).await.unwrap();
+        }
+        assert!(
+            !consensus
+                .has_consensus(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .await
+        );
+        assert!(consensus
+            .consensus_result(&tracker, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+            .await
+            .is_err());
+    }
+
+    /// Three consecutive timeouts against the same validator must
+    /// produce a `PersistentUnavailability` record on the coordinator's
+    /// slashing tracker.
+    #[tokio::test]
+    async fn test_persistent_unavailability_after_streak() {
+        let coordinator = WithdrawalVerificationCoordinator::new();
+        let v = NodeId(vec![7]);
+        coordinator.register_validator(v.clone()).await;
+
+        for _ in 0..PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK {
+            coordinator.record_timeout(&v).await;
+        }
+
+        let records = coordinator.slashing_tracker().for_validator(&v).await;
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].evidence,
+            SlashingEvidence::PersistentUnavailability { .. }
+        ));
+
+        // A successful vote submission resets the streak; subsequent
+        // single timeouts then must not produce a new record on their
+        // own.
+        coordinator.reset_timeout_streak(&v).await;
+        coordinator.record_timeout(&v).await;
+        let records = coordinator.slashing_tracker().for_validator(&v).await;
+        assert_eq!(records.len(), 1, "streak reset must prevent fresh record");
+    }
+
+    /// Byzantine integration test: 10 validators, 3 of whom
+    /// (a) try to equivocate by flipping their vote, and
+    /// (b) bottom out their reputation through repeated failures.
+    /// The honest 7 must still produce a Valid consensus result, and
+    /// the slashing tracker must record evidence for each of the 3
+    /// misbehaving validators.
+    #[tokio::test]
+    async fn test_byzantine_consensus_3_of_10() {
+        let coordinator = WithdrawalVerificationCoordinator::new();
+        let validators: Vec<NodeId> = (0..10).map(|i| NodeId(vec![i as u8])).collect();
+        for v in &validators {
+            coordinator.register_validator(v.clone()).await;
+        }
+
+        let request = WithdrawalVerificationRequest {
+            request_id: "byz-1".to_string(),
+            nullifier: [9u8; 32],
+            amount: 1_000,
+            recipient: [3u8; 32],
+            proof: vec![0u8; 32],
+            fee: 0,
+            timestamp: 0,
+        };
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        // The 7 honest validators vote valid.
+        for v in validators.iter().take(7) {
+            coordinator
+                .submit_result(WithdrawalVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: v.clone(),
+                    vote: VerificationVote::Valid,
+                    timestamp: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        // The 3 Byzantine validators each submit a Valid vote first
+        // (so they enter the quorum), then immediately flip — the
+        // flipped vote is rejected as equivocation and the original
+        // stands. This shape is more realistic than a single
+        // disagreeing vote: a Byzantine validator that wanted to
+        // poison the quorum without leaving evidence would just send
+        // one vote, but the round-tripping check above
+        // (`test_submit_vote_detects_equivocation`) covers that path.
+        for v in validators.iter().skip(7) {
+            coordinator
+                .submit_result(WithdrawalVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: v.clone(),
+                    vote: VerificationVote::Valid,
+                    timestamp: 0,
+                })
+                .await
+                .unwrap();
+            coordinator
+                .submit_result(WithdrawalVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: v.clone(),
+                    vote: VerificationVote::Invalid {
+                        reason: "byzantine flip".to_string(),
+                    },
+                    timestamp: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Consensus must converge to Valid: the 10 votes that were
+        // counted (the equivocation flips were dropped) are all Valid.
+        let result = coordinator
+            .check_consensus(&request.request_id)
+            .await
+            .unwrap()
+            .expect("quorum reached");
+        assert!(result.is_valid(), "honest majority must produce Valid");
+
+        // Slashing tracker must hold one Equivocation record per
+        // Byzantine validator, and only those validators.
+        let flagged = coordinator.slashing_tracker().flagged_validators().await;
+        assert_eq!(flagged.len(), 3, "exactly the 3 Byzantine validators flagged");
+        for v in validators.iter().skip(7) {
+            let records = coordinator.slashing_tracker().for_validator(v).await;
+            assert_eq!(records.len(), 1);
+            assert!(matches!(
+                records[0].evidence,
+                SlashingEvidence::Equivocation { .. }
+            ));
+        }
+    }
 }
