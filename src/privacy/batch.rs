@@ -242,17 +242,40 @@ mod tests {
     /// is enough to populate the `proofs` slice; the test exercises
     /// the length-mismatch branch, not the verifier internals.
     ///
-    /// Was previously `#[ignore]`'d with no recorded reason. Restored
-    /// in #71 — un-ignoring the existing skipped tests is part of
-    /// the test-coverage epic, and DepositCircuit is small enough
-    /// that one prove() call is cheap.
+    /// Was previously `#[ignore]`'d because the witness values
+    /// hard-coded into the original test predated the v0.3 Poseidon
+    /// migration (#56) — the `[1u8; 32]` commitment no longer matched
+    /// the `(value, randomness, recipient)` Poseidon hash, and prove()
+    /// would panic on `cs.is_satisfied().unwrap()`. The fix: derive
+    /// the commitment with the same host helper the circuit uses, so
+    /// the witness assignment is satisfiable.
     #[test]
     fn test_mismatched_inputs_and_proofs() {
+        use crate::privacy::poseidon::poseidon_commit;
+        use ark_ff::{BigInteger, PrimeField};
+
         let mut rng = StdRng::seed_from_u64(0u64);
         let circuit = DepositCircuit::new();
         let (pk, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
-        let circuit1 = DepositCircuit::with_witness([1u8; 32], 100, [2u8; 32], [3u8; 32]);
+        // Build a satisfiable DepositCircuit: the commitment must
+        // equal `Poseidon(COMMIT_TAG, value, randomness, recipient)`
+        // exactly — same shape as `Note::commitment()` on the host
+        // side. Mirrors `fr_to_bytes_32` in `privacy::types`.
+        let value = 100u64;
+        let randomness = [2u8; 32];
+        let recipient = [3u8; 32];
+        let commitment_fr = poseidon_commit(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&randomness),
+            Fr::from_le_bytes_mod_order(&recipient),
+        );
+        let bytes = commitment_fr.into_bigint().to_bytes_le();
+        let mut commitment = [0u8; 32];
+        let len = bytes.len().min(32);
+        commitment[..len].copy_from_slice(&bytes[..len]);
+
+        let circuit1 = DepositCircuit::with_witness(commitment, value, randomness, recipient);
         let proof1 = Groth16ProofSystem::prove(&pk, circuit1, &mut rng).unwrap();
 
         let verifier = BatchVerifier::new();
