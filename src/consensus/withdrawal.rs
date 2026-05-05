@@ -1196,7 +1196,11 @@ mod tests {
         // Slashing tracker must hold one Equivocation record per
         // Byzantine validator, and only those validators.
         let flagged = coordinator.slashing_tracker().flagged_validators().await;
-        assert_eq!(flagged.len(), 3, "exactly the 3 Byzantine validators flagged");
+        assert_eq!(
+            flagged.len(),
+            3,
+            "exactly the 3 Byzantine validators flagged"
+        );
         for v in validators.iter().skip(7) {
             let records = coordinator.slashing_tracker().for_validator(v).await;
             assert_eq!(records.len(), 1);
