@@ -10,6 +10,34 @@ use solana_sdk::{
 };
 use solana_transaction_status::UiTransactionEncoding;
 
+/// Anchor account discriminator length in bytes. Sits at the start of
+/// every Anchor-managed account; data the program itself stores
+/// begins at offset [`ANCHOR_DISCRIMINATOR_LEN`].
+const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
+
+/// Pull the `program_version: u32` out of a raw `BridgeState` account
+/// buffer. The on-chain layout puts `program_version` as the first
+/// field (after the 8-byte Anchor discriminator), so the value lives
+/// at offset 8..12 in little-endian byte order.
+///
+/// Returns a typed error rather than panicking on a short buffer —
+/// the L2 startup flow turns this into a `BridgeError::ConfigError`
+/// when the BridgeState account hasn't been initialised yet, instead
+/// of crashing.
+fn parse_program_version(data: &[u8]) -> Result<u32> {
+    let start = ANCHOR_DISCRIMINATOR_LEN;
+    let end = start + std::mem::size_of::<u32>();
+    if data.len() < end {
+        return Err(BridgeError::ConfigError(format!(
+            "BridgeState account truncated: {} bytes, need >= {}",
+            data.len(),
+            end
+        )));
+    }
+    let bytes: [u8; 4] = data[start..end].try_into().expect("slice fits a u32");
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// Interface to Paraloom Solana program
 pub struct ProgramInterface {
     /// Solana RPC client
@@ -205,6 +233,44 @@ impl ProgramInterface {
             .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get slot: {}", e)))
     }
 
+    /// Read the deployed program's `program_version` from the
+    /// `BridgeState` PDA. The version sits at byte offset 8..12 of the
+    /// account data — Anchor prepends an 8-byte discriminator and the
+    /// `program_version` field is intentionally placed first so this
+    /// read does not require deserialising the rest of the struct.
+    pub async fn program_version(&self) -> Result<u32> {
+        let (state_pda, _) = super::derive_bridge_state(&self.program_id);
+        let account = self.rpc_client.get_account(&state_pda).map_err(|e| {
+            BridgeError::SolanaRpc(format!(
+                "Failed to read BridgeState account {}: {}",
+                state_pda, e
+            ))
+        })?;
+        parse_program_version(&account.data)
+    }
+
+    /// Compare the on-chain program version against the binary's
+    /// expected version (#69, audit #9). Returns `Ok(())` on a match,
+    /// `Err(BridgeError::ConfigError)` on a mismatch with both values
+    /// in the message so an operator can see at a glance whether the
+    /// L2 or the on-chain side is stale.
+    pub async fn verify_program_version(&self) -> Result<()> {
+        let on_chain = self.program_version().await?;
+        let expected = crate::bridge::EXPECTED_PROGRAM_VERSION;
+        if on_chain != expected {
+            return Err(BridgeError::ConfigError(format!(
+                "program version mismatch: on-chain={:#010x} expected={:#010x} (redeploy or upgrade the L2 binary)",
+                on_chain, expected
+            )));
+        }
+        log::info!(
+            target: "paraloom::bridge::solana",
+            "program version handshake OK ({:#010x})",
+            on_chain
+        );
+        Ok(())
+    }
+
     /// Update Merkle root on Solana program
     /// This should be called after processing deposits to sync the on-chain state
     pub async fn update_merkle_root(&self, new_merkle_root: [u8; 32]) -> Result<String> {
@@ -269,5 +335,41 @@ mod tests {
 
         let program = ProgramInterface::new(config);
         assert!(program.is_ok());
+    }
+
+    /// Synthesise a BridgeState account: 8 bytes of discriminator
+    /// (any value), then a u32 program_version, then arbitrary
+    /// trailing bytes. \`parse_program_version\` must read exactly the
+    /// version regardless of the discriminator content or trailing
+    /// payload.
+    #[test]
+    fn parse_program_version_reads_v04() {
+        let mut buf = vec![0xAAu8; 8]; // discriminator
+        buf.extend_from_slice(&0x0004_0000u32.to_le_bytes());
+        buf.extend_from_slice(&[0xFFu8; 200]); // trailing payload
+        assert_eq!(parse_program_version(&buf).unwrap(), 0x0004_0000);
+    }
+
+    #[test]
+    fn parse_program_version_reads_v123() {
+        let mut buf = vec![0u8; 8];
+        buf.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        assert_eq!(parse_program_version(&buf).unwrap(), 0x0102_0304);
+    }
+
+    /// A short buffer (BridgeState account that hasn't been
+    /// initialised yet, or a corrupted account) must produce a typed
+    /// error — never a panic.
+    #[test]
+    fn parse_program_version_rejects_short_buffer() {
+        let buf = vec![0u8; 11]; // 8-byte discriminator + 3 bytes < u32
+        let err = parse_program_version(&buf).expect_err("short buffer");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[test]
+    fn parse_program_version_rejects_empty_buffer() {
+        let err = parse_program_version(&[]).expect_err("empty buffer");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
     }
 }

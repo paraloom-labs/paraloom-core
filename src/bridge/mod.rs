@@ -10,6 +10,15 @@ pub mod types;
 pub use error::{BridgeError, Result};
 pub use types::{BridgeConfig, BridgeStats, DepositEvent, SolanaAddress, WithdrawalRequest};
 
+/// Semver-encoded program version this L2 binary was compiled against:
+/// `major(8) | minor(8) | patch(8) | reserved(8)`. v0.4.0 → 0x00040000.
+/// The L2 reads `BridgeState.program_version` from the deployed
+/// program at startup and refuses to talk to a program at a
+/// different version (#69, audit #9). Bump in lockstep with every
+/// breaking on-chain change so a missed redeploy fails loudly
+/// instead of silently sending incompatible instructions.
+pub const EXPECTED_PROGRAM_VERSION: u32 = 0x0004_0000;
+
 use crate::privacy::ShieldedPool;
 use std::sync::Arc;
 use tokio::sync::RwLock;

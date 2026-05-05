@@ -55,20 +55,29 @@ pub mod discriminators {
     pub const UNPAUSE: [u8; 8] = [111, 51, 238, 100, 208, 146, 57, 103];
 }
 
-/// Create initialize instruction
+/// Create initialize instruction.
+///
+/// `program_version` is the semver-encoded version the deployed
+/// program should record in `BridgeState` (#69, audit #9). The L2
+/// later reads it back via [`crate::bridge::ProgramInterface::program_version`]
+/// and refuses to start if it does not match the binary's
+/// [`crate::bridge::EXPECTED_PROGRAM_VERSION`].
 pub fn create_initialize_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
+    program_version: u32,
     initial_merkle_root: [u8; 32],
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
     #[derive(BorshSerialize)]
     struct InitializeData {
+        program_version: u32,
         initial_merkle_root: [u8; 32],
     }
 
     let data = InitializeData {
+        program_version,
         initial_merkle_root,
     };
 

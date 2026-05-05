@@ -42,12 +42,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Insufficient balance. Need at least 0.001 SOL".into());
     }
 
-    // Create initialize instruction with initial merkle root
+    // Create initialize instruction with initial merkle root.
+    // Initial merkle root is the empty tree root (all zeros for now);
+    // in production it should come from a trusted setup. The program
+    // version is recorded so the L2 can verify it later via
+    // `ProgramInterface::verify_program_version` (#69).
     println!("Creating initialize instruction...");
-    // Initial merkle root is the empty tree root (all zeros for now)
-    // In production, this should come from a trusted setup
     let initial_merkle_root = [0u8; 32];
-    let ix = create_initialize_instruction(&program_id, &authority.pubkey(), initial_merkle_root)?;
+    let program_version = paraloom::bridge::EXPECTED_PROGRAM_VERSION;
+    let ix = create_initialize_instruction(
+        &program_id,
+        &authority.pubkey(),
+        program_version,
+        initial_merkle_root,
+    )?;
     println!(
         "Instruction created with initial merkle root: {:?}\n",
         &initial_merkle_root[..8]

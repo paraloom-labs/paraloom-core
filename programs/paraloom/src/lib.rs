@@ -12,9 +12,20 @@ pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 pub mod paraloom_program {
     use super::*;
 
-    /// Initialize the bridge state
-    pub fn initialize(ctx: Context<Initialize>, initial_merkle_root: [u8; 32]) -> Result<()> {
+    /// Initialize the bridge state.
+    ///
+    /// `program_version` is recorded so an L2 binary can verify it is
+    /// talking to the on-chain program version it was compiled
+    /// against (#69 follow-up to audit #9). Version mismatches are an
+    /// L2 startup precondition; mismatched binaries refuse to send
+    /// instructions rather than risk a silently incompatible call.
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        program_version: u32,
+        initial_merkle_root: [u8; 32],
+    ) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
+        bridge_state.program_version = program_version;
         bridge_state.authority = ctx.accounts.authority.key();
         bridge_state.total_deposited = 0;
         bridge_state.total_withdrawn = 0;
@@ -23,7 +34,7 @@ pub mod paraloom_program {
         bridge_state.paused = false;
         bridge_state.merkle_root = initial_merkle_root;
 
-        msg!("Bridge initialized with merkle root");
+        msg!("Bridge initialized with merkle root, program_version={}", program_version);
         Ok(())
     }
 
@@ -650,6 +661,12 @@ pub struct SlashValidator<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct BridgeState {
+    /// Semver-encoded program version: major(8) | minor(8) | patch(8) |
+    /// reserved(8). v0.4.0 → 0x00040000. Placed first so the L2 can
+    /// read it from the raw account at a fixed offset (8 + 0..4) after
+    /// Anchor's 8-byte account discriminator, without deserialising
+    /// the rest of the struct.
+    pub program_version: u32,
     pub authority: Pubkey,
     pub total_deposited: u64,
     pub total_withdrawn: u64,
