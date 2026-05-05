@@ -235,8 +235,18 @@ mod tests {
         assert_eq!(result, BatchVerificationResult::AllValid);
     }
 
+    /// `verify_batch` must reject — with a typed `Error` rather than
+    /// silently accepting — when the caller hands it a different
+    /// number of proofs than public-input vectors. The check happens
+    /// before any cryptographic work, so a single real Groth16 proof
+    /// is enough to populate the `proofs` slice; the test exercises
+    /// the length-mismatch branch, not the verifier internals.
+    ///
+    /// Was previously `#[ignore]`'d with no recorded reason. Restored
+    /// in #71 — un-ignoring the existing skipped tests is part of
+    /// the test-coverage epic, and DepositCircuit is small enough
+    /// that one prove() call is cheap.
     #[test]
-    #[ignore]
     fn test_mismatched_inputs_and_proofs() {
         let mut rng = StdRng::seed_from_u64(0u64);
         let circuit = DepositCircuit::new();
@@ -248,7 +258,16 @@ mod tests {
         let verifier = BatchVerifier::new();
         let result = verifier.verify_batch(&vk, &[vec![Fr::from(1u64)]], &[proof1.clone(), proof1]);
 
-        assert!(!result.is_valid());
+        assert!(
+            !result.is_valid(),
+            "mismatched lengths must surface as Error, got {:?}",
+            result
+        );
+        assert!(
+            matches!(result, BatchVerificationResult::Error { .. }),
+            "expected `Error` variant, got {:?}",
+            result
+        );
     }
 
     #[test]
