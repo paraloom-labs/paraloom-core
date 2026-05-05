@@ -6,6 +6,7 @@
 use crate::bridge::WithdrawalRequest;
 use crate::consensus::leader::{LeaderSelector, ValidatorInfo};
 use crate::consensus::reputation::ReputationTracker;
+use crate::consensus::slashing::{SlashingEvidence, SlashingTracker};
 use crate::types::NodeId;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -149,11 +150,37 @@ impl WithdrawalConsensus {
         }
     }
 
-    /// Submit a vote
-    pub async fn submit_vote(&self, validator: NodeId, vote: VerificationVote) -> Result<()> {
+    /// Submit a vote.
+    ///
+    /// Returns `Ok(None)` for the normal case (first vote, or a
+    /// repeated identical vote which we treat as idempotent). Returns
+    /// `Ok(Some(SlashingEvidence::Equivocation { .. }))` if the
+    /// validator has previously submitted a vote on this request and
+    /// the new vote disagrees — this is provable misbehavior and is
+    /// surfaced to the caller for recording in the
+    /// [`crate::consensus::SlashingTracker`]. The new vote is **not**
+    /// installed in that case; the original stands.
+    pub async fn submit_vote(
+        &self,
+        validator: NodeId,
+        vote: VerificationVote,
+    ) -> Result<Option<SlashingEvidence>> {
         let mut votes = self.votes.write().await;
+        if let Some(previous) = votes.get(&validator) {
+            if previous == &vote {
+                // Idempotent re-send. Common when a validator retries
+                // over a flaky transport.
+                return Ok(None);
+            }
+            let evidence = SlashingEvidence::Equivocation {
+                request_id: self.request_id.clone(),
+                previous_vote: previous.clone(),
+                new_vote: vote,
+            };
+            return Ok(Some(evidence));
+        }
         votes.insert(validator, vote);
-        Ok(())
+        Ok(None)
     }
 
     /// Check whether consensus has been reached among the eligible
@@ -297,6 +324,16 @@ pub struct WithdrawalVerificationCoordinator {
     /// Reputation tracker for automatic reputation updates
     reputation_tracker: Arc<ReputationTracker>,
 
+    /// Slashing-evidence log. Equivocation and persistent-unavailability
+    /// detections are appended here. A separate slashing pipeline (the
+    /// on-chain `slash_validator` instruction) will consume the log.
+    slashing_tracker: Arc<SlashingTracker>,
+
+    /// Per-validator timeout streak counter, used to detect persistent
+    /// unavailability. Reset to 0 whenever the validator is observed
+    /// active in a verification round.
+    timeout_streaks: Arc<RwLock<HashMap<NodeId, u64>>>,
+
     /// Reputation floor for consensus participation. Configurable so an
     /// operator can tighten or loosen the gate without recompiling.
     min_reputation_for_consensus: u64,
@@ -310,8 +347,59 @@ impl WithdrawalVerificationCoordinator {
             validators: Arc::new(RwLock::new(Vec::new())),
             leader_selector: Arc::new(RwLock::new(LeaderSelector::new())),
             reputation_tracker: Arc::new(ReputationTracker::new()),
+            slashing_tracker: Arc::new(SlashingTracker::new()),
+            timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
             min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
         }
+    }
+
+    /// Reference to the slashing-evidence log. Tests and downstream
+    /// pipelines read this directly; the coordinator never mutates it
+    /// outside its own write paths.
+    pub fn slashing_tracker(&self) -> &Arc<SlashingTracker> {
+        &self.slashing_tracker
+    }
+
+    /// Record a verification timeout against `validator` and append a
+    /// `PersistentUnavailability` slashing record once the streak hits
+    /// [`PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK`]. Resetting the
+    /// streak after a successful round happens in
+    /// [`Self::reset_timeout_streak`].
+    pub async fn record_timeout(&self, validator: &NodeId) {
+        let mut streaks = self.timeout_streaks.write().await;
+        let streak = streaks.entry(validator.clone()).or_insert(0);
+        *streak += 1;
+        let current = *streak;
+        drop(streaks);
+
+        if current >= PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK {
+            self.slashing_tracker
+                .record(
+                    validator.clone(),
+                    SlashingEvidence::PersistentUnavailability {
+                        streak_length: current,
+                        threshold: PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK,
+                    },
+                )
+                .await;
+        }
+
+        if let Err(e) = self.reputation_tracker.record_timeout(validator).await {
+            log::debug!(
+                target: "paraloom::consensus",
+                "skipping reputation timeout for {:?}: {}",
+                validator,
+                e
+            );
+        }
+    }
+
+    /// Clear the timeout streak after a validator is observed alive.
+    pub async fn reset_timeout_streak(&self, validator: &NodeId) {
+        self.timeout_streaks
+            .write()
+            .await
+            .insert(validator.clone(), 0);
     }
 
     /// Override the reputation floor for consensus participation. Useful
@@ -452,7 +540,18 @@ impl WithdrawalVerificationCoordinator {
             result.validator
         );
 
-        consensus.submit_vote(result.validator, result.vote).await?;
+        let validator = result.validator.clone();
+        // Once a validator submitted any vote, they are alive — clear
+        // any outstanding timeout streak before classifying the vote.
+        self.reset_timeout_streak(&validator).await;
+
+        if let Some(evidence) = consensus.submit_vote(validator.clone(), result.vote).await? {
+            // Equivocation: a previous vote on this request from the
+            // same validator disagreed with the new one. Record the
+            // evidence and *do not* install the new vote — the
+            // original stands.
+            self.slashing_tracker.record(validator, evidence).await;
+        }
 
         Ok(())
     }
