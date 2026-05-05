@@ -49,10 +49,7 @@ pub enum SlashingEvidence {
     /// The threshold that triggered the entry is captured for forensic
     /// clarity: a future raise of the threshold should not retroactively
     /// invalidate previously recorded evidence.
-    PersistentUnavailability {
-        streak_length: u64,
-        threshold: u64,
-    },
+    PersistentUnavailability { streak_length: u64, threshold: u64 },
 }
 
 /// One entry in the slashing log.
@@ -123,12 +120,7 @@ impl SlashingTracker {
 
     /// Total number of evidence entries across all validators.
     pub async fn total_count(&self) -> usize {
-        self.records
-            .read()
-            .await
-            .values()
-            .map(|v| v.len())
-            .sum()
+        self.records.read().await.values().map(|v| v.len()).sum()
     }
 
     /// Set of validators with at least one record. Useful for the

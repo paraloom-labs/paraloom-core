@@ -194,7 +194,9 @@ impl WithdrawalConsensus {
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
     ) -> bool {
-        let eligible = self.count_eligible_votes(reputation_tracker, min_reputation).await;
+        let eligible = self
+            .count_eligible_votes(reputation_tracker, min_reputation)
+            .await;
         eligible >= MIN_VALIDATORS_FOR_CONSENSUS
     }
 
@@ -545,7 +547,10 @@ impl WithdrawalVerificationCoordinator {
         // any outstanding timeout streak before classifying the vote.
         self.reset_timeout_streak(&validator).await;
 
-        if let Some(evidence) = consensus.submit_vote(validator.clone(), result.vote).await? {
+        if let Some(evidence) = consensus
+            .submit_vote(validator.clone(), result.vote)
+            .await?
+        {
             // Equivocation: a previous vote on this request from the
             // same validator disagreed with the new one. Record the
             // evidence and *do not* install the new vote — the
