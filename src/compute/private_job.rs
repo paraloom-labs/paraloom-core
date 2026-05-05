@@ -35,6 +35,7 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -320,33 +321,49 @@ impl PrivateJobResult {
             // Load proving key
             let pk = Self::load_proving_key()?;
 
-            // Create simplified circuit with dummy input (output-only proof for MVP)
-            // This proves: output_commitment = commit(hash(output_data), randomness)
+            // Build the compute circuit with witnesses derived through
+            // the same Poseidon helpers the constraint system uses
+            // (#63). Until the runtime threads the actual submitter
+            // ownership through this proof path, we use deterministic
+            // placeholder owner / spending-key bytes so the commitment
+            // and nullifier round-trip correctly. Production wiring is
+            // tracked alongside the deferred output-note plumbing.
             let dummy_code_hash = [0u8; 32];
             let dummy_input = vec![0u8];
             let dummy_input_randomness = [0u8; 32];
+            let dummy_owner = [0u8; 32];
+            let dummy_spending_key = [0u8; 32];
 
-            // Calculate dummy input commitment using Poseidon hash (matching circuit)
-            // Circuit constraint: computed_hash = poseidon(hash(data))
-            let dummy_input_hash = PrivateComputeJob::hash_data(&dummy_input);
-            let dummy_input_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
-                &ark_bls12_381::Fr::from(dummy_input_hash),
+            let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
+            let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+                dummy_input_hash,
+                &dummy_input_randomness,
+                &dummy_owner,
             );
 
-            // Calculate output commitment using Poseidon hash (matching circuit)
-            let output_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
-                &ark_bls12_381::Fr::from(output_hash),
+            let output_data_hash = crate::compute::ComputeCircuit::hash_data_to_field(output_data);
+            let output_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+                output_data_hash,
+                randomness,
+                &dummy_owner,
             );
 
-            // Create circuit with witness (all commitments properly calculated)
+            let input_nullifier_fr = crate::compute::ComputeCircuit::compute_nullifier(
+                dummy_input_commitment_fr,
+                &dummy_spending_key,
+            );
+
             let circuit = crate::compute::ComputeCircuit::with_witness(
                 dummy_code_hash,
                 dummy_input_commitment_fr,
                 output_commitment_fr,
+                input_nullifier_fr,
                 dummy_input,
                 dummy_input_randomness,
                 output_data.to_vec(),
                 *randomness,
+                dummy_owner,
+                dummy_spending_key,
             );
 
             // Generate proof
@@ -393,7 +410,16 @@ impl PrivateJobResult {
     ///
     /// - If verifying keys exist: Verify real Groth16 proof
     /// - If keys don't exist: Basic format check (for testing/dev)
-    fn verify_execution_proof(proof_bytes: &[u8], output_hash: u64) -> Result<bool> {
+    ///
+    /// Takes the full `PrivateJobResult` so the verifier has access to
+    /// the public-input material that the v0.4 commitment scheme
+    /// requires (output commitment, output bytes for hash recovery).
+    /// The pre-#63 path could recompute the output commitment from the
+    /// hash alone because commitments were not bound to randomness or
+    /// owner; that simplification is gone now.
+    fn verify_execution_proof(result: &PrivateJobResult) -> Result<bool> {
+        let proof_bytes = &result.execution_proof;
+
         // Check if real keys are available
         if Self::compute_keys_exist() {
             log::info!("Verifying real Groth16 proof");
@@ -403,38 +429,50 @@ impl PrivateJobResult {
 
             // Deserialize proof
             use ark_serialize::CanonicalDeserialize;
-            let proof =
-                ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(proof_bytes)
-                    .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            let proof = ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(
+                proof_bytes.as_slice(),
+            )
+            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
 
-            // Prepare public inputs (matching the circuit)
-            let dummy_code_hash_bytes = [0u8; 32];
+            // Public inputs for the v0.4 ComputeCircuit shape:
+            //   [code_hash_fr, input_commitment, output_commitment, input_nullifier]
+            //
+            // The prover writes a deterministic placeholder
+            // (`code_hash = [0; 32]`, dummy input/owner/spending_key)
+            // until the runtime threads real ownership info through;
+            // the verifier mirrors those placeholders exactly.
+            let code_hash_fr = ark_bls12_381::Fr::from_le_bytes_mod_order(&[0u8; 32]);
 
-            // Calculate commitments using Poseidon hash (matching circuit constraints)
-            // Dummy input commitment: poseidon(hash([0u8]))
-            let dummy_input_hash = crate::compute::PrivateComputeJob::hash_data(&[0u8]);
-            let dummy_input_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
-                &ark_bls12_381::Fr::from(dummy_input_hash),
+            let dummy_input = vec![0u8];
+            let dummy_input_randomness = [0u8; 32];
+            let dummy_owner = [0u8; 32];
+            let dummy_spending_key = [0u8; 32];
+
+            let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
+            let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+                dummy_input_hash,
+                &dummy_input_randomness,
+                &dummy_owner,
             );
 
-            // Output commitment: poseidon(hash(output_data))
-            let output_commitment_fr = crate::privacy::poseidon::poseidon_hash_field(
-                &ark_bls12_381::Fr::from(output_hash),
+            // The output commitment is taken from the result struct —
+            // the prover serialised it there. Lift the 32-byte buffer
+            // to Fr exactly as the circuit's public-input allocation
+            // does on its side.
+            let output_commitment_fr =
+                ark_bls12_381::Fr::from_le_bytes_mod_order(result.output_commitment.as_bytes());
+
+            let input_nullifier_fr = crate::compute::ComputeCircuit::compute_nullifier(
+                dummy_input_commitment_fr,
+                &dummy_spending_key,
             );
 
-            // Public inputs: code_hash (32 bytes), input_commitment (1 field), output_commitment (1 field)
-            let mut public_inputs = Vec::new();
-
-            // Add code hash as field elements
-            for &byte in &dummy_code_hash_bytes {
-                public_inputs.push(ark_bls12_381::Fr::from(byte as u64));
-            }
-
-            // Add input commitment
-            public_inputs.push(dummy_input_commitment_fr);
-
-            // Add output commitment
-            public_inputs.push(output_commitment_fr);
+            let public_inputs = vec![
+                code_hash_fr,
+                dummy_input_commitment_fr,
+                output_commitment_fr,
+                input_nullifier_fr,
+            ];
 
             // Verify proof
             use ark_groth16::Groth16;
@@ -527,8 +565,7 @@ impl PrivateJobCoordinator {
         log::info!("Verifying private job result: {}", result.job_id);
 
         // Step 1: Verify zkSNARK proof
-        let proof_valid =
-            PrivateJobResult::verify_execution_proof(&result.execution_proof, result.output_hash)?;
+        let proof_valid = PrivateJobResult::verify_execution_proof(result)?;
 
         if !proof_valid {
             log::warn!(
