@@ -138,15 +138,39 @@ jobs:
           echo "----- SHA256SUMS -----"
           cat release/SHA256SUMS
 
+      # Generate a CycloneDX SBOM by scanning the repository at the
+      # tagged commit. anchore/sbom-action runs Syft underneath; for
+      # a Cargo-based project that means it walks `Cargo.lock` and
+      # produces a JSON-formatted SBOM listing every transitive
+      # dependency, version, and license. Operators can ingest this
+      # into their vulnerability-management tooling, and a downstream
+      # auditor can quickly answer "is this binary affected by
+      # CVE-X" by grepping the SBOM rather than rebuilding from
+      # source. Tracked under #70.
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: paraloom-core-sbom.cdx.json
+          output-file: release/paraloom-core-sbom.cdx.json
+          # The action also uploads the SBOM directly to the release
+          # via the `Upload SBOM as Release Asset` step it injects;
+          # we duplicate it as a workflow artifact to make
+          # post-mortem inspection easier.
+          upload-release-assets: false
+          upload-artifact: true
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          # Append the binaries and the aggregate checksum file to
-          # the release that was already drafted by `release-drafter`
-          # on the tagged merge.
+          # Append the binaries, aggregate checksum file, and SBOM
+          # to the release that was already drafted by
+          # `release-drafter` on the tagged merge.
           files: |
             release/paraloom-node-*
             release/SHA256SUMS
+            release/paraloom-core-sbom.cdx.json
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
