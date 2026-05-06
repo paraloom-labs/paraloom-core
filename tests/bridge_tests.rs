@@ -29,6 +29,9 @@ async fn test_bridge_with_pool() {
         start_block: Some(0),
         authority_keypair_path: None,
         bridge_vault: None,
+        // Future-proof: any new field added to `BridgeConfig` picks up
+        // the default rather than failing this test build.
+        ..Default::default()
     };
 
     let pool = Arc::new(ShieldedPool::new());
