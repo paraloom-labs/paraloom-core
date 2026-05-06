@@ -5,13 +5,13 @@
 <h1 align="center">Paraloom Core</h1>
 
 <p align="center">
-  <strong>Privacy-Preserving Distributed Computing on Solana</strong>
+  <strong>Privacy Layer 2 on Solana — shielded pool, zkSNARKs, run on commodity hardware</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/paraloom-labs/paraloom-core/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build"/></a>
-  <img src="https://img.shields.io/badge/tests-116%20passing-brightgreen" alt="Tests"/>
-  <img src="https://img.shields.io/badge/LOC-21K-blue" alt="Lines of Code"/>
+  <img src="https://img.shields.io/badge/tests-282%20passing-brightgreen" alt="Tests"/>
+  <img src="https://img.shields.io/badge/LOC-26K-blue" alt="Lines of Code"/>
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/anchor-0.31-purple" alt="Anchor"/>
   <a href="https://github.com/paraloom-labs/paraloom-core/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/></a>
@@ -27,26 +27,34 @@
 
 ## What is Paraloom?
 
-Paraloom combines **Zcash-level transaction privacy** with **distributed computing** on Solana. Using zkSNARK proofs (Groth16 on BLS12-381), it enables confidential transactions and privacy-preserving compute jobs where validators process encrypted data without seeing the actual inputs or outputs.
+Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded pool, transfers move privately inside that pool, and withdrawals settle back to Solana — all anchored by Groth16 zkSNARKs over BLS12-381. The validator network is intentionally designed for commodity hardware (laptops, home PCs, single-board computers) running a verify-only role; proof generation stays with the user, verification is cheap enough for an off-the-shelf machine to participate in consensus.
 
 **Core Features:**
-- **zkSNARK Privacy** — Poseidon hash + Groth16 proofs (192 bytes, ~10ms verification)
-- **Private Compute** — WASM execution with encrypted input/output
-- **Byzantine Consensus** — 7/10 validator threshold, <1s latency
-- **Solana Bridge** — Bidirectional SOL deposits/withdrawals
+- **zkSNARK Privacy** — Poseidon hash, in-circuit u64 range proofs, Groth16 (192-byte proofs, ~10 ms verification)
+- **Solana Bridge** — bidirectional SOL deposits/withdrawals, on-chain replay protection via expiration slots
+- **Byzantine Consensus** — configurable BFT threshold (default 7-of-10), reputation-gated voting, equivocation slashing evidence
+- **Operations** — `/health`, `/ready`, `/metrics` endpoints, RocksDB-backed crash-consistent storage, peer registry with reconnection backoff
+- **Private Compute (alpha)** — WASM execution with encrypted I/O, ownership-proof bound; smaller, simpler nodes can opt out
 
 ## Status
 
 | Component | Status | Notes |
 |-----------|--------|-------|
 | zkSNARK privacy layer | ✅ Working | Groth16 + BLS12-381, 192-byte proofs, devnet tested |
-| Solana bridge (Anchor) | ✅ Working | Deployed on devnet, deposit/withdraw end-to-end |
-| Byzantine consensus | ✅ Working | 7/10 threshold, validated on 10-node localnet |
-| Merkle + nullifier set | ✅ Working | Double-spend prevention verified |
-| Private compute (WASM) | 🚧 Alpha | Engine works; encrypted I/O integration in progress |
-| Poseidon hash | ⚠️ MVP | Arkworks-based; production-hardening pending |
-| Trusted setup | ⚠️ MVP | Deterministic seed; MPC ceremony scheduled |
-| Mainnet launch | 🔜 Planned | Awaiting external security audit |
+| In-circuit range proofs | ✅ Working | u64 bit-decomposition in deposit / transfer / withdraw (v0.4.0) |
+| Solana bridge (Anchor) | ✅ Working | Deployed on devnet; replay-bound by `expiration_slot` (v0.4.0) |
+| Program version handshake | ✅ Working | L2 refuses to talk to wrong on-chain program version |
+| Byzantine consensus | ✅ Working | Configurable BFT threshold; default 7/10; validated on 10-node localnet |
+| Reputation gating + slashing | ✅ Working | Equivocation + persistent-unavailability evidence (v0.4.0) |
+| Merkle + nullifier set | ✅ Working | Double-spend prevention verified; fsync'd on hot writes |
+| Operational endpoints | ✅ Working | `/health`, `/ready`, `/metrics` (Prometheus) on a separate port |
+| Peer registry | ✅ Working | Reconnection state machine; libp2p Kademlia wiring pending |
+| Release pipeline | ✅ Working | Multi-platform binaries, SHA-256 checksums, CycloneDX SBOM, Sigstore-signed |
+| Poseidon hash | ✅ Working | Domain-separated; native↔circuit equivalence pinned by tests |
+| Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending |
+| Trusted setup | ⚠️ MVP | Deterministic seed; MPC ceremony required before mainnet |
+| Coordinator HA | 🔜 Planned | Single-process today; failover / leader-election pending |
+| Mainnet launch | 🔜 Planned | Awaiting external security audit + MPC ceremony |
 
 ## Quick Start
 
@@ -116,9 +124,11 @@ cargo fmt --all
 
 ## Development History
 
-`main` uses **squash-merge** — each commit represents a completed feature PR.
-Granular commit history (232+ commits across 6 parallel feature branches) is
-preserved on:
+`main` currently uses **merge commits** so each PR's atomic commit narrative
+is preserved end-to-end. Earlier development (v0.1) used **squash-merge**
+across six long-lived feature branches that consolidated the initial
+privacy / bridge / compute / CLI work; that history is still readable on
+those branches:
 
 - [`feature/privacy-layer`](../../tree/feature/privacy-layer) — zkSNARK circuits, Pedersen commitments, shielded pool
 - [`feature/solana-bridge`](../../tree/feature/solana-bridge) — Anchor program, PDA design, deposit/withdraw
