@@ -243,4 +243,143 @@ mod tests {
         assert!(path.verify(&leaf, &leaf));
         assert!(!path.verify(&leaf, &root));
     }
+
+    // ── Adversarial / property coverage for `MerklePath::verify` ─────
+    //
+    // The audit (#71) called for fuzz coverage of the Merkle path
+    // verifier — a malicious peer can hand the L2 any
+    // `(path, indices)` pair through the network codec, and a panic
+    // here crashes a validator. The tests below cover the three
+    // behaviours that matter:
+    //   1. random adversarial paths never panic
+    //   2. an honestly-constructed path verifies, and any bit-flip
+    //      breaks it
+    //   3. structural shapes (mismatched path/indices, zero-length,
+    //      excess depth) all return cleanly
+
+    /// Compute the Merkle root for a single-leaf tree by hashing the
+    /// leaf with its sibling at each level — same recipe the
+    /// constructor of an honest `MerklePath` would follow.
+    fn root_for(leaf: &[u8; 32], path: &[[u8; 32]], indices: &[bool]) -> [u8; 32] {
+        let mut current = *leaf;
+        for (sibling, is_right) in path.iter().zip(indices.iter()) {
+            let (l_bytes, r_bytes) = if *is_right {
+                (&current, sibling)
+            } else {
+                (sibling, &current)
+            };
+            let l = Fr::from_le_bytes_mod_order(l_bytes);
+            let r = Fr::from_le_bytes_mod_order(r_bytes);
+            current = fr_to_bytes_32(poseidon_merkle_pair(l, r));
+        }
+        current
+    }
+
+    /// Honestly-built path of moderate depth verifies; any single-bit
+    /// flip in the leaf, the path, the indices, or the root breaks it.
+    /// This is the "tamper detection" property the privacy layer
+    /// relies on for inclusion proofs.
+    #[test]
+    fn merkle_path_detects_single_bit_flips() {
+        let leaf = [0xA1u8; 32];
+        let path_data = vec![[0x55u8; 32], [0xAAu8; 32], [0x11u8; 32], [0x22u8; 32]];
+        let indices = vec![true, false, true, false];
+        let root = root_for(&leaf, &path_data, &indices);
+
+        let path = MerklePath {
+            path: path_data.clone(),
+            indices: indices.clone(),
+        };
+        assert!(path.verify(&leaf, &root), "honest path must verify");
+
+        // Flip one bit in the leaf → must fail.
+        let mut tampered_leaf = leaf;
+        tampered_leaf[0] ^= 0x01;
+        assert!(!path.verify(&tampered_leaf, &root));
+
+        // Flip one bit in the root → must fail.
+        let mut tampered_root = root;
+        tampered_root[0] ^= 0x01;
+        assert!(!path.verify(&leaf, &tampered_root));
+
+        // Flip one bit in a sibling → must fail.
+        let mut tampered_path = path_data.clone();
+        tampered_path[1][3] ^= 0x10;
+        let tampered = MerklePath {
+            path: tampered_path,
+            indices: indices.clone(),
+        };
+        assert!(!tampered.verify(&leaf, &root));
+
+        // Flip an index → must fail.
+        let mut tampered_indices = indices;
+        tampered_indices[2] = !tampered_indices[2];
+        let tampered = MerklePath {
+            path: path_data,
+            indices: tampered_indices,
+        };
+        assert!(!tampered.verify(&leaf, &root));
+    }
+
+    /// Mismatched `path.len()` vs `indices.len()` is a malformed
+    /// input. The current implementation silently zips to the shorter
+    /// of the two — pin that behaviour explicitly so a future change
+    /// to "panic" or "Err" is a deliberate API decision rather than
+    /// an accidental drift.
+    #[test]
+    fn merkle_path_mismatched_lengths_truncate_via_zip() {
+        let leaf = [0u8; 32];
+        let path = MerklePath {
+            path: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+            indices: vec![true], // strictly shorter
+        };
+        // Build the root the implementation would compute (1 level).
+        let expected_root = root_for(&leaf, &path.path[..1], &path.indices);
+        // Verify against that — the verifier walks only `min(len)`
+        // levels, so the path lengths can disagree without panicking.
+        assert!(path.verify(&leaf, &expected_root));
+    }
+
+    /// Random `(path, indices)` pairs of varying shapes must never
+    /// panic — they may verify (vanishingly unlikely) or not.
+    #[test]
+    fn merkle_path_verify_random_inputs_never_panic() {
+        use ark_std::rand::rngs::StdRng;
+        use ark_std::rand::{Rng, RngCore, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0xDEC0_DE13u64);
+        for _ in 0..512 {
+            let depth = rng.gen_range(0..32);
+            let mut path = Vec::with_capacity(depth);
+            let mut indices = Vec::with_capacity(depth);
+            for _ in 0..depth {
+                let mut sibling = [0u8; 32];
+                rng.fill_bytes(&mut sibling);
+                path.push(sibling);
+                indices.push(rng.gen());
+            }
+            let mp = MerklePath { path, indices };
+
+            let mut leaf = [0u8; 32];
+            let mut root = [0u8; 32];
+            rng.fill_bytes(&mut leaf);
+            rng.fill_bytes(&mut root);
+
+            // Result is uninteresting; the assertion is "no panic".
+            let _ = mp.verify(&leaf, &root);
+        }
+    }
+
+    /// Very deep paths (depth 256) must not stack-overflow or panic.
+    /// 256 is well above any realistic shielded-pool depth and a
+    /// natural stress point for an iterative implementation.
+    #[test]
+    fn merkle_path_deep_path_does_not_panic() {
+        let leaf = [0xCDu8; 32];
+        let path: Vec<[u8; 32]> = (0..256).map(|i| [i as u8; 32]).collect();
+        let indices: Vec<bool> = (0..256).map(|i| i % 2 == 0).collect();
+        let root = root_for(&leaf, &path, &indices);
+        let mp = MerklePath { path, indices };
+        assert!(mp.verify(&leaf, &root));
+    }
 }
