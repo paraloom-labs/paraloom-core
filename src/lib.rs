@@ -5,6 +5,7 @@ pub mod compute;
 pub mod config;
 pub mod consensus;
 pub mod coordinator;
+pub mod health;
 pub mod network;
 pub mod node;
 pub mod privacy;
