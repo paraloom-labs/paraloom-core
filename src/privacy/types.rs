@@ -382,4 +382,118 @@ mod tests {
         let mp = MerklePath { path, indices };
         assert!(mp.verify(&leaf, &root));
     }
+
+    // ── Property-based tests via `proptest` (#71) ─────────────────────
+    //
+    // The discrete tests above cover known boundaries; these
+    // property tests check that the same shape holds across the
+    // proptest-default 256 random inputs per case. The properties
+    // are the fundamental ones the privacy layer's integrity rests
+    // on, so a regression that broke any of them would be silently
+    // catastrophic without coverage at this level.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `Note::commitment` is deterministic: same (recipient,
+        /// amount, randomness) must always produce the same
+        /// commitment. Required for the verifier to reproduce the
+        /// commitment from witness data.
+        #[test]
+        fn note_commitment_is_deterministic(
+            recipient_bytes in any::<[u8; 32]>(),
+            amount in any::<u64>(),
+            randomness in any::<[u8; 32]>(),
+        ) {
+            let note = Note::new(ShieldedAddress(recipient_bytes), amount, randomness);
+            prop_assert_eq!(note.commitment(), note.commitment());
+        }
+
+        /// Distinct amounts must produce distinct commitments when
+        /// recipient and randomness are held constant. This is the
+        /// hiding-yet-binding property: a verifier must not be able
+        /// to confuse commitments to different amounts.
+        #[test]
+        fn note_commitment_differs_with_amount(
+            recipient_bytes in any::<[u8; 32]>(),
+            amount_a in any::<u64>(),
+            amount_b in any::<u64>(),
+            randomness in any::<[u8; 32]>(),
+        ) {
+            prop_assume!(amount_a != amount_b);
+            let note_a = Note::new(ShieldedAddress(recipient_bytes), amount_a, randomness);
+            let note_b = Note::new(ShieldedAddress(recipient_bytes), amount_b, randomness);
+            prop_assert_ne!(note_a.commitment(), note_b.commitment());
+        }
+
+        /// Distinct randomness with the same amount and recipient
+        /// must produce distinct commitments. This is the
+        /// blinding-factor property: two deposits of the same amount
+        /// to the same address must be unlinkable.
+        #[test]
+        fn note_commitment_differs_with_randomness(
+            recipient_bytes in any::<[u8; 32]>(),
+            amount in any::<u64>(),
+            randomness_a in any::<[u8; 32]>(),
+            randomness_b in any::<[u8; 32]>(),
+        ) {
+            prop_assume!(randomness_a != randomness_b);
+            let note_a = Note::new(ShieldedAddress(recipient_bytes), amount, randomness_a);
+            let note_b = Note::new(ShieldedAddress(recipient_bytes), amount, randomness_b);
+            prop_assert_ne!(note_a.commitment(), note_b.commitment());
+        }
+
+        /// `Nullifier::derive(commitment, spending_key)` is
+        /// deterministic. Same inputs → same nullifier; the verifier
+        /// can therefore reproduce the nullifier from the witness.
+        #[test]
+        fn nullifier_derive_is_deterministic(
+            commitment_bytes in any::<[u8; 32]>(),
+            spending_key in any::<[u8; 32]>(),
+        ) {
+            let commitment = Commitment(commitment_bytes);
+            let n1 = Nullifier::derive(&commitment, &spending_key);
+            let n2 = Nullifier::derive(&commitment, &spending_key);
+            prop_assert_eq!(n1, n2);
+        }
+
+        /// Distinct spending keys against the same commitment must
+        /// produce distinct nullifiers. Required for spend privacy
+        /// across different owners of structurally similar notes.
+        #[test]
+        fn nullifier_differs_with_spending_key(
+            commitment_bytes in any::<[u8; 32]>(),
+            sk_a in any::<[u8; 32]>(),
+            sk_b in any::<[u8; 32]>(),
+        ) {
+            prop_assume!(sk_a != sk_b);
+            let commitment = Commitment(commitment_bytes);
+            let n_a = Nullifier::derive(&commitment, &sk_a);
+            let n_b = Nullifier::derive(&commitment, &sk_b);
+            prop_assert_ne!(n_a, n_b);
+        }
+
+        /// An honestly-built Merkle path of arbitrary depth and
+        /// shape always verifies against the root computed from
+        /// the same inputs. Catches regressions that break
+        /// inclusion proofs for non-trivial tree topologies.
+        #[test]
+        fn merkle_path_honest_path_verifies(
+            leaf in any::<[u8; 32]>(),
+            siblings in proptest::collection::vec(any::<[u8; 32]>(), 0..32),
+            indices_seed in any::<u64>(),
+        ) {
+            // Derive boolean indices from the seed so they're
+            // deterministic per shrunken case.
+            let indices: Vec<bool> = (0..siblings.len())
+                .map(|i| (indices_seed >> (i % 64)) & 1 == 1)
+                .collect();
+            let root = root_for(&leaf, &siblings, &indices);
+            let mp = MerklePath {
+                path: siblings,
+                indices,
+            };
+            prop_assert!(mp.verify(&leaf, &root));
+        }
+    }
 }
