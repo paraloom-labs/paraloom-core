@@ -4,13 +4,42 @@
 //! - Merkle tree commitments
 //! - Nullifier set
 //! - Shielded pool metadata
+//!
+//! ## Durability model (#68)
+//!
+//! Five writes are durability-critical: they record the on-disk
+//! state the privacy layer relies on to prevent double-spends and
+//! to anchor proofs after a crash. They go through
+//! [`durable_write_options`], which sets `sync = true` so the
+//! write only returns once the data has been fsync'd through to
+//! disk:
+//!
+//! - `insert_commitment` / `insert_commitments_batch`
+//! - `insert_nullifier` / `insert_nullifiers_batch`
+//! - `set_total_supply`
+//!
+//! `set_merkle_root` is intentionally async — the root is a cache
+//! that the tree can rebuild from the persisted leaves on startup,
+//! so a missed write costs at most a one-time recomputation rather
+//! than data loss. Documented as such in #59 and preserved here.
 
 use crate::privacy::types::{Commitment, Nullifier};
 use anyhow::{anyhow, Result};
 use log::info;
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteOptions, DB};
 use std::path::Path;
 use std::sync::Arc;
+
+/// `WriteOptions` for the durability-critical paths described in the
+/// module docs. `sync = true` instructs RocksDB to fsync the WAL
+/// (and through it, the OS page cache) before the write is
+/// acknowledged, so a crash in the next millisecond cannot lose the
+/// already-confirmed mutation.
+fn durable_write_options() -> WriteOptions {
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    opts
+}
 
 /// Column family names
 const CF_MERKLE_TREE: &str = "merkle_tree";
@@ -52,9 +81,12 @@ impl PrivacyStorage {
 
     // ========== Merkle Tree Operations ==========
 
-    /// Insert a commitment into the Merkle tree
-    /// Key: index (u64 as bytes)
-    /// Value: commitment (32 bytes)
+    /// Insert a commitment into the Merkle tree.
+    ///
+    /// Durability-critical: synchronous fsync via
+    /// [`durable_write_options`]. A crash after this returns must
+    /// not lose the leaf — the in-memory tree relies on RocksDB as
+    /// the source of truth on restart.
     pub fn insert_commitment(&self, index: u64, commitment: &Commitment) -> Result<()> {
         let cf = self
             .db
@@ -62,7 +94,8 @@ impl PrivacyStorage {
             .ok_or_else(|| anyhow!("Merkle tree CF not found"))?;
 
         let key = index.to_le_bytes();
-        self.db.put_cf(cf, key, commitment.as_bytes())?;
+        self.db
+            .put_cf_opt(cf, key, commitment.as_bytes(), &durable_write_options())?;
         Ok(())
     }
 
@@ -87,7 +120,13 @@ impl PrivacyStorage {
         }
     }
 
-    /// Batch insert commitments
+    /// Batch insert commitments.
+    ///
+    /// Uses a `WriteBatch` with sync semantics: every entry is
+    /// staged into the batch, then a single atomic, fsync'd write
+    /// commits all of them. Either every leaf in the batch lands
+    /// on disk, or none does — the in-memory tree mirrors the
+    /// successful-path invariant.
     pub fn insert_commitments_batch(
         &self,
         start_index: u64,
@@ -98,11 +137,13 @@ impl PrivacyStorage {
             .cf_handle(CF_MERKLE_TREE)
             .ok_or_else(|| anyhow!("Merkle tree CF not found"))?;
 
+        let mut batch = rocksdb::WriteBatch::default();
         for (i, commitment) in commitments.iter().enumerate() {
             let index = start_index + i as u64;
             let key = index.to_le_bytes();
-            self.db.put_cf(cf, key, commitment.as_bytes())?;
+            batch.put_cf(cf, key, commitment.as_bytes());
         }
+        self.db.write_opt(batch, &durable_write_options())?;
 
         Ok(())
     }
@@ -148,16 +189,21 @@ impl PrivacyStorage {
 
     // ========== Nullifier Set Operations ==========
 
-    /// Insert a nullifier (mark as spent)
-    /// Key: nullifier (32 bytes)
-    /// Value: empty (existence = spent)
+    /// Insert a nullifier (mark as spent).
+    ///
+    /// Most safety-critical write in the system: a missed nullifier
+    /// on restart re-opens a double-spend window for the
+    /// already-spent note. Forced fsync via
+    /// [`durable_write_options`] — the write does not return until
+    /// the WAL has hit disk.
     pub fn insert_nullifier(&self, nullifier: &Nullifier) -> Result<()> {
         let cf = self
             .db
             .cf_handle(CF_NULLIFIER_SET)
             .ok_or_else(|| anyhow!("Nullifier set CF not found"))?;
 
-        self.db.put_cf(cf, nullifier.as_bytes(), [])?;
+        self.db
+            .put_cf_opt(cf, nullifier.as_bytes(), [], &durable_write_options())?;
         Ok(())
     }
 
@@ -171,16 +217,23 @@ impl PrivacyStorage {
         Ok(self.db.get_cf(cf, nullifier.as_bytes())?.is_some())
     }
 
-    /// Batch insert nullifiers
+    /// Batch insert nullifiers.
+    ///
+    /// Same crash-consistency contract as
+    /// [`Self::insert_commitments_batch`]: a single atomic, fsync'd
+    /// `WriteBatch`. All-or-nothing relative to a crash, with one
+    /// fsync amortised across the whole batch.
     pub fn insert_nullifiers_batch(&self, nullifiers: &[Nullifier]) -> Result<()> {
         let cf = self
             .db
             .cf_handle(CF_NULLIFIER_SET)
             .ok_or_else(|| anyhow!("Nullifier set CF not found"))?;
 
+        let mut batch = rocksdb::WriteBatch::default();
         for nullifier in nullifiers {
-            self.db.put_cf(cf, nullifier.as_bytes(), [])?;
+            batch.put_cf(cf, nullifier.as_bytes(), []);
         }
+        self.db.write_opt(batch, &durable_write_options())?;
 
         Ok(())
     }
@@ -242,14 +295,22 @@ impl PrivacyStorage {
 
     // ========== Pool State Operations ==========
 
-    /// Store total shielded supply
+    /// Store total shielded supply.
+    ///
+    /// Durability-critical: a stale total-supply on restart breaks
+    /// the pool's accounting invariants. Forced fsync.
     pub fn set_total_supply(&self, supply: u64) -> Result<()> {
         let cf = self
             .db
             .cf_handle(CF_POOL_STATE)
             .ok_or_else(|| anyhow!("Pool state CF not found"))?;
 
-        self.db.put_cf(cf, b"total_supply", supply.to_le_bytes())?;
+        self.db.put_cf_opt(
+            cf,
+            b"total_supply",
+            supply.to_le_bytes(),
+            &durable_write_options(),
+        )?;
         Ok(())
     }
 
@@ -273,7 +334,12 @@ impl PrivacyStorage {
         }
     }
 
-    /// Store Merkle root
+    /// Store Merkle root.
+    ///
+    /// Intentionally async (no fsync) — the root is a cache that
+    /// the tree rebuilds from the persisted leaves on startup, so a
+    /// missed write here costs at most a one-time recomputation
+    /// rather than data loss. See the module docs and #59.
     pub fn set_merkle_root(&self, root: &[u8; 32]) -> Result<()> {
         let cf = self
             .db
