@@ -381,7 +381,10 @@ mod tests {
                 let delay = *retry_at - now(&clock);
                 assert_eq!(delay, RECONNECT_BACKOFF[0]);
             }
-            other => panic!("expected Backoff after reconnect+disconnect, got {:?}", other),
+            other => panic!(
+                "expected Backoff after reconnect+disconnect, got {:?}",
+                other
+            ),
         }
     }
 
