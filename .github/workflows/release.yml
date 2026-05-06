@@ -8,31 +8,36 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Linux x86_64 — primary validator deployment target.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: paraloom-node
             asset_name: paraloom-node-linux-amd64
 
-          # Uncomment when Windows/Mac builds are needed:
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   artifact_name: paraloom-node.exe
-          #   asset_name: paraloom-node-windows-amd64.exe
-          #
-          # - os: macos-latest
-          #   target: x86_64-apple-darwin
-          #   artifact_name: paraloom-node
-          #   asset_name: paraloom-node-macos-amd64
-          #
-          # - os: macos-latest
-          #   target: aarch64-apple-darwin
-          #   artifact_name: paraloom-node
-          #   asset_name: paraloom-node-macos-arm64
+          # macOS x86_64 — older Intel Macs, dev workstations.
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_name: paraloom-node
+            asset_name: paraloom-node-macos-amd64
+
+          # macOS aarch64 — Apple Silicon (M1/M2/M3) developer
+          # workstations, where most contributor builds happen.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: paraloom-node
+            asset_name: paraloom-node-macos-arm64
+
+          # Windows and Linux aarch64 are intentionally out of scope
+          # for this slice — Solana SDK on Windows MSVC needs more
+          # toolchain plumbing than fits this PR, and aarch64 Linux
+          # cross-compilation hits RocksDB's bindgen tooling. Both
+          # are tracked under #70 follow-ups.
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +48,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -57,55 +62,91 @@ jobs:
             libstdc++-12-dev
 
       - name: Install dependencies (macOS)
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         run: |
           brew install protobuf cmake
-
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install protoc -y
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bin paraloom-node
 
-      - name: Strip binary (Unix)
-        if: matrix.os != 'windows-latest'
+      - name: Strip binary
         run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
-      - name: Rename binary
+      - name: Stage artifact
         shell: bash
         run: |
           mkdir -p artifacts
           cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.asset_name }}
 
+      - name: Compute SHA-256 checksum
+        shell: bash
+        run: |
+          # Per-platform checksum file. The package job aggregates
+          # these into a single SHA256SUMS that operators verify.
+          cd artifacts
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          fi
+          cat "${{ matrix.asset_name }}.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: artifacts/${{ matrix.asset_name }}
+          path: |
+            artifacts/${{ matrix.asset_name }}
+            artifacts/${{ matrix.asset_name }}.sha256
           retention-days: 7
 
-  # Uncomment when ready to create releases with tags
-  # package:
-  #   name: Create Release Package
-  #   needs: build
-  #   runs-on: ubuntu-latest
-  #   if: startsWith(github.ref, 'refs/tags/')
-  #
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - name: Download all artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: artifacts
-  #
-  #     - name: Create Release
-  #       uses: softprops/action-gh-release@v1
-  #       with:
-  #         files: artifacts/**/*
-  #         draft: false
-  #         prerelease: false
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  package:
+    name: Aggregate Checksums and Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish a GitHub Release on actual version tags. Manual
+    # workflow_dispatch runs still produce per-platform artifacts via
+    # the build job above; they just don't update the Releases page.
+    if: startsWith(github.ref, 'refs/tags/')
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Aggregate checksums
+        shell: bash
+        run: |
+          # Each per-platform `*.sha256` file already contains a
+          # `<hash>  <filename>` line; concatenating them produces a
+          # canonical SHA256SUMS that an operator can verify with
+          # `sha256sum -c SHA256SUMS` after downloading the whole
+          # release.
+          mkdir -p release
+          for d in artifacts/*/; do
+            name="${d#artifacts/}"
+            name="${name%/}"
+            cp "$d/$name" "release/$name"
+            cat "$d/$name.sha256" >> release/SHA256SUMS
+          done
+          echo "----- SHA256SUMS -----"
+          cat release/SHA256SUMS
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # Append the binaries and the aggregate checksum file to
+          # the release that was already drafted by `release-drafter`
+          # on the tagged merge.
+          files: |
+            release/paraloom-node-*
+            release/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
