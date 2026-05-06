@@ -81,11 +81,17 @@ jobs:
         with:
           shared-key: "paraloom-ci"
 
-      - name: Build all features
+      - name: Build all features (lib, bins, tests, examples)
         uses: actions-rs/cargo@v1
         with:
           command: build
-          args: --all-features
+          # \`--all-targets\` compiles integration tests under \`tests/\`
+          # and any examples in addition to the lib and bins. Catches
+          # dead imports in test files that would otherwise drift
+          # silently because \`cargo test --lib\` does not touch them.
+          # See #89, where a stale post-Poseidon-migration import had
+          # been broken since v0.2.0 without anyone noticing.
+          args: --all-features --all-targets
 
   test-quick:
     name: Quick Test (All Modules)
