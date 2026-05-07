@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 /// Unique identifier for a node
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -13,6 +14,18 @@ impl fmt::Display for NodeId {
             write!(f, "{:02x}", byte)?;
         }
         Ok(())
+    }
+}
+
+/// Round-trip with `Display`: the hex form an operator pastes into
+/// a config file decodes back to the same byte vector. Used by the
+/// HA settings (#66) to lift `String` config values into `NodeId`
+/// at node startup.
+impl FromStr for NodeId {
+    type Err = hex::FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        hex::decode(s).map(NodeId)
     }
 }
 
@@ -64,4 +77,33 @@ pub enum NodeStatus {
     ShuttingDown,
     /// Node has encountered an error
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nodeid_display_and_fromstr_round_trip() {
+        let id = NodeId(vec![0x12, 0x34, 0xab, 0xcd, 0xef]);
+        let rendered = format!("{}", id);
+        assert_eq!(rendered, "1234abcdef");
+        let parsed: NodeId = rendered.parse().expect("decode");
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn nodeid_fromstr_rejects_odd_length_hex() {
+        // hex::decode requires even-length input; an operator who
+        // pastes a truncated id should get a clear error rather
+        // than a silently-truncated NodeId.
+        let result: Result<NodeId, _> = "abc".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn nodeid_fromstr_rejects_non_hex_characters() {
+        let result: Result<NodeId, _> = "zz".parse();
+        assert!(result.is_err());
+    }
 }
