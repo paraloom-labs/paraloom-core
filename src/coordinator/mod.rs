@@ -5,6 +5,7 @@ use crate::task::{ResultData, Task, TaskId, TaskResult, TaskStatus, TaskType};
 use crate::types::NodeId;
 use anyhow::Result;
 use log::info;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -367,5 +368,64 @@ impl Coordinator {
         }
 
         Ok(())
+    }
+
+    /// Capture a serializable snapshot of all in-memory coordinator state.
+    ///
+    /// Acquires each of the four state mutexes in turn, clones the
+    /// inner data, and releases the lock immediately. The snapshot is
+    /// a point-in-time view: by the time the caller reads it, the
+    /// underlying state may have moved on. Replication, heartbeat,
+    /// and promotion logic on top of this surface is tracked under
+    /// #66; this method is the data foothold those PRs build on.
+    pub async fn snapshot(&self) -> CoordinatorSnapshot {
+        let validators = self.validators.lock().await.clone();
+        let active_tasks = self.active_tasks.lock().await.clone();
+        let parent_tasks = self.parent_tasks.lock().await.clone();
+        let results = self.results.lock().await.clone();
+        CoordinatorSnapshot {
+            validators,
+            active_tasks,
+            parent_tasks,
+            results,
+        }
+    }
+}
+
+/// Serializable snapshot of all in-memory coordinator state.
+///
+/// Used as the data surface for the active/passive HA work tracked
+/// in #66. Subsequent PRs build heartbeat, replication, and
+/// promotion on top of this type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CoordinatorSnapshot {
+    pub validators: Vec<NodeId>,
+    pub active_tasks: HashMap<TaskId, Task>,
+    pub parent_tasks: HashMap<TaskId, TaskId>,
+    pub results: HashMap<TaskId, TaskResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_snapshot_has_zero_state() {
+        let snapshot = CoordinatorSnapshot::default();
+        assert!(snapshot.validators.is_empty());
+        assert!(snapshot.active_tasks.is_empty());
+        assert!(snapshot.parent_tasks.is_empty());
+        assert!(snapshot.results.is_empty());
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_serde_json() {
+        let snapshot = CoordinatorSnapshot::default();
+        let encoded = serde_json::to_string(&snapshot).expect("serialize");
+        let decoded: CoordinatorSnapshot = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.validators.len(), snapshot.validators.len());
+        assert_eq!(decoded.active_tasks.len(), snapshot.active_tasks.len());
+        assert_eq!(decoded.parent_tasks.len(), snapshot.parent_tasks.len());
+        assert_eq!(decoded.results.len(), snapshot.results.len());
     }
 }
