@@ -41,6 +41,31 @@ pub const TRANSCRIPT_VERSION: u32 = 1;
 /// pure-byte comparison.
 pub type TranscriptHash = [u8; 64];
 
+/// Serde helper for `[u8; 64]` fields. Derive expansion does not
+/// support arrays larger than 32 elements, so transcript fields
+/// of type `TranscriptHash` are annotated `#[serde(with =
+/// "serde_hash")]` to delegate to this module.
+mod serde_hash {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(h: &[u8; 64], ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(h)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 64], D::Error> {
+        let bytes = Vec::<u8>::deserialize(de)?;
+        if bytes.len() != 64 {
+            return Err(serde::de::Error::invalid_length(
+                bytes.len(),
+                &"64 bytes for a TranscriptHash",
+            ));
+        }
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
 /// Identifier of the circuit a transcript was produced against.
 ///
 /// A Groth16 phase-2 SRS is bound to a specific R1CS, so a single
@@ -78,6 +103,7 @@ impl CircuitId {
 pub struct Contribution {
     /// Hash of the previous contribution's serialised bytes, or
     /// the initial-state hash if this is the first contribution.
+    #[serde(with = "serde_hash")]
     pub prior_hash: TranscriptHash,
 
     /// Contributor's identity. NodeId is reused so the ceremony
@@ -142,6 +168,7 @@ pub struct Phase2Transcript {
     /// Hash of the initial single-source SRS (produced by the
     /// existing `setup_*_ceremony` binaries). The first
     /// contribution's `prior_hash` must equal this value.
+    #[serde(with = "serde_hash")]
     pub initial_srs_hash: TranscriptHash,
 
     /// Ordered list of contributions. The chain is canonical:
@@ -154,6 +181,7 @@ pub struct Phase2Transcript {
     /// compares against this stored value as a defence against
     /// a corrupted ProvingKey file accompanying an otherwise-
     /// valid transcript.
+    #[serde(with = "serde_hash")]
     pub final_srs_hash: TranscriptHash,
 }
 
@@ -234,7 +262,7 @@ pub fn hash_contribution(contribution: &Contribution) -> TranscriptHash {
     let bytes = bincode::serialize(contribution).expect("Contribution always serialises");
     let digest = sha2::Sha512::digest(&bytes);
     let mut out = [0u8; 64];
-    out.copy_from_slice(digest.as_slice());
+    out.copy_from_slice(&digest[..]);
     out
 }
 
