@@ -8,7 +8,9 @@ use libp2p::{
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
     identity,
     kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
-    noise, quic,
+    noise,
+    ping::{self, Behaviour as Ping, Event as PingEvent},
+    quic,
     request_response::{
         Behaviour as RequestResponse, Event as RequestResponseEvent,
         Message as RequestResponseMessage,
@@ -56,6 +58,13 @@ pub struct ParaloomBehaviour {
     /// empty at construction; bootstrap registration and periodic
     /// refresh land in subsequent PRs.
     pub kad: Kademlia<MemoryStore>,
+    /// libp2p ping for connection-level liveness probes (#65).
+    /// Distinct from the application-level heartbeat protocol
+    /// used for coordinator HA in #66; this one runs on every
+    /// open connection and surfaces RTTs / disconnects to the
+    /// swarm event loop. PeerRegistry (#69) integration of these
+    /// signals is a follow-up.
+    pub ping: Ping,
 }
 
 /// Network event handler
@@ -171,11 +180,24 @@ impl NetworkManager {
         let mut kad = Kademlia::new(local_peer_id, kad_store);
         kad.set_mode(Some(KadMode::Server));
 
+        // Connection-level ping. interval=15s, timeout=20s — both
+        // shorter than libp2p's defaults so a stalled peer is
+        // disconnected from the swarm within a window the
+        // PeerRegistry's slow/offline distinction (#69) can react
+        // to without piling up retries. Tunable later when
+        // operational data shows what real deployments need.
+        let ping = Ping::new(
+            ping::Config::new()
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_timeout(std::time::Duration::from_secs(20)),
+        );
+
         let behaviour = ParaloomBehaviour {
             gossipsub,
             request_response,
             heartbeat,
             kad,
+            ping,
         };
 
         // Set up message channel
@@ -497,6 +519,17 @@ impl NetworkManager {
                                                 }
                                                 other => {
                                                     debug!("kad event: {:?}", other);
+                                                }
+                                            }
+                                        }
+
+                                        ParaloomBehaviourEvent::Ping(ping_event) => {
+                                            match ping_event {
+                                                PingEvent { peer, result: Ok(rtt), .. } => {
+                                                    debug!("ping ok: peer {} rtt {:?}", peer, rtt);
+                                                }
+                                                PingEvent { peer, result: Err(e), .. } => {
+                                                    log::warn!("ping failed: peer {} error {:?}", peer, e);
                                                 }
                                             }
                                         }
