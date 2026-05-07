@@ -40,6 +40,15 @@ pub struct Node {
     compute_storage: Option<Arc<ComputeStorage>>,
     // Track coordinator nodes for result reporting
     job_coordinators: Arc<Mutex<std::collections::HashMap<crate::compute::JobId, NodeId>>>,
+
+    // Coordinator-HA spawn handles (#66). The broadcast handle is
+    // populated when the node is configured as a primary with a
+    // non-empty standby list; the watchdog handle is populated when
+    // the node is configured as a standby. Either may be None when
+    // HA is disabled. Held in Arc<Mutex<Option<...>>> so Clone of
+    // Node remains cheap and shutdown can abort in place.
+    ha_broadcast: Arc<Mutex<Option<JoinHandle<()>>>>,
+    ha_watchdog: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -702,6 +711,8 @@ impl Node {
             compute_coordinator,
             compute_storage,
             job_coordinators: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ha_broadcast: Arc::new(Mutex::new(None)),
+            ha_watchdog: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -1177,6 +1188,8 @@ impl Clone for Node {
             compute_coordinator: self.compute_coordinator.clone(),
             compute_storage: self.compute_storage.clone(),
             job_coordinators: self.job_coordinators.clone(),
+            ha_broadcast: self.ha_broadcast.clone(),
+            ha_watchdog: self.ha_watchdog.clone(),
         }
     }
 }
