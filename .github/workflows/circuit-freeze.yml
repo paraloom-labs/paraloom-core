@@ -1,0 +1,43 @@
+name: Circuit Freeze Guard
+
+# Hard rule from #64's ceremony plan: between the v0.5.0-rc1 tag
+# and the final v0.5.0 release, no PR may change the privacy
+# circuits' R1CS shape. The ceremony output is bound to that exact
+# R1CS hash; any constraint change invalidates every contribution
+# that has already landed.
+#
+# Mechanism: when the operator cuts rc1 and starts the ceremony,
+# they commit a `.ceremony-in-progress` sentinel file to `main`
+# (containing the rc1 tag and start timestamp). This workflow
+# triggers only on PRs that touch the privacy circuits file. If
+# the base branch carries the sentinel, the workflow fails with a
+# clear diagnostic. After the ceremony completes the operator
+# removes the sentinel and circuit changes are unblocked.
+
+on:
+  pull_request:
+    paths:
+      - 'src/privacy/circuits.rs'
+
+jobs:
+  freeze-check:
+    name: Reject circuit changes during active ceremony
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+
+      - name: Reject if ceremony is in progress
+        shell: bash
+        run: |
+          if [ -f .ceremony-in-progress ]; then
+            echo "::error::src/privacy/circuits.rs is frozen while a phase-2 MPC ceremony is in progress."
+            echo "::error::Any constraint change invalidates every contribution already on the chain."
+            echo "::error::Sentinel file contents:"
+            sed 's/^/    /' .ceremony-in-progress
+            echo "::error::Wait until the ceremony completes (sentinel is removed) before re-opening this PR."
+            exit 1
+          fi
+          echo "no ceremony in progress; circuit-modifying PR allowed."
