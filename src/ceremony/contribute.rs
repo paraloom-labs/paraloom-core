@@ -10,11 +10,18 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use ark_bls12_381::Bls12_381;
+use ark_bls12_381::{Bls12_381, Fr};
+use ark_ff::UniformRand;
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use rand::{CryptoRng, RngCore};
 
-use super::transcript::Phase2Transcript;
+use crate::types::NodeId;
+
+use super::bgm17::{apply_contribution, BgmError};
+use super::transcript::{
+    CircuitId, Contribution, Phase2Transcript, TranscriptError, TranscriptHash,
+};
 
 /// Errors surfaced by the contributor flow.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +34,76 @@ pub enum ContributeError {
 
     #[error("failed to serialise a ceremony artefact: {0}")]
     Serialize(String),
+
+    #[error("BGM17 contribution failed: {0}")]
+    Bgm(#[from] BgmError),
+
+    #[error("transcript chain rejected the new contribution: {0}")]
+    Transcript(#[from] TranscriptError),
+}
+
+/// Apply one contribution and return the updated proving key plus
+/// the extended transcript. Pure orchestration of the cryptographic
+/// pieces in [`super::bgm17`] and the data shape in
+/// [`super::transcript`].
+///
+/// The caller supplies `prior_pk` and the previous `prior_transcript`
+/// (or `None` for the very first contribution, in which case
+/// `initial_srs_hash` seeds the transcript). `delta_i` is sampled
+/// inside this function from `rng` and is dropped at the end of the
+/// call so it does not outlive the stack frame; the caller's `rng`
+/// remains the only entropy reference.
+///
+/// `contributor_pubkey` and `signature` on the resulting
+/// Contribution are left empty in this commit; a follow-up PR
+/// wires up signed attestations once the signing-key plumbing
+/// lands. Verifiers built from this module check the DLEQ and
+/// chain integrity regardless; signatures only add the
+/// social-trust layer on top.
+pub fn contribute<R: RngCore + CryptoRng>(
+    mut prior_pk: ProvingKey<Bls12_381>,
+    prior_transcript: Option<Phase2Transcript>,
+    circuit: CircuitId,
+    initial_srs_hash: TranscriptHash,
+    contributor: NodeId,
+    attestation: String,
+    rng: &mut R,
+) -> Result<(ProvingKey<Bls12_381>, Phase2Transcript), ContributeError> {
+    let delta_i = Fr::rand(rng);
+    let proof = apply_contribution(&mut prior_pk, delta_i, rng)?;
+
+    let mut delta_after_g1 = Vec::new();
+    prior_pk
+        .delta_g1
+        .serialize_compressed(&mut delta_after_g1)
+        .map_err(|e| ContributeError::Serialize(format!("delta_after_g1: {}", e)))?;
+    let mut delta_after_g2 = Vec::new();
+    prior_pk
+        .vk
+        .delta_g2
+        .serialize_compressed(&mut delta_after_g2)
+        .map_err(|e| ContributeError::Serialize(format!("delta_after_g2: {}", e)))?;
+
+    let mut transcript = prior_transcript
+        .unwrap_or_else(|| Phase2Transcript::new(circuit.clone(), initial_srs_hash));
+    let prior_hash = match transcript.contributions.last() {
+        Some(prev) => super::transcript::hash_contribution(prev),
+        None => transcript.initial_srs_hash,
+    };
+
+    let contribution = Contribution {
+        prior_hash,
+        contributor,
+        delta_after_g1,
+        delta_after_g2,
+        dleq_proof: proof.to_bytes(),
+        contributor_pubkey: Vec::new(),
+        signature: Vec::new(),
+        attestation,
+    };
+    transcript.append(contribution)?;
+
+    Ok((prior_pk, transcript))
 }
 
 /// Read a `ProvingKey<Bls12_381>` from a compressed-arkworks file.
