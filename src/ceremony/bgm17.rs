@@ -163,27 +163,48 @@ pub fn verify_contribution(
     pk_after: &ProvingKey<Bls12_381>,
     proof: &DleqProof,
 ) -> Result<(), BgmError> {
-    if pk_after.delta_g1.is_zero() || pk_after.vk.delta_g2.is_zero() {
-        return Err(BgmError::ZeroContribution);
-    }
-
-    let c = fiat_shamir_challenge(
+    verify_contribution_deltas(
         &pk_before.delta_g1,
         &pk_after.delta_g1,
         &pk_before.vk.delta_g2,
         &pk_after.vk.delta_g2,
+        proof,
+    )
+}
+
+/// Lower-level DLEQ check that operates on raw delta points
+/// rather than full proving keys. The transcript verifier
+/// consumes this directly: a `Phase2Transcript` stores only
+/// the delta bytes per contribution, not the full SRS, so the
+/// PK-shaped wrapper above is the wrong API there.
+pub fn verify_contribution_deltas(
+    delta_before_g1: &G1Affine,
+    delta_after_g1: &G1Affine,
+    delta_before_g2: &G2Affine,
+    delta_after_g2: &G2Affine,
+    proof: &DleqProof,
+) -> Result<(), BgmError> {
+    if delta_after_g1.is_zero() || delta_after_g2.is_zero() {
+        return Err(BgmError::ZeroContribution);
+    }
+
+    let c = fiat_shamir_challenge(
+        delta_before_g1,
+        delta_after_g1,
+        delta_before_g2,
+        delta_after_g2,
         &proof.r_g1,
         &proof.r_g2,
     );
 
-    let lhs_g1 = (pk_before.delta_g1 * proof.s).into_affine();
-    let rhs_g1 = (proof.r_g1 + pk_after.delta_g1 * c).into_affine();
+    let lhs_g1 = (*delta_before_g1 * proof.s).into_affine();
+    let rhs_g1 = (proof.r_g1 + *delta_after_g1 * c).into_affine();
     if lhs_g1 != rhs_g1 {
         return Err(BgmError::DleqMismatchG1);
     }
 
-    let lhs_g2 = (pk_before.vk.delta_g2 * proof.s).into_affine();
-    let rhs_g2 = (proof.r_g2 + pk_after.vk.delta_g2 * c).into_affine();
+    let lhs_g2 = (*delta_before_g2 * proof.s).into_affine();
+    let rhs_g2 = (proof.r_g2 + *delta_after_g2 * c).into_affine();
     if lhs_g2 != rhs_g2 {
         return Err(BgmError::DleqMismatchG2);
     }
