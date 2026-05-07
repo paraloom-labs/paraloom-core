@@ -173,6 +173,99 @@ impl Coordinator {
         role.promote()
     }
 
+    /// Spawn the primary-side heartbeat broadcast task.
+    ///
+    /// Every `interval`, builds a single heartbeat from the current
+    /// snapshot via `next_heartbeat_request` and sends it to each
+    /// standby in `standbys`. The same heartbeat (same sequence) is
+    /// sent to every standby in one tick, so all standbys agree on
+    /// the canonical primary view at that point in time.
+    ///
+    /// The loop checks `is_primary()` at the top of each tick and
+    /// exits cleanly if the role has been demoted (an unusual but
+    /// possible scenario when external operator tooling promotes a
+    /// standby and the old primary survives the partition that
+    /// triggered it). Send failures to individual standbys are
+    /// logged at warn but do not stop the loop; transient
+    /// disconnections recover on the next tick.
+    ///
+    /// Returns the JoinHandle so the caller can `abort()` it on
+    /// node shutdown. Drop the handle to detach.
+    pub fn start_heartbeat_broadcast(
+        self: Arc<Self>,
+        primary_id: NodeId,
+        standbys: Vec<NodeId>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first tick fires immediately; consume it so the
+            // first real heartbeat is sent after one full interval,
+            // giving the standbys time to subscribe.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if !self.is_primary().await {
+                    info!("coordinator no longer primary; stopping heartbeat broadcast");
+                    break;
+                }
+                let request = self.next_heartbeat_request(primary_id.clone()).await;
+                for standby in &standbys {
+                    if let Err(e) = self
+                        .network
+                        .send_heartbeat_request(standby.clone(), request.clone())
+                        .await
+                    {
+                        log::warn!("failed to send heartbeat to standby {}: {}", standby, e);
+                    }
+                }
+            }
+        })
+    }
+
+    /// Spawn the standby-side stall watchdog task.
+    ///
+    /// Every `check_interval`, asks `try_promote_if_stalled(now)`
+    /// whether the configured stall threshold has elapsed since the
+    /// last applied heartbeat. If it has, the standby promotes
+    /// itself to Primary and the watchdog exits — there is nothing
+    /// further to watch.
+    ///
+    /// `check_interval` should be substantially smaller than the
+    /// stall threshold so the standby reacts quickly once the
+    /// threshold is crossed. A typical ratio is 5:1 (e.g. check
+    /// every 5s against a 30s stall threshold), giving a worst-case
+    /// detection latency equal to one check interval.
+    ///
+    /// Returns the JoinHandle so the caller can `abort()` it. The
+    /// watchdog also self-terminates on promotion, so callers
+    /// often do not need to abort it explicitly.
+    pub fn start_stall_watchdog(
+        self: Arc<Self>,
+        check_interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(check_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if self.is_primary().await {
+                    info!("coordinator is primary; stopping stall watchdog");
+                    break;
+                }
+                if let Some(previous_primary) = self.try_promote_if_stalled(Instant::now()).await {
+                    log::warn!(
+                        "primary {} appears stalled; promoted to Primary",
+                        previous_primary
+                    );
+                    break;
+                }
+            }
+        })
+    }
+
     /// Register a validator
     pub async fn register_validator(&self, validator_id: NodeId) {
         let mut validators = self.validators.lock().await;
@@ -541,6 +634,7 @@ pub struct CoordinatorSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Settings;
 
     #[test]
     fn empty_snapshot_has_zero_state() {
@@ -560,5 +654,96 @@ mod tests {
         assert_eq!(decoded.active_tasks.len(), snapshot.active_tasks.len());
         assert_eq!(decoded.parent_tasks.len(), snapshot.parent_tasks.len());
         assert_eq!(decoded.results.len(), snapshot.results.len());
+    }
+
+    /// Build a NetworkManager for tests that need to construct a
+    /// Coordinator. The tests below never call `.start()` on it, so
+    /// no swarm tasks spin up; only the in-process state-machine
+    /// methods are exercised.
+    fn make_test_network() -> Arc<NetworkManager> {
+        Arc::new(NetworkManager::new(&Settings::development()).expect("test network"))
+    }
+
+    #[tokio::test]
+    async fn primary_to_standby_state_replication_round_trip() {
+        let primary = Coordinator::new(make_test_network());
+        primary.register_validator(NodeId(vec![0xAA])).await;
+        primary.register_validator(NodeId(vec![0xBB])).await;
+
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+        assert!(!standby.is_primary().await);
+
+        let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = standby.apply_heartbeat(request).await;
+
+        assert!(response.accepted);
+        assert_eq!(response.last_applied_sequence, 1);
+
+        let snapshot = standby.snapshot().await;
+        assert_eq!(snapshot.validators.len(), 2);
+        assert!(snapshot.validators.contains(&NodeId(vec![0xAA])));
+        assert!(snapshot.validators.contains(&NodeId(vec![0xBB])));
+    }
+
+    #[tokio::test]
+    async fn standby_rejects_replayed_heartbeats() {
+        let primary = Coordinator::new(make_test_network());
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+
+        let req1 = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let resp1 = standby.apply_heartbeat(req1.clone()).await;
+        assert!(resp1.accepted);
+        assert_eq!(resp1.last_applied_sequence, 1);
+
+        // Replaying the same heartbeat must be rejected because the
+        // sequence is no longer strictly greater than the highest
+        // applied. The standby's view never moves backwards.
+        let resp2 = standby.apply_heartbeat(req1).await;
+        assert!(!resp2.accepted);
+        assert_eq!(resp2.last_applied_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn primary_rejects_inbound_heartbeats() {
+        // A coordinator already in the Primary role refuses to apply
+        // heartbeats; this protects against a confused remote standby
+        // attempting to overwrite primary state.
+        let primary_a = Coordinator::new(make_test_network());
+        let primary_b = Coordinator::new(make_test_network());
+
+        let request = primary_a.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = primary_b.apply_heartbeat(request).await;
+        assert!(!response.accepted);
+        assert!(primary_b.is_primary().await);
+    }
+
+    #[tokio::test]
+    async fn standby_promotes_after_stall_threshold() {
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(50),
+        );
+        assert!(!standby.is_primary().await);
+
+        // Sleep past the stall threshold, then ask the standby to
+        // self-promote based on the current Instant. Promotion
+        // returns the previous primary identity for audit logging.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let promoted = standby.try_promote_if_stalled(Instant::now()).await;
+        assert_eq!(promoted, Some(NodeId(vec![0x01])));
+        assert!(standby.is_primary().await);
+
+        // After promotion, further calls are no-ops and return None.
+        let again = standby.try_promote_if_stalled(Instant::now()).await;
+        assert_eq!(again, None);
     }
 }

@@ -556,6 +556,28 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             })
         }
     }
+
+    /// Route an inbound coordinator-HA heartbeat to the local
+    /// coordinator instance, if any. A node configured without a
+    /// coordinator has no standby state to apply, so it rejects the
+    /// heartbeat and the primary will surface this as an outbound
+    /// failure — useful operationally to spot a misconfigured peer
+    /// list.
+    async fn handle_heartbeat_request(
+        &self,
+        _source: NodeId,
+        request: crate::network::HeartbeatRequest,
+    ) -> Result<crate::network::HeartbeatResponse> {
+        if let Some(coordinator) = &self.coordinator {
+            Ok(coordinator.apply_heartbeat(request).await)
+        } else {
+            log::warn!("heartbeat received but this node has no coordinator");
+            Ok(crate::network::HeartbeatResponse {
+                accepted: false,
+                last_applied_sequence: 0,
+            })
+        }
+    }
 }
 
 impl Node {
