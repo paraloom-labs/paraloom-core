@@ -32,6 +32,21 @@ use super::req_resp::{create_result_protocol, ResultCodec, ResultRequest, Result
 // Global topic for all paraloom messages
 const PARALOOM_TOPIC: &str = "paraloom/v1";
 
+/// Extract the trailing `/p2p/<peer_id>` component from a
+/// multiaddr if present. Used by bootstrap registration to learn
+/// the PeerId without dialling first; if the operator gives us a
+/// bare network multiaddr (no /p2p/ suffix) we fall back to dial
+/// only.
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|proto| {
+        if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
+            Some(peer_id)
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(NetworkBehaviour)]
 pub struct ParaloomBehaviour {
     pub gossipsub: Gossipsub,
@@ -202,6 +217,25 @@ impl NetworkManager {
         for addr_str in bootstrap_nodes {
             match addr_str.parse::<Multiaddr>() {
                 Ok(addr) => {
+                    // Extract /p2p/<peer_id> if present so the
+                    // address can also be registered in Kademlia's
+                    // routing table. Without the suffix the dial
+                    // still works, but the DHT cannot use the
+                    // bootstrap as a query target. Operators are
+                    // expected to publish full multiaddrs
+                    // including /p2p/<peer_id>; an address without
+                    // the suffix gets a warn log and is dialled
+                    // but not added to kad.
+                    let peer_id = peer_id_from_multiaddr(&addr);
+                    if let Some(pid) = peer_id {
+                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                        info!("Registered bootstrap {} in Kademlia routing table", pid);
+                    } else {
+                        log::warn!(
+                            "Bootstrap address {} has no /p2p/<peer_id>; dialled but not in kad",
+                            addr
+                        );
+                    }
                     info!("Dialing bootstrap node: {}", addr);
                     if let Err(e) = swarm.dial(addr.clone()) {
                         log::warn!("Failed to dial {}: {}", addr, e);
