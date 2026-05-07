@@ -92,6 +92,39 @@ impl CircuitId {
     }
 }
 
+impl std::str::FromStr for CircuitId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "deposit" => Ok(CircuitId::Deposit),
+            "transfer" => Ok(CircuitId::Transfer),
+            "withdraw" => Ok(CircuitId::Withdraw),
+            other => Err(format!(
+                "unknown circuit {:?}; expected deposit | transfer | withdraw",
+                other
+            )),
+        }
+    }
+}
+
+/// Decode a hex-encoded SHA-512 digest into a [`TranscriptHash`].
+/// Surfaces a clear error rather than silently truncating, so an
+/// operator pasting a wrong-length hash to a CLI flag knows what
+/// is wrong.
+pub fn try_hash_from_hex(s: &str) -> Result<TranscriptHash, String> {
+    let bytes = hex::decode(s).map_err(|e| format!("not valid hex: {}", e))?;
+    if bytes.len() != 64 {
+        return Err(format!(
+            "transcript hash must decode to 64 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 /// A single contributor's record on the transcript.
 ///
 /// The cryptographic content (DLEQ proof, contributor's public
@@ -389,5 +422,31 @@ mod tests {
         assert_eq!(CircuitId::Deposit.label(), "deposit");
         assert_eq!(CircuitId::Transfer.label(), "transfer");
         assert_eq!(CircuitId::Withdraw.label(), "withdraw");
+    }
+
+    #[test]
+    fn circuit_id_from_str_round_trips_with_label() {
+        use std::str::FromStr;
+        for c in [CircuitId::Deposit, CircuitId::Transfer, CircuitId::Withdraw] {
+            let parsed = CircuitId::from_str(c.label()).expect("label round-trips");
+            assert_eq!(parsed, c);
+        }
+        assert!(CircuitId::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn try_hash_from_hex_round_trips_64_bytes() {
+        let original: TranscriptHash = [0x42u8; 64];
+        let hex_str: String = original.iter().map(|b| format!("{:02x}", b)).collect();
+        let decoded = try_hash_from_hex(&hex_str).expect("64-byte hex decodes");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn try_hash_from_hex_rejects_short_input() {
+        match try_hash_from_hex("aabbccdd") {
+            Err(msg) => assert!(msg.contains("64 bytes")),
+            Ok(_) => panic!("short hex must error"),
+        }
     }
 }

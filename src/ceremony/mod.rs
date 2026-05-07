@@ -48,7 +48,7 @@ pub use contribute::{
     contribute, read_pk, read_transcript, write_pk, write_transcript, ContributeError,
 };
 pub use transcript::{
-    hash_contribution, CircuitId, Contribution, Phase2Transcript, TranscriptError, TranscriptHash,
-    TRANSCRIPT_VERSION,
+    hash_contribution, try_hash_from_hex, CircuitId, Contribution, Phase2Transcript,
+    TranscriptError, TranscriptHash, TRANSCRIPT_VERSION,
 };
 pub use verifier::{verify_phase2_transcript, VerifyError};
