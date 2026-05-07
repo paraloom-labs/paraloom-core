@@ -37,12 +37,14 @@
 //! progresses; each is scoped to one PR.
 
 pub mod bgm17;
+pub mod contribute;
 pub mod transcript;
 pub mod verifier;
 
 pub use bgm17::{
     apply_contribution, verify_contribution, verify_contribution_deltas, BgmError, DleqProof,
 };
+pub use contribute::{read_pk, read_transcript, write_pk, write_transcript, ContributeError};
 pub use transcript::{
     hash_contribution, CircuitId, Contribution, Phase2Transcript, TranscriptError, TranscriptHash,
     TRANSCRIPT_VERSION,
