@@ -38,9 +38,13 @@
 
 pub mod bgm17;
 pub mod transcript;
+pub mod verifier;
 
-pub use bgm17::{apply_contribution, verify_contribution, BgmError, DleqProof};
+pub use bgm17::{
+    apply_contribution, verify_contribution, verify_contribution_deltas, BgmError, DleqProof,
+};
 pub use transcript::{
     hash_contribution, CircuitId, Contribution, Phase2Transcript, TranscriptError, TranscriptHash,
     TRANSCRIPT_VERSION,
 };
+pub use verifier::{verify_phase2_transcript, VerifyError};
