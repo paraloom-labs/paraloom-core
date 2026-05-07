@@ -49,10 +49,14 @@ struct Args {
     #[arg(long, default_value = "deposit")]
     circuit: String,
 
-    /// Hex-encoded SHA-512 of the initial SRS. Only used when
-    /// --prior-transcript is omitted.
-    #[arg(long, default_value_t = "00".repeat(64))]
-    initial_srs_hash: String,
+    /// Hex-encoded SHA-512 of the initial SRS. Only meaningful when
+    /// --prior-transcript is omitted; the value is committed to the
+    /// new transcript as the chain anchor. If unset, the chain is
+    /// anchored at the all-zero hash, which is acceptable for
+    /// testnet but should be the actual SHA-512 of the initial PK
+    /// for any production ceremony.
+    #[arg(long)]
+    initial_srs_hash: Option<String>,
 
     /// Hex-encoded NodeId of this contributor. Round-trips through
     /// NodeId's Display/FromStr impls.
@@ -71,8 +75,12 @@ fn main() -> Result<()> {
 
     let circuit =
         CircuitId::from_str(&args.circuit).map_err(|e| anyhow::anyhow!("--circuit: {}", e))?;
-    let initial_srs_hash = try_hash_from_hex(&args.initial_srs_hash)
-        .map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?;
+    let initial_srs_hash = match args.initial_srs_hash.as_deref() {
+        Some(hex) => {
+            try_hash_from_hex(hex).map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?
+        }
+        None => [0u8; 64],
+    };
     let contributor =
         NodeId::from_str(&args.contributor_hex).context("--contributor-hex is not valid hex")?;
 
