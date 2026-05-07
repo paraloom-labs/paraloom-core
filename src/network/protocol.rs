@@ -21,6 +21,9 @@ use tokio::sync::{mpsc, Mutex};
 use crate::config::Settings;
 use crate::types::NodeId;
 
+use super::heartbeat::{
+    create_heartbeat_protocol, HeartbeatCodec, HeartbeatRequest, HeartbeatResponse,
+};
 use super::message::Message;
 use super::req_resp::{create_result_protocol, ResultCodec, ResultRequest, ResultResponse};
 
@@ -31,6 +34,7 @@ const PARALOOM_TOPIC: &str = "paraloom/v1";
 pub struct ParaloomBehaviour {
     pub gossipsub: Gossipsub,
     pub request_response: RequestResponse<ResultCodec>,
+    pub heartbeat: RequestResponse<HeartbeatCodec>,
 }
 
 /// Network event handler
@@ -48,6 +52,21 @@ pub trait NetworkEventHandler: Send + Sync {
         Ok(ResultResponse {
             success: false,
             message: "Handler not implemented".to_string(),
+        })
+    }
+
+    /// Handle an inbound coordinator-HA heartbeat. The default
+    /// rejects the heartbeat so a node that has not opted into
+    /// standby mode does not silently accept primary state.
+    async fn handle_heartbeat_request(
+        &self,
+        _source: NodeId,
+        _request: HeartbeatRequest,
+    ) -> Result<HeartbeatResponse> {
+        log::warn!("Received heartbeat request but handler not implemented");
+        Ok(HeartbeatResponse {
+            accepted: false,
+            last_applied_sequence: 0,
         })
     }
 }
@@ -118,10 +137,12 @@ impl NetworkManager {
         .map_err(|e| anyhow!("Gossipsub error: {}", e))?;
 
         let request_response = create_result_protocol();
+        let heartbeat = create_heartbeat_protocol();
 
         let behaviour = ParaloomBehaviour {
             gossipsub,
             request_response,
+            heartbeat,
         };
 
         // Set up message channel
@@ -357,6 +378,62 @@ impl NetworkManager {
                                                 }
                                             }
                                         }
+
+                                        ParaloomBehaviourEvent::Heartbeat(hb_event) => {
+                                            match hb_event {
+                                                RequestResponseEvent::Message { peer, message, connection_id: _ } => {
+                                                    match message {
+                                                        RequestResponseMessage::Request { request, channel, .. } => {
+                                                            let source = NodeId(peer.to_bytes());
+                                                            let handler_lock = handler.lock().await;
+                                                            let response = if let Some(h) = handler_lock.as_ref() {
+                                                                match h.handle_heartbeat_request(source, request).await {
+                                                                    Ok(resp) => resp,
+                                                                    Err(e) => {
+                                                                        log::error!("heartbeat handler error: {}", e);
+                                                                        HeartbeatResponse {
+                                                                            accepted: false,
+                                                                            last_applied_sequence: 0,
+                                                                        }
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                HeartbeatResponse {
+                                                                    accepted: false,
+                                                                    last_applied_sequence: 0,
+                                                                }
+                                                            };
+                                                            drop(handler_lock);
+                                                            let mut swarm_lock = swarm.lock().await;
+                                                            if let Err(e) = swarm_lock.behaviour_mut().heartbeat.send_response(channel, response) {
+                                                                log::error!("Failed to send heartbeat response: {:?}", e);
+                                                            }
+                                                        }
+                                                        RequestResponseMessage::Response { response, .. } => {
+                                                            debug!(
+                                                                "heartbeat response: accepted={}, last_applied={}",
+                                                                response.accepted, response.last_applied_sequence
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                RequestResponseEvent::OutboundFailure { peer, error, .. } => {
+                                                    log::warn!(
+                                                        "heartbeat outbound failure to {:?}: {:?}",
+                                                        peer, error
+                                                    );
+                                                }
+                                                RequestResponseEvent::InboundFailure { peer, error, .. } => {
+                                                    log::warn!(
+                                                        "heartbeat inbound failure from {:?}: {:?}",
+                                                        peer, error
+                                                    );
+                                                }
+                                                RequestResponseEvent::ResponseSent { peer, .. } => {
+                                                    debug!("heartbeat response sent to {}", peer);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {
@@ -428,6 +505,25 @@ impl NetworkManager {
 
         info!("Request ID: {:?}", request_id);
         info!("=== REQUEST SENT ===");
+        Ok(())
+    }
+
+    /// Send a coordinator-HA heartbeat to a standby. Fire-and-forget
+    /// at the request level: the response (an ack with the standby's
+    /// last applied sequence) is observed via the swarm event loop
+    /// rather than awaited synchronously here, so a slow standby
+    /// cannot back-pressure the primary's broadcast cadence.
+    pub async fn send_heartbeat_request(
+        &self,
+        peer: NodeId,
+        request: HeartbeatRequest,
+    ) -> Result<()> {
+        let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        let mut swarm = self.swarm.lock().await;
+        swarm
+            .behaviour_mut()
+            .heartbeat
+            .send_request(&peer_id, request);
         Ok(())
     }
 
