@@ -251,7 +251,18 @@ mod tests {
         r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError},
     };
     use ark_snark::SNARK;
-    use ark_std::test_rng;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn test_rng() -> StdRng {
+        // Deterministic seed so the eight unit tests in this module
+        // are reproducible across runs. Direct StdRng (rand 0.8)
+        // rather than ark_std::test_rng so the rng's CryptoRng impl
+        // is from the same rand_core version that ark_groth16 binds
+        // against; ark_std exposes a newer rand_core that the
+        // groth16 setup signature does not accept.
+        StdRng::seed_from_u64(0xC0FFEE_BAADu64)
+    }
 
     /// Trivial circuit so we can call `circuit_specific_setup` and
     /// produce a real `ProvingKey<Bls12_381>` for the
