@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::config::Settings;
 use crate::types::NodeId;
 
+use super::discovery::PeerRegistry;
 use super::heartbeat::{
     create_heartbeat_protocol, HeartbeatCodec, HeartbeatRequest, HeartbeatResponse,
 };
@@ -109,6 +110,12 @@ pub struct NetworkManager {
     message_receiver: Arc<Mutex<mpsc::Receiver<(NodeId, Message)>>>,
     handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
     connected_peers: Arc<Mutex<Vec<PeerId>>>,
+    /// Peer state machine introduced in #69. The swarm event loop
+    /// feeds connection establish / close into mark_connected /
+    /// mark_disconnected, and ping ok-rtt into record_response.
+    /// The slow / offline distinction in #65's acceptance criteria
+    /// is enforced here.
+    peer_registry: Arc<Mutex<PeerRegistry>>,
 }
 
 impl NetworkManager {
@@ -218,7 +225,15 @@ impl NetworkManager {
             message_receiver: Arc::new(Mutex::new(rx)),
             handler: Arc::new(Mutex::new(None)),
             connected_peers: Arc::new(Mutex::new(Vec::new())),
+            peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
         })
+    }
+
+    /// Borrow the peer registry. Public so operational tooling
+    /// (the /metrics endpoint, future CLI status commands) can
+    /// observe peer state without going through the swarm.
+    pub fn peer_registry(&self) -> Arc<Mutex<PeerRegistry>> {
+        self.peer_registry.clone()
     }
 
     /// Set the event handler
@@ -294,6 +309,7 @@ impl NetworkManager {
         let receiver_clone = self.message_receiver.clone();
         let handler_clone = self.handler.clone();
         let connected_peers_clone = self.connected_peers.clone();
+        let peer_registry_clone = self.peer_registry.clone();
 
         // Spawn task to handle events
         tokio::spawn(async move {
@@ -302,6 +318,7 @@ impl NetworkManager {
                 receiver_clone,
                 handler_clone,
                 connected_peers_clone,
+                peer_registry_clone,
             )
             .await;
         });
@@ -315,6 +332,7 @@ impl NetworkManager {
         receiver: Arc<Mutex<mpsc::Receiver<(NodeId, Message)>>>,
         handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
         connected_peers: Arc<Mutex<Vec<PeerId>>>,
+        peer_registry: Arc<Mutex<PeerRegistry>>,
     ) {
         info!("Starting network event loop");
 
@@ -337,6 +355,13 @@ impl NetworkManager {
                                     if !peers.contains(&peer_id) {
                                         peers.push(peer_id);
                                     }
+                                    drop(peers);
+
+                                    // Mirror into the PeerRegistry state
+                                    // machine so the slow / offline
+                                    // distinction has live data.
+                                    let mut registry = peer_registry.lock().await;
+                                    registry.mark_connected(NodeId(peer_id.to_bytes()));
                                 }
                                 libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                     info!("Connection closed with peer: {} (cause: {:?})", peer_id, cause);
@@ -344,6 +369,10 @@ impl NetworkManager {
                                     // Remove from connected peers list
                                     let mut peers = connected_peers.lock().await;
                                     peers.retain(|p| p != &peer_id);
+                                    drop(peers);
+
+                                    let mut registry = peer_registry.lock().await;
+                                    registry.mark_disconnected(NodeId(peer_id.to_bytes()));
                                 }
                                 libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
                                     info!("Incoming connection");
@@ -527,9 +556,29 @@ impl NetworkManager {
                                             match ping_event {
                                                 PingEvent { peer, result: Ok(rtt), .. } => {
                                                     debug!("ping ok: peer {} rtt {:?}", peer, rtt);
+                                                    // Feed the rtt into the
+                                                    // PeerRegistry so the
+                                                    // slow-vs-offline
+                                                    // distinction has data.
+                                                    let mut registry = peer_registry.lock().await;
+                                                    registry.record_response(
+                                                        &NodeId(peer.to_bytes()),
+                                                        rtt,
+                                                    );
                                                 }
                                                 PingEvent { peer, result: Err(e), .. } => {
                                                     log::warn!("ping failed: peer {} error {:?}", peer, e);
+                                                    // libp2p will close the
+                                                    // connection on repeated
+                                                    // ping failures, which
+                                                    // surfaces as a
+                                                    // ConnectionClosed event
+                                                    // and triggers the
+                                                    // mark_disconnected path
+                                                    // above. No direct call
+                                                    // here to avoid double-
+                                                    // counting transient
+                                                    // failures.
                                                 }
                                             }
                                         }
