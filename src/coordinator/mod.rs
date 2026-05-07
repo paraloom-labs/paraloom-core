@@ -634,6 +634,7 @@ pub struct CoordinatorSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Settings;
 
     #[test]
     fn empty_snapshot_has_zero_state() {
@@ -653,5 +654,96 @@ mod tests {
         assert_eq!(decoded.active_tasks.len(), snapshot.active_tasks.len());
         assert_eq!(decoded.parent_tasks.len(), snapshot.parent_tasks.len());
         assert_eq!(decoded.results.len(), snapshot.results.len());
+    }
+
+    /// Build a NetworkManager for tests that need to construct a
+    /// Coordinator. The tests below never call `.start()` on it, so
+    /// no swarm tasks spin up; only the in-process state-machine
+    /// methods are exercised.
+    fn make_test_network() -> Arc<NetworkManager> {
+        Arc::new(NetworkManager::new(&Settings::development()).expect("test network"))
+    }
+
+    #[tokio::test]
+    async fn primary_to_standby_state_replication_round_trip() {
+        let primary = Coordinator::new(make_test_network());
+        primary.register_validator(NodeId(vec![0xAA])).await;
+        primary.register_validator(NodeId(vec![0xBB])).await;
+
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+        assert!(!standby.is_primary().await);
+
+        let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = standby.apply_heartbeat(request).await;
+
+        assert!(response.accepted);
+        assert_eq!(response.last_applied_sequence, 1);
+
+        let snapshot = standby.snapshot().await;
+        assert_eq!(snapshot.validators.len(), 2);
+        assert!(snapshot.validators.contains(&NodeId(vec![0xAA])));
+        assert!(snapshot.validators.contains(&NodeId(vec![0xBB])));
+    }
+
+    #[tokio::test]
+    async fn standby_rejects_replayed_heartbeats() {
+        let primary = Coordinator::new(make_test_network());
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+
+        let req1 = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let resp1 = standby.apply_heartbeat(req1.clone()).await;
+        assert!(resp1.accepted);
+        assert_eq!(resp1.last_applied_sequence, 1);
+
+        // Replaying the same heartbeat must be rejected because the
+        // sequence is no longer strictly greater than the highest
+        // applied. The standby's view never moves backwards.
+        let resp2 = standby.apply_heartbeat(req1).await;
+        assert!(!resp2.accepted);
+        assert_eq!(resp2.last_applied_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn primary_rejects_inbound_heartbeats() {
+        // A coordinator already in the Primary role refuses to apply
+        // heartbeats; this protects against a confused remote standby
+        // attempting to overwrite primary state.
+        let primary_a = Coordinator::new(make_test_network());
+        let primary_b = Coordinator::new(make_test_network());
+
+        let request = primary_a.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = primary_b.apply_heartbeat(request).await;
+        assert!(!response.accepted);
+        assert!(primary_b.is_primary().await);
+    }
+
+    #[tokio::test]
+    async fn standby_promotes_after_stall_threshold() {
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(50),
+        );
+        assert!(!standby.is_primary().await);
+
+        // Sleep past the stall threshold, then ask the standby to
+        // self-promote based on the current Instant. Promotion
+        // returns the previous primary identity for audit logging.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let promoted = standby.try_promote_if_stalled(Instant::now()).await;
+        assert_eq!(promoted, Some(NodeId(vec![0x01])));
+        assert!(standby.is_primary().await);
+
+        // After promotion, further calls are no-ops and return None.
+        let again = standby.try_promote_if_stalled(Instant::now()).await;
+        assert_eq!(again, None);
     }
 }
