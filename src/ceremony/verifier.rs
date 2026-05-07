@@ -190,4 +190,54 @@ mod tests {
         verify_phase2_transcript(&initial_pk, &transcript)
             .expect("3-contribution real chain verifies end-to-end");
     }
+
+    #[test]
+    fn tampered_attestation_breaks_chain_at_next_position() {
+        let (initial_pk, mut transcript) = build_real_transcript(3);
+        // Mutate the first contribution's attestation. Its hash
+        // changes; the second contribution's prior_hash no longer
+        // matches; the chain check surfaces the break at position 1.
+        transcript.contributions[0].attestation = "tampered".to_string();
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::Chain(TranscriptError::ChainBroken { position })) => {
+                assert_eq!(position, 1);
+            }
+            other => panic!("expected Chain(ChainBroken at 1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wrong_initial_pk_fails_first_dleq_check() {
+        let (_real_initial_pk, transcript) = build_real_transcript(2);
+        // Hand the verifier an unrelated initial PK. The chain
+        // check still passes (it does not depend on the PK), but
+        // the very first DLEQ check fails because delta_before_g1
+        // does not match the value the prover used.
+        let mut other_rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64);
+        let (other_pk, _vk) =
+            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut other_rng).unwrap();
+        match verify_phase2_transcript(&other_pk, &transcript) {
+            Err(VerifyError::DleqRejected { position: 0, .. }) => {}
+            other => panic!("expected DleqRejected at 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn malformed_dleq_proof_bytes_rejected() {
+        let (initial_pk, mut transcript) = build_real_transcript(1);
+        // Replace the single contribution's DLEQ bytes with
+        // garbage. The chain hash also changes, but with only one
+        // contribution there is no next link to break, so the
+        // chain check passes and we hit MalformedDleq.
+        transcript.contributions[0].dleq_proof = vec![0xAAu8; 16];
+        // The chain check verifies prior_hash for the *first*
+        // contribution against transcript.initial_srs_hash; that
+        // still matches because we did not mutate prior_hash. So
+        // the chain check passes and the verifier reaches the
+        // bytes parse, which fails.
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::MalformedDleq { position: 0, .. }) => {}
+            other => panic!("expected MalformedDleq at 0, got {:?}", other),
+        }
+    }
 }
