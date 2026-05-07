@@ -36,8 +36,10 @@
 //! verifier, contributor CLI) land as the implementation
 //! progresses; each is scoped to one PR.
 
+pub mod bgm17;
 pub mod transcript;
 
+pub use bgm17::{apply_contribution, verify_contribution, BgmError, DleqProof};
 pub use transcript::{
     hash_contribution, CircuitId, Contribution, Phase2Transcript, TranscriptError, TranscriptHash,
     TRANSCRIPT_VERSION,
