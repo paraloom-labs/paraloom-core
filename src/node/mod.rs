@@ -1,10 +1,13 @@
 //! Node implementation
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
@@ -37,6 +40,15 @@ pub struct Node {
     compute_storage: Option<Arc<ComputeStorage>>,
     // Track coordinator nodes for result reporting
     job_coordinators: Arc<Mutex<std::collections::HashMap<crate::compute::JobId, NodeId>>>,
+
+    // Coordinator-HA spawn handles (#66). The broadcast handle is
+    // populated when the node is configured as a primary with a
+    // non-empty standby list; the watchdog handle is populated when
+    // the node is configured as a standby. Either may be None when
+    // HA is disabled. Held in Arc<Mutex<Option<...>>> so Clone of
+    // Node remains cheap and shutdown can abort in place.
+    ha_broadcast: Arc<Mutex<Option<JoinHandle<()>>>>,
+    ha_watchdog: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -613,9 +625,22 @@ impl Node {
 
         let network_arc = Arc::new(network);
 
-        // Initialize coordinator or validator based on node type
+        // Initialize coordinator or validator based on node type.
+        // For Coordinator nodes, the HA settings determine the role:
+        // a configured `ha.primary` puts this coordinator into the
+        // Standby role mirroring that primary; otherwise it starts
+        // as a Primary (the existing default, preserved for any
+        // operator who has not opted into HA yet).
         let coordinator = if node_type == NodeType::Coordinator {
-            Some(Arc::new(Coordinator::new(network_arc.clone())))
+            let coord = if let Some(primary_hex) = &settings.ha.primary {
+                let primary_id = NodeId::from_str(primary_hex)
+                    .map_err(|e| anyhow!("invalid ha.primary hex {:?}: {}", primary_hex, e))?;
+                let stall = Duration::from_millis(settings.ha.stall_threshold_ms);
+                Coordinator::standby_of(network_arc.clone(), primary_id, stall)
+            } else {
+                Coordinator::new(network_arc.clone())
+            };
+            Some(Arc::new(coord))
         } else {
             None
         };
@@ -686,6 +711,8 @@ impl Node {
             compute_coordinator,
             compute_storage,
             job_coordinators: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ha_broadcast: Arc::new(Mutex::new(None)),
+            ha_watchdog: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -758,6 +785,43 @@ impl Node {
         {
             let mut status = self.status.lock().await;
             *status = NodeStatus::Running;
+        }
+
+        // Spawn coordinator-HA loops based on the configured role
+        // (#66). A standby runs the stall watchdog; a primary with
+        // a non-empty standby list runs the heartbeat broadcast.
+        // A primary without standbys (or any node configured
+        // without HA) skips both, preserving the pre-#66 behavior.
+        if let Some(coordinator) = &self.coordinator {
+            let ha = &self.settings.ha;
+            if ha.primary.is_some() {
+                let handle = Arc::clone(coordinator)
+                    .start_stall_watchdog(Duration::from_millis(ha.watchdog_interval_ms));
+                *self.ha_watchdog.lock().await = Some(handle);
+                info!(
+                    "HA stall watchdog spawned (interval {}ms, threshold {}ms)",
+                    ha.watchdog_interval_ms, ha.stall_threshold_ms
+                );
+            } else if !ha.standbys.is_empty() {
+                let mut standby_ids = Vec::with_capacity(ha.standbys.len());
+                for hex in &ha.standbys {
+                    let id = NodeId::from_str(hex)
+                        .map_err(|e| anyhow!("invalid ha.standbys entry {:?}: {}", hex, e))?;
+                    standby_ids.push(id);
+                }
+                let primary_id = self.network.local_peer_id();
+                let handle = Arc::clone(coordinator).start_heartbeat_broadcast(
+                    primary_id,
+                    standby_ids,
+                    Duration::from_millis(ha.heartbeat_interval_ms),
+                );
+                *self.ha_broadcast.lock().await = Some(handle);
+                info!(
+                    "HA heartbeat broadcast spawned to {} standbys (interval {}ms)",
+                    ha.standbys.len(),
+                    ha.heartbeat_interval_ms
+                );
+            }
         }
 
         // Start timeout monitoring for coordinator nodes
@@ -899,6 +963,16 @@ impl Node {
     /// Stop the node
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping node");
+        // Cancel HA loops first so they do not race the status flip
+        // (the broadcast loop checks is_primary on each tick; an
+        // abort during a tick is safe but waiting one tick of
+        // unnecessary heartbeats is also safe).
+        if let Some(handle) = self.ha_broadcast.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.ha_watchdog.lock().await.take() {
+            handle.abort();
+        }
         let mut status = self.status.lock().await;
         *status = NodeStatus::ShuttingDown;
         Ok(())
@@ -1161,6 +1235,8 @@ impl Clone for Node {
             compute_coordinator: self.compute_coordinator.clone(),
             compute_storage: self.compute_storage.clone(),
             job_coordinators: self.job_coordinators.clone(),
+            ha_broadcast: self.ha_broadcast.clone(),
+            ha_watchdog: self.ha_watchdog.clone(),
         }
     }
 }
