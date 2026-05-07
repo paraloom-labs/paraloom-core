@@ -603,6 +603,47 @@ impl NetworkManager {
         let peers = self.connected_peers.lock().await;
         peers.iter().map(|p| NodeId(p.to_bytes())).collect()
     }
+
+    /// Spawn a tokio task that periodically asks Kademlia to
+    /// refresh its routing table.
+    ///
+    /// Bootstrap walks the local routing table by issuing a query
+    /// for the local peer's own id, which finds the closest peers
+    /// in the DHT and refreshes their entries. Without periodic
+    /// refresh, a routing-table entry whose underlying connection
+    /// silently died would linger and queries through it would
+    /// time out instead of hopping to a healthier neighbour.
+    ///
+    /// `interval` should be on the order of minutes; libp2p's own
+    /// guidance suggests 5 minutes for healthy networks. The
+    /// returned JoinHandle lets the caller `abort()` on shutdown.
+    pub fn start_kad_bootstrap_refresh(
+        self: Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the immediate first tick so the very first
+            // bootstrap attempt happens after `interval`, by which
+            // time the swarm event loop is up and the routing
+            // table has at least the bootstrap entries from
+            // connect_to_bootstrap.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let mut swarm = self.swarm.lock().await;
+                match swarm.behaviour_mut().kad.bootstrap() {
+                    Ok(query_id) => {
+                        debug!("kad bootstrap refresh kicked off ({:?})", query_id);
+                    }
+                    Err(e) => {
+                        log::warn!("kad bootstrap refresh failed to start: {}", e);
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
