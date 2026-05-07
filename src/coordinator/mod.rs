@@ -173,6 +173,57 @@ impl Coordinator {
         role.promote()
     }
 
+    /// Spawn the primary-side heartbeat broadcast task.
+    ///
+    /// Every `interval`, builds a single heartbeat from the current
+    /// snapshot via `next_heartbeat_request` and sends it to each
+    /// standby in `standbys`. The same heartbeat (same sequence) is
+    /// sent to every standby in one tick, so all standbys agree on
+    /// the canonical primary view at that point in time.
+    ///
+    /// The loop checks `is_primary()` at the top of each tick and
+    /// exits cleanly if the role has been demoted (an unusual but
+    /// possible scenario when external operator tooling promotes a
+    /// standby and the old primary survives the partition that
+    /// triggered it). Send failures to individual standbys are
+    /// logged at warn but do not stop the loop; transient
+    /// disconnections recover on the next tick.
+    ///
+    /// Returns the JoinHandle so the caller can `abort()` it on
+    /// node shutdown. Drop the handle to detach.
+    pub fn start_heartbeat_broadcast(
+        self: Arc<Self>,
+        primary_id: NodeId,
+        standbys: Vec<NodeId>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first tick fires immediately; consume it so the
+            // first real heartbeat is sent after one full interval,
+            // giving the standbys time to subscribe.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if !self.is_primary().await {
+                    info!("coordinator no longer primary; stopping heartbeat broadcast");
+                    break;
+                }
+                let request = self.next_heartbeat_request(primary_id.clone()).await;
+                for standby in &standbys {
+                    if let Err(e) = self
+                        .network
+                        .send_heartbeat_request(standby.clone(), request.clone())
+                        .await
+                    {
+                        log::warn!("failed to send heartbeat to standby {}: {}", standby, e);
+                    }
+                }
+            }
+        })
+    }
+
     /// Register a validator
     pub async fn register_validator(&self, validator_id: NodeId) {
         let mut validators = self.validators.lock().await;
