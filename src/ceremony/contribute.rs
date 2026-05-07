@@ -106,6 +106,98 @@ pub fn contribute<R: RngCore + CryptoRng>(
     Ok((prior_pk, transcript))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ceremony::verifier::verify_phase2_transcript;
+    use ark_groth16::Groth16;
+    use ark_relations::{
+        lc,
+        r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError},
+    };
+    use ark_snark::SNARK;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[derive(Clone)]
+    struct TrivialCircuit;
+
+    impl ConstraintSynthesizer<Fr> for TrivialCircuit {
+        fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+            let a = cs.new_witness_variable(|| Ok(Fr::from(3u32)))?;
+            let b = cs.new_witness_variable(|| Ok(Fr::from(5u32)))?;
+            let c = cs.new_input_variable(|| Ok(Fr::from(15u32)))?;
+            cs.enforce_constraint(lc!() + a, lc!() + b, lc!() + c)?;
+            Ok(())
+        }
+    }
+
+    fn rng() -> StdRng {
+        StdRng::seed_from_u64(0xCAFE_F00D_u64)
+    }
+
+    fn fresh_initial_pk() -> ProvingKey<Bls12_381> {
+        let mut rng = rng();
+        let (pk, _vk) =
+            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+        pk
+    }
+
+    #[test]
+    fn one_contribution_extends_transcript_and_verifies() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+        let (after_pk, transcript) = contribute(
+            initial_pk.clone(),
+            None,
+            CircuitId::Deposit,
+            [0u8; 64],
+            NodeId(vec![0x01]),
+            "test contributor 1".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript.circuit, CircuitId::Deposit);
+        assert_ne!(after_pk.delta_g1, initial_pk.delta_g1);
+        verify_phase2_transcript(&initial_pk, &transcript).expect("transcript verifies");
+    }
+
+    #[test]
+    fn two_chained_contributions_verify_end_to_end() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+
+        let (after_pk_1, transcript_1) = contribute(
+            initial_pk.clone(),
+            None,
+            CircuitId::Transfer,
+            [0u8; 64],
+            NodeId(vec![0x01]),
+            "first contributor".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        let (after_pk_2, transcript_2) = contribute(
+            after_pk_1,
+            Some(transcript_1),
+            CircuitId::Transfer,
+            [0u8; 64],
+            NodeId(vec![0x02]),
+            "second contributor".to_string(),
+            &mut rng,
+        )
+        .expect("second contribution succeeds");
+
+        assert_eq!(transcript_2.len(), 2);
+        assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
+        verify_phase2_transcript(&initial_pk, &transcript_2)
+            .expect("two-link chain verifies end-to-end");
+    }
+}
+
 /// Read a `ProvingKey<Bls12_381>` from a compressed-arkworks file.
 pub fn read_pk(path: &Path) -> Result<ProvingKey<Bls12_381>, ContributeError> {
     let bytes = fs::read(path)?;
