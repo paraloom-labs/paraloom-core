@@ -1,10 +1,13 @@
 //! Node implementation
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
@@ -613,9 +616,22 @@ impl Node {
 
         let network_arc = Arc::new(network);
 
-        // Initialize coordinator or validator based on node type
+        // Initialize coordinator or validator based on node type.
+        // For Coordinator nodes, the HA settings determine the role:
+        // a configured `ha.primary` puts this coordinator into the
+        // Standby role mirroring that primary; otherwise it starts
+        // as a Primary (the existing default, preserved for any
+        // operator who has not opted into HA yet).
         let coordinator = if node_type == NodeType::Coordinator {
-            Some(Arc::new(Coordinator::new(network_arc.clone())))
+            let coord = if let Some(primary_hex) = &settings.ha.primary {
+                let primary_id = NodeId::from_str(primary_hex)
+                    .map_err(|e| anyhow!("invalid ha.primary hex {:?}: {}", primary_hex, e))?;
+                let stall = Duration::from_millis(settings.ha.stall_threshold_ms);
+                Coordinator::standby_of(network_arc.clone(), primary_id, stall)
+            } else {
+                Coordinator::new(network_arc.clone())
+            };
+            Some(Arc::new(coord))
         } else {
             None
         };
