@@ -4,7 +4,7 @@ pub mod role;
 
 pub use role::CoordinatorRole;
 
-use crate::network::{Message, NetworkManager};
+use crate::network::{HeartbeatRequest, HeartbeatResponse, Message, NetworkManager};
 use crate::task::{ResultData, Task, TaskId, TaskResult, TaskStatus, TaskType};
 use crate::types::NodeId;
 use anyhow::Result;
@@ -12,6 +12,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Coordinator manages task distribution and aggregation
@@ -30,10 +31,20 @@ pub struct Coordinator {
 
     /// Network manager
     network: Arc<NetworkManager>,
+
+    /// Active role (Primary or Standby) for the HA failover work in
+    /// #66. Defaults to Primary on `new()`; standbys are constructed
+    /// via `standby_of()`.
+    role: Arc<Mutex<CoordinatorRole>>,
+
+    /// Monotonic sequence number stamped on outgoing heartbeats while
+    /// this coordinator is the primary, and the highest sequence
+    /// applied so far while this coordinator is a standby.
+    heartbeat_sequence: Arc<Mutex<u64>>,
 }
 
 impl Coordinator {
-    /// Create a new coordinator
+    /// Create a new coordinator in the `Primary` role.
     pub fn new(network: Arc<NetworkManager>) -> Self {
         Coordinator {
             validators: Arc::new(Mutex::new(Vec::new())),
@@ -41,7 +52,125 @@ impl Coordinator {
             results: Arc::new(Mutex::new(HashMap::new())),
             parent_tasks: Arc::new(Mutex::new(HashMap::new())),
             network,
+            role: Arc::new(Mutex::new(CoordinatorRole::Primary)),
+            heartbeat_sequence: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Create a new coordinator in the `Standby` role, mirroring
+    /// `primary` and watching for `stall_threshold` of silence.
+    pub fn standby_of(
+        network: Arc<NetworkManager>,
+        primary: NodeId,
+        stall_threshold: Duration,
+    ) -> Self {
+        Coordinator {
+            validators: Arc::new(Mutex::new(Vec::new())),
+            active_tasks: Arc::new(Mutex::new(HashMap::new())),
+            results: Arc::new(Mutex::new(HashMap::new())),
+            parent_tasks: Arc::new(Mutex::new(HashMap::new())),
+            network,
+            role: Arc::new(Mutex::new(CoordinatorRole::standby_of(
+                primary,
+                stall_threshold,
+                Instant::now(),
+            ))),
+            heartbeat_sequence: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// True if this coordinator is currently the primary.
+    pub async fn is_primary(&self) -> bool {
+        self.role.lock().await.is_primary()
+    }
+
+    /// Build the next outgoing heartbeat from this coordinator's
+    /// current state. Caller is responsible for being in the primary
+    /// role; calling this from a standby is allowed (returns the
+    /// last-applied state) but uncommon and is logged as a hint of
+    /// a misconfiguration upstream.
+    pub async fn next_heartbeat_request(&self, primary: NodeId) -> HeartbeatRequest {
+        let mut sequence = self.heartbeat_sequence.lock().await;
+        *sequence = sequence.saturating_add(1);
+        let snapshot = self.snapshot().await;
+        HeartbeatRequest {
+            primary,
+            sequence: *sequence,
+            snapshot,
+        }
+    }
+
+    /// Apply an inbound heartbeat to this coordinator's state. Used
+    /// by a standby to mirror the primary's snapshot.
+    ///
+    /// If this coordinator is itself a primary (already promoted, or
+    /// never a standby) the heartbeat is rejected with
+    /// `accepted: false` and the standby state is left untouched. A
+    /// stale-or-replayed heartbeat (sequence not strictly greater
+    /// than the highest applied) is also rejected so the standby's
+    /// view never moves backwards.
+    pub async fn apply_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
+        let role = self.role.lock().await;
+        if role.is_primary() {
+            let last_applied = *self.heartbeat_sequence.lock().await;
+            return HeartbeatResponse {
+                accepted: false,
+                last_applied_sequence: last_applied,
+            };
+        }
+        drop(role);
+
+        let mut sequence_slot = self.heartbeat_sequence.lock().await;
+        if request.sequence <= *sequence_slot && *sequence_slot != 0 {
+            return HeartbeatResponse {
+                accepted: false,
+                last_applied_sequence: *sequence_slot,
+            };
+        }
+        *sequence_slot = request.sequence;
+        drop(sequence_slot);
+
+        // Replace local state with the primary's snapshot. Each
+        // mutex is taken in turn and released immediately so the
+        // window during which the standby is mid-mirror is short.
+        {
+            let mut validators = self.validators.lock().await;
+            *validators = request.snapshot.validators;
+        }
+        {
+            let mut active_tasks = self.active_tasks.lock().await;
+            *active_tasks = request.snapshot.active_tasks;
+        }
+        {
+            let mut parent_tasks = self.parent_tasks.lock().await;
+            *parent_tasks = request.snapshot.parent_tasks;
+        }
+        {
+            let mut results = self.results.lock().await;
+            *results = request.snapshot.results;
+        }
+
+        // Reset the standby's stall watchdog.
+        let mut role = self.role.lock().await;
+        role.record_heartbeat(Instant::now());
+
+        HeartbeatResponse {
+            accepted: true,
+            last_applied_sequence: request.sequence,
+        }
+    }
+
+    /// If this coordinator is a standby and its primary has been
+    /// silent past the configured stall threshold relative to `now`,
+    /// promote to primary and return the previously-known primary
+    /// identity. Returns `None` if already primary or if the standby
+    /// has not yet stalled.
+    pub async fn try_promote_if_stalled(&self, now: Instant) -> Option<NodeId> {
+        let mut role = self.role.lock().await;
+        if !role.is_stalled(now) {
+            return None;
+        }
+        role.promote()
     }
 
     /// Register a validator
