@@ -787,6 +787,43 @@ impl Node {
             *status = NodeStatus::Running;
         }
 
+        // Spawn coordinator-HA loops based on the configured role
+        // (#66). A standby runs the stall watchdog; a primary with
+        // a non-empty standby list runs the heartbeat broadcast.
+        // A primary without standbys (or any node configured
+        // without HA) skips both, preserving the pre-#66 behavior.
+        if let Some(coordinator) = &self.coordinator {
+            let ha = &self.settings.ha;
+            if ha.primary.is_some() {
+                let handle = Arc::clone(coordinator)
+                    .start_stall_watchdog(Duration::from_millis(ha.watchdog_interval_ms));
+                *self.ha_watchdog.lock().await = Some(handle);
+                info!(
+                    "HA stall watchdog spawned (interval {}ms, threshold {}ms)",
+                    ha.watchdog_interval_ms, ha.stall_threshold_ms
+                );
+            } else if !ha.standbys.is_empty() {
+                let mut standby_ids = Vec::with_capacity(ha.standbys.len());
+                for hex in &ha.standbys {
+                    let id = NodeId::from_str(hex)
+                        .map_err(|e| anyhow!("invalid ha.standbys entry {:?}: {}", hex, e))?;
+                    standby_ids.push(id);
+                }
+                let primary_id = self.network.local_peer_id();
+                let handle = Arc::clone(coordinator).start_heartbeat_broadcast(
+                    primary_id,
+                    standby_ids,
+                    Duration::from_millis(ha.heartbeat_interval_ms),
+                );
+                *self.ha_broadcast.lock().await = Some(handle);
+                info!(
+                    "HA heartbeat broadcast spawned to {} standbys (interval {}ms)",
+                    ha.standbys.len(),
+                    ha.heartbeat_interval_ms
+                );
+            }
+        }
+
         // Start timeout monitoring for coordinator nodes
         if let Some(coordinator) = &self.compute_coordinator {
             let coordinator_clone = coordinator.clone();
@@ -926,6 +963,16 @@ impl Node {
     /// Stop the node
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping node");
+        // Cancel HA loops first so they do not race the status flip
+        // (the broadcast loop checks is_primary on each tick; an
+        // abort during a tick is safe but waiting one tick of
+        // unnecessary heartbeats is also safe).
+        if let Some(handle) = self.ha_broadcast.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.ha_watchdog.lock().await.take() {
+            handle.abort();
+        }
         let mut status = self.status.lock().await;
         *status = NodeStatus::ShuttingDown;
         Ok(())
