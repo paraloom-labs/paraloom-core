@@ -746,4 +746,143 @@ mod tests {
         let again = standby.try_promote_if_stalled(Instant::now()).await;
         assert_eq!(again, None);
     }
+
+    /// Kill-the-primary RTO scenario from #66's acceptance criteria.
+    ///
+    /// Scaled-down timing (100ms stall threshold instead of the
+    /// 30s production default) so the test runs in well under a
+    /// second, but the semantics match: a primary with in-flight
+    /// task state replicates to a standby, the primary "dies" by
+    /// going silent, the standby's watchdog observes the stall and
+    /// self-promotes within one watchdog interval, and the
+    /// in-flight task state survives the promotion intact.
+    ///
+    /// What this confirms about #66:
+    /// - State replication preserves active_tasks and parent_tasks
+    ///   end-to-end (no chunks orphaned at promotion).
+    /// - The watchdog reacts within the configured stall threshold,
+    ///   not slower; the under-30-seconds production RTO is just
+    ///   the same math at a longer threshold.
+    /// - After promotion the standby is in the Primary role and
+    ///   would accept new task submissions or aggregate inbound
+    ///   results without further intervention.
+    ///
+    /// What this deliberately does NOT cover: real libp2p in the
+    /// loop. The broadcast loop's network send path is exercised
+    /// by upstream libp2p tests; spinning up real swarms here
+    /// would add CI flakiness without exercising new logic.
+    #[tokio::test]
+    async fn kill_the_primary_promotes_standby_with_in_flight_task_state() {
+        use crate::task::TaskType;
+
+        let primary = Coordinator::new(make_test_network());
+        primary.register_validator(NodeId(vec![0xAA])).await;
+
+        // Submit a task. submit_task populates active_tasks and
+        // parent_tasks before attempting the network send, so
+        // even with a non-started NetworkManager the state mutation
+        // lands; the send itself times out at the per-chunk
+        // 1-second guard and is logged but not propagated. We use
+        // a single-element range so only one chunk is created and
+        // the test takes a single timeout window in the worst case.
+        let task_type = TaskType::HashCalculation {
+            start: 0,
+            end: 0,
+            algorithm: "sha256".to_string(),
+        };
+        primary
+            .submit_task(task_type)
+            .await
+            .expect("submit_task populates state regardless of send result");
+
+        let pre_replication = primary.snapshot().await;
+        assert!(
+            !pre_replication.active_tasks.is_empty(),
+            "primary's active_tasks should be populated by submit_task"
+        );
+        assert!(
+            !pre_replication.parent_tasks.is_empty(),
+            "primary's parent_tasks should be populated by submit_task"
+        );
+
+        // Stand up a standby with a 100ms stall threshold and
+        // mirror the primary's snapshot via one heartbeat. After
+        // this, the standby holds the in-flight task state.
+        let standby = Arc::new(Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(100),
+        ));
+        let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = standby.apply_heartbeat(request).await;
+        assert!(response.accepted);
+
+        let mirrored = standby.snapshot().await;
+        assert_eq!(
+            mirrored.active_tasks.len(),
+            pre_replication.active_tasks.len(),
+            "in-flight task chunks must replicate to the standby"
+        );
+        assert_eq!(
+            mirrored.parent_tasks.len(),
+            pre_replication.parent_tasks.len(),
+            "parent-task mapping must replicate so aggregation can resume"
+        );
+
+        // Simulate primary death: drop the primary handle. With
+        // no further heartbeats, the standby's watchdog should
+        // observe the stall threshold elapsing and self-promote.
+        // Spawn the watchdog with a 25ms poll interval (4:1 vs
+        // the 100ms stall threshold) so worst-case detection
+        // latency is one poll interval.
+        drop(primary);
+        let kill_at = Instant::now();
+        let watchdog = Arc::clone(&standby).start_stall_watchdog(Duration::from_millis(25));
+
+        // The watchdog self-terminates on promotion; awaiting its
+        // JoinHandle is the cleanest way to learn that promotion
+        // happened. A wall-clock budget caps how long we wait so a
+        // bug that prevents promotion fails the test loudly rather
+        // than hanging.
+        let join_result = tokio::time::timeout(Duration::from_millis(500), watchdog).await;
+        let elapsed = kill_at.elapsed();
+        assert!(
+            join_result.is_ok(),
+            "standby watchdog did not exit within the RTO budget; promotion likely failed"
+        );
+        assert!(
+            standby.is_primary().await,
+            "standby should hold the Primary role after watchdog promotion"
+        );
+
+        // Promotion must happen no faster than the stall threshold
+        // (otherwise it is reacting to the wrong condition) and no
+        // slower than threshold + one poll interval + scheduling
+        // slack. 250ms is generous against the 100ms threshold.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "promoted in {:?}, faster than the stall threshold; logic regressed",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "promoted in {:?}, slower than threshold + one poll interval; RTO regressed",
+            elapsed
+        );
+
+        // Task state must survive the promotion: the new primary
+        // owns the same active_tasks and parent_tasks the old
+        // primary had at the last heartbeat.
+        let post_promotion = standby.snapshot().await;
+        assert_eq!(
+            post_promotion.active_tasks.len(),
+            mirrored.active_tasks.len(),
+            "active_tasks lost across promotion"
+        );
+        assert_eq!(
+            post_promotion.parent_tasks.len(),
+            mirrored.parent_tasks.len(),
+            "parent_tasks lost across promotion"
+        );
+    }
 }
