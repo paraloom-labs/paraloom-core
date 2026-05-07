@@ -6,7 +6,9 @@ use libp2p::futures::StreamExt;
 use libp2p::{
     core::upgrade,
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
-    identity, noise, quic,
+    identity,
+    kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
+    noise, quic,
     request_response::{
         Behaviour as RequestResponse, Event as RequestResponseEvent,
         Message as RequestResponseMessage,
@@ -35,6 +37,10 @@ pub struct ParaloomBehaviour {
     pub gossipsub: Gossipsub,
     pub request_response: RequestResponse<ResultCodec>,
     pub heartbeat: RequestResponse<HeartbeatCodec>,
+    /// Kademlia DHT for peer discovery (#65). Routing table is
+    /// empty at construction; bootstrap registration and periodic
+    /// refresh land in subsequent PRs.
+    pub kad: Kademlia<MemoryStore>,
 }
 
 /// Network event handler
@@ -139,10 +145,22 @@ impl NetworkManager {
         let request_response = create_result_protocol();
         let heartbeat = create_heartbeat_protocol();
 
+        // Kademlia DHT in Server mode so this node accepts queries
+        // from other peers and contributes its routing-table view.
+        // Routing table is empty at construction; PRs that follow
+        // this one register the bootstrap list and run periodic
+        // refresh. The MemoryStore is suitable for v0.5.0; a
+        // disk-backed store can be considered for very large
+        // validator sets later.
+        let kad_store = MemoryStore::new(local_peer_id);
+        let mut kad = Kademlia::new(local_peer_id, kad_store);
+        kad.set_mode(Some(KadMode::Server));
+
         let behaviour = ParaloomBehaviour {
             gossipsub,
             request_response,
             heartbeat,
+            kad,
         };
 
         // Set up message channel
@@ -431,6 +449,20 @@ impl NetworkManager {
                                                 }
                                                 RequestResponseEvent::ResponseSent { peer, .. } => {
                                                     debug!("heartbeat response sent to {}", peer);
+                                                }
+                                            }
+                                        }
+
+                                        ParaloomBehaviourEvent::Kad(kad_event) => {
+                                            match kad_event {
+                                                KadEvent::RoutingUpdated { peer, .. } => {
+                                                    debug!("kad routing table updated with peer {}", peer);
+                                                }
+                                                KadEvent::OutboundQueryProgressed { id, result, .. } => {
+                                                    debug!("kad query {:?} progressed: {:?}", id, result);
+                                                }
+                                                other => {
+                                                    debug!("kad event: {:?}", other);
                                                 }
                                             }
                                         }
