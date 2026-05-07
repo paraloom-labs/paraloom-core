@@ -49,6 +49,13 @@ pub struct Node {
     // Node remains cheap and shutdown can abort in place.
     ha_broadcast: Arc<Mutex<Option<JoinHandle<()>>>>,
     ha_watchdog: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Kademlia bootstrap-refresh handle (#65). Spawned in run()
+    /// once the swarm is up and bootstrap addresses are
+    /// registered; aborted in stop(). Held under the same
+    /// Arc<Mutex<Option<...>>> shape as the HA handles so Clone
+    /// stays cheap.
+    kad_refresh: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -713,6 +720,7 @@ impl Node {
             job_coordinators: Arc::new(Mutex::new(std::collections::HashMap::new())),
             ha_broadcast: Arc::new(Mutex::new(None)),
             ha_watchdog: Arc::new(Mutex::new(None)),
+            kad_refresh: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -785,6 +793,18 @@ impl Node {
         {
             let mut status = self.status.lock().await;
             *status = NodeStatus::Running;
+        }
+
+        // Spawn the Kademlia bootstrap-refresh task (#65). Cadence
+        // is hardcoded at 5 minutes for now; a configurable knob
+        // lands when the rest of the discovery surface (liveness
+        // probes, integration test) is ready and we know what
+        // operators actually want to tune.
+        {
+            let handle =
+                Arc::clone(&self.network).start_kad_bootstrap_refresh(Duration::from_secs(300));
+            *self.kad_refresh.lock().await = Some(handle);
+            info!("Kademlia bootstrap-refresh task spawned (interval 300s)");
         }
 
         // Spawn coordinator-HA loops based on the configured role
@@ -971,6 +991,9 @@ impl Node {
             handle.abort();
         }
         if let Some(handle) = self.ha_watchdog.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.kad_refresh.lock().await.take() {
             handle.abort();
         }
         let mut status = self.status.lock().await;
@@ -1237,6 +1260,7 @@ impl Clone for Node {
             job_coordinators: self.job_coordinators.clone(),
             ha_broadcast: self.ha_broadcast.clone(),
             ha_watchdog: self.ha_watchdog.clone(),
+            kad_refresh: self.kad_refresh.clone(),
         }
     }
 }
