@@ -207,9 +207,23 @@ pub fn read_pk(path: &Path) -> Result<ProvingKey<Bls12_381>, ContributeError> {
 
 /// Write a `ProvingKey<Bls12_381>` to a compressed-arkworks file.
 pub fn write_pk(pk: &ProvingKey<Bls12_381>, path: &Path) -> Result<(), ContributeError> {
+    write_compressed(pk, path)
+}
+
+/// Generic write of any `CanonicalSerialize` value as a
+/// compressed-arkworks file. Used for both proving keys and the
+/// verifying key the ceremony finalize binary extracts. Any
+/// caller wanting a different on-disk format should not use this
+/// helper — bincode-shaped artefacts go through
+/// `write_transcript` instead.
+pub fn write_compressed<T>(value: &T, path: &Path) -> Result<(), ContributeError>
+where
+    T: ark_serialize::CanonicalSerialize,
+{
     let mut bytes = Vec::new();
-    pk.serialize_compressed(&mut bytes)
-        .map_err(|e| ContributeError::Serialize(format!("ProvingKey to {:?}: {}", path, e)))?;
+    value
+        .serialize_compressed(&mut bytes)
+        .map_err(|e| ContributeError::Serialize(format!("{:?}: {}", path, e)))?;
     fs::write(path, &bytes)?;
     Ok(())
 }
