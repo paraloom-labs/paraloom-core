@@ -422,8 +422,7 @@ mod tests {
     fn snapshot_round_trips_through_serde_json() {
         let snapshot = CoordinatorSnapshot::default();
         let encoded = serde_json::to_string(&snapshot).expect("serialize");
-        let decoded: CoordinatorSnapshot =
-            serde_json::from_str(&encoded).expect("deserialize");
+        let decoded: CoordinatorSnapshot = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.validators.len(), snapshot.validators.len());
         assert_eq!(decoded.active_tasks.len(), snapshot.active_tasks.len());
         assert_eq!(decoded.parent_tasks.len(), snapshot.parent_tasks.len());
