@@ -7,7 +7,7 @@ use libp2p::{
     core::upgrade,
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
     identity,
-    kad::{self, store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
+    kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
     noise, quic,
     request_response::{
         Behaviour as RequestResponse, Event as RequestResponseEvent,
