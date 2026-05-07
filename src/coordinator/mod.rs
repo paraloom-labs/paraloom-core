@@ -1,5 +1,9 @@
 //! Coordinator node logic
 
+pub mod role;
+
+pub use role::CoordinatorRole;
+
 use crate::network::{Message, NetworkManager};
 use crate::task::{ResultData, Task, TaskId, TaskResult, TaskStatus, TaskType};
 use crate::types::NodeId;
