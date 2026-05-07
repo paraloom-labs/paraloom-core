@@ -604,3 +604,24 @@ impl NetworkManager {
         peers.iter().map(|p| NodeId(p.to_bytes())).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_id_extracted_from_multiaddr_with_p2p_suffix() {
+        let key = identity::Keypair::generate_ed25519();
+        let expected = PeerId::from(key.public());
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/9000/p2p/{}", expected)
+            .parse()
+            .expect("multiaddr parses");
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(expected));
+    }
+
+    #[test]
+    fn peer_id_returns_none_for_bare_multiaddr() {
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("multiaddr parses");
+        assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
+}
