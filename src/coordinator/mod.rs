@@ -224,6 +224,48 @@ impl Coordinator {
         })
     }
 
+    /// Spawn the standby-side stall watchdog task.
+    ///
+    /// Every `check_interval`, asks `try_promote_if_stalled(now)`
+    /// whether the configured stall threshold has elapsed since the
+    /// last applied heartbeat. If it has, the standby promotes
+    /// itself to Primary and the watchdog exits — there is nothing
+    /// further to watch.
+    ///
+    /// `check_interval` should be substantially smaller than the
+    /// stall threshold so the standby reacts quickly once the
+    /// threshold is crossed. A typical ratio is 5:1 (e.g. check
+    /// every 5s against a 30s stall threshold), giving a worst-case
+    /// detection latency equal to one check interval.
+    ///
+    /// Returns the JoinHandle so the caller can `abort()` it. The
+    /// watchdog also self-terminates on promotion, so callers
+    /// often do not need to abort it explicitly.
+    pub fn start_stall_watchdog(
+        self: Arc<Self>,
+        check_interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(check_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if self.is_primary().await {
+                    info!("coordinator is primary; stopping stall watchdog");
+                    break;
+                }
+                if let Some(previous_primary) = self.try_promote_if_stalled(Instant::now()).await {
+                    log::warn!(
+                        "primary {} appears stalled; promoted to Primary",
+                        previous_primary
+                    );
+                    break;
+                }
+            }
+        })
+    }
+
     /// Register a validator
     pub async fn register_validator(&self, validator_id: NodeId) {
         let mut validators = self.validators.lock().await;
