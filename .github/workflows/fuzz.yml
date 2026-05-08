@@ -31,8 +31,12 @@ jobs:
           workspaces: fuzz
           shared-key: paraloom-fuzz
 
+      # Drop `--locked`: cargo-fuzz 0.13.1's pinned rustix 0.36.5 uses
+      # `rustc_attrs` cfg attributes that current nightly rejects with
+      # `attributes starting with rustc are reserved`. Resolving without
+      # the lockfile picks a newer rustix that builds cleanly.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz
 
       # 300s per target keeps a single nightly run under ~20 minutes
       # while still giving libfuzzer enough cycles to drive coverage
