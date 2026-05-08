@@ -1,0 +1,35 @@
+name: Programs CI
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'programs/**'
+      - '.github/workflows/programs.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'programs/**'
+      - '.github/workflows/programs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test programs/paraloom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: programs/paraloom
+          shared-key: paraloom-programs
+
+      - name: Run tests
+        run: cargo test --manifest-path programs/paraloom/Cargo.toml
