@@ -3,7 +3,8 @@ members = [
     "."
 ]
 exclude = [
-    "programs/paraloom"  # Separate build - has different Anchor/Solana version requirements
+    "programs/paraloom",  # Separate build - has different Anchor/Solana version requirements
+    "fuzz",               # cargo-fuzz crate; nightly-only, not part of the regular build
 ]
 resolver = "2"
 
