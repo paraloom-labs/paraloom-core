@@ -12,14 +12,30 @@ use paraloom_program::{accounts, instruction, BridgeState};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
 
+/// Adapter from `solana-program-test`'s decoupled `&'b [AccountInfo<'c>]`
+/// to Anchor 0.31's correlated `&'info [AccountInfo<'info>]`. The
+/// transmute is sound because the test runner's accounts slice in
+/// fact owns its element borrows for at least as long as the call,
+/// the same shape Anchor's entry assumes — but the type system can't
+/// prove it from the looser `processor!` signature alone. This is
+/// the documented Anchor + solana-program-test interop workaround.
+#[allow(clippy::missing_safety_doc)]
+fn entry<'a, 'b, 'c, 'd>(
+    program_id: &'a Pubkey,
+    accounts: &'b [AccountInfo<'c>],
+    data: &'d [u8],
+) -> ProgramResult {
+    paraloom_program::entry(
+        program_id,
+        unsafe { std::mem::transmute::<&'b [AccountInfo<'c>], &'b [AccountInfo<'b>]>(accounts) },
+        data,
+    )
+}
+
 #[tokio::test]
 async fn initialize_persists_bridge_state_fields() {
     let program_id = paraloom_program::ID;
-    let pt = ProgramTest::new(
-        "paraloom_program",
-        program_id,
-        processor!(paraloom_program::entry),
-    );
+    let pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
