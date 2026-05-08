@@ -1,0 +1,97 @@
+//! Third on-chain unit test for #71. Pins the pause-flag contract:
+//! `pause` flips `BridgeState.paused`, and a subsequent `deposit`
+//! against the paused bridge fails on the handler's
+//! `require!(!paused, BridgePaused)` rather than silently
+//! succeeding. Without this test a regression that lost the require
+//! line would only surface when an admin needed pause for an
+//! incident and discovered deposits were still landing.
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::entrypoint::ProgramResult;
+use anchor_lang::{InstructionData, ToAccountMetas};
+use paraloom_program::{accounts, instruction, BridgeState};
+use solana_program_test::{processor, tokio, ProgramTest};
+use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
+
+#[allow(clippy::missing_safety_doc)]
+fn entry<'a, 'b, 'c, 'd>(
+    program_id: &'a Pubkey,
+    accounts: &'b [AccountInfo<'c>],
+    data: &'d [u8],
+) -> ProgramResult {
+    paraloom_program::entry(
+        program_id,
+        unsafe { std::mem::transmute::<&'b [AccountInfo<'c>], &'b [AccountInfo<'b>]>(accounts) },
+        data,
+    )
+}
+
+#[tokio::test]
+async fn pause_flips_flag_and_blocks_deposit() {
+    let program_id = paraloom_program::ID;
+    let pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+
+    let init_ix = Instruction {
+        program_id,
+        data: instruction::Initialize {
+            program_version: 0x0004_0000,
+            initial_merkle_root: [0u8; 32],
+        }
+        .data(),
+        accounts: accounts::Initialize {
+            bridge_state: bridge_state_pda,
+            authority: payer.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    let pause_ix = Instruction {
+        program_id,
+        data: instruction::Pause {}.data(),
+        accounts: accounts::Pause {
+            bridge_state: bridge_state_pda,
+            authority: payer.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[pause_ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    let raw = banks_client
+        .get_account(bridge_state_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let state = BridgeState::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert!(state.paused);
+
+    let deposit_ix = Instruction {
+        program_id,
+        data: instruction::Deposit {
+            amount: 1_000_000,
+            recipient: [1u8; 32],
+            randomness: [2u8; 32],
+        }
+        .data(),
+        accounts: accounts::Deposit {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            depositor: payer.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deposit_ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], recent_blockhash);
+    let result = banks_client.process_transaction(tx).await;
+    assert!(result.is_err(), "deposit must fail when paused");
+}
