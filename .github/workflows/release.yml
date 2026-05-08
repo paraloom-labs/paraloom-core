@@ -20,12 +20,6 @@ jobs:
             artifact_name: paraloom-node
             asset_name: paraloom-node-linux-amd64
 
-          # macOS x86_64 — older Intel Macs, dev workstations.
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact_name: paraloom-node
-            asset_name: paraloom-node-macos-amd64
-
           # macOS aarch64 — Apple Silicon (M1/M2/M3) developer
           # workstations, where most contributor builds happen.
           - os: macos-latest
@@ -33,11 +27,20 @@ jobs:
             artifact_name: paraloom-node
             asset_name: paraloom-node-macos-arm64
 
-          # Windows and Linux aarch64 are intentionally out of scope
-          # for this slice — Solana SDK on Windows MSVC needs more
-          # toolchain plumbing than fits this PR, and aarch64 Linux
-          # cross-compilation hits RocksDB's bindgen tooling. Both
-          # are tracked under #70 follow-ups.
+          # macOS x86_64 (Intel) is intentionally out of scope:
+          # the GitHub Actions macos-13 runner queue routinely
+          # leaves jobs pending for hours, blocking the package
+          # job and starving Linux operators of release artifacts.
+          # Intel Mac validator share is small enough that
+          # operators on those machines can build from source via
+          # `cargo build --release` until reproducible aarch64 +
+          # native-Intel cross builds are in place.
+          #
+          # Windows and Linux aarch64 remain out of scope for the
+          # same shape of reasons: Solana SDK on Windows MSVC
+          # needs toolchain plumbing this PR does not own, and
+          # aarch64 Linux cross-compilation hits RocksDB's
+          # bindgen path. Both tracked as post-v0.5.0 follow-ups.
 
     steps:
       - uses: actions/checkout@v4
