@@ -15,6 +15,95 @@ use paraloom::privacy::*;
 use paraloom::types::NodeId;
 use std::sync::Arc;
 
+/// Deposit → Transfer → Withdraw E2E. The audit flagged that no test exercised
+/// the full L2 flow with an intermediate transfer, which is exactly the path
+/// where the v0.2.0 commitment/nullifier mismatch lived: the transfer must
+/// burn the input note's nullifier AND publish a fresh output commitment whose
+/// own nullifier (derived from the new randomness) is what the recipient later
+/// spends. A bug that confused the two would let the depositor's nullifier
+/// withdraw the recipient's funds, or leave the recipient's note unspendable.
+#[tokio::test]
+async fn test_deposit_transfer_withdraw_flow() {
+    let pool = Arc::new(ShieldedPool::new());
+
+    let alice_addr = ShieldedAddress([0xAA; 32]);
+    let alice_rand = pedersen::generate_randomness();
+    let deposit_amount = 1_000_000u64;
+    let deposit_fee = 1_000u64;
+    let net_deposit = deposit_amount - deposit_fee;
+    let deposit_tx = DepositTx::new(
+        vec![0x01; 32],
+        deposit_amount,
+        alice_addr,
+        alice_rand,
+        deposit_fee,
+    );
+    let alice_note = deposit_tx.output_note.clone();
+    pool.deposit(alice_note.clone(), net_deposit).await.unwrap();
+    assert_eq!(pool.total_supply().await, net_deposit);
+
+    let alice_nullifier = Nullifier::derive(&alice_note.commitment(), &alice_rand);
+    let bob_addr = ShieldedAddress([0xBB; 32]);
+    let bob_rand = pedersen::generate_randomness();
+    let bob_note = Note::new(bob_addr, net_deposit, bob_rand);
+    let transfer_tx = TransferTx::new(
+        vec![alice_nullifier.clone()],
+        vec![bob_note.clone()],
+        pool.root().await,
+        0,
+    );
+    assert!(transfer_tx.verify_structure());
+
+    let new_commitments = pool
+        .transfer(vec![alice_nullifier.clone()], vec![bob_note.clone()])
+        .await
+        .unwrap();
+    assert_eq!(new_commitments, vec![bob_note.commitment()]);
+    assert!(pool.is_spent(&alice_nullifier).await);
+    assert_eq!(
+        pool.total_supply().await,
+        net_deposit,
+        "transfer must not change supply"
+    );
+
+    // Replay of Alice's nullifier must fail — this is the property the audit
+    // wanted us to lock down.
+    let replay = pool
+        .transfer(vec![alice_nullifier.clone()], vec![bob_note.clone()])
+        .await;
+    assert!(replay.is_err(), "alice nullifier replay must fail");
+
+    // Bob withdraws using the nullifier derived from his note + his randomness,
+    // not Alice's. Confusing the two is the v0.2.0-shaped bug.
+    let bob_nullifier = Nullifier::derive(&bob_note.commitment(), &bob_rand);
+    assert_ne!(
+        alice_nullifier, bob_nullifier,
+        "transfer output must yield a fresh nullifier"
+    );
+
+    let recipient = [0xCC; 32];
+    let withdraw_tx = WithdrawTx::new(
+        bob_nullifier.clone(),
+        net_deposit,
+        recipient.to_vec(),
+        pool.root().await,
+        0,
+    );
+    assert!(withdraw_tx.verify());
+    pool.withdraw(bob_nullifier.clone(), net_deposit, &recipient)
+        .await
+        .unwrap();
+
+    assert!(pool.is_spent(&bob_nullifier).await);
+    assert_eq!(pool.spent_count().await, 2, "alice transfer + bob withdraw");
+    assert_eq!(pool.total_supply().await, 0);
+
+    // Alice's already-spent nullifier cannot be used to withdraw — defends
+    // against the symmetric form of the same bug.
+    let alice_replay_withdraw = pool.withdraw(alice_nullifier.clone(), 1, &recipient).await;
+    assert!(alice_replay_withdraw.is_err());
+}
+
 #[tokio::test]
 async fn test_withdrawal_consensus_with_validators() {
     env_logger::builder()
