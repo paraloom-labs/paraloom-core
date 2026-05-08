@@ -747,4 +747,35 @@ mod tests {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("multiaddr parses");
         assert_eq!(peer_id_from_multiaddr(&addr), None);
     }
+
+    #[tokio::test]
+    async fn fresh_network_manager_has_empty_peer_registry() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let registry = mgr.peer_registry();
+        let registry = registry.lock().await;
+        assert_eq!(registry.len(), 0, "fresh registry holds no peers");
+        assert!(
+            registry.peers_due_for_reconnect().is_empty(),
+            "no pending reconnects in a fresh registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_bootstrap_list_succeeds_without_warning() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        mgr.connect_to_bootstrap(Vec::new())
+            .await
+            .expect("empty bootstrap is a no-op");
+    }
+
+    #[tokio::test]
+    async fn malformed_bootstrap_address_does_not_error() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        // The function logs a warn and skips the bad address; the
+        // overall call must still succeed so a single typo in the
+        // operator's bootstrap list does not prevent node startup.
+        mgr.connect_to_bootstrap(vec!["not-a-multiaddr".to_string()])
+            .await
+            .expect("malformed addresses surface as warn, not Err");
+    }
 }
