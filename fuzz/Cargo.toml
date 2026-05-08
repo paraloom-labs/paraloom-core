@@ -26,3 +26,10 @@ path = "fuzz_targets/merkle_path_verify.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wasm_output_len"
+path = "fuzz_targets/wasm_output_len.rs"
+test = false
+doc = false
+bench = false
