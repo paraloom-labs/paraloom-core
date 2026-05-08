@@ -1,0 +1,21 @@
+[package]
+name = "paraloom-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.paraloom]
+path = ".."
+
+[[bin]]
+name = "proof_codec_decode"
+path = "fuzz_targets/proof_codec_decode.rs"
+test = false
+doc = false
+bench = false
