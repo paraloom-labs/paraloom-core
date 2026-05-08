@@ -7,8 +7,9 @@
 //! argument (the symmetric direction), and the insert-then-lookup
 //! contract on the pool's Merkle tree that withdrawals rely on.
 
-use paraloom::privacy::*;
+use paraloom::privacy::{Commitment, Note, Nullifier, ShieldedAddress, ShieldedPool};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 use tokio::runtime::Builder;
 
 fn rt() -> tokio::runtime::Runtime {
