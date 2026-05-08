@@ -1,3 +1,9 @@
+# Empty `[workspace]` makes this manifest its own workspace root so
+# `cargo fuzz` does not try to attach it to the parent (which would
+# fail because parent's `exclude = ["fuzz"]` is not enough on its own
+# when the user invokes cargo with --manifest-path fuzz/Cargo.toml).
+[workspace]
+
 [package]
 name = "paraloom-fuzz"
 version = "0.0.0"
