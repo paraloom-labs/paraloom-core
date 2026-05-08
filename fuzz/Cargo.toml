@@ -19,3 +19,10 @@ path = "fuzz_targets/proof_codec_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "merkle_path_verify"
+path = "fuzz_targets/merkle_path_verify.rs"
+test = false
+doc = false
+bench = false
