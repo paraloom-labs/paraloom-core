@@ -10,6 +10,26 @@ use wasmtime::*;
 
 use super::job::{ComputeJob, JobResult};
 
+/// Maximum bytes copied out of a WASM module's memory after a job
+/// returns. Audit (#71) flagged the unsafe shape this constant
+/// guards: a malicious module could otherwise return an output
+/// pointer that walks past the end of its linear memory.
+pub const MAX_WASM_OUTPUT_SIZE: usize = 65_536;
+
+/// Decide how many bytes to copy from a WASM module's linear memory
+/// starting at `output_ptr`, given the module's current `memory_size`
+/// and an upstream `max_output_size` cap. Pure / total / panic-free
+/// for any `(i32, usize, usize)` triple — the engine relies on this
+/// to keep a malicious output pointer from reading out of bounds, so
+/// the property is fuzzed under `fuzz/fuzz_targets/wasm_output_len`.
+pub fn wasm_output_len(output_ptr: i32, memory_size: usize, max_output_size: usize) -> usize {
+    if output_ptr >= 0 && (output_ptr as usize) < memory_size {
+        std::cmp::min(max_output_size, memory_size - (output_ptr as usize))
+    } else {
+        0
+    }
+}
+
 /// WASM execution engine with resource isolation
 pub struct WasmEngine {
     /// Wasmtime engine
@@ -160,21 +180,8 @@ impl WasmEngine {
                 let remaining_fuel = store.get_fuel().unwrap_or(0);
                 let instructions_executed = initial_fuel.saturating_sub(remaining_fuel);
 
-                // Read output data from memory
-                // The output_ptr is the starting position, we need to determine length
-                // For now, read up to 64KB or until we hit zeros (depends on contract)
-                let max_output_size = 65536; // 64KB max output
                 let output_len =
-                    if output_ptr >= 0 && (output_ptr as usize) < memory.data_size(&store) {
-                        // Read a reasonable amount of data
-                        // In real scenarios, the WASM module should return length or use a convention
-                        std::cmp::min(
-                            max_output_size,
-                            memory.data_size(&store) - (output_ptr as usize),
-                        )
-                    } else {
-                        0
-                    };
+                    wasm_output_len(output_ptr, memory.data_size(&store), MAX_WASM_OUTPUT_SIZE);
 
                 let mut output_data = vec![0u8; output_len];
                 if output_len > 0 {
