@@ -7,6 +7,7 @@
 //! initial counters / paused flag the L2 reads at startup.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::{accounts, instruction, BridgeState};
 use solana_program_test::{processor, tokio, ProgramTest};
