@@ -12,7 +12,7 @@
   <a href="https://github.com/paraloom-labs/paraloom-core/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build"/></a>
   <img src="https://img.shields.io/badge/tests-407%20passing-brightgreen" alt="Tests"/>
   <img src="https://img.shields.io/badge/LOC-33K-blue" alt="Lines of Code"/>
-  <img src="https://img.shields.io/badge/release-v0.5.0--rc1-yellow" alt="Release"/>
+  <img src="https://img.shields.io/badge/release-v0.5.0--rc2-yellow" alt="Release"/>
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/anchor-0.31-purple" alt="Anchor"/>
   <a href="https://github.com/paraloom-labs/paraloom-core/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/></a>
@@ -49,14 +49,14 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | Reputation gating + slashing | ✅ Working | Equivocation + persistent-unavailability evidence (v0.4.0) |
 | Merkle + nullifier set | ✅ Working | Double-spend prevention verified; fsync'd on hot writes |
 | Operational endpoints | ✅ Working | `/health`, `/ready`, `/metrics` (Prometheus) on a separate port |
-| Peer discovery | ✅ Working | Kademlia DHT, bootstrap refresh, libp2p ping liveness, registry-fed slow/offline distinction (v0.5.0-rc1) |
+| Peer discovery | ✅ Working | Kademlia DHT, bootstrap refresh, libp2p ping liveness, registry-fed slow/offline distinction (v0.5.0-rc2) |
 | Release pipeline | ✅ Working | Multi-platform binaries, SHA-256 checksums, CycloneDX SBOM, Sigstore-signed |
 | Poseidon hash | ✅ Working | Domain-separated; native↔circuit equivalence pinned by tests |
-| Coordinator HA | ✅ Working | Active/passive failover with RTO scenario test under 30s (v0.5.0-rc1) |
-| MPC trusted setup tooling | ✅ Working | BGM17 contribution + verifier, transcript chain, contributor / verifier / finalize CLIs (v0.5.0-rc1) |
+| Coordinator HA | ✅ Working | Active/passive failover with RTO scenario test under 30s (v0.5.0-rc2) |
+| MPC trusted setup tooling | ✅ Working | BGM17 contribution + verifier, transcript chain, contributor / verifier / finalize CLIs (v0.5.0-rc2) |
 | Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending; explicitly out of scope for the v0.5.0 ceremony |
-| MPC ceremony execution | 🟡 In progress | Tooling shipped at rc1; the 20–30 contributor run is the calendar gate to v0.5.0 final |
-| Mainnet launch | 🟡 Pre-release | v0.5.0-rc1 cut; awaiting ceremony completion + external security audit |
+| MPC ceremony execution | 🟡 In progress | Tooling shipped at rc2; the 20–30 contributor run is the calendar gate to v0.5.0 final |
+| Mainnet launch | 🟡 Pre-release | v0.5.0-rc2 cut; awaiting ceremony completion + external security audit |
 
 ## Quick Start
 
