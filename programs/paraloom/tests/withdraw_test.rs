@@ -1,8 +1,7 @@
 //! Eleventh on-chain unit test for #71. Happy-path withdraw:
-//! initialize → deposit → withdraw. Pins that the requested amount
-//! moves from bridge_vault to the recipient, the L2-visible counters
-//! tick, and the nullifier PDA the replay-protection layer leans
-//! on is created. Replay-rejection is a separate PR.
+//! initialize → deposit → withdraw. Pins the recipient transfer,
+//! the L2-visible counters, and the nullifier PDA the replay layer
+//! relies on. Replay-rejection is a separate PR.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
@@ -42,8 +41,11 @@ async fn withdraw_credits_recipient_and_advances_counters() {
         },
         Instruction {
             program_id,
+            // 2 SOL so vault stays above the rent-exempt minimum
+            // (~890_880 lamports) after the 1 SOL withdraw — a
+            // smaller margin trips InsufficientFundsForRent.
             data: instruction::Deposit {
-                amount: 1_000_000,
+                amount: 2_000_000_000,
                 recipient: [1u8; 32],
                 randomness: [2u8; 32],
             }
@@ -60,7 +62,7 @@ async fn withdraw_credits_recipient_and_advances_counters() {
             program_id,
             data: instruction::Withdraw {
                 nullifier: NULLIFIER,
-                amount: 500_000,
+                amount: 1_000_000_000,
                 expiration_slot: u64::MAX,
                 proof: vec![1, 2, 3, 4],
             }
@@ -84,7 +86,7 @@ async fn withdraw_credits_recipient_and_advances_counters() {
 
     let state_raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
-    assert_eq!(state.total_withdrawn, 500_000);
+    assert_eq!(state.total_withdrawn, 1_000_000_000);
     assert_eq!(state.withdrawal_count, 1);
 
     let nul_raw = banks_client
