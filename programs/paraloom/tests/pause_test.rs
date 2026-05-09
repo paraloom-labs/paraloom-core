@@ -7,24 +7,13 @@
 //! incident and discovered deposits were still landing.
 
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::entrypoint::ProgramResult;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::{accounts, instruction, BridgeState};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
 
-#[allow(clippy::missing_safety_doc)]
-fn entry<'a, 'b, 'c, 'd>(
-    program_id: &'a Pubkey,
-    accounts: &'b [AccountInfo<'c>],
-    data: &'d [u8],
-) -> ProgramResult {
-    paraloom_program::entry(
-        program_id,
-        unsafe { std::mem::transmute::<&'b [AccountInfo<'c>], &'b [AccountInfo<'b>]>(accounts) },
-        data,
-    )
-}
+mod common;
+use common::entry;
 
 #[tokio::test]
 async fn pause_flips_flag_and_blocks_deposit() {
