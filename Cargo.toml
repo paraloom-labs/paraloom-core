@@ -14,7 +14,7 @@ version = "0.4.0"
 authors = ["Paraloom Team"]
 edition = "2021"
 license = "MIT"
-description = "A distributed sidechain solution for the Solana ecosystem"
+description = "Privacy-focused Layer 2 on Solana with shielded pool and Groth16 zkSNARKs"
 
 [lib]
 name = "paraloom"
