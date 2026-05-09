@@ -1,0 +1,84 @@
+//! Fifth on-chain unit test for #71. Opens validator-registry
+//! coverage: `initialize_validator_registry` then `register_validator`
+//! with the minimum stake. Pins both pieces the consensus layer
+//! relies on — the registry counters tick correctly so quorum math
+//! has the right population, and a fresh `ValidatorAccount` lands
+//! with the default reputation (1000) and `is_active = true` so the
+//! consensus pipeline does not silently exclude newly registered
+//! validators.
+
+use anchor_lang::prelude::*;
+use anchor_lang::{InstructionData, ToAccountMetas};
+use paraloom_program::{accounts, instruction, ValidatorAccount, ValidatorRegistry};
+use solana_program_test::{processor, tokio, ProgramTest};
+use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
+
+mod common;
+use common::entry;
+
+const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
+
+#[tokio::test]
+async fn register_validator_initializes_account_and_counters() {
+    let program_id = paraloom_program::ID;
+    let pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_account_pda, _) =
+        Pubkey::find_program_address(&[b"validator", payer.pubkey().as_ref()], &program_id);
+
+    let init_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            validator_registry: registry_pda,
+            authority: payer.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    let register_ix = Instruction {
+        program_id,
+        data: instruction::RegisterValidator {
+            stake_amount: MIN_VALIDATOR_STAKE,
+        }
+        .data(),
+        accounts: accounts::RegisterValidator {
+            validator_account: validator_account_pda,
+            validator_registry: registry_pda,
+            validator: payer.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[register_ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    let registry_raw = banks_client
+        .get_account(registry_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = ValidatorRegistry::try_deserialize(&mut registry_raw.data.as_slice()).unwrap();
+    assert_eq!(registry.total_validators, 1);
+    assert_eq!(registry.active_validators, 1);
+    assert_eq!(registry.minimum_stake, MIN_VALIDATOR_STAKE);
+
+    let acc_raw = banks_client
+        .get_account(validator_account_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(acc.validator, payer.pubkey());
+    assert_eq!(acc.stake_amount, MIN_VALIDATOR_STAKE);
+    assert_eq!(acc.reputation_score, 1000);
+    assert!(acc.is_active);
+    assert_eq!(acc.times_slashed, 0);
+}
