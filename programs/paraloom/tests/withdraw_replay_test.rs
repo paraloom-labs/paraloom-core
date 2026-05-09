@@ -1,10 +1,7 @@
 //! Twelfth on-chain unit test for #71. Replay-rejection counterpart
-//! to withdraw_test (#143). The audit's primary concern with the
-//! withdrawal path was double-spend: a leaked withdrawal request
-//! must not be re-submittable. The on-chain defence is the
-//! init'd `nullifier_account` PDA at `seeds = [b"nullifier",
-//! nullifier]` — a second submission of the same nullifier fails
-//! because Anchor's `init` rejects an already-initialised account.
+//! to withdraw_test (#143). The audit's primary concern was
+//! double-spend; the on-chain defence is the init'd nullifier PDA,
+//! and Anchor's init rejects an already-initialised account.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
@@ -86,12 +83,17 @@ async fn withdraw_with_same_nullifier_is_rejected() {
         banks_client.process_transaction(tx).await.unwrap();
     }
 
-    // Replay: same nullifier, same shape — must fail. Anchor's init
-    // on the nullifier_account PDA rejects the already-existing
-    // account, the on-chain primary defence the audit asked us to
-    // pin.
+    // Replay with a fresh blockhash so the runtime does not dedupe
+    // the second tx as a copy of the first. Same nullifier, same
+    // shape — Anchor's init on the nullifier_account PDA must
+    // reject the already-existing account, the on-chain primary
+    // defence the audit asked us to pin.
+    let new_blockhash = banks_client
+        .get_new_latest_blockhash(&recent_blockhash)
+        .await
+        .unwrap();
     let mut tx = Transaction::new_with_payer(&[withdraw_ix()], Some(&payer.pubkey()));
-    tx.sign(&[&payer], recent_blockhash);
+    tx.sign(&[&payer], new_blockhash);
     let result = banks_client.process_transaction(tx).await;
     assert!(result.is_err(), "replay of the same nullifier must fail");
 }
