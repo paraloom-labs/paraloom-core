@@ -88,10 +88,7 @@ async fn withdraw_with_same_nullifier_is_rejected() {
     // shape — Anchor's init on the nullifier_account PDA must
     // reject the already-existing account, the on-chain primary
     // defence the audit asked us to pin.
-    let new_blockhash = banks_client
-        .get_new_latest_blockhash(&recent_blockhash)
-        .await
-        .unwrap();
+    let new_blockhash = banks_client.get_latest_blockhash().await.unwrap();
     let mut tx = Transaction::new_with_payer(&[withdraw_ix()], Some(&payer.pubkey()));
     tx.sign(&[&payer], new_blockhash);
     let result = banks_client.process_transaction(tx).await;
