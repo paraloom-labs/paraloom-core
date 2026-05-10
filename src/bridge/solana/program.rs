@@ -344,6 +344,27 @@ mod tests {
         assert!(!program.is_program_deployed().await.unwrap());
     }
 
+    /// `get_balance` is a thin pass-through to the RPC: forwards the
+    /// configured value, surfaces an RPC error untouched.
+    #[tokio::test]
+    async fn get_balance_returns_mocked_value() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_balance.lock().unwrap() = Some(Ok(42_000_000));
+        let program = program_with_mock(mock);
+        assert_eq!(program.get_balance([1u8; 32]).await.unwrap(), 42_000_000);
+    }
+
+    /// Same shape for `get_slot`: pass-through, no parsing, no
+    /// fallback. A regression that returned 0 instead of forwarding
+    /// the value would break the lag-metric path.
+    #[tokio::test]
+    async fn get_slot_returns_mocked_value() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(987_654_321));
+        let program = program_with_mock(mock);
+        assert_eq!(program.get_slot().await.unwrap(), 987_654_321);
+    }
+
     /// Synthesise a BridgeState account: 8 bytes of discriminator
     /// (any value), then a u32 program_version, then arbitrary
     /// trailing bytes. \`parse_program_version\` must read exactly the
