@@ -365,6 +365,31 @@ mod tests {
         assert_eq!(program.get_slot().await.unwrap(), 987_654_321);
     }
 
+    /// Both signing handlers (`submit_withdrawal`, `update_merkle_root`)
+    /// guard against being called without an authority keypair —
+    /// without the guard a misconfigured node would silently no-op
+    /// withdrawals or root updates instead of failing loudly. The
+    /// mock is never reached because the guard short-circuits.
+    #[tokio::test]
+    async fn submit_withdrawal_fails_fast_when_authority_missing() {
+        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
+        let err = program
+            .submit_withdrawal([0u8; 32], 1, [0u8; 32], u64::MAX, &[0u8; 4])
+            .await
+            .expect_err("missing authority must fail before any RPC call");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn update_merkle_root_fails_fast_when_authority_missing() {
+        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
+        let err = program
+            .update_merkle_root([0u8; 32])
+            .await
+            .expect_err("missing authority must fail before any RPC call");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
     /// Synthesise a BridgeState account: 8 bytes of discriminator
     /// (any value), then a u32 program_version, then arbitrary
     /// trailing bytes. \`parse_program_version\` must read exactly the
