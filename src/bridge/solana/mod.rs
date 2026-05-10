@@ -7,6 +7,8 @@ mod listener;
 mod program;
 mod rpc;
 mod submitter;
+#[cfg(test)]
+mod test_support;
 
 pub use instructions::{
     create_deposit_instruction, create_initialize_instruction,
