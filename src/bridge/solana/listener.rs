@@ -490,6 +490,47 @@ mod tests {
         );
     }
 
+    /// `poll_events` must update `state.last_signature` to the most
+    /// recent successfully-processed deposit's signature so the next
+    /// poll narrows `getSignaturesForAddress` to "newer than this".
+    /// Drives the full path: get_signatures → get_transaction →
+    /// extract_deposit_events → process_deposit → cursor update.
+    /// The synth_deposit_tx helper builds the in-memory tx the
+    /// decoder expects so we never need to boot a validator.
+    #[tokio::test]
+    async fn poll_events_advances_cursor_after_successful_deposit() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        let sig = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: sig.to_string(),
+                slot: 7,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(synth_deposit_tx(
+            sig,
+            7,
+            &program_id,
+            &depositor,
+            1_000,
+            [9u8; 32],
+            [11u8; 32],
+        )));
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 1, "exactly one deposit must process");
+        assert_eq!(*state.last_signature.read().await, Some(sig));
+        assert_eq!(state.pool.commitment_count().await, 1);
+    }
+
     /// A signature already in `state.seen_signatures` must be filtered
     /// before `get_transaction` is reached. The mock leaves
     /// get_transaction unconfigured for the seen sig — if the dedup
