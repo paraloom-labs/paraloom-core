@@ -268,12 +268,26 @@ impl ProgramInterface {
 mod tests {
     use super::*;
     use crate::bridge::solana::rpc::RealBridgeRpc;
+    use crate::bridge::solana::test_support::MockBridgeRpc;
     use solana_client::rpc_client::RpcClient;
+    use solana_sdk::account::Account;
 
     fn dummy_rpc() -> Arc<dyn BridgeRpc> {
         Arc::new(RealBridgeRpc::new(Arc::new(RpcClient::new(
             "http://localhost:8899".to_string(),
         ))))
+    }
+
+    fn bridge_state_account(program_version: u32) -> Account {
+        let mut data = vec![0xAAu8; 8];
+        data.extend_from_slice(&program_version.to_le_bytes());
+        Account {
+            lamports: 1,
+            data,
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        }
     }
 
     #[test]
@@ -298,6 +312,42 @@ mod tests {
     /// trailing bytes. \`parse_program_version\` must read exactly the
     /// version regardless of the discriminator content or trailing
     /// payload.
+    /// `verify_program_version` reads the on-chain BridgeState via
+    /// `get_account`, parses the version from the fixed offset, and
+    /// returns `Ok(())` when it matches `EXPECTED_PROGRAM_VERSION`.
+    #[tokio::test]
+    async fn verify_program_version_accepts_matching_version() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(bridge_state_account(
+            crate::bridge::EXPECTED_PROGRAM_VERSION,
+        )));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        assert!(program.verify_program_version().await.is_ok());
+    }
+
+    /// A version mismatch surfaces as a typed `ConfigError`, not a
+    /// silent pass — the L2 startup flow turns this into a refusal
+    /// to boot rather than risk talking to an incompatible program.
+    #[tokio::test]
+    async fn verify_program_version_rejects_mismatch() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(bridge_state_account(0x0099_0000)));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        let err = program
+            .verify_program_version()
+            .await
+            .expect_err("mismatch");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
     #[test]
     fn parse_program_version_reads_v04() {
         let mut buf = vec![0xAAu8; 8]; // discriminator
