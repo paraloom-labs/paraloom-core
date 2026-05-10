@@ -435,6 +435,22 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    /// `update_lag_metric` writes `current_slot - last_processed_slot`
+    /// to `stats.event_lag_slots`. The metric powers the operator-
+    /// visible "deposit listener is N slots behind chain tip" line;
+    /// a regression that wrote zero would silently mask a stalled
+    /// listener.
+    #[tokio::test]
+    async fn update_lag_metric_writes_slot_delta_to_stats() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(1_000));
+        let state = make_state(mock);
+        *state.last_processed_slot.write().await = 100;
+        EventListener::update_lag_metric(&state).await;
+        assert_eq!(state.stats.read().await.event_lag_slots, 900);
+    }
+
     /// A signature whose `err` field is `Some` (the on-chain
     /// transaction reverted) must be skipped before `get_transaction`
     /// is reached — in this test `get_transaction` is intentionally
