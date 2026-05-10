@@ -451,6 +451,72 @@ mod tests {
         assert_eq!(state.stats.read().await.event_lag_slots, 900);
     }
 
+    /// During cold start (`last_processed_slot == 0`) the lag is
+    /// still written to stats — the warn-on-threshold path is what
+    /// suppresses the noisy "we are 200_000 slots behind" message,
+    /// not the metric itself. Operators who scrape the metric should
+    /// see a real value from boot, even if it temporarily looks like
+    /// the listener has the entire chain to catch up on.
+    #[tokio::test]
+    async fn update_lag_metric_writes_lag_during_cold_start() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(1_000));
+        let state = make_state(mock);
+        // last_processed_slot defaults to 0 — cold start.
+        EventListener::update_lag_metric(&state).await;
+        assert_eq!(state.stats.read().await.event_lag_slots, 1_000);
+    }
+
+    /// When `get_slot` errors out the listener must skip the metric
+    /// update entirely — no half-written stats, no panic. Without
+    /// that guard a flaky RPC could clobber `event_lag_slots` with
+    /// stale or zero values and operators would lose visibility on
+    /// the actual lag.
+    #[tokio::test]
+    async fn update_lag_metric_silent_on_rpc_error() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        // Leave next_get_slot unconfigured — the mock returns Err.
+        let state = make_state(mock);
+        *state.last_processed_slot.write().await = 100;
+        // Pre-seed a previous lag value to detect any clobber.
+        state.stats.write().await.event_lag_slots = 42;
+        EventListener::update_lag_metric(&state).await;
+        assert_eq!(
+            state.stats.read().await.event_lag_slots,
+            42,
+            "rpc error must not overwrite a previous lag reading"
+        );
+    }
+
+    /// A signature already in `state.seen_signatures` must be filtered
+    /// before `get_transaction` is reached. The mock leaves
+    /// get_transaction unconfigured for the seen sig — if the dedup
+    /// guard regressed, the listener would call `get_transaction` and
+    /// pick up the "mock not configured" Err. The empty-Vec assertion
+    /// catches that path too.
+    #[tokio::test]
+    async fn fetch_events_skips_signatures_already_in_seen_set() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        let already_seen = Signature::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: already_seen.to_string(),
+                slot: 1,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        let state = make_state(mock);
+        state.seen_signatures.write().await.insert(already_seen);
+        let events = EventListener::fetch_events(&state, None).await.unwrap();
+        assert!(events.is_empty());
+    }
+
     /// A signature whose `err` field is `Some` (the on-chain
     /// transaction reverted) must be skipped before `get_transaction`
     /// is reached — in this test `get_transaction` is intentionally
