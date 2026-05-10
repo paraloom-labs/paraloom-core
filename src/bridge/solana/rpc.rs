@@ -9,6 +9,7 @@ use solana_client::client_error::ClientError;
 use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::account::Account;
+use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
@@ -32,6 +33,12 @@ pub trait BridgeRpc: Send + Sync {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Account>;
 
     async fn send_and_confirm_transaction(&self, tx: &Transaction) -> Result<Signature>;
+
+    async fn get_latest_blockhash(&self) -> Result<Hash>;
+
+    async fn get_balance(&self, pubkey: &Pubkey) -> Result<u64>;
+
+    async fn get_slot(&self) -> Result<u64>;
 }
 
 pub struct RealBridgeRpc {
@@ -97,5 +104,21 @@ impl BridgeRpc for RealBridgeRpc {
             rpc.send_and_confirm_transaction(&tx)
         })
         .await
+    }
+
+    async fn get_latest_blockhash(&self) -> Result<Hash> {
+        let rpc = Arc::clone(&self.client);
+        blocking("getLatestBlockhash", move || rpc.get_latest_blockhash()).await
+    }
+
+    async fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
+        let rpc = Arc::clone(&self.client);
+        let key = *pubkey;
+        blocking("getBalance", move || rpc.get_balance(&key)).await
+    }
+
+    async fn get_slot(&self) -> Result<u64> {
+        let rpc = Arc::clone(&self.client);
+        blocking("getSlot", move || rpc.get_slot()).await
     }
 }
