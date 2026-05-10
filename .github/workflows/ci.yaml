@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+# `mold` is significantly faster than the default `ld` for linking
+# Rust binaries on Linux. Install via apt in each job that links
+# (build, test*, coverage) and route the toolchain through it.
+env:
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
 jobs:
   format-and-lint:
     name: Format & Lint
@@ -50,6 +56,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            mold \
             protobuf-compiler \
             clang \
             libclang-dev \
@@ -97,6 +104,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            mold \
             protobuf-compiler \
             clang \
             libclang-dev \
@@ -149,6 +157,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            mold \
             protobuf-compiler \
             clang \
             libclang-dev \
@@ -192,6 +201,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            mold \
             protobuf-compiler \
             clang \
             libclang-dev \
@@ -239,6 +249,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            mold \
             protobuf-compiler \
             clang \
             libclang-dev \
