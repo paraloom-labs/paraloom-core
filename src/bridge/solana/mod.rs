@@ -5,6 +5,7 @@ mod instructions;
 mod keypair;
 mod listener;
 mod program;
+mod rpc;
 mod submitter;
 
 pub use instructions::{
