@@ -5,10 +5,10 @@
 //! and feeds the resulting events into the local privacy pool.
 
 use crate::bridge::solana::decoder::{extract_deposit_events, LISTENER_TX_ENCODING};
+use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, DepositEvent, Result};
 use crate::privacy::{DepositTx, ShieldedAddress, ShieldedPool};
-use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::HashSet;
@@ -33,6 +33,9 @@ const SEEN_SIGNATURE_CAP: usize = 100_000;
 pub struct EventListener {
     /// Bridge configuration
     config: BridgeConfig,
+
+    /// RPC client (behind the trait so tests can substitute a mock).
+    rpc: Arc<dyn BridgeRpc>,
 
     /// Privacy pool to process deposits into
     pool: Arc<ShieldedPool>,
@@ -63,7 +66,7 @@ pub struct EventListener {
 /// State shared with the spawned poller task. Grouping it keeps the
 /// `tokio::spawn` body from accumulating clones of every field.
 struct PollerState {
-    rpc_client: Arc<RpcClient>,
+    rpc: Arc<dyn BridgeRpc>,
     program_id: Pubkey,
     pool: Arc<ShieldedPool>,
     stats: Arc<RwLock<BridgeStats>>,
@@ -76,14 +79,18 @@ struct PollerState {
 }
 
 impl EventListener {
-    /// Create a new event listener.
+    /// Create a new event listener with the supplied RPC implementation.
+    /// `SolanaBridge::new` wires the production `RealBridgeRpc`; tests
+    /// substitute a `MockBridgeRpc`.
     pub fn new(
         config: BridgeConfig,
+        rpc: Arc<dyn BridgeRpc>,
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
     ) -> Self {
         Self {
             config,
+            rpc,
             pool,
             stats,
             running: Arc::new(RwLock::new(false)),
@@ -95,7 +102,7 @@ impl EventListener {
 
     /// Start listening for events
     pub async fn start(&mut self) -> Result<()> {
-        // Defer RPC and program-ID resolution to start time so that
+        // Defer program-ID resolution to start time so that
         // construction of the listener cannot fail just because the
         // bridge hasn't been configured yet.
         let program_id = Pubkey::from_str(&self.config.program_id).map_err(|e| {
@@ -105,15 +112,10 @@ impl EventListener {
             ))
         })?;
 
-        let rpc_client = Arc::new(RpcClient::new_with_commitment(
-            self.config.solana_rpc_url.clone(),
-            CommitmentConfig::confirmed(),
-        ));
-
         *self.running.write().await = true;
 
         let state = PollerState {
-            rpc_client,
+            rpc: Arc::clone(&self.rpc),
             program_id,
             pool: Arc::clone(&self.pool),
             stats: Arc::clone(&self.stats),
@@ -282,27 +284,21 @@ impl EventListener {
         state: &PollerState,
         cursor: Option<Signature>,
     ) -> Result<Vec<DepositEvent>> {
-        // Map the (large) `ClientError` to `BridgeError` inside the
-        // closure so the `Result` that crosses `spawn_blocking`'s
-        // boundary is small — `clippy::result_large_err` flags the
-        // un-mapped variant. The pattern repeats for every RPC call
-        // below.
-        let rpc = Arc::clone(&state.rpc_client);
-        let program_id = state.program_id;
-        let signatures = tokio::task::spawn_blocking(move || {
-            rpc.get_signatures_for_address_with_config(
-                &program_id,
+        // RPC calls go through the BridgeRpc trait — RealBridgeRpc
+        // handles the spawn_blocking + ClientError mapping, mocks
+        // return canned data directly.
+        let signatures = state
+            .rpc
+            .get_signatures_for_address_with_config(
+                &state.program_id,
                 GetConfirmedSignaturesForAddress2Config {
                     before: None,
                     until: cursor,
                     limit: Some(SIGNATURE_BATCH_LIMIT),
-                    commitment: Some(CommitmentConfig::confirmed()),
+                    commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
                 },
             )
-            .map_err(|e| BridgeError::SolanaRpc(format!("getSignaturesForAddress: {}", e)))
-        })
-        .await
-        .map_err(|e| BridgeError::SolanaRpc(format!("signature fetch task panicked: {}", e)))??;
+            .await?;
 
         if signatures.is_empty() {
             return Ok(Vec::new());
@@ -338,15 +334,7 @@ impl EventListener {
 
         let mut events = Vec::new();
         for sig in to_fetch {
-            let rpc = Arc::clone(&state.rpc_client);
-            let signature = sig;
-            let confirmed = match tokio::task::spawn_blocking(move || {
-                rpc.get_transaction(&signature, LISTENER_TX_ENCODING)
-                    .map_err(|e| BridgeError::SolanaRpc(format!("getTransaction: {}", e)))
-            })
-            .await
-            .map_err(|e| BridgeError::SolanaRpc(format!("getTransaction task panicked: {}", e)))?
-            {
+            let confirmed = match state.rpc.get_transaction(&sig, LISTENER_TX_ENCODING).await {
                 Ok(tx) => tx,
                 Err(e) => {
                     log::warn!(
@@ -419,11 +407,16 @@ mod tests {
 
     #[test]
     fn test_listener_creation() {
+        use crate::bridge::solana::rpc::RealBridgeRpc;
+        use solana_client::rpc_client::RpcClient;
         let config = BridgeConfig::default();
         let pool = Arc::new(ShieldedPool::new());
         let stats = Arc::new(RwLock::new(BridgeStats::default()));
+        let rpc = Arc::new(RealBridgeRpc::new(Arc::new(RpcClient::new(
+            config.solana_rpc_url.clone(),
+        ))));
 
-        let listener = EventListener::new(config, pool, stats);
+        let listener = EventListener::new(config, rpc, pool, stats);
         assert!(listener.last_signature.blocking_read().is_none());
         assert_eq!(*listener.last_processed_slot.blocking_read(), 0);
     }
