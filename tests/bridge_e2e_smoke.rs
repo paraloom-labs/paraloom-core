@@ -166,9 +166,13 @@ async fn deposit_on_chain_propagates_to_l2_pool_via_listener() {
     );
     rpc.send_and_confirm_transaction(&tx).expect("deposit tx");
 
-    // Two poll intervals worth of slack — one for the listener to
-    // wake, one to fetch + decode + apply.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Poll for up to 15s for the deposit to materialise — CI
+    // runners boot the validator slower than a laptop, and the
+    // listener tick is 1s. A fixed sleep proved too tight on CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while pool.commitment_count().await == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     listener.stop().await.expect("listener stop");
 
     assert_eq!(
