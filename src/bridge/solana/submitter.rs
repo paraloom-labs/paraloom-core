@@ -373,6 +373,32 @@ mod tests {
         assert!(matches!(err, BridgeError::InvalidTransaction(_)));
     }
 
+    /// `batch_submit` must continue past individual failures rather
+    /// than aborting on the first error. Contract is best-effort:
+    /// collect successful signatures, log the rest, return
+    /// `Ok(successes)`. With three deliberately-malformed requests
+    /// (all empty-proof) none succeed; the call must still resolve
+    /// to `Ok(empty Vec)`, and the pool's nullifier set must stay
+    /// untouched.
+    #[tokio::test]
+    async fn batch_submit_continues_past_individual_failures() {
+        let pool = Arc::new(ShieldedPool::new());
+        let bad = |n: u8| WithdrawalRequest {
+            nullifier: [n; 32],
+            amount: 1,
+            recipient: [0u8; 32],
+            fee: 0,
+            expiration_slot: u64::MAX,
+            proof: vec![],
+        };
+        let signatures = submitter_for(Arc::clone(&pool))
+            .batch_submit(vec![bad(1), bad(2), bad(3)])
+            .await
+            .expect("batch_submit must not propagate per-item errors");
+        assert!(signatures.is_empty());
+        assert_eq!(pool.spent_count().await, 0);
+    }
+
     #[tokio::test]
     #[ignore] // Requires zkSNARK keys, run with: cargo test -- --ignored
     async fn test_submit_withdrawal() {
