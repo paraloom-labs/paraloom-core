@@ -301,6 +301,78 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn submitter_for(pool: Arc<ShieldedPool>) -> ResultSubmitter {
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let stats = Arc::new(RwLock::new(BridgeStats::default()));
+        ResultSubmitter::new(config, dummy_rpc(), pool, stats).unwrap()
+    }
+
+    /// `submit` rejects a withdrawal whose nullifier is already in the
+    /// pool's spent set before it ever reaches proof verification or
+    /// the chain. Pins the first defence layer of the replay
+    /// protection (#71) — without it a leaked withdrawal could be
+    /// re-submitted while the on-chain nullifier PDA still let it
+    /// through some race window.
+    #[tokio::test]
+    async fn submit_rejects_already_spent_nullifier() {
+        use crate::privacy::Nullifier;
+        let pool = Arc::new(ShieldedPool::new());
+        let randomness = pedersen::generate_randomness();
+        let deposit = DepositTx::new(
+            vec![0x42; 32],
+            1000,
+            ShieldedAddress([1u8; 32]),
+            randomness,
+            10,
+        );
+        pool.deposit(deposit.output_note.clone(), 990)
+            .await
+            .unwrap();
+        let nullifier = Nullifier::derive(&deposit.output_note.commitment(), &randomness);
+        pool.withdraw(nullifier.clone(), 990, &[0u8; 32])
+            .await
+            .unwrap();
+
+        let request = WithdrawalRequest {
+            nullifier: nullifier.0,
+            amount: 100,
+            recipient: [0u8; 32],
+            fee: 1,
+            expiration_slot: u64::MAX,
+            proof: vec![1u8; 32],
+        };
+        let err = submitter_for(pool)
+            .submit(request)
+            .await
+            .expect_err("replay");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+    }
+
+    /// An empty proof is rejected before any consensus / chain work.
+    /// The on-chain handler also checks `!proof.is_empty()` — we
+    /// catch the same shape locally so a malformed request fails
+    /// fast rather than wasting validator time.
+    #[tokio::test]
+    async fn submit_rejects_empty_proof() {
+        let pool = Arc::new(ShieldedPool::new());
+        let request = WithdrawalRequest {
+            nullifier: [9u8; 32],
+            amount: 100,
+            recipient: [0u8; 32],
+            fee: 1,
+            expiration_slot: u64::MAX,
+            proof: vec![],
+        };
+        let err = submitter_for(pool)
+            .submit(request)
+            .await
+            .expect_err("empty proof");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+    }
+
     #[tokio::test]
     #[ignore] // Requires zkSNARK keys, run with: cargo test -- --ignored
     async fn test_submit_withdrawal() {

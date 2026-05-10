@@ -407,6 +407,19 @@ mod tests {
         assert_eq!(*listener.last_processed_slot.blocking_read(), 0);
     }
 
+    fn make_state(rpc: Arc<dyn BridgeRpc>) -> PollerState {
+        PollerState {
+            rpc,
+            program_id: Pubkey::new_unique(),
+            pool: Arc::new(ShieldedPool::new()),
+            stats: Arc::new(RwLock::new(BridgeStats::default())),
+            last_signature: Arc::new(RwLock::new(None)),
+            seen_signatures: Arc::new(RwLock::new(HashSet::new())),
+            last_processed_slot: Arc::new(RwLock::new(0)),
+            lag_warn_threshold_slots: 100,
+        }
+    }
+
     /// Drives `fetch_events` through `MockBridgeRpc` — the mock
     /// returns an empty signature list, so `get_transaction` is never
     /// called and the function reports no events. Validates the
@@ -416,17 +429,52 @@ mod tests {
         use crate::bridge::solana::test_support::MockBridgeRpc;
         let mock = Arc::new(MockBridgeRpc::new());
         *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![]));
-        let state = PollerState {
-            rpc: mock,
-            program_id: Pubkey::new_unique(),
-            pool: Arc::new(ShieldedPool::new()),
-            stats: Arc::new(RwLock::new(BridgeStats::default())),
-            last_signature: Arc::new(RwLock::new(None)),
-            seen_signatures: Arc::new(RwLock::new(HashSet::new())),
-            last_processed_slot: Arc::new(RwLock::new(0)),
-            lag_warn_threshold_slots: 100,
-        };
-        let events = EventListener::fetch_events(&state, None).await.unwrap();
+        let events = EventListener::fetch_events(&make_state(mock), None)
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+    }
+
+    /// `update_lag_metric` writes `current_slot - last_processed_slot`
+    /// to `stats.event_lag_slots`. The metric powers the operator-
+    /// visible "deposit listener is N slots behind chain tip" line;
+    /// a regression that wrote zero would silently mask a stalled
+    /// listener.
+    #[tokio::test]
+    async fn update_lag_metric_writes_slot_delta_to_stats() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(1_000));
+        let state = make_state(mock);
+        *state.last_processed_slot.write().await = 100;
+        EventListener::update_lag_metric(&state).await;
+        assert_eq!(state.stats.read().await.event_lag_slots, 900);
+    }
+
+    /// A signature whose `err` field is `Some` (the on-chain
+    /// transaction reverted) must be skipped before `get_transaction`
+    /// is reached — in this test `get_transaction` is intentionally
+    /// not configured, so a regression that lost the filter would
+    /// surface as the "mock get_transaction not configured" error,
+    /// not as the empty-Vec we assert here.
+    #[tokio::test]
+    async fn fetch_events_skips_signatures_with_chain_err() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        use solana_sdk::transaction::TransactionError;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: Signature::new_unique().to_string(),
+                slot: 1,
+                err: Some(TransactionError::AlreadyProcessed),
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        let events = EventListener::fetch_events(&make_state(mock), None)
+            .await
+            .unwrap();
         assert!(events.is_empty());
     }
 

@@ -307,6 +307,89 @@ mod tests {
         assert!(program.is_ok());
     }
 
+    fn program_with_mock(mock: Arc<MockBridgeRpc>) -> ProgramInterface {
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        ProgramInterface::new(config, mock).unwrap()
+    }
+
+    /// `is_program_deployed` reads `program_id` via `get_account` and
+    /// returns `account.executable`. The handler treats a missing
+    /// account (RPC `Err`) as "not deployed" rather than a fatal
+    /// error so the L2 health check can keep running while the
+    /// operator inspects.
+    #[tokio::test]
+    async fn is_program_deployed_returns_true_for_executable_account() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: vec![],
+            owner: Pubkey::default(),
+            executable: true,
+            rent_epoch: 0,
+        }));
+        let program = program_with_mock(mock);
+        assert!(program.is_program_deployed().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_program_deployed_returns_false_when_account_missing() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        // Default — no `next_get_account` configured — so the mock
+        // returns the "not configured" Err. is_program_deployed maps
+        // any RPC Err to `false`.
+        let program = program_with_mock(mock);
+        assert!(!program.is_program_deployed().await.unwrap());
+    }
+
+    /// `get_balance` is a thin pass-through to the RPC: forwards the
+    /// configured value, surfaces an RPC error untouched.
+    #[tokio::test]
+    async fn get_balance_returns_mocked_value() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_balance.lock().unwrap() = Some(Ok(42_000_000));
+        let program = program_with_mock(mock);
+        assert_eq!(program.get_balance([1u8; 32]).await.unwrap(), 42_000_000);
+    }
+
+    /// Same shape for `get_slot`: pass-through, no parsing, no
+    /// fallback. A regression that returned 0 instead of forwarding
+    /// the value would break the lag-metric path.
+    #[tokio::test]
+    async fn get_slot_returns_mocked_value() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(987_654_321));
+        let program = program_with_mock(mock);
+        assert_eq!(program.get_slot().await.unwrap(), 987_654_321);
+    }
+
+    /// Both signing handlers (`submit_withdrawal`, `update_merkle_root`)
+    /// guard against being called without an authority keypair —
+    /// without the guard a misconfigured node would silently no-op
+    /// withdrawals or root updates instead of failing loudly. The
+    /// mock is never reached because the guard short-circuits.
+    #[tokio::test]
+    async fn submit_withdrawal_fails_fast_when_authority_missing() {
+        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
+        let err = program
+            .submit_withdrawal([0u8; 32], 1, [0u8; 32], u64::MAX, &[0u8; 4])
+            .await
+            .expect_err("missing authority must fail before any RPC call");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn update_merkle_root_fails_fast_when_authority_missing() {
+        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
+        let err = program
+            .update_merkle_root([0u8; 32])
+            .await
+            .expect_err("missing authority must fail before any RPC call");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
     /// Synthesise a BridgeState account: 8 bytes of discriminator
     /// (any value), then a u32 program_version, then arbitrary
     /// trailing bytes. \`parse_program_version\` must read exactly the
