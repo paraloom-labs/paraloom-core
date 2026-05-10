@@ -451,6 +451,23 @@ mod tests {
         assert_eq!(state.stats.read().await.event_lag_slots, 900);
     }
 
+    /// During cold start (`last_processed_slot == 0`) the lag is
+    /// still written to stats — the warn-on-threshold path is what
+    /// suppresses the noisy "we are 200_000 slots behind" message,
+    /// not the metric itself. Operators who scrape the metric should
+    /// see a real value from boot, even if it temporarily looks like
+    /// the listener has the entire chain to catch up on.
+    #[tokio::test]
+    async fn update_lag_metric_writes_lag_during_cold_start() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(1_000));
+        let state = make_state(mock);
+        // last_processed_slot defaults to 0 — cold start.
+        EventListener::update_lag_metric(&state).await;
+        assert_eq!(state.stats.read().await.event_lag_slots, 1_000);
+    }
+
     /// When `get_slot` errors out the listener must skip the metric
     /// update entirely — no half-written stats, no panic. Without
     /// that guard a flaky RPC could clobber `event_lag_slots` with
