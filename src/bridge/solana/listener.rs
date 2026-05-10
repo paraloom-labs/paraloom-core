@@ -451,6 +451,28 @@ mod tests {
         assert_eq!(state.stats.read().await.event_lag_slots, 900);
     }
 
+    /// When `get_slot` errors out the listener must skip the metric
+    /// update entirely — no half-written stats, no panic. Without
+    /// that guard a flaky RPC could clobber `event_lag_slots` with
+    /// stale or zero values and operators would lose visibility on
+    /// the actual lag.
+    #[tokio::test]
+    async fn update_lag_metric_silent_on_rpc_error() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        // Leave next_get_slot unconfigured — the mock returns Err.
+        let state = make_state(mock);
+        *state.last_processed_slot.write().await = 100;
+        // Pre-seed a previous lag value to detect any clobber.
+        state.stats.write().await.event_lag_slots = 42;
+        EventListener::update_lag_metric(&state).await;
+        assert_eq!(
+            state.stats.read().await.event_lag_slots,
+            42,
+            "rpc error must not overwrite a previous lag reading"
+        );
+    }
+
     /// A signature already in `state.seen_signatures` must be filtered
     /// before `get_transaction` is reached. The mock leaves
     /// get_transaction unconfigured for the seen sig — if the dedup
