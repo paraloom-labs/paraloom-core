@@ -51,16 +51,22 @@ impl RealBridgeRpc {
     }
 }
 
+/// Map a `ClientError` (large) to a `BridgeError::SolanaRpc` (small)
+/// at the call site so closures crossing `spawn_blocking` never carry
+/// the large variant — `clippy::result_large_err` flags the un-mapped
+/// shape.
+fn rpc_err<T>(label: &'static str, r: std::result::Result<T, ClientError>) -> Result<T> {
+    r.map_err(|e| BridgeError::SolanaRpc(format!("{}: {}", label, e)))
+}
+
 async fn blocking<T, F>(label: &'static str, f: F) -> Result<T>
 where
-    F: FnOnce() -> std::result::Result<T, ClientError> + Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        f().map_err(|e| BridgeError::SolanaRpc(format!("{}: {}", label, e)))
-    })
-    .await
-    .map_err(|e| BridgeError::SolanaRpc(format!("{} task panicked: {}", label, e)))?
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| BridgeError::SolanaRpc(format!("{} task panicked: {}", label, e)))?
 }
 
 #[async_trait]
@@ -73,7 +79,10 @@ impl BridgeRpc for RealBridgeRpc {
         let rpc = Arc::clone(&self.client);
         let addr = *address;
         blocking("getSignaturesForAddress", move || {
-            rpc.get_signatures_for_address_with_config(&addr, config)
+            rpc_err(
+                "getSignaturesForAddress",
+                rpc.get_signatures_for_address_with_config(&addr, config),
+            )
         })
         .await
     }
@@ -86,7 +95,7 @@ impl BridgeRpc for RealBridgeRpc {
         let rpc = Arc::clone(&self.client);
         let sig = *signature;
         blocking("getTransaction", move || {
-            rpc.get_transaction(&sig, encoding)
+            rpc_err("getTransaction", rpc.get_transaction(&sig, encoding))
         })
         .await
     }
@@ -94,31 +103,43 @@ impl BridgeRpc for RealBridgeRpc {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Account> {
         let rpc = Arc::clone(&self.client);
         let key = *pubkey;
-        blocking("getAccount", move || rpc.get_account(&key)).await
+        blocking("getAccount", move || {
+            rpc_err("getAccount", rpc.get_account(&key))
+        })
+        .await
     }
 
     async fn send_and_confirm_transaction(&self, tx: &Transaction) -> Result<Signature> {
         let rpc = Arc::clone(&self.client);
         let tx = tx.clone();
         blocking("sendAndConfirmTransaction", move || {
-            rpc.send_and_confirm_transaction(&tx)
+            rpc_err(
+                "sendAndConfirmTransaction",
+                rpc.send_and_confirm_transaction(&tx),
+            )
         })
         .await
     }
 
     async fn get_latest_blockhash(&self) -> Result<Hash> {
         let rpc = Arc::clone(&self.client);
-        blocking("getLatestBlockhash", move || rpc.get_latest_blockhash()).await
+        blocking("getLatestBlockhash", move || {
+            rpc_err("getLatestBlockhash", rpc.get_latest_blockhash())
+        })
+        .await
     }
 
     async fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
         let rpc = Arc::clone(&self.client);
         let key = *pubkey;
-        blocking("getBalance", move || rpc.get_balance(&key)).await
+        blocking("getBalance", move || {
+            rpc_err("getBalance", rpc.get_balance(&key))
+        })
+        .await
     }
 
     async fn get_slot(&self) -> Result<u64> {
         let rpc = Arc::clone(&self.client);
-        blocking("getSlot", move || rpc.get_slot()).await
+        blocking("getSlot", move || rpc_err("getSlot", rpc.get_slot())).await
     }
 }
