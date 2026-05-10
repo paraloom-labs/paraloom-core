@@ -229,26 +229,12 @@ impl EventListener {
     /// and would otherwise report a "lag" equal to the chain's full
     /// recorded history.
     async fn update_lag_metric(state: &PollerState) {
-        let rpc = Arc::clone(&state.rpc_client);
-        let current_slot = match tokio::task::spawn_blocking(move || {
-            rpc.get_slot()
-                .map_err(|e| BridgeError::SolanaRpc(format!("getSlot: {}", e)))
-        })
-        .await
-        {
-            Ok(Ok(slot)) => slot,
-            Ok(Err(e)) => {
-                log::warn!(
-                    target: "paraloom::bridge::solana",
-                    "skipping lag metric — {}",
-                    e
-                );
-                return;
-            }
+        let current_slot = match state.rpc.get_slot().await {
+            Ok(slot) => slot,
             Err(e) => {
                 log::warn!(
                     target: "paraloom::bridge::solana",
-                    "skipping lag metric — getSlot task panicked: {}",
+                    "skipping lag metric — {}",
                     e
                 );
                 return;

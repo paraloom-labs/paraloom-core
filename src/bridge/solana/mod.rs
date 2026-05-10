@@ -57,9 +57,14 @@ impl SolanaBridge {
                 CommitmentConfig::confirmed(),
             ),
         )));
-        let program = ProgramInterface::new(config.clone())?;
-        let listener = EventListener::new(config.clone(), rpc, pool.clone(), Arc::clone(&stats));
-        let submitter = ResultSubmitter::new(config, pool, Arc::clone(&stats))?;
+        let program = ProgramInterface::new(config.clone(), Arc::clone(&rpc))?;
+        let listener = EventListener::new(
+            config.clone(),
+            Arc::clone(&rpc),
+            pool.clone(),
+            Arc::clone(&stats),
+        );
+        let submitter = ResultSubmitter::new(config, rpc, pool, Arc::clone(&stats))?;
 
         Ok(Self {
             listener,
