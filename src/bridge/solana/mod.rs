@@ -23,7 +23,6 @@ pub use submitter::ResultSubmitter;
 
 use crate::bridge::{BridgeConfig, BridgeStats, Result, WithdrawalRequest};
 use crate::privacy::ShieldedPool;
-use rpc::{BridgeRpc, RealBridgeRpc};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
