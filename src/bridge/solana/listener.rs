@@ -451,6 +451,33 @@ mod tests {
         assert_eq!(state.stats.read().await.event_lag_slots, 900);
     }
 
+    /// A signature already in `state.seen_signatures` must be filtered
+    /// before `get_transaction` is reached. The mock leaves
+    /// get_transaction unconfigured for the seen sig — if the dedup
+    /// guard regressed, the listener would call `get_transaction` and
+    /// pick up the "mock not configured" Err. The empty-Vec assertion
+    /// catches that path too.
+    #[tokio::test]
+    async fn fetch_events_skips_signatures_already_in_seen_set() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        let already_seen = Signature::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: already_seen.to_string(),
+                slot: 1,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        let state = make_state(mock);
+        state.seen_signatures.write().await.insert(already_seen);
+        let events = EventListener::fetch_events(&state, None).await.unwrap();
+        assert!(events.is_empty());
+    }
+
     /// A signature whose `err` field is `Some` (the on-chain
     /// transaction reverted) must be skipped before `get_transaction`
     /// is reached — in this test `get_transaction` is intentionally
