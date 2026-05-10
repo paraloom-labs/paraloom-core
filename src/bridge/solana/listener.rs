@@ -407,6 +407,29 @@ mod tests {
         assert_eq!(*listener.last_processed_slot.blocking_read(), 0);
     }
 
+    /// Drives `fetch_events` through `MockBridgeRpc` — the mock
+    /// returns an empty signature list, so `get_transaction` is never
+    /// called and the function reports no events. Validates the
+    /// trait+mock plumbing on the listener side end to end.
+    #[tokio::test]
+    async fn fetch_events_with_no_signatures_returns_empty() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![]));
+        let state = PollerState {
+            rpc: mock,
+            program_id: Pubkey::new_unique(),
+            pool: Arc::new(ShieldedPool::new()),
+            stats: Arc::new(RwLock::new(BridgeStats::default())),
+            last_signature: Arc::new(RwLock::new(None)),
+            seen_signatures: Arc::new(RwLock::new(HashSet::new())),
+            last_processed_slot: Arc::new(RwLock::new(0)),
+            lag_warn_threshold_slots: 100,
+        };
+        let events = EventListener::fetch_events(&state, None).await.unwrap();
+        assert!(events.is_empty());
+    }
+
     #[tokio::test]
     async fn test_process_deposit() {
         let pool = Arc::new(ShieldedPool::new());
