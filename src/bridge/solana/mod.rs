@@ -5,7 +5,10 @@ mod instructions;
 mod keypair;
 mod listener;
 mod program;
+mod rpc;
 mod submitter;
+#[cfg(test)]
+mod test_support;
 
 pub use instructions::{
     create_deposit_instruction, create_initialize_instruction,
@@ -19,6 +22,9 @@ pub use submitter::ResultSubmitter;
 
 use crate::bridge::{BridgeConfig, BridgeStats, Result, WithdrawalRequest};
 use crate::privacy::ShieldedPool;
+use rpc::{BridgeRpc, RealBridgeRpc};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -45,9 +51,22 @@ impl SolanaBridge {
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
     ) -> Result<Self> {
-        let program = ProgramInterface::new(config.clone())?;
-        let listener = EventListener::new(config.clone(), pool.clone(), Arc::clone(&stats));
-        let submitter = ResultSubmitter::new(config, pool, Arc::clone(&stats))?;
+        // One RpcClient instance shared across listener / program /
+        // submitter via the BridgeRpc trait.
+        let rpc: Arc<dyn BridgeRpc> = Arc::new(RealBridgeRpc::new(Arc::new(
+            RpcClient::new_with_commitment(
+                config.solana_rpc_url.clone(),
+                CommitmentConfig::confirmed(),
+            ),
+        )));
+        let program = ProgramInterface::new(config.clone(), Arc::clone(&rpc))?;
+        let listener = EventListener::new(
+            config.clone(),
+            Arc::clone(&rpc),
+            pool.clone(),
+            Arc::clone(&stats),
+        );
+        let submitter = ResultSubmitter::new(config, rpc, pool, Arc::clone(&stats))?;
 
         Ok(Self {
             listener,

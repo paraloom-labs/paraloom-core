@@ -2,13 +2,14 @@
 //!
 //! Interacts with the Paraloom Solana program for deposits and withdrawals
 
+use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, Result, SolanaAddress};
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signature::Signature,
-    signature::Signer, transaction::Transaction,
+    pubkey::Pubkey, signature::Keypair, signature::Signature, signature::Signer,
+    transaction::Transaction,
 };
 use solana_transaction_status::UiTransactionEncoding;
+use std::sync::Arc;
 
 /// Anchor account discriminator length in bytes. Sits at the start of
 /// every Anchor-managed account; data the program itself stores
@@ -40,8 +41,8 @@ fn parse_program_version(data: &[u8]) -> Result<u32> {
 
 /// Interface to Paraloom Solana program
 pub struct ProgramInterface {
-    /// Solana RPC client
-    rpc_client: RpcClient,
+    /// Solana RPC behind the trait so tests can substitute a mock.
+    rpc: Arc<dyn BridgeRpc>,
 
     /// Program ID
     program_id: Pubkey,
@@ -54,19 +55,13 @@ pub struct ProgramInterface {
 }
 
 impl ProgramInterface {
-    /// Create new program interface
-    pub fn new(config: BridgeConfig) -> Result<Self> {
-        let rpc_client = RpcClient::new_with_commitment(
-            config.solana_rpc_url.clone(),
-            CommitmentConfig::confirmed(),
-        );
-
+    /// Create new program interface using the supplied RPC backend.
+    pub fn new(config: BridgeConfig, rpc: Arc<dyn BridgeRpc>) -> Result<Self> {
         let program_id = config
             .program_id
             .parse::<Pubkey>()
             .map_err(|e| BridgeError::ConfigError(format!("Invalid program ID: {}", e)))?;
 
-        // Load authority keypair if configured
         let authority_keypair = if let Some(ref path) = config.authority_keypair_path {
             Some(super::load_keypair_from_file(path)?)
         } else {
@@ -85,7 +80,7 @@ impl ProgramInterface {
             };
 
         Ok(Self {
-            rpc_client,
+            rpc,
             program_id,
             authority_keypair,
             bridge_vault,
@@ -97,11 +92,6 @@ impl ProgramInterface {
         &self.program_id
     }
 
-    /// Get RPC client
-    pub fn rpc_client(&self) -> &RpcClient {
-        &self.rpc_client
-    }
-
     /// Verify a deposit transaction exists on Solana
     pub async fn verify_deposit(&self, signature: &str, expected_amount: u64) -> Result<bool> {
         log::debug!("Verifying deposit signature: {}", signature);
@@ -110,11 +100,10 @@ impl ProgramInterface {
             .parse::<Signature>()
             .map_err(|e| BridgeError::InvalidTransaction(format!("Invalid signature: {}", e)))?;
 
-        // Get transaction details with JSON encoding for easier parsing
         let tx = self
-            .rpc_client
+            .rpc
             .get_transaction(&sig, UiTransactionEncoding::Json)
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to fetch transaction: {}", e)))?;
+            .await?;
 
         // Verify transaction succeeded
         if tx
@@ -176,45 +165,26 @@ impl ProgramInterface {
             proof.to_vec(),
         )?;
 
-        // Get recent blockhash
-        let recent_blockhash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get blockhash: {}", e)))?;
-
-        // Create and sign transaction
+        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
         let transaction = Transaction::new_signed_with_payer(
             &[instruction],
             Some(&authority.pubkey()),
             &[authority],
             recent_blockhash,
         );
-
-        // Send transaction
-        let signature = self
-            .rpc_client
-            .send_and_confirm_transaction(&transaction)
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to send transaction: {}", e)))?;
-
+        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
         log::info!("Withdrawal submitted successfully: {}", signature);
         Ok(signature.to_string())
     }
 
     /// Get account balance
     pub async fn get_balance(&self, address: SolanaAddress) -> Result<u64> {
-        let pubkey = Pubkey::new_from_array(address);
-
-        let balance = self
-            .rpc_client
-            .get_balance(&pubkey)
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get balance: {}", e)))?;
-
-        Ok(balance)
+        self.rpc.get_balance(&Pubkey::new_from_array(address)).await
     }
 
     /// Check if program is deployed
     pub async fn is_program_deployed(&self) -> Result<bool> {
-        match self.rpc_client.get_account(&self.program_id) {
+        match self.rpc.get_account(&self.program_id).await {
             Ok(account) => {
                 // Check if account is executable (is a program)
                 Ok(account.executable)
@@ -228,9 +198,7 @@ impl ProgramInterface {
 
     /// Get current slot (block number equivalent)
     pub async fn get_slot(&self) -> Result<u64> {
-        self.rpc_client
-            .get_slot()
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get slot: {}", e)))
+        self.rpc.get_slot().await
     }
 
     /// Read the deployed program's `program_version` from the
@@ -240,12 +208,7 @@ impl ProgramInterface {
     /// read does not require deserialising the rest of the struct.
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
-        let account = self.rpc_client.get_account(&state_pda).map_err(|e| {
-            BridgeError::SolanaRpc(format!(
-                "Failed to read BridgeState account {}: {}",
-                state_pda, e
-            ))
-        })?;
+        let account = self.rpc.get_account(&state_pda).await?;
         parse_program_version(&account.data)
     }
 
@@ -288,26 +251,14 @@ impl ProgramInterface {
             new_merkle_root,
         )?;
 
-        // Get recent blockhash
-        let recent_blockhash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to get blockhash: {}", e)))?;
-
-        // Create and sign transaction
+        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
         let transaction = Transaction::new_signed_with_payer(
             &[instruction],
             Some(&authority.pubkey()),
             &[authority],
             recent_blockhash,
         );
-
-        // Send transaction
-        let signature = self
-            .rpc_client
-            .send_and_confirm_transaction(&transaction)
-            .map_err(|e| BridgeError::SolanaRpc(format!("Failed to send transaction: {}", e)))?;
-
+        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
         log::info!("Merkle root updated successfully: {}", signature);
         Ok(signature.to_string())
     }
@@ -316,24 +267,43 @@ impl ProgramInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::solana::rpc::RealBridgeRpc;
+    use crate::bridge::solana::test_support::MockBridgeRpc;
+    use solana_client::rpc_client::RpcClient;
+    use solana_sdk::account::Account;
+
+    fn dummy_rpc() -> Arc<dyn BridgeRpc> {
+        Arc::new(RealBridgeRpc::new(Arc::new(RpcClient::new(
+            "http://localhost:8899".to_string(),
+        ))))
+    }
+
+    fn bridge_state_account(program_version: u32) -> Account {
+        let mut data = vec![0xAAu8; 8];
+        data.extend_from_slice(&program_version.to_le_bytes());
+        Account {
+            lamports: 1,
+            data,
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
 
     #[test]
     fn test_program_interface_creation() {
         let config = BridgeConfig::default();
-        let result = ProgramInterface::new(config);
-        // Will fail with invalid program ID, but tests the creation path
+        let result = ProgramInterface::new(config, dummy_rpc());
         assert!(result.is_err() || result.is_ok());
     }
 
     #[tokio::test]
     async fn test_verify_deposit_with_valid_config() {
-        // Use a valid-format program ID for testing
         let config = BridgeConfig {
             program_id: "11111111111111111111111111111111".to_string(),
             ..Default::default()
         };
-
-        let program = ProgramInterface::new(config);
+        let program = ProgramInterface::new(config, dummy_rpc());
         assert!(program.is_ok());
     }
 
@@ -342,6 +312,42 @@ mod tests {
     /// trailing bytes. \`parse_program_version\` must read exactly the
     /// version regardless of the discriminator content or trailing
     /// payload.
+    /// `verify_program_version` reads the on-chain BridgeState via
+    /// `get_account`, parses the version from the fixed offset, and
+    /// returns `Ok(())` when it matches `EXPECTED_PROGRAM_VERSION`.
+    #[tokio::test]
+    async fn verify_program_version_accepts_matching_version() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(bridge_state_account(
+            crate::bridge::EXPECTED_PROGRAM_VERSION,
+        )));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        assert!(program.verify_program_version().await.is_ok());
+    }
+
+    /// A version mismatch surfaces as a typed `ConfigError`, not a
+    /// silent pass — the L2 startup flow turns this into a refusal
+    /// to boot rather than risk talking to an incompatible program.
+    #[tokio::test]
+    async fn verify_program_version_rejects_mismatch() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(bridge_state_account(0x0099_0000)));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        let err = program
+            .verify_program_version()
+            .await
+            .expect_err("mismatch");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
     #[test]
     fn parse_program_version_reads_v04() {
         let mut buf = vec![0xAAu8; 8]; // discriminator

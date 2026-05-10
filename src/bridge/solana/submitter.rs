@@ -2,6 +2,7 @@
 //!
 //! Submits withdrawal requests to Solana blockchain
 
+use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, Result, WithdrawalRequest};
 use crate::consensus::WithdrawalVerificationCoordinator;
 use crate::privacy::ShieldedPool;
@@ -32,11 +33,11 @@ impl ResultSubmitter {
     /// Create a new result submitter
     pub fn new(
         config: BridgeConfig,
+        rpc: Arc<dyn BridgeRpc>,
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
     ) -> Result<Self> {
-        let program = ProgramInterface::new(config)?;
-
+        let program = ProgramInterface::new(config, rpc)?;
         Ok(Self {
             pool,
             stats,
@@ -49,12 +50,12 @@ impl ResultSubmitter {
     /// Create a new result submitter with distributed consensus
     pub fn with_consensus(
         config: BridgeConfig,
+        rpc: Arc<dyn BridgeRpc>,
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
         verification_coordinator: Arc<WithdrawalVerificationCoordinator>,
     ) -> Result<Self> {
-        let program = ProgramInterface::new(config)?;
-
+        let program = ProgramInterface::new(config, rpc)?;
         Ok(Self {
             pool,
             stats,
@@ -276,7 +277,15 @@ impl ResultSubmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::solana::rpc::RealBridgeRpc;
     use crate::privacy::{pedersen, DepositTx, ShieldedAddress};
+    use solana_client::rpc_client::RpcClient;
+
+    fn dummy_rpc() -> Arc<dyn BridgeRpc> {
+        Arc::new(RealBridgeRpc::new(Arc::new(RpcClient::new(
+            "http://localhost:8899".to_string(),
+        ))))
+    }
 
     #[tokio::test]
     async fn test_submitter_creation() {
@@ -287,7 +296,7 @@ mod tests {
         let pool = Arc::new(ShieldedPool::new());
         let stats = Arc::new(RwLock::new(BridgeStats::default()));
 
-        let result = ResultSubmitter::new(config, pool, stats);
+        let result = ResultSubmitter::new(config, dummy_rpc(), pool, stats);
         // Will succeed even without keypair, just won't be able to submit
         assert!(result.is_ok());
     }
@@ -320,7 +329,7 @@ mod tests {
             proof: vec![0u8; 32], // Mock proof
         };
 
-        let submitter = ResultSubmitter::new(config, pool, stats).unwrap();
+        let submitter = ResultSubmitter::new(config, dummy_rpc(), pool, stats).unwrap();
         let result = submitter.submit(request).await;
 
         // Will fail without keypair configured
@@ -356,7 +365,7 @@ mod tests {
             },
         ];
 
-        let submitter = ResultSubmitter::new(config, pool, stats).unwrap();
+        let submitter = ResultSubmitter::new(config, dummy_rpc(), pool, stats).unwrap();
         let result = submitter.batch_submit(requests).await;
 
         // Will succeed but return empty vec (all fail without keypair)
