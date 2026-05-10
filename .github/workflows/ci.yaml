@@ -11,14 +11,11 @@ jobs:
     name: Format & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
           components: rustfmt, clippy
 
       - name: Rust Cache
@@ -27,22 +24,16 @@ jobs:
           shared-key: "paraloom-ci"
 
       - name: Check formatting
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Clippy warnings
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy -- -D warnings
 
   build:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
@@ -70,35 +61,26 @@ jobs:
             libbz2-dev
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "paraloom-ci"
 
+      # `--all-targets` compiles integration tests under `tests/` and
+      # any examples in addition to the lib and bins. Catches dead
+      # imports in test files that would otherwise drift silently
+      # because `cargo test --lib` does not touch them. See #89.
       - name: Build all features (lib, bins, tests, examples)
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          # \`--all-targets\` compiles integration tests under \`tests/\`
-          # and any examples in addition to the lib and bins. Catches
-          # dead imports in test files that would otherwise drift
-          # silently because \`cargo test --lib\` does not touch them.
-          # See #89, where a stale post-Poseidon-migration import had
-          # been broken since v0.2.0 without anyone noticing.
-          args: --all-features --all-targets
+        run: cargo build --all-features --all-targets
 
   test-quick:
     name: Quick Test (All Modules)
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
@@ -126,11 +108,7 @@ jobs:
             libbz2-dev
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -138,10 +116,7 @@ jobs:
           shared-key: "paraloom-ci"
 
       - name: Run all tests (quick check)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --lib --all-features
+        run: cargo test --lib --all-features
 
   test:
     name: Test (${{ matrix.module }})
@@ -157,7 +132,7 @@ jobs:
           - network
           - consensus
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
@@ -185,11 +160,7 @@ jobs:
             libbz2-dev
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -197,17 +168,14 @@ jobs:
           shared-key: "paraloom-ci"
 
       - name: Run module tests (thread-safe)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --lib ${{ matrix.module }} --all-features -- --test-threads=1
+        run: cargo test --lib ${{ matrix.module }} --all-features -- --test-threads=1
 
   test-binaries:
     name: Test Binaries
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
@@ -235,11 +203,7 @@ jobs:
             libbz2-dev
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -247,16 +211,10 @@ jobs:
           shared-key: "paraloom-ci"
 
       - name: Build setup ceremony binary
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --bin setup_compute_ceremony
+        run: cargo build --bin setup_compute_ceremony
 
       - name: Build all binaries
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --bins
+        run: cargo build --bins
 
   coverage:
     name: Code Coverage
@@ -264,7 +222,7 @@ jobs:
     needs: [test, test-binaries]
     if: false # Disabled due to RAM limitations on free runners
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
@@ -292,11 +250,7 @@ jobs:
             libbz2-dev
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install tarpaulin
         run: cargo install cargo-tarpaulin
