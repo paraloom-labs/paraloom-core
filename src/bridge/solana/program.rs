@@ -307,6 +307,43 @@ mod tests {
         assert!(program.is_ok());
     }
 
+    fn program_with_mock(mock: Arc<MockBridgeRpc>) -> ProgramInterface {
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        ProgramInterface::new(config, mock).unwrap()
+    }
+
+    /// `is_program_deployed` reads `program_id` via `get_account` and
+    /// returns `account.executable`. The handler treats a missing
+    /// account (RPC `Err`) as "not deployed" rather than a fatal
+    /// error so the L2 health check can keep running while the
+    /// operator inspects.
+    #[tokio::test]
+    async fn is_program_deployed_returns_true_for_executable_account() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: vec![],
+            owner: Pubkey::default(),
+            executable: true,
+            rent_epoch: 0,
+        }));
+        let program = program_with_mock(mock);
+        assert!(program.is_program_deployed().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_program_deployed_returns_false_when_account_missing() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        // Default — no `next_get_account` configured — so the mock
+        // returns the "not configured" Err. is_program_deployed maps
+        // any RPC Err to `false`.
+        let program = program_with_mock(mock);
+        assert!(!program.is_program_deployed().await.unwrap());
+    }
+
     /// Synthesise a BridgeState account: 8 bytes of discriminator
     /// (any value), then a u32 program_version, then arbitrary
     /// trailing bytes. \`parse_program_version\` must read exactly the
