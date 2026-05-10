@@ -7,6 +7,7 @@
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::signature::Signer;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -102,4 +103,24 @@ impl Drop for SubprocessValidator {
 pub fn paraloom_program_so() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("programs/paraloom/target/deploy/paraloom_program.so")
+}
+
+/// Airdrop `lamports` to a fresh keypair and poll until the balance
+/// reflects it, then return the funded keypair. Tests use this to
+/// avoid relying on a pre-existing `~/.config/solana/id.json`.
+pub fn fund_new_keypair(
+    rpc: &RpcClient,
+    lamports: u64,
+) -> Result<solana_sdk::signature::Keypair, String> {
+    let kp = solana_sdk::signature::Keypair::new();
+    rpc.request_airdrop(&kp.pubkey(), lamports)
+        .map_err(|e| format!("airdrop request: {}", e))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if rpc.get_balance(&kp.pubkey()).unwrap_or(0) >= lamports {
+            return Ok(kp);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("airdrop did not confirm within 30s".to_string())
 }
