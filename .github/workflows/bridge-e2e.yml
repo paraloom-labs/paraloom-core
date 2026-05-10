@@ -52,5 +52,10 @@ jobs:
       - name: Verify validator binary
         run: solana-test-validator --version
 
+      - name: Build paraloom_program .so
+        run: cargo build-sbf --manifest-path programs/paraloom/Cargo.toml
+
+      # --test-threads=1 forces sequential execution so parallel tests
+      # do not collide on the validator RPC port.
       - name: Run ignored bridge E2E tests
-        run: cargo test --test bridge_e2e_smoke -- --ignored --nocapture
+        run: cargo test --test bridge_e2e_smoke -- --ignored --nocapture --test-threads=1
