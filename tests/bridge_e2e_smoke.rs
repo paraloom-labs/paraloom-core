@@ -10,12 +10,17 @@ mod common;
 use common::solana_validator::{
     fund_new_keypair, paraloom_program_so, SubprocessValidator, PARALOOM_PROGRAM_ID,
 };
-use paraloom::bridge::solana::{create_initialize_instruction, ProgramInterface, RealBridgeRpc};
-use paraloom::bridge::{BridgeConfig, EXPECTED_PROGRAM_VERSION};
+use paraloom::bridge::solana::{
+    create_deposit_instruction, create_initialize_instruction, derive_bridge_vault, EventListener,
+    ProgramInterface, RealBridgeRpc,
+};
+use paraloom::bridge::{BridgeConfig, BridgeStats, EXPECTED_PROGRAM_VERSION};
+use paraloom::privacy::ShieldedPool;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 use solana_sdk::transaction::Transaction;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[test]
 #[ignore = "requires solana-test-validator binary; CI runs with --ignored"]
@@ -96,4 +101,84 @@ async fn program_version_handshake_against_real_validator() {
         .verify_program_version()
         .await
         .expect("version handshake against real on-chain state");
+}
+
+/// Full deposit round-trip: send a real Deposit instruction on-chain,
+/// run the EventListener against the validator's RPC, and assert the
+/// listener decoded the deposit and added the note to the L2 pool.
+/// This is the test #71's first bullet specifically asks for —
+/// "deposit on Solana → assert a note appears on L2".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires solana-test-validator + cargo build-sbf; CI runs with --ignored"]
+async fn deposit_on_chain_propagates_to_l2_pool_via_listener() {
+    let validator = SubprocessValidator::launch_with_programs(
+        8902,
+        &[(PARALOOM_PROGRAM_ID, paraloom_program_so())],
+    )
+    .expect("validator must boot with paraloom_program");
+    let rpc = validator.rpc_client();
+    let payer = fund_new_keypair(&rpc, 3_000_000_000).expect("airdrop");
+
+    let program_id: Pubkey = PARALOOM_PROGRAM_ID.parse().unwrap();
+    let init_ix = create_initialize_instruction(
+        &program_id,
+        &payer.pubkey(),
+        EXPECTED_PROGRAM_VERSION,
+        [0u8; 32],
+    )
+    .expect("init ix");
+    let blockhash = rpc.get_latest_blockhash().expect("blockhash");
+    let tx =
+        Transaction::new_signed_with_payer(&[init_ix], Some(&payer.pubkey()), &[&payer], blockhash);
+    rpc.send_and_confirm_transaction(&tx).expect("init tx");
+
+    let bridge_rpc: Arc<dyn paraloom::bridge::solana::BridgeRpc> =
+        Arc::new(RealBridgeRpc::new(rpc.clone()));
+    let pool = Arc::new(ShieldedPool::new());
+    let stats = Arc::new(RwLock::new(BridgeStats::default()));
+    let config = BridgeConfig {
+        program_id: PARALOOM_PROGRAM_ID.to_string(),
+        enabled: true,
+        solana_rpc_url: validator.rpc_url(),
+        poll_interval_secs: 1,
+        ..Default::default()
+    };
+    let mut listener =
+        EventListener::new(config, bridge_rpc, Arc::clone(&pool), Arc::clone(&stats));
+    listener.start().await.expect("listener start");
+
+    let (vault_pda, _) = derive_bridge_vault(&program_id);
+    let deposit_ix = create_deposit_instruction(
+        &program_id,
+        &payer.pubkey(),
+        &vault_pda,
+        1_000_000,
+        [9u8; 32],
+        [11u8; 32],
+    )
+    .expect("deposit ix");
+    let blockhash = rpc.get_latest_blockhash().expect("blockhash");
+    let tx = Transaction::new_signed_with_payer(
+        &[deposit_ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+    rpc.send_and_confirm_transaction(&tx).expect("deposit tx");
+
+    // Two poll intervals worth of slack — one for the listener to
+    // wake, one to fetch + decode + apply.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    listener.stop().await.expect("listener stop");
+
+    assert_eq!(
+        pool.commitment_count().await,
+        1,
+        "L2 pool must have the deposit note"
+    );
+    assert_eq!(
+        stats.read().await.total_deposits,
+        1,
+        "listener stats must tick"
+    );
 }
