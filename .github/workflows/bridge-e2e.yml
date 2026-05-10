@@ -1,0 +1,56 @@
+name: Bridge E2E
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/bridge/**'
+      - 'tests/bridge_e2e_*.rs'
+      - 'tests/common/solana_validator.rs'
+      - '.github/workflows/bridge-e2e.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/bridge/**'
+      - 'tests/bridge_e2e_*.rs'
+      - 'tests/common/solana_validator.rs'
+      - '.github/workflows/bridge-e2e.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-e2e:
+    name: Bridge E2E (solana-test-validator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: paraloom-bridge-e2e
+
+      - name: Cache Solana CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana/install
+          key: solana-stable-${{ runner.os }}
+
+      - name: Install Solana CLI
+        run: |
+          if ! [ -x "$HOME/.local/share/solana/install/active_release/bin/solana-test-validator" ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Verify validator binary
+        run: solana-test-validator --version
+
+      - name: Run ignored bridge E2E tests
+        run: cargo test --test bridge_e2e_smoke -- --ignored --nocapture
