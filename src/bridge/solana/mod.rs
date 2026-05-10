@@ -5,7 +5,7 @@ mod instructions;
 mod keypair;
 mod listener;
 mod program;
-mod rpc;
+pub mod rpc;
 mod submitter;
 #[cfg(test)]
 mod test_support;
@@ -18,11 +18,11 @@ pub use instructions::{
 pub use keypair::load_keypair_from_file;
 pub use listener::EventListener;
 pub use program::ProgramInterface;
+pub use rpc::{BridgeRpc, RealBridgeRpc};
 pub use submitter::ResultSubmitter;
 
 use crate::bridge::{BridgeConfig, BridgeStats, Result, WithdrawalRequest};
 use crate::privacy::ShieldedPool;
-use rpc::{BridgeRpc, RealBridgeRpc};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
