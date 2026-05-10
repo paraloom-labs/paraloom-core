@@ -7,6 +7,7 @@
 
 #![cfg(test)]
 
+use crate::bridge::solana::instructions::{discriminators, DepositInstructionData};
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeError, Result};
 use async_trait::async_trait;
@@ -14,10 +15,15 @@ use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::account::Account;
 use solana_sdk::hash::Hash;
+use solana_sdk::message::MessageHeader;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding};
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
+    EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage, UiRawMessage,
+    UiTransaction, UiTransactionEncoding,
+};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -44,6 +50,70 @@ fn take<T>(slot: &Mutex<Option<Result<T>>>, label: &'static str) -> Result<T> {
             label
         )))
     })
+}
+
+/// Build a synthetic `EncodedConfirmedTransactionWithStatusMeta`
+/// shaped like what `getTransaction` returns for a real Paraloom
+/// deposit. Used by listener tests that need to drive
+/// `extract_deposit_events` end to end without booting a validator.
+/// Account ordering matches `create_deposit_instruction`'s account
+/// metas: `[bridge_state, bridge_vault, depositor, system_program,
+/// program]` (program is at index 4 so the program-id-index in the
+/// instruction lands there, with `depositor` at index 2 to match
+/// `DEPOSITOR_ACCOUNT_INDEX` in the decoder).
+pub fn synth_deposit_tx(
+    signature: Signature,
+    slot: u64,
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    amount: u64,
+    recipient: [u8; 32],
+    randomness: [u8; 32],
+) -> EncodedConfirmedTransactionWithStatusMeta {
+    let payload = DepositInstructionData {
+        amount,
+        recipient,
+        randomness,
+    };
+    let mut data = discriminators::DEPOSIT.to_vec();
+    data.extend_from_slice(&borsh::to_vec(&payload).expect("borsh serialise"));
+    let instruction = UiCompiledInstruction {
+        program_id_index: 4,
+        accounts: vec![0, 1, 2, 3],
+        data: bs58::encode(data).into_string(),
+        stack_height: None,
+    };
+    let dummy = Pubkey::default();
+    let account_keys = vec![
+        dummy.to_string(),
+        dummy.to_string(),
+        depositor.to_string(),
+        solana_sdk::system_program::ID.to_string(),
+        program_id.to_string(),
+    ];
+    let raw = UiRawMessage {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 2,
+        },
+        account_keys,
+        recent_blockhash: Hash::default().to_string(),
+        instructions: vec![instruction],
+        address_table_lookups: None,
+    };
+    EncodedConfirmedTransactionWithStatusMeta {
+        slot,
+        transaction: EncodedTransactionWithStatusMeta {
+            transaction: EncodedTransaction::Json(UiTransaction {
+                signatures: vec![signature.to_string()],
+                message: UiMessage::Raw(raw),
+            }),
+            meta: None,
+            version: None,
+        },
+        block_time: None,
+    }
 }
 
 #[async_trait]
