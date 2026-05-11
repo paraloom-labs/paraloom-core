@@ -146,7 +146,7 @@ toml = "0.7.3"
 
 # Utilities
 futures = "0.3.26"
-async-trait = "0.1.64"
+async-trait = "0.1.89"
 once_cell = "1.17.1"
 uuid = { version = "1.3", features = ["v4", "serde"] }
 wat = "1.240" # For WASM parsing (compute demo)
