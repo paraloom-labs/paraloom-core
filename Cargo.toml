@@ -187,4 +187,4 @@ sysinfo = "0.29.0"
 tokio-test = "0.4.5"
 tempfile = "3.3.0"
 wat = "1.240" # For WASM testing (Phase 3)
-proptest = "1.5" # Property-based testing for privacy primitives (#71)
+proptest = "1.11.0" # Property-based testing for privacy primitives (#71)
