@@ -58,6 +58,21 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | MPC ceremony execution | 🟡 In progress | Tooling shipped at rc2; the 20–30 contributor run is the calendar gate to v0.5.0 final |
 | Mainnet launch | 🟡 Pre-release | v0.5.0-rc2 cut; awaiting ceremony completion + external security audit |
 
+## Economic Model
+
+Paraloom is structured as permissionless validator-run infrastructure rather than a founder-fee product. Withdrawal fees collected by the on-chain program are credited to the validator that led verification — not to a single recipient account.
+
+The on-chain instructions wired today (`programs/paraloom/src/lib.rs`):
+
+- `register_validator` — anyone meeting `MIN_VALIDATOR_STAKE` (1 SOL) joins the validator set
+- `distribute_fee` — credits `pending_rewards` on the leader's `ValidatorAccount`
+- `claim_rewards` — validator withdraws accumulated earnings to their own wallet
+- `slash_validator` — burns 1–100% of stake for protocol violations, recorded in `times_slashed`
+
+Validators are verify-only; proof generation stays with the user. A Groth16 proof verifies in roughly ten milliseconds on a single CPU core, so participation does not require GPUs or co-located hardware. The role is meant to run from a laptop.
+
+The validator-quorum daemon path that automatically calls `distribute_fee` after consensus is tracked in [#164](https://github.com/paraloom-labs/paraloom-core/issues/164). Until that ships, fee distribution requires a manual instruction; the on-chain mechanism itself is unchanged.
+
 ## Quick Start
 
 ```bash
@@ -90,12 +105,38 @@ paraloom-core/
 
 ## Documentation
 
-Full documentation available at **[docs.paraloom.io](https://docs.paraloom.io)**
+Full documentation: **[docs.paraloom.io](https://docs.paraloom.io)**
 
-- [Architecture Overview](https://docs.paraloom.io/architecture)
-- [Privacy Layer](https://docs.paraloom.io/privacy-layer)
-- [Compute Layer](https://docs.paraloom.io/compute-layer)
-- [Validator Guide](https://docs.paraloom.io/validator-guide)
+**Getting started**
+- [Quickstart](https://docs.paraloom.io/docs/quickstart) — get a node running on devnet
+- [Installation](https://docs.paraloom.io/docs/installation) — build from source and prerequisites
+
+**Core concepts**
+- [Architecture](https://docs.paraloom.io/docs/architecture) — system layers and module structure
+- [Vision](https://docs.paraloom.io/docs/vision) — design goals and threat model
+- [Use cases](https://docs.paraloom.io/docs/use-cases) — what shielded transfers and private compute unlock
+
+**Layers**
+- [Privacy layer](https://docs.paraloom.io/docs/privacy-layer) — Groth16 circuits, Poseidon, nullifiers, Merkle tree
+- [Compute layer](https://docs.paraloom.io/docs/compute-layer) — WASM execution, BFT verification, encrypted I/O
+- [Consensus](https://docs.paraloom.io/docs/consensus) — BFT threshold, reputation gating, equivocation slashing
+- [Networking](https://docs.paraloom.io/docs/networking) — libp2p mesh, Kademlia DHT, ping liveness
+- [Solana bridge](https://docs.paraloom.io/docs/solana-bridge) — on-chain Anchor program, bridge state, nullifier PDAs
+
+**Operations**
+- [Validator guide](https://docs.paraloom.io/docs/validator-guide) — run a validator on commodity hardware
+- [Coordinator HA](https://docs.paraloom.io/docs/coordinator-ha) — active/passive failover
+- [Monitoring](https://docs.paraloom.io/docs/monitoring) — `/health`, `/ready`, `/metrics` endpoints
+- [Performance](https://docs.paraloom.io/docs/performance) — proof generation, verification, throughput
+- [Troubleshooting](https://docs.paraloom.io/docs/troubleshooting) — common errors and recovery
+
+**Reference**
+- [API reference](https://docs.paraloom.io/docs/api-reference) — RPC and library surface
+- [MPC ceremony](https://docs.paraloom.io/docs/ceremony) — BGM17 trusted setup workflow
+- [Security](https://docs.paraloom.io/docs/security) — threat model, known limitations, audit status
+- [Releases](https://docs.paraloom.io/docs/releases) — version notes and migration guides
+- [Developer guide](https://docs.paraloom.io/docs/developer-guide) — contributing to paraloom-core
+- [FAQ](https://docs.paraloom.io/docs/faq)
 
 ## CLI Usage
 
