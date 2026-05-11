@@ -44,8 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://localhost:8899".to_string());
-    let program_id_str = std::env::var("SOLANA_PROGRAM_ID")
-        .map_err(|_| "SOLANA_PROGRAM_ID env var required")?;
+    let program_id_str =
+        std::env::var("SOLANA_PROGRAM_ID").map_err(|_| "SOLANA_PROGRAM_ID env var required")?;
     let authority_keypair_path = std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")
         .map_err(|_| "BRIDGE_AUTHORITY_KEYPAIR_PATH env var required")?;
     let deposit_amount: u64 = match std::env::var("DEPOSIT_AMOUNT_LAMPORTS") {
@@ -72,9 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (bridge_state, _) = derive_bridge_state(&program_id);
-    let bridge_state_account = client.get_account(&bridge_state).map_err(|_| {
-        "Bridge state PDA not found. Run bridge-init first.".to_string()
-    })?;
+    let bridge_state_account = client
+        .get_account(&bridge_state)
+        .map_err(|_| "Bridge state PDA not found. Run bridge-init first.".to_string())?;
     println!(
         "Bridge state PDA:  {} ({} bytes)",
         bridge_state,
@@ -96,10 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Bob (withdrawal):  {}", bob.pubkey());
 
     let airdrop_amount = deposit_amount + LAMPORTS_PER_SOL; // deposit + tx fees
-    println!(
-        "\nAirdropping Alice {} SOL...",
-        airdrop_amount as f64 / 1e9
-    );
+    println!("\nAirdropping Alice {} SOL...", airdrop_amount as f64 / 1e9);
     let _airdrop_sig = client.request_airdrop(&alice.pubkey(), airdrop_amount)?;
     // `confirm_transaction` returns once the signature is known but the
     // balance may not yet reflect the credit on localnet — poll until it
@@ -213,11 +210,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let circuit = WithdrawCircuit::with_witness(
         merkle_root_bytes,
         nullifier_bytes_arr,
-        net_deposit,        // withdraw_amount
-        net_deposit,        // input_value (whole note)
-        randomness,         // input_randomness (matches commitment)
-        recipient_bytes,    // input_recipient (shielded address)
-        randomness,         // secret == randomness (matches Nullifier::derive)
+        net_deposit,     // withdraw_amount
+        net_deposit,     // input_value (whole note)
+        randomness,      // input_randomness (matches commitment)
+        recipient_bytes, // input_recipient (shielded address)
+        randomness,      // secret == randomness (matches Nullifier::derive)
         merkle_path,
     );
 
