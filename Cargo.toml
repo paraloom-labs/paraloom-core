@@ -137,7 +137,7 @@ rocksdb = "0.22"
 log = "0.4.17"
 env_logger = "0.10.0"
 thiserror = "1.0.38"
-anyhow = "1.0.69"
+anyhow = "1.0.102"
 
 # CLI 
 clap = { version = "4.1.8", features = ["derive"] }
