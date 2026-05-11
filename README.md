@@ -105,12 +105,38 @@ paraloom-core/
 
 ## Documentation
 
-Full documentation available at **[docs.paraloom.io](https://docs.paraloom.io)**
+Full documentation: **[docs.paraloom.io](https://docs.paraloom.io)**
 
-- [Architecture Overview](https://docs.paraloom.io/architecture)
-- [Privacy Layer](https://docs.paraloom.io/privacy-layer)
-- [Compute Layer](https://docs.paraloom.io/compute-layer)
-- [Validator Guide](https://docs.paraloom.io/validator-guide)
+**Getting started**
+- [Quickstart](https://docs.paraloom.io/docs/quickstart) — get a node running on devnet
+- [Installation](https://docs.paraloom.io/docs/installation) — build from source and prerequisites
+
+**Core concepts**
+- [Architecture](https://docs.paraloom.io/docs/architecture) — system layers and module structure
+- [Vision](https://docs.paraloom.io/docs/vision) — design goals and threat model
+- [Use cases](https://docs.paraloom.io/docs/use-cases) — what shielded transfers and private compute unlock
+
+**Layers**
+- [Privacy layer](https://docs.paraloom.io/docs/privacy-layer) — Groth16 circuits, Poseidon, nullifiers, Merkle tree
+- [Compute layer](https://docs.paraloom.io/docs/compute-layer) — WASM execution, BFT verification, encrypted I/O
+- [Consensus](https://docs.paraloom.io/docs/consensus) — BFT threshold, reputation gating, equivocation slashing
+- [Networking](https://docs.paraloom.io/docs/networking) — libp2p mesh, Kademlia DHT, ping liveness
+- [Solana bridge](https://docs.paraloom.io/docs/solana-bridge) — on-chain Anchor program, bridge state, nullifier PDAs
+
+**Operations**
+- [Validator guide](https://docs.paraloom.io/docs/validator-guide) — run a validator on commodity hardware
+- [Coordinator HA](https://docs.paraloom.io/docs/coordinator-ha) — active/passive failover
+- [Monitoring](https://docs.paraloom.io/docs/monitoring) — `/health`, `/ready`, `/metrics` endpoints
+- [Performance](https://docs.paraloom.io/docs/performance) — proof generation, verification, throughput
+- [Troubleshooting](https://docs.paraloom.io/docs/troubleshooting) — common errors and recovery
+
+**Reference**
+- [API reference](https://docs.paraloom.io/docs/api-reference) — RPC and library surface
+- [MPC ceremony](https://docs.paraloom.io/docs/ceremony) — BGM17 trusted setup workflow
+- [Security](https://docs.paraloom.io/docs/security) — threat model, known limitations, audit status
+- [Releases](https://docs.paraloom.io/docs/releases) — version notes and migration guides
+- [Developer guide](https://docs.paraloom.io/docs/developer-guide) — contributing to paraloom-core
+- [FAQ](https://docs.paraloom.io/docs/faq)
 
 ## CLI Usage
 
