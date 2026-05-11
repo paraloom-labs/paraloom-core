@@ -110,6 +110,10 @@ path = "src/bin/init_validator_registry.rs"
 name = "register-validator"
 path = "src/bin/register_validator.rs"
 
+[[bin]]
+name = "demo-flow"
+path = "src/bin/demo_flow.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh", "bs58"]
