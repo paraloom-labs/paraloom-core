@@ -155,7 +155,7 @@ wat = "1.240" # For WASM parsing (compute demo)
 sha2 = "0.10"
 hex = "0.4"
 bs58 = { version = "0.5", optional = true }
-aes-gcm = "0.10"
+aes-gcm = "0.10.3"
 rand = "0.8"
 
 # zkSNARK (arkworks ecosystem)
