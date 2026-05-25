@@ -161,6 +161,19 @@ impl MerkleTree {
         root
     }
 
+    /// Find the index of a commitment among the current leaves, if it is
+    /// present. The stored leaf bytes are exactly `commitment.as_bytes()`
+    /// (see [`MerkleTree::insert`]), so raw-byte equality identifies the
+    /// leaf. A linear scan is acceptable here: path queries are
+    /// infrequent relative to inserts, and this keeps the lookup correct
+    /// for both in-memory and storage-restored trees without a parallel
+    /// index map that could drift out of sync.
+    pub async fn index_of(&self, commitment: &Commitment) -> Option<usize> {
+        let target = commitment.as_bytes();
+        let leaves = self.leaves.read().await;
+        leaves.iter().position(|leaf| leaf == target)
+    }
+
     /// Get the Merkle path for a leaf at given index
     pub async fn path(&self, index: usize) -> Option<MerklePath> {
         let leaves = self.leaves.read().await;

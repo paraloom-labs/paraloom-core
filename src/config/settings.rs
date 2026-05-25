@@ -1,5 +1,6 @@
 //! Settings for the Paraloom node
 
+use crate::bridge::BridgeConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -20,6 +21,15 @@ pub struct Settings {
     /// in #66 stays opt-in until operators explicitly turn it on.
     #[serde(default)]
     pub ha: HaSettings,
+    /// Solana bridge / deposit-listener settings. Optional like
+    /// `[ha]`: a config without a `[bridge]` section parses using
+    /// `BridgeConfig::default()`, which is env-var driven and leaves
+    /// the bridge disabled unless `enabled = true`. When enabled on a
+    /// validator- or bridge-class node, the node spawns the deposit
+    /// `EventListener` and owns a `ShieldedPool` indexed from on-chain
+    /// deposits (#163).
+    #[serde(default)]
+    pub bridge: BridgeConfig,
 }
 
 /// Network settings
@@ -151,6 +161,7 @@ impl Settings {
                 data_dir: "./data".to_string(),
             },
             ha: HaSettings::default(),
+            bridge: BridgeConfig::default(),
         }
     }
 }
