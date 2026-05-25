@@ -22,6 +22,7 @@ pub use rpc::{BridgeRpc, RealBridgeRpc};
 pub use submitter::ResultSubmitter;
 
 use crate::bridge::{BridgeConfig, BridgeStats, Result, WithdrawalRequest};
+use crate::consensus::ApprovedWithdrawal;
 use crate::privacy::ShieldedPool;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -96,6 +97,11 @@ impl SolanaBridge {
     /// Submit a withdrawal to Solana
     pub async fn submit_withdrawal(&self, request: WithdrawalRequest) -> Result<String> {
         self.submitter.submit(request).await
+    }
+
+    /// Settle a consensus-approved withdrawal on-chain (#164).
+    pub async fn submit_approved(&self, approved: ApprovedWithdrawal) -> Result<String> {
+        self.submitter.submit_approved(approved).await
     }
 
     /// Get program interface

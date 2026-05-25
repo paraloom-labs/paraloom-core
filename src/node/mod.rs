@@ -6,12 +6,13 @@ use log::info;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
+use crate::consensus::{ApprovedWithdrawal, WithdrawalVerificationCoordinator};
 use crate::coordinator::Coordinator;
 use crate::network::{Message, NetworkManager, ResultRequest, ResultResponse};
 use crate::privacy::pool::ShieldedPool;
@@ -73,6 +74,22 @@ pub struct Node {
     /// aborted in stop(). Same Arc<Mutex<Option<...>>> shape as the
     /// other spawned-task handles so Clone of Node stays cheap.
     path_server: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Withdrawal consensus coordinator (#164). Present on bridge-enabled
+    /// validator/bridge nodes. Incoming `WithdrawalVerificationResult`
+    /// votes are routed into it; when a validator quorum approves a
+    /// withdrawal it pushes the approval onto the channel drained by the
+    /// submitter task.
+    withdrawal_coordinator: Option<Arc<WithdrawalVerificationCoordinator>>,
+
+    /// Receiver half of the coordinator's approval channel (#164). Taken
+    /// once by run() to drive the submitter task. Wrapped so Clone of
+    /// Node stays cheap; the receiver itself is not `Clone`.
+    approval_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ApprovedWithdrawal>>>>,
+
+    /// Submitter task handle (#164): drains approvals and settles them
+    /// on-chain. Spawned in run(), aborted in stop().
+    submitter_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -351,6 +368,17 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received withdrawal verification result: {}",
                     result.request_id
                 );
+                // Route the vote into the withdrawal coordinator (#164).
+                // On the node that started this verification, a vote that
+                // completes the quorum makes the coordinator emit an
+                // approval, which the submitter task settles on-chain. A
+                // node that never started this request has no pending
+                // entry — submit_result errors and we drop the vote.
+                if let Some(coordinator) = &self.withdrawal_coordinator {
+                    if let Err(e) = coordinator.submit_result(result).await {
+                        log::debug!("dropping withdrawal vote: {}", e);
+                    }
+                }
             }
             Message::ValidatorRegistration {
                 validator_id,
@@ -616,6 +644,17 @@ impl crate::network::protocol::NetworkEventHandler for Node {
     }
 }
 
+/// Whether a submit error means the withdrawal was already settled (its
+/// nullifier is spent), as opposed to a real failure (#164). A replay is
+/// expected — e.g. two nodes reach quorum and both try to submit — so the
+/// submitter task skips it quietly instead of logging a warning.
+fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
+    matches!(
+        e,
+        crate::bridge::BridgeError::InvalidTransaction(msg) if msg.contains("already spent")
+    )
+}
+
 impl Node {
     /// Create a new node
     pub fn new(settings: Settings) -> Result<Self> {
@@ -743,6 +782,16 @@ impl Node {
             None
         };
 
+        // Withdrawal consensus coordinator + its approval channel (#164).
+        // Built only on bridge-enabled validator/bridge nodes; the
+        // receiver is held until run() spawns the submitter task.
+        let (withdrawal_coordinator, approval_rx) = if runs_bridge {
+            let (coord, rx) = WithdrawalVerificationCoordinator::new_with_approvals();
+            (Some(Arc::new(coord)), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let node = Node {
             settings,
             network: network_arc,
@@ -764,6 +813,9 @@ impl Node {
             ha_watchdog: Arc::new(Mutex::new(None)),
             kad_refresh: Arc::new(Mutex::new(None)),
             path_server: Arc::new(Mutex::new(None)),
+            withdrawal_coordinator,
+            approval_rx: Arc::new(Mutex::new(approval_rx)),
+            submitter_task: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -1043,6 +1095,39 @@ impl Node {
             }
         }
 
+        // Settle consensus-approved withdrawals (#164). Drains the
+        // approval channel the withdrawal coordinator pushes to when a
+        // validator quorum approves a withdrawal, and submits each
+        // on-chain via the bridge. A per-message failure — including a
+        // replay whose nullifier is already spent — is logged and
+        // skipped so it cannot kill the task and stall later approvals.
+        if let (Some(bridge), Some(rx)) =
+            (self.bridge.clone(), self.approval_rx.lock().await.take())
+        {
+            let mut rx = rx;
+            let handle = tokio::spawn(async move {
+                while let Some(approved) = rx.recv().await {
+                    let request_id = approved.request_id.clone();
+                    match bridge.lock().await.submit_approved(approved).await {
+                        Ok(sig) => {
+                            info!("on-chain withdraw submitted for {}: {}", request_id, sig)
+                        }
+                        Err(e) if is_replay_error(&e) => {
+                            log::debug!(
+                                "withdrawal {} already settled (nullifier spent), skipping",
+                                request_id
+                            )
+                        }
+                        Err(e) => {
+                            log::warn!("withdrawal {} submit failed: {}", request_id, e)
+                        }
+                    }
+                }
+            });
+            *self.submitter_task.lock().await = Some(handle);
+            info!("withdrawal submitter task started");
+        }
+
         // Periodically update resource information
         let status = self.status.clone();
         loop {
@@ -1088,6 +1173,9 @@ impl Node {
         if let Some(handle) = self.path_server.lock().await.take() {
             handle.abort();
         }
+        if let Some(handle) = self.submitter_task.lock().await.take() {
+            handle.abort();
+        }
         // Stop the bridge deposit listener (#163) so its poll loop
         // winds down on the next tick. A failure here must not block
         // the rest of shutdown, so it is logged rather than propagated.
@@ -1113,6 +1201,14 @@ impl Node {
     /// Get coordinator reference
     pub fn coordinator(&self) -> Option<Arc<Coordinator>> {
         self.coordinator.clone()
+    }
+
+    /// Get the withdrawal consensus coordinator (#164), if this node runs
+    /// one. Exposed so an integration harness can drive verification
+    /// (start_verification + submit_result) against the same coordinator
+    /// whose approvals the node's submitter task settles on-chain.
+    pub fn withdrawal_coordinator(&self) -> Option<Arc<WithdrawalVerificationCoordinator>> {
+        self.withdrawal_coordinator.clone()
     }
 
     /// Get node info
@@ -1363,6 +1459,9 @@ impl Clone for Node {
             kad_refresh: self.kad_refresh.clone(),
             bridge: self.bridge.clone(),
             path_server: self.path_server.clone(),
+            withdrawal_coordinator: self.withdrawal_coordinator.clone(),
+            approval_rx: self.approval_rx.clone(),
+            submitter_task: self.submitter_task.clone(),
         }
     }
 }
@@ -1381,11 +1480,13 @@ mod tests {
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
+        assert!(node.withdrawal_coordinator.is_none());
     }
 
     // A validator-class node (ResourceProvider) with the bridge enabled
-    // owns a shielded pool and a bridge manager, so run() can start the
-    // deposit listener that indexes commitments into the pool (#163).
+    // owns a shielded pool, a bridge manager, and a withdrawal
+    // coordinator, so run() can start the deposit listener (#163) and the
+    // consensus→submit pipeline (#164).
     #[test]
     fn bridge_enabled_validator_owns_pool_and_bridge() {
         let mut settings = Settings::development();
@@ -1393,6 +1494,7 @@ mod tests {
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_some());
         assert!(node.bridge.is_some());
+        assert!(node.withdrawal_coordinator.is_some());
     }
 
     // A coordinator node does not index deposits even with the bridge
@@ -1405,5 +1507,6 @@ mod tests {
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
+        assert!(node.withdrawal_coordinator.is_none());
     }
 }

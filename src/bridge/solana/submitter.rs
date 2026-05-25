@@ -4,7 +4,7 @@
 
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, Result, WithdrawalRequest};
-use crate::consensus::WithdrawalVerificationCoordinator;
+use crate::consensus::{ApprovedWithdrawal, WithdrawalVerificationCoordinator};
 use crate::privacy::ShieldedPool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,6 +27,12 @@ pub struct ResultSubmitter {
 
     /// Enable distributed consensus
     enable_consensus: bool,
+
+    /// Slots past the current chain slot at which a request built from a
+    /// consensus approval expires. Copied from
+    /// `BridgeConfig::withdrawal_expiration_window_slots` so `submit_approved`
+    /// can set the expiration without re-reading the config.
+    expiration_window_slots: u64,
 }
 
 impl ResultSubmitter {
@@ -37,6 +43,7 @@ impl ResultSubmitter {
         pool: Arc<ShieldedPool>,
         stats: Arc<RwLock<BridgeStats>>,
     ) -> Result<Self> {
+        let expiration_window_slots = config.withdrawal_expiration_window_slots;
         let program = ProgramInterface::new(config, rpc)?;
         Ok(Self {
             pool,
@@ -44,6 +51,7 @@ impl ResultSubmitter {
             program,
             verification_coordinator: None,
             enable_consensus: false,
+            expiration_window_slots,
         })
     }
 
@@ -55,6 +63,7 @@ impl ResultSubmitter {
         stats: Arc<RwLock<BridgeStats>>,
         verification_coordinator: Arc<WithdrawalVerificationCoordinator>,
     ) -> Result<Self> {
+        let expiration_window_slots = config.withdrawal_expiration_window_slots;
         let program = ProgramInterface::new(config, rpc)?;
         Ok(Self {
             pool,
@@ -62,6 +71,7 @@ impl ResultSubmitter {
             program,
             verification_coordinator: Some(verification_coordinator),
             enable_consensus: true,
+            expiration_window_slots,
         })
     }
 
@@ -102,6 +112,27 @@ impl ResultSubmitter {
 
         log::info!("Withdrawal submitted successfully: {}", signature);
         Ok(signature)
+    }
+
+    /// Settle a consensus-approved withdrawal (#164).
+    ///
+    /// Builds the on-chain [`WithdrawalRequest`] from the approval,
+    /// deriving the expiration slot from the live chain slot plus the
+    /// configured window (falling back to the window alone if `getSlot`
+    /// is unavailable), then submits it via [`submit`](Self::submit).
+    /// Separated from `submit` so the consensus pipeline does not have to
+    /// know how the expiration slot is derived.
+    pub async fn submit_approved(&self, approved: ApprovedWithdrawal) -> Result<String> {
+        let current_slot = self.program.get_slot().await.unwrap_or(0);
+        let request = WithdrawalRequest {
+            nullifier: approved.nullifier,
+            amount: approved.amount,
+            recipient: approved.recipient,
+            fee: approved.fee,
+            expiration_slot: current_slot + self.expiration_window_slots,
+            proof: approved.proof,
+        };
+        self.submit(request).await
     }
 
     /// Verify withdrawal proof with real zkSNARK verification

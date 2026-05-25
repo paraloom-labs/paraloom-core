@@ -97,6 +97,22 @@ impl Bridge {
             ))
         }
     }
+
+    /// Settle a consensus-approved withdrawal on-chain (#164). Called by
+    /// the node's submitter task when the validator quorum approves a
+    /// withdrawal; the expiration slot is derived inside the submitter.
+    pub async fn submit_approved(
+        &self,
+        approved: crate::consensus::ApprovedWithdrawal,
+    ) -> Result<String> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.submit_approved(approved).await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
