@@ -56,6 +56,14 @@ jobs:
         run: cargo build-sbf --manifest-path programs/paraloom/Cargo.toml
 
       # --test-threads=1 forces sequential execution so parallel tests
-      # do not collide on the validator RPC port.
-      - name: Run ignored bridge E2E tests
+      # do not collide on the validator RPC port. Each test file binds its
+      # own validator on a distinct port, so the two suites run back to back.
+      - name: Run ignored bridge E2E smoke tests
         run: cargo test --test bridge_e2e_smoke -- --ignored --nocapture --test-threads=1
+
+      # Wrapped in `timeout` so the step self-terminates well under the job
+      # ceiling: a hung test then *completes* the step (exit 124) and its
+      # --nocapture PHASE log is captured, instead of the job killing the step
+      # and dropping the buffered log.
+      - name: Run ignored withdrawal-consensus E2E test (#164)
+        run: timeout -s KILL 420 cargo test --test bridge_e2e_consensus -- --ignored --nocapture --test-threads=1
