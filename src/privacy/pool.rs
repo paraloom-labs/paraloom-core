@@ -164,21 +164,24 @@ impl ShieldedPool {
         self.commitment_tree.root().await
     }
 
-    /// Get the Merkle path for a commitment
+    /// Get the Merkle authentication path for a commitment.
+    ///
+    /// Resolves the commitment to its leaf index in the tree and returns
+    /// the path from that leaf to the current root. A withdrawing client
+    /// pairs this with [`ShieldedPool::root`] to build the public inputs
+    /// for its withdrawal proof. Errors if the commitment was never
+    /// inserted into this pool.
     pub async fn path(&self, commitment: &Commitment) -> Result<crate::privacy::types::MerklePath> {
-        // Find the index of this commitment
-        // In production, we'd maintain a commitment -> index map
-        let notes = self.notes.read().await;
+        let index = self
+            .commitment_tree
+            .index_of(commitment)
+            .await
+            .ok_or_else(|| anyhow!("commitment not found in pool"))?;
 
-        if !notes.contains_key(commitment) {
-            return Err(anyhow!("Commitment not found in pool"));
-        }
-
-        // For now, we can't easily get the index without storing it
-        // This is a simplification - production would track indices
-        Err(anyhow!(
-            "Path retrieval not implemented - requires index tracking"
-        ))
+        self.commitment_tree
+            .path(index)
+            .await
+            .ok_or_else(|| anyhow!("commitment index {} out of range", index))
     }
 
     /// Check if a nullifier has been spent
@@ -378,5 +381,35 @@ mod tests {
 
         let root2 = pool.root().await;
         assert_ne!(root1, root2);
+    }
+
+    #[tokio::test]
+    async fn path_round_trips_for_deposited_commitments() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([7u8; 32]);
+
+        let note_a = Note::new(addr.clone(), 100, [1u8; 32]);
+        let note_b = Note::new(addr, 200, [2u8; 32]);
+        let commitment_a = pool.deposit(note_a, 100).await.unwrap();
+        let commitment_b = pool.deposit(note_b, 200).await.unwrap();
+
+        // Each path must authenticate its own leaf against the current
+        // root — this is exactly what a withdrawing client checks before
+        // building its proof.
+        let root = pool.root().await;
+        let path_a = pool.path(&commitment_a).await.unwrap();
+        let path_b = pool.path(&commitment_b).await.unwrap();
+        assert!(path_a.verify(commitment_a.as_bytes(), &root));
+        assert!(path_b.verify(commitment_b.as_bytes(), &root));
+
+        // A path must not authenticate a different leaf.
+        assert!(!path_a.verify(commitment_b.as_bytes(), &root));
+    }
+
+    #[tokio::test]
+    async fn path_errors_for_unknown_commitment() {
+        let pool = ShieldedPool::new();
+        let unknown = Commitment::from_bytes([9u8; 32]);
+        assert!(pool.path(&unknown).await.is_err());
     }
 }
