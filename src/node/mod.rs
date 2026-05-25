@@ -118,6 +118,18 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 } else {
                     info!("This is not a coordinator node");
                 }
+
+                // Mirror the registration into the withdrawal coordinator
+                // (#175) so it knows the validator set: start_verification
+                // requires a quorum-sized set, and leader selection weighs
+                // these members. Independent of the compute coordinator
+                // above — a bridge-enabled validator node has the former
+                // without being a compute Coordinator.
+                if let Some(withdrawal) = &self.withdrawal_coordinator {
+                    if node_info.node_type == NodeType::ResourceProvider {
+                        withdrawal.register_validator(source.clone()).await;
+                    }
+                }
             }
             Message::ResourceUpdate { resources } => {
                 info!("Resource update from {}: {:?}", source, resources);
@@ -1101,13 +1113,47 @@ impl Node {
         // on-chain via the bridge. A per-message failure — including a
         // replay whose nullifier is already spent — is logged and
         // skipped so it cannot kill the task and stall later approvals.
-        if let (Some(bridge), Some(rx)) =
-            (self.bridge.clone(), self.approval_rx.lock().await.take())
-        {
+        if let (Some(bridge), Some(coordinator), Some(rx)) = (
+            self.bridge.clone(),
+            self.withdrawal_coordinator.clone(),
+            self.approval_rx.lock().await.take(),
+        ) {
             let mut rx = rx;
+            let local_id = self.node_info.id.clone();
             let handle = tokio::spawn(async move {
                 while let Some(approved) = rx.recv().await {
                     let request_id = approved.request_id.clone();
+
+                    // Leader gate (#175): the gossip mesh floods the
+                    // approval to every node, so without this each
+                    // validator would submit the same withdrawal — N-1
+                    // redundant, replay-rejected transactions. Only the
+                    // deterministically-selected leader for this request
+                    // settles it; every node derives the same leader from
+                    // the request_id seed, so exactly one submits.
+                    match coordinator.select_leader(&request_id).await {
+                        Ok(leader) if leader != local_id => {
+                            log::debug!(
+                                "withdrawal {} approved; not leader, leaving submission to {:?}",
+                                request_id,
+                                leader
+                            );
+                            continue;
+                        }
+                        Ok(_) => { /* we are the leader — settle below */ }
+                        Err(e) => {
+                            // No leader selectable (e.g. empty set): submit
+                            // rather than drop the withdrawal. Replay
+                            // protection keeps it safe if another node
+                            // also submits.
+                            log::warn!(
+                                "leader selection failed for {}: {} — submitting anyway",
+                                request_id,
+                                e
+                            );
+                        }
+                    }
+
                     match bridge.lock().await.submit_approved(approved).await {
                         Ok(sig) => {
                             info!("on-chain withdraw submitted for {}: {}", request_id, sig)
@@ -1209,6 +1255,40 @@ impl Node {
     /// whose approvals the node's submitter task settles on-chain.
     pub fn withdrawal_coordinator(&self) -> Option<Arc<WithdrawalVerificationCoordinator>> {
         self.withdrawal_coordinator.clone()
+    }
+
+    /// Initiate distributed verification of a withdrawal (#175).
+    ///
+    /// Records the request with this node's withdrawal coordinator and
+    /// broadcasts it to the validator set over the gossip mesh, so
+    /// validators verify and vote without the request having to be driven
+    /// into the coordinator by hand. Votes flood back as
+    /// `WithdrawalVerificationResult`, route into the coordinator (#164),
+    /// and the resulting approval is settled on-chain by the leader's
+    /// submitter task. Returns the request id.
+    ///
+    /// Errors if this node runs no withdrawal coordinator, or if
+    /// `start_verification` rejects the request (e.g. the known validator
+    /// set is below the consensus quorum).
+    pub async fn initiate_withdrawal_verification(
+        &self,
+        request: crate::consensus::WithdrawalVerificationRequest,
+    ) -> Result<String> {
+        let coordinator = self.withdrawal_coordinator.as_ref().ok_or_else(|| {
+            anyhow!("node has no withdrawal coordinator (bridge disabled or non-validator)")
+        })?;
+        let request_id = coordinator.start_verification(request.clone()).await?;
+        // send_message broadcasts to the whole gossip topic — the peer
+        // argument is ignored by the network layer — so every validator
+        // receives the request to verify.
+        self.network
+            .send_message(
+                NodeId(vec![]),
+                Message::WithdrawalVerificationRequest { request },
+            )
+            .await?;
+        info!("initiated withdrawal verification: {}", request_id);
+        Ok(request_id)
     }
 
     /// Get node info
@@ -1508,5 +1588,58 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.withdrawal_coordinator.is_none());
+    }
+
+    // A node without a withdrawal coordinator (bridge disabled) cannot
+    // initiate verification (#175).
+    #[tokio::test]
+    async fn initiate_withdrawal_errors_without_coordinator() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let request = crate::consensus::WithdrawalVerificationRequest {
+            request_id: "x".to_string(),
+            nullifier: [0u8; 32],
+            amount: 1,
+            recipient: [0u8; 32],
+            proof: vec![0u8; 8],
+            fee: 0,
+            timestamp: 0,
+        };
+        assert!(node
+            .initiate_withdrawal_verification(request)
+            .await
+            .is_err());
+    }
+
+    // On a bridge-enabled validator with a quorum-sized validator set
+    // registered, initiate_withdrawal_verification records the request
+    // and returns its id (#175). The broadcast is buffered on the network
+    // channel; delivery is exercised by the multi-node integration test.
+    #[tokio::test]
+    async fn initiate_withdrawal_starts_verification() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+
+        let coordinator = node
+            .withdrawal_coordinator()
+            .expect("validator node has a withdrawal coordinator");
+        for i in 0..10u8 {
+            coordinator.register_validator(NodeId(vec![i])).await;
+        }
+
+        let request = crate::consensus::WithdrawalVerificationRequest {
+            request_id: "init-1".to_string(),
+            nullifier: [1u8; 32],
+            amount: 1000,
+            recipient: [2u8; 32],
+            proof: vec![0u8; 128],
+            fee: 10,
+            timestamp: 0,
+        };
+        let request_id = node
+            .initiate_withdrawal_verification(request)
+            .await
+            .expect("initiate succeeds with a quorum-sized validator set");
+        assert_eq!(request_id, "init-1");
     }
 }
