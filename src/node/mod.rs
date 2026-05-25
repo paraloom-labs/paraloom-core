@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
 use crate::coordinator::Coordinator;
@@ -56,6 +57,16 @@ pub struct Node {
     /// Arc<Mutex<Option<...>>> shape as the HA handles so Clone
     /// stays cheap.
     kad_refresh: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Solana bridge manager (#163). Present only on bridge-enabled
+    /// validator- or bridge-class nodes. Owns the deposit
+    /// `EventListener` that indexes on-chain deposits into
+    /// `shielded_pool`, so a withdrawing client can later obtain the
+    /// Merkle path for the note it wants to spend. Initialized and
+    /// started in run(), stopped in stop(). Held under Arc<Mutex<...>>
+    /// so Clone of Node stays cheap and the &mut-taking lifecycle
+    /// methods (init/start/stop) remain reachable behind &self.
+    bridge: Option<Arc<Mutex<Bridge>>>,
 }
 
 #[async_trait]
@@ -701,7 +712,31 @@ impl Node {
                 None
             };
 
-        // Privacy layer will be initialized in run() if enabled
+        // Privacy layer + Solana bridge (#163). A validator- or
+        // bridge-class node with the bridge enabled owns a ShieldedPool
+        // that the Bridge manager's deposit EventListener keeps in sync
+        // with on-chain deposits (started in run()). Compute-only
+        // providers and nodes with the bridge disabled skip it.
+        //
+        // The pool is in-memory (ShieldedPool::new) rather than
+        // storage-backed on purpose: the deposit listener does not yet
+        // persist its scan cursor, so a persistent tree would
+        // double-index on restart. Rebuilding from chain on each run
+        // keeps the cursor and the tree consistent; persistent indexing
+        // is a follow-up once the cursor is durable.
+        let runs_bridge = settings.bridge.enabled
+            && matches!(node_type, NodeType::ResourceProvider | NodeType::Bridge);
+        let shielded_pool = if runs_bridge {
+            Some(Arc::new(ShieldedPool::new()))
+        } else {
+            None
+        };
+        let bridge = if runs_bridge {
+            Some(Arc::new(Mutex::new(Bridge::new(settings.bridge.clone()))))
+        } else {
+            None
+        };
+
         let node = Node {
             settings,
             network: network_arc,
@@ -711,8 +746,9 @@ impl Node {
             coordinator,
             validator,
             privacy_storage: None,
-            shielded_pool: None,
+            shielded_pool,
             verification_coordinator: None,
+            bridge,
             compute_executor,
             compute_manager,
             compute_coordinator,
@@ -954,6 +990,18 @@ impl Node {
             info!("Result reporting started for ResourceProvider node");
         }
 
+        // Start the Solana bridge deposit listener (#163). On a
+        // bridge-enabled validator/bridge node this spawns the
+        // EventListener, which polls Solana and indexes deposit
+        // commitments into the shielded pool so a withdrawing client
+        // can later obtain a Merkle path for the note it spends.
+        if let (Some(bridge), Some(pool)) = (&self.bridge, &self.shielded_pool) {
+            let mut bridge = bridge.lock().await;
+            bridge.init(pool.clone()).await?;
+            bridge.start().await?;
+            info!("Solana bridge deposit listener started");
+        }
+
         // Periodically update resource information
         let status = self.status.clone();
         loop {
@@ -995,6 +1043,14 @@ impl Node {
         }
         if let Some(handle) = self.kad_refresh.lock().await.take() {
             handle.abort();
+        }
+        // Stop the bridge deposit listener (#163) so its poll loop
+        // winds down on the next tick. A failure here must not block
+        // the rest of shutdown, so it is logged rather than propagated.
+        if let Some(bridge) = &self.bridge {
+            if let Err(e) = bridge.lock().await.stop().await {
+                log::warn!("error stopping Solana bridge: {}", e);
+            }
         }
         let mut status = self.status.lock().await;
         *status = NodeStatus::ShuttingDown;
@@ -1261,6 +1317,48 @@ impl Clone for Node {
             ha_broadcast: self.ha_broadcast.clone(),
             ha_watchdog: self.ha_watchdog.clone(),
             kad_refresh: self.kad_refresh.clone(),
+            bridge: self.bridge.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Settings;
+
+    // With the bridge disabled (the default), a node owns neither a
+    // shielded pool nor a bridge manager — unchanged from pre-#163.
+    #[test]
+    fn bridge_disabled_node_has_no_pool() {
+        let settings = Settings::development();
+        assert!(!settings.bridge.enabled);
+        let node = Node::new(settings).expect("construct node");
+        assert!(node.shielded_pool.is_none());
+        assert!(node.bridge.is_none());
+    }
+
+    // A validator-class node (ResourceProvider) with the bridge enabled
+    // owns a shielded pool and a bridge manager, so run() can start the
+    // deposit listener that indexes commitments into the pool (#163).
+    #[test]
+    fn bridge_enabled_validator_owns_pool_and_bridge() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        assert!(node.shielded_pool.is_some());
+        assert!(node.bridge.is_some());
+    }
+
+    // A coordinator node does not index deposits even with the bridge
+    // enabled: the deposit listener is validator/bridge-class only.
+    #[test]
+    fn bridge_enabled_coordinator_skips_pool() {
+        let mut settings = Settings::development();
+        settings.node.node_type = "Coordinator".to_string();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        assert!(node.shielded_pool.is_none());
+        assert!(node.bridge.is_none());
     }
 }
