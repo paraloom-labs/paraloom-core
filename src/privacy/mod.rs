@@ -24,6 +24,7 @@ pub mod error;
 mod integration_tests;
 pub mod merkle;
 pub mod nullifier;
+pub mod path_server;
 pub mod pedersen;
 pub mod pool;
 pub mod poseidon;

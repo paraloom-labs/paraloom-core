@@ -95,6 +95,14 @@ pub struct BridgeConfig {
     /// consensus and the RPC submit, short enough that a leaked
     /// request becomes useless within ~1 minute. See #61.
     pub withdrawal_expiration_window_slots: u64,
+
+    /// Address the Merkle path-query HTTP server binds to on a
+    /// bridge-enabled node (#163). Withdrawing clients query it for the
+    /// `(root, path)` of the note they spend. The data is public, so the
+    /// endpoint is unauthenticated — it defaults to a loopback address
+    /// and should stay on a loopback or management interface. Set to an
+    /// empty string to disable the server while keeping the bridge on.
+    pub merkle_path_query_address: String,
 }
 
 impl Default for BridgeConfig {
@@ -126,6 +134,8 @@ impl Default for BridgeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(150),
+            merkle_path_query_address: std::env::var("BRIDGE_MERKLE_PATH_ADDRESS")
+                .unwrap_or_else(|_| "127.0.0.1:9090".to_string()),
         }
     }
 }

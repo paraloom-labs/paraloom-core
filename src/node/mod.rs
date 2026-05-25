@@ -67,6 +67,12 @@ pub struct Node {
     /// so Clone of Node stays cheap and the &mut-taking lifecycle
     /// methods (init/start/stop) remain reachable behind &self.
     bridge: Option<Arc<Mutex<Bridge>>>,
+
+    /// Merkle path-query HTTP server handle (#163). Spawned in run()
+    /// when the bridge is enabled and a bind address is configured;
+    /// aborted in stop(). Same Arc<Mutex<Option<...>>> shape as the
+    /// other spawned-task handles so Clone of Node stays cheap.
+    path_server: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -757,6 +763,7 @@ impl Node {
             ha_broadcast: Arc::new(Mutex::new(None)),
             ha_watchdog: Arc::new(Mutex::new(None)),
             kad_refresh: Arc::new(Mutex::new(None)),
+            path_server: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -1002,6 +1009,40 @@ impl Node {
             info!("Solana bridge deposit listener started");
         }
 
+        // Serve Merkle paths over HTTP (#163) so a withdrawing client
+        // can fetch the (root, path) for the note it spends. Only runs
+        // when the node owns an indexed pool and a bind address is
+        // configured; an empty address disables it. An unparseable
+        // address is logged and skipped rather than failing start-up.
+        if let Some(pool) = &self.shielded_pool {
+            let addr_str = self.settings.bridge.merkle_path_query_address.trim();
+            if !addr_str.is_empty() {
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let pool = pool.clone();
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = crate::privacy::path_server::serve(pool, addr).await {
+                                log::error!(
+                                    target: "paraloom::privacy::path_server",
+                                    "Merkle path query server exited: {}",
+                                    e
+                                );
+                            }
+                        });
+                        *self.path_server.lock().await = Some(handle);
+                        info!("Merkle path query server started on {}", addr_str);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "invalid bridge.merkle_path_query_address '{}': {} — path server not started",
+                            addr_str,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Periodically update resource information
         let status = self.status.clone();
         loop {
@@ -1042,6 +1083,9 @@ impl Node {
             handle.abort();
         }
         if let Some(handle) = self.kad_refresh.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.path_server.lock().await.take() {
             handle.abort();
         }
         // Stop the bridge deposit listener (#163) so its poll loop
@@ -1318,6 +1362,7 @@ impl Clone for Node {
             ha_watchdog: self.ha_watchdog.clone(),
             kad_refresh: self.kad_refresh.clone(),
             bridge: self.bridge.clone(),
+            path_server: self.path_server.clone(),
         }
     }
 }
