@@ -10,9 +10,9 @@ use crate::consensus::slashing::{SlashingEvidence, SlashingTracker};
 use crate::types::NodeId;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 /// Default minimum validator count for the 7-of-10 BFT consensus.
 /// The actual threshold is configurable per [`WithdrawalConsensus`]
@@ -123,6 +123,22 @@ pub struct WithdrawalVerificationResult {
 
     /// Timestamp when verified
     pub timestamp: u64,
+}
+
+/// A withdrawal the validator quorum has approved (#164). Emitted by the
+/// coordinator on the approval channel the moment a `Valid` quorum is
+/// first reached for a request, so a submitter task can settle it
+/// on-chain without polling. Carries exactly the fields needed to build
+/// a [`WithdrawalRequest`]; the expiration slot is computed at submit
+/// time against the live chain, so it is intentionally not included.
+#[derive(Clone, Debug)]
+pub struct ApprovedWithdrawal {
+    pub request_id: String,
+    pub nullifier: [u8; 32],
+    pub amount: u64,
+    pub recipient: [u8; 32],
+    pub proof: Vec<u8>,
+    pub fee: u64,
 }
 
 /// Consensus state for a withdrawal verification
@@ -382,6 +398,18 @@ pub struct WithdrawalVerificationCoordinator {
     /// Total validator-set size used as the divisor in
     /// completion-percentage reporting.
     total_validators: usize,
+
+    /// Approval-event sender (#164). `Some` only when the coordinator was
+    /// built with [`WithdrawalVerificationCoordinator::new_with_approvals`];
+    /// a quorum-`Valid` result is pushed here so a submitter task settles
+    /// it on-chain. `None` for the plain `new()` coordinator, which keeps
+    /// every existing caller and test unchanged.
+    approval_tx: Option<mpsc::UnboundedSender<ApprovedWithdrawal>>,
+
+    /// Request IDs already emitted on `approval_tx`, so a request is
+    /// settled at most once even though more validator votes may keep
+    /// arriving after the quorum is first reached.
+    emitted: Arc<RwLock<HashSet<String>>>,
 }
 
 impl WithdrawalVerificationCoordinator {
@@ -397,7 +425,21 @@ impl WithdrawalVerificationCoordinator {
             min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
             min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
             total_validators: DEFAULT_TOTAL_VALIDATORS,
+            approval_tx: None,
+            emitted: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Create a coordinator that emits approved withdrawals on a channel
+    /// (#164). Identical to [`new`](Self::new) except a `Valid` quorum
+    /// result is pushed to the returned receiver, which a submitter task
+    /// drains to settle the withdrawal on-chain. Returned as a pair so
+    /// the receiver — not `Clone` — is owned by exactly one consumer.
+    pub fn new_with_approvals() -> (Self, mpsc::UnboundedReceiver<ApprovedWithdrawal>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut coordinator = Self::new();
+        coordinator.approval_tx = Some(tx);
+        (coordinator, rx)
     }
 
     /// Override the BFT thresholds for this coordinator. The two
@@ -640,6 +682,44 @@ impl WithdrawalVerificationCoordinator {
             // evidence and *do not* install the new vote — the
             // original stands.
             self.slashing_tracker.record(validator, evidence).await;
+        }
+
+        // Emit the approval the first time this vote completes a `Valid`
+        // quorum (#164). Computed from the borrowed `consensus` directly
+        // — the same eligibility view check_consensus uses — to avoid
+        // re-locking `pending`. The `emitted` set guards against emitting
+        // twice as later votes keep arriving.
+        if let Some(tx) = &self.approval_tx {
+            let mut emitted = self.emitted.write().await;
+            if !emitted.contains(&result.request_id)
+                && consensus
+                    .has_consensus(&self.reputation_tracker, self.min_reputation_for_consensus)
+                    .await
+                && matches!(
+                    consensus
+                        .consensus_result(
+                            &self.reputation_tracker,
+                            self.min_reputation_for_consensus,
+                        )
+                        .await,
+                    Ok(VerificationVote::Valid)
+                )
+            {
+                let req = &consensus.request;
+                let approved = ApprovedWithdrawal {
+                    request_id: result.request_id.clone(),
+                    nullifier: req.nullifier,
+                    amount: req.amount,
+                    recipient: req.recipient,
+                    proof: req.proof.clone(),
+                    fee: req.fee,
+                };
+                // A closed receiver just means no submitter is listening
+                // (e.g. a non-bridge node); that is not an error here.
+                if tx.send(approved).is_ok() {
+                    emitted.insert(result.request_id.clone());
+                }
+            }
         }
 
         Ok(())
@@ -994,6 +1074,74 @@ mod tests {
 
         let request_id = coordinator.start_verification(request).await.unwrap();
         assert_eq!(request_id, "test123");
+    }
+
+    #[tokio::test]
+    async fn approval_channel_emits_once_on_valid_quorum() {
+        let (coordinator, mut rx) = WithdrawalVerificationCoordinator::new_with_approvals();
+        let validators: Vec<NodeId> = (0..10).map(|i| NodeId(vec![i as u8])).collect();
+        for v in &validators {
+            coordinator.register_validator(v.clone()).await;
+        }
+
+        let request = WithdrawalVerificationRequest {
+            request_id: "approve-1".to_string(),
+            nullifier: [5u8; 32],
+            amount: 4_200,
+            recipient: [6u8; 32],
+            proof: vec![7u8; 64],
+            fee: 9,
+            timestamp: 0,
+        };
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        // No approval before the 7-vote quorum is reached.
+        for v in validators.iter().take(6) {
+            coordinator
+                .submit_result(WithdrawalVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: v.clone(),
+                    vote: VerificationVote::Valid,
+                    timestamp: 0,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(rx.try_recv().is_err(), "no approval before quorum");
+
+        // The 7th valid vote crosses the quorum and emits one approval
+        // carrying the original request's fields.
+        coordinator
+            .submit_result(WithdrawalVerificationResult {
+                request_id: request.request_id.clone(),
+                validator: validators[6].clone(),
+                vote: VerificationVote::Valid,
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
+
+        let approved = rx.try_recv().expect("approval emitted at quorum");
+        assert_eq!(approved.request_id, "approve-1");
+        assert_eq!(approved.nullifier, [5u8; 32]);
+        assert_eq!(approved.amount, 4_200);
+        assert_eq!(approved.recipient, [6u8; 32]);
+        assert_eq!(approved.fee, 9);
+
+        // Later votes must not emit a second approval for the same request.
+        coordinator
+            .submit_result(WithdrawalVerificationResult {
+                request_id: request.request_id.clone(),
+                validator: validators[7].clone(),
+                vote: VerificationVote::Valid,
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "approval emitted at most once");
     }
 
     #[tokio::test]
