@@ -73,11 +73,7 @@ async fn path_handler(
 
     Ok(Json(PathResponse {
         root: hex::encode(root),
-        path: path
-            .path
-            .iter()
-            .map(|sibling| hex::encode(sibling))
-            .collect(),
+        path: path.path.iter().map(hex::encode).collect(),
         indices: path.indices,
     }))
 }
