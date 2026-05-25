@@ -11,4 +11,6 @@ pub mod withdrawal;
 pub use leader::{LeaderSelector, ValidatorInfo};
 pub use reputation::{ReputationTracker, ValidatorMetrics};
 pub use slashing::{SlashingEvidence, SlashingRecord, SlashingTracker};
-pub use withdrawal::{WithdrawalVerificationCoordinator, WithdrawalVerificationRequest};
+pub use withdrawal::{
+    ApprovedWithdrawal, WithdrawalVerificationCoordinator, WithdrawalVerificationRequest,
+};
