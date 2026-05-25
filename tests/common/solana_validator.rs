@@ -63,7 +63,11 @@ impl SubprocessValidator {
             .map_err(|e| format!("spawn solana-test-validator: {}", e))?;
 
         let url = format!("http://127.0.0.1:{}", port);
-        let rpc = RpcClient::new_with_commitment(url, CommitmentConfig::confirmed());
+        let rpc = RpcClient::new_with_timeout_and_commitment(
+            url,
+            Duration::from_secs(20),
+            CommitmentConfig::confirmed(),
+        );
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if rpc.get_health().is_ok() {
@@ -82,9 +86,14 @@ impl SubprocessValidator {
         format!("http://127.0.0.1:{}", self.rpc_port)
     }
 
+    /// RPC client with a 20s request timeout so a stuck/dead validator makes
+    /// a blocking call (e.g. `send_and_confirm_transaction`'s confirm poll)
+    /// fail fast instead of parking a thread forever — which previously hung
+    /// the whole job rather than failing the test (#164/#178 follow-up).
     pub fn rpc_client(&self) -> Arc<RpcClient> {
-        Arc::new(RpcClient::new_with_commitment(
+        Arc::new(RpcClient::new_with_timeout_and_commitment(
             self.rpc_url(),
+            Duration::from_secs(20),
             CommitmentConfig::confirmed(),
         ))
     }

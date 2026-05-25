@@ -43,8 +43,8 @@ use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use paraloom::bridge::solana::BridgeRpc;
 use paraloom::bridge::solana::{
-    create_deposit_instruction, create_initialize_instruction, derive_bridge_vault,
-    derive_nullifier_account, RealBridgeRpc, ResultSubmitter,
+    create_deposit_instruction, create_initialize_instruction, create_withdraw_instruction,
+    derive_bridge_vault, derive_nullifier_account, RealBridgeRpc, ResultSubmitter,
 };
 use paraloom::bridge::{BridgeConfig, BridgeStats, WithdrawalRequest, EXPECTED_PROGRAM_VERSION};
 use paraloom::consensus::withdrawal::{
@@ -417,6 +417,47 @@ async fn run_consensus_e2e() {
     assert!(
         rpc.get_account(&bad_pda).is_err(),
         "no nullifier PDA must exist for the rejected withdrawal"
+    );
+
+    // ════════ NEGATIVE 2: unauthorized signer rejected on-chain (#178) ═══
+    // A signer that is not the bridge authority must not be able to settle a
+    // withdrawal, even with a well-formed-looking request. This is the
+    // on-chain `has_one = authority` guard.
+    log::info!("PHASE 13: negative — unauthorized signer must be rejected on-chain");
+    let attacker = fund_new_keypair(&rpc, 1_000_000_000).expect("airdrop attacker");
+    let attacker_nullifier = [123u8; 32];
+    let cur_slot = rpc.get_slot().unwrap_or(0);
+    let bh = rpc.get_latest_blockhash().expect("blockhash");
+    let attack_ix = create_withdraw_instruction(
+        &program_id,
+        &attacker.pubkey(), // attacker poses as the authority
+        &vault_pda,
+        recipient_bytes,
+        attacker_nullifier,
+        100_000,
+        cur_slot + 150,
+        vec![1u8; 192],
+    )
+    .expect("withdraw ix");
+    let attack_tx = Transaction::new_signed_with_payer(
+        &[attack_ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        bh,
+    );
+    let attack_res = rpc.send_and_confirm_transaction(&attack_tx);
+    assert!(
+        attack_res.is_err(),
+        "unauthorized signer must be rejected by has_one = authority"
+    );
+    let (attacker_pda, _) = derive_nullifier_account(&program_id, &attacker_nullifier);
+    assert!(
+        rpc.get_account(&attacker_pda).is_err(),
+        "no nullifier PDA may exist for the rejected unauthorized withdrawal"
+    );
+    log::info!(
+        "unauthorized withdraw correctly rejected: {:?}",
+        attack_res.err()
     );
 
     let _ = std::fs::remove_file(&authority_path);
