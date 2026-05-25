@@ -8,6 +8,11 @@ declare_id!("DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
+/// Upper bound on the withdrawal proof blob. A BLS12-381 Groth16 proof is
+/// 192 bytes; the cap leaves headroom while rejecting oversized blobs that
+/// would only bloat the transaction (flagged alongside #178).
+pub const MAX_PROOF_LEN: usize = 256;
+
 #[program]
 pub mod paraloom_program {
     use super::*;
@@ -118,6 +123,7 @@ pub mod paraloom_program {
         require!(!bridge_state.paused, BridgeError::BridgePaused);
         require!(amount > 0, BridgeError::InvalidAmount);
         require!(!proof.is_empty(), BridgeError::InvalidProof);
+        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
 
         let current_slot = Clock::get()?.slot;
         require!(
@@ -450,10 +456,14 @@ pub struct Deposit<'info> {
 #[derive(Accounts)]
 #[instruction(nullifier: [u8; 32])]
 pub struct Withdraw<'info> {
+    // `has_one = authority` binds the signer to the authority recorded at
+    // `initialize` (the bridge authority / consensus leader). Without it any
+    // signer could settle a withdrawal — see #178.
     #[account(
         mut,
         seeds = [b"bridge_state"],
-        bump
+        bump,
+        has_one = authority
     )]
     pub bridge_state: Account<'info, BridgeState>,
 
@@ -769,6 +779,9 @@ pub enum BridgeError {
 
     #[msg("Invalid proof")]
     InvalidProof,
+
+    #[msg("Proof exceeds maximum length")]
+    ProofTooLarge,
 
     #[msg("Insufficient funds in bridge")]
     InsufficientFunds,
