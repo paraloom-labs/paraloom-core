@@ -7,8 +7,8 @@ use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
 use std::fs;
 use std::path::Path;
 
-const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v3.key";
-const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v3.key";
+const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v4.key";
+const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v4.key";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();

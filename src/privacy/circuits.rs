@@ -595,17 +595,29 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
 
         let mut current_hash = commitment.clone();
 
+        // Walk the authentication path to the root. The sibling at each level
+        // and the direction are *witnesses*, not circuit constants, so a
+        // single proving/verifying key pair verifies a membership proof for
+        // any leaf and reveals neither the path nor which leaf is spent.
+        // (An earlier version allocated the sibling as `FpVar::constant` and
+        // branched on the direction with a Rust `if`, which baked the path
+        // into the R1CS — the keys then fit one fixed path and only the
+        // degenerate single-leaf, empty-path case ever verified.)
         if let Some(path) = &self.input_path {
             for (sibling_hash, is_left) in path {
-                let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
+                let sibling_var = FpVar::new_witness(cs.clone(), || {
+                    Ok(Fr::from_le_bytes_mod_order(sibling_hash))
+                })?;
+                let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
 
-                let (l, r) = if *is_left {
-                    (&current_hash, &sibling_var)
-                } else {
-                    (&sibling_var, &current_hash)
-                };
+                // `is_left` = the current node is the left child, so it pairs
+                // as (current, sibling); otherwise (sibling, current). Use a
+                // constraint-level select so the R1CS shape is the same for
+                // every direction pattern.
+                let l = is_left_var.select(&current_hash, &sibling_var)?;
+                let r = is_left_var.select(&sibling_var, &current_hash)?;
 
-                current_hash = poseidon_merkle_pair_gadget(cs.clone(), l, r)?;
+                current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
             }
         }
 

@@ -142,16 +142,13 @@ impl VerificationChunk {
 
 /// Default path for the withdrawal verifying key on disk.
 ///
-/// Versioned (`_v3`) after the v0.3.0 circuit alignment work that
-/// extended `WithdrawCircuit` with an `input_recipient` witness so it
-/// could locate notes produced by `DepositCircuit`. The constraint
-/// system shape changed, so any key generated against the prior
-/// circuit (filenames `withdraw_verifying.key` or
-/// `withdraw_verifying_v2.key`) is incompatible and will fail
-/// verification. Regenerate with
-/// `cargo run --bin setup_withdrawal_ceremony` to produce the `_v3`
-/// artifact.
-pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v3.key";
+/// Versioned (`_v4`) after the commitment tree became fixed-depth (#184): a
+/// withdrawal proof now always carries a depth-`DEFAULT_TREE_DEPTH` Merkle
+/// path, so the circuit's constraint system has a fixed shape and the `_v3`
+/// keys (generated from an empty path, single-leaf only) no longer verify.
+/// Earlier filenames (`withdraw_verifying.key`, `_v2`, `_v3`) are incompatible.
+/// Regenerate with `cargo run --bin setup-withdrawal-ceremony`.
+pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v4.key";
 
 /// Errors that can arise when loading the withdrawal verifying key from
 /// disk. Surfacing these as a typed enum (instead of `expect`-style
