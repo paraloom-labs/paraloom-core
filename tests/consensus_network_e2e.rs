@@ -60,6 +60,12 @@ fn accept_verifier() -> paraloom::node::WithdrawalProofVerifier {
     Arc::new(|_req: &WithdrawalVerificationRequest| true)
 }
 
+/// An injected verifier that rejects every request — a byzantine validator
+/// that votes Invalid on a withdrawal the honest majority accepts.
+fn reject_verifier() -> paraloom::node::WithdrawalProofVerifier {
+    Arc::new(|_req: &WithdrawalVerificationRequest| false)
+}
+
 /// An OS-assigned free loopback port. Binding to port 0 and reading back the
 /// assignment avoids both the lack of a bound-address API (we need the port
 /// to build node1's bootstrap address) and the cross-run flakiness of fixed
@@ -216,6 +222,145 @@ async fn two_node_withdrawal_reaches_quorum_over_libp2p() {
     let _ = node1.stop().await;
     h0.abort();
     h1.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "binds loopback TCP + depends on gossipsub mesh timing; CI runs with --ignored"]
+async fn five_node_byzantine_quorum_holds() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // node0 initiates and observes; nodes 1..=4 vote. Honest nodes accept;
+    // the last node is byzantine and votes Invalid. A 3-of-5 threshold: the
+    // three honest Valid votes reach quorum despite the one Invalid.
+    const N: usize = 5;
+    let dirs: Vec<_> = (0..N)
+        .map(|_| tempfile::tempdir().expect("tempdir"))
+        .collect();
+    let ports: Vec<u16> = (0..N).map(|_| free_port()).collect();
+    let port0 = ports[0];
+
+    let mut nodes = Vec::with_capacity(N);
+    for i in 0..N {
+        // Star topology: every voter dials node0, so node0 broadcasts to and
+        // collects votes from all of them.
+        let bootstrap = if i == 0 {
+            vec![]
+        } else {
+            vec![format!("/ip4/127.0.0.1/tcp/{port0}")]
+        };
+        let verifier = if i == N - 1 {
+            reject_verifier() // the byzantine node
+        } else {
+            accept_verifier()
+        };
+        let node = Node::new(validator_settings(
+            ports[i],
+            bootstrap,
+            dirs[i].path().to_str().unwrap(),
+        ))
+        .expect("node")
+        .with_proof_verifier(verifier)
+        .with_consensus_thresholds(3, 5);
+        nodes.push(node);
+    }
+
+    // Launch node0 first and wait until it is listening — each voter's
+    // bootstrap dial fires once and is not retried, so the hub must be up.
+    let mut handles = Vec::with_capacity(N);
+    let n0 = nodes[0].clone();
+    handles.push(tokio::spawn(async move { n0.run().await }));
+    let listening = wait_until(
+        Duration::from_secs(15),
+        Duration::from_millis(100),
+        || async {
+            tokio::net::TcpStream::connect(("127.0.0.1", port0))
+                .await
+                .is_ok()
+        },
+    )
+    .await;
+    assert!(
+        listening,
+        "node0 did not start listening on {port0} within 15s"
+    );
+    for node in nodes.iter().skip(1) {
+        let n = node.clone();
+        handles.push(tokio::spawn(async move { n.run().await }));
+    }
+
+    let node0 = nodes[0].clone();
+
+    // node0 must connect to all four voters before it broadcasts.
+    let connected = wait_until(Duration::from_secs(40), Duration::from_millis(500), || {
+        let n0 = node0.clone();
+        async move { n0.connected_peer_count().await >= N - 1 }
+    })
+    .await;
+    assert!(
+        connected,
+        "node0 did not connect to all {} voters within 40s",
+        N - 1
+    );
+
+    // Start the verification, retrying until the Discovery handshake has
+    // registered enough validators (the 3-of-5 threshold needs >= 3).
+    let until = Instant::now() + Duration::from_secs(30);
+    let request_id = loop {
+        match node0
+            .initiate_withdrawal_verification(sample_request())
+            .await
+        {
+            Ok(rid) => break rid,
+            Err(e) if Instant::now() < until => {
+                log::debug!("initiate not ready yet ({e}); retrying");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("node0 could not start verification within 30s: {e}"),
+        }
+    };
+
+    // Three honest Valid votes reach the 3-of-5 quorum despite the byzantine
+    // node's Invalid vote.
+    let quorum = wait_until(Duration::from_secs(40), Duration::from_millis(500), || {
+        let n0 = node0.clone();
+        let rid = request_id.clone();
+        async move {
+            matches!(
+                n0.withdrawal_consensus_status(&rid).await,
+                Ok(Some(VerificationVote::Valid))
+            )
+        }
+    })
+    .await;
+    assert!(
+        quorum,
+        "did not reach Valid quorum despite a byzantine voter within 40s"
+    );
+
+    // Confirm the byzantine dissent actually landed and was outvoted, not that
+    // we merely got lucky with three honest votes: >= 3 Valid and >= 1 Invalid.
+    let counted = wait_until(Duration::from_secs(15), Duration::from_millis(500), || {
+        let n0 = node0.clone();
+        let rid = request_id.clone();
+        async move {
+            matches!(
+                n0.withdrawal_vote_counts(&rid).await,
+                Ok(Some((valid, invalid))) if valid >= 3 && invalid >= 1
+            )
+        }
+    })
+    .await;
+    assert!(
+        counted,
+        "expected >=3 Valid and >=1 Invalid (byzantine) vote to be recorded"
+    );
+
+    for node in &nodes {
+        let _ = node.stop().await;
+    }
+    for h in handles {
+        h.abort();
+    }
 }
 
 /// A distinct request per call (nanosecond-keyed id + nullifier) so retried

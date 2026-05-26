@@ -900,6 +900,22 @@ impl Node {
         }
     }
 
+    /// Tally of `(valid, invalid)` votes seen so far for a withdrawal
+    /// verification this node initiated (#181). Read-only view over the
+    /// coordinator's status — lets a test confirm that a byzantine
+    /// (Invalid-voting) validator's dissent actually reached the quorum and
+    /// was outvoted, rather than just observing the final Valid result.
+    /// `Ok(None)` on a node with no withdrawal coordinator.
+    pub async fn withdrawal_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
+        match &self.withdrawal_coordinator {
+            Some(coordinator) => {
+                let (_pct, valid, invalid) = coordinator.get_status(request_id).await?;
+                Ok(Some((valid, invalid)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Run the node
     pub async fn run(&self) -> Result<()> {
         info!("Starting node: {:?}", self.node_info);
