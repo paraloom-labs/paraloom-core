@@ -691,6 +691,44 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
     )
 }
 
+/// Drain the consensus approval channel, settling each withdrawal via
+/// `submit` (#164).
+///
+/// The approval channel is local to the coordinator that reached quorum: only
+/// the node that gathered the votes for a request — the one the client
+/// submitted it to — emits an [`ApprovedWithdrawal`] here, so exactly one node
+/// settles and there is nothing to gate. (An earlier version gated submission
+/// on a deterministically-selected leader, assuming the approval was gossiped
+/// to every node. It is not — the channel is in-process — so the chosen leader
+/// usually did not hold the approval and the settlement was silently dropped.
+/// Replay protection on the nullifier PDA still makes a duplicate submit safe
+/// if the model ever changes to several nodes tallying independently.)
+///
+/// A per-message failure — including a replay whose nullifier is already spent
+/// — is logged and skipped so it cannot kill the task and stall later
+/// approvals.
+async fn settle_approved_withdrawals<F, Fut>(
+    mut rx: mpsc::UnboundedReceiver<ApprovedWithdrawal>,
+    mut submit: F,
+) where
+    F: FnMut(ApprovedWithdrawal) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
+{
+    while let Some(approved) = rx.recv().await {
+        let request_id = approved.request_id.clone();
+        match submit(approved).await {
+            Ok(sig) => info!("on-chain withdraw submitted for {}: {}", request_id, sig),
+            Err(e) if is_replay_error(&e) => {
+                log::debug!(
+                    "withdrawal {} already settled (nullifier spent), skipping",
+                    request_id
+                )
+            }
+            Err(e) => log::warn!("withdrawal {} submit failed: {}", request_id, e),
+        }
+    }
+}
+
 impl Node {
     /// Create a new node
     pub fn new(settings: Settings) -> Result<Self> {
@@ -1257,63 +1295,15 @@ impl Node {
         // on-chain via the bridge. A per-message failure — including a
         // replay whose nullifier is already spent — is logged and
         // skipped so it cannot kill the task and stall later approvals.
-        if let (Some(bridge), Some(coordinator), Some(rx)) = (
+        if let (Some(bridge), Some(_coordinator), Some(rx)) = (
             self.bridge.clone(),
             self.withdrawal_coordinator.clone(),
             self.approval_rx.lock().await.take(),
         ) {
-            let mut rx = rx;
-            let local_id = self.node_info.id.clone();
-            let handle = tokio::spawn(async move {
-                while let Some(approved) = rx.recv().await {
-                    let request_id = approved.request_id.clone();
-
-                    // Leader gate (#175): the gossip mesh floods the
-                    // approval to every node, so without this each
-                    // validator would submit the same withdrawal — N-1
-                    // redundant, replay-rejected transactions. Only the
-                    // deterministically-selected leader for this request
-                    // settles it; every node derives the same leader from
-                    // the request_id seed, so exactly one submits.
-                    match coordinator.select_leader(&request_id).await {
-                        Ok(leader) if leader != local_id => {
-                            log::debug!(
-                                "withdrawal {} approved; not leader, leaving submission to {:?}",
-                                request_id,
-                                leader
-                            );
-                            continue;
-                        }
-                        Ok(_) => { /* we are the leader — settle below */ }
-                        Err(e) => {
-                            // No leader selectable (e.g. empty set): submit
-                            // rather than drop the withdrawal. Replay
-                            // protection keeps it safe if another node
-                            // also submits.
-                            log::warn!(
-                                "leader selection failed for {}: {} — submitting anyway",
-                                request_id,
-                                e
-                            );
-                        }
-                    }
-
-                    match bridge.lock().await.submit_approved(approved).await {
-                        Ok(sig) => {
-                            info!("on-chain withdraw submitted for {}: {}", request_id, sig)
-                        }
-                        Err(e) if is_replay_error(&e) => {
-                            log::debug!(
-                                "withdrawal {} already settled (nullifier spent), skipping",
-                                request_id
-                            )
-                        }
-                        Err(e) => {
-                            log::warn!("withdrawal {} submit failed: {}", request_id, e)
-                        }
-                    }
-                }
-            });
+            let handle = tokio::spawn(settle_approved_withdrawals(rx, move |approved| {
+                let bridge = bridge.clone();
+                async move { bridge.lock().await.submit_approved(approved).await }
+            }));
             *self.submitter_task.lock().await = Some(handle);
             info!("withdrawal submitter task started");
         }
@@ -1647,6 +1637,74 @@ impl Clone for Node {
 mod tests {
     use super::*;
     use crate::config::Settings;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn approval(id: &str) -> ApprovedWithdrawal {
+        ApprovedWithdrawal {
+            request_id: id.to_string(),
+            nullifier: [0u8; 32],
+            amount: 1,
+            recipient: [0u8; 32],
+            proof: Vec::new(),
+            fee: 0,
+        }
+    }
+
+    // Every approval on the channel is settled: the submitter does not gate on
+    // leader selection. Regression for #164 — a leader gate here dropped
+    // approvals because the channel is in-process, not gossiped, so the
+    // deterministically-chosen leader rarely held the approval and the
+    // settlement was silently lost.
+    #[tokio::test]
+    async fn settles_every_approval_without_gating() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..3 {
+            tx.send(approval(&format!("req-{i}"))).unwrap();
+        }
+        drop(tx);
+
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let counter = submitted.clone();
+        settle_approved_withdrawals(rx, move |_approved| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok("signature".to_string())
+            }
+        })
+        .await;
+
+        assert_eq!(submitted.load(Ordering::SeqCst), 3);
+    }
+
+    // A replay (nullifier already spent) is skipped quietly and does not stop
+    // the task from settling later approvals.
+    #[tokio::test]
+    async fn replay_error_does_not_stall_later_approvals() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(approval("replayed")).unwrap();
+        tx.send(approval("fresh")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_withdrawals(rx, move |_approved| {
+            let counter = counter.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(crate::bridge::BridgeError::InvalidTransaction(
+                        "nullifier already spent".to_string(),
+                    ))
+                } else {
+                    Ok("signature".to_string())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     // With the bridge disabled (the default), a node owns neither a
     // shielded pool nor a bridge manager — unchanged from pre-#163.
