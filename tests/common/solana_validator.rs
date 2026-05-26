@@ -7,7 +7,8 @@
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::signature::Signer;
+use solana_sdk::signature::{Signature, Signer};
+use solana_sdk::transaction::Transaction;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -103,6 +104,37 @@ impl Drop for SubprocessValidator {
 pub fn paraloom_program_so() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("programs/paraloom/target/deploy/paraloom_program.so")
+}
+
+/// Submit `tx` and poll its signature status against a hard deadline,
+/// returning `Err` on timeout instead of blocking forever. The default
+/// `send_and_confirm_transaction` has no deadline: the #164 happy-path
+/// withdraw hung CI for 26 minutes because a settlement that never
+/// confirmed left that loop spinning. Bounded confirm makes a stuck
+/// withdrawal fail fast and visibly — the symptom becomes a clear
+/// timeout error rather than a wedged runner.
+pub fn confirm_within(
+    rpc: &RpcClient,
+    tx: &Transaction,
+    timeout: Duration,
+) -> Result<Signature, String> {
+    let sig = rpc
+        .send_transaction(tx)
+        .map_err(|e| format!("send_transaction: {}", e))?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match rpc.get_signature_status(&sig) {
+            Ok(Some(Ok(()))) => return Ok(sig),
+            Ok(Some(Err(e))) => return Err(format!("transaction failed on-chain: {:?}", e)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("signature status poll: {}", e)),
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Err(format!(
+        "transaction {} did not confirm within {:?}",
+        sig, timeout
+    ))
 }
 
 /// Airdrop `lamports` to a fresh keypair and poll until the balance

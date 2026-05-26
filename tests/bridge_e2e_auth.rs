@@ -7,16 +7,20 @@
 //!   * a signer other than the bridge authority is rejected (`has_one`)
 //!   * a proof longer than `MAX_PROOF_LEN` is rejected (`ProofTooLarge`)
 //!
-//! Both are fast preflight rejections — no consensus, no confirmation wait —
-//! so this suite stays green and quick. The authority happy-path settlement
-//! is exercised by the consensus E2E (#164).
+//! The first two are fast preflight rejections — no consensus, no
+//! confirmation wait. The third (`authority_can_withdraw`) is the #164
+//! Layer 1 happy path: the bridge authority settles a real withdrawal on
+//! chain. It confirms with a bounded deadline (`confirm_within`) so a
+//! settlement that never lands fails fast instead of hanging CI, and
+//! asserts the on-chain effects (nullifier PDA created, vault debited,
+//! recipient credited). Network-layer consensus is a separate test.
 //!
 //! Ignored by default; CI runs it via the bridge-e2e workflow with
 //! `--ignored --test-threads=1` after installing the Solana CLI.
 
 mod common;
 use common::solana_validator::{
-    fund_new_keypair, paraloom_program_so, SubprocessValidator, PARALOOM_PROGRAM_ID,
+    confirm_within, fund_new_keypair, paraloom_program_so, SubprocessValidator, PARALOOM_PROGRAM_ID,
 };
 use paraloom::bridge::solana::{
     create_deposit_instruction, create_initialize_instruction, create_withdraw_instruction,
@@ -26,6 +30,7 @@ use paraloom::bridge::EXPECTED_PROGRAM_VERSION;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
+use std::time::Duration;
 
 /// Boot a validator, airdrop a fresh authority, initialize the bridge under
 /// it, and fund the vault so a withdrawal reaches the on-chain guards rather
@@ -157,4 +162,66 @@ fn oversized_proof_rejected() {
         "no nullifier PDA may exist for the rejected oversized-proof withdrawal"
     );
     log::info!("oversized proof correctly rejected: {:?}", res.err());
+}
+
+#[test]
+#[ignore = "requires solana-test-validator; run in CI via bridge-e2e workflow"]
+fn authority_can_withdraw() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (validator, program_id, authority) = bootstrap(8906);
+    let rpc = validator.rpc_client();
+
+    // The bridge authority settles a well-formed withdrawal. bootstrap
+    // funded the vault with 2_000_000 lamports, so this 1_000_000 draw is
+    // within balance and must pass every on-chain guard.
+    let (vault_pda, _) = derive_bridge_vault(&program_id);
+    let vault_before = rpc.get_balance(&vault_pda).expect("vault balance before");
+
+    let recipient = Keypair::new();
+    let nullifier = [77u8; 32];
+    let amount = 1_000_000u64;
+    let cur_slot = rpc.get_slot().unwrap_or(0);
+    let ix = create_withdraw_instruction(
+        &program_id,
+        &authority.pubkey(),
+        &vault_pda,
+        recipient.pubkey().to_bytes(),
+        nullifier,
+        amount,
+        cur_slot + 150,
+        vec![1u8; 192],
+    )
+    .expect("withdraw ix");
+    let bh = rpc.get_latest_blockhash().expect("blockhash");
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&authority.pubkey()), &[&authority], bh);
+
+    // Bounded confirm — a withdrawal that never lands fails fast here
+    // rather than wedging the runner the way #164's unbounded confirm did.
+    let sig = confirm_within(&rpc, &tx, Duration::from_secs(30))
+        .expect("authority withdrawal must confirm");
+    log::info!("authority withdrawal confirmed: {}", sig);
+
+    // The nullifier PDA is `init`'d by the settlement — its existence is
+    // the on-chain record that this note was spent.
+    let (nullifier_pda, _) = derive_nullifier_account(&program_id, &nullifier);
+    assert!(
+        rpc.get_account(&nullifier_pda).is_ok(),
+        "nullifier PDA must exist after a successful settlement"
+    );
+
+    // Vault debited by exactly `amount`; recipient credited the same. The
+    // authority pays the transaction fee, so the vault delta is clean.
+    let vault_after = rpc.get_balance(&vault_pda).expect("vault balance after");
+    assert_eq!(
+        vault_before - vault_after,
+        amount,
+        "vault must be debited by exactly the withdrawn amount"
+    );
+    assert_eq!(
+        rpc.get_balance(&recipient.pubkey())
+            .expect("recipient balance"),
+        amount,
+        "recipient must receive exactly the withdrawn amount"
+    );
 }
