@@ -1,27 +1,32 @@
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::thread_rng;
 use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
+use paraloom::privacy::merkle::DEFAULT_TREE_DEPTH;
 use std::fs;
 use std::path::Path;
 
-// Versioned (`_v3`) after the v0.3.0 circuit alignment work that
-// extended `WithdrawCircuit` with an `input_recipient` witness so it
-// could locate notes produced by `DepositCircuit`. The constraint
-// system shape changed; the previous `_v2` keys (and the original
-// pre-Poseidon keys) are not interchangeable. Bumping the filename
-// ensures the loader can't silently pick up a stale key.
-const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v3.key";
-const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v3.key";
+// Versioned (`_v4`) after the commitment tree became fixed-depth (#184). A
+// withdrawal proof now always carries a depth-`DEFAULT_TREE_DEPTH` Merkle
+// path, so the circuit's constraint system has a fixed shape with that many
+// `poseidon_merkle_pair` gadgets. The `_v3` keys were generated from
+// `WithdrawCircuit::new()` (an empty path) and only fit a single-leaf
+// withdrawal — incompatible with the fixed-depth circuit. Bumping the
+// filename ensures the loader can't silently pick up a stale, single-leaf key.
+const PROVING_KEY_PATH: &str = "keys/withdraw_proving_v4.key";
+const VERIFYING_KEY_PATH: &str = "keys/withdraw_verifying_v4.key";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    println!("=== Withdrawal Circuit Setup Ceremony (v3) ===\n");
+    println!("=== Withdrawal Circuit Setup Ceremony (v4) ===\n");
     println!("This will generate proving and verifying keys for the");
-    println!("post-v0.3.0 withdrawal circuit (input_recipient witness).\n");
-    println!("Earlier keys (keys/withdraw_*.key, including the _v2 set)");
-    println!("are INCOMPATIBLE with the current circuit. They can be deleted");
-    println!("safely once this ceremony completes.\n");
+    println!(
+        "fixed-depth withdrawal circuit (depth {}).\n",
+        DEFAULT_TREE_DEPTH
+    );
+    println!("Earlier keys (keys/withdraw_*.key, including the _v3 set)");
+    println!("are INCOMPATIBLE with the fixed-depth circuit. They can be");
+    println!("deleted safely once this ceremony completes.\n");
     println!("This is a TRUSTED SETUP. In production, this should be done");
     println!("through a multi-party computation ceremony.\n");
 
@@ -43,7 +48,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all("keys")?;
 
     println!("Creating dummy circuit for setup...");
-    let dummy_circuit = WithdrawCircuit::new();
+    // The setup only reads the circuit's constraint *shape*, not the witness
+    // values — but the shape now depends on the Merkle path length, so the
+    // dummy must carry a full depth-`DEFAULT_TREE_DEPTH` path (the fixed depth
+    // every real withdrawal proof uses). An empty path would regenerate the
+    // old single-leaf keys.
+    let dummy_path: Vec<([u8; 32], bool)> = vec![([0u8; 32], false); DEFAULT_TREE_DEPTH];
+    let dummy_circuit = WithdrawCircuit::with_witness(
+        [0u8; 32], // merkle_root
+        [0u8; 32], // nullifier
+        0,         // withdraw_amount
+        0,         // input_value
+        [0u8; 32], // input_randomness
+        [0u8; 32], // input_recipient
+        [0u8; 32], // secret
+        dummy_path,
+    );
 
     println!("Running trusted setup...");
     println!("This may take a few minutes...\n");
