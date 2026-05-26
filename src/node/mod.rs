@@ -23,6 +23,15 @@ use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
 
 /// Node implementation
+/// Withdrawal-proof verifier hook (#181). A closure that decides whether a
+/// withdrawal request's proof is valid. Production never sets one — the node
+/// uses the real Groth16 path. The multi-node consensus E2E injects one via
+/// [`Node::with_proof_verifier`] to exercise the libp2p gossip → vote →
+/// quorum wiring independently of the cryptographic proof (which is covered
+/// by the privacy circuit tests and the on-chain settlement test).
+pub type WithdrawalProofVerifier =
+    Arc<dyn Fn(&crate::consensus::withdrawal::WithdrawalVerificationRequest) -> bool + Send + Sync>;
+
 pub struct Node {
     settings: Settings,
     network: Arc<NetworkManager>,
@@ -90,6 +99,13 @@ pub struct Node {
     /// Submitter task handle (#164): drains approvals and settles them
     /// on-chain. Spawned in run(), aborted in stop().
     submitter_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Optional withdrawal-proof verifier override (#181, Layer 2 testing
+    /// seam). `None` in production, so `verify_withdrawal_proof` runs the
+    /// real Groth16 path. The multi-node consensus E2E injects a closure
+    /// here to decouple the network/consensus wiring under test from the
+    /// cryptographic proof path. Set via [`Node::with_proof_verifier`].
+    proof_verifier_override: Option<WithdrawalProofVerifier>,
 }
 
 #[async_trait]
@@ -828,9 +844,60 @@ impl Node {
             withdrawal_coordinator,
             approval_rx: Arc::new(Mutex::new(approval_rx)),
             submitter_task: Arc::new(Mutex::new(None)),
+            proof_verifier_override: None,
         };
 
         Ok(node)
+    }
+
+    /// Inject a withdrawal-proof verifier, overriding the real Groth16 path
+    /// (#181). Intended for the multi-node consensus E2E, whose goal is to
+    /// exercise the libp2p gossip → vote → quorum wiring rather than the
+    /// cryptographic proof itself (covered by the privacy circuit tests and
+    /// the on-chain settlement test). Production never calls this, so
+    /// verification always uses the real verifier.
+    pub fn with_proof_verifier(mut self, verifier: WithdrawalProofVerifier) -> Self {
+        self.proof_verifier_override = Some(verifier);
+        self
+    }
+
+    /// Override the withdrawal-consensus quorum thresholds (#181, testing
+    /// seam — deliberately NOT wired to any config file). Production builds
+    /// the node via `new()`, which always uses the BFT-safe defaults
+    /// (7-of-10); because these thresholds are unreachable from a settings
+    /// file, an operator can never weaken the quorum by misconfiguration and
+    /// there is no runtime attack surface — reaching this requires writing
+    /// and compiling code. A multi-node E2E calls it to drive consensus with
+    /// a small validator set (e.g. 3-of-5).
+    ///
+    /// Must be called right after `new()`, before `run()` clones the node:
+    /// the coordinator is uniquely owned then, so `Arc::get_mut` succeeds.
+    /// A no-op on a node with no withdrawal coordinator, or once cloned.
+    pub fn with_consensus_thresholds(
+        mut self,
+        min_validators: usize,
+        total_validators: usize,
+    ) -> Self {
+        if let Some(coordinator) = self.withdrawal_coordinator.as_mut().and_then(Arc::get_mut) {
+            coordinator.set_consensus_thresholds(min_validators, total_validators);
+        }
+        self
+    }
+
+    /// Consensus status for a withdrawal verification this node initiated
+    /// (#181). Delegates to the withdrawal coordinator's quorum check:
+    /// `Ok(Some(vote))` once a validator quorum is reached, `Ok(None)` while
+    /// votes are still accumulating, `Ok(None)` on a node with no withdrawal
+    /// coordinator. Lets a test observe quorum without reaching into the
+    /// node's internals.
+    pub async fn withdrawal_consensus_status(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::consensus::withdrawal::VerificationVote>> {
+        match &self.withdrawal_coordinator {
+            Some(coordinator) => coordinator.check_consensus(request_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Run the node
@@ -1291,6 +1358,14 @@ impl Node {
         Ok(request_id)
     }
 
+    /// Number of peers this node is currently connected to (#181). Read-only
+    /// introspection over the network manager — lets a test wait for the
+    /// gossip mesh to form before initiating a verification, so the broadcast
+    /// is not dropped for want of mesh peers.
+    pub async fn connected_peer_count(&self) -> usize {
+        self.network.connected_peers().await.len()
+    }
+
     /// Get node info
     pub fn node_info(&self) -> NodeInfo {
         self.node_info.clone()
@@ -1425,6 +1500,12 @@ impl Node {
         request: &crate::consensus::withdrawal::WithdrawalVerificationRequest,
         pool: &Arc<crate::privacy::pool::ShieldedPool>,
     ) -> Result<bool> {
+        // Override seam (#181): when a verifier is injected, use it instead
+        // of the real Groth16 path. Never set in production.
+        if let Some(verifier) = &self.proof_verifier_override {
+            return Ok(verifier(request));
+        }
+
         use crate::privacy::{bytes_to_field, deserialize_proof, Groth16ProofSystem};
         use ark_bls12_381::Fr;
 
@@ -1542,6 +1623,7 @@ impl Clone for Node {
             withdrawal_coordinator: self.withdrawal_coordinator.clone(),
             approval_rx: self.approval_rx.clone(),
             submitter_task: self.submitter_task.clone(),
+            proof_verifier_override: self.proof_verifier_override.clone(),
         }
     }
 }
