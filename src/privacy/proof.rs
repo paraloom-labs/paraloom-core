@@ -309,10 +309,29 @@ impl ProofVerifier {
             };
         }
 
-        // Load verifying key. The loader has already logged the failure
-        // with the path that was attempted; here we just propagate the
-        // reason into the structured verification result so the caller
-        // can return an actionable error to the operator.
+        Self::verify_withdrawal_parts(
+            &tx.merkle_root,
+            &tx.input_nullifier.0,
+            tx.amount,
+            &tx.zk_proof,
+        )
+    }
+
+    /// Verify a withdrawal zkSNARK proof from its raw parts against the
+    /// trusted-setup verifying key. This is the canonical withdrawal
+    /// verifier: it loads the ceremony key via `get_verifying_key` and lifts
+    /// the public inputs exactly as the shipped `WithdrawCircuit` reads them
+    /// — `[merkle_root, nullifier, amount]`, the byte blobs via
+    /// `Fr::from_le_bytes_mod_order` and the amount via `Fr::from`. Both
+    /// `verify_withdraw` and the node's network verifier route through here,
+    /// so the verifying key and the public-input layout have a single source
+    /// of truth (a proof from `generate-withdrawal-proof` verifies on a node).
+    pub fn verify_withdrawal_parts(
+        merkle_root: &[u8; 32],
+        nullifier: &[u8; 32],
+        amount: u64,
+        zk_proof: &[u8],
+    ) -> VerificationResult {
         let verifying_key = match Self::get_verifying_key() {
             Ok(vk) => vk,
             Err(e) => {
@@ -322,8 +341,7 @@ impl ProofVerifier {
             }
         };
 
-        // Deserialize proof from bytes
-        let proof = match Proof::<Bls12_381>::deserialize_compressed(&tx.zk_proof[..]) {
+        let proof = match Proof::<Bls12_381>::deserialize_compressed(zk_proof) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to deserialize proof: {}", e);
@@ -333,47 +351,20 @@ impl ProofVerifier {
             }
         };
 
-        // Prepare public inputs — 3 field elements total, matching the
-        // WithdrawCircuit shape after the Poseidon migration:
-        //
-        //   [merkle_root_fr, nullifier_fr, withdraw_amount_fr]
-        //
-        // The circuit now allocates each of these as a single
-        // `FpVar::new_input`; byte blobs on the wire are lifted with
-        // `Fr::from_le_bytes_mod_order` to match the on-circuit reading.
-        // (The previous 5-element layout — 2 Fr per 32-byte blob via
-        // `ToConstraintField` — targeted the old byte-sponge circuit
-        // and never agreed with any circuit that actually shipped.)
         let public_inputs = vec![
-            Fr::from_le_bytes_mod_order(&tx.merkle_root),
-            Fr::from_le_bytes_mod_order(&tx.input_nullifier.0),
-            Fr::from(tx.amount),
+            Fr::from_le_bytes_mod_order(merkle_root),
+            Fr::from_le_bytes_mod_order(nullifier),
+            Fr::from(amount),
         ];
 
-        // Verify the zkSNARK proof
         match Groth16ProofSystem::verify(verifying_key, &public_inputs, &proof) {
-            Ok(true) => {
-                log::info!(
-                    "zkSNARK proof verified successfully for nullifier: {:?}",
-                    hex::encode(tx.input_nullifier.0)
-                );
-                VerificationResult::Valid
-            }
-            Ok(false) => {
-                log::warn!(
-                    "zkSNARK proof verification failed for nullifier: {:?}",
-                    hex::encode(tx.input_nullifier.0)
-                );
-                VerificationResult::Invalid {
-                    reason: "zkSNARK proof verification failed".to_string(),
-                }
-            }
-            Err(e) => {
-                log::error!("zkSNARK verification error: {}", e);
-                VerificationResult::Invalid {
-                    reason: format!("Verification error: {}", e),
-                }
-            }
+            Ok(true) => VerificationResult::Valid,
+            Ok(false) => VerificationResult::Invalid {
+                reason: "zkSNARK proof verification failed".to_string(),
+            },
+            Err(e) => VerificationResult::Invalid {
+                reason: format!("Verification error: {}", e),
+            },
         }
     }
 
