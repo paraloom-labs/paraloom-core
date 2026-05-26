@@ -203,73 +203,85 @@ impl MerkleTree {
         path.verify(leaf, &root)
     }
 
-    /// Compute the root from current leaves
+    /// Precomputed empty-subtree hashes. `empty[k]` is the root of a fully
+    /// empty subtree of height `k`: `empty[0]` is the empty-leaf value and
+    /// each level hashes two empty subtrees of the level below. Used to pad
+    /// absent siblings so the tree is a fixed-depth tree — every leaf has a
+    /// path of exactly `self.depth` siblings, and one set of Groth16 keys
+    /// verifies a withdrawal regardless of how many notes the pool holds.
+    fn empty_subtree_hashes(&self) -> Vec<[u8; 32]> {
+        let mut empties = Vec::with_capacity(self.depth + 1);
+        empties.push([0u8; 32]); // empty leaf
+        for k in 0..self.depth {
+            let prev = empties[k];
+            empties.push(Self::hash_pair(&prev, &prev));
+        }
+        empties
+    }
+
+    /// Compute the fixed-depth root from the current leaves.
+    ///
+    /// Hashes the leaves up exactly `self.depth` levels, filling any absent
+    /// position with the empty-subtree hash for that level. The shape is
+    /// fixed (unlike the earlier dynamic tree, whose height — and so its key
+    /// requirements — changed with the leaf count), so a single trusted setup
+    /// covers a pool of any size up to `2^depth` notes.
     fn compute_root(&self, leaves: &[[u8; 32]]) -> [u8; 32] {
+        let empties = self.empty_subtree_hashes();
         if leaves.is_empty() {
-            return [0u8; 32]; // Empty tree root
+            return empties[self.depth];
         }
 
         let mut layer = leaves.to_vec();
-
-        // Build tree bottom-up
-        while layer.len() > 1 {
-            let mut next_layer = Vec::new();
-
-            for chunk in layer.chunks(2) {
-                let hash = if chunk.len() == 2 {
-                    Self::hash_pair(&chunk[0], &chunk[1])
-                } else {
-                    // Odd number of nodes - hash with itself
-                    Self::hash_pair(&chunk[0], &chunk[0])
-                };
-                next_layer.push(hash);
+        for empty in empties.iter().take(self.depth) {
+            let parent_count = layer.len().div_ceil(2);
+            let mut next_layer = Vec::with_capacity(parent_count);
+            for j in 0..parent_count {
+                let left = layer.get(2 * j).copied().unwrap_or(*empty);
+                let right = layer.get(2 * j + 1).copied().unwrap_or(*empty);
+                next_layer.push(Self::hash_pair(&left, &right));
             }
-
             layer = next_layer;
         }
 
         layer[0]
     }
 
-    /// Compute the Merkle path for a leaf
+    /// Compute the fixed-depth Merkle path for the leaf at `index`: exactly
+    /// `self.depth` `(sibling, is_sibling_on_right)` pairs, padding absent
+    /// siblings with the empty-subtree hash for the level. Hashing the leaf
+    /// up this path reproduces [`compute_root`]'s root and matches both
+    /// `MerklePath::verify` and the circuit gadget (same `hash_pair`, same
+    /// direction convention).
     fn compute_path(&self, leaves: &[[u8; 32]], index: usize) -> MerklePath {
-        let mut path = Vec::new();
-        let mut indices = Vec::new();
+        let empties = self.empty_subtree_hashes();
+        let mut path = Vec::with_capacity(self.depth);
+        let mut indices = Vec::with_capacity(self.depth);
         let mut layer = leaves.to_vec();
         let mut current_index = index;
 
-        while layer.len() > 1 {
+        for empty in empties.iter().take(self.depth) {
             let is_right_child = current_index % 2 == 1;
             let sibling_index = if is_right_child {
                 current_index - 1
             } else {
                 current_index + 1
             };
-
-            // Get sibling (or duplicate if it doesn't exist)
-            let sibling = if sibling_index < layer.len() {
-                layer[sibling_index]
-            } else {
-                layer[current_index]
-            };
+            let sibling = layer.get(sibling_index).copied().unwrap_or(*empty);
 
             path.push(sibling);
-            // Push !is_right_child because we need to know if sibling is on right
-            // If we're the right child (is_right_child=true), sibling is on left (false)
-            // If we're the left child (is_right_child=false), sibling is on right (true)
+            // Push !is_right_child: if we are the right child the sibling is
+            // on the left (false); if we are the left child it is on the
+            // right (true). Matches `MerklePath::verify` and the circuit.
             indices.push(!is_right_child);
 
-            // Build next layer
-            let mut next_layer = Vec::new();
-            for chunk in layer.chunks(2) {
-                let hash = if chunk.len() == 2 {
-                    Self::hash_pair(&chunk[0], &chunk[1])
-                } else {
-                    Self::hash_pair(&chunk[0], &chunk[0])
-                };
-                next_layer.push(hash);
+            let parent_count = layer.len().div_ceil(2);
+            let mut next_layer = Vec::with_capacity(parent_count);
+            for j in 0..parent_count {
+                let left = layer.get(2 * j).copied().unwrap_or(*empty);
+                let right = layer.get(2 * j + 1).copied().unwrap_or(*empty);
+                next_layer.push(Self::hash_pair(&left, &right));
             }
-
             layer = next_layer;
             current_index /= 2;
         }
@@ -336,16 +348,18 @@ mod tests {
     async fn test_merkle_tree_root() {
         let tree = MerkleTree::new();
 
-        // Empty tree
+        // Empty tree: a deterministic fixed-depth empty root (the all-empty
+        // subtree hash), not the zero word — the tree always hashes up to
+        // `depth` levels now.
         let root1 = tree.root().await;
-        assert_eq!(root1, [0u8; 32]);
+        assert_eq!(root1, MerkleTree::new().root().await);
 
-        // Add commitment
+        // Add commitment — root moves off the empty-tree value.
         tree.insert(&Commitment([1u8; 32]))
             .await
             .expect("in-memory insert");
         let root2 = tree.root().await;
-        assert_ne!(root2, [0u8; 32]);
+        assert_ne!(root2, root1);
 
         // Add another commitment - root should change
         tree.insert(&Commitment([2u8; 32]))
@@ -440,6 +454,37 @@ mod tests {
             .expect("in-memory insert");
         let root3 = tree.root().await;
         assert_ne!(root3, root1);
+    }
+
+    #[tokio::test]
+    async fn test_fixed_depth_path_length_and_verify() {
+        // Every leaf gets a path of exactly DEFAULT_TREE_DEPTH siblings, and
+        // each verifies against the tree root via the same hash family the
+        // circuit uses — for a multi-leaf tree, not just a single leaf.
+        let tree = MerkleTree::new();
+        let commitments: Vec<Commitment> = (0..10u8).map(|i| Commitment([i + 1; 32])).collect();
+        for c in &commitments {
+            tree.insert(c).await.expect("in-memory insert");
+        }
+
+        let root = tree.root().await;
+        for (i, c) in commitments.iter().enumerate() {
+            let path = tree.path(i).await.expect("path for inserted leaf");
+            assert_eq!(
+                path.path.len(),
+                DEFAULT_TREE_DEPTH,
+                "leaf {i} path must be fixed depth"
+            );
+            assert_eq!(path.indices.len(), DEFAULT_TREE_DEPTH);
+            assert!(
+                path.verify(c.as_bytes(), &root),
+                "leaf {i} must verify against the root"
+            );
+        }
+
+        // A leaf's path must not verify a different leaf.
+        let path0 = tree.path(0).await.unwrap();
+        assert!(!path0.verify(commitments[1].as_bytes(), &root));
     }
 
     #[tokio::test]
