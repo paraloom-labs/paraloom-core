@@ -231,6 +231,56 @@ jobs:
       - name: Build all binaries
         run: cargo build --bins
 
+  consensus-network-e2e:
+    name: Consensus Network E2E (libp2p)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          sudo apt-get clean
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            mold \
+            protobuf-compiler \
+            clang \
+            libclang-dev \
+            cmake \
+            libsnappy-dev \
+            liblz4-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libbz2-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "paraloom-ci"
+
+      # The #181 Layer 2 test is `#[ignore]`'d — it binds loopback TCP and
+      # depends on gossip-mesh timing — and needs no Solana validator, so it
+      # runs here on a plain runner rather than in the bridge-e2e workflow
+      # (which is path-filtered to the bridge sources). `--test-threads=1`
+      # keeps the two nodes' fixed-lifetime ports and tasks from overlapping
+      # with any future test in the same binary.
+      - name: Run consensus network E2E (ignored)
+        run: cargo test --test consensus_network_e2e --all-features -- --ignored --test-threads=1 --nocapture
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
