@@ -1522,93 +1522,27 @@ impl Node {
             return Ok(verifier(request));
         }
 
-        use crate::privacy::{bytes_to_field, deserialize_proof, Groth16ProofSystem};
-        use ark_bls12_381::Fr;
-
-        // Deserialize proof
-        let proof = match deserialize_proof(&request.proof) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Failed to deserialize proof: {}", e);
-                return Ok(false);
-            }
-        };
-
-        // Get current Merkle root from pool
+        // Delegate to the canonical withdrawal verifier (#184) so the
+        // verifying key (the trusted-setup ceremony key) and the public-input
+        // layout match the prover (`generate-withdrawal-proof`) exactly. The
+        // earlier path here generated an ephemeral seed-0 key and lifted the
+        // inputs with `bytes_to_field`, so a real proof never verified — it
+        // only passed under the injected verifier above.
         let merkle_root = pool.root().await;
-        let merkle_root_field = match bytes_to_field(&merkle_root) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("Invalid Merkle root: {}", e);
-                return Ok(false);
-            }
-        };
-
-        // Convert nullifier to field element
-        let nullifier_field = match bytes_to_field(&request.nullifier) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("Invalid nullifier: {}", e);
-                return Ok(false);
-            }
-        };
-
-        // Convert amount to field element
-        let amount_field = Fr::from(request.amount);
-
-        // Public inputs for verification
-        let public_inputs = vec![merkle_root_field, nullifier_field, amount_field];
-
-        // Load verifying key (for MVP, generate on-the-fly)
-        let vk = match self.load_withdraw_verifying_key() {
-            Ok(k) => k,
-            Err(e) => {
-                log::error!("Failed to load verifying key: {}", e);
-                return Ok(false);
-            }
-        };
-
-        // Verify proof
-        match Groth16ProofSystem::verify(&vk, &public_inputs, &proof) {
-            Ok(valid) => {
-                log::debug!(
-                    "Withdrawal proof verification result for {}: {}",
-                    request.request_id,
-                    valid
-                );
-                Ok(valid)
-            }
-            Err(e) => {
-                log::error!("Proof verification error: {}", e);
-                Ok(false)
-            }
+        let result = crate::privacy::ProofVerifier::verify_withdrawal_parts(
+            &merkle_root,
+            &request.nullifier,
+            request.amount,
+            &request.proof,
+        );
+        if let crate::privacy::VerificationResult::Invalid { reason } = &result {
+            log::warn!(
+                "withdrawal proof rejected for {}: {}",
+                request.request_id,
+                reason
+            );
         }
-    }
-
-    /// Load withdraw circuit verifying key
-    fn load_withdraw_verifying_key(
-        &self,
-    ) -> Result<ark_groth16::VerifyingKey<ark_bls12_381::Bls12_381>> {
-        use crate::privacy::{Groth16ProofSystem, WithdrawCircuit};
-        use ark_std::rand::rngs::StdRng;
-        use ark_std::rand::SeedableRng;
-
-        // For MVP, generate keys on-the-fly
-        // In production, these should be loaded from trusted setup
-        let mut rng = StdRng::seed_from_u64(0u64);
-        let circuit = WithdrawCircuit {
-            merkle_root: Some([0u8; 32]),
-            nullifier: Some([0u8; 32]),
-            withdraw_amount: Some(0u64),
-            input_value: Some(0u64),
-            input_randomness: Some([0u8; 32]),
-            input_recipient: Some([0u8; 32]),
-            input_path: None,
-            secret: Some([0u8; 32]),
-        };
-
-        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng)?;
-        Ok(vk)
+        Ok(matches!(result, crate::privacy::VerificationResult::Valid))
     }
 }
 
