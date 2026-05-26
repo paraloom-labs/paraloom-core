@@ -952,36 +952,53 @@ impl Node {
         // Start network
         self.network.start(listen_address).await?;
 
-        // Connect to bootstrap nodes
+        // Connect to bootstrap nodes, retrying until at least one peer is
+        // connected. A single dial is not guaranteed to land: the bootstrap
+        // target may still be starting, or its event loop briefly busy (e.g. a
+        // cold-start deposit backfill), and a one-shot dial would leave this
+        // node permanently islanded — never sending Discovery, never being
+        // registered for consensus. Re-dial on a short cadence until connected
+        // or a bounded number of attempts elapse (the Kademlia refresh task
+        // can still recover later).
         if !self.settings.network.bootstrap_nodes.is_empty() {
-            info!(
-                "Connecting to {} bootstrap nodes",
-                self.settings.network.bootstrap_nodes.len()
-            );
-            self.network
-                .connect_to_bootstrap(self.settings.network.bootstrap_nodes.clone())
-                .await?;
+            let bootstrap = self.settings.network.bootstrap_nodes.clone();
+            info!("Connecting to {} bootstrap nodes", bootstrap.len());
 
-            // Wait a bit for connection to establish
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            const MAX_BOOTSTRAP_ATTEMPTS: u32 = 30;
+            let mut connected = false;
+            for attempt in 1..=MAX_BOOTSTRAP_ATTEMPTS {
+                if let Err(e) = self.network.connect_to_bootstrap(bootstrap.clone()).await {
+                    log::warn!("bootstrap dial attempt {} failed: {}", attempt, e);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                if !self.network.connected_peers().await.is_empty() {
+                    connected = true;
+                    info!("bootstrap connected after {} attempt(s)", attempt);
+                    break;
+                }
+            }
+            if !connected {
+                log::warn!(
+                    "no bootstrap peers after {} attempts; relying on Kademlia refresh",
+                    MAX_BOOTSTRAP_ATTEMPTS
+                );
+            }
 
-            // Send discovery message to all connected peers
+            // Send discovery to every connected peer so they register this
+            // node (validators learn the consensus set this way).
             let discovery_msg = Message::Discovery {
                 node_info: self.node_info.clone(),
             };
-
             let peers = self.network.connected_peers().await;
             info!(
                 "Sending discovery message to {} connected peers",
                 peers.len()
             );
-
             for peer in peers {
                 if let Err(e) = self.network.send_message(peer, discovery_msg.clone()).await {
                     log::warn!("Failed to send discovery message to peer: {}", e);
                 }
             }
-
             info!(
                 "Discovery broadcast complete for {:?}",
                 self.node_info.node_type
