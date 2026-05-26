@@ -22,6 +22,8 @@ use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
 
+pub mod withdrawal_ingress;
+
 /// Node implementation
 /// Withdrawal-proof verifier hook (#181). A closure that decides whether a
 /// withdrawal request's proof is valid. Production never sets one — the node
@@ -106,6 +108,12 @@ pub struct Node {
     /// here to decouple the network/consensus wiring under test from the
     /// cryptographic proof path. Set via [`Node::with_proof_verifier`].
     proof_verifier_override: Option<WithdrawalProofVerifier>,
+
+    /// Withdrawal-ingress HTTP server handle (#184). Spawned in run() on a
+    /// bridge-enabled node when `bridge.withdrawal_ingress_address` is set;
+    /// aborted in stop(). Same Arc<Mutex<Option<...>>> shape as the other
+    /// spawned-task handles so Clone of Node stays cheap.
+    withdrawal_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -845,6 +853,7 @@ impl Node {
             approval_rx: Arc::new(Mutex::new(approval_rx)),
             submitter_task: Arc::new(Mutex::new(None)),
             proof_verifier_override: None,
+            withdrawal_ingress: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -1190,6 +1199,41 @@ impl Node {
             }
         }
 
+        // Serve the withdrawal-verification ingress over HTTP (#184) so a
+        // client (wallet/CLI) can submit a withdrawal into the consensus
+        // mesh. Only runs on a node that has a withdrawal coordinator and a
+        // configured address; an empty address (the default) disables it, an
+        // unparseable one is logged and skipped rather than failing start-up.
+        if self.withdrawal_coordinator.is_some() {
+            let addr_str = self.settings.bridge.withdrawal_ingress_address.trim();
+            if !addr_str.is_empty() {
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let ingress: Arc<dyn withdrawal_ingress::WithdrawalIngress> =
+                            Arc::new(self.clone());
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = withdrawal_ingress::serve(ingress, addr).await {
+                                log::error!(
+                                    target: "paraloom::node::withdrawal_ingress",
+                                    "withdrawal ingress server exited: {}",
+                                    e
+                                );
+                            }
+                        });
+                        *self.withdrawal_ingress.lock().await = Some(handle);
+                        info!("Withdrawal ingress server started on {}", addr_str);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "invalid bridge.withdrawal_ingress_address '{}': {} — ingress not started",
+                            addr_str,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Settle consensus-approved withdrawals (#164). Drains the
         // approval channel the withdrawal coordinator pushes to when a
         // validator quorum approves a withdrawal, and submits each
@@ -1303,6 +1347,9 @@ impl Node {
             handle.abort();
         }
         if let Some(handle) = self.submitter_task.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.withdrawal_ingress.lock().await.take() {
             handle.abort();
         }
         // Stop the bridge deposit listener (#163) so its poll loop
@@ -1574,6 +1621,7 @@ impl Clone for Node {
             approval_rx: self.approval_rx.clone(),
             submitter_task: self.submitter_task.clone(),
             proof_verifier_override: self.proof_verifier_override.clone(),
+            withdrawal_ingress: self.withdrawal_ingress.clone(),
         }
     }
 }

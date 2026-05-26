@@ -103,6 +103,14 @@ pub struct BridgeConfig {
     /// and should stay on a loopback or management interface. Set to an
     /// empty string to disable the server while keeping the bridge on.
     pub merkle_path_query_address: String,
+
+    /// Address the withdrawal-verification ingress HTTP server binds to on a
+    /// bridge-enabled node (#184). A client (wallet/CLI) POSTs a withdrawal
+    /// request here and the node broadcasts it into the consensus mesh. Unlike
+    /// the Merkle path server this *triggers consensus*, so it defaults to an
+    /// empty string (disabled) and should stay on a loopback/management
+    /// interface when enabled.
+    pub withdrawal_ingress_address: String,
 }
 
 impl Default for BridgeConfig {
@@ -136,6 +144,8 @@ impl Default for BridgeConfig {
             .unwrap_or(150),
             merkle_path_query_address: std::env::var("BRIDGE_MERKLE_PATH_ADDRESS")
                 .unwrap_or_else(|_| "127.0.0.1:9090".to_string()),
+            withdrawal_ingress_address: std::env::var("BRIDGE_WITHDRAWAL_INGRESS_ADDRESS")
+                .unwrap_or_default(),
         }
     }
 }
