@@ -50,12 +50,12 @@ sleep 2
 # whose centre is a bottleneck, and validators that miss its registration
 # handshake never join the quorum.
 config_for() {
-  local i="$1" port=$((BASE_PORT + i)) boot mp ing
+  local i="$1" port=$((BASE_PORT + i)) boot mp ing tr
   if [ "$i" = 1 ]; then
-    boot="[]"; mp="127.0.0.1:9391"; ing="127.0.0.1:9491"
+    boot="[]"; mp="127.0.0.1:9391"; ing="127.0.0.1:9491"; tr="127.0.0.1:9591"
   else
     boot='["/ip4/127.0.0.1/tcp/9301","/ip4/127.0.0.1/tcp/9302","/ip4/127.0.0.1/tcp/9303"]'
-    mp=""; ing=""
+    mp=""; ing=""; tr=""
   fi
   cat > "$DEMO_DIR/v$i.toml" <<EOF
 [network]
@@ -79,6 +79,7 @@ event_lag_warn_threshold_slots = 1500
 withdrawal_expiration_window_slots = 150
 merkle_path_query_address = "$mp"
 withdrawal_ingress_address = "$ing"
+transfer_ingress_address = "$tr"
 EOF
   rm -rf "$DEMO_DIR/v$i-data"
 }
