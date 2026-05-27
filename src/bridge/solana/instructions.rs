@@ -43,11 +43,28 @@ pub struct WithdrawInstructionData {
     pub proof: Vec<u8>,
 }
 
+/// Instruction data for `shielded_transfer` (shielded → shielded, #193).
+///
+/// Layout matches the on-chain `shielded_transfer` function: fixed
+/// 2-in/2-out (`nullifiers`, `output_commitments`), the leader-computed
+/// `new_merkle_root`, and the `TransferCircuit` proof blob (recorded but
+/// not verified on-chain — verification is the L2 quorum's job, #194).
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ShieldedTransferInstructionData {
+    pub nullifiers: [[u8; 32]; 2],
+    pub output_commitments: [[u8; 32]; 2],
+    pub new_merkle_root: [u8; 32],
+    pub proof: Vec<u8>,
+}
+
 /// Instruction discriminators (matching Anchor's generated discriminators)
 pub mod discriminators {
     pub const INITIALIZE: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237];
     pub const DEPOSIT: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
     pub const WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
+    /// `sha256("global:shielded_transfer")[..8]` (#193). Verified against the
+    /// generated IDL by `anchor build`.
+    pub const SHIELDED_TRANSFER: [u8; 8] = [191, 130, 5, 127, 124, 187, 238, 188];
     pub const UPDATE_MERKLE_ROOT: [u8; 8] = [240, 174, 252, 99, 208, 105, 45, 104];
     #[allow(dead_code)]
     pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
@@ -180,6 +197,53 @@ pub fn create_withdraw_instruction(
             AccountMeta::new(*bridge_vault, false),
             AccountMeta::new(nullifier_pda, false), // Nullifier account (will be created)
             AccountMeta::new(recipient_pubkey, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(system_program_id, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create `shielded_transfer` instruction (#193).
+///
+/// Settles a shielded → shielded transfer: records both input nullifiers
+/// (their PDAs are `init`'d, so a replay fails on-chain) and advances the
+/// Merkle root to `new_merkle_root`, without moving any lamports. Mirrors
+/// [`create_withdraw_instruction`]; both nullifier PDAs are derived through
+/// the shared [`derive_nullifier_account`] helper, so the account order here
+/// must match the `ShieldedTransfer` accounts struct in the program.
+pub fn create_shielded_transfer_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    nullifiers: [[u8; 32]; 2],
+    output_commitments: [[u8; 32]; 2],
+    new_merkle_root: [u8; 32],
+    proof: Vec<u8>,
+) -> Result<Instruction> {
+    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
+    let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
+
+    let data = ShieldedTransferInstructionData {
+        nullifiers,
+        output_commitments,
+        new_merkle_root,
+        proof,
+    };
+
+    let mut instruction_data = discriminators::SHIELDED_TRANSFER.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    let system_program_id = SYSTEM_PROGRAM_ID;
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new(nullifier_pda_0, false), // Nullifier account 0 (will be created)
+            AccountMeta::new(nullifier_pda_1, false), // Nullifier account 1 (will be created)
             AccountMeta::new(*authority, true),
             AccountMeta::new_readonly(system_program_id, false),
         ],
@@ -346,5 +410,61 @@ mod tests {
             &bytes[32 + 8..32 + 16],
             &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
         );
+    }
+
+    #[test]
+    fn test_create_shielded_transfer_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let nullifiers = [[1u8; 32], [2u8; 32]];
+        let output_commitments = [[3u8; 32], [4u8; 32]];
+        let new_merkle_root = [5u8; 32];
+        let proof = vec![0u8; 192];
+
+        let ix = create_shielded_transfer_instruction(
+            &program_id,
+            &authority,
+            nullifiers,
+            output_commitments,
+            new_merkle_root,
+            proof,
+        )
+        .expect("builder");
+
+        assert_eq!(ix.program_id, program_id);
+        // bridge_state, nullifier_0, nullifier_1, authority, system_program.
+        assert_eq!(ix.accounts.len(), 5);
+        // The two nullifier PDAs must match the shared derivation helper and
+        // sit in slots 1 and 2 (after bridge_state).
+        let (n0, _) = derive_nullifier_account(&program_id, &nullifiers[0]);
+        let (n1, _) = derive_nullifier_account(&program_id, &nullifiers[1]);
+        assert_eq!(ix.accounts[1].pubkey, n0);
+        assert_eq!(ix.accounts[2].pubkey, n1);
+        // The wire payload is prefixed with the Anchor discriminator.
+        assert_eq!(&ix.data[..8], &discriminators::SHIELDED_TRANSFER);
+    }
+
+    /// Round-trip the transfer payload through borsh to pin the wire format
+    /// against the on-chain `shielded_transfer` signature (#193).
+    #[test]
+    fn test_shielded_transfer_instruction_data_round_trip() {
+        let original = ShieldedTransferInstructionData {
+            nullifiers: [[0xAB; 32], [0xCD; 32]],
+            output_commitments: [[0x11; 32], [0x22; 32]],
+            new_merkle_root: [0x33; 32],
+            proof: vec![0xEF; 192],
+        };
+
+        let bytes = borsh::to_vec(&original).expect("borsh serialize");
+        let decoded =
+            ShieldedTransferInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
+
+        assert_eq!(decoded, original);
+        // Layout: [nullifiers (64) | output_commitments (64) | root (32) | proof_len (4) | proof…].
+        assert_eq!(&bytes[..32], &[0xAB; 32]);
+        assert_eq!(&bytes[32..64], &[0xCD; 32]);
+        assert_eq!(&bytes[64..96], &[0x11; 32]);
+        assert_eq!(&bytes[96..128], &[0x22; 32]);
+        assert_eq!(&bytes[128..160], &[0x33; 32]);
     }
 }
