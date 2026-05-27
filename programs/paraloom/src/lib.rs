@@ -170,6 +170,76 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Settle a shielded → shielded transfer **without releasing funds**.
+    ///
+    /// Unlike `withdraw`, which always pays a recipient, a transfer spends
+    /// two input notes and creates two output notes that stay inside the
+    /// privacy pool. The program therefore:
+    ///  1. Records both input nullifiers as PDAs (`seeds = [b"nullifier",
+    ///     nullifier]`) — the same namespace `withdraw` uses, so a note can
+    ///     never be spent twice across either path. Anchor's `init` fails if
+    ///     a nullifier PDA already exists, which is the cross-transaction
+    ///     double-spend defense.
+    ///  2. Advances the Merkle root to the value the consensus leader
+    ///     computed after appending the two output commitments (the same
+    ///     off-chain-root model as `deposit` + `update_merkle_root`).
+    ///
+    /// Fixed 2-in/2-out (matching `MAX_INPUTS`/`MAX_OUTPUTS` in the circuit).
+    /// A single-note spend pads the second input with a random dummy
+    /// nullifier, so every transaction has a uniform shape and leaks nothing
+    /// about how many real notes were spent.
+    ///
+    /// As with `withdraw`, the Groth16 proof is recorded but **not** verified
+    /// on-chain — verification is the L2 validator quorum's job (#194); the
+    /// `has_one = authority` gate binds settlement to the consensus leader.
+    pub fn shielded_transfer(
+        ctx: Context<ShieldedTransfer>,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        new_merkle_root: [u8; 32],
+        proof: Vec<u8>,
+    ) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+
+        require!(!bridge_state.paused, BridgeError::BridgePaused);
+        require!(!proof.is_empty(), BridgeError::InvalidProof);
+        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
+        // Two equal input nullifiers would target the same PDA twice in one
+        // transaction; reject with a clear error instead of Anchor's opaque
+        // "account already initialized".
+        require!(
+            nullifiers[0] != nullifiers[1],
+            BridgeError::DuplicateNullifier
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+
+        // `withdrawal_id = 0` marks these nullifiers as transfer-spent rather
+        // than withdrawal-spent (transfers release nothing, so there is no
+        // withdrawal id to record).
+        let nullifier_account_0 = &mut ctx.accounts.nullifier_account_0;
+        nullifier_account_0.nullifier = nullifiers[0];
+        nullifier_account_0.used_at = now;
+        nullifier_account_0.withdrawal_id = 0;
+
+        let nullifier_account_1 = &mut ctx.accounts.nullifier_account_1;
+        nullifier_account_1.nullifier = nullifiers[1];
+        nullifier_account_1.used_at = now;
+        nullifier_account_1.withdrawal_id = 0;
+
+        bridge_state.merkle_root = new_merkle_root;
+
+        emit!(ShieldedTransferEvent {
+            nullifiers,
+            output_commitments,
+            new_merkle_root,
+            timestamp: now,
+        });
+
+        msg!("Shielded transfer settled");
+        Ok(())
+    }
+
     /// Pause the bridge
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
@@ -494,6 +564,47 @@ pub struct Withdraw<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(nullifiers: [[u8; 32]; 2])]
+pub struct ShieldedTransfer<'info> {
+    // `has_one = authority` binds settlement to the bridge authority /
+    // consensus leader, exactly as `Withdraw` does (#178).
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump,
+        has_one = authority
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    /// First input nullifier. Shares the `b"nullifier"` namespace with
+    /// `withdraw`, so `init` fails on a replay across either path.
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifiers[0].as_ref()],
+        bump
+    )]
+    pub nullifier_account_0: Account<'info, NullifierAccount>,
+
+    /// Second input nullifier (a random dummy when only one real note is
+    /// spent).
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifiers[1].as_ref()],
+        bump
+    )]
+    pub nullifier_account_1: Account<'info, NullifierAccount>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Pause<'info> {
     #[account(
         mut,
@@ -739,6 +850,14 @@ pub struct WithdrawalEvent {
 }
 
 #[event]
+pub struct ShieldedTransferEvent {
+    pub nullifiers: [[u8; 32]; 2],
+    pub output_commitments: [[u8; 32]; 2],
+    pub new_merkle_root: [u8; 32],
+    pub timestamp: i64,
+}
+
+#[event]
 pub struct ValidatorRegisteredEvent {
     pub validator: Pubkey,
     pub stake_amount: u64,
@@ -800,4 +919,7 @@ pub enum BridgeError {
 
     #[msg("Withdrawal request expired (current slot > expiration_slot)")]
     WithdrawalExpired,
+
+    #[msg("Duplicate input nullifier in transfer")]
+    DuplicateNullifier,
 }
