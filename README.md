@@ -63,8 +63,8 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 
 Honest scope for the current devnet milestone. These are tracked and gate mainnet, not the devnet release; none affect fund safety on devnet.
 
-- **On-chain ZK verification is deferred.** The Solana program records proof blobs and trusts the L2 validator quorum plus the bridge-authority gate; it does not verify Groth16 on-chain yet (blocked on Solana SIMD-0388, ~Q3'26 — #165). The Merkle root a shielded transfer advances is likewise accepted from the consensus leader rather than verified on-chain.
-- **Trusted setup is a dev ceremony.** Proving/verifying keys come from a single-party dev setup; the multi-party (MPC) ceremony that gates v0.5.0 final is in progress (#64).
+- **ZK proofs are verified by the L2 quorum; on-chain re-verification is deferred.** Every withdrawal and shielded-transfer proof **is** verified — each validator runs the real Groth16 verifier (`verify_withdrawal_parts` / `verify_transfer_parts`) and a transfer/withdrawal settles only after a BFT quorum votes it valid. What is deferred is a *redundant* on-chain re-check: the Solana program records the proof and is gated by the consensus authority, but does not itself re-run Groth16 on-chain (blocked on Solana SIMD-0388, ~Q3'26 — #165). The post-transfer Merkle root is set by the consensus leader and is likewise not re-verified on-chain.
+- **Trusted setup is a dev ceremony.** The MPC tooling is shipped (BGM17 contribution/verifier/transcript, rc2), but the proving/verifying keys in use today come from a single-party dev setup; running the multi-party ceremony is the remaining gate to v0.5.0 final (#64).
 - **Transfer note delivery is L2-served and in-memory.** Encrypted output notes are delivered via a node's `/transfer/scan` endpoint (in-memory, not persisted across restart; the ingress is disabled by default and intended for a loopback/management interface). Recipients scan and trial-decrypt client-side.
 - **Per-transfer pool convergence is partial.** The settling node appends a transfer's output commitments to its shielded pool; recipients rely on that node / the on-chain tree to spend.
 
