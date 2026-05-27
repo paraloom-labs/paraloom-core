@@ -147,6 +147,12 @@ pub struct Node {
     /// Transfer-ingress HTTP server handle (#194). Spawned in run() when
     /// `bridge.transfer_ingress_address` is set; aborted in stop().
     transfer_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Encrypted output notes this node has seen (#196), served from
+    /// `GET /transfer/scan` for recipients to trial-decrypt. Populated when the
+    /// node initiates or receives a transfer verification request. In-memory;
+    /// persistence across restart is a follow-up.
+    delivered_notes: Arc<Mutex<Vec<transfer_ingress::DeliveredNote>>>,
 }
 
 #[async_trait]
@@ -463,6 +469,11 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received transfer verification request: {}",
                     request.request_id
                 );
+
+                // Record the encrypted output notes for recipient scanning
+                // (#196); any validator that sees the broadcast can serve scan.
+                self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
+                    .await;
 
                 // Verify the transfer zkSNARK proof if a privacy pool is
                 // available, mirroring the withdrawal path (#194).
@@ -1046,6 +1057,7 @@ impl Node {
             transfer_submitter_task: Arc::new(Mutex::new(None)),
             transfer_proof_verifier_override: None,
             transfer_ingress: Arc::new(Mutex::new(None)),
+            delivered_notes: Arc::new(Mutex::new(Vec::new())),
         };
 
         Ok(node)
@@ -1697,6 +1709,10 @@ impl Node {
             anyhow!("node has no transfer coordinator (bridge disabled or non-validator)")
         })?;
         let request_id = coordinator.start_verification(request.clone()).await?;
+        // Record the encrypted notes locally (#196): the initiator does not
+        // receive its own gossip broadcast, so it stores here to serve scan.
+        self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
+            .await;
         self.network
             .send_message(
                 NodeId(vec![]),
@@ -1705,6 +1721,34 @@ impl Node {
             .await?;
         info!("initiated transfer verification: {}", request_id);
         Ok(request_id)
+    }
+
+    /// Record the encrypted output notes of a transfer for recipient scanning
+    /// (#196), de-duplicated by `(commitment, ciphertext)` so the same transfer
+    /// seen via both ingress and gossip is stored once.
+    async fn record_delivered_notes(
+        &self,
+        output_commitments: &[[u8; 32]; 2],
+        ciphertexts: &[String; 2],
+    ) {
+        let mut store = self.delivered_notes.lock().await;
+        for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
+            let note = transfer_ingress::DeliveredNote {
+                output_commitment: hex::encode(commitment),
+                ciphertext: ciphertext.clone(),
+            };
+            if !store.iter().any(|d| {
+                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
+            }) {
+                store.push(note);
+            }
+        }
+    }
+
+    /// Snapshot of the encrypted notes this node has seen (#196), for the
+    /// `GET /transfer/scan` endpoint.
+    pub async fn delivered_transfer_notes(&self) -> Vec<transfer_ingress::DeliveredNote> {
+        self.delivered_notes.lock().await.clone()
     }
 
     /// Number of peers this node is currently connected to (#181). Read-only
@@ -1945,6 +1989,7 @@ impl Clone for Node {
             transfer_submitter_task: self.transfer_submitter_task.clone(),
             transfer_proof_verifier_override: self.transfer_proof_verifier_override.clone(),
             transfer_ingress: self.transfer_ingress.clone(),
+            delivered_notes: self.delivered_notes.clone(),
         }
     }
 }

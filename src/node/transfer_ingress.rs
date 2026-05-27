@@ -20,7 +20,13 @@
 //!   (e.g. no validator quorum is registered yet).
 
 use async_trait::async_trait;
-use axum::{extract::Extension, http::StatusCode, response::Json, routing::post, Router};
+use axum::{
+    extract::Extension,
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,13 +34,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::consensus::TransferVerificationRequest;
 
-/// The single capability the ingress needs: hand a transfer request to the
-/// consensus mesh and return its request id. Abstracted behind a trait so the
-/// router can be unit-tested with a stub instead of a networked `Node`.
+/// A delivered encrypted output note (#196): the output commitment and the
+/// opaque hex ciphertext (`EncryptedNote`) a recipient trial-decrypts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeliveredNote {
+    pub output_commitment: String,
+    pub ciphertext: String,
+}
+
+/// The capabilities the ingress needs: hand a transfer to the consensus mesh,
+/// and serve the encrypted notes delivered so far for recipients to scan.
+/// Abstracted behind a trait so the router can be unit-tested with a stub.
 #[async_trait]
 pub trait TransferIngress: Send + Sync {
     async fn submit_transfer(&self, request: TransferVerificationRequest)
         -> anyhow::Result<String>;
+
+    /// All encrypted notes this node has seen, for recipient scanning (#196).
+    async fn delivered_notes(&self) -> Vec<DeliveredNote>;
 }
 
 #[async_trait]
@@ -45,6 +62,10 @@ impl TransferIngress for crate::node::Node {
     ) -> anyhow::Result<String> {
         self.initiate_transfer_verification(request).await
     }
+
+    async fn delivered_notes(&self) -> Vec<DeliveredNote> {
+        self.delivered_transfer_notes().await
+    }
 }
 
 #[derive(Deserialize)]
@@ -53,6 +74,7 @@ struct SubmitRequest {
     output_commitments: Vec<String>,
     new_merkle_root: String,
     proof: String,
+    ciphertexts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -107,6 +129,25 @@ async fn submit_handler(
         ));
     }
 
+    // The ciphertexts are opaque to the node — validate only that there are
+    // two non-empty hex blobs (the recipient decrypts them).
+    if req.ciphertexts.len() != 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ciphertexts must have exactly 2 entries".to_string(),
+        ));
+    }
+    for (i, c) in req.ciphertexts.iter().enumerate() {
+        let trimmed = c.strip_prefix("0x").unwrap_or(c);
+        if hex::decode(trimmed).map(|b| b.is_empty()).unwrap_or(true) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("ciphertexts[{i}] must be non-empty hex"),
+            ));
+        }
+    }
+    let ciphertexts = [req.ciphertexts[0].clone(), req.ciphertexts[1].clone()];
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -119,6 +160,7 @@ async fn submit_handler(
         output_commitments,
         new_merkle_root,
         proof,
+        ciphertexts,
         timestamp,
     };
 
@@ -132,11 +174,21 @@ async fn submit_handler(
     Ok(Json(SubmitResponse { request_id: id }))
 }
 
+/// `GET /transfer/scan` (#196) — every encrypted note this node has seen. A
+/// recipient polls it and trial-decrypts each ciphertext with its viewing key,
+/// keeping the ones that decrypt. Failed decrypts are silent.
+async fn scan_handler(
+    Extension(node): Extension<Arc<dyn TransferIngress>>,
+) -> Json<Vec<DeliveredNote>> {
+    Json(node.delivered_notes().await)
+}
+
 /// Build the ingress router. Exposed separately from [`serve`] so it can be
 /// mounted under a caller's own listener or driven directly in tests.
 pub fn router(node: Arc<dyn TransferIngress>) -> Router {
     Router::new()
         .route("/transfer/submit", post(submit_handler))
+        .route("/transfer/scan", get(scan_handler))
         .layer(Extension(node))
 }
 
@@ -181,6 +233,10 @@ mod tests {
                 anyhow::bail!("insufficient validators for consensus")
             }
         }
+
+        async fn delivered_notes(&self) -> Vec<DeliveredNote> {
+            vec![]
+        }
     }
 
     fn post_json(body: &str) -> Request<Body> {
@@ -194,13 +250,15 @@ mod tests {
 
     fn well_formed_body() -> String {
         format!(
-            r#"{{"nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"{}"}}"#,
+            r#"{{"nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"{}","ciphertexts":["{}","{}"]}}"#,
             "11".repeat(32),
             "22".repeat(32),
             "33".repeat(32),
             "44".repeat(32),
             "55".repeat(32),
-            "01".repeat(192)
+            "01".repeat(192),
+            "ab".repeat(88),
+            "cd".repeat(88)
         )
     }
 
@@ -215,12 +273,14 @@ mod tests {
     async fn wrong_nullifier_count_is_400() {
         let app = router(Arc::new(StubIngress { accept: true }));
         let body = format!(
-            r#"{{"nullifiers":["{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"{}"}}"#,
+            r#"{{"nullifiers":["{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"{}","ciphertexts":["{}","{}"]}}"#,
             "11".repeat(32),
             "33".repeat(32),
             "44".repeat(32),
             "55".repeat(32),
-            "01".repeat(192)
+            "01".repeat(192),
+            "ab".repeat(88),
+            "cd".repeat(88)
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -230,12 +290,14 @@ mod tests {
     async fn empty_proof_is_400() {
         let app = router(Arc::new(StubIngress { accept: true }));
         let body = format!(
-            r#"{{"nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":""}}"#,
+            r#"{{"nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"","ciphertexts":["{}","{}"]}}"#,
             "11".repeat(32),
             "22".repeat(32),
             "33".repeat(32),
             "44".repeat(32),
-            "55".repeat(32)
+            "55".repeat(32),
+            "ab".repeat(88),
+            "cd".repeat(88)
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -246,5 +308,36 @@ mod tests {
         let app = router(Arc::new(StubIngress { accept: false }));
         let resp = app.oneshot(post_json(&well_formed_body())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Stub that serves a fixed delivered note, to exercise the scan route.
+    struct ScanStub;
+    #[async_trait]
+    impl TransferIngress for ScanStub {
+        async fn submit_transfer(&self, _: TransferVerificationRequest) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+        async fn delivered_notes(&self) -> Vec<DeliveredNote> {
+            vec![DeliveredNote {
+                output_commitment: "33".repeat(32),
+                ciphertext: "ab".repeat(88),
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_returns_delivered_notes() {
+        let app = router(Arc::new(ScanStub));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transfer/scan")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let notes: Vec<DeliveredNote> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].output_commitment, "33".repeat(32));
     }
 }

@@ -96,6 +96,7 @@ fn sample_request() -> TransferVerificationRequest {
         output_commitments: [[3u8; 32], [4u8; 32]],
         new_merkle_root: [7u8; 32],
         proof: vec![1u8; 192],
+        ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
         timestamp: now_secs(),
     }
 }
@@ -183,6 +184,18 @@ async fn two_node_transfer_reaches_quorum_over_libp2p() {
     assert!(
         quorum,
         "transfer did not reach Valid quorum over the mesh within 30s"
+    );
+
+    // Recipient discovery (#196): node1 received the request over gossip and
+    // recorded the encrypted output notes, so its scan surface exposes them.
+    let delivered = wait_until(Duration::from_secs(10), Duration::from_millis(200), || {
+        let n1 = node1.clone();
+        async move { n1.delivered_transfer_notes().await.len() == 2 }
+    })
+    .await;
+    assert!(
+        delivered,
+        "node1 did not record the 2 delivered ciphertexts for scanning"
     );
 
     let _ = node0.stop().await;
