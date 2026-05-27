@@ -94,23 +94,35 @@ impl Nullifier {
     }
 }
 
-/// Viewing key allows selective disclosure
+/// Viewing key for discovering received notes (#196).
+///
+/// Holds the recipient's X25519 secret. A sender encrypts an output note to the
+/// matching public key (the recipient's shielded address); the recipient trial-
+/// decrypts delivered ciphertexts with this key. See [`crate::privacy::note_crypto`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewingKey {
-    /// The viewing key bytes
+    /// The X25519 secret key
     pub key: [u8; 32],
 }
 
 impl ViewingKey {
-    /// Create new viewing key
+    /// Create a viewing key from an X25519 secret.
     pub fn new(key: [u8; 32]) -> Self {
         ViewingKey { key }
     }
 
-    /// Decrypt a note if this viewing key matches
-    pub fn can_decrypt(&self, _note: &Note) -> bool {
-        // Placeholder - would implement actual decryption logic
-        false
+    /// Trial-decrypt an encrypted note. `Some(plaintext)` if this key owns it,
+    /// `None` otherwise (silent — the caller scans every delivered note).
+    pub fn try_decrypt(
+        &self,
+        note: &crate::privacy::note_crypto::EncryptedNote,
+    ) -> Option<crate::privacy::note_crypto::NotePlaintext> {
+        crate::privacy::note_crypto::decrypt_note(&self.key, note)
+    }
+
+    /// Whether this key can decrypt `note` (convenience over [`try_decrypt`](Self::try_decrypt)).
+    pub fn can_decrypt(&self, note: &crate::privacy::note_crypto::EncryptedNote) -> bool {
+        self.try_decrypt(note).is_some()
     }
 }
 
