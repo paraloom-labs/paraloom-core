@@ -92,22 +92,10 @@ impl WithdrawalVerificationRequest {
     }
 }
 
-/// Verification result from a validator
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum VerificationVote {
-    /// Proof is valid
-    Valid,
-
-    /// Proof is invalid
-    Invalid { reason: String },
-}
-
-impl VerificationVote {
-    /// Check if vote is valid
-    pub fn is_valid(&self) -> bool {
-        matches!(self, VerificationVote::Valid)
-    }
-}
+// The vote type now lives with the payload-independent tally (#194) so the
+// transfer path can share it; re-exported here to keep the existing
+// `crate::consensus::withdrawal::VerificationVote` path stable.
+pub use crate::consensus::vote_tally::{VerificationVote, VoteTally};
 
 /// Verification result from a validator
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,35 +129,19 @@ pub struct ApprovedWithdrawal {
     pub fee: u64,
 }
 
-/// Consensus state for a withdrawal verification
+/// Consensus state for a withdrawal verification.
+///
+/// The vote/quorum machinery now lives in the payload-independent
+/// [`VoteTally`] (#194) so the transfer path can share it; this struct adds
+/// the withdrawal request alongside and delegates the consensus methods to
+/// the tally, keeping the public API unchanged.
 #[derive(Clone, Debug)]
 pub struct WithdrawalConsensus {
-    /// Request ID
-    pub request_id: String,
-
     /// Original request
     pub request: WithdrawalVerificationRequest,
 
-    /// Validators who voted
-    pub votes: Arc<RwLock<HashMap<NodeId, VerificationVote>>>,
-
-    /// When consensus started
-    pub started_at: u64,
-
-    /// Deadline for consensus (30 seconds)
-    pub deadline: u64,
-
-    /// Minimum eligible-vote count required for this consensus to be
-    /// considered reached. Configurable so different validator-set
-    /// sizes can use different BFT thresholds (e.g. 5-of-7 on a small
-    /// devnet, 14-of-20 on a larger network) without recompiling.
-    pub min_validators_for_consensus: usize,
-
-    /// Total validator-set size used as the divisor in
-    /// [`completion_percentage`]. Must agree with the actual size of
-    /// the validator pool the coordinator drew from; mismatch only
-    /// affects the reported percentage, not consensus correctness.
-    pub total_validators: usize,
+    /// Vote collection + BFT quorum state
+    pub tally: VoteTally,
 }
 
 impl WithdrawalConsensus {
@@ -190,174 +162,58 @@ impl WithdrawalConsensus {
         min_validators_for_consensus: usize,
         total_validators: usize,
     ) -> Self {
-        let now = crate::utils::now_unix_seconds();
-
-        Self {
-            request_id: request.request_id.clone(),
-            request,
-            votes: Arc::new(RwLock::new(HashMap::new())),
-            started_at: now,
-            deadline: now + 30, // 30 second deadline
+        let tally = VoteTally::new(
+            request.request_id.clone(),
             min_validators_for_consensus,
             total_validators,
-        }
+        );
+        Self { request, tally }
     }
 
-    /// Submit a vote.
-    ///
-    /// Returns `Ok(None)` for the normal case (first vote, or a
-    /// repeated identical vote which we treat as idempotent). Returns
-    /// `Ok(Some(SlashingEvidence::Equivocation { .. }))` if the
-    /// validator has previously submitted a vote on this request and
-    /// the new vote disagrees — this is provable misbehavior and is
-    /// surfaced to the caller for recording in the
-    /// [`crate::consensus::SlashingTracker`]. The new vote is **not**
-    /// installed in that case; the original stands.
+    /// Submit a vote — delegates to the [`VoteTally`].
     pub async fn submit_vote(
         &self,
         validator: NodeId,
         vote: VerificationVote,
     ) -> Result<Option<SlashingEvidence>> {
-        let mut votes = self.votes.write().await;
-        if let Some(previous) = votes.get(&validator) {
-            if previous == &vote {
-                // Idempotent re-send. Common when a validator retries
-                // over a flaky transport.
-                return Ok(None);
-            }
-            let evidence = SlashingEvidence::Equivocation {
-                request_id: self.request_id.clone(),
-                previous_vote: previous.clone(),
-                new_vote: vote,
-            };
-            return Ok(Some(evidence));
-        }
-        votes.insert(validator, vote);
-        Ok(None)
+        self.tally.submit_vote(validator, vote).await
     }
 
-    /// Check whether consensus has been reached among the eligible
-    /// validators — those whose reputation is at or above
-    /// `min_reputation`. A validator below the threshold is silently
-    /// excluded from the count; their vote may still be in `votes`
-    /// (the network cannot prevent the bytes from arriving) but it
-    /// does not contribute to the quorum.
+    /// Whether the BFT quorum of eligible voters has been reached.
     pub async fn has_consensus(
         &self,
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
     ) -> bool {
-        let eligible = self
-            .count_eligible_votes(reputation_tracker, min_reputation)
-            .await;
-        eligible >= self.min_validators_for_consensus
+        self.tally
+            .has_consensus(reputation_tracker, min_reputation)
+            .await
     }
 
     /// Check if consensus deadline has passed
     pub fn is_timed_out(&self) -> bool {
-        let now = crate::utils::now_unix_seconds();
-        now > self.deadline
+        self.tally.is_timed_out()
     }
 
-    /// Number of submitted votes whose validators currently sit at or
-    /// above `min_reputation`. Helper for [`has_consensus`] and
-    /// [`consensus_result`] so they share a single eligibility view.
-    async fn count_eligible_votes(
-        &self,
-        reputation_tracker: &ReputationTracker,
-        min_reputation: u64,
-    ) -> usize {
-        let votes = self.votes.read().await;
-        let mut count = 0;
-        for validator in votes.keys() {
-            let reputation = reputation_tracker
-                .get_reputation(validator)
-                .await
-                .unwrap_or(0);
-            if reputation >= min_reputation {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Compute consensus result, filtering out votes from validators
-    /// whose reputation has dropped below `min_reputation`.
-    ///
-    /// The audit (#62) flagged that the previous version aggregated
-    /// every submitted vote regardless of the voter's standing, so a
-    /// validator whose reputation had bottomed out from repeated
-    /// dishonest votes still got to influence the quorum. This version
-    /// snapshots reputation at result-time and counts only votes from
-    /// validators currently in good standing.
+    /// Compute the reputation-gated consensus result.
     pub async fn consensus_result(
         &self,
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
     ) -> Result<VerificationVote> {
-        let votes = self.votes.read().await;
-
-        // Collect (validator, vote) pairs whose reputation is currently
-        // at or above the threshold.
-        let mut eligible: Vec<&VerificationVote> = Vec::with_capacity(votes.len());
-        let mut excluded = 0usize;
-        for (validator, vote) in votes.iter() {
-            let reputation = reputation_tracker
-                .get_reputation(validator)
-                .await
-                .unwrap_or(0);
-            if reputation >= min_reputation {
-                eligible.push(vote);
-            } else {
-                excluded += 1;
-                log::warn!(
-                    target: "paraloom::consensus",
-                    "vote from low-reputation validator {:?} (rep {}, threshold {}) excluded from consensus on {}",
-                    validator,
-                    reputation,
-                    min_reputation,
-                    self.request_id
-                );
-            }
-        }
-
-        if eligible.len() < self.min_validators_for_consensus {
-            return Err(anyhow!(
-                "Not enough eligible votes: {} < {} (excluded {} below reputation {})",
-                eligible.len(),
-                self.min_validators_for_consensus,
-                excluded,
-                min_reputation
-            ));
-        }
-
-        let valid_count = eligible.iter().filter(|v| v.is_valid()).count();
-        let invalid_count = eligible.len() - valid_count;
-
-        if valid_count >= self.min_validators_for_consensus {
-            Ok(VerificationVote::Valid)
-        } else {
-            Ok(VerificationVote::Invalid {
-                reason: format!(
-                    "Consensus rejected: {} valid, {} invalid (need {})",
-                    valid_count, invalid_count, self.min_validators_for_consensus
-                ),
-            })
-        }
+        self.tally
+            .consensus_result(reputation_tracker, min_reputation)
+            .await
     }
 
     /// Get completion percentage
     pub async fn completion_percentage(&self) -> f64 {
-        let votes = self.votes.read().await;
-        (votes.len() as f64 / self.total_validators as f64) * 100.0
+        self.tally.completion_percentage().await
     }
 
     /// Get vote counts
     pub async fn vote_counts(&self) -> (usize, usize) {
-        let votes = self.votes.read().await;
-        let valid = votes.values().filter(|v| v.is_valid()).count();
-        let invalid = votes.len() - valid;
-        (valid, invalid)
+        self.tally.vote_counts().await
     }
 }
 
@@ -856,7 +712,7 @@ impl WithdrawalVerificationCoordinator {
             .get(request_id)
             .ok_or_else(|| anyhow!("Request not found: {}", request_id))?;
 
-        let votes = consensus.votes.read().await;
+        let votes = consensus.tally.votes.read().await;
 
         for (validator_id, vote) in votes.iter() {
             // Check if vote aligns with consensus
@@ -948,7 +804,7 @@ mod tests {
         };
 
         let consensus = WithdrawalConsensus::new(request);
-        assert_eq!(consensus.request_id, "test123");
+        assert_eq!(consensus.tally.request_id, "test123");
         let tracker = ReputationTracker::new();
         assert!(
             !consensus
