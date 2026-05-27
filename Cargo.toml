@@ -103,6 +103,10 @@ name = "check-validators"
 path = "src/bin/check_validators.rs"
 
 [[bin]]
+name = "demo-withdraw"
+path = "src/bin/demo_withdraw.rs"
+
+[[bin]]
 name = "init-validator-registry"
 path = "src/bin/init_validator_registry.rs"
 

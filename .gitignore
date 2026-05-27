@@ -29,6 +29,9 @@ config/*-temp.toml
 !CONTRIBUTING.md
 *.sh.env
 *.sh
+# Reproducible devnet withdrawal demo (the other scripts/*.sh are local experiments)
+!scripts/start.sh
+!scripts/demo.sh
 .env
 
 # Solana test files
