@@ -113,6 +113,22 @@ impl Bridge {
             ))
         }
     }
+
+    /// Settle a consensus-approved shielded transfer on-chain (#194). Called
+    /// by the node's transfer submitter task when the validator quorum
+    /// approves a transfer.
+    pub async fn submit_approved_transfer(
+        &self,
+        approved: crate::consensus::ApprovedTransfer,
+    ) -> Result<String> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.submit_approved_transfer(approved).await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

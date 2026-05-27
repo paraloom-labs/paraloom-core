@@ -4,8 +4,8 @@
 
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, Result, WithdrawalRequest};
-use crate::consensus::{ApprovedWithdrawal, WithdrawalVerificationCoordinator};
-use crate::privacy::ShieldedPool;
+use crate::consensus::{ApprovedTransfer, ApprovedWithdrawal, WithdrawalVerificationCoordinator};
+use crate::privacy::{Commitment, Nullifier, ShieldedPool};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -133,6 +133,45 @@ impl ResultSubmitter {
             proof: approved.proof,
         };
         self.submit(request).await
+    }
+
+    /// Settle a consensus-approved shielded transfer (#194).
+    ///
+    /// Applies the transfer to the local pool from its public parts (mark the
+    /// input nullifiers spent, append the output commitments — the settling
+    /// node does not hold the private output notes), then submits the on-chain
+    /// `shielded_transfer` instruction. Unlike `submit_approved`, no funds move
+    /// and there is no expiration slot.
+    pub async fn submit_approved_transfer(&self, approved: ApprovedTransfer) -> Result<String> {
+        let nullifiers: Vec<Nullifier> =
+            approved.nullifiers.iter().copied().map(Nullifier).collect();
+        let output_commitments: Vec<Commitment> = approved
+            .output_commitments
+            .iter()
+            .copied()
+            .map(Commitment)
+            .collect();
+
+        // Local pool state first; a double-spend here surfaces before we pay
+        // RPC fees. The on-chain nullifier PDAs are the authoritative replay
+        // guard, but this keeps the node's own view consistent.
+        self.pool
+            .apply_transfer(nullifiers, output_commitments)
+            .await
+            .map_err(|e| BridgeError::WithdrawalFailed(e.to_string()))?;
+
+        let signature = self
+            .program
+            .submit_shielded_transfer(
+                approved.nullifiers,
+                approved.output_commitments,
+                approved.new_merkle_root,
+                &approved.proof,
+            )
+            .await?;
+
+        log::info!("Shielded transfer settled: {}", signature);
+        Ok(signature)
     }
 
     /// Verify withdrawal proof with real zkSNARK verification
