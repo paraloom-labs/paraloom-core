@@ -52,6 +52,11 @@ pub struct TransferVerificationRequest {
     /// zkSNARK proof (serialized `TransferCircuit` Groth16 proof)
     pub proof: Vec<u8>,
 
+    /// Encrypted output notes (#196), one per output commitment, hex-encoded
+    /// `EncryptedNote`. Opaque to validators — carried so recipients can scan
+    /// and trial-decrypt; never verified or settled on-chain.
+    pub ciphertexts: [String; 2],
+
     /// Timestamp when the request was created
     pub timestamp: u64,
 }

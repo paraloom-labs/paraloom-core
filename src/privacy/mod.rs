@@ -23,6 +23,7 @@ pub mod error;
 #[cfg(test)]
 mod integration_tests;
 pub mod merkle;
+pub mod note_crypto;
 pub mod nullifier;
 pub mod path_server;
 pub mod pedersen;
@@ -42,6 +43,7 @@ pub use circuits::{
 pub use commitment::{CommitmentBuilder, CommitmentGenerator};
 pub use error::{PrivacyError, Result};
 pub use merkle::MerkleTree;
+pub use note_crypto::{decrypt_note, encrypt_note, EncryptedNote, NotePlaintext};
 pub use nullifier::NullifierSet;
 pub use pool::ShieldedPool;
 pub use proof::{ProofVerifier, VerificationChunk, VerificationResult};
