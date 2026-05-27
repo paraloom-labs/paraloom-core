@@ -85,6 +85,16 @@ pub enum Message {
         result: crate::consensus::withdrawal::WithdrawalVerificationResult,
     },
 
+    /// Transfer verification request (broadcast to all validators, #194)
+    TransferVerificationRequest {
+        request: crate::consensus::transfer::TransferVerificationRequest,
+    },
+
+    /// Transfer verification result (validator -> coordinator, #194)
+    TransferVerificationResult {
+        result: crate::consensus::transfer::TransferVerificationResult,
+    },
+
     /// Validator registration announcement
     ValidatorRegistration {
         validator_id: crate::types::NodeId,
