@@ -284,21 +284,28 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // the public `merkle_root`. The Merkle gadget mirrors
         // `MerkleTree::hash_pair` and `MerklePath::verify` on the host
         // side (privacy::merkle, privacy::types).
+        // The sibling is a witness (not an `FpVar::constant`) and the
+        // direction is chosen with a constraint-level `select`, so the R1CS
+        // shape is identical for every path pattern — a single ceremony key
+        // verifies any leaf. This mirrors the `WithdrawCircuit` fix (#184); the
+        // earlier `FpVar::constant` + Rust `if *is_left` baked the path into
+        // the R1CS, so a key from the all-`false` dummy setup only verified the
+        // degenerate path and rejected real mixed-direction proofs.
         for (path_slot, commitment_var) in self.input_paths.iter().zip(input_commitment_vars.iter())
         {
             if let Some(path) = path_slot {
                 let mut current_hash = commitment_var.clone();
 
                 for (sibling_hash, is_left) in path {
-                    let sibling_var = FpVar::constant(Fr::from_le_bytes_mod_order(sibling_hash));
+                    let sibling_var = FpVar::new_witness(cs.clone(), || {
+                        Ok(Fr::from_le_bytes_mod_order(sibling_hash))
+                    })?;
+                    let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
 
-                    let (l, r) = if *is_left {
-                        (&current_hash, &sibling_var)
-                    } else {
-                        (&sibling_var, &current_hash)
-                    };
+                    let l = is_left_var.select(&current_hash, &sibling_var)?;
+                    let r = is_left_var.select(&sibling_var, &current_hash)?;
 
-                    current_hash = poseidon_merkle_pair_gadget(cs.clone(), l, r)?;
+                    current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
                 }
 
                 current_hash.enforce_equal(&merkle_root_var)?;

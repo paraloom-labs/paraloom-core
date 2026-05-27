@@ -111,6 +111,13 @@ pub struct BridgeConfig {
     /// empty string (disabled) and should stay on a loopback/management
     /// interface when enabled.
     pub withdrawal_ingress_address: String,
+
+    /// Address the transfer-verification ingress HTTP server binds to on a
+    /// bridge-enabled node (#194), the transfer twin of
+    /// `withdrawal_ingress_address`. A client POSTs a shielded transfer here
+    /// and the node broadcasts it into the consensus mesh. Triggers consensus,
+    /// so it defaults to an empty string (disabled).
+    pub transfer_ingress_address: String,
 }
 
 impl Default for BridgeConfig {
@@ -145,6 +152,8 @@ impl Default for BridgeConfig {
             merkle_path_query_address: std::env::var("BRIDGE_MERKLE_PATH_ADDRESS")
                 .unwrap_or_else(|_| "127.0.0.1:9090".to_string()),
             withdrawal_ingress_address: std::env::var("BRIDGE_WITHDRAWAL_INGRESS_ADDRESS")
+                .unwrap_or_default(),
+            transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
                 .unwrap_or_default(),
         }
     }

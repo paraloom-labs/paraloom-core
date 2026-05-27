@@ -1,0 +1,393 @@
+//! Shielded → shielded transfer verification consensus (#194).
+//!
+//! The transfer twin of [`crate::consensus::withdrawal`]. A client submits a
+//! transfer (two input nullifiers, two output commitments, the post-state
+//! Merkle root, and a `TransferCircuit` proof); validators verify the proof
+//! and vote, and once a BFT quorum of eligible voters agrees the coordinator
+//! emits an [`ApprovedTransfer`] that a submitter task settles on-chain via
+//! the `shielded_transfer` instruction.
+//!
+//! The vote/quorum machinery is shared with withdrawals through
+//! [`VoteTally`]; this module only adds the transfer-specific request,
+//! approval, and the thin coordinator shell. The reputation/slashing/leader
+//! trackers are reused as-is, so a validator's standing is consistent across
+//! both verification paths.
+
+use crate::consensus::leader::{LeaderSelector, ValidatorInfo};
+use crate::consensus::reputation::ReputationTracker;
+use crate::consensus::slashing::SlashingTracker;
+use crate::consensus::vote_tally::{VerificationVote, VoteTally};
+use crate::consensus::withdrawal::{
+    DEFAULT_MIN_REPUTATION_FOR_CONSENSUS, DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+    DEFAULT_TOTAL_VALIDATORS,
+};
+use crate::types::NodeId;
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+
+/// A shielded-transfer verification request broadcast to validators.
+///
+/// Fixed 2-in/2-out, matching the on-chain `shielded_transfer` instruction
+/// and `TransferCircuit`. `new_merkle_root` is the leader-computed root
+/// *after* the two output commitments are appended; it is carried for
+/// settlement only and is **not** a proof public input (the proof is checked
+/// against the inputs' membership root, the pool's current root).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferVerificationRequest {
+    /// Unique request ID
+    pub request_id: String,
+
+    /// Input note nullifiers (one may be a random dummy for a 1-real-input spend)
+    pub nullifiers: [[u8; 32]; 2],
+
+    /// New output note commitments
+    pub output_commitments: [[u8; 32]; 2],
+
+    /// Merkle root after appending the output commitments (settlement only)
+    pub new_merkle_root: [u8; 32],
+
+    /// zkSNARK proof (serialized `TransferCircuit` Groth16 proof)
+    pub proof: Vec<u8>,
+
+    /// Timestamp when the request was created
+    pub timestamp: u64,
+}
+
+/// Verification result from a validator for a transfer request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferVerificationResult {
+    /// Request ID
+    pub request_id: String,
+
+    /// Validator who performed verification
+    pub validator: NodeId,
+
+    /// Verification vote
+    pub vote: VerificationVote,
+
+    /// Timestamp when verified
+    pub timestamp: u64,
+}
+
+/// A transfer the validator quorum has approved (#194). Emitted on the
+/// approval channel the moment a `Valid` quorum is first reached, carrying
+/// exactly the fields needed to build the on-chain `shielded_transfer`
+/// instruction.
+#[derive(Clone, Debug)]
+pub struct ApprovedTransfer {
+    pub request_id: String,
+    pub nullifiers: [[u8; 32]; 2],
+    pub output_commitments: [[u8; 32]; 2],
+    pub new_merkle_root: [u8; 32],
+    pub proof: Vec<u8>,
+}
+
+/// Consensus state for one transfer verification: the request plus the
+/// shared [`VoteTally`].
+#[derive(Clone, Debug)]
+pub struct TransferConsensus {
+    pub request: TransferVerificationRequest,
+    pub tally: VoteTally,
+}
+
+impl TransferConsensus {
+    /// Create new consensus state with explicit BFT thresholds.
+    pub fn new_with_thresholds(
+        request: TransferVerificationRequest,
+        min_validators_for_consensus: usize,
+        total_validators: usize,
+    ) -> Self {
+        let tally = VoteTally::new(
+            request.request_id.clone(),
+            min_validators_for_consensus,
+            total_validators,
+        );
+        Self { request, tally }
+    }
+}
+
+/// Coordinates transfer verification across validators. Mirrors
+/// [`crate::consensus::withdrawal::WithdrawalVerificationCoordinator`]; the
+/// quorum logic is delegated to the embedded [`VoteTally`] of each
+/// [`TransferConsensus`].
+pub struct TransferVerificationCoordinator {
+    /// Active consensus states (request_id -> consensus)
+    pending: Arc<RwLock<HashMap<String, TransferConsensus>>>,
+
+    /// Registered validators
+    validators: Arc<RwLock<Vec<NodeId>>>,
+
+    /// Leader selector (shared selection model with withdrawals)
+    leader_selector: Arc<RwLock<LeaderSelector>>,
+
+    /// Reputation tracker for eligibility gating
+    reputation_tracker: Arc<ReputationTracker>,
+
+    /// Slashing-evidence log (equivocation detection)
+    slashing_tracker: Arc<SlashingTracker>,
+
+    /// Per-validator timeout streaks
+    timeout_streaks: Arc<RwLock<HashMap<NodeId, u64>>>,
+
+    /// Reputation floor for consensus participation
+    min_reputation_for_consensus: u64,
+
+    /// Minimum eligible-vote count for the BFT quorum
+    min_validators_for_consensus: usize,
+
+    /// Total validator-set size (percentage divisor)
+    total_validators: usize,
+
+    /// Approval-event sender; `Some` only when built with
+    /// [`new_with_approvals`](Self::new_with_approvals).
+    approval_tx: Option<mpsc::UnboundedSender<ApprovedTransfer>>,
+
+    /// Request IDs already emitted, so a transfer is settled at most once.
+    emitted: Arc<RwLock<HashSet<String>>>,
+}
+
+impl TransferVerificationCoordinator {
+    /// Create a new coordinator with the default 7-of-10 thresholds.
+    pub fn new() -> Self {
+        Self {
+            pending: Arc::new(RwLock::new(HashMap::new())),
+            validators: Arc::new(RwLock::new(Vec::new())),
+            leader_selector: Arc::new(RwLock::new(LeaderSelector::new())),
+            reputation_tracker: Arc::new(ReputationTracker::new()),
+            slashing_tracker: Arc::new(SlashingTracker::new()),
+            timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
+            min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+            total_validators: DEFAULT_TOTAL_VALIDATORS,
+            approval_tx: None,
+            emitted: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Create a coordinator that emits approved transfers on a channel.
+    /// Returned as a pair so the receiver (not `Clone`) is owned by exactly
+    /// one submitter consumer.
+    pub fn new_with_approvals() -> (Self, mpsc::UnboundedReceiver<ApprovedTransfer>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut coordinator = Self::new();
+        coordinator.approval_tx = Some(tx);
+        (coordinator, rx)
+    }
+
+    /// Override the BFT thresholds. Falls back to defaults on an invalid
+    /// pair (`min == 0`, `total == 0`, or `min > total`).
+    pub fn set_consensus_thresholds(
+        &mut self,
+        min_validators_for_consensus: usize,
+        total_validators: usize,
+    ) {
+        if min_validators_for_consensus == 0
+            || total_validators == 0
+            || min_validators_for_consensus > total_validators
+        {
+            log::warn!(
+                target: "paraloom::consensus",
+                "ignoring invalid transfer consensus thresholds (min={} total={}); falling back to {}/{}",
+                min_validators_for_consensus,
+                total_validators,
+                DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+                DEFAULT_TOTAL_VALIDATORS
+            );
+            self.min_validators_for_consensus = DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS;
+            self.total_validators = DEFAULT_TOTAL_VALIDATORS;
+            return;
+        }
+        self.min_validators_for_consensus = min_validators_for_consensus;
+        self.total_validators = total_validators;
+    }
+
+    /// Reference to the slashing-evidence log (tests/pipelines read it).
+    pub fn slashing_tracker(&self) -> &Arc<SlashingTracker> {
+        &self.slashing_tracker
+    }
+
+    /// Register a validator into the transfer consensus, mirroring the
+    /// withdrawal coordinator (reputation tracker + leader selector).
+    pub async fn register_validator(&self, validator: NodeId) {
+        let mut validators = self.validators.write().await;
+        if !validators.contains(&validator) {
+            log::info!(
+                "Validator registered for transfer consensus: {:?}",
+                validator
+            );
+            validators.push(validator.clone());
+        }
+
+        self.reputation_tracker
+            .register_validator(validator.clone())
+            .await;
+
+        let validator_info = ValidatorInfo::new(validator, 10_000_000_000, 1000);
+        let mut leader_selector = self.leader_selector.write().await;
+        leader_selector.register_validator(validator_info);
+    }
+
+    /// Number of registered validators
+    pub async fn validator_count(&self) -> usize {
+        self.validators.read().await.len()
+    }
+
+    /// Clear the timeout streak after a validator is observed alive.
+    async fn reset_timeout_streak(&self, validator: &NodeId) {
+        self.timeout_streaks
+            .write()
+            .await
+            .insert(validator.clone(), 0);
+    }
+
+    /// Start verification for a transfer request. Errors if there are not
+    /// enough registered validators to reach the configured quorum.
+    pub async fn start_verification(&self, request: TransferVerificationRequest) -> Result<String> {
+        let validators = self.validators.read().await;
+
+        if validators.is_empty() {
+            return Err(anyhow!("No validators available"));
+        }
+        if validators.len() < self.min_validators_for_consensus {
+            return Err(anyhow!(
+                "Not enough validators: {} < {}",
+                validators.len(),
+                self.min_validators_for_consensus
+            ));
+        }
+
+        let request_id = request.request_id.clone();
+        let consensus = TransferConsensus::new_with_thresholds(
+            request,
+            self.min_validators_for_consensus,
+            self.total_validators,
+        );
+
+        self.pending
+            .write()
+            .await
+            .insert(request_id.clone(), consensus);
+
+        log::info!("Started transfer verification: {}", request_id);
+        Ok(request_id)
+    }
+
+    /// Submit a verification result from a validator. On the node that
+    /// started the request, the vote that first completes a `Valid` quorum
+    /// makes the coordinator emit an [`ApprovedTransfer`] exactly once.
+    pub async fn submit_result(&self, result: TransferVerificationResult) -> Result<()> {
+        let pending = self.pending.read().await;
+
+        let consensus = pending
+            .get(&result.request_id)
+            .ok_or_else(|| anyhow!("Request not found: {}", result.request_id))?;
+
+        log::debug!(
+            "Transfer vote submitted for {}: {:?}",
+            result.request_id,
+            result.validator
+        );
+
+        let validator = result.validator.clone();
+        self.reset_timeout_streak(&validator).await;
+
+        if let Some(evidence) = consensus
+            .tally
+            .submit_vote(validator.clone(), result.vote)
+            .await?
+        {
+            // Equivocation: record the evidence; the original vote stands.
+            self.slashing_tracker.record(validator, evidence).await;
+        }
+
+        // Emit the approval the first time this vote completes a `Valid`
+        // quorum. Computed from the borrowed `consensus` directly, guarded by
+        // the `emitted` set against later votes re-triggering it.
+        if let Some(tx) = &self.approval_tx {
+            let mut emitted = self.emitted.write().await;
+            if !emitted.contains(&result.request_id)
+                && consensus
+                    .tally
+                    .has_consensus(&self.reputation_tracker, self.min_reputation_for_consensus)
+                    .await
+                && matches!(
+                    consensus
+                        .tally
+                        .consensus_result(
+                            &self.reputation_tracker,
+                            self.min_reputation_for_consensus,
+                        )
+                        .await,
+                    Ok(VerificationVote::Valid)
+                )
+            {
+                let req = &consensus.request;
+                let approved = ApprovedTransfer {
+                    request_id: result.request_id.clone(),
+                    nullifiers: req.nullifiers,
+                    output_commitments: req.output_commitments,
+                    new_merkle_root: req.new_merkle_root,
+                    proof: req.proof.clone(),
+                };
+                if tx.send(approved).is_ok() {
+                    emitted.insert(result.request_id.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Non-blocking quorum check.
+    pub async fn check_consensus(&self, request_id: &str) -> Result<Option<VerificationVote>> {
+        let pending = self.pending.read().await;
+        let consensus = pending
+            .get(request_id)
+            .ok_or_else(|| anyhow!("Request not found: {}", request_id))?;
+
+        if consensus.tally.is_timed_out() {
+            return Err(anyhow!("Verification timed out"));
+        }
+
+        if consensus
+            .tally
+            .has_consensus(&self.reputation_tracker, self.min_reputation_for_consensus)
+            .await
+        {
+            let result = consensus
+                .tally
+                .consensus_result(&self.reputation_tracker, self.min_reputation_for_consensus)
+                .await?;
+            Ok(Some(result))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `(completion_percentage, valid, invalid)` vote tally for a request.
+    pub async fn get_status(&self, request_id: &str) -> Result<(f64, usize, usize)> {
+        let pending = self.pending.read().await;
+        let consensus = pending
+            .get(request_id)
+            .ok_or_else(|| anyhow!("Request not found: {}", request_id))?;
+        let percentage = consensus.tally.completion_percentage().await;
+        let (valid, invalid) = consensus.tally.vote_counts().await;
+        Ok((percentage, valid, invalid))
+    }
+
+    /// Remove a completed verification's state.
+    pub async fn cleanup(&self, request_id: &str) -> Result<()> {
+        self.pending.write().await.remove(request_id);
+        log::debug!("Cleaned up transfer verification: {}", request_id);
+        Ok(())
+    }
+}
+
+impl Default for TransferVerificationCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}

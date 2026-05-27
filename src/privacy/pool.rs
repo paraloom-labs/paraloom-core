@@ -125,6 +125,33 @@ impl ShieldedPool {
         Ok(output_commitments)
     }
 
+    /// Apply a quorum-approved transfer to the local pool from its public
+    /// parts only (#194).
+    ///
+    /// Unlike [`transfer`](Self::transfer), the settling node does not hold the
+    /// private output notes — only their commitments — so it marks the input
+    /// nullifiers spent and appends the raw output commitments to the tree
+    /// without storing any note. Recipients learn and store their own output
+    /// notes out of band (viewing-key discovery, #196). Nullifier insertion is
+    /// persistence-first, matching [`transfer`](Self::transfer)/[`withdraw`](Self::withdraw):
+    /// a storage failure aborts before any in-memory mutation.
+    pub async fn apply_transfer(
+        &self,
+        input_nullifiers: Vec<Nullifier>,
+        output_commitments: Vec<Commitment>,
+    ) -> Result<()> {
+        if !self.nullifier_set.check_batch(&input_nullifiers).await {
+            return Err(anyhow!("Double-spend detected: nullifier already used"));
+        }
+        self.nullifier_set.insert_batch(input_nullifiers).await?;
+
+        for commitment in output_commitments {
+            self.commitment_tree.insert(&commitment).await?;
+        }
+
+        Ok(())
+    }
+
     /// Withdraw from the shielded pool
     /// Burns a commitment (via nullifier) and releases funds
     pub async fn withdraw(

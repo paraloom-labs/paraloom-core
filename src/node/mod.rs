@@ -12,7 +12,10 @@ use tokio::task::JoinHandle;
 use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
-use crate::consensus::{ApprovedWithdrawal, WithdrawalVerificationCoordinator};
+use crate::consensus::{
+    ApprovedTransfer, ApprovedWithdrawal, TransferVerificationCoordinator,
+    WithdrawalVerificationCoordinator,
+};
 use crate::coordinator::Coordinator;
 use crate::network::{Message, NetworkManager, ResultRequest, ResultResponse};
 use crate::privacy::pool::ShieldedPool;
@@ -22,6 +25,7 @@ use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
 
+pub mod transfer_ingress;
 pub mod withdrawal_ingress;
 
 /// Node implementation
@@ -33,6 +37,13 @@ pub mod withdrawal_ingress;
 /// by the privacy circuit tests and the on-chain settlement test).
 pub type WithdrawalProofVerifier =
     Arc<dyn Fn(&crate::consensus::withdrawal::WithdrawalVerificationRequest) -> bool + Send + Sync>;
+
+/// Transfer-proof verifier override (#194), the transfer twin of
+/// [`WithdrawalProofVerifier`]. `None` in production, so `verify_transfer_proof`
+/// runs the real Groth16 path; the multi-node transfer consensus E2E injects a
+/// closure to exercise the gossip → vote → quorum wiring without proving.
+pub type TransferProofVerifier =
+    Arc<dyn Fn(&crate::consensus::transfer::TransferVerificationRequest) -> bool + Send + Sync>;
 
 pub struct Node {
     settings: Settings,
@@ -114,6 +125,28 @@ pub struct Node {
     /// aborted in stop(). Same Arc<Mutex<Option<...>>> shape as the other
     /// spawned-task handles so Clone of Node stays cheap.
     withdrawal_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Transfer consensus coordinator (#194), the transfer twin of
+    /// `withdrawal_coordinator`. Incoming `TransferVerificationResult` votes
+    /// route into it; a quorum-approved transfer is pushed onto the channel
+    /// drained by the transfer submitter task.
+    transfer_coordinator: Option<Arc<TransferVerificationCoordinator>>,
+
+    /// Receiver half of the transfer coordinator's approval channel (#194).
+    /// Taken once by run() to drive the transfer submitter task.
+    transfer_approval_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ApprovedTransfer>>>>,
+
+    /// Transfer submitter task handle (#194): drains approved transfers and
+    /// settles them on-chain. Spawned in run(), aborted in stop().
+    transfer_submitter_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// Optional transfer-proof verifier override (#194 testing seam). `None`
+    /// in production.
+    transfer_proof_verifier_override: Option<TransferProofVerifier>,
+
+    /// Transfer-ingress HTTP server handle (#194). Spawned in run() when
+    /// `bridge.transfer_ingress_address` is set; aborted in stop().
+    transfer_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[async_trait]
@@ -152,6 +185,15 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 if let Some(withdrawal) = &self.withdrawal_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
                         withdrawal.register_validator(source.clone()).await;
+                    }
+                }
+
+                // Mirror into the transfer coordinator (#194) for the same
+                // reason — its `start_verification` also needs a quorum-sized
+                // validator set.
+                if let Some(transfer) = &self.transfer_coordinator {
+                    if node_info.node_type == NodeType::ResourceProvider {
+                        transfer.register_validator(source.clone()).await;
                     }
                 }
             }
@@ -413,6 +455,78 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 if let Some(coordinator) = &self.withdrawal_coordinator {
                     if let Err(e) = coordinator.submit_result(result).await {
                         log::debug!("dropping withdrawal vote: {}", e);
+                    }
+                }
+            }
+            Message::TransferVerificationRequest { request } => {
+                info!(
+                    "Received transfer verification request: {}",
+                    request.request_id
+                );
+
+                // Verify the transfer zkSNARK proof if a privacy pool is
+                // available, mirroring the withdrawal path (#194).
+                let vote = if let Some(pool) = &self.shielded_pool {
+                    match self.verify_transfer_proof(&request, pool).await {
+                        Ok(true) => {
+                            info!(
+                                "Transfer proof verified successfully: {}",
+                                request.request_id
+                            );
+                            crate::consensus::vote_tally::VerificationVote::Valid
+                        }
+                        Ok(false) => {
+                            log::warn!(
+                                "Transfer proof verification failed: {}",
+                                request.request_id
+                            );
+                            crate::consensus::vote_tally::VerificationVote::Invalid {
+                                reason: "Proof verification failed".to_string(),
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Error verifying transfer proof {}: {}",
+                                request.request_id,
+                                e
+                            );
+                            crate::consensus::vote_tally::VerificationVote::Invalid {
+                                reason: format!("Verification error: {}", e),
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!("Privacy pool not available, cannot verify transfer proof");
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "Privacy pool not available".to_string(),
+                    }
+                };
+
+                let result = crate::consensus::transfer::TransferVerificationResult {
+                    request_id: request.request_id,
+                    validator: self.node_info.id.clone(),
+                    vote,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                };
+
+                let response = Message::TransferVerificationResult { result };
+                if let Err(e) = self.network.send_message(source.clone(), response).await {
+                    log::error!("Failed to send transfer verification result: {}", e);
+                }
+            }
+            Message::TransferVerificationResult { result } => {
+                info!(
+                    "Received transfer verification result: {}",
+                    result.request_id
+                );
+                // Route the vote into the transfer coordinator (#194); a node
+                // that never started this request drops it.
+                if let Some(coordinator) = &self.transfer_coordinator {
+                    if let Err(e) = coordinator.submit_result(result).await {
+                        log::debug!("dropping transfer vote: {}", e);
                     }
                 }
             }
@@ -729,6 +843,32 @@ async fn settle_approved_withdrawals<F, Fut>(
     }
 }
 
+/// Drain the transfer coordinator's approval channel and settle each approved
+/// transfer on-chain (#194), the transfer twin of [`settle_approved_withdrawals`].
+/// A per-message failure — including a replay whose nullifier is already spent —
+/// is logged and skipped so it cannot stall later approvals.
+async fn settle_approved_transfers<F, Fut>(
+    mut rx: mpsc::UnboundedReceiver<ApprovedTransfer>,
+    mut submit: F,
+) where
+    F: FnMut(ApprovedTransfer) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
+{
+    while let Some(approved) = rx.recv().await {
+        let request_id = approved.request_id.clone();
+        match submit(approved).await {
+            Ok(sig) => info!("on-chain transfer settled for {}: {}", request_id, sig),
+            Err(e) if is_replay_error(&e) => {
+                log::debug!(
+                    "transfer {} already settled (nullifier spent), skipping",
+                    request_id
+                )
+            }
+            Err(e) => log::warn!("transfer {} submit failed: {}", request_id, e),
+        }
+    }
+}
+
 impl Node {
     /// Create a new node
     pub fn new(settings: Settings) -> Result<Self> {
@@ -866,6 +1006,15 @@ impl Node {
             (None, None)
         };
 
+        // Transfer consensus coordinator + its approval channel (#194), the
+        // transfer twin of the withdrawal pair above.
+        let (transfer_coordinator, transfer_approval_rx) = if runs_bridge {
+            let (coord, rx) = TransferVerificationCoordinator::new_with_approvals();
+            (Some(Arc::new(coord)), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let node = Node {
             settings,
             network: network_arc,
@@ -892,6 +1041,11 @@ impl Node {
             submitter_task: Arc::new(Mutex::new(None)),
             proof_verifier_override: None,
             withdrawal_ingress: Arc::new(Mutex::new(None)),
+            transfer_coordinator,
+            transfer_approval_rx: Arc::new(Mutex::new(transfer_approval_rx)),
+            transfer_submitter_task: Arc::new(Mutex::new(None)),
+            transfer_proof_verifier_override: None,
+            transfer_ingress: Arc::new(Mutex::new(None)),
         };
 
         Ok(node)
@@ -929,6 +1083,55 @@ impl Node {
             coordinator.set_consensus_thresholds(min_validators, total_validators);
         }
         self
+    }
+
+    /// Inject a transfer-proof verifier override (#194 testing seam), the
+    /// transfer twin of [`with_proof_verifier`](Self::with_proof_verifier).
+    pub fn with_transfer_proof_verifier(mut self, verifier: TransferProofVerifier) -> Self {
+        self.transfer_proof_verifier_override = Some(verifier);
+        self
+    }
+
+    /// Override the transfer-consensus quorum thresholds (#194 testing seam),
+    /// the transfer twin of [`with_consensus_thresholds`](Self::with_consensus_thresholds).
+    /// Must be called right after `new()`, before `run()` clones the node.
+    pub fn with_transfer_consensus_thresholds(
+        mut self,
+        min_validators: usize,
+        total_validators: usize,
+    ) -> Self {
+        if let Some(coordinator) = self.transfer_coordinator.as_mut().and_then(Arc::get_mut) {
+            coordinator.set_consensus_thresholds(min_validators, total_validators);
+        }
+        self
+    }
+
+    /// Quorum status for a transfer verification this node initiated (#194).
+    /// `Ok(Some(vote))` once a quorum is reached, `Ok(None)` while votes
+    /// accumulate or on a node with no transfer coordinator.
+    pub async fn transfer_consensus_status(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::consensus::vote_tally::VerificationVote>> {
+        match &self.transfer_coordinator {
+            Some(coordinator) => coordinator.check_consensus(request_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// `(valid, invalid)` transfer-vote tally for a request this node
+    /// initiated (#194), the transfer twin of
+    /// [`withdrawal_vote_counts`](Self::withdrawal_vote_counts). Lets a test
+    /// confirm a byzantine validator's dissent reached the quorum and was
+    /// outvoted. `Ok(None)` on a node with no transfer coordinator.
+    pub async fn transfer_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
+        match &self.transfer_coordinator {
+            Some(coordinator) => {
+                let (_pct, valid, invalid) = coordinator.get_status(request_id).await?;
+                Ok(Some((valid, invalid)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Consensus status for a withdrawal verification this node initiated
@@ -1308,6 +1511,53 @@ impl Node {
             info!("withdrawal submitter task started");
         }
 
+        // Serve the transfer-verification ingress over HTTP (#194), the
+        // transfer twin of the withdrawal ingress above.
+        if self.transfer_coordinator.is_some() {
+            let addr_str = self.settings.bridge.transfer_ingress_address.trim();
+            if !addr_str.is_empty() {
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let ingress: Arc<dyn transfer_ingress::TransferIngress> =
+                            Arc::new(self.clone());
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = transfer_ingress::serve(ingress, addr).await {
+                                log::error!(
+                                    target: "paraloom::node::transfer_ingress",
+                                    "transfer ingress server exited: {}",
+                                    e
+                                );
+                            }
+                        });
+                        *self.transfer_ingress.lock().await = Some(handle);
+                        info!("Transfer ingress server started on {}", addr_str);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "invalid bridge.transfer_ingress_address '{}': {} — ingress not started",
+                            addr_str,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Settle consensus-approved transfers (#194), the transfer twin of the
+        // withdrawal submitter task above.
+        if let (Some(bridge), Some(_coordinator), Some(rx)) = (
+            self.bridge.clone(),
+            self.transfer_coordinator.clone(),
+            self.transfer_approval_rx.lock().await.take(),
+        ) {
+            let handle = tokio::spawn(settle_approved_transfers(rx, move |approved| {
+                let bridge = bridge.clone();
+                async move { bridge.lock().await.submit_approved_transfer(approved).await }
+            }));
+            *self.transfer_submitter_task.lock().await = Some(handle);
+            info!("transfer submitter task started");
+        }
+
         // Periodically update resource information
         let status = self.status.clone();
         loop {
@@ -1357,6 +1607,12 @@ impl Node {
             handle.abort();
         }
         if let Some(handle) = self.withdrawal_ingress.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.transfer_submitter_task.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.transfer_ingress.lock().await.take() {
             handle.abort();
         }
         // Stop the bridge deposit listener (#163) so its poll loop
@@ -1425,6 +1681,29 @@ impl Node {
             )
             .await?;
         info!("initiated withdrawal verification: {}", request_id);
+        Ok(request_id)
+    }
+
+    /// Initiate distributed verification of a shielded transfer (#194), the
+    /// transfer twin of [`initiate_withdrawal_verification`](Self::initiate_withdrawal_verification).
+    /// Records the request with this node's transfer coordinator and broadcasts
+    /// it over the gossip mesh; validators verify and vote, and the resulting
+    /// approval is settled on-chain by this node's transfer submitter task.
+    pub async fn initiate_transfer_verification(
+        &self,
+        request: crate::consensus::TransferVerificationRequest,
+    ) -> Result<String> {
+        let coordinator = self.transfer_coordinator.as_ref().ok_or_else(|| {
+            anyhow!("node has no transfer coordinator (bridge disabled or non-validator)")
+        })?;
+        let request_id = coordinator.start_verification(request.clone()).await?;
+        self.network
+            .send_message(
+                NodeId(vec![]),
+                Message::TransferVerificationRequest { request },
+            )
+            .await?;
+        info!("initiated transfer verification: {}", request_id);
         Ok(request_id)
     }
 
@@ -1598,6 +1877,38 @@ impl Node {
         }
         Ok(matches!(result, crate::privacy::VerificationResult::Valid))
     }
+
+    /// Verify a transfer zkSNARK proof (#194), the transfer twin of
+    /// [`verify_withdrawal_proof`](Self::verify_withdrawal_proof). The proof's
+    /// membership root is the pool's *current* root (the request's
+    /// `new_merkle_root` is the post-state, used only at settle), and the
+    /// public inputs are `[root, nullifiers.., output_commitments..]`.
+    async fn verify_transfer_proof(
+        &self,
+        request: &crate::consensus::transfer::TransferVerificationRequest,
+        pool: &Arc<crate::privacy::pool::ShieldedPool>,
+    ) -> Result<bool> {
+        // Override seam (#194): use the injected verifier when present.
+        if let Some(verifier) = &self.transfer_proof_verifier_override {
+            return Ok(verifier(request));
+        }
+
+        let merkle_root = pool.root().await;
+        let result = crate::privacy::ProofVerifier::verify_transfer_parts(
+            &merkle_root,
+            &request.nullifiers,
+            &request.output_commitments,
+            &request.proof,
+        );
+        if let crate::privacy::VerificationResult::Invalid { reason } = &result {
+            log::warn!(
+                "transfer proof rejected for {}: {}",
+                request.request_id,
+                reason
+            );
+        }
+        Ok(matches!(result, crate::privacy::VerificationResult::Valid))
+    }
 }
 
 // Clone is needed for the async_trait implementation
@@ -1629,6 +1940,11 @@ impl Clone for Node {
             submitter_task: self.submitter_task.clone(),
             proof_verifier_override: self.proof_verifier_override.clone(),
             withdrawal_ingress: self.withdrawal_ingress.clone(),
+            transfer_coordinator: self.transfer_coordinator.clone(),
+            transfer_approval_rx: self.transfer_approval_rx.clone(),
+            transfer_submitter_task: self.transfer_submitter_task.clone(),
+            transfer_proof_verifier_override: self.transfer_proof_verifier_override.clone(),
+            transfer_ingress: self.transfer_ingress.clone(),
         }
     }
 }

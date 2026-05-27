@@ -281,6 +281,11 @@ jobs:
       - name: Run consensus network E2E (ignored)
         run: cargo test --test consensus_network_e2e --all-features -- --ignored --test-threads=1 --nocapture
 
+      # Transfer twin of the above (#194). Same override-seam approach — no
+      # real proof or transfer key needed, so it runs on a plain runner.
+      - name: Run transfer consensus network E2E (ignored)
+        run: cargo test --test transfer_consensus_network_e2e --all-features -- --ignored --test-threads=1 --nocapture
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

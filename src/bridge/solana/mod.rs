@@ -105,6 +105,14 @@ impl SolanaBridge {
         self.submitter.submit_approved(approved).await
     }
 
+    /// Settle a consensus-approved shielded transfer on-chain (#194).
+    pub async fn submit_approved_transfer(
+        &self,
+        approved: crate::consensus::ApprovedTransfer,
+    ) -> Result<String> {
+        self.submitter.submit_approved_transfer(approved).await
+    }
+
     /// Get program interface
     pub fn program(&self) -> &ProgramInterface {
         &self.program

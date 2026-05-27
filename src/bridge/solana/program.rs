@@ -177,6 +177,46 @@ impl ProgramInterface {
         Ok(signature.to_string())
     }
 
+    /// Submit a quorum-approved shielded transfer on-chain (#194).
+    ///
+    /// Builds the `shielded_transfer` instruction (nullify two inputs, append
+    /// two output commitments, advance the Merkle root) and sends it signed by
+    /// the bridge authority. No vault is involved — a transfer releases no
+    /// funds.
+    pub async fn submit_shielded_transfer(
+        &self,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        new_merkle_root: [u8; 32],
+        proof: &[u8],
+    ) -> Result<String> {
+        log::info!("Submitting shielded transfer (advancing root)");
+
+        let authority = self.authority_keypair.as_ref().ok_or_else(|| {
+            BridgeError::ConfigError("No authority keypair configured".to_string())
+        })?;
+
+        let instruction = super::create_shielded_transfer_instruction(
+            &self.program_id,
+            &authority.pubkey(),
+            nullifiers,
+            output_commitments,
+            new_merkle_root,
+            proof.to_vec(),
+        )?;
+
+        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&authority.pubkey()),
+            &[authority],
+            recent_blockhash,
+        );
+        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
+        log::info!("Shielded transfer submitted successfully: {}", signature);
+        Ok(signature.to_string())
+    }
+
     /// Get account balance
     pub async fn get_balance(&self, address: SolanaAddress) -> Result<u64> {
         self.rpc.get_balance(&Pubkey::new_from_array(address)).await

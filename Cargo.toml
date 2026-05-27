@@ -78,6 +78,10 @@ name = "setup-withdrawal-ceremony"
 path = "src/bin/setup_withdrawal_ceremony.rs"
 
 [[bin]]
+name = "setup-transfer-ceremony"
+path = "src/bin/setup_transfer_ceremony.rs"
+
+[[bin]]
 name = "compute-poseidon-inputs"
 path = "src/bin/compute_poseidon_inputs.rs"
 
