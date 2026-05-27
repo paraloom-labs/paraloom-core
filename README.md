@@ -44,6 +44,7 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | zkSNARK privacy layer | ✅ Working | Groth16 + BLS12-381, 192-byte proofs, devnet tested |
 | In-circuit range proofs | ✅ Working | u64 bit-decomposition in deposit / transfer / withdraw (v0.4.0) |
 | Solana bridge (Anchor) | ✅ Working | Deployed on devnet; replay-bound by `expiration_slot` (v0.4.0) |
+| Shielded transfers (private→private) | ✅ Working | 2-in/2-out `TransferCircuit`, client-side proof, BFT-settled, encrypted note delivery + recipient scan (v0.5.0) |
 | Program version handshake | ✅ Working | L2 refuses to talk to wrong on-chain program version |
 | Byzantine consensus | ✅ Working | Configurable BFT threshold; default 7/10; validated on 10-node localnet |
 | Reputation gating + slashing | ✅ Working | Equivocation + persistent-unavailability evidence (v0.4.0) |
@@ -57,6 +58,17 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending; explicitly out of scope for the v0.5.0 ceremony |
 | MPC ceremony execution | 🟡 In progress | Tooling shipped at rc2; the 20–30 contributor run is the calendar gate to v0.5.0 final |
 | Mainnet launch | 🟡 Pre-release | v0.5.0-rc2 cut; awaiting ceremony completion + external security audit |
+
+### Known limitations (devnet, pre-mainnet)
+
+Honest scope for the current devnet milestone. These are tracked and gate mainnet, not the devnet release; none affect fund safety on devnet.
+
+- **On-chain ZK verification is deferred.** The Solana program records proof blobs and trusts the L2 validator quorum plus the bridge-authority gate; it does not verify Groth16 on-chain yet (blocked on Solana SIMD-0388, ~Q3'26 — #165). The Merkle root a shielded transfer advances is likewise accepted from the consensus leader rather than verified on-chain.
+- **Trusted setup is a dev ceremony.** Proving/verifying keys come from a single-party dev setup; the multi-party (MPC) ceremony that gates v0.5.0 final is in progress (#64).
+- **Transfer note delivery is L2-served and in-memory.** Encrypted output notes are delivered via a node's `/transfer/scan` endpoint (in-memory, not persisted across restart; the ingress is disabled by default and intended for a loopback/management interface). Recipients scan and trial-decrypt client-side.
+- **Per-transfer pool convergence is partial.** The settling node appends a transfer's output commitments to its shielded pool; recipients rely on that node / the on-chain tree to spend.
+
+These are the work between a pre-mainnet milestone and a mainnet launch, which also awaits an external security audit.
 
 ## Economic Model
 
