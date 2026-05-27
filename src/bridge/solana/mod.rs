@@ -12,8 +12,9 @@ mod test_support;
 
 pub use instructions::{
     create_deposit_instruction, create_initialize_instruction,
-    create_update_merkle_root_instruction, create_withdraw_instruction, derive_bridge_state,
-    derive_bridge_vault, derive_nullifier_account, DepositInstructionData,
+    create_shielded_transfer_instruction, create_update_merkle_root_instruction,
+    create_withdraw_instruction, derive_bridge_state, derive_bridge_vault,
+    derive_nullifier_account, DepositInstructionData, ShieldedTransferInstructionData,
 };
 pub use keypair::load_keypair_from_file;
 pub use listener::EventListener;
