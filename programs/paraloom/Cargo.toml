@@ -25,3 +25,8 @@ ed25519-dalek = "2" # Upgrade to use curve25519-dalek 4.x
 [dev-dependencies]
 solana-program-test = "2.3.13"
 solana-sdk = "2.0"
+# Used by `tests/common::add_program_data` to bincode-serialize a fake
+# `UpgradeableLoaderState::ProgramData` account so the upgrade-authority init
+# constraint (#204) can be exercised under `solana-program-test`, which loads
+# programs via the non-upgradeable loader and has no real ProgramData PDA.
+bincode = "1"
