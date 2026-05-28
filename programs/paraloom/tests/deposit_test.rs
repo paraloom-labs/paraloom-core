@@ -3,6 +3,9 @@
 //! changes the L2 reads to update its shielded pool: `deposit_count`
 //! must tick to 1, `total_deposited` must equal the transferred
 //! amount, and the bridge_vault PDA must hold those lamports.
+//!
+//! Init now uses an upgrade-authority signer (#204); the (permissionless)
+//! deposit ix is still signed by the auto-payer.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
@@ -11,12 +14,13 @@ use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
 
 mod common;
-use common::entry;
+use common::{add_program_data, entry};
 
 #[tokio::test]
 async fn deposit_credits_vault_and_advances_counters() {
     let program_id = paraloom_program::ID;
-    let pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
@@ -31,13 +35,14 @@ async fn deposit_credits_vault_and_advances_counters() {
         .data(),
         accounts: accounts::Initialize {
             bridge_state: bridge_state_pda,
-            authority: payer.pubkey(),
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
     };
-    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&payer.pubkey()));
-    tx.sign(&[&payer], recent_blockhash);
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
     let amount: u64 = 1_000_000;

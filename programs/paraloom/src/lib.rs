@@ -3,6 +3,7 @@
 //! Handles deposits into and withdrawals from the Paraloom privacy layer
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::bpf_loader_upgradeable;
 
 declare_id!("DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco");
 
@@ -12,6 +13,35 @@ pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 /// 192 bytes; the cap leaves headroom while rejecting oversized blobs that
 /// would only bloat the transaction (flagged alongside #178).
 pub const MAX_PROOF_LEN: usize = 256;
+
+/// Verify a BPFLoaderUpgradeable `ProgramData` account's upgrade authority
+/// matches `expected` (#204). Closes the init front-run race: only the wallet
+/// holding the program's upgrade authority can call the `initialize_*`
+/// instructions. Parses the canonical
+/// `bincode(UpgradeableLoaderState::ProgramData)` layout manually so this gate
+/// adds no extra dependency to the on-chain binary:
+///
+/// ```text
+///   bytes  0..4   : u32 LE enum tag (= 3 for `ProgramData`)
+///   bytes  4..12  : u64 LE slot                (unused here)
+///   byte  12      : `Option<Pubkey>` discriminator (1 = Some, 0 = None)
+///   bytes 13..45  : 32-byte upgrade authority pubkey (when Some)
+/// ```
+fn check_upgrade_authority(program_data: &UncheckedAccount, expected: &Pubkey) -> Result<()> {
+    require!(
+        program_data.owner == &bpf_loader_upgradeable::id(),
+        BridgeError::UnauthorizedInit
+    );
+    let data = program_data.try_borrow_data()?;
+    require!(data.len() >= 45, BridgeError::UnauthorizedInit);
+    let tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    require!(tag == 3, BridgeError::UnauthorizedInit); // ProgramData variant
+    require!(data[12] == 1, BridgeError::UnauthorizedInit); // Some(_)
+    let authority_bytes: [u8; 32] = data[13..45].try_into().unwrap();
+    let actual = Pubkey::from(authority_bytes);
+    require!(&actual == expected, BridgeError::UnauthorizedInit);
+    Ok(())
+}
 
 #[program]
 pub mod paraloom_program {
@@ -29,6 +59,7 @@ pub mod paraloom_program {
         program_version: u32,
         initial_merkle_root: [u8; 32],
     ) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let bridge_state = &mut ctx.accounts.bridge_state;
         bridge_state.program_version = program_version;
         bridge_state.authority = ctx.accounts.authority.key();
@@ -39,7 +70,10 @@ pub mod paraloom_program {
         bridge_state.paused = false;
         bridge_state.merkle_root = initial_merkle_root;
 
-        msg!("Bridge initialized with merkle root, program_version={}", program_version);
+        msg!(
+            "Bridge initialized with merkle root, program_version={}",
+            program_version
+        );
         Ok(())
     }
 
@@ -320,7 +354,9 @@ pub mod paraloom_program {
         require!(validator_account.is_active, BridgeError::ValidatorNotActive);
 
         let stake_amount = validator_account.stake_amount;
-        **validator_account.to_account_info().try_borrow_mut_lamports()? -= stake_amount;
+        **validator_account
+            .to_account_info()
+            .try_borrow_mut_lamports()? -= stake_amount;
         **ctx
             .accounts
             .validator
@@ -442,16 +478,27 @@ pub mod paraloom_program {
             validator_account.validator == validator,
             BridgeError::InvalidValidator
         );
-        require!(slash_percentage > 0 && slash_percentage <= 100, BridgeError::InvalidAmount);
+        require!(
+            slash_percentage > 0 && slash_percentage <= 100,
+            BridgeError::InvalidAmount
+        );
 
-        let slash_amount = (validator_account.stake_amount as u128 * slash_percentage as u128 / 100) as u64;
+        let slash_amount =
+            (validator_account.stake_amount as u128 * slash_percentage as u128 / 100) as u64;
 
         let old_stake = validator_account.stake_amount;
-        validator_account.stake_amount = validator_account.stake_amount.saturating_sub(slash_amount);
+        validator_account.stake_amount =
+            validator_account.stake_amount.saturating_sub(slash_amount);
         validator_account.times_slashed += 1;
 
-        **validator_account.to_account_info().try_borrow_mut_lamports()? -= slash_amount;
-        **ctx.accounts.bridge_vault.to_account_info().try_borrow_mut_lamports()? += slash_amount;
+        **validator_account
+            .to_account_info()
+            .try_borrow_mut_lamports()? -= slash_amount;
+        **ctx
+            .accounts
+            .bridge_vault
+            .to_account_info()
+            .try_borrow_mut_lamports()? += slash_amount;
 
         emit!(ValidatorSlashedEvent {
             validator,
@@ -473,6 +520,7 @@ pub mod paraloom_program {
 
     /// Initialize validator registry
     pub fn initialize_validator_registry(ctx: Context<InitializeValidatorRegistry>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let registry = &mut ctx.accounts.validator_registry;
         registry.authority = ctx.accounts.authority.key();
         registry.total_validators = 0;
@@ -497,6 +545,23 @@ pub struct Initialize<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    /// Program's BPFLoaderUpgradeable `ProgramData` account (#204). Binds
+    /// `initialize` to the program's upgrade authority — without this gate
+    /// anyone could win the race between `program deploy` and the first
+    /// `initialize` call and permanently become `bridge_state.authority`
+    /// (no `set_authority` instruction exists). The seeds constraint pins
+    /// this account to the canonical PDA derived under BPFLoaderUpgradeable;
+    /// the upgrade-authority match is verified inside the instruction body
+    /// via [`check_upgrade_authority`].
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -643,6 +708,17 @@ pub struct InitializeValidatorRegistry<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    /// Same upgrade-authority gate as `Initialize` (#204) — closes the init
+    /// front-run race for the validator registry.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -922,4 +998,7 @@ pub enum BridgeError {
 
     #[msg("Duplicate input nullifier in transfer")]
     DuplicateNullifier,
+
+    #[msg("Initialize signer must be the program's upgrade authority")]
+    UnauthorizedInit,
 }
