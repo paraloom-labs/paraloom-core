@@ -38,6 +38,10 @@ use solana_sdk::{
 #[cfg(feature = "solana-bridge")]
 use std::str::FromStr;
 
+// Node boot (validator start) — core, not gated on the Solana bridge.
+use paraloom::config::Settings;
+use paraloom::node::Node;
+
 // Compute layer imports
 use once_cell::sync::Lazy;
 use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
@@ -1316,71 +1320,33 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
     match command {
         ValidatorCommands::Start { config, daemon } => {
-            println!("Starting Paraloom validator...\n");
+            if daemon {
+                anyhow::bail!(
+                    "Background/daemon mode is not built in. Run the node under a process \
+                     manager instead (systemd, supervisor, or `nohup`). See the validator \
+                     guide: https://docs.paraloom.io/docs/validator-guide"
+                );
+            }
 
-            // Load config file
+            println!("Starting Paraloom validator node...\n");
             println!("Loading configuration from: {}", config.display());
 
             if !config.exists() {
                 anyhow::bail!(
-                    "Config file not found: {}\n\nRun 'paraloom init' to create a default config",
+                    "Config file not found: {}\n\nCopy scripts/devnet/validator.toml.example \
+                     to a path of your choice and edit the marked fields.",
                     config.display()
                 );
             }
 
-            let config_content =
-                std::fs::read_to_string(&config).context("Failed to read config file")?;
+            let config_path = config.to_str().context("Config path is not valid UTF-8")?;
 
-            // Parse TOML config
-            let config_value: toml::Value =
-                toml::from_str(&config_content).context("Failed to parse config file")?;
-
-            // Extract validator info
-            let validator_enabled = config_value
-                .get("validator")
-                .and_then(|v| v.get("enabled"))
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false);
-
-            if !validator_enabled {
-                anyhow::bail!(
-                    "Validator is disabled in config.\n\nSet 'enabled = true' in [validator] section"
-                );
-            }
-
-            let cpu_capacity = config_value
-                .get("validator")
-                .and_then(|v| v.get("capacity_cpu"))
-                .and_then(|c| c.as_integer())
-                .unwrap_or(4);
-
-            let memory_capacity = config_value
-                .get("validator")
-                .and_then(|v| v.get("capacity_memory"))
-                .and_then(|m| m.as_integer())
-                .unwrap_or(4096);
-
-            println!("\nValidator Configuration:");
-            println!("  CPU Capacity: {} cores", cpu_capacity);
-            println!("  Memory Capacity: {} MB", memory_capacity);
-
-            if daemon {
-                println!("\n[OK] Validator would start in background mode");
-                println!("  Note: Daemon mode not yet implemented");
-                println!("  Logs would be at: .paraloom/logs/validator.log");
-                println!("\n[INFO] To implement:");
-                println!("  1. Use tokio::spawn for background execution");
-                println!("  2. Save PID to .paraloom/validator.pid");
-                println!("  3. Setup log file rotation");
-            } else {
-                println!("\n[OK] Validator would start in foreground mode");
-                println!("  Press Ctrl+C to stop");
-                println!("\n[INFO] Next steps to implement:");
-                println!("  1. Initialize RocksDB storage");
-                println!("  2. Start libp2p networking");
-                println!("  3. Register capacity with coordinator");
-                println!("  4. Begin processing jobs from queue");
-            }
+            // Same boot path as the `paraloom-node start` binary: load settings,
+            // construct the node, and run it in the foreground until interrupted.
+            let settings = Settings::from_file(config_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load settings: {}", e))?;
+            let node = Node::new(settings)?;
+            node.run().await?;
 
             Ok(())
         }
