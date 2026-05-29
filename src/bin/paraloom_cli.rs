@@ -38,6 +38,10 @@ use solana_sdk::{
 #[cfg(feature = "solana-bridge")]
 use std::str::FromStr;
 
+// Node boot (validator start) — core, not gated on the Solana bridge.
+use paraloom::config::Settings;
+use paraloom::node::Node;
+
 // Compute layer imports
 use once_cell::sync::Lazy;
 use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
@@ -277,6 +281,21 @@ enum ValidatorCommands {
         daemon: bool,
     },
 
+    /// Register this validator on-chain (stakes 1 SOL into a per-validator PDA)
+    Register {
+        /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Stop running validator
     Stop {
         /// Force stop (SIGKILL)
@@ -284,11 +303,34 @@ enum ValidatorCommands {
         force: bool,
     },
 
-    /// Show validator status
+    /// Show validator status (reads on-chain state when a keypair is given)
     Status {
-        /// Show detailed metrics
+        /// Show detailed local system metrics
         #[arg(short, long)]
         detailed: bool,
+
+        /// Validator wallet keypair to look up on-chain (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
+    /// List validators registered on-chain
+    List {
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
     },
 
     /// View validator logs
@@ -1313,73 +1355,169 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
     }
 }
 
+/// Decode an on-chain `ValidatorAccount` (after the 8-byte Anchor
+/// discriminator) into (validator pubkey, stake in SOL, reputation, is_active).
+/// Returns None if the buffer isn't a ValidatorAccount (113 bytes).
+#[cfg(feature = "solana-bridge")]
+fn decode_validator_account(data: &[u8]) -> Option<(Pubkey, f64, u64, bool)> {
+    if data.len() < 113 {
+        return None;
+    }
+    let validator = Pubkey::new_from_array(<[u8; 32]>::try_from(&data[8..40]).ok()?);
+    let stake = u64::from_le_bytes(data[40..48].try_into().ok()?) as f64 / LAMPORTS_PER_SOL as f64;
+    let reputation = u64::from_le_bytes(data[48..56].try_into().ok()?);
+    let is_active = data[88] == 1;
+    Some((validator, stake, reputation, is_active))
+}
+
 async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
     match command {
         ValidatorCommands::Start { config, daemon } => {
-            println!("Starting Paraloom validator...\n");
+            if daemon {
+                anyhow::bail!(
+                    "Background/daemon mode is not built in. Run the node under a process \
+                     manager instead (systemd, supervisor, or `nohup`). See the validator \
+                     guide: https://docs.paraloom.io/docs/validator-guide"
+                );
+            }
 
-            // Load config file
+            println!("Starting Paraloom validator node...\n");
             println!("Loading configuration from: {}", config.display());
 
             if !config.exists() {
                 anyhow::bail!(
-                    "Config file not found: {}\n\nRun 'paraloom init' to create a default config",
+                    "Config file not found: {}\n\nCopy scripts/devnet/validator.toml.example \
+                     to a path of your choice and edit the marked fields.",
                     config.display()
                 );
             }
 
-            let config_content =
-                std::fs::read_to_string(&config).context("Failed to read config file")?;
+            let config_path = config.to_str().context("Config path is not valid UTF-8")?;
 
-            // Parse TOML config
-            let config_value: toml::Value =
-                toml::from_str(&config_content).context("Failed to parse config file")?;
+            // Same boot path as the `paraloom-node start` binary: load settings,
+            // construct the node, and run it in the foreground until interrupted.
+            let settings = Settings::from_file(config_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load settings: {}", e))?;
+            let node = Node::new(settings)?;
+            node.run().await?;
 
-            // Extract validator info
-            let validator_enabled = config_value
-                .get("validator")
-                .and_then(|v| v.get("enabled"))
-                .and_then(|e| e.as_bool())
-                .unwrap_or(false);
+            Ok(())
+        }
 
-            if !validator_enabled {
-                anyhow::bail!(
-                    "Validator is disabled in config.\n\nSet 'enabled = true' in [validator] section"
+        ValidatorCommands::Register {
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Registering validator on-chain...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+                const STAKE_LAMPORTS: u64 = LAMPORTS_PER_SOL; // 1 SOL minimum stake
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("VALIDATOR_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Validator Keypair: {}\n", keypair_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let validator =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Validator Address: {}\n", validator.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let balance = client
+                    .get_balance(&validator.pubkey())
+                    .context("Failed to get balance")?;
+                println!(
+                    "Validator Balance: {} SOL\n",
+                    balance as f64 / LAMPORTS_PER_SOL as f64
                 );
+                if balance < 2 * LAMPORTS_PER_SOL {
+                    anyhow::bail!(
+                        "Insufficient balance. Need at least 2 SOL (1 to stake + fees). \
+                         Airdrop with: solana airdrop 2 {} --url devnet",
+                        validator.pubkey()
+                    );
+                }
+
+                let (validator_account_pda, _bump) = Pubkey::find_program_address(
+                    &[b"validator", validator.pubkey().as_ref()],
+                    &program_id,
+                );
+                let (validator_registry_pda, _registry_bump) =
+                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+                println!("Validator Account PDA: {}", validator_account_pda);
+                println!("Validator Registry PDA: {}\n", validator_registry_pda);
+
+                // Anchor discriminator for `register_validator` + stake (u64 LE).
+                let discriminator: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
+                let mut data = discriminator.to_vec();
+                data.extend_from_slice(&STAKE_LAMPORTS.to_le_bytes());
+
+                let ix = solana_sdk::instruction::Instruction {
+                    program_id,
+                    accounts: vec![
+                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
+                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
+                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
+                        solana_sdk::instruction::AccountMeta::new_readonly(
+                            solana_sdk::system_program::ID,
+                            false,
+                        ),
+                    ],
+                    data,
+                };
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    blockhash,
+                );
+
+                println!("Staking 1 SOL and registering...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Validator registered!");
+                println!("  Transaction: {}", signature);
+                println!("  Validator:   {}", validator.pubkey());
+                println!("  Stake:       1 SOL");
+                println!("\nVerify with: paraloom validator list");
             }
 
-            let cpu_capacity = config_value
-                .get("validator")
-                .and_then(|v| v.get("capacity_cpu"))
-                .and_then(|c| c.as_integer())
-                .unwrap_or(4);
-
-            let memory_capacity = config_value
-                .get("validator")
-                .and_then(|v| v.get("capacity_memory"))
-                .and_then(|m| m.as_integer())
-                .unwrap_or(4096);
-
-            println!("\nValidator Configuration:");
-            println!("  CPU Capacity: {} cores", cpu_capacity);
-            println!("  Memory Capacity: {} MB", memory_capacity);
-
-            if daemon {
-                println!("\n[OK] Validator would start in background mode");
-                println!("  Note: Daemon mode not yet implemented");
-                println!("  Logs would be at: .paraloom/logs/validator.log");
-                println!("\n[INFO] To implement:");
-                println!("  1. Use tokio::spawn for background execution");
-                println!("  2. Save PID to .paraloom/validator.pid");
-                println!("  3. Setup log file rotation");
-            } else {
-                println!("\n[OK] Validator would start in foreground mode");
-                println!("  Press Ctrl+C to stop");
-                println!("\n[INFO] Next steps to implement:");
-                println!("  1. Initialize RocksDB storage");
-                println!("  2. Start libp2p networking");
-                println!("  3. Register capacity with coordinator");
-                println!("  4. Begin processing jobs from queue");
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
             }
 
             Ok(())
@@ -1415,41 +1553,89 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             Ok(())
         }
 
-        ValidatorCommands::Status { detailed } => {
+        ValidatorCommands::Status {
+            detailed,
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
             println!("Validator Status:\n");
 
-            // Check if validator is running
-            let pid_file = std::path::Path::new(".paraloom/validator.pid");
-            let is_running = pid_file.exists();
+            // On-chain state is the source of truth — read it when a keypair
+            // is available. No fabricated reputation/earnings numbers.
+            #[cfg(feature = "solana-bridge")]
+            {
+                let keypair_path = keypair.or_else(|| {
+                    std::env::var("VALIDATOR_KEYPAIR_PATH")
+                        .ok()
+                        .map(PathBuf::from)
+                });
 
-            if is_running {
-                println!("Status: [ONLINE] Running");
-            } else {
-                println!("Status: [OFFLINE] Not running");
-                println!("\nStart validator with: paraloom validator start --config paraloom.toml");
-                return Ok(());
+                if let Some(keypair_path) = keypair_path {
+                    let rpc_url = rpc_url
+                        .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                        .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+                    let program_id_str = program_id
+                        .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                        .unwrap_or_else(|| {
+                            "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP".to_string()
+                        });
+                    let program_id =
+                        Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+                    let validator = load_keypair_from_file(
+                        keypair_path.to_str().context("Invalid keypair path")?,
+                    )
+                    .context("Failed to load keypair")?;
+                    let (pda, _bump) = Pubkey::find_program_address(
+                        &[b"validator", validator.pubkey().as_ref()],
+                        &program_id,
+                    );
+                    let client =
+                        RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                    println!("Validator:   {}", validator.pubkey());
+                    println!("Account PDA: {}", pda);
+                    match client.get_account_data(&pda) {
+                        Ok(data) => match decode_validator_account(&data) {
+                            Some((_, stake, reputation, is_active)) => println!(
+                                "On-chain:    {} | stake {} SOL | reputation {}",
+                                if is_active { "ACTIVE" } else { "INACTIVE" },
+                                stake,
+                                reputation
+                            ),
+                            None => {
+                                println!("On-chain:    account exists but isn't a ValidatorAccount")
+                            }
+                        },
+                        Err(_) => println!(
+                            "On-chain:    not registered. Run `paraloom validator register`."
+                        ),
+                    }
+                } else {
+                    println!(
+                        "No keypair given — pass --keypair (or set VALIDATOR_KEYPAIR_PATH) to read \
+                         on-chain state, or run `paraloom validator list`."
+                    );
+                }
             }
 
-            // Mock metrics (in production, query from running validator)
-            println!("Uptime: Not yet implemented");
-            println!("Reputation: 1,000 (Neutral - new validator)");
-            println!("Jobs processed (24h): 0");
-            println!("Earnings (30d): 0 SOL");
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                let _ = (&keypair, &rpc_url, &program_id);
+                println!("On-chain status requires the solana-bridge feature.");
+            }
 
+            // Optional local system snapshot (not the validator's network state).
             if detailed {
-                // Get real system info
                 use sysinfo::{CpuExt, System, SystemExt};
                 let mut sys = System::new_all();
                 sys.refresh_all();
 
-                println!("\nHardware (System):");
-
-                // CPU info
+                println!("\nLocal system:");
                 let cpu_usage: f32 = sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>()
                     / sys.cpus().len() as f32;
                 println!("  CPU: {:.1}% ({} cores)", cpu_usage, sys.cpus().len());
 
-                // Memory info
                 let used_memory = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
                 let total_memory = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
                 println!(
@@ -1458,13 +1644,68 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     total_memory,
                     (used_memory / total_memory) * 100.0
                 );
+            }
 
-                println!("\nNetwork:");
-                println!("  Peers: 0 connected (validator not active)");
-                println!("  Validator ID: Not yet assigned");
-                println!("  P2P Address: Not yet configured");
+            Ok(())
+        }
 
-                println!("\n[NOTE] Full metrics require active validator node");
+        ValidatorCommands::List {
+            rpc_url,
+            program_id,
+        } => {
+            println!("Registered validators (on-chain):\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP".to_string());
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let accounts = client
+                    .get_program_accounts(&program_id)
+                    .context("Failed to fetch program accounts")?;
+
+                let mut validators: Vec<(Pubkey, f64, u64, bool)> = accounts
+                    .iter()
+                    .filter_map(|(_, acc)| decode_validator_account(&acc.data))
+                    .collect();
+                validators
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                if validators.is_empty() {
+                    println!("No validators registered yet on this RPC.");
+                } else {
+                    let total_stake: f64 = validators.iter().map(|v| v.1).sum();
+                    let active = validators.iter().filter(|v| v.3).count();
+                    for (pubkey, stake, reputation, is_active) in &validators {
+                        println!(
+                            "  {}  {:>7.3} SOL  rep {:>5}  {}",
+                            pubkey,
+                            stake,
+                            reputation,
+                            if *is_active { "active" } else { "inactive" }
+                        );
+                    }
+                    println!(
+                        "\n{} validators ({} active) · {} SOL staked",
+                        validators.len(),
+                        active,
+                        total_stake
+                    );
+                }
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                let _ = (&rpc_url, &program_id);
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
             }
 
             Ok(())
