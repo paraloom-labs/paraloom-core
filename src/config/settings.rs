@@ -41,6 +41,15 @@ pub struct NetworkSettings {
     pub bootstrap_nodes: Vec<String>,
     /// Enable mDNS discovery
     pub enable_mdns: bool,
+    /// Path to a libp2p identity key (protobuf-encoded). When set, the
+    /// network manager loads the keypair from this file on startup so the
+    /// PeerId is stable across restarts; if the file is missing, a fresh
+    /// ed25519 keypair is generated and persisted to the path. Required for
+    /// any node whose multiaddr is published (bootstrap anchors, named
+    /// validators) — without it every restart rotates the PeerId, breaking
+    /// any `/p2p/<peerid>` reference others rely on.
+    #[serde(default)]
+    pub identity_path: Option<String>,
 }
 
 /// Node settings
@@ -150,6 +159,7 @@ impl Settings {
                 listen_address: "/ip4/127.0.0.1/tcp/0".to_string(),
                 bootstrap_nodes: vec![],
                 enable_mdns: true,
+                identity_path: None,
             },
             node: NodeSettings {
                 node_type: "ResourceProvider".to_string(),

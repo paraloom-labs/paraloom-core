@@ -1,6 +1,6 @@
 //! P2P network protocol implementation
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::{
@@ -118,11 +118,73 @@ pub struct NetworkManager {
     peer_registry: Arc<Mutex<PeerRegistry>>,
 }
 
+/// Load a libp2p ed25519 identity from `path` (protobuf-encoded, the format
+/// produced by [`identity::Keypair::to_protobuf_encoding`]). If `path` is
+/// `None` an ephemeral keypair is returned. If `path` is set but the file does
+/// not exist, a fresh keypair is generated and written to the path with mode
+/// 0600 (Unix) so subsequent restarts reuse the same PeerId.
+///
+/// Errors propagate filesystem and protobuf-decode failures rather than
+/// silently falling back to a fresh key — a corrupted or unreadable identity
+/// file is operator-actionable; silently regenerating would mean published
+/// `/p2p/<peerid>` multiaddrs stop resolving without explanation.
+fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
+    use std::fs;
+    use std::path::Path;
+
+    let path = match path {
+        Some(p) => Path::new(p),
+        None => return Ok(identity::Keypair::generate_ed25519()),
+    };
+
+    if path.exists() {
+        let bytes = fs::read(path)
+            .with_context(|| format!("reading libp2p identity from {}", path.display()))?;
+        let keypair = identity::Keypair::from_protobuf_encoding(&bytes).with_context(|| {
+            format!(
+                "decoding libp2p identity at {} (expected protobuf-encoded Keypair; \
+                 delete the file to regenerate)",
+                path.display()
+            )
+        })?;
+        info!("Loaded persisted libp2p identity from {}", path.display());
+        return Ok(keypair);
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent directory {}", parent.display()))?;
+        }
+    }
+    let keypair = identity::Keypair::generate_ed25519();
+    let bytes = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow!("encoding libp2p identity to protobuf: {}", e))?;
+    fs::write(path, &bytes)
+        .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting 0600 permissions on {}", path.display()))?;
+    }
+    info!(
+        "Generated new libp2p identity, persisted to {} (PeerId stable across restarts)",
+        path.display()
+    );
+    Ok(keypair)
+}
+
 impl NetworkManager {
     /// Create a new network manager
-    pub fn new(_settings: &Settings) -> Result<Self> {
-        // Create a random PeerId
-        let local_key = identity::Keypair::generate_ed25519();
+    pub fn new(settings: &Settings) -> Result<Self> {
+        // Load a persisted libp2p identity if `network.identity_path` is set,
+        // otherwise generate a fresh one (and persist it back to the path when
+        // configured, so the next restart keeps the same PeerId). Without this,
+        // every restart rotates the PeerId — fatal for any node whose
+        // `/p2p/<peerid>` multiaddr is published as a bootstrap anchor.
+        let local_key = load_or_create_identity(settings.network.identity_path.as_deref())?;
         let local_peer_id = PeerId::from(local_key.public());
 
         info!("Local peer ID: {}", local_peer_id);
@@ -777,5 +839,73 @@ mod tests {
         mgr.connect_to_bootstrap(vec!["not-a-multiaddr".to_string()])
             .await
             .expect("malformed addresses surface as warn, not Err");
+    }
+
+    #[test]
+    fn identity_persists_across_calls_when_path_set() {
+        // Pins the anchor-onboarding contract: a node configured with a
+        // persistent identity_path must surface the SAME PeerId on every
+        // start-up. A regression here would silently invalidate every
+        // published `/p2p/<peerid>` multiaddr the moment the anchor restarts.
+        let tmp = std::env::temp_dir().join(format!(
+            "paraloom-identity-test-{}-{}.key",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = tmp.to_string_lossy().to_string();
+
+        // First call: file does not exist → generate + persist.
+        let key1 = load_or_create_identity(Some(&path_str)).expect("first generate");
+        let peer1 = PeerId::from(key1.public());
+        assert!(tmp.exists(), "identity file must be created on first call");
+
+        // Second call: file exists → load back the same keypair.
+        let key2 = load_or_create_identity(Some(&path_str)).expect("second load");
+        let peer2 = PeerId::from(key2.public());
+        assert_eq!(peer1, peer2, "PeerId must be stable across restarts");
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn identity_is_ephemeral_when_path_unset() {
+        // Without an identity_path the old behaviour is preserved: every
+        // call yields a fresh ephemeral keypair. Pins the opt-in nature of
+        // the feature so existing test/demo configs are not silently
+        // re-routed to write key material into the cwd.
+        let key1 = load_or_create_identity(None).expect("ephemeral 1");
+        let key2 = load_or_create_identity(None).expect("ephemeral 2");
+        assert_ne!(
+            PeerId::from(key1.public()),
+            PeerId::from(key2.public()),
+            "ephemeral identities must differ between calls"
+        );
+    }
+
+    #[test]
+    fn corrupted_identity_file_returns_error() {
+        // A garbled identity file is operator-actionable; silently
+        // regenerating would mean published `/p2p/<peerid>` multiaddrs
+        // stop resolving without explanation. Pins the "fail loud" contract.
+        let tmp = std::env::temp_dir().join(format!(
+            "paraloom-identity-corrupt-{}-{}.key",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp, b"this is not a protobuf-encoded libp2p keypair")
+            .expect("write corrupted file");
+        let result = load_or_create_identity(Some(&tmp.to_string_lossy()));
+        assert!(
+            result.is_err(),
+            "corrupted identity must error, not regenerate"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
