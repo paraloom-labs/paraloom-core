@@ -9,13 +9,12 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/paraloom-labs/paraloom-core/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build"/></a>
-  <img src="https://img.shields.io/badge/tests-407%20passing-brightgreen" alt="Tests"/>
-  <img src="https://img.shields.io/badge/LOC-33K-blue" alt="Lines of Code"/>
-  <img src="https://img.shields.io/badge/release-v0.5.0--rc2-yellow" alt="Release"/>
+  <a href="https://github.com/paraloom-labs/paraloom-core/actions/workflows/ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/paraloom-labs/paraloom-core/ci.yaml?branch=main&label=CI" alt="CI"/></a>
+  <a href="https://github.com/paraloom-labs/paraloom-core/actions/workflows/programs.yml"><img src="https://img.shields.io/github/actions/workflow/status/paraloom-labs/paraloom-core/programs.yml?branch=main&label=Programs%20CI" alt="Programs CI"/></a>
+  <a href="https://github.com/paraloom-labs/paraloom-core/releases/latest"><img src="https://img.shields.io/github/v/release/paraloom-labs/paraloom-core?include_prereleases&label=release" alt="Release"/></a>
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust"/>
   <img src="https://img.shields.io/badge/anchor-0.31-purple" alt="Anchor"/>
-  <a href="https://github.com/paraloom-labs/paraloom-core/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/></a>
+  <a href="https://github.com/paraloom-labs/paraloom-core/blob/main/LICENSE"><img src="https://img.shields.io/github/license/paraloom-labs/paraloom-core?color=blue" alt="License"/></a>
 </p>
 
 <p align="center">
