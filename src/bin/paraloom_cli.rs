@@ -281,6 +281,21 @@ enum ValidatorCommands {
         daemon: bool,
     },
 
+    /// Register this validator on-chain (stakes 1 SOL into a per-validator PDA)
+    Register {
+        /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Stop running validator
     Stop {
         /// Force stop (SIGKILL)
@@ -1347,6 +1362,125 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to load settings: {}", e))?;
             let node = Node::new(settings)?;
             node.run().await?;
+
+            Ok(())
+        }
+
+        ValidatorCommands::Register {
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Registering validator on-chain...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+                const STAKE_LAMPORTS: u64 = LAMPORTS_PER_SOL; // 1 SOL minimum stake
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("VALIDATOR_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Validator Keypair: {}\n", keypair_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let validator =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Validator Address: {}\n", validator.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let balance = client
+                    .get_balance(&validator.pubkey())
+                    .context("Failed to get balance")?;
+                println!(
+                    "Validator Balance: {} SOL\n",
+                    balance as f64 / LAMPORTS_PER_SOL as f64
+                );
+                if balance < 2 * LAMPORTS_PER_SOL {
+                    anyhow::bail!(
+                        "Insufficient balance. Need at least 2 SOL (1 to stake + fees). \
+                         Airdrop with: solana airdrop 2 {} --url devnet",
+                        validator.pubkey()
+                    );
+                }
+
+                let (validator_account_pda, _bump) = Pubkey::find_program_address(
+                    &[b"validator", validator.pubkey().as_ref()],
+                    &program_id,
+                );
+                let (validator_registry_pda, _registry_bump) =
+                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+                println!("Validator Account PDA: {}", validator_account_pda);
+                println!("Validator Registry PDA: {}\n", validator_registry_pda);
+
+                // Anchor discriminator for `register_validator` + stake (u64 LE).
+                let discriminator: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
+                let mut data = discriminator.to_vec();
+                data.extend_from_slice(&STAKE_LAMPORTS.to_le_bytes());
+
+                let ix = solana_sdk::instruction::Instruction {
+                    program_id,
+                    accounts: vec![
+                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
+                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
+                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
+                        solana_sdk::instruction::AccountMeta::new_readonly(
+                            solana_sdk::system_program::ID,
+                            false,
+                        ),
+                    ],
+                    data,
+                };
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    blockhash,
+                );
+
+                println!("Staking 1 SOL and registering...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Validator registered!");
+                println!("  Transaction: {}", signature);
+                println!("  Validator:   {}", validator.pubkey());
+                println!("  Stake:       1 SOL");
+                println!("\nVerify with: paraloom validator list");
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
 
             Ok(())
         }
