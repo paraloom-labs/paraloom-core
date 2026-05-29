@@ -160,11 +160,54 @@ paraloom wallet withdraw --amount 0.5 --to <ADDRESS>
 # Compute operations
 paraloom compute submit --wasm ./program.wasm --input ./data.json
 paraloom compute submit --wasm ./program.wasm --input ./data.json --private
-
-# Validator operations
-paraloom validator start --config validator.toml
-paraloom validator status
 ```
+
+## Run a validator on devnet
+
+Permissionless. Anyone with a devnet wallet holding ≥ 2 SOL can stake into
+the registry and join the consensus mesh.
+
+```bash
+# 1. system deps (Debian/Ubuntu; see release.yml for full list)
+sudo apt-get install -y build-essential pkg-config libssl-dev \
+  protobuf-compiler clang libclang-dev cmake \
+  libc++-dev libc++abi-dev libstdc++-12-dev
+
+# 2. build the node and the on-chain registration helper
+git clone https://github.com/paraloom-labs/paraloom-core.git
+cd paraloom-core
+cargo build --release --bin paraloom-node --bin register-validator
+
+# 3. fund a Solana keypair on devnet (faucet.solana.com gives 2 SOL/8h)
+solana-keygen new --no-bip39-passphrase -o ~/.config/solana/paraloom-validator.json
+solana airdrop 2 $(solana-keygen pubkey ~/.config/solana/paraloom-validator.json) \
+  --url https://api.devnet.solana.com
+
+# 4. stake 1 SOL and register on-chain
+SOLANA_RPC_URL=https://api.devnet.solana.com \
+SOLANA_PROGRAM_ID=8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP \
+VALIDATOR_KEYPAIR_PATH=$HOME/.config/solana/paraloom-validator.json \
+  ./target/release/register-validator
+
+# 5. write a validator.toml from the template (wires bootstrap + bridge)
+cp scripts/devnet/validator.toml.example ~/.paraloom/validator.toml
+# edit the marked paths in the file, then:
+./target/release/paraloom-node start --config ~/.paraloom/validator.toml
+```
+
+The template's `bootstrap_nodes` points at the paraloom-labs anchor:
+
+```
+/ip4/67.205.142.8/tcp/9300/p2p/12D3KooWFf8xfNz77E9Ve4HnpyZkAHKAcUdw4LmagpFCYQD6R7WK
+```
+
+Once dialled, the Kademlia DHT fans out to the rest of the validator set
+automatically — the anchor is just the first hop. Its libp2p identity is
+persisted (#206), so this multiaddr is stable; if you cache it, it keeps
+resolving across anchor restarts.
+
+The full guide (systemd unit, log monitoring, common pitfalls) lives at
+[docs.paraloom.io/docs/validator-guide](https://docs.paraloom.io/docs/validator-guide).
 
 ## Contributing
 
