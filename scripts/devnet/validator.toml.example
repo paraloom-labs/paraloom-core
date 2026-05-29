@@ -1,0 +1,56 @@
+# Devnet validator config template — join the public mesh
+#
+# Copy to a private path (e.g. ~/.paraloom/validator.toml), edit the marked
+# fields, and pass with `paraloom-node start --config <path>`. Pairs with
+# the on-chain `register-validator` binary; see the "Run a validator on
+# devnet" section of README.md for the full sequence.
+
+[network]
+# Public listen address. Open this TCP port on your firewall.
+listen_address = "/ip4/0.0.0.0/tcp/9300"
+
+# Devnet bootstrap anchor maintained by paraloom-labs. New nodes dial this
+# multiaddr to enter the Kademlia DHT; once you have any peer, the DHT
+# fans out to the rest of the validator set automatically. The anchor's
+# libp2p PeerId is persisted across restarts (#206), so this address is
+# stable — operators can rely on it living in the README rather than
+# rotating each time the anchor is redeployed.
+bootstrap_nodes = [
+  "/ip4/67.205.142.8/tcp/9300/p2p/12D3KooWFf8xfNz77E9Ve4HnpyZkAHKAcUdw4LmagpFCYQD6R7WK",
+]
+
+# mDNS is only useful on a LAN; leave off on a public-internet validator.
+enable_mdns = false
+
+# Persist this node's libp2p identity (#206). Without this every restart
+# rotates your PeerId, so peers have to re-discover you and any address
+# you published elsewhere stops resolving. Mode 0600 on first write.
+identity_path = "/var/lib/paraloom/node.key"
+
+[node]
+node_type = "ResourceProvider"
+max_cpu_usage = 80
+max_memory_usage = 70
+max_storage_usage = 10240
+
+[storage]
+data_dir = "/var/lib/paraloom/data"
+
+[bridge]
+solana_rpc_url = "https://api.devnet.solana.com"
+program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP"
+poll_interval_secs = 8
+enabled = true
+# Path to the Solana keypair you registered on-chain via `register-validator`.
+# Same wallet that holds the 1-SOL stake; signs settlement txs.
+authority_keypair_path = "/home/USER/.config/solana/paraloom-validator.json"
+event_lag_warn_threshold_slots = 1500
+withdrawal_expiration_window_slots = 150
+# Local-only HTTP endpoint exposed by the bridge-enabled node for
+# wallet/CLI clients to query a Merkle (root, path). Stays on loopback —
+# do not open this port on the public firewall.
+merkle_path_query_address = "127.0.0.1:9090"
+# Empty = disabled. Set to a loopback address only on the node that
+# accepts wallet-submitted withdrawal / transfer requests.
+withdrawal_ingress_address = ""
+transfer_ingress_address = ""
