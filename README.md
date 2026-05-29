@@ -49,14 +49,14 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | Reputation gating + slashing | ✅ Working | Equivocation + persistent-unavailability evidence (v0.4.0) |
 | Merkle + nullifier set | ✅ Working | Double-spend prevention verified; fsync'd on hot writes |
 | Operational endpoints | ✅ Working | `/health`, `/ready`, `/metrics` (Prometheus) on a separate port |
-| Peer discovery | ✅ Working | Kademlia DHT, bootstrap refresh, libp2p ping liveness, registry-fed slow/offline distinction (v0.5.0-rc2) |
+| Peer discovery | ✅ Working | Kademlia DHT, bootstrap refresh, libp2p ping liveness, registry-fed slow/offline distinction |
 | Release pipeline | ✅ Working | Multi-platform binaries, SHA-256 checksums, CycloneDX SBOM, Sigstore-signed |
 | Poseidon hash | ✅ Working | Domain-separated; native↔circuit equivalence pinned by tests |
-| Coordinator HA | ✅ Working | Active/passive failover with RTO scenario test under 30s (v0.5.0-rc2) |
-| MPC trusted setup tooling | ✅ Working | BGM17 contribution + verifier, transcript chain, contributor / verifier / finalize CLIs (v0.5.0-rc2) |
+| Coordinator HA | ✅ Working | Active/passive failover with RTO scenario test under 30s |
+| MPC trusted setup tooling | ✅ Working | BGM17 contribution + verifier, transcript chain, contributor / verifier / finalize CLIs |
 | Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending; explicitly out of scope for the v0.5.0 ceremony |
 | MPC ceremony execution | 🟡 In progress | Tooling shipped at rc2; the 20–30 contributor run is the calendar gate to v0.5.0 final |
-| Mainnet launch | 🟡 Pre-release | v0.5.0-rc2 cut; awaiting ceremony completion + external security audit |
+| Mainnet launch | 🟡 Pre-release | Devnet stable on `8gPsR…TWrP`; awaiting ceremony completion + external security audit |
 
 ### Known limitations (devnet, pre-mainnet)
 
