@@ -1935,7 +1935,7 @@ shielded_address = ""  # Generate with: paraloom wallet new-address
 
 [solana]
 rpc_url = "https://api.devnet.solana.com"
-bridge_program_id = "DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco"
+bridge_program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP"
 
 [storage]
 path = ".paraloom/storage"

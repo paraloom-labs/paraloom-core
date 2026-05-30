@@ -28,7 +28,7 @@ fn validator_settings(port: u16, bootstrap: Vec<String>, data_dir: &str) -> Sett
     s.network.enable_mdns = false;
     s.storage.data_dir = data_dir.to_string();
     s.bridge.enabled = true;
-    s.bridge.program_id = "DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco".to_string();
+    s.bridge.program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP".to_string();
     s.bridge.solana_rpc_url = "http://127.0.0.1:1".to_string();
     s.bridge.merkle_path_query_address = String::new();
     s.bridge.poll_interval_secs = 3600;
