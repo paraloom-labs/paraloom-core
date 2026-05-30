@@ -296,6 +296,21 @@ enum ValidatorCommands {
         program_id: Option<String>,
     },
 
+    /// Unregister this validator on-chain (returns the staked SOL)
+    Unregister {
+        /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Stop running validator
     Stop {
         /// Force stop (SIGKILL)
@@ -1510,6 +1525,104 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("  Transaction: {}", signature);
                 println!("  Validator:   {}", validator.pubkey());
                 println!("  Stake:       1 SOL");
+                println!("\nVerify with: paraloom validator list");
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
+
+            Ok(())
+        }
+
+        ValidatorCommands::Unregister {
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Unregistering validator on-chain...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("VALIDATOR_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Validator Keypair: {}\n", keypair_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let validator =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Validator Address: {}\n", validator.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let (validator_account_pda, _bump) = Pubkey::find_program_address(
+                    &[b"validator", validator.pubkey().as_ref()],
+                    &program_id,
+                );
+                let (validator_registry_pda, _registry_bump) =
+                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+                println!("Validator Account PDA: {}", validator_account_pda);
+                println!("Validator Registry PDA: {}\n", validator_registry_pda);
+
+                // Anchor discriminator for `unregister_validator` (no args).
+                let discriminator: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
+                let data = discriminator.to_vec();
+
+                let ix = solana_sdk::instruction::Instruction {
+                    program_id,
+                    accounts: vec![
+                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
+                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
+                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
+                    ],
+                    data,
+                };
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    blockhash,
+                );
+
+                println!("Unregistering and returning stake...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Validator unregistered!");
+                println!("  Transaction: {}", signature);
+                println!("  Validator:   {}", validator.pubkey());
+                println!("  Stake returned to your wallet.");
                 println!("\nVerify with: paraloom validator list");
             }
 
