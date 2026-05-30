@@ -172,10 +172,10 @@ sudo apt-get install -y build-essential pkg-config libssl-dev \
   protobuf-compiler clang libclang-dev cmake \
   libc++-dev libc++abi-dev libstdc++-12-dev
 
-# 2. build the node and the on-chain registration helper
+# 2. build the unified CLI
 git clone https://github.com/paraloom-labs/paraloom-core.git
 cd paraloom-core
-cargo build --release --bin paraloom-node --bin register-validator
+cargo build --release --bin paraloom
 
 # 3. fund a Solana keypair on devnet (faucet.solana.com gives 2 SOL/8h)
 solana-keygen new --no-bip39-passphrase -o ~/.config/solana/paraloom-validator.json
@@ -183,16 +183,19 @@ solana airdrop 2 $(solana-keygen pubkey ~/.config/solana/paraloom-validator.json
   --url https://api.devnet.solana.com
 
 # 4. stake 1 SOL and register on-chain
-SOLANA_RPC_URL=https://api.devnet.solana.com \
-SOLANA_PROGRAM_ID=8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP \
-VALIDATOR_KEYPAIR_PATH=$HOME/.config/solana/paraloom-validator.json \
-  ./target/release/register-validator
+#    (devnet RPC and the canonical program ID are the defaults — keypair is all you need)
+./target/release/paraloom validator register \
+  --keypair ~/.config/solana/paraloom-validator.json
 
-# 5. write a validator.toml from the template (wires bootstrap + bridge)
+# 5. write a validator.toml from the template (wires bootstrap + bridge), then start
 cp scripts/devnet/validator.toml.example ~/.paraloom/validator.toml
 # edit the marked paths in the file, then:
-./target/release/paraloom-node start --config ~/.paraloom/validator.toml
+./target/release/paraloom validator start --config ~/.paraloom/validator.toml
 ```
+
+Check your registration any time with `paraloom validator status --keypair
+~/.config/solana/paraloom-validator.json`, or see the whole live set with
+`paraloom validator list`.
 
 The template's `bootstrap_nodes` points at the paraloom-labs anchor:
 
