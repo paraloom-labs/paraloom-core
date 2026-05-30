@@ -364,6 +364,10 @@ pub mod paraloom_program {
             .try_borrow_mut_lamports()? += stake_amount;
 
         validator_account.is_active = false;
+        // Stake lamports were just returned to the wallet; zero the recorded
+        // amount so `status`/`list` and the explorer don't show a phantom
+        // stake on an unregistered account.
+        validator_account.stake_amount = 0;
 
         validator_registry.active_validators -= 1;
 
