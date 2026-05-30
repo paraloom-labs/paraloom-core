@@ -233,7 +233,10 @@ jobs:
           # offline once they have the binaries + SHA256SUMS +
           # SHA256SUMS.sig + SHA256SUMS.pem.
           files: |
-            release/paraloom-node-*
+            release/paraloom-node-linux-amd64
+            release/paraloom-node-macos-arm64
+            release/paraloom-linux-amd64
+            release/paraloom-macos-arm64
             release/SHA256SUMS
             release/SHA256SUMS.sig
             release/SHA256SUMS.pem
