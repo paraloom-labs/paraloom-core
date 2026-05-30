@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 /// Paraloom on-chain program ID — declared in programs/paraloom/src/lib.rs.
 /// Hardcoded here because programs/paraloom is not a dep of paraloom-core
 /// (separate workspace, on-chain crate cannot pull the L2's heavy deps).
-pub const PARALOOM_PROGRAM_ID: &str = "DSysqF2oYAuDRLfPajMnRULce2MjC3AtTszCkcDv1jco";
+pub const PARALOOM_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
 
 pub struct SubprocessValidator {
     child: Child,
