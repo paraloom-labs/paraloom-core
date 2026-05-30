@@ -27,6 +27,17 @@ jobs:
             artifact_name: paraloom-node
             asset_name: paraloom-node-macos-arm64
 
+          # The unified `paraloom` CLI (validator / wallet / compute) — the
+          # binary the validator guide and onboarding docs actually invoke.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: paraloom
+            asset_name: paraloom-linux-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: paraloom
+            asset_name: paraloom-macos-arm64
+
           # macOS x86_64 (Intel) is intentionally out of scope:
           # the GitHub Actions macos-13 runner queue routinely
           # leaves jobs pending for hours, blocking the package
@@ -70,7 +81,7 @@ jobs:
           brew install protobuf cmake
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin paraloom-node
+        run: cargo build --release --target ${{ matrix.target }} --bin ${{ matrix.artifact_name }}
 
       - name: Strip binary
         run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
