@@ -14,6 +14,14 @@ pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 /// would only bloat the transaction (flagged alongside #178).
 pub const MAX_PROOF_LEN: usize = 256;
 
+/// Withdrawal fee, in basis points of the withdrawn amount (25 bps = 0.25%).
+/// The fee is credited to the validator that settles the withdrawal — the
+/// signer that gathered the BFT quorum and submitted the proof — so the
+/// people running the network are the people earning from it. No founder
+/// account sits in the withdraw path. The fee stays in the vault and is
+/// pulled out by the earner through `claim_rewards`.
+pub const WITHDRAWAL_FEE_BPS: u64 = 25;
+
 /// Verify a BPFLoaderUpgradeable `ProgramData` account's upgrade authority
 /// matches `expected` (#204). Closes the init front-run race: only the wallet
 /// holding the program's upgrade authority can call the `initialize_*`
@@ -168,6 +176,25 @@ pub mod paraloom_program {
         let vault_balance = ctx.accounts.bridge_vault.lamports();
         require!(vault_balance >= amount, BridgeError::InsufficientFunds);
 
+        // The settling validator earns a fee for gathering quorum and
+        // submitting this withdrawal. `has_one`-style seeds bind the
+        // `validator_account` to the `authority` signer, so the earner is
+        // exactly the validator that settled — no founder account, no
+        // third party. The fee is a cut of the amount: the recipient
+        // receives `amount - fee`, and `fee` stays in the vault as a claim
+        // recorded against the validator's `pending_rewards`.
+        let validator_account = &mut ctx.accounts.validator_account;
+        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
+
+        let fee = amount
+            .checked_mul(WITHDRAWAL_FEE_BPS)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(BridgeError::InvalidAmount)?;
+        // A fee of 0 (dust withdrawals below 1/WITHDRAWAL_FEE_BPS) is fine;
+        // the recipient simply receives the full amount. `fee < amount` is
+        // guaranteed since the rate is well under 100%.
+        let payout = amount - fee;
+
         let nullifier_account = &mut ctx.accounts.nullifier_account;
         nullifier_account.nullifier = nullifier;
         nullifier_account.used_at = Clock::get()?.unix_timestamp;
@@ -186,8 +213,14 @@ pub mod paraloom_program {
                 },
                 signer_seeds,
             ),
-            amount,
+            payout,
         )?;
+
+        // Credit the fee to the settling validator (claimed later via
+        // `claim_rewards`) and record the settlement against its activity.
+        validator_account.pending_rewards += fee;
+        validator_account.successful_verifications += 1;
+        validator_account.last_active = Clock::get()?.unix_timestamp;
 
         bridge_state.total_withdrawn += amount;
         bridge_state.withdrawal_count += 1;
@@ -200,7 +233,12 @@ pub mod paraloom_program {
             withdrawal_id: bridge_state.withdrawal_count,
         });
 
-        msg!("Withdrawal successful: {} lamports", amount);
+        msg!(
+            "Withdrawal successful: {} lamports to recipient, {} fee to validator {}",
+            payout,
+            fee,
+            validator_account.validator
+        );
         Ok(())
     }
 
@@ -625,6 +663,18 @@ pub struct Withdraw<'info> {
 
     #[account(mut)]
     pub recipient: SystemAccount<'info>,
+
+    // The settling validator's on-chain account, bound by seeds to the
+    // `authority` signer: only a registered validator can settle a
+    // withdrawal, and the withdrawal fee is credited here. The PDA must
+    // already exist (the validator registered via `register_validator`),
+    // so `withdraw` fails for any signer without a validator account.
+    #[account(
+        mut,
+        seeds = [b"validator", authority.key().as_ref()],
+        bump
+    )]
+    pub validator_account: Account<'info, ValidatorAccount>,
 
     #[account(mut)]
     pub authority: Signer<'info>,

@@ -30,7 +30,14 @@ async fn withdraw_with_same_nullifier_is_rejected() {
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (nullifier_pda, _) = Pubkey::find_program_address(&[b"nullifier", &NULLIFIER], &program_id);
+    // The settling authority is also the registered validator that earns the
+    // fee — `withdraw` requires its account to exist and be active.
+    let (validator_pda, _) = Pubkey::find_program_address(
+        &[b"validator", upgrade_authority.pubkey().as_ref()],
+        &program_id,
+    );
 
     let recipient = Keypair::new();
 
@@ -55,6 +62,7 @@ async fn withdraw_with_same_nullifier_is_rejected() {
             bridge_vault: vault_pda,
             nullifier_account: nullifier_pda,
             recipient: recipient.pubkey(),
+            validator_account: validator_pda,
             authority: upgrade_authority.pubkey(),
             system_program: solana_sdk::system_program::ID,
         }
@@ -96,7 +104,43 @@ async fn withdraw_with_same_nullifier_is_rejected() {
         .to_account_metas(None),
     };
 
+    // Registry init (upgrade-authority gated) + register the settling
+    // authority as a validator so the first withdraw can credit its fee.
+    let registry_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let register_ix = Instruction {
+        program_id,
+        data: instruction::RegisterValidator {
+            stake_amount: 1_000_000_000,
+        }
+        .data(),
+        accounts: accounts::RegisterValidator {
+            validator_account: validator_pda,
+            validator_registry: registry_pda,
+            validator: upgrade_authority.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+
     let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    let mut tx = Transaction::new_with_payer(&[registry_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    let mut tx = Transaction::new_with_payer(&[register_ix], Some(&upgrade_authority.pubkey()));
     tx.sign(&[&upgrade_authority], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 

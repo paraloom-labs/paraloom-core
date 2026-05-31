@@ -1,14 +1,18 @@
 //! Eleventh on-chain unit test for #71. Happy-path withdraw:
-//! initialize → deposit → withdraw. Pins the recipient transfer,
-//! the L2-visible counters, and the nullifier PDA the replay layer
-//! relies on. Replay-rejection is a separate PR.
+//! initialize → register validator → deposit → withdraw. Pins the
+//! recipient transfer (now net of the validator fee), the L2-visible
+//! counters, the nullifier PDA the replay layer relies on, and the
+//! fee credited to the settling validator's `pending_rewards`.
+//! Replay-rejection is a separate PR.
 //!
 //! Init + withdraw both run as the program upgrade authority (#204);
 //! the deposit ix is permissionless and signed by the auto-payer.
+//! Settlement now requires the signer to be a registered, active
+//! validator — the withdrawal fee is credited to that validator.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
-use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
+use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount, ValidatorAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
     instruction::Instruction,
@@ -20,9 +24,13 @@ mod common;
 use common::{add_program_data, entry};
 
 const NULLIFIER: [u8; 32] = [42u8; 32];
+const WITHDRAW_AMOUNT: u64 = 1_000_000_000;
+// 25 bps of 1 SOL = 0.0025 SOL.
+const EXPECTED_FEE: u64 = WITHDRAW_AMOUNT * 25 / 10_000;
+const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 
 #[tokio::test]
-async fn withdraw_credits_recipient_and_advances_counters() {
+async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
@@ -30,7 +38,14 @@ async fn withdraw_credits_recipient_and_advances_counters() {
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (nullifier_pda, _) = Pubkey::find_program_address(&[b"nullifier", &NULLIFIER], &program_id);
+    // The bridge authority (= upgrade authority) settles the withdrawal, so it
+    // is also the validator whose account is bound and credited.
+    let (validator_pda, _) = Pubkey::find_program_address(
+        &[b"validator", upgrade_authority.pubkey().as_ref()],
+        &program_id,
+    );
 
     let recipient = Keypair::new();
 
@@ -69,8 +84,51 @@ async fn withdraw_credits_recipient_and_advances_counters() {
     )
     .await;
 
-    // 2. deposit — permissionless; 2 SOL so the vault stays above the
-    //    rent-exempt minimum (~890_880 lamports) after the 1 SOL withdraw.
+    // 2. initialize the validator registry — upgrade-authority gated (#204).
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // 3. register the settling authority as a validator (stakes 1 SOL).
+    //    Without this the withdraw below fails: the validator_account PDA
+    //    would not exist.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: upgrade_authority.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // 4. deposit — permissionless; 2 SOL so the vault stays above the
+    //    rent-exempt minimum after the withdraw + retained fee.
     send(
         &mut banks_client,
         recent_blockhash,
@@ -94,9 +152,8 @@ async fn withdraw_credits_recipient_and_advances_counters() {
     )
     .await;
 
-    // 3. withdraw — must be signed by the bridge authority
-    //    (`has_one = authority` on bridge_state), which now equals the
-    //    upgrade authority from init.
+    // 5. withdraw — signed by the bridge authority (`has_one = authority`),
+    //    which is also the registered validator that earns the fee.
     send(
         &mut banks_client,
         recent_blockhash,
@@ -105,7 +162,7 @@ async fn withdraw_credits_recipient_and_advances_counters() {
             program_id,
             data: instruction::Withdraw {
                 nullifier: NULLIFIER,
-                amount: 1_000_000_000,
+                amount: WITHDRAW_AMOUNT,
                 expiration_slot: u64::MAX,
                 proof: vec![1, 2, 3, 4],
             }
@@ -115,6 +172,7 @@ async fn withdraw_credits_recipient_and_advances_counters() {
                 bridge_vault: vault_pda,
                 nullifier_account: nullifier_pda,
                 recipient: recipient.pubkey(),
+                validator_account: validator_pda,
                 authority: upgrade_authority.pubkey(),
                 system_program: solana_sdk::system_program::ID,
             }
@@ -125,8 +183,27 @@ async fn withdraw_credits_recipient_and_advances_counters() {
 
     let state_raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
-    assert_eq!(state.total_withdrawn, 1_000_000_000);
+    assert_eq!(state.total_withdrawn, WITHDRAW_AMOUNT);
     assert_eq!(state.withdrawal_count, 1);
+
+    // The recipient receives the amount net of the validator fee.
+    let recipient_acc = banks_client
+        .get_account(recipient.pubkey())
+        .await
+        .unwrap()
+        .expect("recipient funded by the withdraw");
+    assert_eq!(recipient_acc.lamports, WITHDRAW_AMOUNT - EXPECTED_FEE);
+
+    // The fee lands in the settling validator's pending_rewards (claimable
+    // later via claim_rewards) and the settlement is recorded.
+    let val_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let val = ValidatorAccount::try_deserialize(&mut val_raw.data.as_slice()).unwrap();
+    assert_eq!(val.pending_rewards, EXPECTED_FEE);
+    assert_eq!(val.successful_verifications, 1);
 
     let nul_raw = banks_client
         .get_account(nullifier_pda)

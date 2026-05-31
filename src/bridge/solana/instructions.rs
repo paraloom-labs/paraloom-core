@@ -174,6 +174,10 @@ pub fn create_withdraw_instruction(
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (nullifier_pda, _nullifier_bump) = derive_nullifier_account(program_id, &nullifier);
+    // The settling validator's account, bound to the `authority` signer.
+    // The on-chain program credits the withdrawal fee here, so settlement
+    // requires the submitter to be a registered validator.
+    let (validator_pda, _validator_bump) = derive_validator_account(program_id, authority);
     let recipient_pubkey = Pubkey::new_from_array(recipient);
 
     let data = WithdrawInstructionData {
@@ -197,6 +201,7 @@ pub fn create_withdraw_instruction(
             AccountMeta::new(*bridge_vault, false),
             AccountMeta::new(nullifier_pda, false), // Nullifier account (will be created)
             AccountMeta::new(recipient_pubkey, false),
+            AccountMeta::new(validator_pda, false), // Settling validator (fee credited here)
             AccountMeta::new(*authority, true),
             AccountMeta::new_readonly(system_program_id, false),
         ],
@@ -291,6 +296,11 @@ pub fn derive_bridge_state(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"bridge_state"], program_id)
 }
 
+/// Derive a validator account PDA from the validator's pubkey.
+pub fn derive_validator_account(program_id: &Pubkey, validator: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"validator", validator.as_ref()], program_id)
+}
+
 /// Derive nullifier account PDA
 pub fn derive_nullifier_account(program_id: &Pubkey, nullifier: &[u8; 32]) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"nullifier", nullifier.as_ref()], program_id)
@@ -339,7 +349,18 @@ mod tests {
         assert!(ix.is_ok());
         let instruction = ix.unwrap();
         assert_eq!(instruction.program_id, program_id);
-        assert_eq!(instruction.accounts.len(), 6); // Updated: now includes nullifier account
+        // bridge_state, bridge_vault, nullifier, recipient, validator_account,
+        // authority (signer), system_program.
+        assert_eq!(instruction.accounts.len(), 7);
+
+        // The settling validator's account is bound to the authority signer
+        // and sits between the recipient and the signer.
+        let (validator_pda, _) = derive_validator_account(&program_id, &authority);
+        assert_eq!(instruction.accounts[4].pubkey, validator_pda);
+        assert!(instruction.accounts[4].is_writable);
+        assert!(!instruction.accounts[4].is_signer);
+        assert_eq!(instruction.accounts[5].pubkey, authority);
+        assert!(instruction.accounts[5].is_signer);
     }
 
     #[test]
