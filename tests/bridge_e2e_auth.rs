@@ -36,6 +36,16 @@ use std::time::Duration;
 /// it, and fund the vault so a withdrawal reaches the on-chain guards rather
 /// than failing early on an empty vault. Returns the validator, program id,
 /// and the funded authority keypair.
+///
+/// NOTE (#217): these tests are already blocked on the harness rework —
+/// `--bpf-program` loads the program non-upgradeably, so there is no
+/// `ProgramData` account and the #204-gated `Initialize` cannot pass. When
+/// that rework lands, two more steps are required here for the Design-A fee
+/// path: (1) `bootstrap` must register the `authority` as a validator
+/// (init the registry + `register_validator`), since `withdraw` is now
+/// validator-gated; (2) `authority_can_withdraw` must assert the recipient
+/// receives `amount - fee` (25 bps) and the vault is debited by the same,
+/// with the fee retained as the validator's `pending_rewards`.
 fn bootstrap(port: u16) -> (SubprocessValidator, Pubkey, Keypair) {
     let validator = SubprocessValidator::launch_with_programs(
         port,
