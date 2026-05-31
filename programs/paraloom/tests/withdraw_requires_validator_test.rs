@@ -46,7 +46,7 @@ async fn withdraw_fails_when_authority_is_not_a_registered_validator() {
         recent_blockhash: anchor_lang::solana_program::hash::Hash,
         signer: &Keypair,
         ix: Instruction,
-    ) -> Result<(), solana_program_test::BanksClientError> {
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
         let mut tx = Transaction::new_with_payer(&[ix], Some(&signer.pubkey()));
         tx.sign(&[signer], recent_blockhash);
         banks_client.process_transaction(tx).await
