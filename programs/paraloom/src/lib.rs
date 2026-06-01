@@ -330,6 +330,29 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Rotate the bridge settlement authority to a new key.
+    ///
+    /// `initialize` (#204) pins the bridge authority to the program's upgrade
+    /// authority at genesis, to close the init front-run race. But ongoing
+    /// settlement (`withdraw` / `shielded_transfer` / `update_merkle_root`,
+    /// all `has_one = authority`) is performed by a node-resident validator
+    /// key — which must NOT be the upgrade authority sitting on a public
+    /// host. This hands settlement control from the genesis authority to the
+    /// operating validator (a staked, slashable key), keeping the upgrade
+    /// authority offline. Gated `has_one = authority`: only the current
+    /// authority can rotate it.
+    pub fn set_bridge_authority(
+        ctx: Context<SetBridgeAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+        let previous = bridge_state.authority;
+        bridge_state.authority = new_authority;
+
+        msg!("Bridge authority rotated: {} -> {}", previous, new_authority);
+        Ok(())
+    }
+
     /// Register a validator
     pub fn register_validator(ctx: Context<RegisterValidator>, stake_amount: u64) -> Result<()> {
         require!(
@@ -725,6 +748,19 @@ pub struct ShieldedTransfer<'info> {
 
 #[derive(Accounts)]
 pub struct Pause<'info> {
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump,
+        has_one = authority
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SetBridgeAuthority<'info> {
     #[account(
         mut,
         seeds = [b"bridge_state"],
