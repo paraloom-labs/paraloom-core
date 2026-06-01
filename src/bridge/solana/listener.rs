@@ -209,9 +209,10 @@ impl EventListener {
             *state.last_signature.write().await = Some(sig);
         }
         if latest_slot > 0 {
-            *state.last_processed_slot.write().await = latest_slot;
-            let mut stats_guard = state.stats.write().await;
-            stats_guard.last_block = latest_slot;
+            // `last_block` tracks the most recent DEPOSIT slot for stats; the
+            // scan frontier (`last_processed_slot`) is advanced by
+            // `update_lag_metric` to the chain tip, not to the deposit slot.
+            state.stats.write().await.last_block = latest_slot;
         }
 
         Self::update_lag_metric(state).await;
@@ -219,15 +220,23 @@ impl EventListener {
         Ok(processed)
     }
 
-    /// Pull the current Solana slot, compute the listener's lag against
-    /// the most recently processed slot, persist the lag in
-    /// [`BridgeStats::event_lag_slots`], and warn loudly if the lag
-    /// exceeds the configured threshold.
+    /// Record the listener's lag and advance the scan frontier.
     ///
-    /// During the cold-start phase (`last_processed_slot == 0`) the
-    /// warning is suppressed: the listener has not seen any events yet
-    /// and would otherwise report a "lag" equal to the chain's full
-    /// recorded history.
+    /// `last_processed_slot` is the chain tip as of the last SUCCESSFUL poll —
+    /// the frontier the listener has scanned through. This runs only after a
+    /// successful fetch (a failed fetch returns early from `poll_events` and the
+    /// caller logs it), so the reported lag is the slots elapsed since the
+    /// previous successful poll (≈ the poll interval, normally tiny), NOT the
+    /// time since the last deposit. We then advance the frontier to the tip.
+    ///
+    /// This is what keeps a merely quiet chain (no deposits for hours) from
+    /// tripping the warning, while a genuine fetch outage — which freezes the
+    /// frontier because this is not called — surfaces as a large lag (and a
+    /// warning) on the first poll after recovery, plus the caller's per-tick
+    /// "error polling events" logs during the outage.
+    ///
+    /// During cold start (`last_processed_slot == 0`) the warning is
+    /// suppressed but the metric is still written.
     async fn update_lag_metric(state: &PollerState) {
         let current_slot = match state.rpc.get_slot().await {
             Ok(slot) => slot,
@@ -256,6 +265,11 @@ impl EventListener {
                 state.lag_warn_threshold_slots
             );
         }
+
+        // Advance the frontier to the tip: this poll confirmed the chain is
+        // scanned through `current_slot`, so the next poll measures lag from
+        // here, not from the last deposit.
+        *state.last_processed_slot.write().await = current_slot;
     }
 
     /// Fetch deposit events newer than `cursor` from the Solana RPC.
@@ -487,6 +501,28 @@ mod tests {
             state.stats.read().await.event_lag_slots,
             42,
             "rpc error must not overwrite a previous lag reading"
+        );
+    }
+
+    /// After recording the lag, `update_lag_metric` advances the scan frontier
+    /// to the current tip, so a later poll measures lag from there (≈ the poll
+    /// interval) rather than from the last deposit. This is what stops a quiet,
+    /// deposit-free chain from accumulating a false "N slots behind chain tip".
+    #[tokio::test]
+    async fn update_lag_metric_advances_frontier_to_tip() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(1_000));
+        let state = make_state(mock);
+        *state.last_processed_slot.write().await = 100;
+
+        EventListener::update_lag_metric(&state).await;
+
+        assert_eq!(state.stats.read().await.event_lag_slots, 900);
+        assert_eq!(
+            *state.last_processed_slot.read().await,
+            1_000,
+            "frontier must advance to the tip after a successful poll"
         );
     }
 
