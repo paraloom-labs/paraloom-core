@@ -79,6 +79,62 @@ impl SubprocessValidator {
         Err("validator did not become healthy within 60s".to_string())
     }
 
+    /// Launch with a single program preloaded as an UPGRADEABLE program,
+    /// i.e. with a BPFLoaderUpgradeable `ProgramData` account whose upgrade
+    /// authority is `upgrade_authority`. The #204 init gate
+    /// (`check_upgrade_authority`) reads that account, so the program must be
+    /// loaded this way (not `--bpf-program`, which is non-upgradeable and has
+    /// no ProgramData account) and the init signer must equal
+    /// `upgrade_authority`.
+    pub fn launch_with_upgradeable_program(
+        port: u16,
+        program_id: &str,
+        so: PathBuf,
+        upgrade_authority: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<Self, String> {
+        if !so.exists() {
+            return Err(format!(
+                "program .so not found at {:?} — run `cargo build-sbf` first",
+                so
+            ));
+        }
+        let ledger = tempfile::tempdir().map_err(|e| format!("tempdir: {}", e))?;
+        let mut cmd = Command::new("solana-test-validator");
+        cmd.args([
+            "--ledger",
+            ledger.path().to_str().expect("utf-8 ledger path"),
+            "--reset",
+            "--quiet",
+            "--rpc-port",
+            &port.to_string(),
+        ]);
+        cmd.arg("--upgradeable-program")
+            .arg(program_id)
+            .arg(so.to_str().expect("utf-8 so path"))
+            .arg(upgrade_authority.to_string());
+
+        let child = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn solana-test-validator: {}", e))?;
+
+        let url = format!("http://127.0.0.1:{}", port);
+        let rpc = RpcClient::new_with_commitment(url, CommitmentConfig::confirmed());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if rpc.get_health().is_ok() {
+                return Ok(Self {
+                    child,
+                    rpc_port: port,
+                    _ledger: ledger,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Err("validator did not become healthy within 60s".to_string())
+    }
+
     pub fn rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.rpc_port)
     }
@@ -145,12 +201,24 @@ pub fn fund_new_keypair(
     lamports: u64,
 ) -> Result<solana_sdk::signature::Keypair, String> {
     let kp = solana_sdk::signature::Keypair::new();
+    fund_keypair(rpc, &kp, lamports)?;
+    Ok(kp)
+}
+
+/// Airdrop `lamports` to an EXISTING keypair and poll until it lands. Used
+/// when the keypair must be generated before the validator launches (e.g. it
+/// is the upgrade authority passed to `launch_with_upgradeable_program`).
+pub fn fund_keypair(
+    rpc: &RpcClient,
+    kp: &solana_sdk::signature::Keypair,
+    lamports: u64,
+) -> Result<(), String> {
     rpc.request_airdrop(&kp.pubkey(), lamports)
         .map_err(|e| format!("airdrop request: {}", e))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if rpc.get_balance(&kp.pubkey()).unwrap_or(0) >= lamports {
-            return Ok(kp);
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
