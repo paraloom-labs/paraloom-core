@@ -70,6 +70,9 @@ pub mod discriminators {
     pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
     #[allow(dead_code)]
     pub const UNPAUSE: [u8; 8] = [111, 51, 238, 100, 208, 146, 57, 103];
+    /// `sha256("global:set_bridge_authority")[..8]`. Rotates the bridge
+    /// settlement authority (admin op, current-authority-signed).
+    pub const SET_BRIDGE_AUTHORITY: [u8; 8] = [158, 241, 140, 64, 226, 16, 99, 251];
 }
 
 /// Create initialize instruction.
@@ -272,6 +275,44 @@ pub fn create_update_merkle_root_instruction(
     let data = UpdateMerkleRootData { new_merkle_root };
 
     let mut instruction_data = discriminators::UPDATE_MERKLE_ROOT.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create a `set_bridge_authority` instruction (admin: rotate the bridge
+/// settlement authority). Signed by the CURRENT authority; sets
+/// `bridge_state.authority = new_authority`. Used to hand settlement control
+/// from the genesis (upgrade) authority to the node-resident validator key,
+/// keeping the upgrade authority offline.
+pub fn create_set_bridge_authority_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    new_authority: &Pubkey,
+) -> Result<Instruction> {
+    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+
+    #[derive(BorshSerialize)]
+    struct SetBridgeAuthorityData {
+        // Serialized as 32 bytes — wire-identical to the on-chain `Pubkey`
+        // borsh layout the program decodes.
+        new_authority: [u8; 32],
+    }
+
+    let data = SetBridgeAuthorityData {
+        new_authority: new_authority.to_bytes(),
+    };
+
+    let mut instruction_data = discriminators::SET_BRIDGE_AUTHORITY.to_vec();
     instruction_data.extend_from_slice(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
