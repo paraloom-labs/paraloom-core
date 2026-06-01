@@ -70,6 +70,10 @@ pub mod discriminators {
     pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
     #[allow(dead_code)]
     pub const UNPAUSE: [u8; 8] = [111, 51, 238, 100, 208, 146, 57, 103];
+    /// `sha256("global:initialize_validator_registry")[..8]`.
+    pub const INITIALIZE_VALIDATOR_REGISTRY: [u8; 8] = [168, 49, 128, 236, 25, 7, 168, 85];
+    /// `sha256("global:register_validator")[..8]`.
+    pub const REGISTER_VALIDATOR: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
 }
 
 /// Create initialize instruction.
@@ -104,13 +108,67 @@ pub fn create_initialize_instruction(
     );
 
     let system_program_id = SYSTEM_PROGRAM_ID;
+    // #204: `initialize` is gated to the program's upgrade authority via the
+    // BPFLoaderUpgradeable ProgramData account. The on-chain `Initialize`
+    // accounts struct requires it (seeds = [program_id], program =
+    // bpf_loader_upgradeable), so it must be passed here.
+    let (program_data_pda, _) = derive_program_data(program_id);
 
     Ok(Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(bridge_state_pda, false),
             AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
             AccountMeta::new_readonly(system_program_id, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create an `initialize_validator_registry` instruction (#204-gated to the
+/// program's upgrade authority, same as `initialize`).
+pub fn create_initialize_validator_registry_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+) -> Result<Instruction> {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: discriminators::INITIALIZE_VALIDATOR_REGISTRY.to_vec(),
+    })
+}
+
+/// Create a `register_validator` instruction. Permissionless: the validator
+/// signs for itself and stakes `stake_amount` lamports (>= MIN_VALIDATOR_STAKE).
+pub fn create_register_validator_instruction(
+    program_id: &Pubkey,
+    validator: &Pubkey,
+    stake_amount: u64,
+) -> Result<Instruction> {
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    let mut instruction_data = discriminators::REGISTER_VALIDATOR.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&stake_amount).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*validator, true),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data: instruction_data,
     })
@@ -299,6 +357,21 @@ pub fn derive_bridge_state(program_id: &Pubkey) -> (Pubkey, u8) {
 /// Derive a validator account PDA from the validator's pubkey.
 pub fn derive_validator_account(program_id: &Pubkey, validator: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"validator", validator.as_ref()], program_id)
+}
+
+/// Derive the validator registry PDA.
+pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"validator_registry"], program_id)
+}
+
+/// Derive the BPFLoaderUpgradeable `ProgramData` PDA for `program_id` — the
+/// account the #204 upgrade-authority gate reads on `initialize` /
+/// `initialize_validator_registry`.
+pub fn derive_program_data(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[program_id.as_ref()],
+        &solana_sdk::bpf_loader_upgradeable::id(),
+    )
 }
 
 /// Derive nullifier account PDA
