@@ -1,95 +1,111 @@
-//! #178 acceptance: the on-chain `withdraw` is authenticated.
-//!
-//! Reported by PerkinsFund: `Withdraw` declared a bare `authority: Signer`
-//! with no `has_one`, so any signer could settle a withdrawal and drain the
-//! vault. These tests assert the guards against a real `solana-test-validator`:
+//! #178 acceptance: the on-chain `withdraw` is authenticated, plus the
+//! Design-A fee path (withdraw credits the settling validator).
 //!
 //!   * a signer other than the bridge authority is rejected (`has_one`)
 //!   * a proof longer than `MAX_PROOF_LEN` is rejected (`ProofTooLarge`)
+//!   * the bridge authority (a registered validator) settles a real
+//!     withdrawal; the recipient receives `amount - fee` and the fee
+//!     (25 bps) stays in the vault as the validator's reward
 //!
-//! The first two are fast preflight rejections — no consensus, no
-//! confirmation wait. The third (`authority_can_withdraw`) is the #164
-//! Layer 1 happy path: the bridge authority settles a real withdrawal on
-//! chain. It confirms with a bounded deadline (`confirm_within`) so a
-//! settlement that never lands fails fast instead of hanging CI, and
-//! asserts the on-chain effects (nullifier PDA created, vault debited,
-//! recipient credited). Network-layer consensus is a separate test.
+//! Since #204 the program is loaded UPGRADEABLE and `initialize` /
+//! `initialize_validator_registry` must be signed by the upgrade authority,
+//! so `bootstrap` generates that authority up front and passes its pubkey to
+//! the launch (#217). Settlement is validator-gated (Design A), so bootstrap
+//! also registers the authority as a validator.
 //!
 //! Ignored by default; CI runs it via the bridge-e2e workflow with
 //! `--ignored --test-threads=1` after installing the Solana CLI.
 
 mod common;
 use common::solana_validator::{
-    confirm_within, fund_new_keypair, paraloom_program_so, SubprocessValidator, PARALOOM_PROGRAM_ID,
+    confirm_within, fund_keypair, paraloom_program_so, SubprocessValidator, PARALOOM_PROGRAM_ID,
 };
 use paraloom::bridge::solana::{
-    create_deposit_instruction, create_initialize_instruction, create_withdraw_instruction,
-    derive_bridge_vault, derive_nullifier_account,
+    create_deposit_instruction, create_initialize_instruction,
+    create_initialize_validator_registry_instruction, create_register_validator_instruction,
+    create_withdraw_instruction, derive_bridge_vault, derive_nullifier_account,
 };
 use paraloom::bridge::EXPECTED_PROGRAM_VERSION;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use std::time::Duration;
 
-/// Boot a validator, airdrop a fresh authority, initialize the bridge under
-/// it, and fund the vault so a withdrawal reaches the on-chain guards rather
-/// than failing early on an empty vault. Returns the validator, program id,
-/// and the funded authority keypair.
-///
-/// NOTE (#217): these tests are already blocked on the harness rework —
-/// `--bpf-program` loads the program non-upgradeably, so there is no
-/// `ProgramData` account and the #204-gated `Initialize` cannot pass. When
-/// that rework lands, two more steps are required here for the Design-A fee
-/// path: (1) `bootstrap` must register the `authority` as a validator
-/// (init the registry + `register_validator`), since `withdraw` is now
-/// validator-gated; (2) `authority_can_withdraw` must assert the recipient
-/// receives `amount - fee` (25 bps) and the vault is debited by the same,
-/// with the fee retained as the validator's `pending_rewards`.
+const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
+const WITHDRAWAL_FEE_BPS: u64 = 25;
+
+/// Send a single-instruction tx signed by `signer` and confirm it.
+fn send(rpc: &RpcClient, signer: &Keypair, ix: solana_sdk::instruction::Instruction) {
+    let bh = rpc.get_latest_blockhash().expect("blockhash");
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[signer], bh);
+    rpc.send_and_confirm_transaction(&tx).expect("tx confirm");
+}
+
+/// Generate the upgrade authority, boot the validator with the program loaded
+/// upgradeable under it, initialize the bridge + validator registry, register
+/// the authority as a validator (settlement is validator-gated), and fund the
+/// vault. Returns the validator, program id, and the funded authority keypair.
 fn bootstrap(port: u16) -> (SubprocessValidator, Pubkey, Keypair) {
-    let validator = SubprocessValidator::launch_with_programs(
+    let authority = Keypair::new();
+    let validator = SubprocessValidator::launch_with_upgradeable_program(
         port,
-        &[(PARALOOM_PROGRAM_ID, paraloom_program_so())],
+        PARALOOM_PROGRAM_ID,
+        paraloom_program_so(),
+        &authority.pubkey(),
     )
     .expect("validator must boot with paraloom_program");
     let rpc = validator.rpc_client();
-    let authority = fund_new_keypair(&rpc, 3_000_000_000).expect("airdrop authority");
+    fund_keypair(&rpc, &authority, 4_000_000_000).expect("airdrop authority");
     let program_id: Pubkey = PARALOOM_PROGRAM_ID.parse().unwrap();
 
-    let init_ix = create_initialize_instruction(
-        &program_id,
-        &authority.pubkey(),
-        EXPECTED_PROGRAM_VERSION,
-        [0u8; 32],
-    )
-    .expect("init ix");
-    let bh = rpc.get_latest_blockhash().expect("blockhash");
-    let tx = Transaction::new_signed_with_payer(
-        &[init_ix],
-        Some(&authority.pubkey()),
-        &[&authority],
-        bh,
+    // initialize the bridge (signed by the upgrade authority, #204).
+    send(
+        &rpc,
+        &authority,
+        create_initialize_instruction(
+            &program_id,
+            &authority.pubkey(),
+            EXPECTED_PROGRAM_VERSION,
+            [0u8; 32],
+        )
+        .expect("init ix"),
     );
-    rpc.send_and_confirm_transaction(&tx).expect("init tx");
 
-    let (vault_pda, _) = derive_bridge_vault(&program_id);
-    let deposit_ix = create_deposit_instruction(
-        &program_id,
-        &authority.pubkey(),
-        &vault_pda,
-        2_000_000,
-        [9u8; 32],
-        [11u8; 32],
-    )
-    .expect("deposit ix");
-    let bh = rpc.get_latest_blockhash().expect("blockhash");
-    let tx = Transaction::new_signed_with_payer(
-        &[deposit_ix],
-        Some(&authority.pubkey()),
-        &[&authority],
-        bh,
+    // initialize the validator registry + register the authority as a
+    // validator so it can settle (Design A: withdraw is validator-gated).
+    send(
+        &rpc,
+        &authority,
+        create_initialize_validator_registry_instruction(&program_id, &authority.pubkey())
+            .expect("registry ix"),
     );
-    rpc.send_and_confirm_transaction(&tx).expect("deposit tx");
+    send(
+        &rpc,
+        &authority,
+        create_register_validator_instruction(
+            &program_id,
+            &authority.pubkey(),
+            MIN_VALIDATOR_STAKE,
+        )
+        .expect("register ix"),
+    );
+
+    // fund the vault so a withdrawal reaches the on-chain guards.
+    let (vault_pda, _) = derive_bridge_vault(&program_id);
+    send(
+        &rpc,
+        &authority,
+        create_deposit_instruction(
+            &program_id,
+            &authority.pubkey(),
+            &vault_pda,
+            2_000_000,
+            [9u8; 32],
+            [11u8; 32],
+        )
+        .expect("deposit ix"),
+    );
 
     (validator, program_id, authority)
 }
@@ -102,8 +118,9 @@ fn unauthorized_signer_cannot_withdraw() {
     let rpc = validator.rpc_client();
 
     // A signer that is NOT the bridge authority attempts a well-formed
-    // withdrawal. `has_one = authority` must reject it at account validation.
-    let attacker = fund_new_keypair(&rpc, 2_000_000_000).expect("airdrop attacker");
+    // withdrawal. It is rejected at account validation — both `has_one =
+    // authority` and the missing validator_account PDA for this signer.
+    let attacker = fund_new_attacker(&rpc);
     let (vault_pda, _) = derive_bridge_vault(&program_id);
     let nullifier = [123u8; 32];
     let cur_slot = rpc.get_slot().unwrap_or(0);
@@ -141,8 +158,8 @@ fn oversized_proof_rejected() {
     let (validator, program_id, authority) = bootstrap(8905);
     let rpc = validator.rpc_client();
 
-    // The authority itself submits, but with a proof past MAX_PROOF_LEN (256).
-    // The handler's length guard must reject it.
+    // The authority (a registered validator) submits, but with a proof past
+    // MAX_PROOF_LEN (256). The handler's length guard must reject it.
     let (vault_pda, _) = derive_bridge_vault(&program_id);
     let nullifier = [200u8; 32];
     let cur_slot = rpc.get_slot().unwrap_or(0);
@@ -181,15 +198,16 @@ fn authority_can_withdraw() {
     let (validator, program_id, authority) = bootstrap(8906);
     let rpc = validator.rpc_client();
 
-    // The bridge authority settles a well-formed withdrawal. bootstrap
-    // funded the vault with 2_000_000 lamports, so this 1_000_000 draw is
-    // within balance and must pass every on-chain guard.
+    // The bridge authority (a registered validator) settles a well-formed
+    // withdrawal. bootstrap funded the vault with 2_000_000 lamports.
     let (vault_pda, _) = derive_bridge_vault(&program_id);
     let vault_before = rpc.get_balance(&vault_pda).expect("vault balance before");
 
     let recipient = Keypair::new();
     let nullifier = [77u8; 32];
     let amount = 1_000_000u64;
+    let fee = amount * WITHDRAWAL_FEE_BPS / 10_000;
+    let payout = amount - fee;
     let cur_slot = rpc.get_slot().unwrap_or(0);
     let ix = create_withdraw_instruction(
         &program_id,
@@ -220,18 +238,25 @@ fn authority_can_withdraw() {
         "nullifier PDA must exist after a successful settlement"
     );
 
-    // Vault debited by exactly `amount`; recipient credited the same. The
-    // authority pays the transaction fee, so the vault delta is clean.
+    // The recipient receives amount - fee; the fee stays in the vault as the
+    // settling validator's reward, so the vault is debited only by the payout.
     let vault_after = rpc.get_balance(&vault_pda).expect("vault balance after");
     assert_eq!(
         vault_before - vault_after,
-        amount,
-        "vault must be debited by exactly the withdrawn amount"
+        payout,
+        "vault must be debited by the payout (amount - fee); the fee stays in the vault"
     );
     assert_eq!(
         rpc.get_balance(&recipient.pubkey())
             .expect("recipient balance"),
-        amount,
-        "recipient must receive exactly the withdrawn amount"
+        payout,
+        "recipient must receive amount - fee"
     );
+}
+
+/// Fund a fresh attacker keypair (not the bridge authority, not a validator).
+fn fund_new_attacker(rpc: &RpcClient) -> Keypair {
+    let kp = Keypair::new();
+    fund_keypair(rpc, &kp, 2_000_000_000).expect("airdrop attacker");
+    kp
 }
