@@ -4,18 +4,19 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::{
+    autonat,
     core::upgrade,
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
     identity,
     kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
     noise,
     ping::{self, Behaviour as Ping, Event as PingEvent},
-    quic,
+    quic, relay,
     request_response::{
         Behaviour as RequestResponse, Event as RequestResponseEvent,
         Message as RequestResponseMessage,
     },
-    swarm::{NetworkBehaviour, Swarm},
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Swarm},
     tcp, yamux, Multiaddr, PeerId, Transport,
 };
 use log::{debug, info};
@@ -66,6 +67,20 @@ pub struct ParaloomBehaviour {
     /// swarm event loop. PeerRegistry (#69) integration of these
     /// signals is a follow-up.
     pub ping: Ping,
+    /// AutoNAT v1 (#226). Always present: every node probes peers to
+    /// learn whether its own listen addresses are publicly reachable
+    /// (`NatStatus::Public`) or it sits behind a NAT
+    /// (`NatStatus::Private`). The status drives the relay-client
+    /// decision in PR-B; here in PR-A it confirms external addresses
+    /// so other peers learn how to dial this node.
+    pub autonat: autonat::Behaviour,
+    /// Circuit-relay v2 *server* (#226), gated on
+    /// `network.enable_relay_server`. A `Toggle` so a node that does
+    /// not opt in carries no relay-server state machine at all —
+    /// only public, dialable anchors should accept reservations and
+    /// forward circuits on behalf of NATed peers. The relay *client*
+    /// side (a NATed node reserving a slot here) lands in PR-B.
+    pub relay: Toggle<relay::Behaviour>,
 }
 
 /// Network event handler
@@ -261,12 +276,33 @@ impl NetworkManager {
                 .with_timeout(std::time::Duration::from_secs(20)),
         );
 
+        // AutoNAT (#226): probe peers to discover our own reachability.
+        // Always on — the status it produces is what lets PR-B decide
+        // whether this node needs to listen via a relay, and in the
+        // meantime it confirms external addresses so peers can dial us.
+        let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
+
+        // Circuit-relay v2 server (#226), opt-in. Only a public anchor
+        // should forward traffic for NATed peers; everyone else carries
+        // a disabled `Toggle` and accepts no reservations.
+        let relay = if settings.network.enable_relay_server {
+            info!("Relay server enabled — forwarding circuits for NATed peers");
+            Toggle::from(Some(relay::Behaviour::new(
+                local_peer_id,
+                relay::Config::default(),
+            )))
+        } else {
+            Toggle::from(None)
+        };
+
         let behaviour = ParaloomBehaviour {
             gossipsub,
             request_response,
             heartbeat,
             kad,
             ping,
+            autonat,
+            relay,
         };
 
         // Set up message channel
@@ -444,6 +480,14 @@ impl NetworkManager {
                                 }
                                 libp2p::swarm::SwarmEvent::Dialing { peer_id, connection_id: _ } => {
                                     info!("Dialing peer: {:?}", peer_id);
+                                }
+                                libp2p::swarm::SwarmEvent::NewExternalAddrCandidate { address } => {
+                                    // AutoNAT will probe this candidate; promotion to
+                                    // a confirmed external address surfaces below.
+                                    debug!("New external address candidate: {}", address);
+                                }
+                                libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
+                                    info!("External address confirmed: {}", address);
                                 }
                                 libp2p::swarm::SwarmEvent::Behaviour(behaviour_event) => {
                                     match behaviour_event {
@@ -644,6 +688,41 @@ impl NetworkManager {
                                                 }
                                             }
                                         }
+
+                                        ParaloomBehaviourEvent::Autonat(autonat_event) => {
+                                            match autonat_event {
+                                                autonat::Event::StatusChanged { old, new } => {
+                                                    info!(
+                                                        "AutoNAT reachability changed: {:?} -> {:?}",
+                                                        old, new
+                                                    );
+                                                    // When a probe confirms we are
+                                                    // publicly reachable, register the
+                                                    // address as external so the swarm
+                                                    // advertises it to peers (and PR-B
+                                                    // can prefer a direct dial over a
+                                                    // relay circuit).
+                                                    if let autonat::NatStatus::Public(addr) = &new {
+                                                        let mut swarm_lock = swarm.lock().await;
+                                                        swarm_lock.add_external_address(addr.clone());
+                                                        info!("Confirmed publicly reachable at {}", addr);
+                                                    }
+                                                }
+                                                other => {
+                                                    debug!("autonat event: {:?}", other);
+                                                }
+                                            }
+                                        }
+
+                                        ParaloomBehaviourEvent::Relay(relay_event) => {
+                                            // Relay-server activity (reservations,
+                                            // circuit open/close) is low-volume, so
+                                            // log at info: it makes the anchor's relay
+                                            // role observable without a debug build.
+                                            // Only emitted when enable_relay_server is
+                                            // on; the Toggle is silent otherwise.
+                                            info!("relay server event: {:?}", relay_event);
+                                        }
                                     }
                                 }
                                 _ => {
@@ -742,6 +821,15 @@ impl NetworkManager {
         NodeId(self.peer_id.to_bytes())
     }
 
+    /// Whether this node is running a circuit-relay v2 server (#226).
+    /// Mirrors `network.enable_relay_server`; exposed so operational
+    /// tooling (the /metrics endpoint, status CLIs) can report the
+    /// node's relay role without reaching into the swarm.
+    pub async fn relay_server_enabled(&self) -> bool {
+        let swarm = self.swarm.lock().await;
+        swarm.behaviour().relay.is_enabled()
+    }
+
     /// Get connected peers
     pub async fn connected_peers(&self) -> Vec<NodeId> {
         let peers = self.connected_peers.lock().await;
@@ -819,6 +907,29 @@ mod tests {
         assert!(
             registry.peers_due_for_reconnect().is_empty(),
             "no pending reconnects in a fresh registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_server_toggle_follows_config() {
+        // The relay-server behaviour is a Toggle gated on
+        // network.enable_relay_server: off by default (a NATed
+        // validator carries no relay state) and on only when an
+        // operator opts the node in (the public anchor). #226.
+        let mut off = Settings::development();
+        off.network.enable_relay_server = false;
+        let mgr_off = NetworkManager::new(&off).expect("network manager");
+        assert!(
+            !mgr_off.relay_server_enabled().await,
+            "relay server must be disabled when the flag is off"
+        );
+
+        let mut on = Settings::development();
+        on.network.enable_relay_server = true;
+        let mgr_on = NetworkManager::new(&on).expect("network manager");
+        assert!(
+            mgr_on.relay_server_enabled().await,
+            "relay server must be enabled when the flag is on"
         );
     }
 

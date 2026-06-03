@@ -22,6 +22,13 @@ bootstrap_nodes = [
 # mDNS is only useful on a LAN; leave off on a public-internet validator.
 enable_mdns = false
 
+# Run a circuit-relay v2 server (#226). Set true ONLY on a public, dialable
+# node (e.g. the bootstrap anchor) so validators behind a NAT can reserve a
+# relay slot through it and become reachable. A NATed validator should leave
+# this false — it has nothing to relay. Omit entirely to default false (or
+# set the ENABLE_RELAY_SERVER env var).
+enable_relay_server = false
+
 # Persist this node's libp2p identity (#206). Without this every restart
 # rotates your PeerId, so peers have to re-discover you and any address
 # you published elsewhere stops resolving. Mode 0600 on first write.
