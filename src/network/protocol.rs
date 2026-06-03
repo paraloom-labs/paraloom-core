@@ -4,20 +4,19 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::{
-    autonat,
-    core::upgrade,
+    autonat, dcutr,
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
     identity,
     kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
     noise,
     ping::{self, Behaviour as Ping, Event as PingEvent},
-    quic, relay,
+    relay,
     request_response::{
         Behaviour as RequestResponse, Event as RequestResponseEvent,
         Message as RequestResponseMessage,
     },
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Swarm},
-    tcp, yamux, Multiaddr, PeerId, Transport,
+    tcp, yamux, Multiaddr, PeerId,
 };
 use log::{debug, info};
 use std::sync::Arc;
@@ -78,9 +77,20 @@ pub struct ParaloomBehaviour {
     /// `network.enable_relay_server`. A `Toggle` so a node that does
     /// not opt in carries no relay-server state machine at all —
     /// only public, dialable anchors should accept reservations and
-    /// forward circuits on behalf of NATed peers. The relay *client*
-    /// side (a NATed node reserving a slot here) lands in PR-B.
+    /// forward circuits on behalf of NATed peers.
     pub relay: Toggle<relay::Behaviour>,
+    /// Circuit-relay v2 *client* (#226). Always present: when this
+    /// node sits behind a NAT it reserves a slot on a relay server
+    /// and listens on the resulting `/<relay>/p2p-circuit` address so
+    /// peers can reach it through the relay. The behaviour is injected
+    /// by `SwarmBuilder::with_relay_client`, which also weaves the
+    /// matching relay transport into the swarm.
+    pub relay_client: relay::client::Behaviour,
+    /// Direct Connection Upgrade through Relay (#226). Once a relayed
+    /// circuit is established, DCUtR coordinates a simultaneous-open
+    /// hole punch to upgrade it to a direct connection, dropping the
+    /// relay from the hot path when the NAT allows it.
+    pub dcutr: dcutr::Behaviour,
 }
 
 /// Network event handler
@@ -204,31 +214,6 @@ impl NetworkManager {
 
         info!("Local peer ID: {}", local_peer_id);
 
-        // Create TCP transport
-        let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default())
-            .upgrade(upgrade::Version::V1)
-            .authenticate(
-                noise::Config::new(&local_key).map_err(|e| anyhow!("Noise error: {}", e))?,
-            )
-            .multiplex(yamux::Config::default())
-            .boxed();
-
-        // Create QUIC transport (has built-in encryption)
-        let quic_transport = quic::tokio::Transport::new(quic::Config::new(&local_key));
-
-        // Combine TCP and QUIC transports using or_transport
-        let transport = tcp_transport
-            .or_transport(quic_transport)
-            .map(|either, _| match either {
-                futures::future::Either::Left((peer_id, muxer)) => {
-                    (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer))
-                }
-                futures::future::Either::Right((peer_id, muxer)) => {
-                    (peer_id, libp2p::core::muxing::StreamMuxerBox::new(muxer))
-                }
-            })
-            .boxed();
-
         // Gossipsub `max_transmit_size` (#69, follow-up to audit #10).
         // The previous value of 10 MiB allowed any peer to flood the
         // network with messages larger than any legitimate paraloom
@@ -295,26 +280,41 @@ impl NetworkManager {
             Toggle::from(None)
         };
 
-        let behaviour = ParaloomBehaviour {
-            gossipsub,
-            request_response,
-            heartbeat,
-            kad,
-            ping,
-            autonat,
-            relay,
-        };
-
         // Set up message channel
         let (tx, rx) = mpsc::channel(100);
 
-        // Build the Swarm with combined behavior
-        let swarm = Swarm::new(
-            transport,
-            behaviour,
-            local_peer_id,
-            libp2p::swarm::Config::with_tokio_executor(),
-        );
+        // Build the swarm via SwarmBuilder rather than Swarm::new so
+        // the relay *client* transport can be woven into the stack
+        // (#226). `with_relay_client` returns the client behaviour and
+        // injects a `/p2p-circuit` transport, letting a NATed node dial
+        // and listen through a relay; assembling that transport by hand
+        // alongside TCP+QUIC is exactly the error-prone composition the
+        // builder exists to handle. Transport set is otherwise
+        // unchanged: TCP (noise + yamux) or QUIC, same as before.
+        let swarm = libp2p::SwarmBuilder::with_existing_identity(local_key.clone())
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .map_err(|e| anyhow!("building TCP transport: {}", e))?
+            .with_quic()
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| anyhow!("building relay-client transport: {}", e))?
+            .with_behaviour(|_key, relay_client| ParaloomBehaviour {
+                gossipsub,
+                request_response,
+                heartbeat,
+                kad,
+                ping,
+                autonat,
+                relay,
+                relay_client,
+                dcutr: dcutr::Behaviour::new(local_peer_id),
+            })
+            .map_err(|e| anyhow!("building swarm behaviour: {}", e))?
+            .build();
 
         Ok(NetworkManager {
             peer_id: local_peer_id,
@@ -382,6 +382,87 @@ impl NetworkManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// Declare a publicly-reachable address for this node (#226).
+    ///
+    /// Calls `Swarm::add_external_address`, which marks the address
+    /// confirmed and propagates it to every behaviour. This matters
+    /// for a relay *server*: the reservation it grants a NATed peer
+    /// only carries the relay's own external addresses, so without one
+    /// the client gets `NoAddressesInReservation` and cannot build a
+    /// usable `/p2p-circuit` listen address. A public anchor therefore
+    /// declares its routable multiaddr here. AutoNAT also confirms
+    /// addresses automatically, but a bootstrap anchor may have no
+    /// other AutoNAT server to probe it, so an explicit declaration is
+    /// the reliable path.
+    pub async fn add_external_address(&self, addr: &str) -> Result<()> {
+        let addr: Multiaddr = addr
+            .parse()
+            .with_context(|| format!("parsing external address {}", addr))?;
+        let mut swarm = self.swarm.lock().await;
+        swarm.add_external_address(addr.clone());
+        info!("Declared external address {}", addr);
+        Ok(())
+    }
+
+    /// Reserve a slot on a circuit-relay v2 server and listen on the
+    /// resulting `/<relay>/p2p-circuit` address (#226).
+    ///
+    /// A node behind a NAT calls this so peers can reach it *through*
+    /// the relay: the relay client transport (woven in by
+    /// `SwarmBuilder::with_relay_client`) dials the relay, requests a
+    /// reservation, and the swarm starts accepting inbound circuits on
+    /// the relayed address. DCUtR then opportunistically upgrades each
+    /// relayed circuit to a direct connection.
+    ///
+    /// `relay_addr` must include the relay's `/p2p/<peer_id>` suffix —
+    /// without it the relay client cannot identify the reservation
+    /// target, so we reject the address rather than silently no-op.
+    pub async fn listen_via_relay(&self, relay_addr: &str) -> Result<()> {
+        let relay_addr: Multiaddr = relay_addr
+            .parse()
+            .with_context(|| format!("parsing relay address {}", relay_addr))?;
+
+        let relay_peer = peer_id_from_multiaddr(&relay_addr).ok_or_else(|| {
+            anyhow!(
+                "relay address {} has no /p2p/<peer_id> suffix; cannot reserve a circuit",
+                relay_addr
+            )
+        })?;
+
+        let mut swarm = self.swarm.lock().await;
+
+        // Register the relay in Kademlia so the relay-client behaviour
+        // can resolve the relay's address when it dials (it builds its
+        // reservation dial with `extend_addresses_through_behaviour`).
+        // We deliberately do NOT dial the relay ourselves: listening on
+        // the circuit triggers the relay-client behaviour to open its
+        // own dial and pin the pending reservation to that connection.
+        // A second, explicit dial to the same peer races with it and
+        // gets coalesced, dropping the reservation's listener channel —
+        // the listener then closes cleanly before any reservation is
+        // made. Letting the behaviour own the dial is the supported path.
+        swarm
+            .behaviour_mut()
+            .kad
+            .add_address(&relay_peer, relay_addr.clone());
+
+        // Listening on `<relay>/p2p-circuit` is what actually requests
+        // the reservation and starts accepting relayed inbound
+        // connections.
+        let circuit_addr = relay_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+        swarm
+            .listen_on(circuit_addr.clone())
+            .with_context(|| format!("listening on relay circuit {}", circuit_addr))?;
+
+        info!(
+            "Reserving relay slot on {} and listening via circuit {}",
+            relay_addr, circuit_addr
+        );
         Ok(())
     }
 
@@ -723,6 +804,23 @@ impl NetworkManager {
                                             // on; the Toggle is silent otherwise.
                                             info!("relay server event: {:?}", relay_event);
                                         }
+
+                                        ParaloomBehaviourEvent::RelayClient(relay_client_event) => {
+                                            // Client side of #226: reservations we hold
+                                            // on a relay and circuits opened through it.
+                                            // Low-volume; info-level so a NATed node's
+                                            // path to reachability is observable.
+                                            info!("relay client event: {:?}", relay_client_event);
+                                        }
+
+                                        ParaloomBehaviourEvent::Dcutr(dcutr_event) => {
+                                            // Hole-punch attempt to upgrade a relayed
+                                            // circuit to a direct connection. The event
+                                            // carries the peer and a Result; log the
+                                            // whole event so both success and the
+                                            // failure cause are visible.
+                                            info!("dcutr hole-punch event: {:?}", dcutr_event);
+                                        }
                                     }
                                 }
                                 _ => {
@@ -819,6 +917,25 @@ impl NetworkManager {
     /// Get local peer ID
     pub fn local_peer_id(&self) -> NodeId {
         NodeId(self.peer_id.to_bytes())
+    }
+
+    /// The local PeerId in libp2p's base58 string form (the value
+    /// that appears in a `/p2p/<peer_id>` multiaddr). Distinct from
+    /// [`Self::local_peer_id`], which returns the raw-byte `NodeId`;
+    /// this is what operators and tests need to construct a dialable
+    /// multiaddr for this node.
+    pub fn peer_id_base58(&self) -> String {
+        self.peer_id.to_string()
+    }
+
+    /// Multiaddrs the swarm is currently listening on, stringified.
+    /// After a successful relay reservation (#226) this includes the
+    /// `/<relay>/p2p-circuit` address; before that it is just the
+    /// local transport addresses. Exposed for operational tooling and
+    /// for tests that assert a relay circuit came up.
+    pub async fn listen_addresses(&self) -> Vec<String> {
+        let swarm = self.swarm.lock().await;
+        swarm.listeners().map(|a| a.to_string()).collect()
     }
 
     /// Whether this node is running a circuit-relay v2 server (#226).
