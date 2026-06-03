@@ -128,7 +128,7 @@ solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "bo
 
 [dependencies]
 # Core networking
-libp2p = { version = "0.56.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "gossipsub", "request-response", "macros", "kad", "ping"] }
+libp2p = { version = "0.56.0", features = ["tokio", "tcp", "quic", "noise", "yamux", "gossipsub", "request-response", "macros", "kad", "ping", "relay", "dcutr", "autonat"] }
 tokio = { version = "1.25.0", features = ["full"] }
 
 # Web server - compatible versions
