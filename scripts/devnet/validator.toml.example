@@ -29,6 +29,21 @@ enable_mdns = false
 # set the ENABLE_RELAY_SERVER env var).
 enable_relay_server = false
 
+# This node's own publicly-reachable multiaddr. Required on a relay server (the
+# anchor): the reservation a relay grants a NATed peer carries only the relay's
+# external addresses, so without this the peer can't build a usable circuit
+# address. Use your real public IP + port. Leave unset on a node that has no
+# public address (AutoNAT will discover one if any relay/AutoNAT peers exist).
+# external_address = "/ip4/67.205.142.8/tcp/9300"
+
+# If THIS node is behind a NAT/firewall (no public, dialable address), point it
+# at a relay server's full multiaddr (must end in /p2p/<peer_id>). The node
+# reserves a slot there and becomes reachable via /p2p-circuit; DCUtR then tries
+# to upgrade each relayed connection to a direct one (#226). Leave unset on a
+# public node. The bootstrap anchor above runs a relay server, so it doubles as
+# a relay target.
+# relay_address = "/ip4/67.205.142.8/tcp/9300/p2p/12D3KooWFf8xfNz77E9Ve4HnpyZkAHKAcUdw4LmagpFCYQD6R7WK"
+
 # Persist this node's libp2p identity (#206). Without this every restart
 # rotates your PeerId, so peers have to re-discover you and any address
 # you published elsewhere stops resolving. Mode 0600 on first write.

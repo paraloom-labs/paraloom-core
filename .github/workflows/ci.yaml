@@ -286,6 +286,12 @@ jobs:
       - name: Run transfer consensus network E2E (ignored)
         run: cargo test --test transfer_consensus_network_e2e --all-features -- --ignored --test-threads=1 --nocapture
 
+      # #226 relay reservation E2E. Also `#[ignore]`'d (binds loopback TCP,
+      # depends on circuit-relay v2 reservation timing) and needs no Solana
+      # validator, so it rides this same plain-runner job.
+      - name: Run relay reservation E2E (ignored)
+        run: cargo test --test relay_reservation_e2e --all-features -- --ignored --test-threads=1 --nocapture
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
