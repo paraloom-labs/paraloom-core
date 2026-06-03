@@ -1216,18 +1216,6 @@ impl Node {
             }
         }
 
-        // If a relay server is configured, reserve a slot on it and
-        // listen via its circuit so peers can reach this node when it
-        // sits behind a NAT (#226). A failure here is non-fatal: the
-        // node still works for outbound traffic and direct dials, it
-        // just isn't reachable through the relay.
-        if let Some(relay) = self.settings.network.relay_address.clone() {
-            info!("Reserving a relay slot on {}", relay);
-            if let Err(e) = self.network.listen_via_relay(&relay).await {
-                log::warn!("relay reservation failed: {}", e);
-            }
-        }
-
         // Connect to bootstrap nodes, retrying until at least one peer is
         // connected. A single dial is not guaranteed to land: the bootstrap
         // target may still be starting, or its event loop briefly busy (e.g. a
@@ -1279,6 +1267,23 @@ impl Node {
                 "Discovery broadcast complete for {:?}",
                 self.node_info.node_type
             );
+        }
+
+        // Reserve a relay slot AFTER bootstrap (#226). Order matters: when
+        // relay_address points at a node we also bootstrap from (the common
+        // case — the anchor is both bootstrap and relay), the bootstrap dial
+        // has already established a connection, so the relay client reserves
+        // over that existing connection instead of opening a second dial to
+        // the same peer. Reserving before bootstrap raced the two dials;
+        // libp2p coalesced them and the reservation's listener was silently
+        // dropped, so the node never became reachable via the relay. Non-fatal
+        // on error: the node still works for outbound traffic and direct
+        // dials, it just isn't reachable through the relay.
+        if let Some(relay) = self.settings.network.relay_address.clone() {
+            info!("Reserving a relay slot on {}", relay);
+            if let Err(e) = self.network.listen_via_relay(&relay).await {
+                log::warn!("relay reservation failed: {}", e);
+            }
         }
 
         // Update status
