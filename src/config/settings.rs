@@ -52,6 +52,28 @@ pub struct NetworkSettings {
     /// configs upgrade without edits.
     #[serde(default = "default_enable_relay_server")]
     pub enable_relay_server: bool,
+    /// This node's own publicly-reachable multiaddr, if it has one
+    /// (#226). Declared as a confirmed external address at startup.
+    /// Set this on a relay server (the anchor): a reservation it
+    /// grants a NATed peer carries only the relay's external
+    /// addresses, so without one the peer cannot build a usable
+    /// `/p2p-circuit` listen address. Typically the node's public
+    /// `listen_address` with the real IP, e.g.
+    /// `/ip4/203.0.113.5/tcp/9300`. `None` (default) leaves address
+    /// discovery to AutoNAT.
+    #[serde(default)]
+    pub external_address: Option<String>,
+    /// Multiaddr of a circuit-relay v2 *server* to reserve a slot on
+    /// (#226). Set this on a node that sits behind a NAT: the node
+    /// dials the relay and listens on the relay's `/p2p-circuit`
+    /// address so peers can reach it through the relay even though no
+    /// inbound dial to the node itself can land. Must include the
+    /// relay's `/p2p/<peer_id>` suffix. `None` (the default) means no
+    /// relay reservation — correct for a publicly dialable node.
+    /// Harmless to set on a public node: the reservation simply goes
+    /// unused.
+    #[serde(default)]
+    pub relay_address: Option<String>,
     /// Path to a libp2p identity key (protobuf-encoded). When set, the
     /// network manager loads the keypair from this file on startup so the
     /// PeerId is stable across restarts; if the file is missing, a fresh
@@ -181,6 +203,8 @@ impl Settings {
                 bootstrap_nodes: vec![],
                 enable_mdns: true,
                 enable_relay_server: false,
+                external_address: None,
+                relay_address: None,
                 identity_path: None,
             },
             node: NodeSettings {
@@ -317,5 +341,58 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(toml_text).expect("parses with relay field");
         assert!(settings.network.enable_relay_server);
+    }
+
+    #[test]
+    fn relay_client_fields_default_none_and_round_trip() {
+        // The relay *client* fields (#226 PR-B) are optional. A config
+        // without them leaves both None; a NATed node opts in by
+        // setting relay_address, and a relay server declares its public
+        // multiaddr via external_address.
+        let bare = r#"
+            [network]
+            listen_address = "/ip4/127.0.0.1/tcp/0"
+            bootstrap_nodes = []
+            enable_mdns = false
+
+            [node]
+            node_type = "Coordinator"
+            max_cpu_usage = 80
+            max_memory_usage = 70
+            max_storage_usage = 1024
+
+            [storage]
+            data_dir = "./data"
+        "#;
+        let s: Settings = toml::from_str(bare).expect("parses without relay-client fields");
+        assert!(s.network.relay_address.is_none());
+        assert!(s.network.external_address.is_none());
+
+        let configured = r#"
+            [network]
+            listen_address = "/ip4/0.0.0.0/tcp/9300"
+            bootstrap_nodes = []
+            enable_mdns = false
+            external_address = "/ip4/203.0.113.5/tcp/9300"
+            relay_address = "/ip4/203.0.113.5/tcp/9300/p2p/12D3KooWtest"
+
+            [node]
+            node_type = "Coordinator"
+            max_cpu_usage = 80
+            max_memory_usage = 70
+            max_storage_usage = 1024
+
+            [storage]
+            data_dir = "./data"
+        "#;
+        let s: Settings = toml::from_str(configured).expect("parses with relay-client fields");
+        assert_eq!(
+            s.network.external_address.as_deref(),
+            Some("/ip4/203.0.113.5/tcp/9300")
+        );
+        assert_eq!(
+            s.network.relay_address.as_deref(),
+            Some("/ip4/203.0.113.5/tcp/9300/p2p/12D3KooWtest")
+        );
     }
 }

@@ -1205,6 +1205,29 @@ impl Node {
         // Start network
         self.network.start(listen_address).await?;
 
+        // Declare our public address if the operator configured one
+        // (#226). A relay server must advertise its own external
+        // address or the reservations it grants carry no usable
+        // circuit address; a non-relay node benefits too, since peers
+        // learn a confirmed way to dial it.
+        if let Some(external) = self.settings.network.external_address.clone() {
+            if let Err(e) = self.network.add_external_address(&external).await {
+                log::warn!("declaring external address failed: {}", e);
+            }
+        }
+
+        // If a relay server is configured, reserve a slot on it and
+        // listen via its circuit so peers can reach this node when it
+        // sits behind a NAT (#226). A failure here is non-fatal: the
+        // node still works for outbound traffic and direct dials, it
+        // just isn't reachable through the relay.
+        if let Some(relay) = self.settings.network.relay_address.clone() {
+            info!("Reserving a relay slot on {}", relay);
+            if let Err(e) = self.network.listen_via_relay(&relay).await {
+                log::warn!("relay reservation failed: {}", e);
+            }
+        }
+
         // Connect to bootstrap nodes, retrying until at least one peer is
         // connected. A single dial is not guaranteed to land: the bootstrap
         // target may still be starting, or its event loop briefly busy (e.g. a
