@@ -41,6 +41,17 @@ pub struct NetworkSettings {
     pub bootstrap_nodes: Vec<String>,
     /// Enable mDNS discovery
     pub enable_mdns: bool,
+    /// Run a circuit-relay v2 *server* on this node (#226). A public,
+    /// dialable node (the bootstrap anchor) sets this `true` so peers
+    /// behind a NAT can reserve a relay slot and become reachable
+    /// through it. Leave `false` on NATed validators — they have
+    /// nothing to relay and gain only attack surface by accepting
+    /// reservations. Optional in TOML: defaults to the
+    /// `ENABLE_RELAY_SERVER` env var (parsed as bool) and otherwise
+    /// `false`, mirroring the `[bridge] enabled` pattern so existing
+    /// configs upgrade without edits.
+    #[serde(default = "default_enable_relay_server")]
+    pub enable_relay_server: bool,
     /// Path to a libp2p identity key (protobuf-encoded). When set, the
     /// network manager loads the keypair from this file on startup so the
     /// PeerId is stable across restarts; if the file is missing, a fresh
@@ -120,6 +131,16 @@ pub struct HaSettings {
     pub watchdog_interval_ms: u64,
 }
 
+/// Default for [`NetworkSettings::enable_relay_server`]. Reads the
+/// `ENABLE_RELAY_SERVER` env var (parsed as bool) so the anchor can
+/// flip relay on without a config edit, falling back to `false`.
+fn default_enable_relay_server() -> bool {
+    std::env::var("ENABLE_RELAY_SERVER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(false)
+}
+
 fn default_heartbeat_interval_ms() -> u64 {
     5_000
 }
@@ -159,6 +180,7 @@ impl Settings {
                 listen_address: "/ip4/127.0.0.1/tcp/0".to_string(),
                 bootstrap_nodes: vec![],
                 enable_mdns: true,
+                enable_relay_server: false,
                 identity_path: None,
             },
             node: NodeSettings {
@@ -244,5 +266,56 @@ mod tests {
         assert_eq!(settings.ha.heartbeat_interval_ms, 5_000); // default still
         assert_eq!(settings.ha.standbys.len(), 2);
         assert!(settings.ha.primary.is_none());
+    }
+
+    #[test]
+    fn network_without_relay_field_defaults_off() {
+        // A pre-#226 `[network]` table has no `enable_relay_server`
+        // key. The `#[serde(default = ...)]` must let it parse and
+        // leave relay-server off, so existing validator configs
+        // upgrade without edits and don't accidentally start relaying.
+        let toml_text = r#"
+            [network]
+            listen_address = "/ip4/127.0.0.1/tcp/0"
+            bootstrap_nodes = []
+            enable_mdns = false
+
+            [node]
+            node_type = "Coordinator"
+            max_cpu_usage = 80
+            max_memory_usage = 70
+            max_storage_usage = 1024
+
+            [storage]
+            data_dir = "./data"
+        "#;
+        let settings: Settings = toml::from_str(toml_text).expect("parses without relay field");
+        assert!(
+            !settings.network.enable_relay_server,
+            "relay server must default off"
+        );
+    }
+
+    #[test]
+    fn network_relay_field_parses_when_set() {
+        // A public anchor opts in explicitly; the flag round-trips.
+        let toml_text = r#"
+            [network]
+            listen_address = "/ip4/0.0.0.0/tcp/9300"
+            bootstrap_nodes = []
+            enable_mdns = false
+            enable_relay_server = true
+
+            [node]
+            node_type = "Coordinator"
+            max_cpu_usage = 80
+            max_memory_usage = 70
+            max_storage_usage = 1024
+
+            [storage]
+            data_dir = "./data"
+        "#;
+        let settings: Settings = toml::from_str(toml_text).expect("parses with relay field");
+        assert!(settings.network.enable_relay_server);
     }
 }
