@@ -6,7 +6,7 @@ use libp2p::futures::StreamExt;
 use libp2p::{
     autonat, dcutr,
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
-    identity,
+    identify, identity,
     kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
     noise,
     ping::{self, Behaviour as Ping, Event as PingEvent},
@@ -91,6 +91,13 @@ pub struct ParaloomBehaviour {
     /// hole punch to upgrade it to a direct connection, dropping the
     /// relay from the hot path when the NAT allows it.
     pub dcutr: dcutr::Behaviour,
+    /// libp2p identify (#226). Required for DCUtR and AutoNAT to work:
+    /// it tells each peer the address the *other* side observes it on,
+    /// which the swarm records as an external-address candidate. DCUtR
+    /// needs that observed address to coordinate the hole punch — without
+    /// identify the hole-punch attempt fails immediately with
+    /// `NoAddresses`. Also lets peers learn each other's protocol set.
+    pub identify: identify::Behaviour,
 }
 
 /// Network event handler
@@ -280,6 +287,16 @@ impl NetworkManager {
             Toggle::from(None)
         };
 
+        // identify (#226): exchange each peer's observed address so the
+        // swarm learns its external-address candidates. DCUtR and AutoNAT
+        // both depend on this — without it DCUtR's hole punch fails with
+        // `NoAddresses`. The protocol string is the libp2p identify
+        // protocol id; the agent version carries our crate version.
+        let identify = identify::Behaviour::new(
+            identify::Config::new("/paraloom/1.0.0".to_string(), local_key.public())
+                .with_agent_version(format!("paraloom/{}", env!("CARGO_PKG_VERSION"))),
+        );
+
         // Set up message channel
         let (tx, rx) = mpsc::channel(100);
 
@@ -312,6 +329,7 @@ impl NetworkManager {
                 relay,
                 relay_client,
                 dcutr: dcutr::Behaviour::new(local_peer_id),
+                identify,
             })
             .map_err(|e| anyhow!("building swarm behaviour: {}", e))?
             .build();
@@ -820,6 +838,15 @@ impl NetworkManager {
                                             // whole event so both success and the
                                             // failure cause are visible.
                                             info!("dcutr hole-punch event: {:?}", dcutr_event);
+                                        }
+
+                                        ParaloomBehaviourEvent::Identify(identify_event) => {
+                                            // The behaviour reports observed addresses
+                                            // to the swarm on its own (as external-addr
+                                            // candidates that AutoNAT confirms and DCUtR
+                                            // consumes); we just log at debug for
+                                            // visibility into the peer handshake.
+                                            debug!("identify event: {:?}", identify_event);
                                         }
                                     }
                                 }
