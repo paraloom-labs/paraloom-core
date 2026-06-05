@@ -293,9 +293,9 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // degenerate path and rejected real mixed-direction proofs.
         for (path_slot, commitment_var) in self.input_paths.iter().zip(input_commitment_vars.iter())
         {
-            if let Some(path) = path_slot {
-                let mut current_hash = commitment_var.clone();
+            let mut current_hash = commitment_var.clone();
 
+            if let Some(path) = path_slot {
                 for (sibling_hash, is_left) in path {
                     let sibling_var = FpVar::new_witness(cs.clone(), || {
                         Ok(Fr::from_le_bytes_mod_order(sibling_hash))
@@ -307,9 +307,18 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
 
                     current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
                 }
-
-                current_hash.enforce_equal(&merkle_root_var)?;
             }
+
+            // Enforce membership UNCONDITIONALLY (mirrors WithdrawCircuit). A
+            // `None` path leaves `current_hash = commitment` and forces
+            // `commitment == merkle_root`, which fails closed for any real
+            // (multi-level) tree. Previously this `enforce_equal` sat inside
+            // the `if let Some(path)`, so a `None` path silently skipped the
+            // membership check — an input could then be spent without proving
+            // it exists in the tree. The R1CS shape is unchanged for the
+            // production path (setup and prover both pass full-depth `Some`
+            // paths), so this only closes the `None` footgun.
+            current_hash.enforce_equal(&merkle_root_var)?;
         }
 
         // CONSTRAINT 3: nullifier = Poseidon(NULLIFIER_TAG, commitment, secret).
@@ -774,6 +783,65 @@ mod tests {
         assert!(
             cs.is_satisfied().expect("constraint system query"),
             "transfer circuit constraints should be satisfied by host-aligned witnesses"
+        );
+    }
+
+    /// A `None` input path must NOT bypass the Merkle membership check.
+    /// With the fail-closed fix, a `None` path forces `commitment == root`,
+    /// which fails for any real tree (root != bare leaf). Pre-fix this
+    /// silently passed, letting a prover spend a note not in the tree.
+    #[test]
+    fn transfer_none_path_does_not_bypass_membership() {
+        let input_value = 1_000u64;
+        let input_randomness = [4u8; 32];
+        let input_recipient = [7u8; 32];
+        let input_secret = [9u8; 32];
+
+        let input_commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+        );
+        let nullifier_fr = poseidon_nullifier(
+            input_commitment_fr,
+            Fr::from_le_bytes_mod_order(&input_secret),
+        );
+        // A real root: the pair of the commitment and a sibling, so it is
+        // NOT equal to the bare commitment.
+        let sibling = [5u8; 32];
+        let merkle_root_fr =
+            poseidon_merkle_pair(input_commitment_fr, Fr::from_le_bytes_mod_order(&sibling));
+
+        let output_value = input_value;
+        let output_randomness = [6u8; 32];
+        let output_recipient = [11u8; 32];
+        let output_commitment_fr = poseidon_commit(
+            Fr::from(output_value),
+            Fr::from_le_bytes_mod_order(&output_randomness),
+            Fr::from_le_bytes_mod_order(&output_recipient),
+        );
+
+        // Build the circuit directly with a `None` input path — the footgun.
+        let circuit = TransferCircuit {
+            merkle_root: Some(fr_to_bytes_32(merkle_root_fr)),
+            nullifiers: vec![Some(fr_to_bytes_32(nullifier_fr))],
+            output_commitments: vec![Some(fr_to_bytes_32(output_commitment_fr))],
+            input_values: vec![Some(input_value)],
+            input_randomness: vec![Some(input_randomness)],
+            input_recipients: vec![Some(input_recipient)],
+            input_secrets: vec![Some(input_secret)],
+            input_paths: vec![None],
+            output_values: vec![Some(output_value)],
+            output_randomness: vec![Some(output_randomness)],
+            recipient_addresses: vec![Some(output_recipient)],
+        };
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should succeed");
+        assert!(
+            !cs.is_satisfied().expect("constraint system query"),
+            "a None input path must not bypass Merkle membership"
         );
     }
 
