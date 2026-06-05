@@ -6,13 +6,34 @@ use crate::privacy::circuits::Groth16ProofSystem;
 use crate::privacy::transaction::{DepositTx, TransferTx, WithdrawTx};
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_ff::PrimeField;
+use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use thiserror::Error;
+
+/// True iff `b` is the *canonical* little-endian encoding of its own field
+/// element — i.e. `b`, read as a 256-bit little-endian integer, is already
+/// less than the BLS12-381 scalar modulus.
+///
+/// `Fr::from_le_bytes_mod_order` is non-injective on 32 bytes: 256 bits is
+/// wider than the ~255-bit modulus `p`, so a buffer `b` and `b + p` lift to
+/// the *same* field element. The Groth16 public inputs bind the field
+/// element, but nullifier uniqueness is keyed on the raw bytes (the off-chain
+/// `NullifierSet` and the on-chain nullifier PDA seed). Accepting a
+/// non-canonical encoding would therefore let an already-spent note
+/// re-present under different bytes while satisfying the same proof. Reject
+/// any input that is not its own canonical encoding so the proof's field
+/// element and the byte-keyed uniqueness checks correspond 1:1.
+fn is_canonical_le(b: &[u8; 32]) -> bool {
+    let le = Fr::from_le_bytes_mod_order(b).into_bigint().to_bytes_le();
+    let mut canonical = [0u8; 32];
+    let n = le.len().min(32);
+    canonical[..n].copy_from_slice(&le[..n]);
+    &canonical == b
+}
 
 /// Proof verification result
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -349,6 +370,30 @@ impl ProofVerifier {
             }
         };
 
+        // Reject non-canonical field-element encodings before lifting. Without
+        // this, `b` and `b + p` lift to the same public input but are distinct
+        // bytes to the nullifier set / PDA seed — a spent note could re-present
+        // under a different encoding. Guard every byte-blob input.
+        if !is_canonical_le(merkle_root) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical merkle_root encoding".to_string(),
+            };
+        }
+        for nullifier in nullifiers {
+            if !is_canonical_le(nullifier) {
+                return VerificationResult::Invalid {
+                    reason: "non-canonical nullifier encoding".to_string(),
+                };
+            }
+        }
+        for commitment in output_commitments {
+            if !is_canonical_le(commitment) {
+                return VerificationResult::Invalid {
+                    reason: "non-canonical output commitment encoding".to_string(),
+                };
+            }
+        }
+
         let mut public_inputs = Vec::with_capacity(1 + nullifiers.len() + output_commitments.len());
         public_inputs.push(Fr::from_le_bytes_mod_order(merkle_root));
         for nullifier in nullifiers {
@@ -456,6 +501,21 @@ impl ProofVerifier {
             }
         };
 
+        // Reject non-canonical encodings (see `is_canonical_le`): `b` and
+        // `b + p` share a field element but differ as bytes, and the nullifier
+        // PDA / off-chain set key on the bytes — so a non-canonical re-encoding
+        // of a spent nullifier would bypass the uniqueness check.
+        if !is_canonical_le(merkle_root) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical merkle_root encoding".to_string(),
+            };
+        }
+        if !is_canonical_le(nullifier) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical nullifier encoding".to_string(),
+            };
+        }
+
         let public_inputs = vec![
             Fr::from_le_bytes_mod_order(merkle_root),
             Fr::from_le_bytes_mod_order(nullifier),
@@ -505,6 +565,49 @@ impl ProofVerifier {
 mod tests {
     use super::*;
     use crate::privacy::types::{Note, ShieldedAddress};
+
+    /// A canonical encoding is accepted; the same field element re-encoded as
+    /// `b + p` (a distinct 32-byte buffer that lifts to the same `Fr`) is
+    /// rejected. This is the nullifier-uniqueness-bypass guard: without it,
+    /// `b` and `b + p` would pass the same proof but look like two different
+    /// nullifiers to the byte-keyed spent-set and on-chain PDA.
+    #[test]
+    fn rejects_non_canonical_field_encoding() {
+        // Canonical little-endian bytes of a small field element.
+        let x = Fr::from(123_456_789u64);
+        let le = x.into_bigint().to_bytes_le();
+        let mut canonical = [0u8; 32];
+        canonical[..le.len().min(32)].copy_from_slice(&le[..le.len().min(32)]);
+        assert!(
+            is_canonical_le(&canonical),
+            "canonical encoding must be accepted"
+        );
+
+        // The scalar modulus p as 32 LE bytes.
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus = [0u8; 32];
+        modulus[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        // non_canonical = canonical + p  (256-bit little-endian add).
+        let mut non_canonical = [0u8; 32];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let s = canonical[i] as u16 + modulus[i] as u16 + carry;
+            non_canonical[i] = (s & 0xff) as u8;
+            carry = s >> 8;
+        }
+        assert_eq!(carry, 0, "canonical + p must fit in 256 bits");
+        assert_ne!(non_canonical, canonical, "must be a distinct buffer");
+        assert_eq!(
+            Fr::from_le_bytes_mod_order(&non_canonical),
+            x,
+            "b + p must lift to the same field element as b"
+        );
+        assert!(
+            !is_canonical_le(&non_canonical),
+            "non-canonical encoding (b + p) must be rejected"
+        );
+    }
 
     #[test]
     fn test_output_commitments_chunk() {
