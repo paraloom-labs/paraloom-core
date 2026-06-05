@@ -7,7 +7,7 @@
 
 use crate::privacy::merkle::MerkleTree;
 use crate::privacy::nullifier::NullifierSet;
-use crate::privacy::types::{Commitment, Note, Nullifier};
+use crate::privacy::types::{AssetId, Commitment, Note, Nullifier, NATIVE_SOL_ASSET};
 use crate::storage::PrivacyStorage;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -26,8 +26,11 @@ pub struct ShieldedPool {
     /// In production, notes would be encrypted
     notes: Arc<RwLock<HashMap<Commitment, Note>>>,
 
-    /// Total shielded supply (in lamports)
-    total_supply: Arc<RwLock<u64>>,
+    /// Per-asset shielded supply (#236). Keyed by [`AssetId`]; native SOL
+    /// uses [`NATIVE_SOL_ASSET`] and the smallest-unit amount (lamports),
+    /// SPL tokens use their mint id and base units. An absent key means a
+    /// zero supply for that asset.
+    supplies: Arc<RwLock<HashMap<AssetId, u64>>>,
 
     /// Optional persistent storage
     storage: Option<Arc<PrivacyStorage>>,
@@ -40,7 +43,7 @@ impl ShieldedPool {
             commitment_tree: MerkleTree::new(),
             nullifier_set: NullifierSet::new(),
             notes: Arc::new(RwLock::new(HashMap::new())),
-            total_supply: Arc::new(RwLock::new(0)),
+            supplies: Arc::new(RwLock::new(HashMap::new())),
             storage: None,
         }
     }
@@ -53,21 +56,35 @@ impl ShieldedPool {
         // Load nullifier set from storage
         let nullifier_set = NullifierSet::with_storage(storage.clone()).await?;
 
-        // Load total supply from storage
-        let total_supply = storage.get_total_supply()?;
+        // Load per-asset supplies from storage (native SOL + any SPL assets)
+        let supplies = storage.get_all_asset_supplies()?;
 
         Ok(ShieldedPool {
             commitment_tree,
             nullifier_set,
             notes: Arc::new(RwLock::new(HashMap::new())),
-            total_supply: Arc::new(RwLock::new(total_supply)),
+            supplies: Arc::new(RwLock::new(supplies)),
             storage: Some(storage),
         })
     }
 
-    /// Deposit funds into the shielded pool
-    /// Creates a new commitment and adds it to the tree
+    /// Deposit native SOL into the shielded pool.
+    ///
+    /// Convenience wrapper over [`deposit_asset`](Self::deposit_asset) with
+    /// [`NATIVE_SOL_ASSET`], preserving the pre-multi-asset signature.
     pub async fn deposit(&self, note: Note, amount: u64) -> Result<Commitment> {
+        self.deposit_asset(note, amount, NATIVE_SOL_ASSET).await
+    }
+
+    /// Deposit `amount` of `asset_id` into the shielded pool (#236).
+    /// Creates a new commitment, adds it to the tree, and credits the
+    /// asset's supply.
+    pub async fn deposit_asset(
+        &self,
+        note: Note,
+        amount: u64,
+        asset_id: AssetId,
+    ) -> Result<Commitment> {
         // Create commitment
         let commitment = note.commitment();
 
@@ -80,13 +97,14 @@ impl ShieldedPool {
         let mut notes = self.notes.write().await;
         notes.insert(commitment.clone(), note);
 
-        // Update total supply
-        let mut supply = self.total_supply.write().await;
+        // Credit this asset's supply
+        let mut supplies = self.supplies.write().await;
+        let supply = supplies.entry(asset_id).or_insert(0);
         *supply += amount;
 
-        // Persist total supply to storage if available
+        // Persist the asset's supply to storage if available
         if let Some(storage) = &self.storage {
-            storage.set_total_supply(*supply)?;
+            storage.set_asset_supply(&asset_id, *supply)?;
         }
 
         Ok(commitment)
@@ -152,13 +170,28 @@ impl ShieldedPool {
         Ok(())
     }
 
-    /// Withdraw from the shielded pool
-    /// Burns a commitment (via nullifier) and releases funds
+    /// Withdraw native SOL from the shielded pool.
+    ///
+    /// Convenience wrapper over [`withdraw_asset`](Self::withdraw_asset) with
+    /// [`NATIVE_SOL_ASSET`], preserving the pre-multi-asset signature.
     pub async fn withdraw(
         &self,
         nullifier: Nullifier,
         amount: u64,
+        recipient: &[u8], // Public address receiving withdrawal
+    ) -> Result<()> {
+        self.withdraw_asset(nullifier, amount, recipient, NATIVE_SOL_ASSET)
+            .await
+    }
+
+    /// Withdraw `amount` of `asset_id` from the shielded pool (#236).
+    /// Burns a commitment (via nullifier) and debits the asset's supply.
+    pub async fn withdraw_asset(
+        &self,
+        nullifier: Nullifier,
+        amount: u64,
         _recipient: &[u8], // Public address receiving withdrawal
+        asset_id: AssetId,
     ) -> Result<()> {
         // Check nullifier hasn't been used
         if self.nullifier_set.contains(&nullifier).await {
@@ -171,16 +204,17 @@ impl ShieldedPool {
         // restarted node accept a replay of the same withdrawal.
         self.nullifier_set.insert(nullifier).await?;
 
-        // Decrease total supply
-        let mut supply = self.total_supply.write().await;
+        // Decrease this asset's supply
+        let mut supplies = self.supplies.write().await;
+        let supply = supplies.entry(asset_id).or_insert(0);
         if *supply < amount {
             return Err(anyhow!("Insufficient shielded supply"));
         }
         *supply -= amount;
 
-        // Persist total supply to storage if available
+        // Persist the asset's supply to storage if available
         if let Some(storage) = &self.storage {
-            storage.set_total_supply(*supply)?;
+            storage.set_asset_supply(&asset_id, *supply)?;
         }
 
         Ok(())
@@ -216,10 +250,25 @@ impl ShieldedPool {
         self.nullifier_set.contains(nullifier).await
     }
 
-    /// Get total shielded supply
+    /// Get the native-SOL shielded supply.
+    ///
+    /// Back-compat accessor preserved from the single-asset pool; equivalent
+    /// to [`supply_of`](Self::supply_of) with [`NATIVE_SOL_ASSET`].
     pub async fn total_supply(&self) -> u64 {
-        let supply = self.total_supply.read().await;
-        *supply
+        self.supply_of(NATIVE_SOL_ASSET).await
+    }
+
+    /// Get the shielded supply of a specific asset (#236). Returns 0 for an
+    /// asset the pool has never held.
+    pub async fn supply_of(&self, asset_id: AssetId) -> u64 {
+        let supplies = self.supplies.read().await;
+        supplies.get(&asset_id).copied().unwrap_or(0)
+    }
+
+    /// Snapshot every asset's shielded supply (#236). Assets with a zero
+    /// balance are omitted.
+    pub async fn all_supplies(&self) -> HashMap<AssetId, u64> {
+        self.supplies.read().await.clone()
     }
 
     /// Get number of commitments in the pool
@@ -268,7 +317,7 @@ impl Clone for ShieldedPool {
             commitment_tree: self.commitment_tree.clone(),
             nullifier_set: self.nullifier_set.clone(),
             notes: Arc::clone(&self.notes),
-            total_supply: Arc::clone(&self.total_supply),
+            supplies: Arc::clone(&self.supplies),
             storage: self.storage.clone(),
         }
     }
@@ -438,5 +487,38 @@ mod tests {
         let pool = ShieldedPool::new();
         let unknown = Commitment::from_bytes([9u8; 32]);
         assert!(pool.path(&unknown).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn per_asset_supply_is_tracked_independently() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([3u8; 32]);
+        let usdc: AssetId = [9u8; 32];
+
+        // Native SOL via the back-compat path; a second asset via the
+        // asset-aware path. Their supplies must not bleed into each other.
+        pool.deposit(Note::new(addr.clone(), 1000, [1u8; 32]), 1000)
+            .await
+            .unwrap();
+        pool.deposit_asset(Note::new(addr, 500, [2u8; 32]), 500, usdc)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.total_supply().await, 1000);
+        assert_eq!(pool.supply_of(NATIVE_SOL_ASSET).await, 1000);
+        assert_eq!(pool.supply_of(usdc).await, 500);
+        assert_eq!(pool.supply_of([1u8; 32]).await, 0); // never held
+
+        // Withdrawing one asset leaves the other untouched.
+        pool.withdraw_asset(Nullifier([4u8; 32]), 200, &[0u8; 32], usdc)
+            .await
+            .unwrap();
+        assert_eq!(pool.supply_of(usdc).await, 300);
+        assert_eq!(pool.total_supply().await, 1000);
+
+        let all = pool.all_supplies().await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[&NATIVE_SOL_ASSET], 1000);
+        assert_eq!(all[&usdc], 300);
     }
 }
