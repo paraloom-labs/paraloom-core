@@ -17,6 +17,17 @@ fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {
     out
 }
 
+/// Identifies an asset in the multi-asset shielded pool. SPL tokens use
+/// their mint pubkey bytes; native SOL uses the canonical all-zero id
+/// [`NATIVE_SOL_ASSET`]. Note and circuit binding of `asset_id` is tracked
+/// separately (#235); this type is the storage/accounting key (#236).
+pub type AssetId = [u8; 32];
+
+/// Canonical asset id for native SOL — the single asset the pool tracked
+/// before multi-asset support. Persisted under the legacy `total_supply`
+/// key so pools created before #236 load unchanged.
+pub const NATIVE_SOL_ASSET: AssetId = [0u8; 32];
+
 /// A shielded address (z-address) - 32 bytes
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShieldedAddress(pub [u8; 32]);
