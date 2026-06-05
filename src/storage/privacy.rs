@@ -23,10 +23,11 @@
 //! so a missed write costs at most a one-time recomputation rather
 //! than data loss. Documented as such in #59 and preserved here.
 
-use crate::privacy::types::{Commitment, Nullifier};
+use crate::privacy::types::{AssetId, Commitment, Nullifier, NATIVE_SOL_ASSET};
 use anyhow::{anyhow, Result};
 use log::info;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteOptions, DB};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -45,6 +46,21 @@ fn durable_write_options() -> WriteOptions {
 const CF_MERKLE_TREE: &str = "merkle_tree";
 const CF_NULLIFIER_SET: &str = "nullifier_set";
 const CF_POOL_STATE: &str = "pool_state";
+
+/// Key prefix for per-asset shielded supply entries in `CF_POOL_STATE`
+/// (#236). A non-native asset's supply is stored under
+/// `SUPPLY_PREFIX || asset_id` (39 bytes). Native SOL is the exception:
+/// it stays under the legacy `total_supply` key so pools predating
+/// multi-asset support load with no migration.
+const SUPPLY_PREFIX: &[u8] = b"supply:";
+
+/// Build the `CF_POOL_STATE` key for a non-native asset's supply.
+fn asset_supply_key(asset_id: &AssetId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SUPPLY_PREFIX.len() + asset_id.len());
+    key.extend_from_slice(SUPPLY_PREFIX);
+    key.extend_from_slice(asset_id);
+    key
+}
 
 /// Privacy storage using RocksDB column families
 pub struct PrivacyStorage {
@@ -334,6 +350,96 @@ impl PrivacyStorage {
         }
     }
 
+    /// Store the shielded supply of `asset_id` (#236).
+    ///
+    /// Native SOL routes to [`set_total_supply`](Self::set_total_supply) so
+    /// its on-disk key is unchanged; non-native assets are stored under
+    /// `SUPPLY_PREFIX || asset_id`. Durability-critical like the native
+    /// supply — a stale value on restart breaks pool accounting — so the
+    /// non-native path also forces fsync.
+    pub fn set_asset_supply(&self, asset_id: &AssetId, supply: u64) -> Result<()> {
+        if asset_id == &NATIVE_SOL_ASSET {
+            return self.set_total_supply(supply);
+        }
+        let cf = self
+            .db
+            .cf_handle(CF_POOL_STATE)
+            .ok_or_else(|| anyhow!("Pool state CF not found"))?;
+        self.db.put_cf_opt(
+            cf,
+            asset_supply_key(asset_id),
+            supply.to_le_bytes(),
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    /// Get the shielded supply of `asset_id` (#236). Returns 0 for an asset
+    /// the pool has never held.
+    pub fn get_asset_supply(&self, asset_id: &AssetId) -> Result<u64> {
+        if asset_id == &NATIVE_SOL_ASSET {
+            return self.get_total_supply();
+        }
+        let cf = self
+            .db
+            .cf_handle(CF_POOL_STATE)
+            .ok_or_else(|| anyhow!("Pool state CF not found"))?;
+        match self.db.get_cf(cf, asset_supply_key(asset_id))? {
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(anyhow!("Invalid asset supply size"));
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes);
+                Ok(u64::from_le_bytes(arr))
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Load every asset's shielded supply (#236) — native SOL from the
+    /// legacy `total_supply` key plus all non-native assets under the
+    /// `SUPPLY_PREFIX`. Used to rehydrate the pool's per-asset map on
+    /// startup. Zero-valued entries are omitted.
+    pub fn get_all_asset_supplies(&self) -> Result<HashMap<AssetId, u64>> {
+        let cf = self
+            .db
+            .cf_handle(CF_POOL_STATE)
+            .ok_or_else(|| anyhow!("Pool state CF not found"))?;
+
+        let mut supplies = HashMap::new();
+
+        // Native SOL lives under the legacy key, not the prefix.
+        let native = self.get_total_supply()?;
+        if native > 0 {
+            supplies.insert(NATIVE_SOL_ASSET, native);
+        }
+
+        // Non-native assets: scan the `supply:` prefix. The iterator seeks
+        // to the first key >= prefix and runs forward, so stop once a key
+        // no longer carries the prefix.
+        for item in self.db.prefix_iterator_cf(cf, SUPPLY_PREFIX) {
+            let (key, value) = item?;
+            if !key.starts_with(SUPPLY_PREFIX) {
+                break;
+            }
+            let id_bytes = &key[SUPPLY_PREFIX.len()..];
+            if id_bytes.len() != 32 || value.len() != 8 {
+                continue;
+            }
+            let mut asset = [0u8; 32];
+            asset.copy_from_slice(id_bytes);
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&value);
+            let supply = u64::from_le_bytes(arr);
+            if supply > 0 {
+                supplies.insert(asset, supply);
+            }
+        }
+
+        Ok(supplies)
+    }
+
     /// Store Merkle root.
     ///
     /// Intentionally async (no fsync) — the root is a cache that
@@ -467,6 +573,45 @@ mod tests {
 
         storage.set_total_supply(2000).unwrap();
         assert_eq!(storage.get_total_supply().unwrap(), 2000);
+    }
+
+    #[test]
+    fn test_per_asset_supply() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        let usdc: AssetId = [7u8; 32];
+
+        // Unknown assets read as zero.
+        assert_eq!(storage.get_asset_supply(&usdc).unwrap(), 0);
+
+        // Native SOL routes through the legacy total_supply key.
+        storage.set_asset_supply(&NATIVE_SOL_ASSET, 1000).unwrap();
+        assert_eq!(storage.get_total_supply().unwrap(), 1000);
+        assert_eq!(storage.get_asset_supply(&NATIVE_SOL_ASSET).unwrap(), 1000);
+
+        // A non-native asset is stored under its own prefixed key.
+        storage.set_asset_supply(&usdc, 500).unwrap();
+        assert_eq!(storage.get_asset_supply(&usdc).unwrap(), 500);
+
+        // Loading all supplies returns both, keyed by asset.
+        let all = storage.get_all_asset_supplies().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[&NATIVE_SOL_ASSET], 1000);
+        assert_eq!(all[&usdc], 500);
+    }
+
+    #[test]
+    fn test_all_asset_supplies_back_compat() {
+        // A pool persisted before #236 has only the legacy total_supply
+        // key; it must load as the native-SOL supply with no migration.
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+        storage.set_total_supply(4242).unwrap();
+
+        let all = storage.get_all_asset_supplies().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[&NATIVE_SOL_ASSET], 4242);
     }
 
     #[test]
