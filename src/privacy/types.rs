@@ -272,6 +272,30 @@ mod tests {
         assert_eq!(commitment1, commitment2);
     }
 
+    /// Two notes identical in every field EXCEPT `asset_id` must produce
+    /// different commitments (#235). asset_id is the 5th Poseidon input, so
+    /// it is bound into the commitment; without this binding, a note of one
+    /// asset could be replayed as another.
+    #[test]
+    fn note_commitment_differs_with_asset_id() {
+        let addr = ShieldedAddress([5u8; 32]);
+        let amount = 1_000u64;
+        let randomness = [10u8; 32];
+
+        let native = Note::new(addr.clone(), amount, randomness, NATIVE_SOL_ASSET);
+        let other_asset = Note::new(addr.clone(), amount, randomness, [9u8; 32]);
+
+        assert_ne!(
+            native.commitment(),
+            other_asset.commitment(),
+            "notes differing only in asset_id must have distinct commitments"
+        );
+
+        // And the native constructor must agree with the explicit native id.
+        let native_via_helper = Note::new_native(addr, amount, randomness);
+        assert_eq!(native.commitment(), native_via_helper.commitment());
+    }
+
     #[test]
     fn test_merkle_path_verification() {
         let leaf = [1u8; 32];

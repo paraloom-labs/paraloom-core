@@ -863,6 +863,77 @@ mod tests {
         );
     }
 
+    /// Cross-asset transfers must be unsatisfiable (#235). The transfer
+    /// circuit binds ONE shared `asset_id` witness into both the input and
+    /// output commitments, so a prover who consumes a note of asset A cannot
+    /// mint a note of asset B: no single asset_id value can simultaneously
+    /// reproduce an input commitment built under A and an output commitment
+    /// built under B. This is what makes value conservation per-asset rather
+    /// than global.
+    #[test]
+    fn transfer_cross_asset_is_unsatisfiable() {
+        let asset_a = [0xAAu8; 32];
+        let asset_b = [0xBBu8; 32];
+
+        let input_value = 1_000u64;
+        let input_randomness = [4u8; 32];
+        let input_recipient = [7u8; 32];
+        let input_secret = [9u8; 32];
+
+        // Input commitment is built under asset A.
+        let input_commitment_fr = poseidon_commit(
+            Fr::from(input_value),
+            Fr::from_le_bytes_mod_order(&input_randomness),
+            Fr::from_le_bytes_mod_order(&input_recipient),
+            Fr::from_le_bytes_mod_order(&asset_a),
+        );
+        let nullifier_fr = poseidon_nullifier(
+            input_commitment_fr,
+            Fr::from_le_bytes_mod_order(&input_secret),
+        );
+
+        let sibling = [5u8; 32];
+        let sibling_fr = Fr::from_le_bytes_mod_order(&sibling);
+        let merkle_root_fr = poseidon_merkle_pair(input_commitment_fr, sibling_fr);
+
+        // Output commitment is built under asset B — the cross-asset attempt.
+        let output_value = input_value; // balance-preserving, only asset differs
+        let output_randomness = [6u8; 32];
+        let output_recipient = [11u8; 32];
+        let output_commitment_fr = poseidon_commit(
+            Fr::from(output_value),
+            Fr::from_le_bytes_mod_order(&output_randomness),
+            Fr::from_le_bytes_mod_order(&output_recipient),
+            Fr::from_le_bytes_mod_order(&asset_b),
+        );
+
+        // The circuit binds a single shared asset_id. Pick asset A so the
+        // input commitment is reproducible; the asset-B output commitment then
+        // cannot be reproduced, so the circuit is unsatisfiable.
+        let circuit = TransferCircuit::with_witness_asset(
+            fr_to_bytes_32(merkle_root_fr),
+            vec![fr_to_bytes_32(nullifier_fr)],
+            vec![fr_to_bytes_32(output_commitment_fr)],
+            vec![input_value],
+            vec![input_randomness],
+            vec![input_recipient],
+            vec![input_secret],
+            vec![vec![(sibling, true)]],
+            vec![output_value],
+            vec![output_randomness],
+            vec![output_recipient],
+            asset_a,
+        );
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis should succeed");
+        assert!(
+            !cs.is_satisfied().expect("constraint system query"),
+            "a cross-asset transfer (input asset != output asset) must not satisfy the circuit"
+        );
+    }
+
     /// A `None` input path must NOT bypass the Merkle membership check.
     /// With the fail-closed fix, a `None` path forces `commitment == root`,
     /// which fails for any real tree (root != bare leaf). Pre-fix this
