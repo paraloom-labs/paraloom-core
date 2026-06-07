@@ -58,7 +58,7 @@ async fn real_multi_leaf_proof_verifies_through_canonical_verifier() {
         let value = 100_000u64 + i as u64;
         let randomness = [i as u8 + 1; 32];
         let recipient = [i as u8 + 100; 32];
-        let note = Note::new(ShieldedAddress(recipient), value, randomness);
+        let note = Note::new_native(ShieldedAddress(recipient), value, randomness);
         pool.deposit(note, value).await.expect("deposit");
         if i == SPEND {
             spent = Some((value, randomness, recipient));
@@ -71,6 +71,7 @@ async fn real_multi_leaf_proof_verifies_through_canonical_verifier() {
         Fr::from(value),
         Fr::from_le_bytes_mod_order(&randomness),
         Fr::from_le_bytes_mod_order(&recipient),
+        Fr::from(0u64),
     );
     let secret = [7u8; 32];
     let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));

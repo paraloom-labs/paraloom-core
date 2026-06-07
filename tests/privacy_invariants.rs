@@ -29,7 +29,7 @@ proptest! {
     ) {
         let result: Result<(), TestCaseError> = rt().block_on(async {
             let pool = ShieldedPool::new();
-            let note = Note::new(ShieldedAddress(recipient), amount, randomness);
+            let note = Note::new_native(ShieldedAddress(recipient), amount, randomness);
             pool.deposit(note.clone(), amount).await.unwrap();
             prop_assert_eq!(pool.total_supply().await, amount);
 
@@ -70,7 +70,7 @@ proptest! {
     ) {
         let result: Result<(), TestCaseError> = rt().block_on(async {
             let pool = ShieldedPool::new();
-            let note = Note::new(ShieldedAddress(recipient), amount, randomness);
+            let note = Note::new_native(ShieldedAddress(recipient), amount, randomness);
             let commitment = pool.deposit(note, amount).await.unwrap();
             let root = pool.root().await;
             let path = pool.path(&commitment).await.unwrap();

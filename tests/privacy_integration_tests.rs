@@ -7,7 +7,7 @@ async fn test_full_shielded_transaction_flow() {
 
     // Alice deposits 1000 into the pool
     let alice_addr = ShieldedAddress([1u8; 32]);
-    let alice_note = Note::new(alice_addr.clone(), 1000, [10u8; 32]);
+    let alice_note = Note::new_native(alice_addr.clone(), 1000, [10u8; 32]);
     let alice_commitment = pool.deposit(alice_note.clone(), 1000).await.unwrap();
 
     assert_eq!(pool.total_supply().await, 1000);
@@ -15,7 +15,7 @@ async fn test_full_shielded_transaction_flow() {
 
     // Bob also deposits
     let bob_addr = ShieldedAddress([2u8; 32]);
-    let bob_note = Note::new(bob_addr.clone(), 500, [20u8; 32]);
+    let bob_note = Note::new_native(bob_addr.clone(), 500, [20u8; 32]);
     pool.deposit(bob_note, 500).await.unwrap();
 
     assert_eq!(pool.total_supply().await, 1500);
@@ -25,8 +25,8 @@ async fn test_full_shielded_transaction_flow() {
     let alice_spending_key = [100u8; 32];
     let alice_nullifier = Nullifier::derive(&alice_commitment, &alice_spending_key);
 
-    let bob_new_note = Note::new(bob_addr.clone(), 300, [30u8; 32]);
-    let alice_change_note = Note::new(alice_addr, 690, [31u8; 32]); // 1000 - 300 - 10 fee
+    let bob_new_note = Note::new_native(bob_addr.clone(), 300, [30u8; 32]);
+    let alice_change_note = Note::new_native(alice_addr, 690, [31u8; 32]); // 1000 - 300 - 10 fee
 
     let output_commitments = pool
         .transfer(
@@ -59,7 +59,7 @@ async fn test_double_spend_prevention() {
     let pool = ShieldedPool::new();
 
     // Deposit
-    let note = Note::new(ShieldedAddress([1u8; 32]), 1000, [1u8; 32]);
+    let note = Note::new_native(ShieldedAddress([1u8; 32]), 1000, [1u8; 32]);
     let commitment = pool.deposit(note.clone(), 1000).await.unwrap();
 
     // Create nullifier
@@ -67,7 +67,7 @@ async fn test_double_spend_prevention() {
     let nullifier = Nullifier::derive(&commitment, &spending_key);
 
     // First spend - should succeed
-    let output_note = Note::new(ShieldedAddress([2u8; 32]), 900, [2u8; 32]);
+    let output_note = Note::new_native(ShieldedAddress([2u8; 32]), 900, [2u8; 32]);
     pool.transfer(vec![nullifier.clone()], vec![output_note.clone()])
         .await
         .unwrap();
@@ -98,8 +98,8 @@ async fn test_deposit_transaction_creation() {
 async fn test_transfer_transaction_creation() {
     let nullifiers = vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])];
 
-    let note1 = Note::new(ShieldedAddress([10u8; 32]), 500, [1u8; 32]);
-    let note2 = Note::new(ShieldedAddress([20u8; 32]), 490, [2u8; 32]);
+    let note1 = Note::new_native(ShieldedAddress([10u8; 32]), 500, [1u8; 32]);
+    let note2 = Note::new_native(ShieldedAddress([20u8; 32]), 490, [2u8; 32]);
 
     let tx = TransferTx::new(nullifiers, vec![note1, note2], [0u8; 32], 10);
 
@@ -124,7 +124,7 @@ async fn test_withdraw_transaction_creation() {
 #[tokio::test]
 async fn test_verification_chunking() {
     let nullifiers = vec![Nullifier([1u8; 32])];
-    let note = Note::new(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
+    let note = Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
 
     let tx = TransferTx::new(nullifiers, vec![note], [0u8; 32], 10);
 
@@ -155,7 +155,7 @@ async fn test_distributed_verification_coordinator() {
     // This ensures we have enough verification tasks for consensus
     let mut output_notes = vec![];
     for i in 0..7 {
-        output_notes.push(Note::new(
+        output_notes.push(Note::new_native(
             ShieldedAddress([i as u8; 32]),
             100,
             [i as u8; 32],
