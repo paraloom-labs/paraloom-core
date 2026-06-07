@@ -19,8 +19,8 @@ fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {
 
 /// Identifies an asset in the multi-asset shielded pool. SPL tokens use
 /// their mint pubkey bytes; native SOL uses the canonical all-zero id
-/// [`NATIVE_SOL_ASSET`]. Note and circuit binding of `asset_id` is tracked
-/// separately (#235); this type is the storage/accounting key (#236).
+/// [`NATIVE_SOL_ASSET`]. This is both the storage/accounting key (#236) and,
+/// lifted to `Fr`, the 5th note-commitment input bound in every circuit (#235).
 pub type AssetId = [u8; 32];
 
 /// Canonical asset id for native SOL — the single asset the pool tracked
@@ -146,19 +146,35 @@ pub struct Note {
     pub amount: u64,
     /// Random blinding factor
     pub randomness: [u8; 32],
+    /// Asset this note holds. Bound into the commitment as the 5th Poseidon
+    /// input so value conservation is enforced per asset (#235). Native SOL
+    /// uses [`NATIVE_SOL_ASSET`].
+    pub asset_id: AssetId,
     /// Memo (optional encrypted message)
     pub memo: Option<Vec<u8>>,
 }
 
 impl Note {
-    /// Create a new note
-    pub fn new(recipient: ShieldedAddress, amount: u64, randomness: [u8; 32]) -> Self {
+    /// Create a new note for a specific asset.
+    pub fn new(
+        recipient: ShieldedAddress,
+        amount: u64,
+        randomness: [u8; 32],
+        asset_id: AssetId,
+    ) -> Self {
         Note {
             recipient,
             amount,
             randomness,
+            asset_id,
             memo: None,
         }
+    }
+
+    /// Create a native-SOL note (`asset_id == NATIVE_SOL_ASSET`). Convenience
+    /// for callers on the pre-multi-asset native path.
+    pub fn new_native(recipient: ShieldedAddress, amount: u64, randomness: [u8; 32]) -> Self {
+        Note::new(recipient, amount, randomness, NATIVE_SOL_ASSET)
     }
 
     /// Compute commitment for this note.
@@ -169,12 +185,13 @@ impl Note {
     /// 32-byte blobs lifted to `Fr` via modular reduction.
     ///
     /// Argument order to the hash function is fixed as
-    /// `(amount, randomness, recipient)` — callers must not reorder.
+    /// `(amount, randomness, recipient, asset_id)` — callers must not reorder.
     pub fn commitment(&self) -> Commitment {
         let amount_fr = Fr::from(self.amount);
         let randomness_fr = Fr::from_le_bytes_mod_order(&self.randomness);
         let recipient_fr = Fr::from_le_bytes_mod_order(self.recipient.as_bytes());
-        let digest = poseidon_commit(amount_fr, randomness_fr, recipient_fr);
+        let asset_id_fr = Fr::from_le_bytes_mod_order(&self.asset_id);
+        let digest = poseidon_commit(amount_fr, randomness_fr, recipient_fr, asset_id_fr);
         Commitment(fr_to_bytes_32(digest))
     }
 }
@@ -246,7 +263,7 @@ mod tests {
     #[test]
     fn test_note_commitment() {
         let addr = ShieldedAddress([5u8; 32]);
-        let note = Note::new(addr, 1000, [10u8; 32]);
+        let note = Note::new_native(addr, 1000, [10u8; 32]);
 
         let commitment1 = note.commitment();
         let commitment2 = note.commitment();
@@ -428,7 +445,7 @@ mod tests {
             amount in any::<u64>(),
             randomness in any::<[u8; 32]>(),
         ) {
-            let note = Note::new(ShieldedAddress(recipient_bytes), amount, randomness);
+            let note = Note::new_native(ShieldedAddress(recipient_bytes), amount, randomness);
             prop_assert_eq!(note.commitment(), note.commitment());
         }
 
@@ -444,8 +461,8 @@ mod tests {
             randomness in any::<[u8; 32]>(),
         ) {
             prop_assume!(amount_a != amount_b);
-            let note_a = Note::new(ShieldedAddress(recipient_bytes), amount_a, randomness);
-            let note_b = Note::new(ShieldedAddress(recipient_bytes), amount_b, randomness);
+            let note_a = Note::new_native(ShieldedAddress(recipient_bytes), amount_a, randomness);
+            let note_b = Note::new_native(ShieldedAddress(recipient_bytes), amount_b, randomness);
             prop_assert_ne!(note_a.commitment(), note_b.commitment());
         }
 
@@ -461,8 +478,8 @@ mod tests {
             randomness_b in any::<[u8; 32]>(),
         ) {
             prop_assume!(randomness_a != randomness_b);
-            let note_a = Note::new(ShieldedAddress(recipient_bytes), amount, randomness_a);
-            let note_b = Note::new(ShieldedAddress(recipient_bytes), amount, randomness_b);
+            let note_a = Note::new_native(ShieldedAddress(recipient_bytes), amount, randomness_a);
+            let note_b = Note::new_native(ShieldedAddress(recipient_bytes), amount, randomness_b);
             prop_assert_ne!(note_a.commitment(), note_b.commitment());
         }
 

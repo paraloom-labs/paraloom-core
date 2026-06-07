@@ -76,7 +76,7 @@ impl DepositTx {
         fee: u64,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness);
+        let output_note = Note::new_native(recipient, amount - fee, randomness);
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()
@@ -343,8 +343,8 @@ mod tests {
     fn test_transfer_transaction() {
         let nullifiers = vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])];
 
-        let note1 = Note::new(ShieldedAddress([10u8; 32]), 500, [1u8; 32]);
-        let note2 = Note::new(ShieldedAddress([20u8; 32]), 490, [2u8; 32]);
+        let note1 = Note::new_native(ShieldedAddress([10u8; 32]), 500, [1u8; 32]);
+        let note2 = Note::new_native(ShieldedAddress([20u8; 32]), 490, [2u8; 32]);
 
         let tx = TransferTx::new(nullifiers, vec![note1, note2], [0u8; 32], 10);
 
@@ -417,7 +417,7 @@ mod tests {
     fn test_invalid_transfer_structure() {
         let tx = TransferTx::new(
             vec![], // Empty inputs - invalid
-            vec![Note::new(ShieldedAddress([1u8; 32]), 100, [1u8; 32])],
+            vec![Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32])],
             [0u8; 32],
             10,
         );

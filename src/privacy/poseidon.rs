@@ -203,7 +203,7 @@ pub fn poseidon_hash_gadget(
 /// Domain tags — unique, monotonically assigned. Never renumber.
 /// Each is hashed as `Fr::from(TAG)` as the first sponge input.
 pub mod domain {
-    /// Note commitment: `Poseidon(TAG, value, randomness, recipient)`.
+    /// Note commitment: `Poseidon(TAG, value, randomness, recipient, asset_id)`.
     pub const COMMITMENT: u64 = 1;
     /// Nullifier derivation: `Poseidon(TAG, commitment, secret)`.
     pub const NULLIFIER: u64 = 2;
@@ -213,8 +213,19 @@ pub mod domain {
 
 /// Native note commitment. Inputs are field elements; byte-blob callers
 /// must lift via `Fr::from_le_bytes_mod_order` before calling.
-pub fn poseidon_commit(value: Fr, randomness: Fr, recipient: Fr) -> Fr {
-    poseidon_hash_fields(&[Fr::from(domain::COMMITMENT), value, randomness, recipient])
+///
+/// `asset_id` is the 5th sponge input. It binds the note to a specific
+/// asset so per-asset value conservation can be enforced in-circuit.
+/// Native-SOL notes use the sentinel `Fr::from(0)` (see
+/// `Note::new_native` / `NATIVE_SOL_ASSET`).
+pub fn poseidon_commit(value: Fr, randomness: Fr, recipient: Fr, asset_id: Fr) -> Fr {
+    poseidon_hash_fields(&[
+        Fr::from(domain::COMMITMENT),
+        value,
+        randomness,
+        recipient,
+        asset_id,
+    ])
 }
 
 /// Native nullifier derivation.
@@ -235,11 +246,18 @@ pub fn poseidon_commit_gadget(
     value: &FpVar<Fr>,
     randomness: &FpVar<Fr>,
     recipient: &FpVar<Fr>,
+    asset_id: &FpVar<Fr>,
 ) -> Result<FpVar<Fr>, SynthesisError> {
     let tag = FpVar::constant(Fr::from(domain::COMMITMENT));
     poseidon_hash_gadget(
         cs,
-        &[tag, value.clone(), randomness.clone(), recipient.clone()],
+        &[
+            tag,
+            value.clone(),
+            randomness.clone(),
+            recipient.clone(),
+            asset_id.clone(),
+        ],
     )
 }
 
@@ -545,12 +563,13 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────────
 
     /// Evaluate the commitment gadget and extract its field value.
-    fn eval_commit_gadget(value: Fr, randomness: Fr, recipient: Fr) -> Fr {
+    fn eval_commit_gadget(value: Fr, randomness: Fr, recipient: Fr, asset_id: Fr) -> Fr {
         let cs = ConstraintSystem::<Fr>::new_ref();
         let v = FpVar::new_witness(cs.clone(), || Ok(value)).unwrap();
         let r = FpVar::new_witness(cs.clone(), || Ok(randomness)).unwrap();
         let p = FpVar::new_witness(cs.clone(), || Ok(recipient)).unwrap();
-        let out = poseidon_commit_gadget(cs.clone(), &v, &r, &p).unwrap();
+        let a = FpVar::new_witness(cs.clone(), || Ok(asset_id)).unwrap();
+        let out = poseidon_commit_gadget(cs.clone(), &v, &r, &p, &a).unwrap();
         assert!(cs.is_satisfied().unwrap());
         out.value().unwrap()
     }
@@ -577,15 +596,39 @@ mod tests {
 
     #[test]
     fn test_commit_native_matches_circuit() {
+        // (value, randomness, recipient, asset_id) — the 4th column exercises
+        // both the native-SOL sentinel (0) and non-native asset ids, so the
+        // host/gadget parity is checked with asset_id actually varying.
         let cases = [
-            (Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)),
-            (Fr::from(100u64), Fr::from(200u64), Fr::from(300u64)),
-            (Fr::from(u64::MAX), Fr::from(1u64), Fr::from(u64::MAX)),
+            (
+                Fr::from(0u64),
+                Fr::from(0u64),
+                Fr::from(0u64),
+                Fr::from(0u64),
+            ),
+            (
+                Fr::from(100u64),
+                Fr::from(200u64),
+                Fr::from(300u64),
+                Fr::from(0u64),
+            ),
+            (
+                Fr::from(100u64),
+                Fr::from(200u64),
+                Fr::from(300u64),
+                Fr::from(7u64),
+            ),
+            (
+                Fr::from(u64::MAX),
+                Fr::from(1u64),
+                Fr::from(u64::MAX),
+                Fr::from(u64::MAX),
+            ),
         ];
-        for (v, r, p) in cases {
-            let native = poseidon_commit(v, r, p);
-            let circuit = eval_commit_gadget(v, r, p);
-            assert_eq!(native, circuit, "commit drift: v={v}, r={r}, p={p}");
+        for (v, r, p, a) in cases {
+            let native = poseidon_commit(v, r, p, a);
+            let circuit = eval_commit_gadget(v, r, p, a);
+            assert_eq!(native, circuit, "commit drift: v={v}, r={r}, p={p}, a={a}");
         }
     }
 
@@ -628,7 +671,7 @@ mod tests {
 
         // Keep arity the same across domains by passing a filler field
         // element to commit, so the only difference is the domain tag.
-        let h_commit = poseidon_commit(Fr::from(0u64), a, b);
+        let h_commit = poseidon_commit(Fr::from(0u64), a, b, Fr::from(0u64));
         let h_nullifier = poseidon_nullifier(a, b);
         let h_merkle = poseidon_merkle_pair(a, b);
 

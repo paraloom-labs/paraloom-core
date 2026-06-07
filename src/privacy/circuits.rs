@@ -85,6 +85,12 @@ pub struct TransferCircuit {
     pub output_values: Vec<Option<u64>>,
     pub output_randomness: Vec<Option<[u8; 32]>>,
     pub recipient_addresses: Vec<Option<[u8; 32]>>,
+    /// Asset id bound into every input AND output commitment as a single
+    /// shared witness (#235). One value across both sides means the
+    /// `sum_inputs == sum_outputs` constraint is automatically per-asset:
+    /// you cannot consume asset A and mint asset B. Native SOL uses
+    /// `NATIVE_SOL_ASSET` (all-zero).
+    pub asset_id: Option<[u8; 32]>,
 }
 
 impl TransferCircuit {
@@ -105,10 +111,13 @@ impl TransferCircuit {
             output_values: vec![None; num_outputs],
             output_randomness: vec![None; num_outputs],
             recipient_addresses: vec![None; num_outputs],
+            asset_id: None,
         }
     }
 
-    /// Create circuit with witness data for proving
+    /// Create a native-SOL transfer circuit with witness data for proving.
+    /// Binds `asset_id = NATIVE_SOL_ASSET` (all-zero) into every commitment,
+    /// preserving the pre-multi-asset call signature.
     #[allow(clippy::too_many_arguments)]
     pub fn with_witness(
         merkle_root: [u8; 32],
@@ -123,6 +132,38 @@ impl TransferCircuit {
         output_randomness: Vec<[u8; 32]>,
         recipient_addresses: Vec<[u8; 32]>,
     ) -> Self {
+        Self::with_witness_asset(
+            merkle_root,
+            nullifiers,
+            output_commitments,
+            input_values,
+            input_randomness,
+            input_recipients,
+            input_secrets,
+            input_paths,
+            output_values,
+            output_randomness,
+            recipient_addresses,
+            crate::privacy::types::NATIVE_SOL_ASSET,
+        )
+    }
+
+    /// Create a transfer circuit bound to a specific `asset_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_witness_asset(
+        merkle_root: [u8; 32],
+        nullifiers: Vec<[u8; 32]>,
+        output_commitments: Vec<[u8; 32]>,
+        input_values: Vec<u64>,
+        input_randomness: Vec<[u8; 32]>,
+        input_recipients: Vec<[u8; 32]>,
+        input_secrets: Vec<[u8; 32]>,
+        input_paths: Vec<Vec<([u8; 32], bool)>>,
+        output_values: Vec<u64>,
+        output_randomness: Vec<[u8; 32]>,
+        recipient_addresses: Vec<[u8; 32]>,
+        asset_id: [u8; 32],
+    ) -> Self {
         TransferCircuit {
             merkle_root: Some(merkle_root),
             nullifiers: nullifiers.into_iter().map(Some).collect(),
@@ -135,6 +176,7 @@ impl TransferCircuit {
             output_values: output_values.into_iter().map(Some).collect(),
             output_randomness: output_randomness.into_iter().map(Some).collect(),
             recipient_addresses: recipient_addresses.into_iter().map(Some).collect(),
+            asset_id: Some(asset_id),
         }
     }
 }
@@ -220,6 +262,19 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
             input_secret_vars.push(secret_var);
         }
 
+        // Single shared asset_id witness, fed into every input AND output
+        // commitment below. Because it is the same variable on both sides,
+        // the `sum_inputs == sum_outputs` balance check (CONSTRAINT 1) is
+        // automatically per-asset: a prover cannot satisfy the input
+        // commitments with asset A and the output commitments with asset B,
+        // so asset A can never be transmuted into asset B (#235).
+        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .asset_id
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+
         // Range-constrain every output value to `[0, 2^64)`. With
         // both sides bounded, the existing `sum_inputs == sum_outputs`
         // equality holds in the integers as well as in the field —
@@ -275,8 +330,13 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
             .zip(input_randomness_vars.iter())
             .zip(input_recipient_vars.iter())
         {
-            let commitment =
-                poseidon_commit_gadget(cs.clone(), value_var, randomness_var, recipient_var)?;
+            let commitment = poseidon_commit_gadget(
+                cs.clone(),
+                value_var,
+                randomness_var,
+                recipient_var,
+                &asset_id_var,
+            )?;
             input_commitment_vars.push(commitment);
         }
 
@@ -345,6 +405,7 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
                 &output_value_vars[i],
                 &output_randomness_vars[i],
                 &recipient_address_vars[i],
+                &asset_id_var,
             )?;
             computed_commitment.enforce_equal(&output_commitment_vars[i])?;
         }
@@ -441,14 +502,22 @@ impl ConstraintSynthesizer<Fr> for DepositCircuit {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
-        // Constraint: commitment_var == Poseidon(TAG, value, randomness, recipient)
+        // Constraint: commitment_var == Poseidon(TAG, value, randomness, recipient, asset_id)
         //
         // Uses the domain-separated gadget that mirrors `poseidon_commit`
         // on the host side one-for-one. The input argument order
-        // (value, randomness, recipient) is fixed and must stay aligned
-        // with the host helper.
-        let computed_commitment =
-            poseidon_commit_gadget(cs, &value_var, &randomness_var, &recipient_var)?;
+        // (value, randomness, recipient, asset_id) is fixed and must stay
+        // aligned with the host helper. Deposits bind the native-SOL
+        // sentinel asset_id (all-zero); promoting deposit asset_id to a
+        // public input + on-chain vault enforcement is #237's scope.
+        let asset_id_var = FpVar::constant(Fr::from(0u64));
+        let computed_commitment = poseidon_commit_gadget(
+            cs,
+            &value_var,
+            &randomness_var,
+            &recipient_var,
+            &asset_id_var,
+        )?;
         computed_commitment.enforce_equal(&commitment_var)?;
 
         Ok(())
@@ -602,11 +671,17 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         // same three-argument formula that `DepositCircuit` and host-side
         // `Note::commitment` use, so any note created by a deposit can be
         // located here.
+        // Withdrawals bind the native-SOL sentinel asset_id (all-zero),
+        // matching how deposits mint native notes. Per-asset withdrawal
+        // (promoting asset_id to a public input + on-chain vault check) is
+        // #237's scope.
+        let asset_id_var = FpVar::constant(Fr::from(0u64));
         let commitment = poseidon_commit_gadget(
             cs.clone(),
             &input_value_var,
             &input_randomness_var,
             &input_recipient_var,
+            &asset_id_var,
         )?;
 
         let mut current_hash = commitment.clone();
@@ -736,6 +811,7 @@ mod tests {
             Fr::from(input_value),
             Fr::from_le_bytes_mod_order(&input_randomness),
             Fr::from_le_bytes_mod_order(&input_recipient),
+            Fr::from(0u64),
         );
 
         // Nullifier: matches `Nullifier::derive(commitment, secret)`.
@@ -759,6 +835,7 @@ mod tests {
             Fr::from(output_value),
             Fr::from_le_bytes_mod_order(&output_randomness),
             Fr::from_le_bytes_mod_order(&output_recipient),
+            Fr::from(0u64),
         );
         let output_commitment_bytes = fr_to_bytes_32(output_commitment_fr);
 
@@ -801,6 +878,7 @@ mod tests {
             Fr::from(input_value),
             Fr::from_le_bytes_mod_order(&input_randomness),
             Fr::from_le_bytes_mod_order(&input_recipient),
+            Fr::from(0u64),
         );
         let nullifier_fr = poseidon_nullifier(
             input_commitment_fr,
@@ -819,6 +897,7 @@ mod tests {
             Fr::from(output_value),
             Fr::from_le_bytes_mod_order(&output_randomness),
             Fr::from_le_bytes_mod_order(&output_recipient),
+            Fr::from(0u64),
         );
 
         // Build the circuit directly with a `None` input path — the footgun.
@@ -834,6 +913,7 @@ mod tests {
             output_values: vec![Some(output_value)],
             output_randomness: vec![Some(output_randomness)],
             recipient_addresses: vec![Some(output_recipient)],
+            asset_id: Some(crate::privacy::types::NATIVE_SOL_ASSET),
         };
         let cs = ConstraintSystem::<Fr>::new_ref();
         circuit
@@ -880,6 +960,7 @@ mod tests {
             Fr::from(input_value),
             Fr::from_le_bytes_mod_order(&input_randomness),
             Fr::from_le_bytes_mod_order(&input_recipient),
+            Fr::from(0u64),
         );
         let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
 
@@ -927,6 +1008,7 @@ mod tests {
             Fr::from(input_value),
             Fr::from_le_bytes_mod_order(&input_randomness),
             Fr::from_le_bytes_mod_order(&input_recipient),
+            Fr::from(0u64),
         );
         let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
         let sibling = [4u8; 32];
@@ -982,6 +1064,7 @@ mod tests {
                 Fr::from(input_value),
                 Fr::from_le_bytes_mod_order(&input_randomness),
                 Fr::from_le_bytes_mod_order(&input_recipient),
+                Fr::from(0u64),
             );
             let nullifier_fr =
                 poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
@@ -1044,6 +1127,7 @@ mod tests {
             Fr::from(value),
             Fr::from_le_bytes_mod_order(&randomness),
             Fr::from_le_bytes_mod_order(&recipient),
+            Fr::from(0u64),
         );
         let commitment_bytes = fr_to_bytes_32(commitment_fr);
 
@@ -1080,6 +1164,7 @@ mod tests {
             Fr::from(alice_amount),
             Fr::from_le_bytes_mod_order(&alice_randomness),
             Fr::from_le_bytes_mod_order(&alice_address),
+            Fr::from(0u64),
         );
         let alice_commitment_bytes = fr_to_bytes_32(alice_commitment_fr);
 
@@ -1118,6 +1203,7 @@ mod tests {
             Fr::from(bob_amount),
             Fr::from_le_bytes_mod_order(&bob_randomness),
             Fr::from_le_bytes_mod_order(&bob_address),
+            Fr::from(0u64),
         );
         let bob_commitment_bytes = fr_to_bytes_32(bob_commitment_fr);
 

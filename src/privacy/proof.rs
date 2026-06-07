@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn test_verification_chunks_creation() {
         let nullifiers = vec![Nullifier([1u8; 32])];
-        let note = Note::new(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
+        let note = Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
 
         let tx = TransferTx::new(nullifiers, vec![note], [0u8; 32], 10);
 

@@ -115,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn returns_path_for_known_commitment() {
         let pool = Arc::new(ShieldedPool::new());
-        let note = Note::new(ShieldedAddress([3u8; 32]), 100, [1u8; 32]);
+        let note = Note::new_native(ShieldedAddress([3u8; 32]), 100, [1u8; 32]);
         let commitment = pool.deposit(note, 100).await.unwrap();
 
         let app = router(pool);

@@ -546,7 +546,7 @@ impl PrivateJobCoordinator {
         let randomness = crate::privacy::pedersen::generate_randomness();
         let amount = job.encrypted_input.len() as u64; // Use size as "amount"
 
-        let note = Note::new(job.owner_address, amount, randomness);
+        let note = Note::new_native(job.owner_address, amount, randomness);
 
         // Deposit into shielded pool
         self.pool.deposit(note.clone(), amount).await?;

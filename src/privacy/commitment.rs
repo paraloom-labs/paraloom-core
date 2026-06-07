@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn test_note_commitment() {
         let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new(addr, 1000, [42u8; 32]);
+        let note = Note::new_native(addr, 1000, [42u8; 32]);
 
         let c1 = CommitmentGenerator::commit_note(&note);
         let c2 = note.commitment();

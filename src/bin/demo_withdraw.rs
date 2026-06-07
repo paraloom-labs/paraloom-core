@@ -57,6 +57,7 @@ fn main() {
         Fr::from(value),
         Fr::from_le_bytes_mod_order(&randomness),
         Fr::from_le_bytes_mod_order(&recipient),
+        Fr::from(0u64),
     );
 
     let mode = std::env::args().nth(1).unwrap_or_default();
