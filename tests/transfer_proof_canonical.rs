@@ -49,6 +49,7 @@ async fn spend_parts(
         Fr::from(value),
         Fr::from_le_bytes_mod_order(&randomness),
         Fr::from_le_bytes_mod_order(&recipient),
+        Fr::from(0u64),
     );
     let nullifier_fr = poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
     let commitment = Commitment::from_bytes(fr_to_le_bytes_32(commitment_fr));
@@ -87,7 +88,7 @@ async fn real_two_in_two_out_transfer_verifies_through_canonical_verifier() {
         let randomness = [i as u8 + 1; 32];
         let recipient = [i as u8 + 100; 32];
         pool.deposit(
-            Note::new(ShieldedAddress(recipient), value, randomness),
+            Note::new_native(ShieldedAddress(recipient), value, randomness),
             value,
         )
         .await
@@ -116,11 +117,13 @@ async fn real_two_in_two_out_transfer_verifies_through_canonical_verifier() {
         Fr::from(out_total),
         Fr::from_le_bytes_mod_order(&out_rand0),
         Fr::from_le_bytes_mod_order(&out_rec0),
+        Fr::from(0u64),
     ));
     let commit_out1 = fr_to_le_bytes_32(poseidon_commit(
         Fr::from(0u64),
         Fr::from_le_bytes_mod_order(&out_rand1),
         Fr::from_le_bytes_mod_order(&out_rec1),
+        Fr::from(0u64),
     ));
 
     let circuit = TransferCircuit::with_witness(

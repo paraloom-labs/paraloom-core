@@ -269,6 +269,7 @@ mod tests {
             Fr::from(value),
             Fr::from_le_bytes_mod_order(&randomness),
             Fr::from_le_bytes_mod_order(&recipient),
+            Fr::from(0u64),
         );
         let bytes = commitment_fr.into_bigint().to_bytes_le();
         let mut commitment = [0u8; 32];

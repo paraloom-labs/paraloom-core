@@ -484,7 +484,7 @@ mod tests {
         // Create transfer transaction
         let tx = ShieldedTransaction::Transfer(TransferTx::new(
             vec![Nullifier([1u8; 32])],
-            vec![Note::new(ShieldedAddress([1u8; 32]), 100, [1u8; 32])],
+            vec![Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32])],
             [0u8; 32],
             10,
         ));

@@ -45,7 +45,7 @@ async fn test_deposit_transfer_withdraw_flow() {
     let alice_nullifier = Nullifier::derive(&alice_note.commitment(), &alice_rand);
     let bob_addr = ShieldedAddress([0xBB; 32]);
     let bob_rand = pedersen::generate_randomness();
-    let bob_note = Note::new(bob_addr, net_deposit, bob_rand);
+    let bob_note = Note::new_native(bob_addr, net_deposit, bob_rand);
     let transfer_tx = TransferTx::new(
         vec![alice_nullifier.clone()],
         vec![bob_note.clone()],

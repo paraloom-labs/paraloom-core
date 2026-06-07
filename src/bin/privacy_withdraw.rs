@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fee = 500;
 
     let recipient_address = ShieldedAddress::from_bytes(shielded_address);
-    let note = Note::new(recipient_address.clone(), amount, randomness);
+    let note = Note::new_native(recipient_address.clone(), amount, randomness);
     let commitment = note.commitment();
 
     println!("Shielded Address: {}", recipient_address.to_hex());

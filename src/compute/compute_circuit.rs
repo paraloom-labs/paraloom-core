@@ -50,7 +50,7 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{Proof, ProvingKey, VerifyingKey};
-use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar};
+use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
@@ -178,14 +178,15 @@ impl ComputeCircuit {
     }
 
     /// Host-side commitment used by the privacy layer's `Note` shape:
-    /// `Poseidon(COMMITMENT_TAG, data_hash, randomness, owner)`.
+    /// `Poseidon(COMMITMENT_TAG, data_hash, randomness, owner, asset_id)`.
     /// Mirrors `Note::commitment` exactly so a note minted by a
     /// compute job is interchangeable with one minted by a deposit.
+    /// Compute notes are native-SOL (sentinel asset_id, all-zero).
     pub fn compute_commitment(data_hash: Fr, randomness: &[u8; 32], owner: &[u8; 32]) -> Fr {
         use crate::privacy::poseidon::poseidon_commit;
         let r = Fr::from_le_bytes_mod_order(randomness);
         let o = Fr::from_le_bytes_mod_order(owner);
-        poseidon_commit(data_hash, r, o)
+        poseidon_commit(data_hash, r, o, Fr::from(0u64))
     }
 
     /// Host-side nullifier matching the shielded-pool spend pattern:
@@ -279,11 +280,16 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
         // commitment with `Note::commitment` makes notes
         // interchangeable across the deposit / transfer / compute
         // paths.
+        // Compute notes are native-SOL: bind the sentinel asset_id (all-zero)
+        // as the 5th commitment input, matching `compute_commitment` and the
+        // deposit/withdraw native path (#235).
+        let asset_id_var = FpVar::constant(Fr::from(0u64));
         let computed_input_commitment = poseidon_commit_gadget(
             cs.clone(),
             &input_hash_var,
             &input_randomness_var,
             &owner_address_var,
+            &asset_id_var,
         )?;
         computed_input_commitment.enforce_equal(&input_commitment_var)?;
 
@@ -296,6 +302,7 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
             &output_hash_var,
             &output_randomness_var,
             &owner_address_var,
+            &asset_id_var,
         )?;
         computed_output_commitment.enforce_equal(&output_commitment_var)?;
 

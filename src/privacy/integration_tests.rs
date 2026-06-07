@@ -101,8 +101,8 @@ mod tests {
         let bob_randomness = pedersen::generate_randomness();
         let alice_change_randomness = pedersen::generate_randomness();
 
-        let bob_note = Note::new(bob_address.clone(), transfer_amount, bob_randomness);
-        let alice_change_note = Note::new(
+        let bob_note = Note::new_native(bob_address.clone(), transfer_amount, bob_randomness);
+        let alice_change_note = Note::new_native(
             alice_address.clone(),
             change_amount,
             alice_change_randomness,
@@ -242,8 +242,9 @@ mod tests {
         let bob_randomness = pedersen::generate_randomness();
         let alice_change_randomness = pedersen::generate_randomness();
 
-        let bob_note = Note::new(bob_address.clone(), 300, bob_randomness);
-        let alice_change_note = Note::new(alice_address.clone(), 680, alice_change_randomness);
+        let bob_note = Note::new_native(bob_address.clone(), 300, bob_randomness);
+        let alice_change_note =
+            Note::new_native(alice_address.clone(), 680, alice_change_randomness);
 
         pool.transfer(
             vec![alice_nullifier],
@@ -265,8 +266,8 @@ mod tests {
         let charlie_randomness = pedersen::generate_randomness();
         let bob_change_randomness = pedersen::generate_randomness();
 
-        let charlie_note = Note::new(charlie_address.clone(), 100, charlie_randomness);
-        let bob_change_note = Note::new(bob_address.clone(), 190, bob_change_randomness);
+        let charlie_note = Note::new_native(charlie_address.clone(), 100, charlie_randomness);
+        let bob_change_note = Note::new_native(bob_address.clone(), 190, bob_change_randomness);
 
         pool.transfer(
             vec![bob_nullifier],
@@ -327,7 +328,7 @@ mod tests {
 
         // First spend - should succeed
         let nullifier = Nullifier::derive(&note.commitment(), &randomness);
-        let output_note = Note::new(address.clone(), 990, pedersen::generate_randomness());
+        let output_note = Note::new_native(address.clone(), 990, pedersen::generate_randomness());
 
         let result = pool
             .transfer(vec![nullifier.clone()], vec![output_note])
@@ -336,7 +337,7 @@ mod tests {
         println!("First spend succeeded");
 
         // Try to spend again - should fail
-        let output_note2 = Note::new(address.clone(), 990, pedersen::generate_randomness());
+        let output_note2 = Note::new_native(address.clone(), 990, pedersen::generate_randomness());
         let result2 = pool
             .transfer(vec![nullifier.clone()], vec![output_note2])
             .await;

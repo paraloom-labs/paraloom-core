@@ -332,7 +332,7 @@ mod tests {
     async fn test_shielded_pool_deposit() {
         let pool = ShieldedPool::new();
         let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new(addr, 1000, [42u8; 32]);
+        let note = Note::new_native(addr, 1000, [42u8; 32]);
 
         let commitment = pool.deposit(note, 1000).await.unwrap();
 
@@ -352,8 +352,8 @@ mod tests {
         // Create output notes
         let addr1 = ShieldedAddress([10u8; 32]);
         let addr2 = ShieldedAddress([20u8; 32]);
-        let note1 = Note::new(addr1, 500, [1u8; 32]);
-        let note2 = Note::new(addr2, 500, [2u8; 32]);
+        let note1 = Note::new_native(addr1, 500, [1u8; 32]);
+        let note2 = Note::new_native(addr2, 500, [2u8; 32]);
 
         // Process transfer
         let outputs = pool
@@ -372,7 +372,7 @@ mod tests {
 
         let nullifier = Nullifier([1u8; 32]);
         let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new(addr, 100, [1u8; 32]);
+        let note = Note::new_native(addr, 100, [1u8; 32]);
 
         // First transfer succeeds
         pool.transfer(vec![nullifier.clone()], vec![note.clone()])
@@ -390,7 +390,7 @@ mod tests {
 
         // Deposit first
         let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new(addr, 1000, [1u8; 32]);
+        let note = Note::new_native(addr, 1000, [1u8; 32]);
         pool.deposit(note, 1000).await.unwrap();
 
         // Withdraw
@@ -414,7 +414,7 @@ mod tests {
 
         // Deposit 1000
         let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new(addr, 1000, [1u8; 32]);
+        let note = Note::new_native(addr, 1000, [1u8; 32]);
         pool.deposit(note, 1000).await.unwrap();
 
         // Try to withdraw more than available
@@ -431,8 +431,8 @@ mod tests {
 
         // Add some commitments and nullifiers
         let addr = ShieldedAddress([1u8; 32]);
-        let note1 = Note::new(addr.clone(), 100, [1u8; 32]);
-        let note2 = Note::new(addr, 200, [2u8; 32]);
+        let note1 = Note::new_native(addr.clone(), 100, [1u8; 32]);
+        let note2 = Note::new_native(addr, 200, [2u8; 32]);
 
         pool.deposit(note1.clone(), 100).await.unwrap();
         pool.deposit(note2, 200).await.unwrap();
@@ -452,7 +452,7 @@ mod tests {
 
         // Add commitment - root should change
         let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new(addr, 100, [1u8; 32]);
+        let note = Note::new_native(addr, 100, [1u8; 32]);
         pool.deposit(note, 100).await.unwrap();
 
         let root2 = pool.root().await;
@@ -464,8 +464,8 @@ mod tests {
         let pool = ShieldedPool::new();
         let addr = ShieldedAddress([7u8; 32]);
 
-        let note_a = Note::new(addr.clone(), 100, [1u8; 32]);
-        let note_b = Note::new(addr, 200, [2u8; 32]);
+        let note_a = Note::new_native(addr.clone(), 100, [1u8; 32]);
+        let note_b = Note::new_native(addr, 200, [2u8; 32]);
         let commitment_a = pool.deposit(note_a, 100).await.unwrap();
         let commitment_b = pool.deposit(note_b, 200).await.unwrap();
 
@@ -497,10 +497,10 @@ mod tests {
 
         // Native SOL via the back-compat path; a second asset via the
         // asset-aware path. Their supplies must not bleed into each other.
-        pool.deposit(Note::new(addr.clone(), 1000, [1u8; 32]), 1000)
+        pool.deposit(Note::new_native(addr.clone(), 1000, [1u8; 32]), 1000)
             .await
             .unwrap();
-        pool.deposit_asset(Note::new(addr, 500, [2u8; 32]), 500, usdc)
+        pool.deposit_asset(Note::new(addr, 500, [2u8; 32], usdc), 500, usdc)
             .await
             .unwrap();
 
