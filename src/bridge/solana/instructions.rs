@@ -77,6 +77,51 @@ pub mod discriminators {
     pub const INITIALIZE_VALIDATOR_REGISTRY: [u8; 8] = [168, 49, 128, 236, 25, 7, 168, 85];
     /// `sha256("global:register_validator")[..8]`.
     pub const REGISTER_VALIDATOR: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
+    /// `sha256("global:deposit_spl")[..8]` (#237). Asset-aware deposit of an
+    /// SPL token into a per-asset vault keyed by the mint.
+    pub const DEPOSIT_SPL: [u8; 8] = [224, 0, 198, 175, 198, 47, 105, 204];
+    /// `sha256("global:withdraw_spl")[..8]` (#237). Asset-aware withdrawal of an
+    /// SPL token from its per-asset vault.
+    pub const WITHDRAW_SPL: [u8; 8] = [181, 154, 94, 86, 62, 115, 6, 186];
+}
+
+/// SPL Token program id (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the
+/// classic v1 token program the on-chain `anchor_spl::token::Token` resolves
+/// to. Defined here as a constant so the off-chain SPL builders need no
+/// `spl-token` dependency.
+pub const SPL_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+]);
+
+/// Associated Token Account program id
+/// (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`). Used to derive the
+/// canonical ATA for an owner + mint without a `spl-associated-token-account`
+/// dependency.
+pub const SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131, 11, 90, 19, 153, 218,
+    255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
+]);
+
+/// Instruction data for `deposit_spl` (#237). Wire-identical to the native
+/// [`DepositInstructionData`] — the on-chain `deposit_spl` takes the same
+/// `(amount, recipient, randomness)` tuple; only the value-movement differs.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DepositSplInstructionData {
+    pub amount: u64,
+    pub recipient: [u8; 32],
+    pub randomness: [u8; 32],
+}
+
+/// Instruction data for `withdraw_spl` (#237). Wire-identical to the native
+/// [`WithdrawInstructionData`]; the mint is passed as an account, not in the
+/// payload.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WithdrawSplInstructionData {
+    pub nullifier: [u8; 32],
+    pub amount: u64,
+    pub expiration_slot: u64,
+    pub proof: Vec<u8>,
 }
 
 /// Create initialize instruction.
@@ -420,6 +465,155 @@ pub fn derive_nullifier_account(program_id: &Pubkey, nullifier: &[u8; 32]) -> (P
     Pubkey::find_program_address(&[b"nullifier", nullifier.as_ref()], program_id)
 }
 
+/// Derive the program PDA that owns every per-asset vault
+/// (`seeds = [b"asset_vault_authority"]`). One authority signs releases from
+/// all asset vaults on the SPL withdraw path.
+pub fn derive_asset_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_vault_authority"], program_id)
+}
+
+/// Derive the per-asset vault token account PDA for `mint`
+/// (`seeds = [b"asset_vault", mint]`). Custody for one SPL asset.
+pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
+}
+
+/// Derive the canonical Associated Token Account address for `owner` + `mint`,
+/// mirroring `spl_associated_token_account::get_associated_token_address`
+/// without the dependency: it is the PDA of
+/// `[owner, SPL_TOKEN_PROGRAM_ID, mint]` under the ATA program.
+pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), SPL_TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+    )
+    .0
+}
+
+/// Build an idempotent "create associated token account" instruction (the
+/// ATA program's `CreateIdempotent`, discriminator byte `1`). `payer` funds the
+/// new account; `owner` will own it; it holds `mint`. Idempotent so re-running
+/// against an existing ATA is a no-op rather than an error — handy in a demo
+/// that may re-create the fresh address's token account.
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        // `1` = CreateIdempotent (vs. `0` = Create).
+        data: vec![1],
+    }
+}
+
+/// Create a `deposit_spl` instruction (#237): move `amount` of `mint` from the
+/// depositor's `depositor_token` account into the program's per-asset vault,
+/// emitting a shielded note for `recipient`/`randomness`. The account order
+/// matches the on-chain `DepositSpl` accounts struct exactly: bridge_state,
+/// mint, asset_vault_authority, asset_vault, depositor_token, depositor
+/// (signer), token_program, system_program, rent.
+pub fn create_deposit_spl_instruction(
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    mint: &Pubkey,
+    depositor_token: &Pubkey,
+    amount: u64,
+    recipient: [u8; 32],
+    randomness: [u8; 32],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
+    let (asset_vault, _) = derive_asset_vault(program_id, mint);
+
+    let data = DepositSplInstructionData {
+        amount,
+        recipient,
+        randomness,
+    };
+    let mut instruction_data = discriminators::DEPOSIT_SPL.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(asset_vault_authority, false),
+            AccountMeta::new(asset_vault, false),
+            AccountMeta::new(*depositor_token, false),
+            AccountMeta::new(*depositor, true),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create a `withdraw_spl` instruction (#237): release `amount` of `mint` from
+/// its per-asset vault to `recipient_token`, spending `nullifier`. The account
+/// order matches the on-chain `WithdrawSpl` accounts struct exactly:
+/// bridge_state, mint, asset_vault_authority, asset_vault, nullifier_account,
+/// recipient_token, validator_account, authority (signer), token_program,
+/// system_program.
+#[allow(clippy::too_many_arguments)]
+pub fn create_withdraw_spl_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    recipient_token: &Pubkey,
+    nullifier: [u8; 32],
+    amount: u64,
+    expiration_slot: u64,
+    proof: Vec<u8>,
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
+    let (asset_vault, _) = derive_asset_vault(program_id, mint);
+    let (nullifier_pda, _) = derive_nullifier_account(program_id, &nullifier);
+    let (validator_pda, _) = derive_validator_account(program_id, authority);
+
+    let data = WithdrawSplInstructionData {
+        nullifier,
+        amount,
+        expiration_slot,
+        proof,
+    };
+    let mut instruction_data = discriminators::WITHDRAW_SPL.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(asset_vault_authority, false),
+            AccountMeta::new(asset_vault, false),
+            AccountMeta::new(nullifier_pda, false),
+            AccountMeta::new(*recipient_token, false),
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: instruction_data,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +771,102 @@ mod tests {
         assert_eq!(ix.accounts[2].pubkey, n1);
         // The wire payload is prefixed with the Anchor discriminator.
         assert_eq!(&ix.data[..8], &discriminators::SHIELDED_TRANSFER);
+    }
+
+    #[test]
+    fn test_create_deposit_spl_instruction() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor_token = Pubkey::new_unique();
+
+        let ix = create_deposit_spl_instruction(
+            &program_id,
+            &depositor,
+            &mint,
+            &depositor_token,
+            500,
+            [7u8; 32],
+            [9u8; 32],
+        )
+        .expect("builder");
+
+        assert_eq!(ix.program_id, program_id);
+        // bridge_state, mint, asset_vault_authority, asset_vault,
+        // depositor_token, depositor (signer), token_program, system_program,
+        // rent — exactly the on-chain `DepositSpl` order.
+        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
+        assert_eq!(ix.accounts[1].pubkey, mint);
+        assert_eq!(
+            ix.accounts[2].pubkey,
+            derive_asset_vault_authority(&program_id).0
+        );
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_asset_vault(&program_id, &mint).0
+        );
+        assert_eq!(ix.accounts[4].pubkey, depositor_token);
+        assert!(ix.accounts[5].is_signer);
+        assert_eq!(ix.accounts[6].pubkey, SPL_TOKEN_PROGRAM_ID);
+        assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_SPL);
+    }
+
+    #[test]
+    fn test_create_withdraw_spl_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let recipient_token = Pubkey::new_unique();
+        let nullifier = [1u8; 32];
+
+        let ix = create_withdraw_spl_instruction(
+            &program_id,
+            &authority,
+            &mint,
+            &recipient_token,
+            nullifier,
+            1000,
+            u64::MAX,
+            vec![0u8; 100],
+        )
+        .expect("builder");
+
+        assert_eq!(ix.program_id, program_id);
+        // bridge_state, mint, asset_vault_authority, asset_vault,
+        // nullifier_account, recipient_token, validator_account, authority
+        // (signer), token_program, system_program.
+        assert_eq!(ix.accounts.len(), 10);
+        assert_eq!(ix.accounts[1].pubkey, mint);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_asset_vault(&program_id, &mint).0
+        );
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_nullifier_account(&program_id, &nullifier).0
+        );
+        assert_eq!(ix.accounts[5].pubkey, recipient_token);
+        assert_eq!(
+            ix.accounts[6].pubkey,
+            derive_validator_account(&program_id, &authority).0
+        );
+        assert!(ix.accounts[7].is_signer);
+        assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_SPL);
+    }
+
+    #[test]
+    fn test_associated_token_address_is_deterministic() {
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let a = derive_associated_token_address(&owner, &mint);
+        let b = derive_associated_token_address(&owner, &mint);
+        assert_eq!(a, b);
+        // Different owners yield different ATAs.
+        assert_ne!(
+            a,
+            derive_associated_token_address(&Pubkey::new_unique(), &mint)
+        );
     }
 
     /// Round-trip the transfer payload through borsh to pin the wire format

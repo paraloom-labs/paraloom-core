@@ -11,12 +11,17 @@ mod submitter;
 mod test_support;
 
 pub use instructions::{
-    create_deposit_instruction, create_initialize_instruction,
+    create_associated_token_account_idempotent_instruction, create_deposit_instruction,
+    create_deposit_spl_instruction, create_initialize_instruction,
     create_initialize_validator_registry_instruction, create_register_validator_instruction,
     create_set_bridge_authority_instruction, create_shielded_transfer_instruction,
-    create_update_merkle_root_instruction, create_withdraw_instruction, derive_bridge_state,
-    derive_bridge_vault, derive_nullifier_account, derive_program_data, derive_validator_account,
-    derive_validator_registry, DepositInstructionData, ShieldedTransferInstructionData,
+    create_update_merkle_root_instruction, create_withdraw_instruction,
+    create_withdraw_spl_instruction, derive_asset_vault, derive_asset_vault_authority,
+    derive_associated_token_address, derive_bridge_state, derive_bridge_vault,
+    derive_nullifier_account, derive_program_data, derive_validator_account,
+    derive_validator_registry, DepositInstructionData, DepositSplInstructionData,
+    ShieldedTransferInstructionData, WithdrawSplInstructionData,
+    SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
 pub use keypair::load_keypair_from_file;
 pub use listener::EventListener;
