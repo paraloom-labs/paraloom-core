@@ -61,6 +61,17 @@ pub enum RelayerError {
     #[error("swap provider failed: {0}")]
     SwapFailed(String),
 
+    /// The aggregator returned no route for the requested pair/amount. Distinct
+    /// from a transport error: the request succeeded but there is no liquidity
+    /// path (the common case on devnet — see [`crate::relayer::jupiter`]).
+    #[error("no swap route for the requested pair/amount: {0}")]
+    NoRoute(String),
+
+    /// An HTTP/transport error talking to the swap aggregator (DNS, TLS,
+    /// timeout, non-2xx status), as opposed to a well-formed "no route" answer.
+    #[error("swap aggregator request failed: {0}")]
+    HttpError(String),
+
     /// Submitting one of the on-chain legs (withdraw or deposit) failed.
     #[error("on-chain submission failed: {0}")]
     SubmissionFailed(String),
@@ -80,14 +91,33 @@ pub struct SwapResult {
 
 /// Routes a swap on public liquidity.
 ///
-/// The real implementation (Jupiter v6, #239) lives behind this trait so the
-/// orchestration can be exercised end-to-end with [`MockSwapProvider`] and no
-/// network. Implementations receive the in/out asset ids (mints; native SOL is
-/// [`NATIVE_SOL_ASSET`]) and the input amount, and return the gross output.
+/// The real implementation (Jupiter v6, #239 — [`crate::relayer::jupiter`])
+/// lives behind this trait so the orchestration can be exercised end-to-end
+/// with [`MockSwapProvider`] and no network. Implementations receive the in/out
+/// asset ids (mints; native SOL is [`NATIVE_SOL_ASSET`]), the input amount, and
+/// the per-swap ephemeral `signer`, and return the gross output.
+///
+/// # Why `signer` is on the method, not the provider
+///
+/// The fresh ephemeral [`Keypair`] is generated per swap inside
+/// [`PrivateSwapRelayer::execute`] — it is the same address the withdraw leg
+/// funded, and the swap must be signed *and submitted from it* so the public
+/// trade originates at the unlinkable address rather than any relayer-owned
+/// wallet. Construction-time injection cannot see a value that does not exist
+/// until the swap begins, so the keypair is threaded through the call. The
+/// [`MockSwapProvider`] simply ignores it.
 #[async_trait::async_trait]
 pub trait SwapProvider: Send + Sync {
-    /// Swap `amount` of `asset_in` for `asset_out` and report the gross output.
-    async fn swap(&self, asset_in: AssetId, asset_out: AssetId, amount: u64) -> Result<SwapResult>;
+    /// Swap `amount` of `asset_in` for `asset_out`, signing and submitting the
+    /// public trade from the per-swap ephemeral `signer`, and report the gross
+    /// output.
+    async fn swap(
+        &self,
+        asset_in: AssetId,
+        asset_out: AssetId,
+        amount: u64,
+        signer: &Keypair,
+    ) -> Result<SwapResult>;
 }
 
 /// Deterministic stub [`SwapProvider`] for tests and #239's scaffolding.
@@ -124,6 +154,7 @@ impl SwapProvider for MockSwapProvider {
         _asset_in: AssetId,
         _asset_out: AssetId,
         amount: u64,
+        _signer: &Keypair,
     ) -> Result<SwapResult> {
         let out_amount = (amount as u128 * self.rate_num as u128 / self.rate_den as u128) as u64;
         Ok(SwapResult { out_amount })
@@ -309,10 +340,12 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             )
             .await?;
 
-        // Step 2: swap on public liquidity from the fresh address.
+        // Step 2: swap on public liquidity from the fresh address. The provider
+        // signs and submits the public trade from `ephemeral`, so the trade
+        // originates at the unlinkable fresh address.
         let swap = self
             .swap_provider
-            .swap(asset_in, asset_out, amount_in)
+            .swap(asset_in, asset_out, amount_in, &ephemeral)
             .await?;
         let gross_out_amount = swap.out_amount;
 
