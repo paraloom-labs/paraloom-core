@@ -115,6 +115,15 @@ struct SwapRequestBody<'a> {
     /// Let Jupiter wrap/unwrap SOL as needed so a native-SOL leg just works.
     #[serde(rename = "wrapAndUnwrapSol")]
     wrap_and_unwrap_sol: bool,
+    /// Ask Jupiter for a legacy transaction (no Address Lookup Tables). Skipped
+    /// from the body when false so mainnet keeps the default versioned tx.
+    #[serde(rename = "asLegacyTransaction", skip_serializing_if = "is_false")]
+    as_legacy_transaction: bool,
+}
+
+/// serde helper: omit a `bool` field when it is `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The `/v6/swap` response: a base64 versioned transaction, ready to sign.
@@ -273,6 +282,18 @@ pub struct JupiterSwapProvider<H: JupiterHttpClient, S: SwapSubmitter> {
     /// Relayer fee token account (`feeAccount`) crediting the platform fee.
     /// Required whenever `platform_fee_bps > 0`.
     fee_account: Option<String>,
+    /// Restrict quotes to single-hop routes (`onlyDirectRoutes`). Off by default
+    /// so mainnet picks the cheapest multi-hop route; turn it on in environments
+    /// (e.g. a mainnet fork) where only a couple of pools have been cloned.
+    direct_routes_only: bool,
+    /// Force a legacy (non-versioned) swap transaction (`asLegacyTransaction`).
+    /// Off by default so mainnet uses Address Lookup Tables; turn it on where the
+    /// referenced ALT accounts are not present (again, a mainnet fork).
+    legacy_transaction: bool,
+    /// Optional `dexes` allow-list pinning the route to specific AMMs (e.g.
+    /// `"Whirlpool"`). None lets Jupiter use any venue; set it on a fork so the
+    /// route only touches the pools/programs that were actually cloned.
+    dexes: Option<String>,
 }
 
 impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
@@ -302,7 +323,28 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
             slippage_bps,
             platform_fee_bps,
             fee_account,
+            direct_routes_only: false,
+            legacy_transaction: false,
+            dexes: None,
         })
+    }
+
+    /// Opt into ALT-free routing: single-hop quotes plus a legacy swap
+    /// transaction. Intended for partial-clone environments (a mainnet fork)
+    /// where multi-hop routes or Address Lookup Tables reference accounts that
+    /// have not been cloned. Leave it off against real mainnet.
+    pub fn with_legacy_routing(mut self) -> Self {
+        self.direct_routes_only = true;
+        self.legacy_transaction = true;
+        self
+    }
+
+    /// Pin routing to a specific AMM allow-list (Jupiter's `dexes` param, e.g.
+    /// `"Whirlpool"`). On a mainnet fork this keeps the route inside the venues
+    /// whose programs and pools were cloned; unset against real mainnet.
+    pub fn with_dexes(mut self, dexes: impl Into<String>) -> Self {
+        self.dexes = Some(dexes.into());
+        self
     }
 
     /// Build the `/v6/quote` query string for the given pair/amount, folding in
@@ -314,6 +356,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         );
         if self.platform_fee_bps > 0 {
             q.push_str(&format!("&platformFeeBps={}", self.platform_fee_bps));
+        }
+        if self.direct_routes_only {
+            q.push_str("&onlyDirectRoutes=true");
+        }
+        if let Some(dexes) = &self.dexes {
+            q.push_str(&format!("&dexes={}", dexes));
         }
         q
     }
@@ -373,6 +421,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             user_public_key: signer.pubkey().to_string(),
             fee_account: self.fee_account.clone(),
             wrap_and_unwrap_sol: true,
+            as_legacy_transaction: self.legacy_transaction,
         };
         let body_value = serde_json::to_value(&body)
             .map_err(|e| RelayerError::SwapFailed(format!("encode swap body: {e}")))?;
@@ -536,6 +585,49 @@ mod tests {
         assert!(q.contains("slippageBps=75"), "query: {q}");
         assert!(q.contains("platformFeeBps=30"), "query: {q}");
         assert!(q.contains("amount=1000"), "query: {q}");
+    }
+
+    #[test]
+    fn legacy_routing_adds_direct_routes_to_query() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let provider =
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 50, 0, None).unwrap();
+        // Off by default: mainnet keeps multi-hop, ALT-backed routes.
+        assert!(!provider
+            .quote_query("In", "Out", 1)
+            .contains("onlyDirectRoutes"));
+        // On after opting in: single-hop only, for partial-clone forks.
+        let forked = provider.with_legacy_routing();
+        assert!(forked
+            .quote_query("In", "Out", 1)
+            .contains("onlyDirectRoutes=true"));
+        // A dex filter pins the route to a named AMM allow-list; off by default.
+        assert!(!forked.quote_query("In", "Out", 1).contains("dexes="));
+        let pinned = forked.with_dexes("Whirlpool");
+        assert!(pinned
+            .quote_query("In", "Out", 1)
+            .contains("dexes=Whirlpool"));
+    }
+
+    #[test]
+    fn legacy_routing_flags_the_swap_body_and_default_omits_it() {
+        let quote = serde_json::json!({});
+        let plain = SwapRequestBody {
+            quote_response: &quote,
+            user_public_key: "User1111".into(),
+            fee_account: None,
+            wrap_and_unwrap_sol: true,
+            as_legacy_transaction: false,
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(v.get("asLegacyTransaction").is_none(), "default omits flag");
+
+        let legacy = SwapRequestBody {
+            as_legacy_transaction: true,
+            ..plain
+        };
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(v["asLegacyTransaction"], serde_json::json!(true));
     }
 
     #[test]
