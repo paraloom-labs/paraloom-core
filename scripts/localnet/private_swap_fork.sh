@@ -85,12 +85,26 @@ CLONE_PROGRAMS=(
   "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"  # Raydium CLMM
 )
 
-# Data accounts to clone (pool state, mints). Tick arrays / oracle accounts for
-# the exact route are discovered per the header note; the main Orca SOL/USDC
-# whirlpool + both mints are the stable baseline.
+# Data accounts to clone (pool state, mints, vaults, tick arrays, oracle). The
+# pool-side accounts below are the exact ones Jupiter's live SOL->USDC Whirlpool
+# direct route touches, discovered by decoding the swap tx (see the header note).
+# They are stable across runs — only the ephemeral user/ATA accounts vary, and
+# those are created locally at swap time, not cloned.
 CLONE_ACCOUNTS=(
   "$WSOL"
   "$USDC"
+  # Orca SOL/USDC Whirlpool the current direct route prefers, plus its vaults,
+  # tick arrays, and oracle (all referenced by the route's Swap instruction).
+  "FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q"  # whirlpool (route pool)
+  "5os4kc32895qa1smTDGsAVXRiisXRo4UJWauUePnas1u"
+  "6c4XJyitgSGkL2NyMULRt2zmssmpQzHonozVoZiD6uNb"
+  "6mQ8xEaHdTikyMvvMxUctYch6dUjnKgfoeib2msyMMi1"
+  "AQ36QRk3HAe6PHqBCtKTQnYKpt2kAagq9YoeTqUPMGHx"
+  "BnVEE8KQgD6p7KkjDSXH3apFwi7ExHhTGgqDTRrhkQCo"
+  "FqCcSudbMfFYiZEXTchAk4wVr6yfWmAcx3uEf5xyx4yV"
+  "G9xKTRhM57AL4my3ZRVNqM95mxtACgKdNRPX6EVhB7hv"
+  "923j69hYbT5Set5kYfiQr1D8jPL6z15tbfTbVLSwUWJD"
+  # Earlier baseline whirlpools, kept in case the route shifts back to them.
   "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"  # Orca SOL/USDC whirlpool (0.04%)
   "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"  # Orca SOL/USDC whirlpool (0.30%)
 )
@@ -134,10 +148,54 @@ cp "$PROGRAM_KEYPAIR" programs/paraloom/target/deploy/paraloom_program-keypair.j
 sed -i.bak -E "s/declare_id!\(\"[^\"]+\"\)/declare_id!(\"$PROGRAM_ID\")/" programs/paraloom/src/lib.rs
 ( cd programs/paraloom && cargo build-sbf )
 
+# Live-route discovery: Jupiter's best SOL->USDC Whirlpool route shifts with the
+# market, so a static pool list goes stale. Ask Jupiter for the swap tx the demo
+# will build (same amount, onlyDirectRoutes + dexes=Whirlpool + legacy) and clone
+# the exact pool-side accounts it references — whirlpool, vaults, tick arrays,
+# oracle. These are stable enough between this call and the demo run seconds
+# later. On any failure (e.g. offline) we fall back to the static list above.
+DISCOVER_AMOUNT="${DISCOVER_AMOUNT:-45000000}" # 0.05 SOL deposit - 0.005 overhead
+echo "=== Discovering the current Whirlpool SOL->USDC route accounts ==="
+DISCOVERED="$(python3 - "$WSOL" "$USDC" "$DISCOVER_AMOUNT" <<'PY' 2>/dev/null || true
+import json,sys,urllib.request,base64
+BASE="https://lite-api.jup.ag/swap/v1"
+sol,usdc,amount=sys.argv[1],sys.argv[2],sys.argv[3]
+known={sol,usdc,"11111111111111111111111111111111","11111111111111111111111111111112",
+ "ComputeBudget111111111111111111111111111111","TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+ "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL","JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+ "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc","D8cy77BBepLMngZx6ZukaTff5hCt1HrWyKk3Hnd9oitf"}
+def b58(b):
+    a="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    n=int.from_bytes(b,'big');s=""
+    while n>0:n,r=divmod(n,58);s=a[r]+s
+    return "1"*(len(b)-len(b.lstrip(b'\x00')))+s
+def cu16(b,i):
+    v=b[i]
+    return (v,i+1) if v<0x80 else ((v&0x7f)|(b[i+1]<<7),i+2)
+q=urllib.request.urlopen(f"{BASE}/quote?inputMint={sol}&outputMint={usdc}&amount={amount}&slippageBps=50&onlyDirectRoutes=true&dexes=Whirlpool&asLegacyTransaction=true").read()
+body={"quoteResponse":json.loads(q),"userPublicKey":"11111111111111111111111111111112","wrapAndUnwrapSol":True,"asLegacyTransaction":True}
+r=urllib.request.Request(f"{BASE}/swap",data=json.dumps(body).encode(),headers={"Content-Type":"application/json"})
+raw=base64.b64decode(json.loads(urllib.request.urlopen(r).read())["swapTransaction"])
+i=0;nsig,i=cu16(raw,i);i+=nsig*64;i+=3;nkeys,i=cu16(raw,i)
+out=[]
+for _ in range(nkeys):
+    k=b58(raw[i:i+32]);i+=32
+    if k not in known:out.append(k)
+print(" ".join(out))
+PY
+)"
+if [ -n "$DISCOVERED" ]; then
+  echo "  discovered route accounts: $DISCOVERED"
+  for a in $DISCOVERED; do CLONE_ACCOUNTS+=("$a"); done
+else
+  echo "  discovery unavailable; using the static pool list"
+fi
+
 # Assemble the validator's clone flags.
 CLONE_FLAGS=()
 for p in "${CLONE_PROGRAMS[@]}"; do CLONE_FLAGS+=(--clone-upgradeable-program "$p"); done
-for a in "${CLONE_ACCOUNTS[@]}"; do CLONE_FLAGS+=(--clone "$a"); done
+# De-dup the accounts (the static list and discovery can overlap).
+for a in $(printf '%s\n' "${CLONE_ACCOUNTS[@]}" | awk '!seen[$0]++'); do CLONE_FLAGS+=(--clone "$a"); done
 
 echo "=== Starting solana-test-validator (mainnet-fork) ==="
 echo "Cloning ${#CLONE_PROGRAMS[@]} programs + ${#CLONE_ACCOUNTS[@]} accounts from $MAINNET_RPC"

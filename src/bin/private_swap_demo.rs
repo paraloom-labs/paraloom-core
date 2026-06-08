@@ -129,6 +129,20 @@ async fn main() -> anyhow::Result<()> {
     println!("Bridge state PDA:  {}", bridge_state);
     println!("Bridge vault PDA:  {}", bridge_vault);
 
+    // The shared bridge_vault accumulates every deposit in production, so a single
+    // withdraw never drains it. A fresh demo vault holds only this one note, so
+    // withdrawing the full note would leave it below the rent-exempt floor (the
+    // "account (1) insufficient funds for rent" a SystemAccount vault hits). Seed a
+    // small rent buffer up front so the withdraw leg's transfer settles.
+    let vault_buffer = LAMPORTS_PER_SOL / 100; // 0.01 SOL, well above the rent floor
+    let _ = client.request_airdrop(&bridge_vault, vault_buffer)?;
+    for _ in 0..20 {
+        if client.get_balance(&bridge_vault)? >= vault_buffer {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
     // ----------------------------------------------------------------
     // Step 1: the user deposits a native-SOL note into the shielded pool.
     // ----------------------------------------------------------------
@@ -258,7 +272,13 @@ async fn main() -> anyhow::Result<()> {
         0,
         None,
     )
-    .map_err(|e| anyhow::anyhow!("building Jupiter provider: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("building Jupiter provider: {e}"))?
+    // The fork only clones a couple of pools and none of mainnet's ALTs, so ask
+    // Jupiter for a single-hop legacy tx that references only cloned accounts...
+    .with_legacy_routing()
+    // ...and pin the route to Orca Whirlpool, the AMM the fork actually cloned,
+    // so Jupiter's Route does not CPI into an un-cloned DEX program.
+    .with_dexes("Whirlpool");
 
     // On-chain submitter: authority signs the withdraw legs; the ephemeral key
     // signs the re-deposit leg. authority must be a registered validator.
@@ -269,7 +289,16 @@ async fn main() -> anyhow::Result<()> {
         EXPIRATION_WINDOW_SLOTS,
     );
 
-    let relayer = PrivateSwapRelayer::new(jupiter, submitter);
+    // On a native-SOL leg the fresh address pays every downstream on-chain cost
+    // out of the same lamports, so the relayer trades the note amount minus this
+    // reserve. The reserve must cover: the output USDC ATA rent (swap leg) + the
+    // shielded vault token-account rent (re-deposit leg), ~0.00204 SOL each, two
+    // tx fees, AND leave the ephemeral account itself rent-exempt (~0.00089 SOL,
+    // since a system account can't end between zero and the rent floor). ~0.005
+    // SOL lands right on that boundary, so reserve 0.01 SOL for a clean margin.
+    let native_swap_overhead = LAMPORTS_PER_SOL / 100; // 0.01 SOL
+    let relayer =
+        PrivateSwapRelayer::new(jupiter, submitter).with_native_swap_overhead(native_swap_overhead);
 
     let mut reshield_recipient_bytes = [0u8; 32];
     let mut reshield_randomness = [0u8; 32];
