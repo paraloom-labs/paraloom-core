@@ -222,11 +222,18 @@ pub trait Submitter: Send + Sync {
     /// Deposit `amount` of `asset_out` from the fresh ephemeral address back
     /// into the shielded pool, creating a note for `recipient` with
     /// `randomness`. Branches native vs. SPL on `leg`.
+    ///
+    /// `signer` is the per-swap ephemeral [`Keypair`] — the same key the
+    /// withdraw leg funded and the swap leg traded from. On-chain `deposit` /
+    /// `deposit_spl` require the depositor (the funds' owner) to sign, and that
+    /// owner is the fresh address, so the orchestrator threads its keypair
+    /// through here. [`MockSubmitter`] ignores it, exactly as
+    /// [`MockSwapProvider`](super::MockSwapProvider) ignores the swap signer.
     async fn submit_deposit_from_fresh(
         &self,
         leg: WithdrawLeg,
         amount: u64,
-        fresh_address: [u8; 32],
+        signer: &Keypair,
         recipient: ShieldedAddress,
         randomness: [u8; 32],
     ) -> Result<SubmittedLeg>;
@@ -359,7 +366,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             .submit_deposit_from_fresh(
                 out_leg,
                 net_out_amount,
-                fresh_address,
+                &ephemeral,
                 request.reshield_recipient.clone(),
                 request.reshield_randomness,
             )
@@ -438,14 +445,14 @@ impl Submitter for MockSubmitter {
         &self,
         leg: WithdrawLeg,
         amount: u64,
-        fresh_address: [u8; 32],
+        signer: &Keypair,
         recipient: ShieldedAddress,
         _randomness: [u8; 32],
     ) -> Result<SubmittedLeg> {
         Ok(self.record(SubmittedLeg {
             leg,
             amount,
-            fresh_address,
+            fresh_address: signer.pubkey().to_bytes(),
             signature: format!("mock-deposit-{}", recipient.to_hex()),
         }))
     }

@@ -12,12 +12,14 @@
 //! follow-up issue).
 
 pub mod jupiter;
+pub mod onchain;
 pub mod private_swap;
 
 pub use jupiter::{
     asset_to_mint, JupiterHttpClient, JupiterSwapProvider, ReqwestJupiterClient, RpcSwapSubmitter,
     SwapSubmitter, DEFAULT_JUPITER_BASE_URL, WRAPPED_SOL_MINT,
 };
+pub use onchain::OnChainSubmitter;
 pub use private_swap::{
     MockSubmitter, MockSwapProvider, PrivateSwapRelayer, PrivateSwapRequest, PrivateSwapResult,
     RelayerError, SubmittedLeg, Submitter, SwapProvider, SwapResult, WithdrawLeg,
