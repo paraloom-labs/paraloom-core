@@ -10,6 +10,7 @@ pub mod health;
 pub mod network;
 pub mod node;
 pub mod privacy;
+pub mod relayer;
 pub mod resource;
 pub mod storage;
 pub mod task;
