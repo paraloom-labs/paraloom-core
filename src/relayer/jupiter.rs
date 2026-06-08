@@ -57,17 +57,21 @@ use crate::privacy::types::{AssetId, NATIVE_SOL_ASSET};
 use crate::relayer::private_swap::{RelayerError, Result, SwapProvider, SwapResult};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
+use std::str::FromStr;
 
 /// Wrapped-SOL mint. Jupiter trades wSOL rather than the native lamport
 /// balance, so [`NATIVE_SOL_ASSET`] maps to this mint on the wire.
 pub const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Default Jupiter v6 API base (the public hosted endpoint). Overridable on the
-/// provider so unit tests point at a canned client and operators can use a
-/// self-hosted or paid endpoint.
-pub const DEFAULT_JUPITER_BASE_URL: &str = "https://quote-api.jup.ag/v6";
+/// Default Jupiter Swap API base (the public hosted endpoint). The legacy
+/// `quote-api.jup.ag/v6` host was retired; the current free, keyless endpoint is
+/// `lite-api.jup.ag/swap/v1` (the paid/keyed host is `api.jup.ag/swap/v1`). The
+/// client appends `/quote` and `/swap`. Overridable on the provider so unit
+/// tests point at a canned client and operators can use a paid endpoint.
+pub const DEFAULT_JUPITER_BASE_URL: &str = "https://lite-api.jup.ag/swap/v1";
 
 /// Convert an [`AssetId`] into the base58 mint string Jupiter expects.
 ///
@@ -113,6 +117,15 @@ struct SwapRequestBody<'a> {
     /// Let Jupiter wrap/unwrap SOL as needed so a native-SOL leg just works.
     #[serde(rename = "wrapAndUnwrapSol")]
     wrap_and_unwrap_sol: bool,
+    /// Ask Jupiter for a legacy transaction (no Address Lookup Tables). Skipped
+    /// from the body when false so mainnet keeps the default versioned tx.
+    #[serde(rename = "asLegacyTransaction", skip_serializing_if = "is_false")]
+    as_legacy_transaction: bool,
+}
+
+/// serde helper: omit a `bool` field when it is `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The `/v6/swap` response: a base64 versioned transaction, ready to sign.
@@ -148,6 +161,17 @@ pub trait SwapSubmitter: Send + Sync {
         transaction: VersionedTransaction,
         signer: &Keypair,
     ) -> Result<String>;
+
+    /// The realized output-token balance on `owner`'s associated token account
+    /// after the swap settled, or `None` when it can't be read cheaply (the
+    /// default). A Jupiter quote is computed against current liquidity; the
+    /// executed swap can land a different amount — slippage on mainnet, or
+    /// frozen-pool drift on a mainnet fork cloned at an earlier slot — so
+    /// reading the balance back lets the caller re-shield exactly what arrived
+    /// instead of the estimate. The default keeps mock submitters quote-driven.
+    async fn realized_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// Production [`JupiterHttpClient`] over `reqwest`, talking to a configurable
@@ -239,18 +263,47 @@ impl SwapSubmitter for RpcSwapSubmitter {
         use solana_sdk::commitment_config::CommitmentConfig;
 
         let rpc_url = self.rpc_url.clone();
-        // Re-sign the message with the fresh keypair: Jupiter builds the tx for
-        // `userPublicKey` but leaves the signature for the caller to fill.
-        let message = transaction.message.clone();
-        let signed = VersionedTransaction::try_new(message, &[signer])
-            .map_err(|e| RelayerError::SubmissionFailed(format!("signing failed: {e}")))?;
+        let signer = signer.insecure_clone();
+        let mut message = transaction.message.clone();
 
         tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // Jupiter stamps the swap tx with a blockhash from its own RPC, which
+            // a custom or forked validator will not recognize ("Blockhash not
+            // found"). Refresh it against the submitting RPC before signing so
+            // the tx is valid wherever we land it; on mainnet this just renews an
+            // already-valid hash, guarding against expiry between quote and send.
+            let blockhash = client.get_latest_blockhash().map_err(|e| {
+                RelayerError::SubmissionFailed(format!("blockhash fetch failed: {e}"))
+            })?;
+            message.set_recent_blockhash(blockhash);
+            // Re-sign the message with the fresh keypair: Jupiter builds the tx
+            // for `userPublicKey` but leaves the signature for the caller to fill.
+            let signed = VersionedTransaction::try_new(message, &[&signer])
+                .map_err(|e| RelayerError::SubmissionFailed(format!("signing failed: {e}")))?;
             client
                 .send_and_confirm_transaction(&signed)
                 .map(|sig| sig.to_string())
                 .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn realized_output(&self, owner: &Pubkey, mint: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let ata = crate::bridge::solana::derive_associated_token_address(owner, mint);
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // A missing/unreadable ATA yields None, not an error: the caller then
+            // falls back to the quote estimate rather than aborting the swap.
+            match client.get_token_account_balance(&ata) {
+                Ok(bal) => Ok(Some(bal.amount.parse::<u64>().unwrap_or(0))),
+                Err(_) => Ok(None),
+            }
         })
         .await
         .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
@@ -271,6 +324,18 @@ pub struct JupiterSwapProvider<H: JupiterHttpClient, S: SwapSubmitter> {
     /// Relayer fee token account (`feeAccount`) crediting the platform fee.
     /// Required whenever `platform_fee_bps > 0`.
     fee_account: Option<String>,
+    /// Restrict quotes to single-hop routes (`onlyDirectRoutes`). Off by default
+    /// so mainnet picks the cheapest multi-hop route; turn it on in environments
+    /// (e.g. a mainnet fork) where only a couple of pools have been cloned.
+    direct_routes_only: bool,
+    /// Force a legacy (non-versioned) swap transaction (`asLegacyTransaction`).
+    /// Off by default so mainnet uses Address Lookup Tables; turn it on where the
+    /// referenced ALT accounts are not present (again, a mainnet fork).
+    legacy_transaction: bool,
+    /// Optional `dexes` allow-list pinning the route to specific AMMs (e.g.
+    /// `"Whirlpool"`). None lets Jupiter use any venue; set it on a fork so the
+    /// route only touches the pools/programs that were actually cloned.
+    dexes: Option<String>,
 }
 
 impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
@@ -300,7 +365,28 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
             slippage_bps,
             platform_fee_bps,
             fee_account,
+            direct_routes_only: false,
+            legacy_transaction: false,
+            dexes: None,
         })
+    }
+
+    /// Opt into ALT-free routing: single-hop quotes plus a legacy swap
+    /// transaction. Intended for partial-clone environments (a mainnet fork)
+    /// where multi-hop routes or Address Lookup Tables reference accounts that
+    /// have not been cloned. Leave it off against real mainnet.
+    pub fn with_legacy_routing(mut self) -> Self {
+        self.direct_routes_only = true;
+        self.legacy_transaction = true;
+        self
+    }
+
+    /// Pin routing to a specific AMM allow-list (Jupiter's `dexes` param, e.g.
+    /// `"Whirlpool"`). On a mainnet fork this keeps the route inside the venues
+    /// whose programs and pools were cloned; unset against real mainnet.
+    pub fn with_dexes(mut self, dexes: impl Into<String>) -> Self {
+        self.dexes = Some(dexes.into());
+        self
     }
 
     /// Build the `/v6/quote` query string for the given pair/amount, folding in
@@ -312,6 +398,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         );
         if self.platform_fee_bps > 0 {
             q.push_str(&format!("&platformFeeBps={}", self.platform_fee_bps));
+        }
+        if self.direct_routes_only {
+            q.push_str("&onlyDirectRoutes=true");
+        }
+        if let Some(dexes) = &self.dexes {
+            q.push_str(&format!("&dexes={}", dexes));
         }
         q
     }
@@ -371,6 +463,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             user_public_key: signer.pubkey().to_string(),
             fee_account: self.fee_account.clone(),
             wrap_and_unwrap_sol: true,
+            as_legacy_transaction: self.legacy_transaction,
         };
         let body_value = serde_json::to_value(&body)
             .map_err(|e| RelayerError::SwapFailed(format!("encode swap body: {e}")))?;
@@ -379,6 +472,21 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
 
         // 3. Execute: sign with the fresh keypair and submit.
         self.submitter.sign_and_submit(transaction, signer).await?;
+
+        // 4. Prefer the realized on-chain output over the quote estimate, so the
+        //    re-shield leg deposits exactly what the swap delivered. Native-SOL
+        //    output is unwrapped to lamports — there is no token account to read
+        //    — so it keeps the quote figure.
+        let realized = if asset_out == NATIVE_SOL_ASSET {
+            None
+        } else {
+            let mint = Pubkey::from_str(&output_mint)
+                .map_err(|e| RelayerError::SwapFailed(format!("bad output mint: {e}")))?;
+            self.submitter
+                .realized_output(&signer.pubkey(), &mint)
+                .await?
+        };
+        let out_amount = realized.unwrap_or(out_amount);
 
         Ok(SwapResult { out_amount })
     }
@@ -534,6 +642,49 @@ mod tests {
         assert!(q.contains("slippageBps=75"), "query: {q}");
         assert!(q.contains("platformFeeBps=30"), "query: {q}");
         assert!(q.contains("amount=1000"), "query: {q}");
+    }
+
+    #[test]
+    fn legacy_routing_adds_direct_routes_to_query() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let provider =
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 50, 0, None).unwrap();
+        // Off by default: mainnet keeps multi-hop, ALT-backed routes.
+        assert!(!provider
+            .quote_query("In", "Out", 1)
+            .contains("onlyDirectRoutes"));
+        // On after opting in: single-hop only, for partial-clone forks.
+        let forked = provider.with_legacy_routing();
+        assert!(forked
+            .quote_query("In", "Out", 1)
+            .contains("onlyDirectRoutes=true"));
+        // A dex filter pins the route to a named AMM allow-list; off by default.
+        assert!(!forked.quote_query("In", "Out", 1).contains("dexes="));
+        let pinned = forked.with_dexes("Whirlpool");
+        assert!(pinned
+            .quote_query("In", "Out", 1)
+            .contains("dexes=Whirlpool"));
+    }
+
+    #[test]
+    fn legacy_routing_flags_the_swap_body_and_default_omits_it() {
+        let quote = serde_json::json!({});
+        let plain = SwapRequestBody {
+            quote_response: &quote,
+            user_public_key: "User1111".into(),
+            fee_account: None,
+            wrap_and_unwrap_sol: true,
+            as_legacy_transaction: false,
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(v.get("asLegacyTransaction").is_none(), "default omits flag");
+
+        let legacy = SwapRequestBody {
+            as_legacy_transaction: true,
+            ..plain
+        };
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(v["asLegacyTransaction"], serde_json::json!(true));
     }
 
     #[test]

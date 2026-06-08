@@ -32,6 +32,8 @@ config/*-temp.toml
 # Reproducible devnet withdrawal demo (the other scripts/*.sh are local experiments)
 !scripts/start.sh
 !scripts/demo.sh
+# Private-swap end-to-end demo: localnet mainnet-fork setup (#240)
+!scripts/localnet/private_swap_fork.sh
 .env
 
 # Solana test files
