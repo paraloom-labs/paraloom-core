@@ -1,15 +1,10 @@
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-    signature::Signer,
+    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
     transaction::Transaction,
 };
 use std::str::FromStr;
-
-const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -47,20 +42,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let discriminator: [u8; 8] = [168, 49, 128, 236, 25, 7, 168, 85];
-
-    let instruction_data = discriminator.to_vec();
-    let system_program_id = Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap();
-
-    let ix = Instruction {
-        program_id,
-        accounts: vec![
-            AccountMeta::new(validator_registry_pda, false),
-            AccountMeta::new(authority.pubkey(), true),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
-        data: instruction_data,
-    };
+    // Use the library builder: it includes the #204 ProgramData
+    // upgrade-authority account the on-chain `InitializeValidatorRegistry`
+    // requires. The hand-rolled 3-account form predated #204 and failed with
+    // AccountNotEnoughKeys (3005).
+    let ix = create_initialize_validator_registry_instruction(&program_id, &authority.pubkey())?;
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
