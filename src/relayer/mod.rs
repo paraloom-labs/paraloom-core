@@ -11,8 +11,13 @@
 //! instruction builders and traits that already exist (or are stubbed for a
 //! follow-up issue).
 
+pub mod jupiter;
 pub mod private_swap;
 
+pub use jupiter::{
+    asset_to_mint, JupiterHttpClient, JupiterSwapProvider, ReqwestJupiterClient, RpcSwapSubmitter,
+    SwapSubmitter, DEFAULT_JUPITER_BASE_URL, WRAPPED_SOL_MINT,
+};
 pub use private_swap::{
     MockSubmitter, MockSwapProvider, PrivateSwapRelayer, PrivateSwapRequest, PrivateSwapResult,
     RelayerError, SubmittedLeg, Submitter, SwapProvider, SwapResult, WithdrawLeg,
