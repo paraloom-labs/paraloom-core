@@ -250,14 +250,24 @@ impl SwapSubmitter for RpcSwapSubmitter {
         use solana_sdk::commitment_config::CommitmentConfig;
 
         let rpc_url = self.rpc_url.clone();
-        // Re-sign the message with the fresh keypair: Jupiter builds the tx for
-        // `userPublicKey` but leaves the signature for the caller to fill.
-        let message = transaction.message.clone();
-        let signed = VersionedTransaction::try_new(message, &[signer])
-            .map_err(|e| RelayerError::SubmissionFailed(format!("signing failed: {e}")))?;
+        let signer = signer.insecure_clone();
+        let mut message = transaction.message.clone();
 
         tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // Jupiter stamps the swap tx with a blockhash from its own RPC, which
+            // a custom or forked validator will not recognize ("Blockhash not
+            // found"). Refresh it against the submitting RPC before signing so
+            // the tx is valid wherever we land it; on mainnet this just renews an
+            // already-valid hash, guarding against expiry between quote and send.
+            let blockhash = client.get_latest_blockhash().map_err(|e| {
+                RelayerError::SubmissionFailed(format!("blockhash fetch failed: {e}"))
+            })?;
+            message.set_recent_blockhash(blockhash);
+            // Re-sign the message with the fresh keypair: Jupiter builds the tx
+            // for `userPublicKey` but leaves the signature for the caller to fill.
+            let signed = VersionedTransaction::try_new(message, &[&signer])
+                .map_err(|e| RelayerError::SubmissionFailed(format!("signing failed: {e}")))?;
             client
                 .send_and_confirm_transaction(&signed)
                 .map(|sig| sig.to_string())
