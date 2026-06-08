@@ -286,6 +286,13 @@ pub struct PrivateSwapResult {
 pub struct PrivateSwapRelayer<S: SwapProvider, T: Submitter> {
     swap_provider: S,
     submitter: T,
+    /// Lamports a native-SOL input leg retains on the fresh address to pay the
+    /// swap's own on-chain costs — rent for the wrapped-SOL account and the
+    /// output token ATA the router creates, plus a transaction-fee margin. A
+    /// native swap trades `amount - this`, never the full note: the trade cannot
+    /// spend the very lamports it must keep to pay for itself. Default 0 (mock
+    /// providers have no rent); real Solana submitters set the on-chain figure.
+    native_swap_overhead_lamports: u64,
 }
 
 impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
@@ -294,7 +301,16 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         Self {
             swap_provider,
             submitter,
+            native_swap_overhead_lamports: 0,
         }
+    }
+
+    /// Set the native-SOL swap overhead reserve (see the field docs). Real
+    /// Solana swaps need ~0.005 SOL to cover two token-account rents plus fees;
+    /// mock-backed tests leave it at the default 0.
+    pub fn with_native_swap_overhead(mut self, lamports: u64) -> Self {
+        self.native_swap_overhead_lamports = lamports;
+        self
     }
 
     /// Apply `fee_bps` to `gross`, returning `(fee, net)`. Rounds the fee down,
@@ -350,9 +366,21 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // Step 2: swap on public liquidity from the fresh address. The provider
         // signs and submits the public trade from `ephemeral`, so the trade
         // originates at the unlinkable fresh address.
+        //
+        // On a native-SOL input leg the fresh address pays the swap's rent and
+        // fees out of the same lamports, so trade `amount_in` minus the overhead
+        // reserve — never the full note (see `native_swap_overhead_lamports`).
+        let swap_amount = if asset_in == NATIVE_SOL_ASSET {
+            amount_in
+                .checked_sub(self.native_swap_overhead_lamports)
+                .filter(|&a| a > 0)
+                .ok_or(RelayerError::InvalidAmount(amount_in))?
+        } else {
+            amount_in
+        };
         let swap = self
             .swap_provider
-            .swap(asset_in, asset_out, amount_in, &ephemeral)
+            .swap(asset_in, asset_out, swap_amount, &ephemeral)
             .await?;
         let gross_out_amount = swap.out_amount;
 
@@ -510,6 +538,45 @@ mod tests {
         // Both legs were submitted, withdraw then deposit.
         assert_eq!(out.withdraw_leg.amount, 1_000_000);
         assert_eq!(out.deposit_leg.amount, 995_000);
+    }
+
+    #[tokio::test]
+    async fn native_overhead_reserve_shrinks_the_swap_not_the_withdraw() {
+        // 1:1 swap so gross output == the amount actually handed to the provider.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(5_000);
+        let out = relayer
+            .execute(request(native_note(1_000_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect("swap executes");
+        // The full note is withdrawn to the fresh address...
+        assert_eq!(out.withdraw_leg.amount, 1_000_000);
+        // ...but only `amount - overhead` is swapped, leaving lamports for rent/fees.
+        assert_eq!(out.gross_out_amount, 995_000);
+    }
+
+    #[tokio::test]
+    async fn native_overhead_does_not_touch_an_spl_input_leg() {
+        let mint = [4u8; 32];
+        // The overhead is a native-SOL concern; an SPL input swaps its full amount.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(5_000);
+        let out = relayer
+            .execute(request(spl_note(mint, 1_000_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect("swap executes");
+        assert_eq!(out.gross_out_amount, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn native_overhead_at_or_above_amount_is_rejected() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(1_000);
+        let err = relayer
+            .execute(request(native_note(1_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("overhead consuming the whole note must fail, not swap 0");
+        assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
     }
 
     #[tokio::test]
