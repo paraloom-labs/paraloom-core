@@ -122,6 +122,10 @@ path = "src/bin/register_validator.rs"
 name = "demo-flow"
 path = "src/bin/demo_flow.rs"
 
+[[bin]]
+name = "private-swap-demo"
+path = "src/bin/private_swap_demo.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "borsh", "bs58"]
