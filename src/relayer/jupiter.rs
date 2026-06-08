@@ -64,10 +64,12 @@ use solana_sdk::transaction::VersionedTransaction;
 /// balance, so [`NATIVE_SOL_ASSET`] maps to this mint on the wire.
 pub const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Default Jupiter v6 API base (the public hosted endpoint). Overridable on the
-/// provider so unit tests point at a canned client and operators can use a
-/// self-hosted or paid endpoint.
-pub const DEFAULT_JUPITER_BASE_URL: &str = "https://quote-api.jup.ag/v6";
+/// Default Jupiter Swap API base (the public hosted endpoint). The legacy
+/// `quote-api.jup.ag/v6` host was retired; the current free, keyless endpoint is
+/// `lite-api.jup.ag/swap/v1` (the paid/keyed host is `api.jup.ag/swap/v1`). The
+/// client appends `/quote` and `/swap`. Overridable on the provider so unit
+/// tests point at a canned client and operators can use a paid endpoint.
+pub const DEFAULT_JUPITER_BASE_URL: &str = "https://lite-api.jup.ag/swap/v1";
 
 /// Convert an [`AssetId`] into the base58 mint string Jupiter expects.
 ///
