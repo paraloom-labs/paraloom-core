@@ -4,6 +4,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::bpf_loader_upgradeable;
+use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
@@ -312,6 +313,182 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Deposit an SPL token into the privacy pool (#237).
+    ///
+    /// The asset-aware twin of [`deposit`]: instead of moving native SOL into
+    /// the single `bridge_vault`, it moves `amount` of one SPL `mint` into a
+    /// per-asset vault — a program-owned `TokenAccount` PDA keyed by the mint
+    /// (`seeds = [b"asset_vault", mint]`). One vault per mint keeps each
+    /// asset's custody isolated; the first depositor of a mint creates the
+    /// vault (`init_if_needed`) and every later deposit reuses it.
+    ///
+    /// The deposited `asset_id` is the mint pubkey itself (the #235 convention:
+    /// an SPL asset's id == its mint's 32 bytes; native SOL is the all-zero
+    /// [`NATIVE_SOL_ASSET`]). A deposit is public — it reveals which asset and
+    /// how much entered the pool — exactly as the native deposit does; the
+    /// shielding happens later when the note is spent under a proof.
+    ///
+    /// Counters and the emitted event mirror [`deposit`] so the L2 indexes SPL
+    /// and native deposits through the same path; only the value-movement
+    /// (system transfer -> token CPI) and the vault differ.
+    pub fn deposit_spl(
+        ctx: Context<DepositSpl>,
+        amount: u64,
+        recipient: [u8; 32],
+        randomness: [u8; 32],
+    ) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+
+        require!(!bridge_state.paused, BridgeError::BridgePaused);
+        require!(amount > 0, BridgeError::InvalidAmount);
+
+        // Move the tokens depositor -> per-asset vault. The depositor signs
+        // the transfer (it owns the source token account), so no PDA signer is
+        // needed on the deposit leg.
+        transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.depositor_token.to_account_info(),
+                    to: ctx.accounts.asset_vault.to_account_info(),
+                    authority: ctx.accounts.depositor.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+
+        bridge_state.total_deposited += amount;
+        bridge_state.deposit_count += 1;
+
+        emit!(DepositSplEvent {
+            depositor: ctx.accounts.depositor.key(),
+            asset_id: ctx.accounts.mint.key().to_bytes(),
+            amount,
+            recipient,
+            randomness,
+            timestamp: Clock::get()?.unix_timestamp,
+            deposit_id: bridge_state.deposit_count,
+        });
+
+        msg!(
+            "SPL deposit successful: {} of mint {}",
+            amount,
+            ctx.accounts.mint.key()
+        );
+        Ok(())
+    }
+
+    /// Withdraw an SPL token from the privacy pool (#237).
+    ///
+    /// The asset-aware twin of [`withdraw`]: it releases `amount` of one SPL
+    /// `mint` from that mint's per-asset vault to a recipient token account,
+    /// applying the identical replay, expiry, and fee rules as the native
+    /// path:
+    ///  * the nullifier PDA (`seeds = [b"nullifier", nullifier]`) is `init`'d
+    ///    here, sharing the namespace with `withdraw`/`shielded_transfer`, so a
+    ///    note can never be spent twice across any path;
+    ///  * the request is rejected past its `expiration_slot`;
+    ///  * the same 25 bps [`WITHDRAWAL_FEE_BPS`] cut is taken — the recipient
+    ///    token account receives `amount - fee`, and `fee` stays in the vault
+    ///    credited to the settling validator's `pending_rewards`. Because the
+    ///    fee is SPL tokens sitting in a per-asset vault rather than lamports,
+    ///    `pending_rewards` accrues in that asset's smallest unit;
+    ///    `claim_rewards` for SPL fees is a follow-up (this PR keeps fee
+    ///    accounting at parity with the native path).
+    ///
+    /// Value leaves the vault under a PDA signer (`asset_vault_authority`, the
+    /// token account's owner), not the depositor. As with `withdraw`, the
+    /// Groth16 proof is recorded but **not** verified on-chain (#165); the
+    /// `has_one = authority` gate binds settlement to the consensus leader.
+    pub fn withdraw_spl(
+        ctx: Context<WithdrawSpl>,
+        nullifier: [u8; 32],
+        amount: u64,
+        expiration_slot: u64,
+        proof: Vec<u8>,
+    ) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+
+        require!(!bridge_state.paused, BridgeError::BridgePaused);
+        require!(amount > 0, BridgeError::InvalidAmount);
+        require!(!proof.is_empty(), BridgeError::InvalidProof);
+        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
+
+        let current_slot = Clock::get()?.slot;
+        require!(
+            current_slot <= expiration_slot,
+            BridgeError::WithdrawalExpired
+        );
+
+        require!(
+            ctx.accounts.asset_vault.amount >= amount,
+            BridgeError::InsufficientFunds
+        );
+
+        // Same fee/validator binding as the native withdraw: the settling
+        // validator is bound by seeds to the `authority` signer and earns the
+        // fee for gathering quorum and submitting the withdrawal.
+        let validator_account = &mut ctx.accounts.validator_account;
+        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
+
+        let fee = amount
+            .checked_mul(WITHDRAWAL_FEE_BPS)
+            .and_then(|v| v.checked_div(10_000))
+            .ok_or(BridgeError::InvalidAmount)?;
+        let payout = amount - fee;
+
+        let nullifier_account = &mut ctx.accounts.nullifier_account;
+        nullifier_account.nullifier = nullifier;
+        nullifier_account.used_at = Clock::get()?.unix_timestamp;
+        nullifier_account.withdrawal_id = bridge_state.withdrawal_count + 1;
+
+        // The vault's token authority is the program PDA `asset_vault_authority`;
+        // it signs the release. The fee tokens are left behind in the vault.
+        let authority_bump = ctx.bumps.asset_vault_authority;
+        let seeds = &[b"asset_vault_authority".as_ref(), &[authority_bump]];
+        let signer_seeds = &[&seeds[..]];
+
+        transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.asset_vault.to_account_info(),
+                    to: ctx.accounts.recipient_token.to_account_info(),
+                    authority: ctx.accounts.asset_vault_authority.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            payout,
+        )?;
+
+        // Credit the retained fee to the settling validator and record the
+        // settlement against its activity — parity with the native path.
+        validator_account.pending_rewards += fee;
+        validator_account.successful_verifications += 1;
+        validator_account.last_active = Clock::get()?.unix_timestamp;
+
+        bridge_state.total_withdrawn += amount;
+        bridge_state.withdrawal_count += 1;
+
+        emit!(WithdrawalSplEvent {
+            recipient: ctx.accounts.recipient_token.key(),
+            asset_id: ctx.accounts.mint.key().to_bytes(),
+            amount,
+            nullifier,
+            timestamp: Clock::get()?.unix_timestamp,
+            withdrawal_id: bridge_state.withdrawal_count,
+        });
+
+        msg!(
+            "SPL withdrawal successful: {} of mint {} to recipient, {} fee to validator {}",
+            payout,
+            ctx.accounts.mint.key(),
+            fee,
+            validator_account.validator
+        );
+        Ok(())
+    }
+
     /// Pause the bridge
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
@@ -349,7 +526,11 @@ pub mod paraloom_program {
         let previous = bridge_state.authority;
         bridge_state.authority = new_authority;
 
-        msg!("Bridge authority rotated: {} -> {}", previous, new_authority);
+        msg!(
+            "Bridge authority rotated: {} -> {}",
+            previous,
+            new_authority
+        );
         Ok(())
     }
 
@@ -747,6 +928,133 @@ pub struct ShieldedTransfer<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DepositSpl<'info> {
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    /// The SPL mint being deposited. Its pubkey IS the asset id (#235).
+    pub mint: Account<'info, Mint>,
+
+    /// Program-owned PDA that owns every per-asset vault. A single
+    /// deterministic authority for all asset vaults; it never signs on the
+    /// deposit leg (the depositor signs that), but it is set as the vault's
+    /// `authority` here so the withdraw leg can sign releases.
+    ///
+    /// CHECK: a PDA used only as the token-account authority; constrained by
+    /// its seeds. Holds no data and is never deserialized.
+    #[account(
+        seeds = [b"asset_vault_authority"],
+        bump
+    )]
+    pub asset_vault_authority: UncheckedAccount<'info>,
+
+    /// The per-asset vault: a program-owned token account for this one mint.
+    /// `init_if_needed` so the first depositor of a mint creates it and every
+    /// later deposit reuses it. Owned by `asset_vault_authority`.
+    #[account(
+        init_if_needed,
+        payer = depositor,
+        token::mint = mint,
+        token::authority = asset_vault_authority,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump
+    )]
+    pub asset_vault: Account<'info, TokenAccount>,
+
+    /// The depositor's source token account for `mint`.
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = depositor
+    )]
+    pub depositor_token: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+#[instruction(nullifier: [u8; 32])]
+pub struct WithdrawSpl<'info> {
+    // `has_one = authority` binds the signer to the bridge authority recorded
+    // at `initialize` — same #178 settlement guard as the native withdraw.
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump,
+        has_one = authority
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    /// The SPL mint being withdrawn. Its pubkey IS the asset id (#235) and
+    /// keys the vault PDA below.
+    pub mint: Account<'info, Mint>,
+
+    /// Program PDA that owns the vault and signs the release.
+    ///
+    /// CHECK: a PDA used only as the token-account authority; constrained by
+    /// its seeds. Holds no data and is never deserialized.
+    #[account(
+        seeds = [b"asset_vault_authority"],
+        bump
+    )]
+    pub asset_vault_authority: UncheckedAccount<'info>,
+
+    /// The per-asset vault tokens are released from. Must already exist (a
+    /// deposit created it); keyed by the mint exactly as `DepositSpl`.
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = asset_vault_authority,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump
+    )]
+    pub asset_vault: Account<'info, TokenAccount>,
+
+    /// Nullifier account — shares the `b"nullifier"` namespace with the native
+    /// `withdraw` and `shielded_transfer`, so `init` fails on a replay across
+    /// any path.
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifier.as_ref()],
+        bump
+    )]
+    pub nullifier_account: Account<'info, NullifierAccount>,
+
+    /// The recipient's destination token account for `mint`.
+    #[account(
+        mut,
+        token::mint = mint
+    )]
+    pub recipient_token: Account<'info, TokenAccount>,
+
+    // The settling validator's account, bound by seeds to the `authority`
+    // signer — same binding and fee-crediting as the native withdraw.
+    #[account(
+        mut,
+        seeds = [b"validator", authority.key().as_ref()],
+        bump
+    )]
+    pub validator_account: Account<'info, ValidatorAccount>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Pause<'info> {
     #[account(
         mut,
@@ -1009,6 +1317,30 @@ pub struct DepositEvent {
 #[event]
 pub struct WithdrawalEvent {
     pub recipient: Pubkey,
+    pub amount: u64,
+    pub nullifier: [u8; 32],
+    pub timestamp: i64,
+    pub withdrawal_id: u64,
+}
+
+#[event]
+pub struct DepositSplEvent {
+    pub depositor: Pubkey,
+    /// The deposited asset's id == the SPL mint's pubkey bytes (#235).
+    pub asset_id: [u8; 32],
+    pub amount: u64,
+    pub recipient: [u8; 32],
+    pub randomness: [u8; 32],
+    pub timestamp: i64,
+    pub deposit_id: u64,
+}
+
+#[event]
+pub struct WithdrawalSplEvent {
+    /// The recipient's destination token account.
+    pub recipient: Pubkey,
+    /// The withdrawn asset's id == the SPL mint's pubkey bytes (#235).
+    pub asset_id: [u8; 32],
     pub amount: u64,
     pub nullifier: [u8; 32],
     pub timestamp: i64,
