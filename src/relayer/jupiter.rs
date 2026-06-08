@@ -57,8 +57,10 @@ use crate::privacy::types::{AssetId, NATIVE_SOL_ASSET};
 use crate::relayer::private_swap::{RelayerError, Result, SwapProvider, SwapResult};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::VersionedTransaction;
+use std::str::FromStr;
 
 /// Wrapped-SOL mint. Jupiter trades wSOL rather than the native lamport
 /// balance, so [`NATIVE_SOL_ASSET`] maps to this mint on the wire.
@@ -159,6 +161,17 @@ pub trait SwapSubmitter: Send + Sync {
         transaction: VersionedTransaction,
         signer: &Keypair,
     ) -> Result<String>;
+
+    /// The realized output-token balance on `owner`'s associated token account
+    /// after the swap settled, or `None` when it can't be read cheaply (the
+    /// default). A Jupiter quote is computed against current liquidity; the
+    /// executed swap can land a different amount — slippage on mainnet, or
+    /// frozen-pool drift on a mainnet fork cloned at an earlier slot — so
+    /// reading the balance back lets the caller re-shield exactly what arrived
+    /// instead of the estimate. The default keeps mock submitters quote-driven.
+    async fn realized_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// Production [`JupiterHttpClient`] over `reqwest`, talking to a configurable
@@ -272,6 +285,25 @@ impl SwapSubmitter for RpcSwapSubmitter {
                 .send_and_confirm_transaction(&signed)
                 .map(|sig| sig.to_string())
                 .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn realized_output(&self, owner: &Pubkey, mint: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let ata = crate::bridge::solana::derive_associated_token_address(owner, mint);
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // A missing/unreadable ATA yields None, not an error: the caller then
+            // falls back to the quote estimate rather than aborting the swap.
+            match client.get_token_account_balance(&ata) {
+                Ok(bal) => Ok(Some(bal.amount.parse::<u64>().unwrap_or(0))),
+                Err(_) => Ok(None),
+            }
         })
         .await
         .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
@@ -440,6 +472,21 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
 
         // 3. Execute: sign with the fresh keypair and submit.
         self.submitter.sign_and_submit(transaction, signer).await?;
+
+        // 4. Prefer the realized on-chain output over the quote estimate, so the
+        //    re-shield leg deposits exactly what the swap delivered. Native-SOL
+        //    output is unwrapped to lamports — there is no token account to read
+        //    — so it keeps the quote figure.
+        let realized = if asset_out == NATIVE_SOL_ASSET {
+            None
+        } else {
+            let mint = Pubkey::from_str(&output_mint)
+                .map_err(|e| RelayerError::SwapFailed(format!("bad output mint: {e}")))?;
+            self.submitter
+                .realized_output(&signer.pubkey(), &mint)
+                .await?
+        };
+        let out_amount = realized.unwrap_or(out_amount);
 
         Ok(SwapResult { out_amount })
     }
