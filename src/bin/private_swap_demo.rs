@@ -48,7 +48,7 @@ use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
 use paraloom::privacy::types::{Note, Nullifier, ShieldedAddress};
 use paraloom::relayer::{
     JupiterSwapProvider, OnChainSubmitter, PrivateSwapRelayer, PrivateSwapRequest, RelayerError,
-    ReqwestJupiterClient, RpcSwapSubmitter, DEFAULT_JUPITER_BASE_URL,
+    ReqwestJupiterClient, RpcSwapSubmitter, WithdrawLeg, DEFAULT_JUPITER_BASE_URL,
 };
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -248,12 +248,21 @@ async fn main() -> anyhow::Result<()> {
         // diagnostic, not a blocker for exercising the on-chain legs — what the
         // chain actually checks is the non-empty proof and the nullifier the
         // relayer derives. Surface it honestly and keep going.
+        // The chain records the proof but does not verify it yet (#165), so this
+        // local check is a diagnostic only. The bundled demo keys are a vintage
+        // ahead of this circuit, so it is expected to read n/a rather than OK;
+        // either way the on-chain legs below run on the non-empty proof and the
+        // relayer-derived nullifier, which is what the program actually checks.
         match Groth16ProofSystem::verify(&vk, &public_inputs, &proof) {
-            Ok(true) => println!("Local verify:      OK"),
+            Ok(true) => {
+                println!("Local check:       OK (on-chain records the proof; verification is #165)")
+            }
             Ok(false) => println!(
-                "Local verify:      MISMATCH (informational; on-chain does not verify proofs, #165)"
+                "Local check:       n/a, demo key vintage (on-chain records the proof; verification is #165)"
             ),
-            Err(e) => println!("Local verify:      error {e} (informational)"),
+            Err(e) => println!(
+                "Local check:       n/a, {e} (on-chain records the proof; verification is #165)"
+            ),
         }
     }
 
@@ -317,25 +326,49 @@ async fn main() -> anyhow::Result<()> {
     match relayer.execute(request).await {
         Ok(result) => {
             header("Private swap complete");
+            // Label a leg's asset cleanly: SOL for the native leg, the token
+            // symbol for a known mint (USDC here), otherwise the mint address.
+            let leg_label = |leg: &WithdrawLeg| -> String {
+                match leg {
+                    WithdrawLeg::Native => "SOL".to_string(),
+                    WithdrawLeg::Spl(mint) => {
+                        if *mint == usdc_asset {
+                            "USDC".to_string()
+                        } else {
+                            bs58::encode(mint).into_string()
+                        }
+                    }
+                }
+            };
+
             let fresh = Pubkey::new_from_array(result.fresh_address);
             println!("Fresh ephemeral:   {}", fresh);
             println!("  (shares NO signer with the user {} above)", user.pubkey());
             println!();
             println!(
-                "Withdraw leg:      {:?}  {} -> fresh   tx {}",
-                result.withdraw_leg.leg, result.withdraw_leg.amount, result.withdraw_leg.signature
+                "Withdraw leg:      {} {} -> fresh address",
+                leg_label(&result.withdraw_leg.leg),
+                result.withdraw_leg.amount
             );
+            println!("  tx {}", result.withdraw_leg.signature);
             println!(
-                "Gross swap out:    {} USDC base units (Jupiter realized)",
-                result.gross_out_amount
+                "Gross swap out:    {} {} (Jupiter realized)",
+                result.gross_out_amount,
+                leg_label(&result.deposit_leg.leg)
             );
             println!("Relayer fee:       {}", result.relayer_fee);
             println!("Net re-shielded:   {}", result.net_out_amount);
             println!(
-                "Deposit leg:       {:?}  {} from fresh   tx {}",
-                result.deposit_leg.leg, result.deposit_leg.amount, result.deposit_leg.signature
+                "Deposit leg:       {} {} -> shielded pool",
+                leg_label(&result.deposit_leg.leg),
+                result.deposit_leg.amount
             );
-            println!("Output note:       {} USDC", result.output_note.amount);
+            println!("  tx {}", result.deposit_leg.signature);
+            println!(
+                "Output note:       {} {}",
+                result.output_note.amount,
+                leg_label(&result.deposit_leg.leg)
+            );
             println!();
             println!("Inspect the on-chain trace:");
             println!(
