@@ -13,10 +13,11 @@
 use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{ProvingKey, VerifyingKey};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::CanonicalDeserialize;
 use ark_std::rand as ark_rand;
 use paraloom::bridge::solana::*;
 use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
+use paraloom::privacy::onchain_verifier::proof_to_onchain_bytes;
 use paraloom::privacy::transaction::{DepositTx, WithdrawTx};
 use paraloom::privacy::types::{Nullifier, ShieldedAddress};
 use solana_client::rpc_client::RpcClient;
@@ -223,8 +224,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proof = Groth16ProofSystem::prove::<WithdrawCircuit, _>(&proving_key, circuit, &mut rng)?;
     let proof_elapsed = proof_start.elapsed();
 
-    let mut proof_bytes = Vec::new();
-    proof.serialize_compressed(&mut proof_bytes)?;
+    // 256-byte alt_bn128 wire form for on-chain submission (the off-chain
+    // local verify below still uses the arkworks `proof` object directly).
+    let proof_bytes = proof_to_onchain_bytes(&proof).to_vec();
     println!(
         "Proof generated:   {} bytes in {:.2}s",
         proof_bytes.len(),

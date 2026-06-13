@@ -91,6 +91,25 @@ pub fn proof_to_wire(proof: &Proof<ark_bn254::Bn254>) -> WireProof {
     }
 }
 
+impl WireProof {
+    /// The 256-byte on-chain submission blob: `a(64) || b(128) || c(64)`. This
+    /// is exactly what the program's `withdraw_verifier` slices and verifies.
+    pub fn to_bytes(&self) -> [u8; 256] {
+        let mut out = [0u8; 256];
+        out[..64].copy_from_slice(&self.a);
+        out[64..192].copy_from_slice(&self.b);
+        out[192..].copy_from_slice(&self.c);
+        out
+    }
+}
+
+/// Serialize an arkworks Groth16 proof into the 256-byte on-chain wire blob.
+/// Callers building the `withdraw` / `shielded_transfer` instruction pass this
+/// instead of the arkworks-compressed encoding.
+pub fn proof_to_onchain_bytes(proof: &Proof<ark_bn254::Bn254>) -> [u8; 256] {
+    proof_to_wire(proof).to_bytes()
+}
+
 /// A verifying key in the byte layout the vendored verifier consumes. Owns the
 /// IC vector so the borrowed [`Groth16Verifyingkey`] can point into it.
 pub struct WireVerifyingKey {
