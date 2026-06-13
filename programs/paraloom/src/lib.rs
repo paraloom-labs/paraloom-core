@@ -6,12 +6,19 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
+mod groth16;
+#[cfg(test)]
+mod withdraw_fixture_data;
+mod withdraw_verifier;
+mod withdraw_vk_data;
+
 declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
-/// Upper bound on the withdrawal proof blob. A BLS12-381 Groth16 proof is
-/// 192 bytes; the cap leaves headroom while rejecting oversized blobs that
+/// Upper bound on the withdrawal proof blob. A BN254 Groth16 proof in the
+/// `alt_bn128` wire form is exactly 256 bytes (see
+/// [`withdraw_verifier::WIRE_PROOF_LEN`]); the cap rejects oversized blobs that
 /// would only bloat the transaction (flagged alongside #178).
 pub const MAX_PROOF_LEN: usize = 256;
 
