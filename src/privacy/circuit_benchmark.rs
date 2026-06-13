@@ -3,7 +3,7 @@
 //! Measures circuit complexity and performance for optimization
 
 use crate::privacy::circuits::{DepositCircuit, TransferCircuit, WithdrawCircuit};
-use ark_bls12_381::Fr;
+use ark_bn254::Fr;
 use ark_relations::r1cs::ConstraintSystem;
 use std::time::Instant;
 

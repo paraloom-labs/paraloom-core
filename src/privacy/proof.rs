@@ -5,7 +5,7 @@
 use crate::privacy::circuits::Groth16ProofSystem;
 use crate::privacy::transaction::{DepositTx, TransferTx, WithdrawTx};
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
@@ -16,7 +16,7 @@ use thiserror::Error;
 
 /// True iff `b` is the *canonical* little-endian encoding of its own field
 /// element — i.e. `b`, read as a 256-bit little-endian integer, is already
-/// less than the BLS12-381 scalar modulus.
+/// less than the BN254 scalar modulus.
 ///
 /// `Fr::from_le_bytes_mod_order` is non-injective on 32 bytes: 256 bits is
 /// wider than the ~255-bit modulus `p`, so a buffer `b` and `b + p` lift to
@@ -214,11 +214,11 @@ pub enum KeyLoadError {
 /// cached reference. Failed loads do *not* poison the cache — a node
 /// whose key file is restored after a misconfiguration can recover
 /// without a process restart.
-static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bls12_381>> = OnceLock::new();
+static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bn254>> = OnceLock::new();
 
 /// Global verifying key for transfer proofs (#194). Same lazy-load, no-poison
 /// semantics as [`WITHDRAWAL_VERIFYING_KEY`].
-static TRANSFER_VERIFYING_KEY: OnceLock<VerifyingKey<Bls12_381>> = OnceLock::new();
+static TRANSFER_VERIFYING_KEY: OnceLock<VerifyingKey<Bn254>> = OnceLock::new();
 
 /// Resolve the on-disk path of the withdrawal verifying key, honoring
 /// the `WITHDRAWAL_VERIFYING_KEY_PATH` environment variable as an
@@ -244,7 +244,7 @@ fn resolve_transfer_key_path() -> PathBuf {
 /// produce either the key or a typed error explaining what went wrong.
 /// The caching wrapper [`ProofVerifier::get_verifying_key`] composes
 /// this with a global `OnceLock`.
-pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bls12_381>, KeyLoadError> {
+pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -260,11 +260,9 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bls12_381>, KeyLoa
         }
     };
 
-    VerifyingKey::<Bls12_381>::deserialize_compressed(&bytes[..]).map_err(|e| {
-        KeyLoadError::Malformed {
-            path: path.to_path_buf(),
-            source: e,
-        }
+    VerifyingKey::<Bn254>::deserialize_compressed(&bytes[..]).map_err(|e| KeyLoadError::Malformed {
+        path: path.to_path_buf(),
+        source: e,
     })
 }
 
@@ -280,7 +278,7 @@ impl ProofVerifier {
     /// [`KeyLoadError`] on failure. Failed loads are *not* cached, so a
     /// node that is reconfigured at runtime can pick up a corrected key
     /// without restarting.
-    fn get_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, KeyLoadError> {
+    fn get_verifying_key() -> Result<&'static VerifyingKey<Bn254>, KeyLoadError> {
         if let Some(vk) = WITHDRAWAL_VERIFYING_KEY.get() {
             return Ok(vk);
         }
@@ -311,7 +309,7 @@ impl ProofVerifier {
     /// Load the transfer verifying key from disk (cached on success). Mirrors
     /// [`get_verifying_key`](Self::get_verifying_key) but for the transfer
     /// ceremony key (#194).
-    fn get_transfer_verifying_key() -> Result<&'static VerifyingKey<Bls12_381>, KeyLoadError> {
+    fn get_transfer_verifying_key() -> Result<&'static VerifyingKey<Bn254>, KeyLoadError> {
         if let Some(vk) = TRANSFER_VERIFYING_KEY.get() {
             return Ok(vk);
         }
@@ -360,7 +358,7 @@ impl ProofVerifier {
             }
         };
 
-        let proof = match Proof::<Bls12_381>::deserialize_compressed(zk_proof) {
+        let proof = match Proof::<Bn254>::deserialize_compressed(zk_proof) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to deserialize transfer proof: {}", e);
@@ -491,7 +489,7 @@ impl ProofVerifier {
             }
         };
 
-        let proof = match Proof::<Bls12_381>::deserialize_compressed(zk_proof) {
+        let proof = match Proof::<Bn254>::deserialize_compressed(zk_proof) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to deserialize proof: {}", e);

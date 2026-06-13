@@ -24,7 +24,7 @@
 //! - The "toxic waste" (randomness) is automatically discarded
 //! - For production, use a multi-party ceremony (e.g., Powers of Tau)
 
-use ark_bls12_381::Bls12_381;
+use ark_bn254::Bn254;
 use ark_groth16::Groth16;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   This may take 2-5 minutes depending on circuit complexity...");
 
     let start = std::time::Instant::now();
-    let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(circuit, &mut rng)?;
+    let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit, &mut rng)?;
     let setup_time = start.elapsed();
 
     println!("✓ Setup completed in {:.2}s\n", setup_time.as_secs_f64());
@@ -102,8 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify we can load the keys back
     println!("\n🔍 Verifying key integrity...");
-    let pk_loaded = ark_groth16::ProvingKey::<Bls12_381>::deserialize_compressed(&pk_bytes[..])?;
-    let vk_loaded = ark_groth16::VerifyingKey::<Bls12_381>::deserialize_compressed(&vk_bytes[..])?;
+    let pk_loaded = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..])?;
+    let vk_loaded = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..])?;
 
     // Basic sanity check
     if pk_loaded.vk.gamma_g2 != vk_loaded.gamma_g2 {

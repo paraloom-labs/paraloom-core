@@ -6,11 +6,11 @@
 //! # Parameter set
 //!
 //! See [`params`] for the frozen parameter constants and their provenance.
-//! The set is Poseidon-128 over BLS12-381 `Fr`, S-box x^5, t=3 (rate=2,
+//! The set is Poseidon-128 over BN254 `Fr`, S-box x^5, t=3 (rate=2,
 //! capacity=1), R_F=8, R_P=57 — standard 128-bit security per Grassi et al.
 //! (Poseidon paper §5.4, Table 2).
 
-use ark_bls12_381::Fr;
+use ark_bn254::Fr;
 use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     CryptographicSponge,
@@ -30,9 +30,9 @@ use std::sync::OnceLock;
 /// - Reference: Grassi, Khovratovich, Rechberger, Roy, Schofnegger —
 ///   "Poseidon: A New Hash Function for Zero-Knowledge Proof Systems"
 ///   (USENIX Security '21), §5.4 Table 2.
-/// - Field: BLS12-381 scalar field `Fr` (255-bit prime).
+/// - Field: BN254 scalar field `Fr` (254-bit prime).
 /// - Matches arkworks' reference parameters via
-///   `find_poseidon_ark_and_mds::<Fr>(255, 2, 8, 57, 0)`.
+///   `find_poseidon_ark_and_mds::<Fr>(254, 2, 8, 57, 0)`.
 ///
 /// Keep this module exhaustive: every value fed into `PoseidonConfig::new`
 /// must be sourced from a named constant here, so `tests::test_params_frozen`

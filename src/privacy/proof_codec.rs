@@ -1,13 +1,13 @@
 //! Proof serialization and deserialization for network transmission
 
 use crate::privacy::Result;
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use std::io::Cursor;
 
-pub type Groth16Proof = Proof<Bls12_381>;
-pub type Groth16VerifyingKey = VerifyingKey<Bls12_381>;
+pub type Groth16Proof = Proof<Bn254>;
+pub type Groth16VerifyingKey = VerifyingKey<Bn254>;
 
 /// Serialize a Groth16 proof to bytes for network transmission
 pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
@@ -21,7 +21,7 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bls12_381>::deserialize_compressed(&mut cursor)
+    Proof::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
 }
 
@@ -36,7 +36,7 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bls12_381>::deserialize_compressed(&mut cursor)
+    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
         .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
 }
 
@@ -176,7 +176,7 @@ mod tests {
         }
     }
 
-    /// A buffer whose top bytes encode a value larger than the BLS12-381
+    /// A buffer whose top bytes encode a value larger than the BN254
     /// scalar prime must be rejected — \`Fr\` cannot represent such a
     /// value canonically.
     #[test]

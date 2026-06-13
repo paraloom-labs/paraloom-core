@@ -12,7 +12,7 @@
 //!       the derived nullifier is unspent and the same on-chain deposit can be
 //!       demonstrated repeatedly.
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -89,7 +89,7 @@ fn main() {
         merkle_path,
     );
     let pk_bytes = std::fs::read("keys/withdraw_proving_v4.key").expect("v4 proving key");
-    let pk = ProvingKey::<Bls12_381>::deserialize_compressed(&pk_bytes[..]).expect("pk");
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).expect("pk");
     let proof = Groth16ProofSystem::prove::<WithdrawCircuit, _>(&pk, circuit, &mut thread_rng())
         .expect("prove");
     let mut pb = Vec::new();

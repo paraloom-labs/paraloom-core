@@ -13,7 +13,7 @@
 //! Requires the fixed-depth (#184) `_v4` trusted-setup keys in `keys/`, which
 //! are gitignored, so this is `#[ignore]`'d and run locally.
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -105,7 +105,7 @@ async fn real_multi_leaf_proof_verifies_through_canonical_verifier() {
     );
 
     let pk_bytes = std::fs::read(PROVING_KEY_PATH).expect("read proving key");
-    let pk = ProvingKey::<Bls12_381>::deserialize_compressed(&pk_bytes[..])
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..])
         .expect("deserialize proving key");
     let mut rng = thread_rng();
     let proof = Groth16ProofSystem::prove::<WithdrawCircuit, _>(&pk, circuit, &mut rng)

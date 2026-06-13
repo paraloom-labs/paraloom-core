@@ -10,7 +10,7 @@
 //! `merkle_root = commitment`). Multi-deposit Merkle state requires a running
 //! paraloom-node Merkle indexer — out of scope here, tracked separately.
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -202,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     header("Step 4: Generate Groth16 withdrawal proof");
     let proving_key_bytes = fs::read(PROVING_KEY_PATH)?;
-    let proving_key = ProvingKey::<Bls12_381>::deserialize_compressed(&proving_key_bytes[..])?;
+    let proving_key = ProvingKey::<Bn254>::deserialize_compressed(&proving_key_bytes[..])?;
 
     let mut nullifier_bytes_arr = [0u8; 32];
     nullifier_bytes_arr.copy_from_slice(nullifier.as_bytes());
@@ -233,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if Path::new(VERIFYING_KEY_PATH).exists() {
         let vk_bytes = fs::read(VERIFYING_KEY_PATH)?;
-        let vk = VerifyingKey::<Bls12_381>::deserialize_compressed(&vk_bytes[..])?;
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..])?;
         let public_inputs = vec![
             Fr::from_le_bytes_mod_order(&merkle_root_bytes),
             Fr::from_le_bytes_mod_order(&nullifier_bytes_arr),
