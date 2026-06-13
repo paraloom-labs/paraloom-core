@@ -404,7 +404,14 @@ mod tests {
         let pool = ShieldedPool::new();
         let mut spent = None;
         for i in 0..NLEAVES {
-            let value = 100_000u64 + i as u64;
+            // The spent note is 1 SOL so the on-chain happy-path withdraw's
+            // payout (amount - fee) stays above the rent-exempt floor when it
+            // lands on a fresh recipient account.
+            let value = if i == SPEND {
+                1_000_000_000u64
+            } else {
+                100_000u64 + i as u64
+            };
             let randomness = [i as u8 + 1; 32];
             let recipient = [i as u8 + 100; 32];
             pool.deposit(

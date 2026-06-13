@@ -8,6 +8,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
+use paraloom_program::withdraw_fixture_data as fx;
 use paraloom_program::{accounts, instruction};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
@@ -19,7 +20,18 @@ use solana_sdk::{
 mod common;
 use common::{add_program_data, entry};
 
-const NULLIFIER: [u8; 32] = [42u8; 32];
+// Root, nullifier, amount and proof come from the on-chain verifier fixture so
+// the first withdraw's proof verifies against the program's root.
+const NULLIFIER: [u8; 32] = fx::FIXTURE_NULLIFIER;
+
+/// The 256-byte alt_bn128 wire proof from the fixture.
+fn fixture_proof() -> Vec<u8> {
+    let mut p = Vec::with_capacity(256);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_A);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_B);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_C);
+    p
+}
 
 #[tokio::test]
 async fn withdraw_with_same_nullifier_is_rejected() {
@@ -41,20 +53,19 @@ async fn withdraw_with_same_nullifier_is_rejected() {
 
     let recipient = Keypair::new();
 
-    // The proof blob is the only field that varies between the two attempts:
-    // both withdraws target the SAME nullifier (the whole point of the test),
-    // but if the two tx signatures collide BanksClient returns the cached
-    // success of the first instead of re-executing the second. Proof bytes
-    // are opaque to the on-chain handler (Groth16 verification lives in the
-    // L2), so varying them changes the tx hash without weakening the replay
-    // claim — the nullifier PDA the gate relies on is still the same PDA.
-    let withdraw_ix = |proof: Vec<u8>| Instruction {
+    // Both attempts use the SAME valid fixture proof and the SAME nullifier
+    // (the whole point of the test). To keep the two transaction signatures
+    // distinct — otherwise BanksClient returns the cached result of the first
+    // instead of re-executing the second — they vary `expiration_slot`, which
+    // is not a proof public input, so the proof still verifies. The replay is
+    // then rejected by the init'd nullifier PDA, the on-chain primary defence.
+    let withdraw_ix = |expiration_slot: u64| Instruction {
         program_id,
         data: instruction::Withdraw {
             nullifier: NULLIFIER,
-            amount: 1_000_000_000,
-            expiration_slot: u64::MAX,
-            proof,
+            amount: fx::FIXTURE_AMOUNT,
+            expiration_slot,
+            proof: fixture_proof(),
         }
         .data(),
         accounts: accounts::Withdraw {
@@ -76,7 +87,7 @@ async fn withdraw_with_same_nullifier_is_rejected() {
         program_id,
         data: instruction::Initialize {
             program_version: 0x0004_0000,
-            initial_merkle_root: [0u8; 32],
+            initial_merkle_root: fx::FIXTURE_ROOT,
         }
         .data(),
         accounts: accounts::Initialize {
@@ -148,19 +159,17 @@ async fn withdraw_with_same_nullifier_is_rejected() {
     tx.sign(&[&payer], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
-    let mut tx = Transaction::new_with_payer(
-        &[withdraw_ix(vec![1, 2, 3, 4])],
-        Some(&upgrade_authority.pubkey()),
-    );
+    let mut tx =
+        Transaction::new_with_payer(&[withdraw_ix(u64::MAX)], Some(&upgrade_authority.pubkey()));
     tx.sign(&[&upgrade_authority], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
-    // Replay: same NULLIFIER (the whole point), distinct proof bytes so the
-    // signature does not collide with the first tx. Anchor's `init` on the
-    // nullifier_account PDA must reject the already-existing account, the
-    // on-chain primary defence the audit asked us to pin.
+    // Replay: same NULLIFIER (the whole point) and the same valid proof, with a
+    // different expiration_slot so the tx signature does not collide with the
+    // first. Anchor's `init` on the nullifier_account PDA must reject the
+    // already-existing account, the on-chain primary defence the audit pinned.
     let mut tx = Transaction::new_with_payer(
-        &[withdraw_ix(vec![5, 6, 7, 8])],
+        &[withdraw_ix(u64::MAX - 1)],
         Some(&upgrade_authority.pubkey()),
     );
     tx.sign(&[&upgrade_authority], recent_blockhash);
