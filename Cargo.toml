@@ -193,6 +193,9 @@ ark-snark = "0.4"
 ark-relations = "0.4"
 ark-r1cs-std = "0.4"
 ark-crypto-primitives = { version = "0.4", features = ["r1cs", "sponge"] }
+# On-chain Groth16 verification path (BN254 / alt_bn128). #249/#165.
+solana-bn254 = "2.2"
+num-bigint = "0.4"
 
 # Solana dependencies (optional, enabled with solana-bridge feature)
 # Using newer version to avoid dependency conflicts with arkworks
