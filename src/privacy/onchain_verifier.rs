@@ -351,4 +351,114 @@ mod tests {
             "tampered public input must not verify"
         );
     }
+
+    /// Dev tool — regenerates the on-chain program's withdraw verifying-key
+    /// constant and a self-contained proof fixture for its tests. Loads the v4
+    /// ceremony keys so the emitted VK matches the live prover. Run with:
+    /// `cargo test --lib privacy::onchain_verifier::tests::emit_program_fixture \
+    ///   -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "dev fixture generator; needs keys/withdraw_*_v4.key locally"]
+    async fn emit_program_fixture() {
+        use ark_bn254::Bn254;
+        use ark_groth16::{ProvingKey, VerifyingKey};
+        use ark_serialize::CanonicalDeserialize;
+
+        fn rust_bytes(name: &str, b: &[u8]) {
+            print!("pub const {name}: [u8; {}] = [", b.len());
+            for (i, x) in b.iter().enumerate() {
+                if i % 16 == 0 {
+                    print!("\n    ");
+                }
+                print!("{x},");
+            }
+            println!("\n];");
+        }
+
+        let pk_bytes = std::fs::read("keys/withdraw_proving_v4.key").expect("proving key");
+        let vk_bytes = std::fs::read("keys/withdraw_verifying_v4.key").expect("verifying key");
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+
+        const NLEAVES: usize = 8;
+        const SPEND: usize = 3;
+        let pool = ShieldedPool::new();
+        let mut spent = None;
+        for i in 0..NLEAVES {
+            let value = 100_000u64 + i as u64;
+            let randomness = [i as u8 + 1; 32];
+            let recipient = [i as u8 + 100; 32];
+            pool.deposit(
+                Note::new_native(ShieldedAddress(recipient), value, randomness),
+                value,
+            )
+            .await
+            .unwrap();
+            if i == SPEND {
+                spent = Some((value, randomness, recipient));
+            }
+        }
+        let (value, randomness, recipient) = spent.unwrap();
+        let commitment_fr = poseidon_commit(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&randomness),
+            Fr::from_le_bytes_mod_order(&recipient),
+            Fr::from(0u64),
+        );
+        let secret = [7u8; 32];
+        let nullifier = fr_to_le_bytes_32(poseidon_nullifier(
+            commitment_fr,
+            Fr::from_le_bytes_mod_order(&secret),
+        ));
+        let commitment = Commitment::from_bytes(fr_to_le_bytes_32(commitment_fr));
+        let merkle = pool.path(&commitment).await.unwrap();
+        let root = pool.root().await;
+        let merkle_path: Vec<([u8; 32], bool)> = merkle
+            .path
+            .iter()
+            .copied()
+            .zip(merkle.indices.iter().copied())
+            .collect();
+        let circuit = WithdrawCircuit::with_witness(
+            root,
+            nullifier,
+            value,
+            value,
+            randomness,
+            recipient,
+            secret,
+            merkle_path,
+        );
+        let mut rng = thread_rng();
+        let proof =
+            Groth16ProofSystem::prove::<WithdrawCircuit, _>(&pk, circuit, &mut rng).unwrap();
+
+        let wp = proof_to_wire(&proof);
+        let wvk = WireVerifyingKey::from_arkworks(&vk);
+        let pis = [
+            fr_to_be(&Fr::from_le_bytes_mod_order(&root)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&nullifier)),
+            fr_to_be(&Fr::from(value)),
+        ];
+        assert!(
+            verify(&wp, &pis, &wvk.as_verifying_key()),
+            "emitted fixture must verify"
+        );
+
+        println!("\n// ===== withdraw verifying key (dev ceremony v4) =====");
+        rust_bytes("VK_ALPHA_G1", &wvk.alpha);
+        rust_bytes("VK_BETA_G2", &wvk.beta);
+        rust_bytes("VK_GAMMA_G2", &wvk.gamma);
+        rust_bytes("VK_DELTA_G2", &wvk.delta);
+        for (i, ic) in wvk.ic.iter().enumerate() {
+            rust_bytes(&format!("VK_IC_{i}"), ic);
+        }
+        println!("\n// ===== withdraw proof fixture =====");
+        rust_bytes("FIXTURE_ROOT", &root);
+        rust_bytes("FIXTURE_NULLIFIER", &nullifier);
+        println!("pub const FIXTURE_AMOUNT: u64 = {value};");
+        rust_bytes("FIXTURE_PROOF_A", &wp.a);
+        rust_bytes("FIXTURE_PROOF_B", &wp.b);
+        rust_bytes("FIXTURE_PROOF_C", &wp.c);
+    }
 }
