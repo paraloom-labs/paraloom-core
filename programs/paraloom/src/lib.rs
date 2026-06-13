@@ -7,6 +7,9 @@ use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 mod groth16;
+pub mod transfer_fixture_data;
+mod transfer_verifier;
+mod transfer_vk_data;
 pub mod withdraw_fixture_data;
 mod withdraw_verifier;
 mod withdraw_vk_data;
@@ -283,9 +286,10 @@ pub mod paraloom_program {
     /// nullifier, so every transaction has a uniform shape and leaks nothing
     /// about how many real notes were spent.
     ///
-    /// As with `withdraw`, the Groth16 proof is recorded but **not** verified
-    /// on-chain — verification is the L2 validator quorum's job (#194); the
-    /// `has_one = authority` gate binds settlement to the consensus leader.
+    /// As with `withdraw`, the Groth16 proof is verified on-chain (#194) via
+    /// `alt_bn128` against the current Merkle root and the transfer's
+    /// nullifiers + output commitments; the `has_one = authority` gate binds
+    /// settlement to the consensus leader.
     pub fn shielded_transfer(
         ctx: Context<ShieldedTransfer>,
         nullifiers: [[u8; 32]; 2],
@@ -304,6 +308,21 @@ pub mod paraloom_program {
         require!(
             nullifiers[0] != nullifiers[1],
             BridgeError::DuplicateNullifier
+        );
+
+        // Verify the Groth16 transfer proof on-chain (#194) against the current
+        // (pre-update) Merkle root and the transfer's nullifiers + output
+        // commitments, before recording any state. As with `withdraw`, this
+        // means the settling validator cannot forge a transfer even though it
+        // holds the settlement authority.
+        require!(
+            transfer_verifier::verify_transfer(
+                &bridge_state.merkle_root,
+                &nullifiers,
+                &output_commitments,
+                &proof,
+            ),
+            BridgeError::InvalidProof
         );
 
         let now = Clock::get()?.unix_timestamp;
