@@ -15,9 +15,10 @@
 use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::ProvingKey;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::CanonicalDeserialize;
 use ark_std::rand::thread_rng;
 use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
+use paraloom::privacy::onchain_verifier::proof_to_onchain_bytes;
 use paraloom::privacy::poseidon::{poseidon_commit, poseidon_nullifier};
 
 fn fr_to_le_bytes_32(fr: Fr) -> [u8; 32] {
@@ -92,8 +93,8 @@ fn main() {
     let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).expect("pk");
     let proof = Groth16ProofSystem::prove::<WithdrawCircuit, _>(&pk, circuit, &mut thread_rng())
         .expect("prove");
-    let mut pb = Vec::new();
-    proof.serialize_compressed(&mut pb).expect("serialize");
+    // 256-byte alt_bn128 wire form — exactly what the on-chain verifier slices.
+    let pb = proof_to_onchain_bytes(&proof).to_vec();
 
     println!(
         "{{\"nullifier\":\"{}\",\"recipient\":\"{}\",\"proof\":\"{}\",\"amount\":{},\"fee\":0}}",
