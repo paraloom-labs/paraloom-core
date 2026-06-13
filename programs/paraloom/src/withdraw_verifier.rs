@@ -7,11 +7,6 @@
 //! The proof blob is the 256-byte `alt_bn128` wire form
 //! (`proof_a[64] || proof_b[128] || proof_c[64]`), with `proof_a` already
 //! negated by the prover.
-//!
-//! Not yet called from the `withdraw` instruction: wiring it in requires the
-//! prover to emit the wire format, so it lands together with that change
-//! (#165). Until then the verifier is exercised by its own tests.
-#![allow(dead_code)]
 
 use crate::groth16::{Groth16Verifier, Groth16Verifyingkey};
 use crate::withdraw_vk_data as vk;

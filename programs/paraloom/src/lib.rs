@@ -7,8 +7,7 @@ use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 mod groth16;
-#[cfg(test)]
-mod withdraw_fixture_data;
+pub mod withdraw_fixture_data;
 mod withdraw_verifier;
 mod withdraw_vk_data;
 
@@ -179,6 +178,21 @@ pub mod paraloom_program {
         require!(
             current_slot <= expiration_slot,
             BridgeError::WithdrawalExpired
+        );
+
+        // Verify the Groth16 withdrawal proof on-chain (#165). The proof is
+        // bound to the program's published Merkle root and this withdrawal's
+        // nullifier + amount, so the settling validator cannot forge a
+        // withdrawal or redirect it to a different amount even though it holds
+        // the settlement authority.
+        require!(
+            withdraw_verifier::verify_withdrawal(
+                &bridge_state.merkle_root,
+                &nullifier,
+                amount,
+                &proof,
+            ),
+            BridgeError::InvalidProof
         );
 
         let vault_balance = ctx.accounts.bridge_vault.lamports();

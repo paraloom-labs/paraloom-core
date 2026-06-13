@@ -12,6 +12,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
+use paraloom_program::withdraw_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount, ValidatorAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
@@ -23,8 +24,19 @@ use solana_sdk::{
 mod common;
 use common::{add_program_data, entry};
 
-const NULLIFIER: [u8; 32] = [42u8; 32];
-const WITHDRAW_AMOUNT: u64 = 1_000_000_000;
+// The withdrawal proof, root, nullifier and amount come from the on-chain
+// verifier fixture so the proof actually verifies against the program's root.
+const NULLIFIER: [u8; 32] = fx::FIXTURE_NULLIFIER;
+const WITHDRAW_AMOUNT: u64 = fx::FIXTURE_AMOUNT;
+
+/// The 256-byte alt_bn128 wire proof from the fixture.
+fn fixture_proof() -> Vec<u8> {
+    let mut p = Vec::with_capacity(256);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_A);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_B);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_C);
+    p
+}
 // 25 bps of 1 SOL = 0.0025 SOL.
 const EXPECTED_FEE: u64 = WITHDRAW_AMOUNT * 25 / 10_000;
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
@@ -70,7 +82,7 @@ async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
             program_id,
             data: instruction::Initialize {
                 program_version: 0x0004_0000,
-                initial_merkle_root: [0u8; 32],
+                initial_merkle_root: fx::FIXTURE_ROOT,
             }
             .data(),
             accounts: accounts::Initialize {
@@ -164,7 +176,7 @@ async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
                 nullifier: NULLIFIER,
                 amount: WITHDRAW_AMOUNT,
                 expiration_slot: u64::MAX,
-                proof: vec![1, 2, 3, 4],
+                proof: fixture_proof(),
             }
             .data(),
             accounts: accounts::Withdraw {
