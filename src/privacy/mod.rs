@@ -2,7 +2,7 @@
 //!
 //! This module implements ZCash-inspired privacy features including:
 //! - Shielded pool with commitments and nullifiers
-//! - Zero-knowledge proofs using Groth16 on BLS12-381
+//! - Zero-knowledge proofs using Groth16 on BN254
 //! - Distributed verification across validators
 //! - Merkle tree for commitment tracking
 

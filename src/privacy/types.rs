@@ -1,12 +1,12 @@
 //! Privacy-specific types for the shielded pool
 
-use ark_bls12_381::Fr;
+use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use serde::{Deserialize, Serialize};
 
 use crate::privacy::poseidon::{poseidon_commit, poseidon_merkle_pair, poseidon_nullifier};
 
-/// Serialize an `Fr` to 32 little-endian bytes. BLS12-381 `Fr` is 255-bit,
+/// Serialize an `Fr` to 32 little-endian bytes. BN254 `Fr` is 254-bit,
 /// so the 32-byte buffer always fits and we pad trailing zeros if
 /// arkworks' `to_bytes_le` emits fewer than 32 bytes.
 fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {

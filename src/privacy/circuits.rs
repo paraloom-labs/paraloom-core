@@ -1,6 +1,6 @@
 //! zkSNARK circuits for shielded transactions
 //!
-//! Implements zero-knowledge proof circuits using Groth16 on BLS12-381 curve.
+//! Implements zero-knowledge proof circuits using Groth16 on BN254 curve.
 //! These circuits verify transaction validity without revealing sensitive information.
 //!
 //! Circuit types:
@@ -8,7 +8,7 @@
 //! - DepositCircuit: Public → Private deposits
 //! - WithdrawCircuit: Private → Public withdrawals
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::{
@@ -279,7 +279,7 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         // both sides bounded, the existing `sum_inputs == sum_outputs`
         // equality holds in the integers as well as in the field —
         // 2 inputs + 2 outputs at u64 max are still well below the
-        // BLS12-381 scalar prime, so the field equality cannot be
+        // BN254 scalar prime, so the field equality cannot be
         // gamed by a sum that wraps mod p.
         let mut output_value_vars = Vec::new();
         for value in &self.output_values {
@@ -737,38 +737,38 @@ impl Groth16ProofSystem {
     pub fn setup<C: ConstraintSynthesizer<Fr>, R: RngCore + CryptoRng>(
         circuit: C,
         rng: &mut R,
-    ) -> Result<(ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>), SynthesisError> {
-        ark_groth16::Groth16::<Bls12_381>::setup(circuit, rng)
+    ) -> Result<(ProvingKey<Bn254>, VerifyingKey<Bn254>), SynthesisError> {
+        ark_groth16::Groth16::<Bn254>::setup(circuit, rng)
             .map_err(|_| SynthesisError::Unsatisfiable)
     }
 
     /// Create a proof for a circuit
     pub fn prove<C: ConstraintSynthesizer<Fr>, R: RngCore + CryptoRng>(
-        pk: &ProvingKey<Bls12_381>,
+        pk: &ProvingKey<Bn254>,
         circuit: C,
         rng: &mut R,
-    ) -> Result<Proof<Bls12_381>, SynthesisError> {
-        ark_groth16::Groth16::<Bls12_381>::prove(pk, circuit, rng)
+    ) -> Result<Proof<Bn254>, SynthesisError> {
+        ark_groth16::Groth16::<Bn254>::prove(pk, circuit, rng)
             .map_err(|_| SynthesisError::Unsatisfiable)
     }
 
     /// Verify a proof
     pub fn verify(
-        vk: &VerifyingKey<Bls12_381>,
+        vk: &VerifyingKey<Bn254>,
         public_inputs: &[Fr],
-        proof: &Proof<Bls12_381>,
+        proof: &Proof<Bn254>,
     ) -> Result<bool, SynthesisError> {
-        ark_groth16::Groth16::<Bls12_381>::verify(vk, public_inputs, proof)
+        ark_groth16::Groth16::<Bn254>::verify(vk, public_inputs, proof)
             .map_err(|_| SynthesisError::Unsatisfiable)
     }
 
     /// Verify with prepared verifying key (faster for batch verification)
     pub fn verify_with_prepared(
-        pvk: &PreparedVerifyingKey<Bls12_381>,
+        pvk: &PreparedVerifyingKey<Bn254>,
         public_inputs: &[Fr],
-        proof: &Proof<Bls12_381>,
+        proof: &Proof<Bn254>,
     ) -> Result<bool, SynthesisError> {
-        ark_groth16::Groth16::<Bls12_381>::verify_with_processed_vk(pvk, public_inputs, proof)
+        ark_groth16::Groth16::<Bn254>::verify_with_processed_vk(pvk, public_inputs, proof)
             .map_err(|_| SynthesisError::Unsatisfiable)
     }
 }

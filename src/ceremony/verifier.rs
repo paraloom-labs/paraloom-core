@@ -15,7 +15,7 @@
 //! CLI in a later PR. This module is the cryptographic safety
 //! check that makes the SRS trustworthy.
 
-use ark_bls12_381::{Bls12_381, G1Affine, G2Affine};
+use ark_bn254::{Bn254, G1Affine, G2Affine};
 use ark_groth16::ProvingKey;
 use ark_serialize::CanonicalDeserialize;
 
@@ -54,7 +54,7 @@ pub enum VerifyError {
 /// failure the SRS must be considered compromised and the ceremony
 /// aborted.
 pub fn verify_phase2_transcript(
-    initial_pk: &ProvingKey<Bls12_381>,
+    initial_pk: &ProvingKey<Bn254>,
     transcript: &Phase2Transcript,
 ) -> Result<(), VerifyError> {
     transcript.verify_chain()?;
@@ -92,7 +92,7 @@ mod tests {
     use crate::ceremony::bgm17::apply_contribution;
     use crate::ceremony::transcript::{hash_contribution, CircuitId, Contribution, TranscriptHash};
     use crate::types::NodeId;
-    use ark_bls12_381::Fr;
+    use ark_bn254::Fr;
     use ark_ff::UniformRand;
     use ark_groth16::Groth16;
     use ark_relations::{
@@ -105,7 +105,7 @@ mod tests {
     use rand::SeedableRng;
 
     /// Trivial circuit so circuit_specific_setup yields a real
-    /// ProvingKey<Bls12_381> we can run contributions against.
+    /// ProvingKey<Bn254> we can run contributions against.
     #[derive(Clone)]
     struct TrivialCircuit;
 
@@ -129,10 +129,10 @@ mod tests {
     /// [0u8; 64] for these tests; the chain check uses it as the
     /// first prior_hash and that is all that matters for our
     /// invariants.
-    fn build_real_transcript(n: usize) -> (ProvingKey<Bls12_381>, Phase2Transcript) {
+    fn build_real_transcript(n: usize) -> (ProvingKey<Bn254>, Phase2Transcript) {
         let mut rng = rng();
         let (initial_pk, _vk) =
-            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+            Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
         let initial_hash: TranscriptHash = [0u8; 64];
         let mut transcript = Phase2Transcript::new(CircuitId::Deposit, initial_hash);
         let mut current_pk = initial_pk.clone();
@@ -179,7 +179,7 @@ mod tests {
     fn empty_transcript_verifies_against_any_initial_pk() {
         let mut rng = rng();
         let (initial_pk, _vk) =
-            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+            Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
         let transcript = Phase2Transcript::new(CircuitId::Deposit, [0u8; 64]);
         verify_phase2_transcript(&initial_pk, &transcript).expect("empty chain verifies");
     }
@@ -215,7 +215,7 @@ mod tests {
         // does not match the value the prover used.
         let mut other_rng = StdRng::seed_from_u64(0xDEAD_BEEF_u64);
         let (other_pk, _vk) =
-            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut other_rng).unwrap();
+            Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut other_rng).unwrap();
         match verify_phase2_transcript(&other_pk, &transcript) {
             Err(VerifyError::DleqRejected { position: 0, .. }) => {}
             other => panic!("expected DleqRejected at 0, got {:?}", other),

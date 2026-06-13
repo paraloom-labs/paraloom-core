@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::UniformRand;
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -61,14 +61,14 @@ pub enum ContributeError {
 /// chain integrity regardless; signatures only add the
 /// social-trust layer on top.
 pub fn contribute<R: RngCore + CryptoRng>(
-    mut prior_pk: ProvingKey<Bls12_381>,
+    mut prior_pk: ProvingKey<Bn254>,
     prior_transcript: Option<Phase2Transcript>,
     circuit: CircuitId,
     initial_srs_hash: TranscriptHash,
     contributor: NodeId,
     attestation: String,
     rng: &mut R,
-) -> Result<(ProvingKey<Bls12_381>, Phase2Transcript), ContributeError> {
+) -> Result<(ProvingKey<Bn254>, Phase2Transcript), ContributeError> {
     let delta_i = Fr::rand(rng);
     let proof = apply_contribution(&mut prior_pk, delta_i, rng)?;
 
@@ -136,10 +136,9 @@ mod tests {
         StdRng::seed_from_u64(0xCAFE_F00D_u64)
     }
 
-    fn fresh_initial_pk() -> ProvingKey<Bls12_381> {
+    fn fresh_initial_pk() -> ProvingKey<Bn254> {
         let mut rng = rng();
-        let (pk, _vk) =
-            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+        let (pk, _vk) = Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
         pk
     }
 
@@ -198,15 +197,15 @@ mod tests {
     }
 }
 
-/// Read a `ProvingKey<Bls12_381>` from a compressed-arkworks file.
-pub fn read_pk(path: &Path) -> Result<ProvingKey<Bls12_381>, ContributeError> {
+/// Read a `ProvingKey<Bn254>` from a compressed-arkworks file.
+pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
     let bytes = fs::read(path)?;
-    ProvingKey::<Bls12_381>::deserialize_compressed(&bytes[..])
+    ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
         .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
 }
 
-/// Write a `ProvingKey<Bls12_381>` to a compressed-arkworks file.
-pub fn write_pk(pk: &ProvingKey<Bls12_381>, path: &Path) -> Result<(), ContributeError> {
+/// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
+pub fn write_pk(pk: &ProvingKey<Bn254>, path: &Path) -> Result<(), ContributeError> {
     write_compressed(pk, path)
 }
 

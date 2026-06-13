@@ -135,7 +135,7 @@ async fn test_nullifier_generation_and_tracking() {
 #[tokio::test]
 #[ignore] // Proof generation is slow (60+ seconds), run manually with: cargo test --test privacy_integration_test test_proof_serialization_codec -- --ignored
 async fn test_proof_serialization_codec() {
-    use ark_bls12_381::Bls12_381;
+    use ark_bn254::Bn254;
     use ark_groth16::Proof;
     use ark_std::rand::rngs::StdRng;
     use ark_std::rand::SeedableRng;
@@ -165,7 +165,7 @@ async fn test_proof_serialization_codec() {
     log::info!("Serialized proof size: {} bytes", serialized.len());
 
     // Deserialize the proof
-    let deserialized: Proof<Bls12_381> = deserialize_proof(&serialized).unwrap();
+    let deserialized: Proof<Bn254> = deserialize_proof(&serialized).unwrap();
     log::info!("PASS: Proof deserialized");
 
     // Serialize again and verify roundtrip
@@ -265,7 +265,7 @@ async fn test_nullifier_uniqueness() {
 
 #[tokio::test]
 async fn test_field_element_codec() {
-    use ark_bls12_381::Fr;
+    use ark_bn254::Fr;
     use ark_std::UniformRand;
 
     env_logger::builder()

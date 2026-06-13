@@ -38,7 +38,7 @@
 //!   SLIPPAGE_BPS             Jupiter slippage tolerance (50).
 //!   JUPITER_BASE_URL         Jupiter v6 base (quote-api.jup.ag/v6).
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
     nullifier_bytes.copy_from_slice(nullifier.as_bytes());
 
     let proving_key_bytes = fs::read(PROVING_KEY_PATH)?;
-    let proving_key = ProvingKey::<Bls12_381>::deserialize_compressed(&proving_key_bytes[..])?;
+    let proving_key = ProvingKey::<Bn254>::deserialize_compressed(&proving_key_bytes[..])?;
     let circuit = WithdrawCircuit::with_witness(
         merkle_root_bytes,
         nullifier_bytes,
@@ -234,16 +234,15 @@ async fn main() -> anyhow::Result<()> {
         proof_start.elapsed().as_secs_f64()
     );
     if Path::new(VERIFYING_KEY_PATH).exists() {
-        let vk =
-            VerifyingKey::<Bls12_381>::deserialize_compressed(&fs::read(VERIFYING_KEY_PATH)?[..])?;
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&fs::read(VERIFYING_KEY_PATH)?[..])?;
         let public_inputs = vec![
             Fr::from_le_bytes_mod_order(&merkle_root_bytes),
             Fr::from_le_bytes_mod_order(&nullifier_bytes),
             Fr::from(swap_amount),
         ];
         // The on-chain withdraw path records the proof but does NOT verify it
-        // (#165, pending SIMD-0388 BLS12-381 precompiles); real verification is
-        // the L2 quorum's job. So a local-verify mismatch (e.g. a proving key /
+        // yet (#165/#249, on-chain alt_bn128 verifier pending); real
+        // verification is currently the L2 quorum's job. So a local-verify mismatch (e.g. a proving key /
         // verifying key vintage skew between keys/withdraw_*_v3.key) is a
         // diagnostic, not a blocker for exercising the on-chain legs — what the
         // chain actually checks is the non-empty proof and the nullifier the

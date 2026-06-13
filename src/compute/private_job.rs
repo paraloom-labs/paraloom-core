@@ -274,7 +274,7 @@ impl PrivateJobResult {
     }
 
     /// Load compute proving key from disk
-    fn load_proving_key() -> Result<ark_groth16::ProvingKey<ark_bls12_381::Bls12_381>> {
+    fn load_proving_key() -> Result<ark_groth16::ProvingKey<ark_bn254::Bn254>> {
         use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
@@ -286,7 +286,7 @@ impl PrivateJobResult {
     }
 
     /// Load compute verifying key from disk
-    fn load_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bls12_381::Bls12_381>> {
+    fn load_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bn254::Bn254>> {
         use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
@@ -372,7 +372,7 @@ impl PrivateJobResult {
             let mut rng = ark_std::rand::thread_rng();
 
             let start = std::time::Instant::now();
-            let proof = Groth16::<ark_bls12_381::Bls12_381>::prove(&pk, circuit, &mut rng)
+            let proof = Groth16::<ark_bn254::Bn254>::prove(&pk, circuit, &mut rng)
                 .map_err(|e| anyhow!("Proof generation failed: {:?}", e))?;
 
             let proof_time = start.elapsed();
@@ -429,7 +429,7 @@ impl PrivateJobResult {
 
             // Deserialize proof
             use ark_serialize::CanonicalDeserialize;
-            let proof = ark_groth16::Proof::<ark_bls12_381::Bls12_381>::deserialize_compressed(
+            let proof = ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed(
                 proof_bytes.as_slice(),
             )
             .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
@@ -441,7 +441,7 @@ impl PrivateJobResult {
             // (`code_hash = [0; 32]`, dummy input/owner/spending_key)
             // until the runtime threads real ownership info through;
             // the verifier mirrors those placeholders exactly.
-            let code_hash_fr = ark_bls12_381::Fr::from_le_bytes_mod_order(&[0u8; 32]);
+            let code_hash_fr = ark_bn254::Fr::from_le_bytes_mod_order(&[0u8; 32]);
 
             let dummy_input = vec![0u8];
             let dummy_input_randomness = [0u8; 32];
@@ -460,7 +460,7 @@ impl PrivateJobResult {
             // to Fr exactly as the circuit's public-input allocation
             // does on its side.
             let output_commitment_fr =
-                ark_bls12_381::Fr::from_le_bytes_mod_order(result.output_commitment.as_bytes());
+                ark_bn254::Fr::from_le_bytes_mod_order(result.output_commitment.as_bytes());
 
             let input_nullifier_fr = crate::compute::ComputeCircuit::compute_nullifier(
                 dummy_input_commitment_fr,
@@ -479,7 +479,7 @@ impl PrivateJobResult {
             use ark_snark::SNARK;
 
             let start = std::time::Instant::now();
-            let valid = Groth16::<ark_bls12_381::Bls12_381>::verify(&vk, &public_inputs, &proof)
+            let valid = Groth16::<ark_bn254::Bn254>::verify(&vk, &public_inputs, &proof)
                 .map_err(|e| anyhow!("Proof verification failed: {:?}", e))?;
 
             let verify_time = start.elapsed();

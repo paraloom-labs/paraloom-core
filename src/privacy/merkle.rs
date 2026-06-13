@@ -7,7 +7,7 @@
 use crate::privacy::poseidon::poseidon_merkle_pair;
 use crate::privacy::types::{Commitment, MerklePath};
 use crate::storage::PrivacyStorage;
-use ark_bls12_381::Fr;
+use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use std::sync::Arc;
 use tokio::sync::RwLock;

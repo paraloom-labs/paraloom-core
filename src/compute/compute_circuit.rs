@@ -47,7 +47,7 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, fields::fp::FpVar, fields::FieldVar};
@@ -166,7 +166,7 @@ impl ComputeCircuit {
         }
     }
 
-    /// Hash data to a field element via SHA-256 reduced mod the BLS12-381
+    /// Hash data to a field element via SHA-256 reduced mod the BN254
     /// scalar prime. The previous implementation truncated SHA-256 to
     /// 64 bits; collapsing the digest down to a u64 was security-
     /// theatre because the in-circuit commitment then bound to a
@@ -273,7 +273,7 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
         // The audit (#63) called for "Pedersen commitment gadget"; the
         // architectural decision documented in this PR is to use the
         // privacy layer's Poseidon scheme everywhere — implementing a
-        // BLS12-381-G1 Pedersen gadget inside an Fr-based circuit is
+        // BN254-G1 Pedersen gadget inside an Fr-based circuit is
         // impractical (non-native field arithmetic), and the privacy
         // layer's v0.2 Poseidon migration already replaced Pedersen on
         // the host side for the same reason. Aligning the compute
@@ -326,29 +326,29 @@ impl ComputeProofSystem {
     /// Generate proving and verifying keys (one-time setup)
     pub fn setup<R: RngCore + CryptoRng>(
         rng: &mut R,
-    ) -> Result<(ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>), Box<dyn std::error::Error>> {
+    ) -> Result<(ProvingKey<Bn254>, VerifyingKey<Bn254>), Box<dyn std::error::Error>> {
         let circuit = ComputeCircuit::new();
-        let (pk, vk) = ark_groth16::Groth16::<Bls12_381>::circuit_specific_setup(circuit, rng)?;
+        let (pk, vk) = ark_groth16::Groth16::<Bn254>::circuit_specific_setup(circuit, rng)?;
         Ok((pk, vk))
     }
 
     /// Generate a proof for a compute job
     pub fn prove<R: RngCore + CryptoRng>(
-        pk: &ProvingKey<Bls12_381>,
+        pk: &ProvingKey<Bn254>,
         circuit: ComputeCircuit,
         rng: &mut R,
-    ) -> Result<Proof<Bls12_381>, Box<dyn std::error::Error>> {
-        let proof = ark_groth16::Groth16::<Bls12_381>::prove(pk, circuit, rng)?;
+    ) -> Result<Proof<Bn254>, Box<dyn std::error::Error>> {
+        let proof = ark_groth16::Groth16::<Bn254>::prove(pk, circuit, rng)?;
         Ok(proof)
     }
 
     /// Verify a compute proof
     pub fn verify(
-        vk: &VerifyingKey<Bls12_381>,
+        vk: &VerifyingKey<Bn254>,
         public_inputs: &[Fr],
-        proof: &Proof<Bls12_381>,
+        proof: &Proof<Bn254>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let valid = ark_groth16::Groth16::<Bls12_381>::verify(vk, public_inputs, proof)?;
+        let valid = ark_groth16::Groth16::<Bn254>::verify(vk, public_inputs, proof)?;
         Ok(valid)
     }
 }

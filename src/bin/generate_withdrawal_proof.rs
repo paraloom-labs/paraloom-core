@@ -1,4 +1,4 @@
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Loading proving key from {}...", PROVING_KEY_PATH);
     let proving_key_bytes = fs::read(PROVING_KEY_PATH)?;
-    let proving_key = ProvingKey::<Bls12_381>::deserialize_compressed(&proving_key_bytes[..])?;
+    let proving_key = ProvingKey::<Bn254>::deserialize_compressed(&proving_key_bytes[..])?;
 
     println!("Creating withdrawal circuit with witness...");
     let circuit = WithdrawCircuit::with_witness(
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nVerifying proof locally...");
         let verifying_key_bytes = fs::read(VERIFYING_KEY_PATH)?;
         let verifying_key =
-            VerifyingKey::<Bls12_381>::deserialize_compressed(&verifying_key_bytes[..])?;
+            VerifyingKey::<Bn254>::deserialize_compressed(&verifying_key_bytes[..])?;
 
         // Public inputs: 3 Fr total, matching the post-Poseidon
         // WithdrawCircuit shape — merkle_root, nullifier, amount — each

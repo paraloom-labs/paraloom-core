@@ -1,13 +1,13 @@
-//! Pedersen commitment scheme using BLS12-381 curve
+//! Pedersen commitment scheme using BN254 curve
 //!
 //! Provides cryptographically secure commitments using elliptic curve cryptography.
 //! This replaces the hash-based placeholder implementation with real Pedersen commitments.
 //!
 //! Pedersen commitment: C = value*G + randomness*H
-//! where G and H are generator points on the BLS12-381 curve.
+//! where G and H are generator points on the BN254 curve.
 
 use crate::privacy::types::Commitment;
-use ark_bls12_381::{Fr, G1Affine, G1Projective};
+use ark_bn254::{Fr, G1Affine, G1Projective};
 use ark_ec::{AffineRepr, CurveGroup, Group};
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;

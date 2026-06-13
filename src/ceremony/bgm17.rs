@@ -2,7 +2,7 @@
 //!
 //! Implements the contribution operation from Bowe, Gabizon, Miers
 //! (eprint 2017/1050) directly against arkworks
-//! `ProvingKey<Bls12_381>` types. This is the cryptographic core of
+//! `ProvingKey<Bn254>` types. This is the cryptographic core of
 //! paraloom's MPC ceremony: every contributor calls
 //! [`apply_contribution`] with their toxic-waste scalar `δ_i`;
 //! every verifier calls [`verify_contribution`] against the
@@ -44,7 +44,7 @@
 //! Both equations hold iff the same `δ_i` was applied to both
 //! delta values.
 
-use ark_bls12_381::{Bls12_381, Fr, G1Affine, G2Affine};
+use ark_bn254::{Bn254, Fr, G1Affine, G2Affine};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{Field, PrimeField, UniformRand, Zero};
 use ark_groth16::ProvingKey;
@@ -112,7 +112,7 @@ impl DleqProof {
 /// `delta_i` must not be zero. The function returns
 /// [`BgmError::ZeroContribution`] without mutating `pk` if it is.
 pub fn apply_contribution<R: RngCore>(
-    pk: &mut ProvingKey<Bls12_381>,
+    pk: &mut ProvingKey<Bn254>,
     delta_i: Fr,
     rng: &mut R,
 ) -> Result<DleqProof, BgmError> {
@@ -159,8 +159,8 @@ pub fn apply_contribution<R: RngCore>(
 /// non-delta portions of `pk_after` equal `pk_before`. Those
 /// structural checks live in subsequent PRs.
 pub fn verify_contribution(
-    pk_before: &ProvingKey<Bls12_381>,
-    pk_after: &ProvingKey<Bls12_381>,
+    pk_before: &ProvingKey<Bn254>,
+    pk_after: &ProvingKey<Bn254>,
     proof: &DleqProof,
 ) -> Result<(), BgmError> {
     verify_contribution_deltas(
@@ -286,7 +286,7 @@ mod tests {
     }
 
     /// Trivial circuit so we can call `circuit_specific_setup` and
-    /// produce a real `ProvingKey<Bls12_381>` for the
+    /// produce a real `ProvingKey<Bn254>` for the
     /// contribution operation. We never prove or verify against
     /// it; the bgm17 module operates purely on the ProvingKey
     /// shape.
@@ -303,10 +303,9 @@ mod tests {
         }
     }
 
-    fn fresh_pk() -> ProvingKey<Bls12_381> {
+    fn fresh_pk() -> ProvingKey<Bn254> {
         let mut rng = test_rng();
-        let (pk, _vk) =
-            Groth16::<Bls12_381>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+        let (pk, _vk) = Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
         pk
     }
 

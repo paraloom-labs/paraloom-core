@@ -9,7 +9,7 @@
 //!
 //! This is especially important for Raspberry Pi validators.
 
-use ark_bls12_381::{Bls12_381, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_groth16::{PreparedVerifyingKey, Proof, VerifyingKey};
 use ark_relations::r1cs::SynthesisError;
 use ark_snark::SNARK;
@@ -37,7 +37,7 @@ impl BatchVerificationResult {
 /// Batch verifier for Groth16 proofs
 pub struct BatchVerifier {
     /// Prepared verifying key (cached for performance)
-    pvk: Option<PreparedVerifyingKey<Bls12_381>>,
+    pvk: Option<PreparedVerifyingKey<Bn254>>,
 }
 
 impl BatchVerifier {
@@ -47,9 +47,9 @@ impl BatchVerifier {
     }
 
     /// Create a batch verifier with a prepared verifying key
-    pub fn with_prepared_vk(vk: &VerifyingKey<Bls12_381>) -> Self {
+    pub fn with_prepared_vk(vk: &VerifyingKey<Bn254>) -> Self {
         use ark_groth16::Groth16;
-        let pvk = Groth16::<Bls12_381>::process_vk(vk).ok();
+        let pvk = Groth16::<Bn254>::process_vk(vk).ok();
         BatchVerifier { pvk }
     }
 
@@ -59,9 +59,9 @@ impl BatchVerifier {
     /// All proofs must use the same verifying key.
     pub fn verify_batch(
         &self,
-        vk: &VerifyingKey<Bls12_381>,
+        vk: &VerifyingKey<Bn254>,
         public_inputs: &[Vec<Fr>],
-        proofs: &[Proof<Bls12_381>],
+        proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
         if proofs.is_empty() {
             return BatchVerificationResult::AllValid;
@@ -85,7 +85,7 @@ impl BatchVerifier {
         let pvk = match &self.pvk {
             Some(pvk) => pvk,
             None => {
-                owned_pvk = match Groth16::<Bls12_381>::process_vk(vk) {
+                owned_pvk = match Groth16::<Bn254>::process_vk(vk) {
                     Ok(pvk) => pvk,
                     Err(_) => {
                         return BatchVerificationResult::Error {
@@ -127,9 +127,9 @@ impl BatchVerifier {
     /// Verify proofs individually (fallback for small batches)
     fn verify_individually(
         &self,
-        vk: &VerifyingKey<Bls12_381>,
+        vk: &VerifyingKey<Bn254>,
         public_inputs: &[Vec<Fr>],
-        proofs: &[Proof<Bls12_381>],
+        proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
         let mut invalid_indices = Vec::new();
 
@@ -155,9 +155,9 @@ impl BatchVerifier {
     /// Verify a single proof with prepared verifying key
     fn verify_single_with_prepared(
         &self,
-        pvk: &PreparedVerifyingKey<Bls12_381>,
+        pvk: &PreparedVerifyingKey<Bn254>,
         public_inputs: &[Fr],
-        proof: &Proof<Bls12_381>,
+        proof: &Proof<Bn254>,
     ) -> Result<bool, SynthesisError> {
         crate::privacy::circuits::Groth16ProofSystem::verify_with_prepared(
             pvk,
@@ -192,9 +192,9 @@ impl AdaptiveBatchVerifier {
 
     pub fn verify(
         &self,
-        vk: &VerifyingKey<Bls12_381>,
+        vk: &VerifyingKey<Bn254>,
         public_inputs: &[Vec<Fr>],
-        proofs: &[Proof<Bls12_381>],
+        proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
         match proofs.len() {
             0 => BatchVerificationResult::AllValid,
