@@ -13,6 +13,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
+use paraloom_program::transfer_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
@@ -24,9 +25,26 @@ use solana_sdk::{
 mod common;
 use common::{add_program_data, entry};
 
-const N0: [u8; 32] = [42u8; 32];
-const N1: [u8; 32] = [43u8; 32];
+// Nullifiers, output commitments, root and proof come from the on-chain
+// transfer verifier fixture so the happy-path proof verifies against the
+// program's root.
+const N0: [u8; 32] = fx::FIXTURE_NULLIFIER_0;
+const N1: [u8; 32] = fx::FIXTURE_NULLIFIER_1;
 const NEW_ROOT: [u8; 32] = [7u8; 32];
+
+/// The 256-byte alt_bn128 wire transfer proof from the fixture.
+fn fixture_proof() -> Vec<u8> {
+    let mut p = Vec::with_capacity(256);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_A);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_B);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_C);
+    p
+}
+
+/// The two output commitments bound into the fixture proof.
+fn out_commitments() -> [[u8; 32]; 2] {
+    [fx::FIXTURE_COMMITMENT_0, fx::FIXTURE_COMMITMENT_1]
+}
 
 fn initialize_ix(
     program_id: Pubkey,
@@ -38,7 +56,7 @@ fn initialize_ix(
         program_id,
         data: instruction::Initialize {
             program_version: 0x0004_0000,
-            initial_merkle_root: [0u8; 32],
+            initial_merkle_root: fx::FIXTURE_ROOT,
         }
         .data(),
         accounts: accounts::Initialize {
@@ -94,9 +112,9 @@ async fn shielded_transfer_records_nullifiers_and_advances_root() {
             program_id,
             data: instruction::ShieldedTransfer {
                 nullifiers: [N0, N1],
-                output_commitments: [[1u8; 32], [2u8; 32]],
+                output_commitments: out_commitments(),
                 new_merkle_root: NEW_ROOT,
-                proof: vec![1, 2, 3, 4],
+                proof: fixture_proof(),
             }
             .data(),
             accounts: accounts::ShieldedTransfer {
@@ -154,9 +172,9 @@ async fn shielded_transfer_replay_is_rejected() {
         program_id,
         data: instruction::ShieldedTransfer {
             nullifiers: [N0, N1],
-            output_commitments: [[1u8; 32], [2u8; 32]],
+            output_commitments: out_commitments(),
             new_merkle_root: root,
-            proof: vec![1, 2, 3, 4],
+            proof: fixture_proof(),
         }
         .data(),
         accounts: accounts::ShieldedTransfer {
@@ -221,9 +239,9 @@ async fn shielded_transfer_with_duplicate_nullifier_is_rejected() {
         program_id,
         data: instruction::ShieldedTransfer {
             nullifiers: [N0, N0],
-            output_commitments: [[1u8; 32], [2u8; 32]],
+            output_commitments: out_commitments(),
             new_merkle_root: NEW_ROOT,
-            proof: vec![1, 2, 3, 4],
+            proof: fixture_proof(),
         }
         .data(),
         accounts: accounts::ShieldedTransfer {
