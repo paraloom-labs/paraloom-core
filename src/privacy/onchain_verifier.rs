@@ -487,4 +487,153 @@ mod tests {
         rust_bytes("FIXTURE_PROOF_B", &wp.b);
         rust_bytes("FIXTURE_PROOF_C", &wp.c);
     }
+
+    /// Dev tool — regenerates the transfer verifying-key constant + a 2-in/2-out
+    /// transfer proof fixture for the on-chain transfer verifier (#194). Loads
+    /// the transfer ceremony keys. Run with:
+    /// `cargo test --lib privacy::onchain_verifier::tests::emit_transfer_fixture \
+    ///   -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "dev fixture generator; needs keys/transfer_*.key locally"]
+    async fn emit_transfer_fixture() {
+        use crate::privacy::circuits::TransferCircuit;
+        use ark_bn254::Bn254;
+        use ark_groth16::{ProvingKey, VerifyingKey};
+        use ark_serialize::CanonicalDeserialize;
+
+        fn rust_bytes(name: &str, b: &[u8]) {
+            print!("pub const {name}: [u8; {}] = [", b.len());
+            for (i, x) in b.iter().enumerate() {
+                if i % 16 == 0 {
+                    print!("\n    ");
+                }
+                print!("{x},");
+            }
+            println!("\n];");
+        }
+
+        async fn spend_parts(
+            pool: &ShieldedPool,
+            value: u64,
+            randomness: [u8; 32],
+            recipient: [u8; 32],
+            secret: [u8; 32],
+        ) -> ([u8; 32], Vec<([u8; 32], bool)>) {
+            let commitment_fr = poseidon_commit(
+                Fr::from(value),
+                Fr::from_le_bytes_mod_order(&randomness),
+                Fr::from_le_bytes_mod_order(&recipient),
+                Fr::from(0u64),
+            );
+            let nullifier_fr =
+                poseidon_nullifier(commitment_fr, Fr::from_le_bytes_mod_order(&secret));
+            let commitment = Commitment::from_bytes(fr_to_le_bytes_32(commitment_fr));
+            let merkle = pool.path(&commitment).await.unwrap();
+            let path = merkle
+                .path
+                .iter()
+                .copied()
+                .zip(merkle.indices.iter().copied())
+                .collect();
+            (fr_to_le_bytes_32(nullifier_fr), path)
+        }
+
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(
+            &std::fs::read("keys/transfer_proving.key").expect("transfer proving key")[..],
+        )
+        .unwrap();
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(
+            &std::fs::read("keys/transfer_verifying.key").expect("transfer verifying key")[..],
+        )
+        .unwrap();
+
+        const N: usize = 8;
+        let pool = ShieldedPool::new();
+        let mut notes = Vec::new();
+        for i in 0..N {
+            let value = 100_000u64 + i as u64;
+            let randomness = [i as u8 + 1; 32];
+            let recipient = [i as u8 + 100; 32];
+            pool.deposit(
+                Note::new_native(ShieldedAddress(recipient), value, randomness),
+                value,
+            )
+            .await
+            .unwrap();
+            notes.push((value, randomness, recipient));
+        }
+        let (v0, r0, rec0) = notes[2];
+        let (v1, r1, rec1) = notes[5];
+        let secret0 = [0xC0u8; 32];
+        let secret1 = [0xC1u8; 32];
+        let (null0, path0) = spend_parts(&pool, v0, r0, rec0, secret0).await;
+        let (null1, path1) = spend_parts(&pool, v1, r1, rec1, secret1).await;
+        let root = pool.root().await;
+
+        let out_total = v0 + v1;
+        let (out_rand0, out_rec0) = ([0xD0u8; 32], [0xE0u8; 32]);
+        let (out_rand1, out_rec1) = ([0xD1u8; 32], [0xE1u8; 32]);
+        let commit_out0 = fr_to_le_bytes_32(poseidon_commit(
+            Fr::from(out_total),
+            Fr::from_le_bytes_mod_order(&out_rand0),
+            Fr::from_le_bytes_mod_order(&out_rec0),
+            Fr::from(0u64),
+        ));
+        let commit_out1 = fr_to_le_bytes_32(poseidon_commit(
+            Fr::from(0u64),
+            Fr::from_le_bytes_mod_order(&out_rand1),
+            Fr::from_le_bytes_mod_order(&out_rec1),
+            Fr::from(0u64),
+        ));
+
+        let circuit = TransferCircuit::with_witness(
+            root,
+            vec![null0, null1],
+            vec![commit_out0, commit_out1],
+            vec![v0, v1],
+            vec![r0, r1],
+            vec![rec0, rec1],
+            vec![secret0, secret1],
+            vec![path0, path1],
+            vec![out_total, 0],
+            vec![out_rand0, out_rand1],
+            vec![out_rec0, out_rec1],
+        );
+        let mut rng = thread_rng();
+        let proof =
+            Groth16ProofSystem::prove::<TransferCircuit, _>(&pk, circuit, &mut rng).unwrap();
+
+        let wp = proof_to_wire(&proof);
+        let wvk = WireVerifyingKey::from_arkworks(&vk);
+        // Public inputs, in circuit order: [root, null0, null1, commit0, commit1].
+        let pis = [
+            fr_to_be(&Fr::from_le_bytes_mod_order(&root)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&null0)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&null1)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&commit_out0)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&commit_out1)),
+        ];
+        assert!(
+            verify(&wp, &pis, &wvk.as_verifying_key()),
+            "emitted transfer fixture must verify"
+        );
+
+        println!("\n// ===== transfer verifying key (dev ceremony) =====");
+        rust_bytes("VK_ALPHA_G1", &wvk.alpha);
+        rust_bytes("VK_BETA_G2", &wvk.beta);
+        rust_bytes("VK_GAMMA_G2", &wvk.gamma);
+        rust_bytes("VK_DELTA_G2", &wvk.delta);
+        for (i, ic) in wvk.ic.iter().enumerate() {
+            rust_bytes(&format!("VK_IC_{i}"), ic);
+        }
+        println!("\n// ===== transfer proof fixture =====");
+        rust_bytes("FIXTURE_ROOT", &root);
+        rust_bytes("FIXTURE_NULLIFIER_0", &null0);
+        rust_bytes("FIXTURE_NULLIFIER_1", &null1);
+        rust_bytes("FIXTURE_COMMITMENT_0", &commit_out0);
+        rust_bytes("FIXTURE_COMMITMENT_1", &commit_out1);
+        rust_bytes("FIXTURE_PROOF_A", &wp.a);
+        rust_bytes("FIXTURE_PROOF_B", &wp.b);
+        rust_bytes("FIXTURE_PROOF_C", &wp.c);
+    }
 }
