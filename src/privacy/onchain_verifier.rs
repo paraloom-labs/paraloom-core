@@ -110,6 +110,18 @@ pub fn proof_to_onchain_bytes(proof: &Proof<ark_bn254::Bn254>) -> [u8; 256] {
     proof_to_wire(proof).to_bytes()
 }
 
+/// Deserialize an arkworks-compressed BN254 proof and re-encode it as the
+/// 256-byte on-chain wire blob. Used at the submission boundary, where the
+/// node/relayer holds the prover's compressed proof and must hand the program
+/// the wire form it verifies.
+pub fn compressed_proof_to_onchain_bytes(
+    compressed: &[u8],
+) -> Result<[u8; 256], ark_serialize::SerializationError> {
+    use ark_serialize::CanonicalDeserialize;
+    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(compressed)?;
+    Ok(proof_to_onchain_bytes(&proof))
+}
+
 /// A verifying key in the byte layout the vendored verifier consumes. Owns the
 /// IC vector so the borrowed [`Groth16Verifyingkey`] can point into it.
 pub struct WireVerifyingKey {
