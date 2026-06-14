@@ -142,6 +142,13 @@ impl Submitter for OnChainSubmitter {
         let fresh = Pubkey::new_from_array(fresh_address);
         let nullifier_bytes = *nullifier.as_bytes();
 
+        // The prover hands us the arkworks-compressed proof; the on-chain
+        // verifier expects the 256-byte alt_bn128 wire form. Convert at this
+        // submission boundary (#249).
+        let proof = crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&proof)
+            .map_err(|e| RelayerError::SubmissionFailed(format!("proof encoding: {e}")))?
+            .to_vec();
+
         let signature = match leg {
             WithdrawLeg::Native => {
                 let (bridge_vault, _) = derive_bridge_vault(&self.program_id);
