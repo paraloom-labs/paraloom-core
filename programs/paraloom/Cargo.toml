@@ -1,5 +1,13 @@
 [workspace]
 
+# This program is its own workspace root (the empty `[workspace]` above detaches
+# it from the repo root), so the Anchor-template release safety net does not
+# apply unless set here. Enable overflow checks for release/SBF builds so an
+# arithmetic overflow on a balance, counter, or reward panics instead of
+# silently wrapping (audit hardening).
+[profile.release]
+overflow-checks = true
+
 [package]
 name = "paraloom-program"
 version = "0.1.0"
