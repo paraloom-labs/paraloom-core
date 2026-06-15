@@ -10,6 +10,15 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Overflow checks enabled for release/SBF builds** (in-house security audit).
+  The on-chain program is its own Cargo workspace root, which detached it from
+  the Anchor template's release profile — so release/SBF builds compiled with
+  overflow checks off, and an arithmetic overflow on a balance, counter, or
+  validator reward would wrap silently instead of panicking. Release builds now
+  set `overflow-checks = true`. The flagged arithmetic is lamport-bounded or
+  monotonic (so no concrete overflow is reachable today), making this
+  defense-in-depth hardening; fixed pre-mainnet on devnet.
+
 - **Withdrawal note marked spent only after on-chain settlement** (in-house
   security audit). The submitter recorded a withdrawal's nullifier as spent in
   the local pool **before** submitting the settlement on-chain, with no rollback
