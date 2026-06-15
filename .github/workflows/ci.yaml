@@ -292,6 +292,12 @@ jobs:
       - name: Run relay reservation E2E (ignored)
         run: cargo test --test relay_reservation_e2e --all-features -- --ignored --test-threads=1 --nocapture
 
+      # #260 co-sign request-response E2E. Also `#[ignore]`'d (binds loopback
+      # TCP, depends on connection timing) and needs no Solana validator, so it
+      # rides this same plain-runner job.
+      - name: Run co-sign protocol E2E (ignored)
+        run: cargo test --test cosign_e2e --all-features -- --ignored --test-threads=1 --nocapture
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
