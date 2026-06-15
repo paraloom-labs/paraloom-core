@@ -13,18 +13,20 @@ use libp2p::{
     relay,
     request_response::{
         Behaviour as RequestResponse, Event as RequestResponseEvent,
-        Message as RequestResponseMessage,
+        Message as RequestResponseMessage, OutboundRequestId,
     },
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Swarm},
     tcp, yamux, Multiaddr, PeerId,
 };
 use log::{debug, info};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::config::Settings;
 use crate::types::NodeId;
 
+use super::cosign::{create_cosign_protocol, CoSignCodec, CoSignRequest, CoSignResponse};
 use super::discovery::PeerRegistry;
 use super::heartbeat::{
     create_heartbeat_protocol, HeartbeatCodec, HeartbeatRequest, HeartbeatResponse,
@@ -55,6 +57,11 @@ pub struct ParaloomBehaviour {
     pub gossipsub: Gossipsub,
     pub request_response: RequestResponse<ResultCodec>,
     pub heartbeat: RequestResponse<HeartbeatCodec>,
+    /// Settlement co-signing protocol (#260). The round leader sends each
+    /// approving validator a `CoSignRequest` carrying the unsigned settlement
+    /// transaction message and collects their signatures to satisfy the
+    /// on-chain validator quorum.
+    pub cosign: RequestResponse<CoSignCodec>,
     /// Kademlia DHT for peer discovery (#65). Routing table is
     /// empty at construction; bootstrap registration and periodic
     /// refresh land in subsequent PRs.
@@ -132,6 +139,23 @@ pub trait NetworkEventHandler: Send + Sync {
             last_applied_sequence: 0,
         })
     }
+
+    /// Handle an inbound settlement co-sign request (#260). The default
+    /// declines (`signature: None`) so a node that has not opted into
+    /// validator co-signing never signs a settlement it cannot vouch for; the
+    /// verify-then-sign implementation lives on the node.
+    async fn handle_cosign_request(
+        &self,
+        _source: NodeId,
+        request: CoSignRequest,
+    ) -> Result<CoSignResponse> {
+        log::warn!("Received cosign request but handler not implemented");
+        Ok(CoSignResponse {
+            request_id: request.request_id,
+            wallet_pubkey: String::new(),
+            signature: None,
+        })
+    }
 }
 
 /// Network manager
@@ -148,6 +172,12 @@ pub struct NetworkManager {
     /// The slow / offline distinction in #65's acceptance criteria
     /// is enforced here.
     peer_registry: Arc<Mutex<PeerRegistry>>,
+    /// Outstanding co-sign requests this node sent as round leader (#260),
+    /// keyed by the libp2p outbound request id. `send_cosign_request` inserts a
+    /// oneshot here and awaits it; the event loop completes it when the matching
+    /// response arrives, or drops it on outbound failure / timeout so the
+    /// awaiter errors instead of hanging.
+    cosign_waiters: Arc<Mutex<HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>>>,
 }
 
 /// Load a libp2p ed25519 identity from `path` (protobuf-encoded, the format
@@ -244,6 +274,7 @@ impl NetworkManager {
 
         let request_response = create_result_protocol();
         let heartbeat = create_heartbeat_protocol();
+        let cosign = create_cosign_protocol();
 
         // Kademlia DHT in Server mode so this node accepts queries
         // from other peers and contributes its routing-table view.
@@ -323,6 +354,7 @@ impl NetworkManager {
                 gossipsub,
                 request_response,
                 heartbeat,
+                cosign,
                 kad,
                 ping,
                 autonat,
@@ -342,6 +374,7 @@ impl NetworkManager {
             handler: Arc::new(Mutex::new(None)),
             connected_peers: Arc::new(Mutex::new(Vec::new())),
             peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
+            cosign_waiters: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -507,6 +540,7 @@ impl NetworkManager {
         let handler_clone = self.handler.clone();
         let connected_peers_clone = self.connected_peers.clone();
         let peer_registry_clone = self.peer_registry.clone();
+        let cosign_waiters_clone = self.cosign_waiters.clone();
 
         // Spawn task to handle events
         tokio::spawn(async move {
@@ -516,6 +550,7 @@ impl NetworkManager {
                 handler_clone,
                 connected_peers_clone,
                 peer_registry_clone,
+                cosign_waiters_clone,
             )
             .await;
         });
@@ -530,6 +565,7 @@ impl NetworkManager {
         handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
         connected_peers: Arc<Mutex<Vec<PeerId>>>,
         peer_registry: Arc<Mutex<PeerRegistry>>,
+        cosign_waiters: Arc<Mutex<HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>>>,
     ) {
         info!("Starting network event loop");
 
@@ -743,6 +779,71 @@ impl NetworkManager {
                                             }
                                         }
 
+                                        ParaloomBehaviourEvent::Cosign(cosign_event) => {
+                                            match cosign_event {
+                                                RequestResponseEvent::Message { peer, message, connection_id: _ } => {
+                                                    match message {
+                                                        RequestResponseMessage::Request { request, channel, .. } => {
+                                                            let source = NodeId(peer.to_bytes());
+                                                            let request_id = request.request_id.clone();
+                                                            let handler_lock = handler.lock().await;
+                                                            let response = if let Some(h) = handler_lock.as_ref() {
+                                                                match h.handle_cosign_request(source, request).await {
+                                                                    Ok(resp) => resp,
+                                                                    Err(e) => {
+                                                                        log::error!("cosign handler error: {}", e);
+                                                                        CoSignResponse {
+                                                                            request_id,
+                                                                            wallet_pubkey: String::new(),
+                                                                            signature: None,
+                                                                        }
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                CoSignResponse {
+                                                                    request_id,
+                                                                    wallet_pubkey: String::new(),
+                                                                    signature: None,
+                                                                }
+                                                            };
+                                                            drop(handler_lock);
+                                                            let mut swarm_lock = swarm.lock().await;
+                                                            if let Err(e) = swarm_lock.behaviour_mut().cosign.send_response(channel, response) {
+                                                                log::error!("Failed to send cosign response: {:?}", e);
+                                                            }
+                                                        }
+                                                        RequestResponseMessage::Response { request_id, response, .. } => {
+                                                            // Complete the leader-side waiter registered by
+                                                            // send_cosign_request (#260).
+                                                            if let Some(tx) = cosign_waiters.lock().await.remove(&request_id) {
+                                                                let _ = tx.send(response);
+                                                            } else {
+                                                                debug!("cosign response with no waiter: {:?}", request_id);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                RequestResponseEvent::OutboundFailure { peer, request_id, error, .. } => {
+                                                    log::warn!(
+                                                        "cosign outbound failure to {:?}: {:?}",
+                                                        peer, error
+                                                    );
+                                                    // Drop the waiter so the awaiting leader errors
+                                                    // out instead of hanging past the timeout.
+                                                    cosign_waiters.lock().await.remove(&request_id);
+                                                }
+                                                RequestResponseEvent::InboundFailure { peer, error, .. } => {
+                                                    log::warn!(
+                                                        "cosign inbound failure from {:?}: {:?}",
+                                                        peer, error
+                                                    );
+                                                }
+                                                RequestResponseEvent::ResponseSent { peer, .. } => {
+                                                    debug!("cosign response sent to {}", peer);
+                                                }
+                                            }
+                                        }
+
                                         ParaloomBehaviourEvent::Kad(kad_event) => {
                                             match kad_event {
                                                 KadEvent::RoutingUpdated { peer, .. } => {
@@ -939,6 +1040,29 @@ impl NetworkManager {
             .heartbeat
             .send_request(&peer_id, request);
         Ok(())
+    }
+
+    /// Send a settlement co-sign request to a validator and await its response
+    /// (#260). Unlike the heartbeat and result protocols, the round leader needs
+    /// the reply, so this registers a oneshot keyed by the outbound request id
+    /// and awaits it. The event loop completes the oneshot when the response
+    /// arrives, or drops it on outbound failure / the protocol's request
+    /// timeout — in which case this returns an error rather than blocking the
+    /// round on an unresponsive validator.
+    pub async fn send_cosign_request(
+        &self,
+        peer: NodeId,
+        request: CoSignRequest,
+    ) -> Result<CoSignResponse> {
+        let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut swarm = self.swarm.lock().await;
+            let request_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
+            self.cosign_waiters.lock().await.insert(request_id, tx);
+        }
+        rx.await
+            .map_err(|_| anyhow!("cosign request to {} failed or timed out", peer_id))
     }
 
     /// Get local peer ID
