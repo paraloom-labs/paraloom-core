@@ -10,6 +10,19 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Verification votes bound to their authenticated sender** (in-house security
+  audit). A withdrawal/transfer verification result carries a self-declared
+  `validator` field. The node previously routed it into the consensus tally
+  without checking it against the authenticated gossip publisher, so a single
+  peer could submit votes under other validators' identities — fabricating an
+  off-chain quorum or framing an honest validator for equivocation. Gossipsub
+  runs in signed mode, so the node now attributes each message to its
+  authenticated publisher and drops any vote whose claimed validator does not
+  match the sender. (On-chain settlement separately requires genuine validator
+  co-signatures, so this hardens the off-chain consensus layer.) Fixed
+  pre-mainnet on devnet; covered by a test that drops a forged vote and counts a
+  genuine one.
+
 - **Canonical nullifier encoding enforced on-chain** (in-house security audit).
   A nullifier is reduced modulo the BN254 scalar field to form the proof's
   public input, but the replay defence — the nullifier PDA — keys on the raw

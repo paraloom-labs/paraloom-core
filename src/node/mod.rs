@@ -521,6 +521,21 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received withdrawal verification result: {}",
                     result.request_id
                 );
+                // A vote must come from the validator it claims to be (audit):
+                // `result.validator` is set by the sender, so without this check
+                // one peer could submit votes under every validator's identity
+                // and fabricate a quorum. `source` is the authenticated gossip
+                // publisher, so reject any vote whose claimed validator does not
+                // match the sender.
+                if result.validator != source {
+                    log::warn!(
+                        "dropping withdrawal vote for {}: claimed validator {:?} != sender {:?}",
+                        result.request_id,
+                        result.validator,
+                        source
+                    );
+                    return Ok(());
+                }
                 // Route the vote into the withdrawal coordinator (#164).
                 // On the node that started this verification, a vote that
                 // completes the quorum makes the coordinator emit an
@@ -613,6 +628,18 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received transfer verification result: {}",
                     result.request_id
                 );
+                // The vote must come from the validator it claims to be (audit),
+                // mirroring the withdrawal path: reject any whose claimed
+                // validator does not match the authenticated gossip sender.
+                if result.validator != source {
+                    log::warn!(
+                        "dropping transfer vote for {}: claimed validator {:?} != sender {:?}",
+                        result.request_id,
+                        result.validator,
+                        source
+                    );
+                    return Ok(());
+                }
                 // Route the vote into the transfer coordinator (#194); a node
                 // that never started this request drops it.
                 if let Some(coordinator) = &self.transfer_coordinator {
