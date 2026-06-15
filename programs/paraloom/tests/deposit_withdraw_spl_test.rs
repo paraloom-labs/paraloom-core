@@ -15,10 +15,11 @@
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use anchor_spl::token::spl_token;
+use paraloom_program::withdraw_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount, ValidatorAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
-    instruction::Instruction,
+    instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     signature::{Keypair, Signer},
     system_instruction,
@@ -28,12 +29,26 @@ use solana_sdk::{
 mod common;
 use common::{add_program_data, entry};
 
-const NULLIFIER: [u8; 32] = [42u8; 32];
-const DEPOSIT_AMOUNT: u64 = 5_000_000; // 5 token units
-const WITHDRAW_AMOUNT: u64 = 1_000_000;
+// Root, nullifier, amount and proof come from the on-chain verifier fixture so
+// the withdraw proof verifies against the program's published root (#165) — the
+// SPL path now verifies the proof and a validator quorum, exactly like native
+// `withdraw`. Notes of every asset share the off-chain commitment tree, so the
+// native withdraw fixture is valid here.
+const NULLIFIER: [u8; 32] = fx::FIXTURE_NULLIFIER;
+const WITHDRAW_AMOUNT: u64 = fx::FIXTURE_AMOUNT;
+const DEPOSIT_AMOUNT: u64 = fx::FIXTURE_AMOUNT + 5_000_000; // vault keeps the fee
 // 25 bps of WITHDRAW_AMOUNT.
 const EXPECTED_FEE: u64 = WITHDRAW_AMOUNT * 25 / 10_000;
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
+
+/// The 256-byte alt_bn128 wire proof from the fixture.
+fn fixture_proof() -> Vec<u8> {
+    let mut p = Vec::with_capacity(256);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_A);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_B);
+    p.extend_from_slice(&fx::FIXTURE_PROOF_C);
+    p
+}
 
 async fn send(
     banks_client: &mut solana_program_test::BanksClient,
@@ -74,7 +89,7 @@ async fn deposit_spl_then_withdraw_spl_credits_validator_fee() {
             program_id,
             data: instruction::Initialize {
                 program_version: 0x0004_0000,
-                initial_merkle_root: [0u8; 32],
+                initial_merkle_root: fx::FIXTURE_ROOT,
             }
             .data(),
             accounts: accounts::Initialize {
@@ -286,22 +301,30 @@ async fn deposit_spl_then_withdraw_spl_credits_validator_fee() {
                 nullifier: NULLIFIER,
                 amount: WITHDRAW_AMOUNT,
                 expiration_slot: u64::MAX,
-                proof: vec![1, 2, 3, 4],
+                proof: fixture_proof(),
             }
             .data(),
-            accounts: accounts::WithdrawSpl {
-                bridge_state: state_pda,
-                mint: mint.pubkey(),
-                asset_vault_authority: vault_authority_pda,
-                asset_vault: vault_pda,
-                nullifier_account: nullifier_pda,
-                recipient_token: recipient_token.pubkey(),
-                validator_account: validator_pda,
-                authority: upgrade_authority.pubkey(),
-                token_program: spl_token::id(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
+            accounts: {
+                let mut metas = accounts::WithdrawSpl {
+                    bridge_state: state_pda,
+                    mint: mint.pubkey(),
+                    asset_vault_authority: vault_authority_pda,
+                    asset_vault: vault_pda,
+                    nullifier_account: nullifier_pda,
+                    recipient_token: recipient_token.pubkey(),
+                    validator_account: validator_pda,
+                    validator_registry: registry_pda,
+                    authority: upgrade_authority.pubkey(),
+                    token_program: spl_token::id(),
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None);
+                // Quorum co-signers (#260): the authority is the sole registered
+                // validator (threshold 1), co-signing as a (wallet, PDA) pair.
+                metas.push(AccountMeta::new_readonly(upgrade_authority.pubkey(), true));
+                metas.push(AccountMeta::new_readonly(validator_pda, false));
+                metas
+            },
         }],
     )
     .await;
@@ -348,4 +371,63 @@ async fn deposit_spl_then_withdraw_spl_credits_validator_fee() {
     let nul = NullifierAccount::try_deserialize(&mut nul_raw.data.as_slice()).unwrap();
     assert_eq!(nul.nullifier, NULLIFIER);
     assert_eq!(nul.withdrawal_id, 1);
+
+    // --- Adversarial (audit #1, the critical asymmetry this fix closes) ---
+    // Before this fix `withdraw_spl` verified neither a quorum nor the proof, so
+    // a single key could drain the vault with a garbage proof. Build a fresh
+    // attempt and assert both gates now reject it.
+    let attempt = |nullifier: [u8; 32], with_quorum: bool, proof: Vec<u8>| {
+        let (npda, _) = Pubkey::find_program_address(&[b"nullifier", &nullifier], &program_id);
+        let mut metas = accounts::WithdrawSpl {
+            bridge_state: state_pda,
+            mint: mint.pubkey(),
+            asset_vault_authority: vault_authority_pda,
+            asset_vault: vault_pda,
+            nullifier_account: npda,
+            recipient_token: recipient_token.pubkey(),
+            validator_account: validator_pda,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            token_program: spl_token::id(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None);
+        if with_quorum {
+            metas.push(AccountMeta::new_readonly(upgrade_authority.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(validator_pda, false));
+        }
+        Instruction {
+            program_id,
+            data: instruction::WithdrawSpl {
+                nullifier,
+                amount: 1_000,
+                expiration_slot: u64::MAX,
+                proof,
+            }
+            .data(),
+            accounts: metas,
+        }
+    };
+
+    // No quorum co-signers → rejected (would previously have drained the vault).
+    let mut tx = Transaction::new_with_payer(
+        &[attempt([99u8; 32], false, vec![9u8; 256])],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    assert!(
+        banks_client.process_transaction(tx).await.is_err(),
+        "withdraw_spl without a validator quorum must be rejected"
+    );
+
+    // Quorum present but a garbage proof → rejected by on-chain verification.
+    let mut tx = Transaction::new_with_payer(
+        &[attempt([98u8; 32], true, vec![9u8; 256])],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    assert!(
+        banks_client.process_transaction(tx).await.is_err(),
+        "withdraw_spl with an invalid proof must be rejected"
+    );
 }

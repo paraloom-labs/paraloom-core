@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **SPL withdrawals brought to parity with the native withdraw gates**
+  (in-house security audit). The native `withdraw` verifies both a registered-
+  validator quorum and the Groth16 proof on-chain before releasing funds; the
+  SPL twin `withdraw_spl` previously verified neither — its proof argument was
+  only length-checked and its accounts carried no validator registry, so SPL
+  settlement rested on the single bridge-authority key. It now verifies both the
+  quorum and the proof (bound to the published Merkle root, nullifier and
+  amount) before releasing tokens, matching the native path. Surfaced by the
+  project's internal security audit and fixed pre-mainnet on devnet; covered by
+  a test that asserts a withdraw with no quorum and one with an invalid proof
+  are both rejected.
+
 - **On-chain validator quorum for settlement**
   ([#260](https://github.com/paraloom-labs/paraloom-core/issues/260)).
   Settlement (`withdraw` and `shielded_transfer`) previously relied on a single

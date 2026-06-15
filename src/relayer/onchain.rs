@@ -186,6 +186,9 @@ impl Submitter for OnChainSubmitter {
                     amount,
                     expiration_slot,
                     proof,
+                    // Quorum co-signers (#260); the node-side round that gathers
+                    // the full validator quorum into the tx is the next step.
+                    &[self.authority.pubkey()],
                 )
                 .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
                 self.send(vec![create_ata, withdraw], vec![self.authority.clone()])
