@@ -454,9 +454,9 @@ pub mod paraloom_program {
     ///    accounting at parity with the native path).
     ///
     /// Value leaves the vault under a PDA signer (`asset_vault_authority`, the
-    /// token account's owner), not the depositor. As with `withdraw`, the
-    /// Groth16 proof is recorded but **not** verified on-chain (#165); the
-    /// `has_one = authority` gate binds settlement to the consensus leader.
+    /// token account's owner), not the depositor. As with the native `withdraw`,
+    /// settlement requires a validator quorum (#260) and the Groth16 proof is
+    /// verified on-chain (#165) against the published Merkle root.
     pub fn withdraw_spl(
         ctx: Context<WithdrawSpl>,
         nullifier: [u8; 32],
@@ -475,6 +475,30 @@ pub mod paraloom_program {
         require!(
             current_slot <= expiration_slot,
             BridgeError::WithdrawalExpired
+        );
+
+        // Settlement requires a supermajority of registered validators to
+        // co-sign this transaction (#260), exactly as the native `withdraw` —
+        // no single key can drain a per-asset vault alone.
+        quorum::verify_validator_quorum(
+            ctx.program_id,
+            &ctx.accounts.validator_registry,
+            ctx.remaining_accounts,
+        )?;
+
+        // Verify the Groth16 withdrawal proof on-chain (#165), bound to the
+        // published Merkle root and this withdrawal's nullifier + amount, so a
+        // settling validator cannot release tokens for a note that does not
+        // exist. (Notes of every asset share the off-chain commitment tree and
+        // the published `merkle_root`.)
+        require!(
+            withdraw_verifier::verify_withdrawal(
+                &bridge_state.merkle_root,
+                &nullifier,
+                amount,
+                &proof,
+            ),
+            BridgeError::InvalidProof
         );
 
         require!(
@@ -1116,6 +1140,12 @@ pub struct WithdrawSpl<'info> {
         bump
     )]
     pub validator_account: Account<'info, ValidatorAccount>,
+
+    /// The validator registry, against which the settlement quorum is verified
+    /// (#260) — same gate as the native `withdraw`. The co-signers are passed as
+    /// `(wallet, validator PDA)` pairs in `remaining_accounts`.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
 
     #[account(mut)]
     pub authority: Signer<'info>,

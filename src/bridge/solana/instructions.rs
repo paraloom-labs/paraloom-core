@@ -598,6 +598,7 @@ pub fn create_deposit_spl_instruction(
 /// recipient_token, validator_account, authority (signer), token_program,
 /// system_program.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn create_withdraw_spl_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -607,12 +608,14 @@ pub fn create_withdraw_spl_instruction(
     amount: u64,
     expiration_slot: u64,
     proof: Vec<u8>,
+    quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
     let (bridge_state_pda, _) = derive_bridge_state(program_id);
     let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
     let (asset_vault, _) = derive_asset_vault(program_id, mint);
     let (nullifier_pda, _) = derive_nullifier_account(program_id, &nullifier);
     let (validator_pda, _) = derive_validator_account(program_id, authority);
+    let (validator_registry_pda, _) = derive_validator_registry(program_id);
 
     let data = WithdrawSplInstructionData {
         nullifier,
@@ -625,20 +628,24 @@ pub fn create_withdraw_spl_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
+    let mut accounts = vec![
+        AccountMeta::new(bridge_state_pda, false),
+        AccountMeta::new_readonly(*mint, false),
+        AccountMeta::new_readonly(asset_vault_authority, false),
+        AccountMeta::new(asset_vault, false),
+        AccountMeta::new(nullifier_pda, false),
+        AccountMeta::new(*recipient_token, false),
+        AccountMeta::new(validator_pda, false),
+        AccountMeta::new_readonly(validator_registry_pda, false),
+        AccountMeta::new(*authority, true),
+        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
+
     Ok(Instruction {
         program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(asset_vault_authority, false),
-            AccountMeta::new(asset_vault, false),
-            AccountMeta::new(nullifier_pda, false),
-            AccountMeta::new(*recipient_token, false),
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
+        accounts,
         data: instruction_data,
     })
 }
@@ -865,14 +872,15 @@ mod tests {
             1000,
             u64::MAX,
             vec![0u8; 100],
+            &[],
         )
         .expect("builder");
 
         assert_eq!(ix.program_id, program_id);
         // bridge_state, mint, asset_vault_authority, asset_vault,
-        // nullifier_account, recipient_token, validator_account, authority
-        // (signer), token_program, system_program.
-        assert_eq!(ix.accounts.len(), 10);
+        // nullifier_account, recipient_token, validator_account,
+        // validator_registry, authority (signer), token_program, system_program.
+        assert_eq!(ix.accounts.len(), 11);
         assert_eq!(ix.accounts[1].pubkey, mint);
         assert_eq!(
             ix.accounts[3].pubkey,
@@ -887,7 +895,11 @@ mod tests {
             ix.accounts[6].pubkey,
             derive_validator_account(&program_id, &authority).0
         );
-        assert!(ix.accounts[7].is_signer);
+        assert_eq!(
+            ix.accounts[7].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[8].is_signer);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_SPL);
     }
 
