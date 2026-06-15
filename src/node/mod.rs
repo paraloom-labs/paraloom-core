@@ -3,27 +3,35 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::bridge::solana::{build_settlement_message, CoSignPayload, SettlementParams};
 use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
+use crate::consensus::transfer::TransferVerificationRequest;
+use crate::consensus::withdrawal::WithdrawalVerificationRequest;
 use crate::consensus::{
     ApprovedTransfer, ApprovedWithdrawal, TransferVerificationCoordinator,
     WithdrawalVerificationCoordinator,
 };
 use crate::coordinator::Coordinator;
-use crate::network::{Message, NetworkManager, ResultRequest, ResultResponse};
+use crate::network::{
+    CoSignRequest, CoSignResponse, Message, NetworkManager, ResultRequest, ResultResponse,
+    SettlementKind,
+};
 use crate::privacy::pool::ShieldedPool;
 use crate::privacy::verification::VerificationCoordinator;
 use crate::resource::ResourceMonitor;
 use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
+use solana_sdk::signature::{Keypair, Signer};
 
 pub mod transfer_ingress;
 pub mod withdrawal_ingress;
@@ -153,6 +161,42 @@ pub struct Node {
     /// node initiates or receives a transfer verification request. In-memory;
     /// persistence across restart is a follow-up.
     delivered_notes: Arc<Mutex<Vec<transfer_ingress::DeliveredNote>>>,
+
+    /// This validator's Solana settlement keypair (#260), loaded from
+    /// `bridge.authority_keypair_path`. Used to co-sign settlement transactions
+    /// when another validator (the round leader) requests it. `None` on nodes
+    /// without a configured keypair; such a node declines all co-sign requests.
+    cosign_keypair: Option<Arc<Keypair>>,
+
+    /// Withdrawal requests this node verified as `Valid` (#260), keyed by
+    /// request id. A co-sign request is honoured only if its parameters match
+    /// the request cached here — so the round leader cannot get this validator
+    /// to sign a withdrawal it never verified, nor one with a substituted
+    /// recipient (the recipient is the one every validator saw in the gossiped
+    /// request). Bounded by `MAX_VERIFIED_CACHE`; entries are short-lived.
+    verified_withdrawals: Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
+
+    /// Transfer twin of `verified_withdrawals` (#260).
+    verified_transfers: Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
+}
+
+/// Upper bound on the per-node verified-settlement caches (#260). Entries are
+/// consumed within seconds of the vote (the co-sign round follows immediately),
+/// so this is only a safety ceiling against unbounded growth, never a working
+/// limit in practice.
+const MAX_VERIFIED_CACHE: usize = 1024;
+
+/// Insert a verified settlement request into a bounded per-node cache (#260).
+/// The bound is a safety ceiling, not a working limit; if the map is somehow at
+/// capacity for a new key, drop one arbitrary existing entry to make room.
+async fn cache_verified<V>(cache: &Arc<Mutex<HashMap<String, V>>>, request_id: String, value: V) {
+    let mut map = cache.lock().await;
+    if map.len() >= MAX_VERIFIED_CACHE && !map.contains_key(&request_id) {
+        if let Some(victim) = map.keys().next().cloned() {
+            map.remove(&victim);
+        }
+    }
+    map.insert(request_id, value);
 }
 
 #[async_trait]
@@ -441,6 +485,17 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     }
                 };
 
+                // Remember a request we verified Valid so we can later co-sign
+                // its settlement, but only the exact parameters we saw (#260).
+                if matches!(vote, crate::consensus::withdrawal::VerificationVote::Valid) {
+                    cache_verified(
+                        &self.verified_withdrawals,
+                        request.request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
+                }
+
                 // Send verification result back to source (coordinator)
                 let result = crate::consensus::withdrawal::WithdrawalVerificationResult {
                     request_id: request.request_id,
@@ -522,6 +577,17 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         reason: "Privacy pool not available".to_string(),
                     }
                 };
+
+                // Remember a transfer we verified Valid so we can later co-sign
+                // its settlement against the exact parameters we saw (#260).
+                if matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid) {
+                    cache_verified(
+                        &self.verified_transfers,
+                        request.request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
+                }
 
                 let result = crate::consensus::transfer::TransferVerificationResult {
                     request_id: request.request_id,
@@ -813,6 +879,116 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             })
         }
     }
+
+    /// Co-sign a settlement transaction for the round leader (#260).
+    ///
+    /// We sign only a settlement we ourselves verified `Valid`, and only its
+    /// security-critical parameters as we saw them in the gossiped verification
+    /// request — recipient/amount/nullifier for a withdrawal, the nullifiers,
+    /// output commitments and new root for a transfer. We then rebuild the
+    /// transaction message from the payload and sign that, so we never sign an
+    /// opaque transaction the leader assembled: a substituted recipient or
+    /// amount fails the match and is declined. (The proof itself is not matched
+    /// byte-for-byte — it is carried in a different encoding and is verified
+    /// on-chain regardless; what matters is that the binding parameters are the
+    /// ones we approved.)
+    async fn handle_cosign_request(
+        &self,
+        _source: NodeId,
+        request: CoSignRequest,
+    ) -> Result<CoSignResponse> {
+        Ok(cosign_settlement(
+            self.cosign_keypair.as_ref(),
+            &self.verified_withdrawals,
+            &self.verified_transfers,
+            request,
+        )
+        .await)
+    }
+}
+
+/// Produce a co-sign response for `request` (#260): sign the rebuilt settlement
+/// message iff we hold a keypair and the payload matches — by request id and
+/// binding parameters — a settlement we verified `Valid`; otherwise decline
+/// (`signature: None`). Free-standing so the security-critical decision can be
+/// unit-tested without standing up a full node.
+async fn cosign_settlement(
+    cosign_keypair: Option<&Arc<Keypair>>,
+    verified_withdrawals: &Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
+    verified_transfers: &Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
+    request: CoSignRequest,
+) -> CoSignResponse {
+    let request_id = request.request_id.clone();
+    let declined = |reason: &str| {
+        log::warn!("declining co-sign for {}: {}", request_id, reason);
+        CoSignResponse {
+            request_id: request_id.clone(),
+            wallet_pubkey: String::new(),
+            signature: None,
+        }
+    };
+
+    let keypair = match cosign_keypair {
+        Some(kp) => kp,
+        None => return declined("no settlement keypair configured"),
+    };
+
+    let payload = match CoSignPayload::from_bytes(&request.message) {
+        Ok(p) => p,
+        Err(e) => return declined(&format!("undecodable payload: {e}")),
+    };
+
+    // Match the payload against a settlement we verified Valid, by request id
+    // and binding parameters.
+    let approved = match (request.kind, &payload.params) {
+        (
+            SettlementKind::Withdrawal,
+            SettlementParams::Withdrawal {
+                recipient,
+                amount,
+                nullifier,
+                ..
+            },
+        ) => {
+            let cache = verified_withdrawals.lock().await;
+            cache.get(&request.request_id).is_some_and(|req| {
+                req.recipient == *recipient && req.amount == *amount && req.nullifier == *nullifier
+            })
+        }
+        (
+            SettlementKind::Transfer,
+            SettlementParams::Transfer {
+                nullifiers,
+                output_commitments,
+                new_merkle_root,
+                ..
+            },
+        ) => {
+            let cache = verified_transfers.lock().await;
+            cache.get(&request.request_id).is_some_and(|req| {
+                req.nullifiers == *nullifiers
+                    && req.output_commitments == *output_commitments
+                    && req.new_merkle_root == *new_merkle_root
+            })
+        }
+        _ => false,
+    };
+    if !approved {
+        return declined("parameters do not match a settlement we verified");
+    }
+
+    // Rebuild the exact settlement message ourselves and sign it.
+    let message = match build_settlement_message(&payload) {
+        Ok(m) => m,
+        Err(e) => return declined(&format!("could not build settlement message: {e}")),
+    };
+    let signature = keypair.sign_message(&message.serialize());
+
+    CoSignResponse {
+        request_id,
+        wallet_pubkey: keypair.pubkey().to_string(),
+        signature: Some(signature.as_ref().to_vec()),
+    }
 }
 
 /// Whether a submit error means the withdrawal was already settled (its
@@ -932,6 +1108,21 @@ impl Node {
             address: settings.network.listen_address.clone(),
             wallet_pubkey,
         };
+
+        // Load the full settlement keypair for co-signing (#260) — the same key
+        // whose pubkey is advertised above. A node without it declines co-sign
+        // requests rather than failing to start.
+        let cosign_keypair = settings
+            .bridge
+            .authority_keypair_path
+            .as_deref()
+            .and_then(|p| match crate::bridge::solana::load_keypair_from_file(p) {
+                Ok(kp) => Some(Arc::new(kp)),
+                Err(e) => {
+                    log::warn!("co-sign keypair unavailable ({e}); will decline co-sign requests");
+                    None
+                }
+            });
 
         let network_arc = Arc::new(network);
 
@@ -1080,6 +1271,9 @@ impl Node {
             transfer_proof_verifier_override: None,
             transfer_ingress: Arc::new(Mutex::new(None)),
             delivered_notes: Arc::new(Mutex::new(Vec::new())),
+            cosign_keypair,
+            verified_withdrawals: Arc::new(Mutex::new(HashMap::new())),
+            verified_transfers: Arc::new(Mutex::new(HashMap::new())),
         };
 
         Ok(node)
@@ -2040,6 +2234,9 @@ impl Clone for Node {
             transfer_proof_verifier_override: self.transfer_proof_verifier_override.clone(),
             transfer_ingress: self.transfer_ingress.clone(),
             delivered_notes: self.delivered_notes.clone(),
+            cosign_keypair: self.cosign_keypair.clone(),
+            verified_withdrawals: self.verified_withdrawals.clone(),
+            verified_transfers: self.verified_transfers.clone(),
         }
     }
 }
@@ -2049,6 +2246,144 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- #260 co-sign handler (cosign_settlement) ---
+
+    fn wd_request(
+        id: &str,
+        recipient: [u8; 32],
+        amount: u64,
+        nullifier: [u8; 32],
+    ) -> WithdrawalVerificationRequest {
+        WithdrawalVerificationRequest {
+            request_id: id.to_string(),
+            nullifier,
+            amount,
+            recipient,
+            proof: vec![0u8; 256],
+            fee: 0,
+            timestamp: 0,
+        }
+    }
+
+    fn wd_payload(
+        authority: [u8; 32],
+        recipient: [u8; 32],
+        amount: u64,
+        nullifier: [u8; 32],
+    ) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority,
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![authority],
+            params: SettlementParams::Withdrawal {
+                recipient,
+                amount,
+                nullifier,
+                expiration_slot: u64::MAX,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    fn cosign_req(id: &str, kind: SettlementKind, payload: &CoSignPayload) -> CoSignRequest {
+        CoSignRequest {
+            request_id: id.to_string(),
+            kind,
+            message: payload.to_bytes().expect("serialize payload"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cosign_signs_a_settlement_we_verified() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+
+        let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
+        wds.lock()
+            .await
+            .insert("w1".into(), wd_request("w1", recipient, amount, nullifier));
+
+        let payload = wd_payload(kp.pubkey().to_bytes(), recipient, amount, nullifier);
+        let resp = cosign_settlement(
+            Some(&kp),
+            &wds,
+            &trs,
+            cosign_req("w1", SettlementKind::Withdrawal, &payload),
+        )
+        .await;
+
+        assert_eq!(resp.request_id, "w1");
+        assert_eq!(resp.wallet_pubkey, kp.pubkey().to_string());
+        let sig_bytes = resp.signature.expect("must sign a settlement it verified");
+        // The signature must verify against the message we would actually submit.
+        let message = build_settlement_message(&payload).expect("build message");
+        let sig = solana_sdk::signature::Signature::try_from(sig_bytes.as_slice()).expect("sig");
+        assert!(
+            sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
+            "the returned signature must be valid over the rebuilt settlement message"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_a_substituted_recipient() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+
+        let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
+        wds.lock()
+            .await
+            .insert("w1".into(), wd_request("w1", recipient, amount, nullifier));
+
+        // Leader tries to redirect the funds to a different recipient.
+        let tampered = wd_payload(kp.pubkey().to_bytes(), [0xFF; 32], amount, nullifier);
+        let resp = cosign_settlement(
+            Some(&kp),
+            &wds,
+            &trs,
+            cosign_req("w1", SettlementKind::Withdrawal, &tampered),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "a substituted recipient must be declined even though we verified the original"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_unknown_request_and_without_keypair() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+        let payload = wd_payload(kp.pubkey().to_bytes(), [9u8; 32], 1, [7u8; 32]);
+
+        // Never verified this request id.
+        let unknown = cosign_settlement(
+            Some(&kp),
+            &wds,
+            &trs,
+            cosign_req("nope", SettlementKind::Withdrawal, &payload),
+        )
+        .await;
+        assert_eq!(unknown.signature, None);
+
+        // No keypair configured at all.
+        wds.lock()
+            .await
+            .insert("w1".into(), wd_request("w1", [9u8; 32], 1, [7u8; 32]));
+        let no_key = cosign_settlement(
+            None,
+            &wds,
+            &trs,
+            cosign_req("w1", SettlementKind::Withdrawal, &payload),
+        )
+        .await;
+        assert_eq!(no_key.signature, None);
+    }
 
     fn approval(id: &str) -> ApprovedWithdrawal {
         ApprovedWithdrawal {
