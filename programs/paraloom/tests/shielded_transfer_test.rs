@@ -17,7 +17,7 @@ use paraloom_program::transfer_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
-    instruction::Instruction,
+    instruction::{AccountMeta, Instruction},
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
@@ -80,6 +80,67 @@ async fn send(
     banks_client.process_transaction(tx).await
 }
 
+/// Initialize the validator registry and register `authority` as the sole
+/// validator, so the settlement quorum threshold is 1 and the authority can
+/// co-sign the transfer (#260). Returns `(registry_pda, validator_pda)`.
+async fn register_authority_validator(
+    banks_client: &mut solana_program_test::BanksClient,
+    recent_blockhash: anchor_lang::solana_program::hash::Hash,
+    authority: &Keypair,
+    program_data: Pubkey,
+    program_id: Pubkey,
+) -> (Pubkey, Pubkey) {
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", authority.pubkey().as_ref()], &program_id);
+    send(
+        banks_client,
+        recent_blockhash,
+        authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
+                authority: authority.pubkey(),
+                program_data,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .unwrap();
+    send(
+        banks_client,
+        recent_blockhash,
+        authority,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: 1_000_000_000,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: authority.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .unwrap();
+    (registry_pda, validator_pda)
+}
+
+/// Append the authority's quorum co-signer pair to a settlement's metas (#260).
+fn push_quorum(metas: &mut Vec<AccountMeta>, authority: Pubkey, validator_pda: Pubkey) {
+    metas.push(AccountMeta::new_readonly(authority, true));
+    metas.push(AccountMeta::new_readonly(validator_pda, false));
+}
+
 #[tokio::test]
 async fn shielded_transfer_records_nullifiers_and_advances_root() {
     let program_id = paraloom_program::ID;
@@ -104,6 +165,14 @@ async fn shielded_transfer_records_nullifiers_and_advances_root() {
     )
     .await
     .unwrap();
+    let (registry_pda, validator_pda) = register_authority_validator(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        program_data_pda,
+        program_id,
+    )
+    .await;
     send(
         &mut banks_client,
         recent_blockhash,
@@ -117,14 +186,19 @@ async fn shielded_transfer_records_nullifiers_and_advances_root() {
                 proof: fixture_proof(),
             }
             .data(),
-            accounts: accounts::ShieldedTransfer {
-                bridge_state: state_pda,
-                nullifier_account_0: n0_pda,
-                nullifier_account_1: n1_pda,
-                authority: upgrade_authority.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
+            accounts: {
+                let mut metas = accounts::ShieldedTransfer {
+                    bridge_state: state_pda,
+                    nullifier_account_0: n0_pda,
+                    nullifier_account_1: n1_pda,
+                    validator_registry: registry_pda,
+                    authority: upgrade_authority.pubkey(),
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None);
+                push_quorum(&mut metas, upgrade_authority.pubkey(), validator_pda);
+                metas
+            },
         },
     )
     .await
@@ -162,6 +236,11 @@ async fn shielded_transfer_replay_is_rejected() {
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (n0_pda, _) = Pubkey::find_program_address(&[b"nullifier", &N0], &program_id);
     let (n1_pda, _) = Pubkey::find_program_address(&[b"nullifier", &N1], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) = Pubkey::find_program_address(
+        &[b"validator", upgrade_authority.pubkey().as_ref()],
+        &program_id,
+    );
 
     // The replay reuses the same input nullifiers (the only fields that seed
     // the nullifier PDAs) but advances `new_merkle_root`, so the second
@@ -177,14 +256,19 @@ async fn shielded_transfer_replay_is_rejected() {
             proof: fixture_proof(),
         }
         .data(),
-        accounts: accounts::ShieldedTransfer {
-            bridge_state: state_pda,
-            nullifier_account_0: n0_pda,
-            nullifier_account_1: n1_pda,
-            authority: upgrade_authority.pubkey(),
-            system_program: solana_sdk::system_program::ID,
-        }
-        .to_account_metas(None),
+        accounts: {
+            let mut metas = accounts::ShieldedTransfer {
+                bridge_state: state_pda,
+                nullifier_account_0: n0_pda,
+                nullifier_account_1: n1_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None);
+            push_quorum(&mut metas, upgrade_authority.pubkey(), validator_pda);
+            metas
+        },
     };
 
     send(
@@ -200,6 +284,14 @@ async fn shielded_transfer_replay_is_rejected() {
     )
     .await
     .unwrap();
+    register_authority_validator(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        program_data_pda,
+        program_id,
+    )
+    .await;
     send(
         &mut banks_client,
         recent_blockhash,
@@ -230,6 +322,7 @@ async fn shielded_transfer_with_duplicate_nullifier_is_rejected() {
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (n0_pda, _) = Pubkey::find_program_address(&[b"nullifier", &N0], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
     // Both inputs carry the same nullifier, so both account slots resolve to
     // the same PDA. Anchor rejects the second `init` on an account the first
@@ -248,6 +341,7 @@ async fn shielded_transfer_with_duplicate_nullifier_is_rejected() {
             bridge_state: state_pda,
             nullifier_account_0: n0_pda,
             nullifier_account_1: n0_pda,
+            validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
             system_program: solana_sdk::system_program::ID,
         }

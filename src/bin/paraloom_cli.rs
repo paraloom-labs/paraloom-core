@@ -722,6 +722,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     withdrawal_lamports,
                     expiration_slot,
                     proof,
+                    &[authority.pubkey()], // quorum co-signers (#260)
                 )
                 .context("Failed to create withdraw instruction")?;
 

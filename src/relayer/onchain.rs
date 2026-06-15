@@ -161,6 +161,7 @@ impl Submitter for OnChainSubmitter {
                     amount,
                     expiration_slot,
                     proof,
+                    &[self.authority.pubkey()], // quorum co-signers (#260)
                 )
                 .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
                 self.send(vec![ix], vec![self.authority.clone()]).await?

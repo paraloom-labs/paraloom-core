@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         withdrawal_amount,
         expiration_slot,
         proof,
+        &[authority.pubkey()], // quorum co-signers (#260)
     )?;
     println!("Instruction created\n");
 

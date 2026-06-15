@@ -184,6 +184,14 @@ pub mod paraloom_program {
             BridgeError::WithdrawalExpired
         );
 
+        // Settlement requires a supermajority of registered validators to
+        // co-sign this transaction (#260) — no single key can settle alone.
+        quorum::verify_validator_quorum(
+            ctx.program_id,
+            &ctx.accounts.validator_registry,
+            ctx.remaining_accounts,
+        )?;
+
         // Verify the Groth16 withdrawal proof on-chain (#165). The proof is
         // bound to the program's published Merkle root and this withdrawal's
         // nullifier + amount, so the settling validator cannot forge a
@@ -310,6 +318,14 @@ pub mod paraloom_program {
             nullifiers[0] != nullifiers[1],
             BridgeError::DuplicateNullifier
         );
+
+        // Settlement requires a supermajority of registered validators to
+        // co-sign this transaction (#260) — no single key can settle alone.
+        quorum::verify_validator_quorum(
+            ctx.program_id,
+            &ctx.accounts.validator_registry,
+            ctx.remaining_accounts,
+        )?;
 
         // Verify the Groth16 transfer proof on-chain (#194) against the current
         // (pre-update) Merkle root and the transfer's nullifiers + output
@@ -921,6 +937,13 @@ pub struct Withdraw<'info> {
     )]
     pub validator_account: Account<'info, ValidatorAccount>,
 
+    /// The validator registry; its `active_validators` count sets the quorum
+    /// threshold (#260). Settlement must be co-signed by a supermajority of
+    /// registered validators, passed as `(wallet, validator PDA)` pairs in
+    /// `remaining_accounts`.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
     #[account(mut)]
     pub authority: Signer<'info>,
 
@@ -961,6 +984,12 @@ pub struct ShieldedTransfer<'info> {
         bump
     )]
     pub nullifier_account_1: Account<'info, NullifierAccount>,
+
+    /// Validator registry; sets the quorum threshold (#260). The transfer must
+    /// be co-signed by a supermajority of registered validators, passed as
+    /// `(wallet, validator PDA)` pairs in `remaining_accounts`.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
 
     #[account(mut)]
     pub authority: Signer<'info>,

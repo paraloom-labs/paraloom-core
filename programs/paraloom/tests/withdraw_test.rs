@@ -16,7 +16,7 @@ use paraloom_program::withdraw_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount, ValidatorAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
-    instruction::Instruction,
+    instruction::{AccountMeta, Instruction},
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
@@ -179,16 +179,24 @@ async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
                 proof: fixture_proof(),
             }
             .data(),
-            accounts: accounts::Withdraw {
-                bridge_state: state_pda,
-                bridge_vault: vault_pda,
-                nullifier_account: nullifier_pda,
-                recipient: recipient.pubkey(),
-                validator_account: validator_pda,
-                authority: upgrade_authority.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
+            accounts: {
+                let mut metas = accounts::Withdraw {
+                    bridge_state: state_pda,
+                    bridge_vault: vault_pda,
+                    nullifier_account: nullifier_pda,
+                    recipient: recipient.pubkey(),
+                    validator_account: validator_pda,
+                    validator_registry: registry_pda,
+                    authority: upgrade_authority.pubkey(),
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None);
+                // Quorum co-signers (#260): the authority is the sole registered
+                // validator (threshold 1), co-signing as a (wallet, PDA) pair.
+                metas.push(AccountMeta::new_readonly(upgrade_authority.pubkey(), true));
+                metas.push(AccountMeta::new_readonly(validator_pda, false));
+                metas
+            },
         },
     )
     .await;

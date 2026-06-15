@@ -277,9 +277,12 @@ pub fn create_withdraw_instruction(
     amount: u64,
     expiration_slot: u64,
     proof: Vec<u8>,
+    quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (nullifier_pda, _nullifier_bump) = derive_nullifier_account(program_id, &nullifier);
+    let (validator_registry_pda, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], program_id);
     // The settling validator's account, bound to the `authority` signer.
     // The on-chain program credits the withdrawal fee here, so settlement
     // requires the submitter to be a registered validator.
@@ -300,19 +303,38 @@ pub fn create_withdraw_instruction(
 
     let system_program_id = SYSTEM_PROGRAM_ID;
 
+    let mut accounts = vec![
+        AccountMeta::new(bridge_state_pda, false),
+        AccountMeta::new(*bridge_vault, false),
+        AccountMeta::new(nullifier_pda, false), // Nullifier account (will be created)
+        AccountMeta::new(recipient_pubkey, false),
+        AccountMeta::new(validator_pda, false), // Settling validator (fee credited here)
+        AccountMeta::new_readonly(validator_registry_pda, false),
+        AccountMeta::new(*authority, true),
+        AccountMeta::new_readonly(system_program_id, false),
+    ];
+    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
+
     Ok(Instruction {
         program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new(*bridge_vault, false),
-            AccountMeta::new(nullifier_pda, false), // Nullifier account (will be created)
-            AccountMeta::new(recipient_pubkey, false),
-            AccountMeta::new(validator_pda, false), // Settling validator (fee credited here)
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
+        accounts,
         data: instruction_data,
     })
+}
+
+/// Append the quorum co-signers as remaining accounts (#260): each validator's
+/// wallet (a signer) followed by its `ValidatorAccount` PDA. The program
+/// verifies on-chain that a supermajority of registered validators signed.
+fn append_quorum_accounts(
+    program_id: &Pubkey,
+    quorum_validators: &[Pubkey],
+    accounts: &mut Vec<AccountMeta>,
+) {
+    for v in quorum_validators {
+        let (vpda, _) = derive_validator_account(program_id, v);
+        accounts.push(AccountMeta::new_readonly(*v, true));
+        accounts.push(AccountMeta::new_readonly(vpda, false));
+    }
 }
 
 /// Create `shielded_transfer` instruction (#193).
@@ -330,8 +352,11 @@ pub fn create_shielded_transfer_instruction(
     output_commitments: [[u8; 32]; 2],
     new_merkle_root: [u8; 32],
     proof: Vec<u8>,
+    quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (validator_registry_pda, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], program_id);
     let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
     let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
 
@@ -349,15 +374,19 @@ pub fn create_shielded_transfer_instruction(
 
     let system_program_id = SYSTEM_PROGRAM_ID;
 
+    let mut accounts = vec![
+        AccountMeta::new(bridge_state_pda, false),
+        AccountMeta::new(nullifier_pda_0, false), // Nullifier account 0 (will be created)
+        AccountMeta::new(nullifier_pda_1, false), // Nullifier account 1 (will be created)
+        AccountMeta::new_readonly(validator_registry_pda, false),
+        AccountMeta::new(*authority, true),
+        AccountMeta::new_readonly(system_program_id, false),
+    ];
+    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
+
     Ok(Instruction {
         program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new(nullifier_pda_0, false), // Nullifier account 0 (will be created)
-            AccountMeta::new(nullifier_pda_1, false), // Nullifier account 1 (will be created)
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
+        accounts,
         data: instruction_data,
     })
 }
@@ -652,23 +681,28 @@ mod tests {
             // the test does not depend on a real `Clock`.
             u64::MAX,
             proof,
+            &[],
         );
 
         assert!(ix.is_ok());
         let instruction = ix.unwrap();
         assert_eq!(instruction.program_id, program_id);
         // bridge_state, bridge_vault, nullifier, recipient, validator_account,
-        // authority (signer), system_program.
-        assert_eq!(instruction.accounts.len(), 7);
+        // validator_registry, authority (signer), system_program.
+        assert_eq!(instruction.accounts.len(), 8);
 
         // The settling validator's account is bound to the authority signer
-        // and sits between the recipient and the signer.
+        // and sits between the recipient and the registry.
         let (validator_pda, _) = derive_validator_account(&program_id, &authority);
         assert_eq!(instruction.accounts[4].pubkey, validator_pda);
         assert!(instruction.accounts[4].is_writable);
         assert!(!instruction.accounts[4].is_signer);
-        assert_eq!(instruction.accounts[5].pubkey, authority);
-        assert!(instruction.accounts[5].is_signer);
+        // validator_registry (read-only) precedes the authority signer (#260).
+        let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+        assert_eq!(instruction.accounts[5].pubkey, registry_pda);
+        assert!(!instruction.accounts[5].is_signer);
+        assert_eq!(instruction.accounts[6].pubkey, authority);
+        assert!(instruction.accounts[6].is_signer);
     }
 
     #[test]
@@ -757,12 +791,14 @@ mod tests {
             output_commitments,
             new_merkle_root,
             proof,
+            &[],
         )
         .expect("builder");
 
         assert_eq!(ix.program_id, program_id);
-        // bridge_state, nullifier_0, nullifier_1, authority, system_program.
-        assert_eq!(ix.accounts.len(), 5);
+        // bridge_state, nullifier_0, nullifier_1, validator_registry, authority,
+        // system_program.
+        assert_eq!(ix.accounts.len(), 6);
         // The two nullifier PDAs must match the shared derivation helper and
         // sit in slots 1 and 2 (after bridge_state).
         let (n0, _) = derive_nullifier_account(&program_id, &nullifiers[0]);
