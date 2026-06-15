@@ -24,6 +24,10 @@ pub struct ValidatorInfo {
 
     /// Is validator currently active
     pub is_active: bool,
+
+    /// Base58 Solana wallet pubkey this validator co-signs settlement
+    /// transactions with (#260). `None` until advertised via discovery.
+    pub wallet_pubkey: Option<String>,
 }
 
 impl ValidatorInfo {
@@ -34,7 +38,14 @@ impl ValidatorInfo {
             stake_amount,
             reputation,
             is_active: true,
+            wallet_pubkey: None,
         }
+    }
+
+    /// Attach the Solana wallet pubkey used for settlement co-signing (#260).
+    pub fn with_wallet(mut self, wallet_pubkey: Option<String>) -> Self {
+        self.wallet_pubkey = wallet_pubkey;
+        self
     }
 
     /// Calculate weight for leader selection

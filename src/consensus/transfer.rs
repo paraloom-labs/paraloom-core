@@ -217,11 +217,23 @@ impl TransferVerificationCoordinator {
     /// Register a validator into the transfer consensus, mirroring the
     /// withdrawal coordinator (reputation tracker + leader selector).
     pub async fn register_validator(&self, validator: NodeId) {
+        self.register_validator_with_wallet(validator, None).await;
+    }
+
+    /// Register a validator, recording the Solana wallet pubkey it co-signs
+    /// settlement with (#260) — the leader maps a voting `NodeId` to the
+    /// on-chain `(wallet, pda)` pair the settlement quorum requires.
+    pub async fn register_validator_with_wallet(
+        &self,
+        validator: NodeId,
+        wallet_pubkey: Option<String>,
+    ) {
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
             log::info!(
-                "Validator registered for transfer consensus: {:?}",
-                validator
+                "Validator registered for transfer consensus: {:?} (wallet: {:?})",
+                validator,
+                wallet_pubkey
             );
             validators.push(validator.clone());
         }
@@ -230,9 +242,19 @@ impl TransferVerificationCoordinator {
             .register_validator(validator.clone())
             .await;
 
-        let validator_info = ValidatorInfo::new(validator, 10_000_000_000, 1000);
+        let validator_info =
+            ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey);
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.register_validator(validator_info);
+    }
+
+    /// Look up the Solana wallet pubkey a registered validator co-signs
+    /// settlement with (#260), or `None` if unknown / not advertised.
+    pub async fn validator_wallet(&self, node_id: &NodeId) -> Option<String> {
+        let leader_selector = self.leader_selector.read().await;
+        leader_selector
+            .get_validator(node_id)
+            .and_then(|v| v.wallet_pubkey.clone())
     }
 
     /// Number of registered validators

@@ -30,6 +30,14 @@ pub fn load_keypair_from_file(path: &str) -> Result<Keypair> {
     })
 }
 
+/// Load just the public key (base58) from a keypair file, so a validator can
+/// advertise the wallet it co-signs settlement with (#260) without exposing the
+/// secret elsewhere.
+pub fn pubkey_from_file(path: &str) -> Result<String> {
+    use solana_sdk::signature::Signer;
+    Ok(load_keypair_from_file(path)?.pubkey().to_string())
+}
+
 /// Generate a new keypair (for testing)
 #[cfg(test)]
 pub fn generate_keypair() -> Keypair {

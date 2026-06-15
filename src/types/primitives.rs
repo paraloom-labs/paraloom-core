@@ -64,6 +64,11 @@ pub struct NodeInfo {
     pub resources: ResourceContribution,
     /// Network address
     pub address: String,
+    /// Base58 Solana wallet pubkey this node settles and co-signs with when it
+    /// runs the bridge as a registered validator (#260). `None` for nodes that
+    /// do not participate in on-chain settlement.
+    #[serde(default)]
+    pub wallet_pubkey: Option<String>,
 }
 
 /// Status of a node
