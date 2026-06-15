@@ -33,6 +33,7 @@ use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
 use solana_sdk::signature::{Keypair, Signer};
 
+pub mod cosign_round;
 pub mod transfer_ingress;
 pub mod withdrawal_ingress;
 
