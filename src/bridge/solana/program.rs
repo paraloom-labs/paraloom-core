@@ -153,6 +153,12 @@ impl ProgramInterface {
             .bridge_vault
             .ok_or_else(|| BridgeError::ConfigError("No bridge vault configured".to_string()))?;
 
+        // The on-chain program verifies the proof (#165): convert the prover's
+        // compressed proof to the 256-byte alt_bn128 wire form it expects.
+        let onchain_proof =
+            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(proof)
+                .map_err(|e| BridgeError::Serialization(format!("withdrawal proof: {e}")))?;
+
         // Create withdraw instruction
         let instruction = super::create_withdraw_instruction(
             &self.program_id,
@@ -162,7 +168,7 @@ impl ProgramInterface {
             nullifier,
             amount,
             expiration_slot,
-            proof.to_vec(),
+            onchain_proof.to_vec(),
         )?;
 
         let recent_blockhash = self.rpc.get_latest_blockhash().await?;
@@ -196,13 +202,19 @@ impl ProgramInterface {
             BridgeError::ConfigError("No authority keypair configured".to_string())
         })?;
 
+        // On-chain transfer verification (#194): convert the compressed proof to
+        // the 256-byte alt_bn128 wire form.
+        let onchain_proof =
+            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(proof)
+                .map_err(|e| BridgeError::Serialization(format!("transfer proof: {e}")))?;
+
         let instruction = super::create_shielded_transfer_instruction(
             &self.program_id,
             &authority.pubkey(),
             nullifiers,
             output_commitments,
             new_merkle_root,
-            proof.to_vec(),
+            onchain_proof.to_vec(),
         )?;
 
         let recent_blockhash = self.rpc.get_latest_blockhash().await?;

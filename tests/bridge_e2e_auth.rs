@@ -35,6 +35,49 @@ use std::time::Duration;
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 const WITHDRAWAL_FEE_BPS: u64 = 25;
 
+// Valid withdrawal proof fixture matching the program's embedded verifying key
+// (same data as programs/paraloom/src/withdraw_fixture_data.rs). The bridge is
+// initialized with FIXTURE_ROOT so this proof verifies on-chain.
+const FIXTURE_ROOT: [u8; 32] = [
+    78, 243, 57, 0, 2, 229, 49, 91, 138, 123, 227, 237, 39, 54, 163, 162, 243, 24, 195, 104, 150,
+    109, 119, 105, 21, 120, 70, 4, 250, 235, 187, 42,
+];
+const FIXTURE_NULLIFIER: [u8; 32] = [
+    20, 154, 53, 188, 47, 157, 179, 116, 115, 45, 116, 99, 45, 193, 211, 231, 237, 138, 15, 198,
+    224, 252, 121, 167, 26, 111, 62, 170, 19, 58, 174, 39,
+];
+const FIXTURE_AMOUNT: u64 = 1_000_000_000;
+const FIXTURE_PROOF_A: [u8; 64] = [
+    5, 20, 4, 23, 11, 5, 135, 170, 183, 202, 145, 77, 114, 233, 115, 37, 206, 73, 88, 227, 113,
+    147, 122, 78, 88, 77, 60, 114, 45, 85, 141, 206, 175, 40, 161, 7, 183, 44, 61, 165, 64, 195,
+    240, 81, 53, 156, 189, 200, 186, 165, 220, 12, 140, 218, 36, 188, 178, 35, 116, 240, 137, 197,
+    135, 227,
+];
+const FIXTURE_PROOF_B: [u8; 128] = [
+    22, 147, 154, 31, 130, 176, 199, 192, 76, 6, 246, 61, 85, 91, 250, 164, 153, 223, 165, 241,
+    180, 64, 95, 213, 159, 221, 210, 69, 149, 193, 247, 43, 14, 140, 206, 205, 186, 184, 227, 180,
+    31, 41, 82, 31, 200, 230, 86, 189, 97, 79, 239, 197, 95, 33, 53, 144, 92, 134, 126, 60, 185,
+    112, 228, 196, 23, 246, 77, 61, 212, 95, 21, 188, 237, 164, 131, 167, 243, 95, 33, 247, 2, 179,
+    87, 111, 26, 13, 142, 15, 138, 33, 149, 139, 156, 38, 133, 214, 39, 190, 92, 85, 242, 71, 184,
+    108, 171, 223, 174, 90, 107, 126, 198, 34, 11, 54, 147, 101, 231, 10, 118, 152, 7, 47, 90, 34,
+    77, 47, 166, 89,
+];
+const FIXTURE_PROOF_C: [u8; 64] = [
+    4, 47, 16, 67, 163, 228, 189, 224, 48, 170, 118, 242, 240, 109, 216, 199, 42, 81, 123, 63, 85,
+    191, 213, 129, 120, 146, 14, 159, 193, 113, 169, 207, 171, 217, 155, 172, 60, 130, 127, 19,
+    171, 202, 211, 56, 113, 158, 125, 38, 108, 46, 112, 135, 174, 247, 129, 83, 233, 122, 176, 114,
+    253, 248, 53, 76,
+];
+
+/// The 256-byte alt_bn128 wire proof from the fixture.
+fn fixture_proof() -> Vec<u8> {
+    let mut p = Vec::with_capacity(256);
+    p.extend_from_slice(&FIXTURE_PROOF_A);
+    p.extend_from_slice(&FIXTURE_PROOF_B);
+    p.extend_from_slice(&FIXTURE_PROOF_C);
+    p
+}
+
 /// Send a single-instruction tx signed by `signer` and confirm it.
 fn send(rpc: &RpcClient, signer: &Keypair, ix: solana_sdk::instruction::Instruction) {
     let bh = rpc.get_latest_blockhash().expect("blockhash");
@@ -67,7 +110,7 @@ fn bootstrap(port: u16) -> (SubprocessValidator, Pubkey, Keypair) {
             &program_id,
             &authority.pubkey(),
             EXPECTED_PROGRAM_VERSION,
-            [0u8; 32],
+            FIXTURE_ROOT,
         )
         .expect("init ix"),
     );
@@ -100,7 +143,7 @@ fn bootstrap(port: u16) -> (SubprocessValidator, Pubkey, Keypair) {
             &program_id,
             &authority.pubkey(),
             &vault_pda,
-            2_000_000,
+            2_000_000_000,
             [9u8; 32],
             [11u8; 32],
         )
@@ -199,13 +242,14 @@ fn authority_can_withdraw() {
     let rpc = validator.rpc_client();
 
     // The bridge authority (a registered validator) settles a well-formed
-    // withdrawal. bootstrap funded the vault with 2_000_000 lamports.
+    // withdrawal with a real proof (the fixture) that verifies on-chain against
+    // the bridge's FIXTURE_ROOT. bootstrap funded the vault with 2 SOL.
     let (vault_pda, _) = derive_bridge_vault(&program_id);
     let vault_before = rpc.get_balance(&vault_pda).expect("vault balance before");
 
     let recipient = Keypair::new();
-    let nullifier = [77u8; 32];
-    let amount = 1_000_000u64;
+    let nullifier = FIXTURE_NULLIFIER;
+    let amount = FIXTURE_AMOUNT;
     let fee = amount * WITHDRAWAL_FEE_BPS / 10_000;
     let payout = amount - fee;
     let cur_slot = rpc.get_slot().unwrap_or(0);
@@ -217,7 +261,7 @@ fn authority_can_withdraw() {
         nullifier,
         amount,
         cur_slot + 150,
-        vec![1u8; 192],
+        fixture_proof(),
     )
     .expect("withdraw ix");
     let bh = rpc.get_latest_blockhash().expect("blockhash");
