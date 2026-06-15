@@ -10,7 +10,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::bridge::solana::{build_settlement_message, CoSignPayload, SettlementParams};
+use crate::bridge::solana::{
+    build_settlement_message, derive_bridge_vault, CoSignPayload, SettlementParams,
+};
 use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
@@ -32,6 +34,7 @@ use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
 use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 
 pub mod cosign_round;
 pub mod transfer_ingress;
@@ -2007,6 +2010,96 @@ impl Node {
     /// Get node info
     pub fn node_info(&self) -> NodeInfo {
         self.node_info.clone()
+    }
+
+    /// Run the co-signing round for an approved withdrawal as the round leader
+    /// and return the assembled, fully-signed settlement transaction (#260).
+    ///
+    /// Collects signatures from the validators that approved this withdrawal —
+    /// mapped to their advertised settlement wallets — and assembles them to
+    /// meet the on-chain validator quorum. `blockhash` and `expiration_slot` are
+    /// supplied by the caller (the submitter fetches a live blockhash and bound;
+    /// tests pass fixed values). This is the integration point the settlement
+    /// submitter drives; it is `pub` so the multi-node end-to-end test can drive
+    /// the same path.
+    pub async fn cosign_settlement_tx(
+        &self,
+        approved: &ApprovedWithdrawal,
+        blockhash: [u8; 32],
+        expiration_slot: u64,
+    ) -> Result<Transaction> {
+        let leader = self
+            .cosign_keypair
+            .as_ref()
+            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
+        let coordinator = self
+            .withdrawal_coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow!("no withdrawal coordinator"))?;
+
+        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
+            .map_err(|e| anyhow!("invalid program id: {e}"))?;
+        let (vault, _) = derive_bridge_vault(&program_id);
+
+        // The validators that approved this withdrawal become the co-signer
+        // quorum, mapped to the settlement wallets they advertised via
+        // discovery. The leader signs as itself and is excluded from the peers
+        // it requests from.
+        let self_id = self.node_info.id.clone();
+        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+        for voter in coordinator.valid_voters(&approved.request_id).await {
+            if voter == self_id {
+                continue;
+            }
+            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
+                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                    peers.push((pubkey, voter));
+                }
+            }
+        }
+        let mut quorum_wallets = vec![leader.pubkey()];
+        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+
+        // Every wallet in the set is marked a required signer in the
+        // instruction, so the transaction is only valid once all of them have
+        // signed: the gather threshold is the whole set. The on-chain program
+        // enforces its own supermajority (programs/paraloom/src/quorum.rs) over
+        // the registry, so if too few operators participated the assembled
+        // transaction simply fails on submit rather than settling under-quorum.
+        let threshold = quorum_wallets.len();
+
+        // The on-chain program verifies the proof in its 256-byte alt_bn128 wire
+        // form; convert the prover's compressed proof.
+        let onchain_proof =
+            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&approved.proof)
+                .map_err(|e| anyhow!("withdrawal proof: {e}"))?;
+        let params = SettlementParams::Withdrawal {
+            recipient: approved.recipient,
+            amount: approved.amount,
+            nullifier: approved.nullifier,
+            expiration_slot,
+            proof: onchain_proof.to_vec(),
+        };
+
+        let network = self.network.clone();
+        cosign_round::run_cosign_round(
+            leader,
+            program_id,
+            vault,
+            blockhash,
+            &approved.request_id,
+            SettlementKind::Withdrawal,
+            params,
+            quorum_wallets,
+            &peers,
+            threshold,
+            |peer, request| {
+                let network = network.clone();
+                async move { network.send_cosign_request(peer, request).await.ok() }
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("co-signing round failed: {e}"))
     }
 
     // Compute layer API methods

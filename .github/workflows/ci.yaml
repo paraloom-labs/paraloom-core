@@ -298,6 +298,12 @@ jobs:
       - name: Run co-sign protocol E2E (ignored)
         run: cargo test --test cosign_e2e --all-features -- --ignored --test-threads=1 --nocapture
 
+      # #260 co-sign settlement E2E: two validators co-sign and the leader
+      # assembles a multi-signature settlement transaction over a real mesh.
+      # `#[ignore]`'d (loopback TCP + gossip-mesh timing), no Solana validator.
+      - name: Run co-sign settlement E2E (ignored)
+        run: cargo test --test cosign_settlement_e2e --all-features -- --ignored --test-threads=1 --nocapture
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest

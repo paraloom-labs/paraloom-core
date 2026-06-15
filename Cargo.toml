@@ -215,3 +215,9 @@ tokio-test = "0.4.5"
 tempfile = "3.3.0"
 wat = "1.240" # For WASM testing (Phase 3)
 proptest = "1.11.0" # Property-based testing for privacy primitives (#71)
+# Construct a well-formed compressed BN254 proof in the co-sign settlement E2E
+# (#260); the proof only needs to deserialize, not satisfy the circuit.
+ark-bn254 = "0.4"
+ark-groth16 = "0.4"
+ark-ec = "0.4"
+ark-serialize = "0.4"
