@@ -438,6 +438,16 @@ impl WithdrawalVerificationCoordinator {
             .and_then(|v| v.wallet_pubkey.clone())
     }
 
+    /// The validators that voted `Valid` on a request (#260) — the eligible
+    /// co-signers for its settlement. Empty if the request is unknown here.
+    pub async fn valid_voters(&self, request_id: &str) -> Vec<NodeId> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => consensus.tally.valid_voters().await,
+            None => Vec::new(),
+        }
+    }
+
     /// Register a validator with full information
     pub async fn register_validator_with_info(&self, validator_info: ValidatorInfo) {
         let node_id = validator_info.node_id.clone();
