@@ -10,6 +10,20 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **On-chain validator quorum for settlement**
+  ([#260](https://github.com/paraloom-labs/paraloom-core/issues/260)).
+  Settlement (`withdraw` and `shielded_transfer`) previously relied on a single
+  settlement authority key (`has_one = authority`). The program now requires a
+  BFT supermajority of registered validators to co-sign the transaction,
+  verified on-chain against the validator registry. Each validator that approved the
+  operation independently rebuilds the settlement transaction from the
+  parameters it verified and signs that; the round leader only assembles the
+  collected signatures. A single compromised settlement key can no longer move
+  funds, and a malicious leader cannot redirect a withdrawal — a co-signer signs
+  only a transaction it reconstructed from the parameters it saw, so a
+  substituted recipient or amount is refused. This binds the recipient that the
+  proof itself does not yet constrain.
+
 - **On-chain proof verification for withdrawals and shielded transfers**
   ([#165](https://github.com/paraloom-labs/paraloom-core/issues/165),
   [#194](https://github.com/paraloom-labs/paraloom-core/issues/194)).
