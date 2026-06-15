@@ -637,7 +637,17 @@ impl NetworkManager {
                                                 // Deserialize the message
                                                 match bincode::deserialize::<Message>(&message.data) {
                                                     Ok(msg) => {
-                                                        let source = NodeId(peer_id.to_bytes());
+                                                        // Gossipsub runs in Signed mode, so `message.source`
+                                                        // is the authenticated original publisher. Prefer it
+                                                        // over `propagation_source` (the last forwarding hop)
+                                                        // so a relayed message is attributed to its real
+                                                        // author — this is what lets the consensus layer
+                                                        // reject a vote whose self-declared validator does not
+                                                        // match the authenticated sender (audit).
+                                                        let source = match message.source {
+                                                            Some(author) => NodeId(author.to_bytes()),
+                                                            None => NodeId(peer_id.to_bytes()),
+                                                        };
                                                         let handler_lock = handler.lock().await;
                                                         if let Some(h) = handler_lock.as_ref() {
                                                             if let Err(e) = h.handle_message(source, msg).await {
