@@ -257,6 +257,16 @@ impl TransferVerificationCoordinator {
             .and_then(|v| v.wallet_pubkey.clone())
     }
 
+    /// The validators that voted `Valid` on a transfer (#260) — the eligible
+    /// co-signers for its settlement. Empty if the request is unknown here.
+    pub async fn valid_voters(&self, request_id: &str) -> Vec<NodeId> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => consensus.tally.valid_voters().await,
+            None => Vec::new(),
+        }
+    }
+
     /// Number of registered validators
     pub async fn validator_count(&self) -> usize {
         self.validators.read().await.len()

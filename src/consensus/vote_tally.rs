@@ -242,4 +242,46 @@ impl VoteTally {
         let invalid = votes.len() - valid;
         (valid, invalid)
     }
+
+    /// The validators that voted `Valid` (#260) — the eligible co-signers the
+    /// round leader collects settlement signatures from.
+    pub async fn valid_voters(&self) -> Vec<NodeId> {
+        let votes = self.votes.read().await;
+        votes
+            .iter()
+            .filter(|(_, vote)| vote.is_valid())
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn valid_voters_lists_only_the_valid_votes() {
+        let tally = VoteTally::new("req-1".to_string(), 2, 3);
+        tally
+            .submit_vote(NodeId(vec![1]), VerificationVote::Valid)
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "bad proof".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(NodeId(vec![3]), VerificationVote::Valid)
+            .await
+            .unwrap();
+
+        let mut voters = tally.valid_voters().await;
+        voters.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(voters, vec![NodeId(vec![1]), NodeId(vec![3])]);
+    }
 }
