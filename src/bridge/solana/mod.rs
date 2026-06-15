@@ -1,5 +1,6 @@
 //! Solana bridge implementation
 
+mod cosign_message;
 mod decoder;
 mod instructions;
 mod keypair;
@@ -10,6 +11,7 @@ mod submitter;
 #[cfg(test)]
 mod test_support;
 
+pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
     create_associated_token_account_idempotent_instruction, create_deposit_instruction,
     create_deposit_spl_instruction, create_initialize_instruction,
