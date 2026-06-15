@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Canonical nullifier encoding enforced on-chain** (in-house security audit).
+  A nullifier is reduced modulo the BN254 scalar field to form the proof's
+  public input, but the replay defence — the nullifier PDA — keys on the raw
+  bytes. So a spent note's nullifier `n` and its non-canonical re-encoding
+  `n + p` (`p` = the field modulus) reduced to the same field element, verified
+  under the same proof, yet derived different PDAs — a double-spend path. The
+  program now requires the raw nullifier to be the canonical encoding of its
+  field element (in `withdraw`, `withdraw_spl` and `shielded_transfer`),
+  restoring the one-to-one byte↔field correspondence the off-chain code already
+  maintained. Fixed pre-mainnet on devnet; covered by a test that settles a
+  nullifier and asserts its non-canonical re-encoding is rejected.
+
 - **SPL withdrawals brought to parity with the native withdraw gates**
   (in-house security audit). The native `withdraw` verifies both a registered-
   validator quorum and the Groth16 proof on-chain before releasing funds; the

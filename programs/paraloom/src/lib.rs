@@ -62,6 +62,25 @@ fn check_upgrade_authority(program_data: &UncheckedAccount, expected: &Pubkey) -
     Ok(())
 }
 
+/// Reject a non-canonical nullifier encoding (audit: on-chain replay via a
+/// non-injective field lift). The proof's public input is
+/// `Fr::from_le_bytes_mod_order(nullifier)`, which maps both `n` and `n + p`
+/// (`p` = the BN254 scalar modulus) to the same field element, while the replay
+/// defence — the nullifier PDA seed — keys on the *raw* bytes. So a spent note
+/// could be settled a second time under `n + p`. Requiring the raw bytes to be
+/// the canonical little-endian encoding of their reduced field element restores
+/// the 1:1 byte↔field correspondence the off-chain code already maintains.
+fn require_canonical_nullifier(nullifier: &[u8; 32]) -> Result<()> {
+    use ark_ff::{BigInteger, PrimeField};
+    let reduced = ark_bn254::Fr::from_le_bytes_mod_order(nullifier);
+    let canonical = reduced.into_bigint().to_bytes_le();
+    require!(
+        canonical.as_slice() == nullifier.as_slice(),
+        BridgeError::NonCanonicalNullifier
+    );
+    Ok(())
+}
+
 #[program]
 pub mod paraloom_program {
     use super::*;
@@ -183,6 +202,10 @@ pub mod paraloom_program {
             current_slot <= expiration_slot,
             BridgeError::WithdrawalExpired
         );
+
+        // Reject a non-canonical nullifier so a spent note cannot be re-settled
+        // under a different raw encoding that lifts to the same field element.
+        require_canonical_nullifier(&nullifier)?;
 
         // Settlement requires a supermajority of registered validators to
         // co-sign this transaction (#260) — no single key can settle alone.
@@ -311,6 +334,13 @@ pub mod paraloom_program {
         require!(!bridge_state.paused, BridgeError::BridgePaused);
         require!(!proof.is_empty(), BridgeError::InvalidProof);
         require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
+        // Reject non-canonical nullifiers so a spent note cannot be re-settled
+        // under a different raw encoding lifting to the same field element; this
+        // also keeps the distinctness check below from being bypassed by
+        // `n` vs `n + p` for the same note.
+        require_canonical_nullifier(&nullifiers[0])?;
+        require_canonical_nullifier(&nullifiers[1])?;
+
         // Two equal input nullifiers would target the same PDA twice in one
         // transaction; reject with a clear error instead of Anchor's opaque
         // "account already initialized".
@@ -476,6 +506,10 @@ pub mod paraloom_program {
             current_slot <= expiration_slot,
             BridgeError::WithdrawalExpired
         );
+
+        // Reject a non-canonical nullifier (same replay defence as the native
+        // withdraw); the raw bytes must canonically encode their field element.
+        require_canonical_nullifier(&nullifier)?;
 
         // Settlement requires a supermajority of registered validators to
         // co-sign this transaction (#260), exactly as the native `withdraw` —
@@ -1520,6 +1554,9 @@ pub enum BridgeError {
 
     #[msg("Duplicate input nullifier in transfer")]
     DuplicateNullifier,
+
+    #[msg("Nullifier is not a canonical field element (>= BN254 scalar modulus)")]
+    NonCanonicalNullifier,
 
     #[msg("Initialize signer must be the program's upgrade authority")]
     UnauthorizedInit,
