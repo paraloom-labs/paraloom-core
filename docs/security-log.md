@@ -10,6 +10,16 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Settlement RPC call bounded by a timeout** (in-house security audit). The
+  bridge's `send_and_confirm_transaction` wrapped the blocking RPC call with no
+  caller-side timeout; the client's confirmation loop polls until the blockhash
+  expires, so a stalling or lagging RPC could block the settlement path for many
+  minutes before erroring. The call is now bounded by a 120-second timeout that
+  returns a typed error promptly, keeping a single stuck settlement from wedging
+  the submitter pipeline. Combined with the spend-after-settle ordering above, a
+  timed-out settlement leaves the note spendable for a retry. Fixed pre-mainnet
+  on devnet; covered by a test that a stalled call returns promptly.
+
 - **Overflow checks enabled for release/SBF builds** (in-house security audit).
   The on-chain program is its own Cargo workspace root, which detached it from
   the Anchor template's release profile — so release/SBF builds compiled with
