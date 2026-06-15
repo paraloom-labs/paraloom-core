@@ -1,6 +1,7 @@
 //! P2P networking module
 
 pub mod compute_protocol;
+pub mod cosign;
 pub mod discovery;
 pub mod heartbeat;
 mod message;
@@ -10,6 +11,10 @@ pub mod req_resp;
 pub use compute_protocol::{
     ComputeJobCodec, ComputeJobRequest, ComputeJobResponse, ComputeQueryCodec, ComputeQueryRequest,
     ComputeQueryResponse, COMPUTE_JOB_PROTOCOL, COMPUTE_QUERY_PROTOCOL,
+};
+pub use cosign::{
+    create_cosign_protocol, CoSignCodec, CoSignRequest, CoSignResponse, SettlementKind,
+    COSIGN_PROTOCOL, MAX_COSIGN_PAYLOAD_BYTES,
 };
 pub use discovery::{PeerCounts, PeerRegistry, PeerState, PeerSummary, RECONNECT_BACKOFF};
 pub use heartbeat::{
