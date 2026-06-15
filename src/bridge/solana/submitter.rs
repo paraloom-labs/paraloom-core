@@ -33,6 +33,11 @@ pub struct ResultSubmitter {
     /// `BridgeConfig::withdrawal_expiration_window_slots` so `submit_approved`
     /// can set the expiration without re-reading the config.
     expiration_window_slots: u64,
+
+    /// Test seam: skip Groth16 proof verification so a unit test can drive
+    /// `submit` past the proof check to exercise the submit/mark-spent ordering.
+    /// Always `false` in production.
+    skip_proof_verification: bool,
 }
 
 impl ResultSubmitter {
@@ -52,7 +57,15 @@ impl ResultSubmitter {
             verification_coordinator: None,
             enable_consensus: false,
             expiration_window_slots,
+            skip_proof_verification: false,
         })
+    }
+
+    /// Test seam: skip Groth16 proof verification (see field docs).
+    #[cfg(test)]
+    fn skipping_proof_verification(mut self) -> Self {
+        self.skip_proof_verification = true;
+        self
     }
 
     /// Create a new result submitter with distributed consensus
@@ -72,6 +85,7 @@ impl ResultSubmitter {
             verification_coordinator: Some(verification_coordinator),
             enable_consensus: true,
             expiration_window_slots,
+            skip_proof_verification: false,
         })
     }
 
@@ -96,14 +110,31 @@ impl ResultSubmitter {
         // Verify proof
         self.verify_withdrawal_proof(&request).await?;
 
-        // Process withdrawal in privacy pool
-        self.pool
+        // Submit on-chain FIRST. The note is marked spent in the local pool
+        // only after the chain accepts the settlement (audit), so a transient
+        // submit failure — RPC error, blockhash expiry, a momentary
+        // QuorumNotMet — leaves the note spendable for a retry instead of
+        // freezing it with funds still sitting in the vault. (If the chain did
+        // settle but this call still returned an error, a later attempt is
+        // rejected on-chain by the nullifier PDA and skipped as a replay — the
+        // double-spend defence lives on-chain, not in this local flag.)
+        let signature = self.submit_to_solana(&request).await?;
+
+        // Settled on-chain → record the spend in the local pool. A failure here
+        // does not undo the settlement, so log and continue; the on-chain
+        // nullifier PDA remains the source of truth for double-spend.
+        if let Err(e) = self
+            .pool
             .withdraw(nullifier, request.amount, &request.recipient)
             .await
-            .map_err(|e| BridgeError::WithdrawalFailed(e.to_string()))?;
-
-        // Submit to Solana
-        let signature = self.submit_to_solana(&request).await?;
+        {
+            log::error!(
+                target: "paraloom::bridge::solana",
+                "settled on-chain ({}) but failed to mark the note spent locally: {}",
+                signature,
+                e
+            );
+        }
 
         // Update statistics
         let mut stats = self.stats.write().await;
@@ -176,6 +207,9 @@ impl ResultSubmitter {
 
     /// Verify withdrawal proof with real zkSNARK verification
     async fn verify_withdrawal_proof(&self, request: &WithdrawalRequest) -> Result<()> {
+        if self.skip_proof_verification {
+            return Ok(());
+        }
         if request.proof.is_empty() {
             return Err(BridgeError::InvalidTransaction("Missing proof".to_string()));
         }
@@ -419,6 +453,49 @@ mod tests {
             .await
             .expect_err("replay");
         assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+    }
+
+    /// Audit: a withdrawal whose on-chain submit fails must NOT be marked spent
+    /// locally, or the note is frozen — funds still in the vault but every
+    /// retry rejected as "already spent". The fix submits on-chain first and
+    /// records the spend only on success.
+    #[tokio::test]
+    async fn a_failed_submit_leaves_the_note_spendable() {
+        use crate::privacy::Nullifier;
+        let pool = Arc::new(ShieldedPool::new());
+        let randomness = pedersen::generate_randomness();
+        let deposit = DepositTx::new(
+            vec![0x77; 32],
+            1000,
+            ShieldedAddress([2u8; 32]),
+            randomness,
+            10,
+        );
+        pool.deposit(deposit.output_note.clone(), 990)
+            .await
+            .unwrap();
+        let nullifier = Nullifier::derive(&deposit.output_note.commitment(), &randomness);
+
+        let request = WithdrawalRequest {
+            nullifier: nullifier.0,
+            amount: 100,
+            recipient: [0u8; 32],
+            fee: 1,
+            expiration_slot: u64::MAX,
+            proof: vec![1u8; 32],
+        };
+
+        // No authority keypair and no reachable RPC, so the on-chain submit
+        // fails. (Proof verification is skipped so we reach the submit step.)
+        let submitter = submitter_for(pool.clone()).skipping_proof_verification();
+        assert!(
+            submitter.submit(request).await.is_err(),
+            "submit must fail when the chain does not accept it"
+        );
+        assert!(
+            !pool.is_spent(&nullifier).await,
+            "a failed on-chain submit must leave the note spendable, not frozen"
+        );
     }
 
     /// An empty proof is rejected before any consensus / chain work.
