@@ -270,6 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_deposit,
         u64::MAX, // never-expires sentinel; production callers use current_slot + window
         proof_bytes.clone(),
+        &[authority.pubkey()], // quorum co-signers (#260)
     )?;
     let blockhash = client.get_latest_blockhash()?;
     let withdraw_tx_signed = Transaction::new_signed_with_payer(

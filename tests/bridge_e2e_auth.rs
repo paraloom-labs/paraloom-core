@@ -176,6 +176,7 @@ fn unauthorized_signer_cannot_withdraw() {
         100_000,
         cur_slot + 150,
         vec![1u8; 192],
+        &[], // rejected at account validation before the quorum check
     )
     .expect("withdraw ix");
     let bh = rpc.get_latest_blockhash().expect("blockhash");
@@ -215,6 +216,7 @@ fn oversized_proof_rejected() {
         100_000,
         cur_slot + 150,
         vec![0u8; 257], // one over MAX_PROOF_LEN
+        &[],            // rejected on proof length before the quorum check
     )
     .expect("withdraw ix");
     let bh = rpc.get_latest_blockhash().expect("blockhash");
@@ -262,6 +264,7 @@ fn authority_can_withdraw() {
         amount,
         cur_slot + 150,
         fixture_proof(),
+        &[authority.pubkey()], // quorum co-signers (#260); 1 active validator → threshold 1
     )
     .expect("withdraw ix");
     let bh = rpc.get_latest_blockhash().expect("blockhash");

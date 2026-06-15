@@ -11,12 +11,9 @@
 //! signature verification keeps the on-chain attack surface minimal.
 //!
 //! `quorum_accounts` are `(validator_wallet, validator_pda)` pairs passed via
-//! `remaining_accounts`.
-//!
-//! Not yet called from `withdraw` / `shielded_transfer`: this lands the verified
-//! primitive first; wiring it into settlement (and the node-side co-signing
-//! round) is the next step of #260.
-#![allow(dead_code)]
+//! `remaining_accounts`. Called by `withdraw` and `shielded_transfer`. The
+//! node-side co-signing round that produces a real multi-validator quorum is
+//! tracked separately in #260 (this enforces it on-chain).
 
 use crate::{BridgeError, ValidatorAccount, ValidatorRegistry};
 use anchor_lang::prelude::*;

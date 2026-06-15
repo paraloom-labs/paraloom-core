@@ -38,6 +38,7 @@ async fn withdraw_fails_when_authority_is_not_a_registered_validator() {
         &[b"validator", upgrade_authority.pubkey().as_ref()],
         &program_id,
     );
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
     let recipient = Keypair::new();
 
@@ -120,6 +121,7 @@ async fn withdraw_fails_when_authority_is_not_a_registered_validator() {
                 nullifier_account: nullifier_pda,
                 recipient: recipient.pubkey(),
                 validator_account: validator_pda,
+                validator_registry: registry_pda,
                 authority: upgrade_authority.pubkey(),
                 system_program: solana_sdk::system_program::ID,
             }

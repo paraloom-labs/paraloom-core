@@ -169,6 +169,10 @@ impl ProgramInterface {
             amount,
             expiration_slot,
             onchain_proof.to_vec(),
+            // Quorum co-signers (#260). The node-side round that gathers the
+            // full validator quorum into the tx is the next step; for now the
+            // settling authority co-signs.
+            &[authority.pubkey()],
         )?;
 
         let recent_blockhash = self.rpc.get_latest_blockhash().await?;
@@ -215,6 +219,7 @@ impl ProgramInterface {
             output_commitments,
             new_merkle_root,
             onchain_proof.to_vec(),
+            &[authority.pubkey()], // quorum co-signers (#260); node-side round next
         )?;
 
         let recent_blockhash = self.rpc.get_latest_blockhash().await?;

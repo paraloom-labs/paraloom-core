@@ -136,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         amount,
         expiration_slot,
         proof,
+        &[authority.pubkey()], // quorum co-signers (#260)
     )?;
 
     println!("Getting recent blockhash...");
