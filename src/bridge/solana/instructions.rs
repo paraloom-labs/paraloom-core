@@ -598,7 +598,6 @@ pub fn create_deposit_spl_instruction(
 /// recipient_token, validator_account, authority (signer), token_program,
 /// system_program.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn create_withdraw_spl_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
