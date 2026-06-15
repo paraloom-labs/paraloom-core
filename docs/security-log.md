@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Withdrawal note marked spent only after on-chain settlement** (in-house
+  security audit). The submitter recorded a withdrawal's nullifier as spent in
+  the local pool **before** submitting the settlement on-chain, with no rollback
+  on failure. So a transient submit failure — an RPC error, an expired
+  blockhash, a momentary quorum miss — left the note marked spent locally while
+  the funds stayed in the vault: every retry was then rejected as "already
+  spent", freezing the note. The submitter now settles on-chain first and
+  records the spend only on success, so a failed submit leaves the note
+  spendable for a retry (the on-chain nullifier PDA remains the double-spend
+  defence). Fixed pre-mainnet on devnet; covered by a test asserting a failed
+  submit does not mark the note spent.
+
 - **Verification votes bound to their authenticated sender** (in-house security
   audit). A withdrawal/transfer verification result carries a self-declared
   `validator` field. The node previously routed it into the consensus tally
