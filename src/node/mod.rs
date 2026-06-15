@@ -190,7 +190,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // without being a compute Coordinator.
                 if let Some(withdrawal) = &self.withdrawal_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
-                        withdrawal.register_validator(source.clone()).await;
+                        withdrawal
+                            .register_validator_with_wallet(
+                                source.clone(),
+                                node_info.wallet_pubkey.clone(),
+                            )
+                            .await;
                     }
                 }
 
@@ -199,7 +204,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // validator set.
                 if let Some(transfer) = &self.transfer_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
-                        transfer.register_validator(source.clone()).await;
+                        transfer
+                            .register_validator_with_wallet(
+                                source.clone(),
+                                node_info.wallet_pubkey.clone(),
+                            )
+                            .await;
                     }
                 }
             }
@@ -904,11 +914,23 @@ impl Node {
         // Initial empty resource contribution
         let resources = resource_monitor.get_contribution();
 
+        // Advertise the Solana wallet this node co-signs settlement with (#260)
+        // so peers can map this NodeId to the on-chain `(wallet, pda)` pair the
+        // settlement quorum requires. Derived from the bridge authority keypair
+        // (the validator's settlement key); `None` for non-bridge nodes or when
+        // the keypair is unavailable.
+        let wallet_pubkey = settings
+            .bridge
+            .authority_keypair_path
+            .as_deref()
+            .and_then(|p| crate::bridge::solana::pubkey_from_file(p).ok());
+
         let node_info = NodeInfo {
             id: node_id.clone(),
             node_type: node_type.clone(),
             resources,
             address: settings.network.listen_address.clone(),
+            wallet_pubkey,
         };
 
         let network_arc = Arc::new(network);

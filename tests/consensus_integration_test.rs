@@ -25,6 +25,7 @@ fn create_validator_info(node_id: NodeId, stake: u64, reputation: u64) -> Valida
         stake_amount: stake,
         reputation,
         is_active: true,
+        wallet_pubkey: None,
     }
 }
 

@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             bandwidth_kbps: 10000,
                         },
                         address: "remote".to_string(),
+                        wallet_pubkey: None,
                     };
                     dashboard_clone.add_node(&peer_info);
                 }

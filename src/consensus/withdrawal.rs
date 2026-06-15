@@ -395,9 +395,25 @@ impl WithdrawalVerificationCoordinator {
 
     /// Register a validator (simple version for backward compatibility)
     pub async fn register_validator(&self, validator: NodeId) {
+        self.register_validator_with_wallet(validator, None).await;
+    }
+
+    /// Register a validator, recording the Solana wallet pubkey it co-signs
+    /// settlement with (#260). The wallet is advertised via discovery and lets
+    /// the leader map a voting `NodeId` to the on-chain `(wallet, pda)` pair the
+    /// settlement quorum requires.
+    pub async fn register_validator_with_wallet(
+        &self,
+        validator: NodeId,
+        wallet_pubkey: Option<String>,
+    ) {
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
-            log::info!("Validator registered for consensus: {:?}", validator);
+            log::info!(
+                "Validator registered for consensus: {:?} (wallet: {:?})",
+                validator,
+                wallet_pubkey
+            );
             validators.push(validator.clone());
         }
 
@@ -407,9 +423,19 @@ impl WithdrawalVerificationCoordinator {
             .await;
 
         // Also register with leader selector (default stake/reputation)
-        let validator_info = ValidatorInfo::new(validator, 10_000_000_000, 1000);
+        let validator_info =
+            ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey);
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.register_validator(validator_info);
+    }
+
+    /// Look up the Solana wallet pubkey a registered validator co-signs
+    /// settlement with (#260), or `None` if unknown / not advertised.
+    pub async fn validator_wallet(&self, node_id: &NodeId) -> Option<String> {
+        let leader_selector = self.leader_selector.read().await;
+        leader_selector
+            .get_validator(node_id)
+            .and_then(|v| v.wallet_pubkey.clone())
     }
 
     /// Register a validator with full information
@@ -907,6 +933,26 @@ mod tests {
         coordinator.register_validator(NodeId(vec![2])).await;
 
         assert_eq!(coordinator.validator_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_records_validator_wallet() {
+        let coordinator = WithdrawalVerificationCoordinator::new();
+
+        // A validator that advertised its settlement wallet (#260) and one that
+        // did not.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("WaLLet1111".to_string()))
+            .await;
+        coordinator.register_validator(NodeId(vec![2])).await;
+
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![1])).await,
+            Some("WaLLet1111".to_string()),
+            "the advertised co-signing wallet must be looked up by NodeId"
+        );
+        assert_eq!(coordinator.validator_wallet(&NodeId(vec![2])).await, None);
+        assert_eq!(coordinator.validator_wallet(&NodeId(vec![9])).await, None);
     }
 
     #[tokio::test]

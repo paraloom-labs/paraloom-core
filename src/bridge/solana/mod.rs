@@ -23,7 +23,7 @@ pub use instructions::{
     ShieldedTransferInstructionData, WithdrawSplInstructionData,
     SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
-pub use keypair::load_keypair_from_file;
+pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;
 pub use program::ProgramInterface;
 pub use rpc::{BridgeRpc, RealBridgeRpc};
