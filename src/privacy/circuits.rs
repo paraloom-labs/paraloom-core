@@ -876,6 +876,232 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
     }
 }
 
+/// Transfer circuit, spend-key construction (circuit v2, #293).
+///
+/// The shielded→shielded successor to [`TransferCircuit`]. Each input note binds
+/// `pubkey = Poseidon(privkey)` and is spent by proving knowledge of its key
+/// (folded into the nullifier through a signature over `(commitment,
+/// leaf_index)`), with `leaf_index` derived in-circuit from the Merkle path.
+/// Output notes bind the recipients' spend public keys. On top of the per-input
+/// spend authorization it enforces (1) value conservation across all asset-bound
+/// commitments and (2) input-nullifier distinctness, so the same note cannot be
+/// presented as two inputs. Additive — alongside v1 until cutover.
+pub struct TransferCircuitV2 {
+    // Public inputs.
+    pub merkle_root: Option<[u8; 32]>,
+    pub nullifiers: Vec<Option<[u8; 32]>>,
+    pub output_commitments: Vec<Option<[u8; 32]>>,
+    // Private witnesses.
+    pub input_values: Vec<Option<u64>>,
+    pub input_blindings: Vec<Option<[u8; 32]>>,
+    pub input_privkeys: Vec<Option<[u8; 32]>>,
+    pub input_paths: Vec<Option<MerklePath>>,
+    pub output_values: Vec<Option<u64>>,
+    pub output_blindings: Vec<Option<[u8; 32]>>,
+    pub output_pubkeys: Vec<Option<[u8; 32]>>,
+    pub asset_id: Option<[u8; 32]>,
+}
+
+impl TransferCircuitV2 {
+    pub fn new(num_inputs: usize, num_outputs: usize) -> Self {
+        TransferCircuitV2 {
+            merkle_root: None,
+            nullifiers: vec![None; num_inputs],
+            output_commitments: vec![None; num_outputs],
+            input_values: vec![None; num_inputs],
+            input_blindings: vec![None; num_inputs],
+            input_privkeys: vec![None; num_inputs],
+            input_paths: vec![None; num_inputs],
+            output_values: vec![None; num_outputs],
+            output_blindings: vec![None; num_outputs],
+            output_pubkeys: vec![None; num_outputs],
+            asset_id: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_witness(
+        merkle_root: [u8; 32],
+        nullifiers: Vec<[u8; 32]>,
+        output_commitments: Vec<[u8; 32]>,
+        input_values: Vec<u64>,
+        input_blindings: Vec<[u8; 32]>,
+        input_privkeys: Vec<[u8; 32]>,
+        input_paths: Vec<Vec<([u8; 32], bool)>>,
+        output_values: Vec<u64>,
+        output_blindings: Vec<[u8; 32]>,
+        output_pubkeys: Vec<[u8; 32]>,
+        asset_id: [u8; 32],
+    ) -> Self {
+        TransferCircuitV2 {
+            merkle_root: Some(merkle_root),
+            nullifiers: nullifiers.into_iter().map(Some).collect(),
+            output_commitments: output_commitments.into_iter().map(Some).collect(),
+            input_values: input_values.into_iter().map(Some).collect(),
+            input_blindings: input_blindings.into_iter().map(Some).collect(),
+            input_privkeys: input_privkeys.into_iter().map(Some).collect(),
+            input_paths: input_paths.into_iter().map(Some).collect(),
+            output_values: output_values.into_iter().map(Some).collect(),
+            output_blindings: output_blindings.into_iter().map(Some).collect(),
+            output_pubkeys: output_pubkeys.into_iter().map(Some).collect(),
+            asset_id: Some(asset_id),
+        }
+    }
+}
+
+impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // --- Public inputs ---
+        let merkle_root_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .merkle_root
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let mut nullifier_vars = Vec::new();
+        for nullifier in &self.nullifiers {
+            nullifier_vars.push(FpVar::new_input(cs.clone(), || {
+                Ok(nullifier
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?);
+        }
+        let mut output_commitment_vars = Vec::new();
+        for commitment in &self.output_commitments {
+            output_commitment_vars.push(FpVar::new_input(cs.clone(), || {
+                Ok(commitment
+                    .map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?);
+        }
+
+        // --- Private witnesses ---
+        let mut input_value_vars = Vec::new();
+        for value in &self.input_values {
+            let (_bits, v) = alloc_u64_witness(cs.clone(), *value)?;
+            input_value_vars.push(v);
+        }
+        let mut input_blinding_vars = Vec::new();
+        for b in &self.input_blindings {
+            input_blinding_vars.push(FpVar::new_witness(cs.clone(), || {
+                Ok(b.map(|x| Fr::from_le_bytes_mod_order(&x))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?);
+        }
+        let mut input_privkey_vars = Vec::new();
+        for k in &self.input_privkeys {
+            input_privkey_vars.push(FpVar::new_witness(cs.clone(), || {
+                Ok(k.map(|x| Fr::from_le_bytes_mod_order(&x))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?);
+        }
+        // Single shared asset_id, bound into every input AND output commitment,
+        // so the balance check below is automatically per-asset.
+        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .asset_id
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let mut output_value_vars = Vec::new();
+        for value in &self.output_values {
+            let (_bits, v) = alloc_u64_witness(cs.clone(), *value)?;
+            output_value_vars.push(v);
+        }
+        let mut output_blinding_vars = Vec::new();
+        for b in &self.output_blindings {
+            output_blinding_vars.push(FpVar::new_witness(cs.clone(), || {
+                Ok(b.map(|x| Fr::from_le_bytes_mod_order(&x))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?);
+        }
+        let mut output_pubkey_vars = Vec::new();
+        for p in &self.output_pubkeys {
+            output_pubkey_vars.push(FpVar::new_witness(cs.clone(), || {
+                Ok(p.map(|x| Fr::from_le_bytes_mod_order(&x))
+                    .unwrap_or_else(|| Fr::from(0u64)))
+            })?);
+        }
+
+        // CONSTRAINT 1: value conservation (sum inputs == sum outputs).
+        let mut input_sum = FpVar::zero();
+        for v in &input_value_vars {
+            input_sum += v;
+        }
+        let mut output_sum = FpVar::zero();
+        for v in &output_value_vars {
+            output_sum += v;
+        }
+        input_sum.enforce_equal(&output_sum)?;
+
+        // CONSTRAINT 2: each input is a spend-authorized note in the tree, and
+        // its nullifier binds the key and the (path-derived) leaf index.
+        for i in 0..input_value_vars.len() {
+            let pubkey = poseidon_pubkey_gadget(cs.clone(), &input_privkey_vars[i])?;
+            let commitment = poseidon_commit_spend_gadget(
+                cs.clone(),
+                &input_value_vars[i],
+                &pubkey,
+                &input_blinding_vars[i],
+                &asset_id_var,
+            )?;
+
+            let mut current_hash = commitment.clone();
+            let mut leaf_index = FpVar::<Fr>::zero();
+            let mut place = Fr::from(1u64);
+            if let Some(path) = &self.input_paths[i] {
+                for (sibling_hash, is_left) in path {
+                    let sibling_var = FpVar::new_witness(cs.clone(), || {
+                        Ok(Fr::from_le_bytes_mod_order(sibling_hash))
+                    })?;
+                    let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
+                    let l = is_left_var.select(&current_hash, &sibling_var)?;
+                    let r = is_left_var.select(&sibling_var, &current_hash)?;
+                    current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
+                    let bit_contrib = is_left_var
+                        .not()
+                        .select(&FpVar::constant(place), &FpVar::<Fr>::zero())?;
+                    leaf_index += &bit_contrib;
+                    place = place + place;
+                }
+            }
+            current_hash.enforce_equal(&merkle_root_var)?;
+
+            let signature = poseidon_signature_gadget(
+                cs.clone(),
+                &input_privkey_vars[i],
+                &commitment,
+                &leaf_index,
+            )?;
+            let computed_nullifier =
+                poseidon_nullifier_spend_gadget(cs.clone(), &commitment, &leaf_index, &signature)?;
+            computed_nullifier.enforce_equal(&nullifier_vars[i])?;
+        }
+
+        // CONSTRAINT 3: input nullifiers are pairwise distinct, so the same note
+        // cannot be presented as two inputs (the reuse-one-note value forgery).
+        for i in 0..nullifier_vars.len() {
+            for j in (i + 1)..nullifier_vars.len() {
+                nullifier_vars[i].enforce_not_equal(&nullifier_vars[j])?;
+            }
+        }
+
+        // CONSTRAINT 4: output commitments bind the recipients' spend pubkeys.
+        for j in 0..output_value_vars.len() {
+            let computed = poseidon_commit_spend_gadget(
+                cs.clone(),
+                &output_value_vars[j],
+                &output_pubkey_vars[j],
+                &output_blinding_vars[j],
+                &asset_id_var,
+            )?;
+            computed.enforce_equal(&output_commitment_vars[j])?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Groth16 proof system wrapper
 pub struct Groth16ProofSystem;
 
@@ -1551,11 +1777,16 @@ mod tests {
         )
     }
 
+    // A circuit *accepts* a witness only if it both synthesises and is
+    // satisfied. A synthesis error (e.g. an `enforce_not_equal` whose operands
+    // are actually equal, so the inverse witness does not exist) is itself a
+    // rejection — the prover cannot even build a proof — so it counts as `false`.
     fn synth_v2(c: WithdrawCircuitV2) -> bool {
         let cs = ConstraintSystem::<Fr>::new_ref();
-        c.generate_constraints(cs.clone())
-            .expect("v2 synthesis should succeed structurally");
-        cs.is_satisfied().expect("constraint system query")
+        match c.generate_constraints(cs.clone()) {
+            Ok(()) => cs.is_satisfied().expect("constraint system query"),
+            Err(_) => false,
+        }
     }
 
     #[test]
@@ -1653,5 +1884,172 @@ mod tests {
             asset_id: Some(asset),
             input_path: Some(path),
         }));
+    }
+
+    // --- TransferCircuitV2 (spend-key construction, #293) ---
+
+    /// Native commitment + nullifier for a v2 input note owned by `sk` at
+    /// `leaf_index` (native SOL asset). Returns `(commitment_fr, nullifier_bytes)`.
+    fn v2_in_note(sk_bytes: [u8; 32], v: u64, b: [u8; 32], leaf_index: u64) -> (Fr, [u8; 32]) {
+        let sk = Fr::from_le_bytes_mod_order(&sk_bytes);
+        let c = poseidon_commit_spend(
+            Fr::from(v),
+            poseidon_pubkey(sk),
+            Fr::from_le_bytes_mod_order(&b),
+            Fr::from(0u64),
+        );
+        let sig = poseidon_signature(sk, c, Fr::from(leaf_index));
+        let nf = poseidon_nullifier_spend(c, Fr::from(leaf_index), sig);
+        (c, fr_to_bytes_32(nf))
+    }
+
+    /// Native output commitment bound to recipient pubkey `opk`.
+    fn v2_out_commit(opk: [u8; 32], v: u64, b: [u8; 32]) -> [u8; 32] {
+        fr_to_bytes_32(poseidon_commit_spend(
+            Fr::from(v),
+            Fr::from_le_bytes_mod_order(&opk),
+            Fr::from_le_bytes_mod_order(&b),
+            Fr::from(0u64),
+        ))
+    }
+
+    fn synth_v2_transfer(c: TransferCircuitV2) -> bool {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        match c.generate_constraints(cs.clone()) {
+            Ok(()) => cs.is_satisfied().expect("constraint system query"),
+            Err(_) => false,
+        }
+    }
+
+    /// Two input notes at positions 0 and 1 (a 2-leaf tree), 600 + 400.
+    #[allow(clippy::type_complexity)]
+    fn two_input_tree() -> (
+        [u8; 32],
+        Vec<[u8; 32]>,
+        Vec<u64>,
+        Vec<[u8; 32]>,
+        Vec<[u8; 32]>,
+        Vec<Vec<([u8; 32], bool)>>,
+    ) {
+        let (sk0, sk1) = ([6u8; 32], [7u8; 32]);
+        let (b0, b1) = ([3u8; 32], [4u8; 32]);
+        let (v0, v1) = (600u64, 400u64);
+        let (c0, nf0) = v2_in_note(sk0, v0, b0, 0);
+        let (c1, nf1) = v2_in_note(sk1, v1, b1, 1);
+        let root = fr_to_bytes_32(poseidon_merkle_pair(c0, c1));
+        // input0 is the left child (sibling c1); input1 is the right child (sibling c0).
+        let path0 = vec![(fr_to_bytes_32(c1), true)];
+        let path1 = vec![(fr_to_bytes_32(c0), false)];
+        (
+            root,
+            vec![nf0, nf1],
+            vec![v0, v1],
+            vec![b0, b1],
+            vec![sk0, sk1],
+            vec![path0, path1],
+        )
+    }
+
+    #[test]
+    fn transfer_v2_valid_two_in_two_out_satisfies() {
+        let (root, nfs, vals, blinds, sks, paths) = two_input_tree();
+        // Outputs: 500 + 500 = 1000 = 600 + 400.
+        let (opk0, opk1) = ([8u8; 32], [9u8; 32]);
+        let (ob0, ob1) = ([10u8; 32], [11u8; 32]);
+        let (ov0, ov1) = (500u64, 500u64);
+        let ocs = vec![v2_out_commit(opk0, ov0, ob0), v2_out_commit(opk1, ov1, ob1)];
+        assert!(synth_v2_transfer(TransferCircuitV2::with_witness(
+            root,
+            nfs,
+            ocs,
+            vals,
+            blinds,
+            sks,
+            paths,
+            vec![ov0, ov1],
+            vec![ob0, ob1],
+            vec![opk0, opk1],
+            [0u8; 32],
+        )));
+    }
+
+    #[test]
+    fn transfer_v2_rejects_balance_violation() {
+        let (root, nfs, vals, blinds, sks, paths) = two_input_tree();
+        // Outputs sum 900 != inputs sum 1000.
+        let (opk0, opk1) = ([8u8; 32], [9u8; 32]);
+        let (ob0, ob1) = ([10u8; 32], [11u8; 32]);
+        let (ov0, ov1) = (500u64, 400u64);
+        let ocs = vec![v2_out_commit(opk0, ov0, ob0), v2_out_commit(opk1, ov1, ob1)];
+        assert!(!synth_v2_transfer(TransferCircuitV2::with_witness(
+            root,
+            nfs,
+            ocs,
+            vals,
+            blinds,
+            sks,
+            paths,
+            vec![ov0, ov1],
+            vec![ob0, ob1],
+            vec![opk0, opk1],
+            [0u8; 32],
+        )));
+    }
+
+    #[test]
+    fn transfer_v2_rejects_the_same_note_used_twice() {
+        // Present input note 0 as BOTH inputs: both produce the same nullifier,
+        // so the pairwise-distinctness constraint traps the reuse-one-note value
+        // forgery (#293 C). Balance is satisfied (1200 in, 1200 out) so only the
+        // distinctness check can fail.
+        let (sk0, b0, v0) = ([6u8; 32], [3u8; 32], 600u64);
+        let (c0, nf0) = v2_in_note(sk0, v0, b0, 0);
+        let c1 = poseidon_commit_spend(
+            Fr::from(400u64),
+            poseidon_pubkey(Fr::from_le_bytes_mod_order(&[7u8; 32])),
+            Fr::from_le_bytes_mod_order(&[4u8; 32]),
+            Fr::from(0u64),
+        );
+        let root = fr_to_bytes_32(poseidon_merkle_pair(c0, c1));
+        let path0 = vec![(fr_to_bytes_32(c1), true)];
+
+        let (opk0, opk1) = ([8u8; 32], [9u8; 32]);
+        let (ob0, ob1) = ([10u8; 32], [11u8; 32]);
+        assert!(!synth_v2_transfer(TransferCircuitV2::with_witness(
+            root,
+            vec![nf0, nf0], // same note → same nullifier twice
+            vec![v2_out_commit(opk0, 600, ob0), v2_out_commit(opk1, 600, ob1)],
+            vec![v0, v0],
+            vec![b0, b0],
+            vec![sk0, sk0],
+            vec![path0.clone(), path0],
+            vec![600, 600],
+            vec![ob0, ob1],
+            vec![opk0, opk1],
+            [0u8; 32],
+        )));
+    }
+
+    #[test]
+    fn transfer_v2_rejects_wrong_input_key() {
+        let (root, nfs, vals, blinds, _sks, paths) = two_input_tree();
+        // Replace input 0's key: its commitment no longer matches the tree.
+        let bad_sks = vec![[0x99u8; 32], [7u8; 32]];
+        let (opk0, opk1) = ([8u8; 32], [9u8; 32]);
+        let (ob0, ob1) = ([10u8; 32], [11u8; 32]);
+        let ocs = vec![v2_out_commit(opk0, 500, ob0), v2_out_commit(opk1, 500, ob1)];
+        assert!(!synth_v2_transfer(TransferCircuitV2::with_witness(
+            root,
+            nfs,
+            ocs,
+            vals,
+            blinds,
+            bad_sks,
+            paths,
+            vec![500, 500],
+            vec![ob0, ob1],
+            vec![opk0, opk1],
+            [0u8; 32],
+        )));
     }
 }
