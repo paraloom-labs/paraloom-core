@@ -10,6 +10,15 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Bounded reads on the compute request-response codecs** (in-house security
+  audit). The compute job/query codecs read inbound payloads with an unbounded
+  `read_to_end`, where every sibling protocol (result, heartbeat, co-sign) caps
+  its reads to stop a peer pinning the heap with an unbounded stream. The codecs
+  are not currently wired into the live swarm, so this was a latent landmine
+  rather than a reachable DoS — the reads are now size-bounded to match the
+  siblings, disarming it before the protocol is ever enabled. Fixed pre-mainnet
+  on devnet; covered by accept/reject tests.
+
 - **Settlement RPC call bounded by a timeout** (in-house security audit). The
   bridge's `send_and_confirm_transaction` wrapped the blocking RPC call with no
   caller-side timeout; the client's confirmation loop polls until the blockhash
