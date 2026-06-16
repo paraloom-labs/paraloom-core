@@ -10,6 +10,16 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Transfer scan buffer recorded only after the proof verifies, and bounded**
+  (in-house security audit). A gossiped transfer-verification request had its
+  encrypted output notes recorded into the node's in-memory scan buffer *before*
+  the zk proof was verified, so any peer could broadcast an unverified (garbage)
+  transfer and pollute the buffer that recipients poll. Recording now happens
+  only after the proof verifies on the gossip path, and the buffer is bounded
+  (oldest-evicted at a fixed cap) so a high volume of transfers cannot grow it
+  without limit. Fixed pre-mainnet on devnet; covered by a test that a gossiped
+  transfer with an unverifiable proof records no notes.
+
 - **Bearer-token auth for the consensus-triggering ingress endpoints** (in-house
   security audit). The withdrawal and transfer HTTP ingress endpoints each accept
   a request and broadcast it into the consensus mesh — a write surface — but were
