@@ -383,6 +383,102 @@ mod tests {
         );
     }
 
+    /// The v2 (spend-key) withdraw circuit verified through the same vendored
+    /// `alt_bn128` path the Solana program runs. This pins the v2 on-chain
+    /// public-input layout — `[merkle_root, nullifier, withdraw_amount,
+    /// ext_data_hash, asset_id]`, 5 inputs → 6 IC points — and proves both the
+    /// asset binding (finding A) and the destination binding (finding D) hold
+    /// through the wire verifier, not just the native arkworks one. Self-contained
+    /// inline setup, so it needs no `keys/`.
+    #[test]
+    fn withdraw_v2_verifies_through_alt_bn128_with_asset_and_ext_data_bound() {
+        use crate::privacy::circuits::WithdrawCircuitV2;
+        use crate::privacy::poseidon::{
+            poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend, poseidon_pubkey,
+            poseidon_signature,
+        };
+
+        // A note owned by `privkey`, native asset, at tree position 2
+        // (path = left@depth0, right@depth1), withdrawing 500 of 1000.
+        let privkey = [6u8; 32];
+        let blinding = [3u8; 32];
+        let asset = [0u8; 32];
+        let input_value = 1_000u64;
+        let withdraw_amount = 500u64;
+        let ext_data_hash = [0x42u8; 32];
+
+        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(input_value),
+            poseidon_pubkey(sk),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+        let sibling_0 = [4u8; 32];
+        let sibling_1 = [5u8; 32];
+        let level_1 = poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling_0));
+        let merkle_root_fr = poseidon_merkle_pair(Fr::from_le_bytes_mod_order(&sibling_1), level_1);
+        let path = vec![(sibling_0, true), (sibling_1, false)];
+        let leaf_index = 2u64;
+
+        let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
+        let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
+
+        let merkle_root = fr_to_le_bytes_32(merkle_root_fr);
+        let nullifier = fr_to_le_bytes_32(nullifier_fr);
+
+        let mk = |p: Vec<([u8; 32], bool)>| WithdrawCircuitV2 {
+            merkle_root: Some(merkle_root),
+            nullifier: Some(nullifier),
+            withdraw_amount: Some(withdraw_amount),
+            ext_data_hash: Some(ext_data_hash),
+            input_value: Some(input_value),
+            blinding: Some(blinding),
+            privkey: Some(privkey),
+            asset_id: Some(asset),
+            input_path: Some(p),
+        };
+
+        let mut rng = thread_rng();
+        let (pk, vk) = Groth16ProofSystem::setup(mk(path.clone()), &mut rng).expect("setup");
+        let proof = Groth16ProofSystem::prove(&pk, mk(path.clone()), &mut rng).expect("prove");
+
+        // On-chain public-input order matches the circuit's new_input order.
+        let public_inputs: [[u8; 32]; 5] = [
+            fr_to_be(&merkle_root_fr),
+            fr_to_be(&nullifier_fr),
+            fr_to_be(&Fr::from(withdraw_amount)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&ext_data_hash)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&asset)),
+        ];
+
+        let wire_proof = proof_to_wire(&proof);
+        let wire_vk = WireVerifyingKey::from_arkworks(&vk);
+        let vk_view = wire_vk.as_verifying_key();
+
+        assert_eq!(wire_vk.ic.len(), 6, "withdraw v2 VK must have 6 IC points");
+        assert!(
+            verify(&wire_proof, &public_inputs, &vk_view),
+            "valid v2 withdrawal proof must verify through the alt_bn128 path"
+        );
+
+        // A different asset_id (finding A) must not verify.
+        let mut bad_asset = public_inputs;
+        bad_asset[4] = fr_to_be(&Fr::from_le_bytes_mod_order(&[0xCCu8; 32]));
+        assert!(
+            !verify(&wire_proof, &bad_asset, &vk_view),
+            "a proof claimed for a different asset_id must not verify"
+        );
+
+        // A redirected destination (finding D) must not verify.
+        let mut bad_dest = public_inputs;
+        bad_dest[3] = fr_to_be(&Fr::from_le_bytes_mod_order(&[0x43u8; 32]));
+        assert!(
+            !verify(&wire_proof, &bad_dest, &vk_view),
+            "a proof bound to one ext_data_hash must not verify against another"
+        );
+    }
+
     /// Dev tool — regenerates the on-chain program's withdraw verifying-key
     /// constant and a self-contained proof fixture for its tests. Loads the v4
     /// ceremony keys so the emitted VK matches the live prover. Run with:
