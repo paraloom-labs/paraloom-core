@@ -740,10 +740,18 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
 /// path. Lives alongside the v1 circuit until the prover, on-chain verifier and
 /// keys cut over together.
 pub struct WithdrawCircuitV2 {
-    // Public inputs.
+    // Public inputs. Order here is also the Groth16 public-input slice order:
+    // [merkle_root, nullifier, withdraw_amount, ext_data_hash, asset_id].
     pub merkle_root: Option<[u8; 32]>,
     pub nullifier: Option<[u8; 32]>,
     pub withdraw_amount: Option<u64>,
+    /// Hash of the external withdrawal data (recipient, fee, relayer, …) that
+    /// the on-chain program computes and supplies as a public input (finding D).
+    /// The circuit does not constrain it against anything internal — its binding
+    /// is the Groth16 public-input equation: a proof is valid for exactly one
+    /// `ext_data_hash`, so a relayer or front-runner cannot redirect the funds
+    /// to a different recipient without invalidating it.
+    pub ext_data_hash: Option<[u8; 32]>,
     // Private witnesses.
     pub input_value: Option<u64>,
     pub blinding: Option<[u8; 32]>,
@@ -758,6 +766,7 @@ impl WithdrawCircuitV2 {
             merkle_root: None,
             nullifier: None,
             withdraw_amount: None,
+            ext_data_hash: None,
             input_value: None,
             blinding: None,
             privkey: None,
@@ -796,6 +805,23 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
         let (_withdraw_bits, withdraw_amount_range_var) =
             alloc_u64_witness(cs.clone(), self.withdraw_amount)?;
         withdraw_amount_var.enforce_equal(&withdraw_amount_range_var)?;
+
+        // CONSTRAINT 0: bind the external withdrawal data (finding D). The
+        // on-chain program computes ext_data_hash = H(recipient, fee, relayer, …)
+        // and passes it as this public input, so a valid proof commits to exactly
+        // one destination — a relayer or front-runner cannot redirect the
+        // withdrawal to another recipient without invalidating the proof. The
+        // hash is not constrained against anything in-circuit; its binding is the
+        // Groth16 public-input equation. We still square it into a witness so the
+        // variable is wired into the R1CS and cannot be optimised away (the
+        // Tornado-Nova `extDataHash` pattern).
+        let ext_data_hash_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .ext_data_hash
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let _ext_data_hash_sq = &ext_data_hash_var * &ext_data_hash_var;
 
         // --- Private witnesses ---
         let (_input_value_bits, input_value_var) = alloc_u64_witness(cs.clone(), self.input_value)?;
@@ -1901,6 +1927,7 @@ mod tests {
             merkle_root: Some(root),
             nullifier: Some(nf),
             withdraw_amount: Some(wd),
+            ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),
             privkey: Some(pk),
@@ -1916,6 +1943,7 @@ mod tests {
             merkle_root: Some(root),
             nullifier: Some([0xABu8; 32]), // not the real nullifier
             withdraw_amount: Some(wd),
+            ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),
             privkey: Some(pk),
@@ -1935,6 +1963,7 @@ mod tests {
             merkle_root: Some(root),
             nullifier: Some(nf),
             withdraw_amount: Some(wd),
+            ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),
             privkey: Some([0x99u8; 32]), // not the owner's key
@@ -1953,6 +1982,7 @@ mod tests {
             merkle_root: Some(root),
             nullifier: Some(nf),
             withdraw_amount: Some(2_000), // > input_value (1000)
+            ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),
             privkey: Some(pk),
@@ -1983,6 +2013,7 @@ mod tests {
             merkle_root: Some(root),
             nullifier: Some(fr_to_bytes_32(nf_wrong)),
             withdraw_amount: Some(wd),
+            ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),
             privkey: Some(pk),
@@ -2003,12 +2034,66 @@ mod tests {
             merkle_root: Some(root),
             nullifier: Some(nf),
             withdraw_amount: Some(wd),
+            ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),
             privkey: Some(pk),
             asset_id: Some([0xCCu8; 32]), // not the asset the note commits to
             input_path: Some(path),
         }));
+    }
+
+    #[test]
+    fn withdraw_v2_proof_is_bound_to_the_ext_data_hash() {
+        // Finding D: the withdrawal destination is bound through the
+        // ext_data_hash public input. A proof generated for one ext_data_hash
+        // verifies only against that exact value, so a relayer cannot take a
+        // valid proof and redirect the funds by swapping in a different
+        // recipient bundle. This is a Groth16 public-input property, so it only
+        // shows under a real prove/verify (satisfaction alone never sees it).
+        let mut rng = StdRng::seed_from_u64(0xD_u64);
+        let (root, nf, wd, val, bl, pk, asset, path) = v2_withdraw_parts();
+        let ext_data_hash = [0x42u8; 32];
+
+        let mk = |edh: [u8; 32], p: Vec<([u8; 32], bool)>| WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nf),
+            withdraw_amount: Some(wd),
+            ext_data_hash: Some(edh),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some(asset),
+            input_path: Some(p),
+        };
+
+        let (gpk, vk) = Groth16ProofSystem::setup(mk(ext_data_hash, path.clone()), &mut rng)
+            .expect("trusted setup should succeed");
+        let proof = Groth16ProofSystem::prove(&gpk, mk(ext_data_hash, path.clone()), &mut rng)
+            .expect("proof generation should succeed");
+
+        // Public-input slice order matches the new_input order in
+        // generate_constraints: [root, nullifier, amount, ext_data_hash, asset].
+        let inputs = |edh: [u8; 32]| {
+            [
+                Fr::from_le_bytes_mod_order(&root),
+                Fr::from_le_bytes_mod_order(&nf),
+                Fr::from(wd),
+                Fr::from_le_bytes_mod_order(&edh),
+                Fr::from_le_bytes_mod_order(&asset),
+            ]
+        };
+
+        assert!(
+            Groth16ProofSystem::verify(&vk, &inputs(ext_data_hash), &proof)
+                .expect("verification should not error"),
+            "the proof verifies against the destination it was bound to"
+        );
+        assert!(
+            !Groth16ProofSystem::verify(&vk, &inputs([0x43u8; 32]), &proof)
+                .expect("verification should not error"),
+            "a redirected destination (different ext_data_hash) must not verify"
+        );
     }
 
     // --- TransferCircuitV2 (spend-key construction, #293) ---
