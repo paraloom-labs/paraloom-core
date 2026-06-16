@@ -10,6 +10,21 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Co-sign settlement assembly rejects an oversized validator set** (in-house
+  security audit). A co-sign request arrives over the network carrying the
+  quorum validator set used to rebuild the settlement transaction every
+  co-signer signs. Each validator contributes two accounts to the transaction,
+  and a Solana message indexes its accounts with a single byte — so a set large
+  enough to push past the 255-account limit would panic the message compiler
+  while building, crashing the node before any signature or settlement check
+  ran. Because the set came straight off the wire, a peer could send an
+  oversized quorum to crash a node reachable on the co-sign protocol. The
+  builder now rejects any quorum above a fixed maximum (100 — far beyond any
+  realistic BFT quorum, and well under the transaction-size limit that binds
+  first) with a typed error instead of panicking. Fixed pre-mainnet on devnet;
+  covered by a test that an oversized quorum returns an error and a quorum at the
+  cap still builds.
+
 - **Unauthenticated shielded-transaction gossip no longer mutates pool state**
   (in-house security audit). One gossip message variant carried a shielded
   transaction that the node applied straight to its local shielded pool —
