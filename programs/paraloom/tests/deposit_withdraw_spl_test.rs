@@ -5,9 +5,10 @@
 //! SPL mint + token accounts -> `deposit_spl` into the per-asset vault ->
 //! `withdraw_spl` out of it. Pins the value movement (tokens land in the
 //! per-asset vault on deposit; the recipient receives `amount - fee` on
-//! withdraw), the 25 bps fee parity with the native path (fee stays in the
-//! vault and is credited to the settling validator's `pending_rewards`), the
-//! L2-visible counters, and the nullifier PDA the replay layer relies on.
+//! withdraw), the 25 bps fee (the fee tokens stay in the per-asset vault and,
+//! unlike the native lamport path, are NOT credited to the validator's
+//! lamport-denominated `pending_rewards`), the L2-visible counters, and the
+//! nullifier PDA the replay layer relies on.
 //!
 //! Init + withdraw run as the program upgrade authority (#204); the SPL
 //! deposit is permissionless and signed by the depositor.
@@ -37,7 +38,7 @@ use common::{add_program_data, entry};
 const NULLIFIER: [u8; 32] = fx::FIXTURE_NULLIFIER;
 const WITHDRAW_AMOUNT: u64 = fx::FIXTURE_AMOUNT;
 const DEPOSIT_AMOUNT: u64 = fx::FIXTURE_AMOUNT + 5_000_000; // vault keeps the fee
-// 25 bps of WITHDRAW_AMOUNT.
+                                                            // 25 bps of WITHDRAW_AMOUNT.
 const EXPECTED_FEE: u64 = WITHDRAW_AMOUNT * 25 / 10_000;
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 
@@ -63,7 +64,7 @@ async fn send(
 }
 
 #[tokio::test]
-async fn deposit_spl_then_withdraw_spl_credits_validator_fee() {
+async fn deposit_spl_then_withdraw_spl_retains_fee_in_vault_without_lamport_credit() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
@@ -346,15 +347,21 @@ async fn deposit_spl_then_withdraw_spl_credits_validator_fee() {
         DEPOSIT_AMOUNT - (WITHDRAW_AMOUNT - EXPECTED_FEE)
     );
 
-    // The fee is credited to the settling validator's pending_rewards and the
-    // settlement is recorded — parity with the native withdraw path.
+    // The settlement is recorded against the validator, but the SPL fee is NOT
+    // credited to `pending_rewards`: that balance is paid out by `claim_rewards`
+    // in native lamports from the `bridge_vault`, whereas the SPL fee is tokens
+    // retained in the `asset_vault` (asserted above). Crediting it 1:1 into the
+    // lamport balance would let an SPL-settling validator drain the native vault.
     let val_raw = banks_client
         .get_account(validator_pda)
         .await
         .unwrap()
         .unwrap();
     let val = ValidatorAccount::try_deserialize(&mut val_raw.data.as_slice()).unwrap();
-    assert_eq!(val.pending_rewards, EXPECTED_FEE);
+    assert_eq!(
+        val.pending_rewards, 0,
+        "the SPL fee must not credit the native lamport pending_rewards"
+    );
     assert_eq!(val.successful_verifications, 1);
 
     // Counters advance and the nullifier PDA exists (replay defense).

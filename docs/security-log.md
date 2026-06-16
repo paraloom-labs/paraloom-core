@@ -24,6 +24,21 @@ issue, email security@paraloom.network.
   first) with a typed error instead of panicking. Fixed pre-mainnet on devnet;
   covered by a test that an oversized quorum returns an error and a quorum at the
   cap still builds.
+- **SPL withdrawal fee no longer credited as native lamport rewards** (in-house
+  security audit). The native `withdraw` credits its lamport fee to the settling
+  validator's `pending_rewards`, which `claim_rewards` later pays out in lamports
+  from the native bridge vault. The SPL twin `withdraw_spl` mirrored that line —
+  but its fee is denominated in the withdrawn SPL *token*, and those fee tokens
+  already stay behind in the per-asset token vault. Crediting the token fee 1:1
+  into the lamport-denominated `pending_rewards` mixed asset units: a validator
+  settling SPL withdrawals accrued lamport-claimable rewards in proportion to
+  token raw amounts, letting it draw down the native SOL vault through
+  `claim_rewards` independent of any SOL the fee was worth. `withdraw_spl` no
+  longer touches `pending_rewards`; the SPL fee tokens accrue in the per-asset
+  vault for a future per-asset payout, and the settlement is still recorded
+  against the validator's activity. Fixed pre-mainnet on devnet; the SPL withdraw
+  test now asserts the native lamport `pending_rewards` stays zero while the fee
+  tokens remain in the vault.
 
 - **Unauthenticated shielded-transaction gossip no longer mutates pool state**
   (in-house security audit). One gossip message variant carried a shielded
