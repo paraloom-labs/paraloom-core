@@ -342,6 +342,80 @@ pub fn poseidon_merkle_pair_gadget(
     poseidon_hash_gadget(cs, &[tag, left.clone(), right.clone()])
 }
 
+// --- Spend-key construction gadgets (circuit v2, #293) ---------------------
+//
+// The in-circuit twins of `poseidon_pubkey` / `poseidon_commit_spend` /
+// `poseidon_signature` / `poseidon_nullifier_spend`. Each allocates its domain
+// tag as a constant and delegates to the generic gadget, so the gadget and the
+// native function compute the same digest for the same inputs (the
+// native↔circuit parity the soundness rests on — see the parity tests).
+
+/// Circuit spend public key: `Poseidon(PUBKEY, privkey)`.
+pub fn poseidon_pubkey_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    privkey: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::PUBKEY));
+    poseidon_hash_gadget(cs, &[tag, privkey.clone()])
+}
+
+/// Circuit spend-key note commitment:
+/// `Poseidon(COMMITMENT, amount, pubkey, blinding, asset_id)`.
+pub fn poseidon_commit_spend_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    amount: &FpVar<Fr>,
+    pubkey: &FpVar<Fr>,
+    blinding: &FpVar<Fr>,
+    asset_id: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::COMMITMENT));
+    poseidon_hash_gadget(
+        cs,
+        &[
+            tag,
+            amount.clone(),
+            pubkey.clone(),
+            blinding.clone(),
+            asset_id.clone(),
+        ],
+    )
+}
+
+/// Circuit spend signature:
+/// `Poseidon(SIGNATURE, privkey, commitment, leaf_index)`.
+pub fn poseidon_signature_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    privkey: &FpVar<Fr>,
+    commitment: &FpVar<Fr>,
+    leaf_index: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::SIGNATURE));
+    poseidon_hash_gadget(
+        cs,
+        &[tag, privkey.clone(), commitment.clone(), leaf_index.clone()],
+    )
+}
+
+/// Circuit spend-key nullifier:
+/// `Poseidon(NULLIFIER, commitment, leaf_index, signature)`.
+pub fn poseidon_nullifier_spend_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    commitment: &FpVar<Fr>,
+    leaf_index: &FpVar<Fr>,
+    signature: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let tag = FpVar::constant(Fr::from(domain::NULLIFIER));
+    poseidon_hash_gadget(
+        cs,
+        &[
+            tag,
+            commitment.clone(),
+            leaf_index.clone(),
+            signature.clone(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +792,120 @@ mod tests {
             let native = poseidon_merkle_pair(l, r);
             let circuit = eval_merkle_pair_gadget(l, r);
             assert_eq!(native, circuit, "merkle_pair drift: l={l}, r={r}");
+        }
+    }
+
+    // --- Spend-key construction gadgets: native↔circuit parity (#293) ---
+
+    fn eval_unary_gadget(
+        input: Fr,
+        f: impl Fn(ConstraintSystemRef<Fr>, &FpVar<Fr>) -> Result<FpVar<Fr>, SynthesisError>,
+    ) -> Fr {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let x = FpVar::new_witness(cs.clone(), || Ok(input)).unwrap();
+        let out = f(cs.clone(), &x).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+        out.value().unwrap()
+    }
+
+    fn eval_ternary_gadget(
+        a: Fr,
+        b: Fr,
+        c: Fr,
+        f: impl Fn(
+            ConstraintSystemRef<Fr>,
+            &FpVar<Fr>,
+            &FpVar<Fr>,
+            &FpVar<Fr>,
+        ) -> Result<FpVar<Fr>, SynthesisError>,
+    ) -> Fr {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let x = FpVar::new_witness(cs.clone(), || Ok(a)).unwrap();
+        let y = FpVar::new_witness(cs.clone(), || Ok(b)).unwrap();
+        let z = FpVar::new_witness(cs.clone(), || Ok(c)).unwrap();
+        let out = f(cs.clone(), &x, &y, &z).unwrap();
+        assert!(cs.is_satisfied().unwrap());
+        out.value().unwrap()
+    }
+
+    #[test]
+    fn test_pubkey_native_matches_circuit() {
+        for sk in [Fr::from(0u64), Fr::from(42u64), Fr::from(u64::MAX)] {
+            let native = poseidon_pubkey(sk);
+            let circuit = eval_unary_gadget(sk, poseidon_pubkey_gadget);
+            assert_eq!(native, circuit, "pubkey drift: sk={sk}");
+        }
+    }
+
+    #[test]
+    fn test_commit_spend_native_matches_circuit() {
+        let cases = [
+            (
+                Fr::from(0u64),
+                Fr::from(0u64),
+                Fr::from(0u64),
+                Fr::from(0u64),
+            ),
+            (
+                Fr::from(1000u64),
+                Fr::from(7u64),
+                Fr::from(3u64),
+                Fr::from(0u64),
+            ),
+            (
+                Fr::from(1000u64),
+                Fr::from(7u64),
+                Fr::from(3u64),
+                Fr::from(9u64),
+            ),
+            (
+                Fr::from(u64::MAX),
+                Fr::from(u64::MAX),
+                Fr::from(1u64),
+                Fr::from(u64::MAX),
+            ),
+        ];
+        for (amount, pubkey, blinding, asset) in cases {
+            let native = poseidon_commit_spend(amount, pubkey, blinding, asset);
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            let amt = FpVar::new_witness(cs.clone(), || Ok(amount)).unwrap();
+            let pk = FpVar::new_witness(cs.clone(), || Ok(pubkey)).unwrap();
+            let bl = FpVar::new_witness(cs.clone(), || Ok(blinding)).unwrap();
+            let a = FpVar::new_witness(cs.clone(), || Ok(asset)).unwrap();
+            let circuit = poseidon_commit_spend_gadget(cs.clone(), &amt, &pk, &bl, &a)
+                .unwrap()
+                .value()
+                .unwrap();
+            assert!(cs.is_satisfied().unwrap());
+            assert_eq!(native, circuit, "commit_spend drift");
+        }
+    }
+
+    #[test]
+    fn test_signature_native_matches_circuit() {
+        let cases = [
+            (Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)),
+            (Fr::from(42u64), Fr::from(1337u64), Fr::from(5u64)),
+            (Fr::from(u64::MAX), Fr::from(u64::MAX), Fr::from(u64::MAX)),
+        ];
+        for (sk, c, idx) in cases {
+            let native = poseidon_signature(sk, c, idx);
+            let circuit = eval_ternary_gadget(sk, c, idx, poseidon_signature_gadget);
+            assert_eq!(native, circuit, "signature drift");
+        }
+    }
+
+    #[test]
+    fn test_nullifier_spend_native_matches_circuit() {
+        let cases = [
+            (Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)),
+            (Fr::from(99u64), Fr::from(3u64), Fr::from(123u64)),
+            (Fr::from(u64::MAX), Fr::from(u64::MAX), Fr::from(u64::MAX)),
+        ];
+        for (c, idx, sig) in cases {
+            let native = poseidon_nullifier_spend(c, idx, sig);
+            let circuit = eval_ternary_gadget(c, idx, sig, poseidon_nullifier_spend_gadget);
+            assert_eq!(native, circuit, "nullifier_spend drift");
         }
     }
 
