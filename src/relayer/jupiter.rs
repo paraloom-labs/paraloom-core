@@ -172,7 +172,22 @@ pub trait SwapSubmitter: Send + Sync {
     async fn realized_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    /// The realized native (lamport) balance of `owner` after a swap whose
+    /// output is SOL, or `None` when it can't be read cheaply (the default).
+    /// Unlike an SPL output there is no token account to read, and the lamport
+    /// balance doubles as the fee asset — so the caller re-shields this balance
+    /// minus a small reserve rather than the quote, which an over-quote would
+    /// push above the actual balance and strand on a failed re-deposit.
+    async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
+
+/// Lamports left at the ephemeral address when re-depositing a native-SOL swap
+/// output, to cover the re-deposit transaction's own fee. The realized balance
+/// minus this reserve is what gets re-shielded.
+const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 10_000;
 
 /// Production [`JupiterHttpClient`] over `reqwest`, talking to a configurable
 /// base URL.
@@ -302,6 +317,25 @@ impl SwapSubmitter for RpcSwapSubmitter {
             // falls back to the quote estimate rather than aborting the swap.
             match client.get_token_account_balance(&ata) {
                 Ok(bal) => Ok(Some(bal.amount.parse::<u64>().unwrap_or(0))),
+                Err(_) => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn realized_native(&self, owner: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let owner = *owner;
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // An unreadable balance yields None, not an error: the caller then
+            // falls back to the quote estimate rather than aborting the swap.
+            match client.get_balance(&owner) {
+                Ok(lamports) => Ok(Some(lamports)),
                 Err(_) => Ok(None),
             }
         })
@@ -474,19 +508,25 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         self.submitter.sign_and_submit(transaction, signer).await?;
 
         // 4. Prefer the realized on-chain output over the quote estimate, so the
-        //    re-shield leg deposits exactly what the swap delivered. Native-SOL
-        //    output is unwrapped to lamports — there is no token account to read
-        //    — so it keeps the quote figure.
-        let realized = if asset_out == NATIVE_SOL_ASSET {
-            None
+        //    re-shield leg deposits exactly what the swap delivered, not a stale
+        //    figure that an over-quote would push above the actual balance and
+        //    strand on a failed re-deposit (audit).
+        let out_amount = if asset_out == NATIVE_SOL_ASSET {
+            // Native output: re-shield the ephemeral's actual lamport balance
+            // minus a reserve for the re-deposit fee, falling back to the quote
+            // only when the balance can't be read.
+            match self.submitter.realized_native(&signer.pubkey()).await? {
+                Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
+                None => out_amount,
+            }
         } else {
             let mint = Pubkey::from_str(&output_mint)
                 .map_err(|e| RelayerError::SwapFailed(format!("bad output mint: {e}")))?;
             self.submitter
                 .realized_output(&signer.pubkey(), &mint)
                 .await?
+                .unwrap_or(out_amount)
         };
-        let out_amount = realized.unwrap_or(out_amount);
 
         Ok(SwapResult { out_amount })
     }
@@ -743,6 +783,46 @@ mod tests {
             provider.submitter.signed_pubkey.lock().unwrap().clone(),
             Some(ephemeral.pubkey().to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn native_output_reshields_realized_balance_not_the_quote() {
+        // Quote says 1_000_000 lamports out, but the ephemeral actually holds
+        // 995_000 (slippage). The relayer must re-shield the realized balance
+        // minus the deposit reserve, never the stale quote — which would exceed
+        // the balance and strand the funds on a failed re-deposit.
+        struct BalanceSubmitter {
+            lamports: u64,
+        }
+        #[async_trait::async_trait]
+        impl SwapSubmitter for BalanceSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(self.lamports))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "1000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider =
+            JupiterSwapProvider::new(http, BalanceSubmitter { lamports: 995_000 }, 50, 0, None)
+                .unwrap();
+
+        // SPL input, native-SOL output.
+        let out = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 995_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS);
     }
 
     #[tokio::test]
