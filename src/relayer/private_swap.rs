@@ -17,11 +17,12 @@
 //!    fresh address. The routing lives behind the [`SwapProvider`] trait; this
 //!    module ships only a [`MockSwapProvider`]. The real Jupiter v6 router is
 //!    issue #239 and is out of scope here.
-//! 3. **Fee.** Apply `fee_bps` to the swap output; the relayer keeps that cut
-//!    and the user receives the remainder. The exact fee *mechanism* (Jupiter's
-//!    `platformFeeBps` taken inside the route vs. a separate transfer of the
-//!    relayer's cut) is decided in #239. Here `fee_bps` is an abstract
-//!    parameter applied to the gross output.
+//! 3. **Fee.** The relayer fee is realized **once**, inside the swap route, by
+//!    the swap provider (Jupiter's `platformFeeBps`, credited to the relayer's
+//!    fee account) — so the swap output is already net of it. The orchestrator
+//!    does **not** take a second cut; doing so double-charged the user.
+//!    `request.fee_bps` is the declared fee the provider is configured to
+//!    realize.
 //! 4. **Re-deposit.** Deposit the net output back into the shielded pool to the
 //!    user's chosen re-shield recipient, producing a fresh note of `asset_out`.
 //!    The on-chain deposit shows the ephemeral fresh address as the depositor,
@@ -267,11 +268,14 @@ pub struct PrivateSwapResult {
     pub withdraw_leg: SubmittedLeg,
     /// The re-deposit leg.
     pub deposit_leg: SubmittedLeg,
-    /// Gross output of the swap, before the relayer fee.
+    /// Swap output reaching the ephemeral address, already net of any fee the
+    /// provider realized inside the route.
     pub gross_out_amount: u64,
-    /// Relayer fee taken, in `asset_out`'s smallest unit.
+    /// Fee taken by the orchestrator. Always 0: the relayer fee is realized once
+    /// by the swap provider in-route, not deducted again here.
     pub relayer_fee: u64,
-    /// Net output re-shielded to the user (`gross - fee`).
+    /// Net output re-shielded to the user. Equals `gross_out_amount` now that the
+    /// orchestrator takes no second cut.
     pub net_out_amount: u64,
     /// The fresh ephemeral address used for this swap. Present so callers can
     /// confirm the link-severing property; it shares no signer with the user.
@@ -311,13 +315,6 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
     pub fn with_native_swap_overhead(mut self, lamports: u64) -> Self {
         self.native_swap_overhead_lamports = lamports;
         self
-    }
-
-    /// Apply `fee_bps` to `gross`, returning `(fee, net)`. Rounds the fee down,
-    /// so the user is never short-changed by rounding.
-    fn split_fee(gross: u64, fee_bps: u16) -> (u64, u64) {
-        let fee = (gross as u128 * fee_bps as u128 / 10_000u128) as u64;
-        (fee, gross - fee)
     }
 
     /// Execute one private swap end to end.
@@ -384,8 +381,14 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             .await?;
         let gross_out_amount = swap.out_amount;
 
-        // Step 3: take the relayer's cut from the gross output.
-        let (relayer_fee, net_out_amount) = Self::split_fee(gross_out_amount, request.fee_bps);
+        // Step 3: the swap output is ALREADY net of the relayer's fee — it is
+        // realized inside the route by the swap provider (Jupiter's
+        // `platformFeeBps`, credited to the relayer's fee account). The
+        // orchestrator does NOT take a second cut here; applying `fee_bps` again
+        // double-charged the user (audit). `request.fee_bps` is the declared fee
+        // the provider is configured to realize, validated for bounds above.
+        let relayer_fee = 0u64;
+        let net_out_amount = gross_out_amount;
 
         // Step 4: re-deposit the net output into the shielded pool to the
         // user's new recipient, producing a fresh `asset_out` note.
@@ -519,17 +522,17 @@ mod tests {
     #[tokio::test]
     async fn composes_withdraw_swap_fee_redeposit_end_to_end() {
         let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
-        // 1:1 swap of 1_000_000 with a 50 bps relayer fee.
+        // 1:1 swap of 1_000_000. The mock provider takes no fee, and the
+        // orchestrator no longer takes a second cut, so the full output is
+        // re-shielded.
         let req = request(native_note(1_000_000), NATIVE_SOL_ASSET, 50);
         let out = relayer.execute(req).await.expect("swap executes");
 
-        // Gross output is the 1:1 swap of the input amount.
         assert_eq!(out.gross_out_amount, 1_000_000);
-        // 50 bps of 1_000_000 = 5_000 fee; user nets 995_000.
-        assert_eq!(out.relayer_fee, 5_000);
-        assert_eq!(out.net_out_amount, 995_000);
-        // The re-shielded note carries the net amount and the user's recipient.
-        assert_eq!(out.output_note.amount, 995_000);
+        assert_eq!(out.relayer_fee, 0);
+        assert_eq!(out.net_out_amount, 1_000_000);
+        // The re-shielded note carries the full output and the user's recipient.
+        assert_eq!(out.output_note.amount, 1_000_000);
         assert_eq!(
             out.output_note.recipient,
             ShieldedAddress::from_bytes([9u8; 32])
@@ -537,7 +540,7 @@ mod tests {
 
         // Both legs were submitted, withdraw then deposit.
         assert_eq!(out.withdraw_leg.amount, 1_000_000);
-        assert_eq!(out.deposit_leg.amount, 995_000);
+        assert_eq!(out.deposit_leg.amount, 1_000_000);
     }
 
     #[tokio::test]
@@ -580,8 +583,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relayer_fee_is_deducted_from_gross_output() {
-        // 250 bps (2.5%) on a 2:1 swap of 400 -> gross 800, fee 20, net 780.
+    async fn orchestrator_takes_no_second_fee_from_the_swap_output() {
+        // 2:1 swap of 400 -> gross 800. Even with a non-zero request fee_bps,
+        // the orchestrator no longer deducts a second cut (the fee is realized
+        // by the swap provider), so the full output is re-shielded — closing the
+        // double-charge.
         let relayer =
             PrivateSwapRelayer::new(MockSwapProvider::with_rate(2, 1), MockSubmitter::new());
         let out = relayer
@@ -589,9 +595,8 @@ mod tests {
             .await
             .expect("swap executes");
         assert_eq!(out.gross_out_amount, 800);
-        assert_eq!(out.relayer_fee, 20);
-        assert_eq!(out.net_out_amount, 780);
-        assert_eq!(out.relayer_fee + out.net_out_amount, out.gross_out_amount);
+        assert_eq!(out.relayer_fee, 0);
+        assert_eq!(out.net_out_amount, 800);
     }
 
     #[tokio::test]

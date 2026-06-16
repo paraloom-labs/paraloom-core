@@ -10,6 +10,16 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Relayer no longer double-charges the swap fee** (in-house security audit).
+  The private-swap relayer applied its fee twice: the swap provider took its
+  `platformFeeBps` inside the route — so the swap output already excluded it —
+  and then the orchestrator deducted `fee_bps` again from that output before
+  re-shielding, silently shrinking the user's note by an extra cut that reached
+  no one. The fee is now realized once, in-route by the provider; the
+  orchestrator re-shields the full swap output. Latent today (the demo sets both
+  fees to zero), but it would have bitten the first real fee. Fixed pre-mainnet
+  on devnet; covered by a test that the orchestrator takes no second cut.
+
 - **Equivocation now costs the validator reputation** (in-house security audit).
   A validator that cast two disagreeing votes on the same request had its
   equivocation recorded as evidence but kept its full reputation — so provable
