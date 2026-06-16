@@ -20,7 +20,9 @@ use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{
-    poseidon_commit_gadget, poseidon_merkle_pair_gadget, poseidon_nullifier_gadget,
+    poseidon_commit_gadget, poseidon_commit_spend_gadget, poseidon_merkle_pair_gadget,
+    poseidon_nullifier_gadget, poseidon_nullifier_spend_gadget, poseidon_pubkey_gadget,
+    poseidon_signature_gadget,
 };
 
 /// Allocate a private witness `u64` and return both the bit-decomposed
@@ -726,6 +728,154 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
     }
 }
 
+/// Withdraw circuit, spend-key construction (circuit v2, #293).
+///
+/// The successor to [`WithdrawCircuit`]: spend authority is a private key, not a
+/// free `secret` witness. The note binds `pubkey = Poseidon(privkey)` in its
+/// commitment, and the nullifier folds in a signature over
+/// `(commitment, leaf_index)` that requires the private key — so a note at a
+/// given tree position yields exactly one nullifier and only its key-holder can
+/// produce it. `leaf_index` is derived in-circuit from the Merkle path's
+/// direction bits, so the prover cannot pick an index inconsistent with the
+/// path. Lives alongside the v1 circuit until the prover, on-chain verifier and
+/// keys cut over together.
+pub struct WithdrawCircuitV2 {
+    // Public inputs.
+    pub merkle_root: Option<[u8; 32]>,
+    pub nullifier: Option<[u8; 32]>,
+    pub withdraw_amount: Option<u64>,
+    // Private witnesses.
+    pub input_value: Option<u64>,
+    pub blinding: Option<[u8; 32]>,
+    pub privkey: Option<[u8; 32]>,
+    pub asset_id: Option<[u8; 32]>,
+    pub input_path: Option<Vec<([u8; 32], bool)>>,
+}
+
+impl WithdrawCircuitV2 {
+    pub fn new() -> Self {
+        WithdrawCircuitV2 {
+            merkle_root: None,
+            nullifier: None,
+            withdraw_amount: None,
+            input_value: None,
+            blinding: None,
+            privkey: None,
+            asset_id: None,
+            input_path: None,
+        }
+    }
+}
+
+impl Default for WithdrawCircuitV2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // --- Public inputs ---
+        let merkle_root_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .merkle_root
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let nullifier_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .nullifier
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let withdraw_amount_var = FpVar::new_input(cs.clone(), || {
+            self.withdraw_amount
+                .map(Fr::from)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let (_withdraw_bits, withdraw_amount_range_var) =
+            alloc_u64_witness(cs.clone(), self.withdraw_amount)?;
+        withdraw_amount_var.enforce_equal(&withdraw_amount_range_var)?;
+
+        // --- Private witnesses ---
+        let (_input_value_bits, input_value_var) = alloc_u64_witness(cs.clone(), self.input_value)?;
+        let blinding_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .blinding
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let privkey_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .privkey
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .asset_id
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+
+        // CONSTRAINT 1: input_value >= withdraw_amount (change is u64-bounded).
+        let change_value = match (self.input_value, self.withdraw_amount) {
+            (Some(input), Some(withdraw)) => Some(input.saturating_sub(withdraw)),
+            _ => None,
+        };
+        let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;
+        let computed_change = &input_value_var - &withdraw_amount_var;
+        change_var.enforce_equal(&computed_change)?;
+
+        // CONSTRAINT 2: the note commitment binds the spend public key.
+        let pubkey_var = poseidon_pubkey_gadget(cs.clone(), &privkey_var)?;
+        let commitment = poseidon_commit_spend_gadget(
+            cs.clone(),
+            &input_value_var,
+            &pubkey_var,
+            &blinding_var,
+            &asset_id_var,
+        )?;
+
+        // CONSTRAINT 3: the commitment is in the tree, and `leaf_index` is the
+        // path's position — derived from the direction bits so it cannot be
+        // chosen inconsistently with the path. `is_left` = current node is the
+        // left child, so the index bit at that level is `!is_left`.
+        let mut current_hash = commitment.clone();
+        let mut leaf_index = FpVar::<Fr>::zero();
+        let mut place = Fr::from(1u64);
+        if let Some(path) = &self.input_path {
+            for (sibling_hash, is_left) in path {
+                let sibling_var = FpVar::new_witness(cs.clone(), || {
+                    Ok(Fr::from_le_bytes_mod_order(sibling_hash))
+                })?;
+                let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
+
+                let l = is_left_var.select(&current_hash, &sibling_var)?;
+                let r = is_left_var.select(&sibling_var, &current_hash)?;
+                current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
+
+                // Add `place` to the index iff this node is the right child.
+                let bit_contrib = is_left_var
+                    .not()
+                    .select(&FpVar::constant(place), &FpVar::<Fr>::zero())?;
+                leaf_index += &bit_contrib;
+                place = place + place;
+            }
+        }
+        current_hash.enforce_equal(&merkle_root_var)?;
+
+        // CONSTRAINT 4: nullifier binds the signature, which requires the key.
+        let signature =
+            poseidon_signature_gadget(cs.clone(), &privkey_var, &commitment, &leaf_index)?;
+        let computed_nullifier =
+            poseidon_nullifier_spend_gadget(cs, &commitment, &leaf_index, &signature)?;
+        computed_nullifier.enforce_equal(&nullifier_var)?;
+
+        Ok(())
+    }
+}
+
 /// Groth16 proof system wrapper
 pub struct Groth16ProofSystem;
 
@@ -776,7 +926,10 @@ impl Groth16ProofSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privacy::poseidon::{poseidon_commit, poseidon_merkle_pair, poseidon_nullifier};
+    use crate::privacy::poseidon::{
+        poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier,
+        poseidon_nullifier_spend, poseidon_pubkey, poseidon_signature,
+    };
     use ark_ff::BigInteger;
     use ark_relations::r1cs::ConstraintSystem;
     use ark_std::rand::rngs::StdRng;
@@ -1341,5 +1494,164 @@ mod tests {
                 .expect("withdraw constraint system query"),
             "withdraw constraints unsatisfied — transfer→withdraw linkage broken"
         );
+    }
+
+    // --- WithdrawCircuitV2 (spend-key construction, #293) ---
+
+    /// A consistent v2 withdraw witness set: a note owned by `privkey` at tree
+    /// position 2 (path = left@0, right@1), withdrawing 500 of 1000. Returns the
+    /// pieces so tests can tamper individually.
+    #[allow(clippy::type_complexity)]
+    fn v2_withdraw_parts() -> (
+        [u8; 32],
+        [u8; 32],
+        u64,
+        u64,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+        Vec<([u8; 32], bool)>,
+    ) {
+        let privkey = [6u8; 32];
+        let blinding = [3u8; 32];
+        let asset = [0u8; 32];
+        let input_value = 1_000u64;
+        let withdraw_amount = 500u64;
+
+        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let pubkey = poseidon_pubkey(sk);
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(input_value),
+            pubkey,
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+
+        // Path: leaf is the left child at depth 0, then the right child at
+        // depth 1 → leaf_index = 0b10 = 2.
+        let sibling_0 = [4u8; 32];
+        let sibling_1 = [5u8; 32];
+        let level_1 = poseidon_merkle_pair(commitment_fr, Fr::from_le_bytes_mod_order(&sibling_0));
+        let merkle_root_fr = poseidon_merkle_pair(Fr::from_le_bytes_mod_order(&sibling_1), level_1);
+        let path = vec![(sibling_0, true), (sibling_1, false)];
+        let leaf_index = 2u64;
+
+        let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
+        let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
+
+        (
+            fr_to_bytes_32(merkle_root_fr),
+            fr_to_bytes_32(nullifier_fr),
+            withdraw_amount,
+            input_value,
+            blinding,
+            privkey,
+            asset,
+            path,
+        )
+    }
+
+    fn synth_v2(c: WithdrawCircuitV2) -> bool {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        c.generate_constraints(cs.clone())
+            .expect("v2 synthesis should succeed structurally");
+        cs.is_satisfied().expect("constraint system query")
+    }
+
+    #[test]
+    fn withdraw_v2_valid_witnesses_satisfy() {
+        let (root, nf, wd, val, bl, pk, asset, path) = v2_withdraw_parts();
+        assert!(synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nf),
+            withdraw_amount: Some(wd),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some(asset),
+            input_path: Some(path),
+        }));
+    }
+
+    #[test]
+    fn withdraw_v2_rejects_tampered_nullifier() {
+        let (root, _nf, wd, val, bl, pk, asset, path) = v2_withdraw_parts();
+        assert!(!synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some([0xABu8; 32]), // not the real nullifier
+            withdraw_amount: Some(wd),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some(asset),
+            input_path: Some(path),
+        }));
+    }
+
+    #[test]
+    fn withdraw_v2_rejects_wrong_privkey() {
+        // A different key derives a different pubkey, so the commitment it forms
+        // is not the one in the tree — membership (and the nullifier) fail. This
+        // is the spend-authorization property: knowing the note's value/blinding
+        // is not enough, you need its private key.
+        let (root, nf, wd, val, bl, _pk, asset, path) = v2_withdraw_parts();
+        assert!(!synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nf),
+            withdraw_amount: Some(wd),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some([0x99u8; 32]), // not the owner's key
+            asset_id: Some(asset),
+            input_path: Some(path),
+        }));
+    }
+
+    #[test]
+    fn withdraw_v2_rejects_underflow() {
+        // withdraw_amount > input_value; the commitment/nullifier are unchanged
+        // (they don't depend on the withdraw amount), so only the change range
+        // constraint traps it.
+        let (root, nf, _wd, val, bl, pk, asset, path) = v2_withdraw_parts();
+        assert!(!synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nf),
+            withdraw_amount: Some(2_000), // > input_value (1000)
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some(asset),
+            input_path: Some(path),
+        }));
+    }
+
+    #[test]
+    fn withdraw_v2_binds_the_leaf_index_into_the_nullifier() {
+        // The nullifier is computed by the host at the WRONG leaf index (3); the
+        // circuit derives the index (2) from the path's direction bits, so the
+        // rebuilt nullifier does not match the public one. This is what makes a
+        // note at a given position yield exactly one nullifier.
+        let (root, _nf, wd, val, bl, pk, asset, path) = v2_withdraw_parts();
+        let sk = Fr::from_le_bytes_mod_order(&pk);
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(val),
+            poseidon_pubkey(sk),
+            Fr::from_le_bytes_mod_order(&bl),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+        let wrong_index = 3u64;
+        let sig = poseidon_signature(sk, commitment_fr, Fr::from(wrong_index));
+        let nf_wrong = poseidon_nullifier_spend(commitment_fr, Fr::from(wrong_index), sig);
+
+        assert!(!synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(fr_to_bytes_32(nf_wrong)),
+            withdraw_amount: Some(wd),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some(asset),
+            input_path: Some(path),
+        }));
     }
 }
