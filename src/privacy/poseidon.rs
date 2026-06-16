@@ -209,6 +209,67 @@ pub mod domain {
     pub const NULLIFIER: u64 = 2;
     /// Merkle inner node: `Poseidon(TAG, left, right)`.
     pub const MERKLE_PAIR: u64 = 3;
+    /// Spend public key (circuit v2, #293): `Poseidon(TAG, privkey)`.
+    pub const PUBKEY: u64 = 4;
+    /// Spend signature (circuit v2, #293):
+    /// `Poseidon(TAG, privkey, commitment, leaf_index)`.
+    pub const SIGNATURE: u64 = 5;
+}
+
+// --- Spend-key construction (circuit v2, #293) -----------------------------
+//
+// Reimplemented independently in arkworks following the public Tornado-Nova
+// construction (the lineage Privacy Cash also forked). A note's spend authority
+// is a private key, not merely knowledge of the note opening:
+//
+//   pubkey     = Poseidon(PUBKEY, privkey)
+//   commitment = Poseidon(COMMITMENT, amount, pubkey, blinding, asset_id)
+//   signature  = Poseidon(SIGNATURE, privkey, commitment, leaf_index)
+//   nullifier  = Poseidon(NULLIFIER, commitment, leaf_index, signature)
+//
+// `pubkey` is bound into the commitment, so a note cannot be re-bound to a
+// different key without changing its commitment (which breaks Merkle
+// membership). The nullifier folds in a signature over (commitment, leaf_index)
+// that requires the private key, so a note at a given tree position yields
+// exactly one nullifier and only its key-holder can produce it. This is the
+// construction that closes the free-secret double-spend and the spend-without-
+// authorization gaps (#293). These use our own (sponge) Poseidon parameters —
+// the construction shape matches the reference, the digests do not.
+
+/// Spend public key from a private key (circuit v2): `Poseidon(PUBKEY, sk)`.
+pub fn poseidon_pubkey(privkey: Fr) -> Fr {
+    poseidon_hash_fields(&[Fr::from(domain::PUBKEY), privkey])
+}
+
+/// Spend-key note commitment (circuit v2):
+/// `Poseidon(COMMITMENT, amount, pubkey, blinding, asset_id)`.
+pub fn poseidon_commit_spend(amount: Fr, pubkey: Fr, blinding: Fr, asset_id: Fr) -> Fr {
+    poseidon_hash_fields(&[
+        Fr::from(domain::COMMITMENT),
+        amount,
+        pubkey,
+        blinding,
+        asset_id,
+    ])
+}
+
+/// Spend signature over a note (circuit v2):
+/// `Poseidon(SIGNATURE, privkey, commitment, leaf_index)`. Requires the private
+/// key, binding the nullifier below to the note's spender.
+pub fn poseidon_signature(privkey: Fr, commitment: Fr, leaf_index: Fr) -> Fr {
+    poseidon_hash_fields(&[Fr::from(domain::SIGNATURE), privkey, commitment, leaf_index])
+}
+
+/// Spend-key nullifier (circuit v2):
+/// `Poseidon(NULLIFIER, commitment, leaf_index, signature)`. Deterministic per
+/// `(note, position, key)`, and only the key-holder can produce it.
+pub fn poseidon_nullifier_spend(commitment: Fr, leaf_index: Fr, signature: Fr) -> Fr {
+    poseidon_hash_fields(&[
+        Fr::from(domain::NULLIFIER),
+        commitment,
+        leaf_index,
+        signature,
+    ])
 }
 
 /// Native note commitment. Inputs are field elements; byte-blob callers
