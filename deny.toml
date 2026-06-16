@@ -1,0 +1,46 @@
+# cargo-deny configuration — the dependency security-advisory gate enforced in
+# CI (.github/workflows/cargo-deny.yml). Unlike the existing Snyk scan, which is
+# advisory-only (continue-on-error), this gate FAILS the build on a RUSTSEC
+# advisory that is not listed below, so a freshly-published advisory in the
+# dependency tree cannot land unnoticed.
+#
+# Everything in `ignore` is a known advisory that is transitive through the
+# Solana SDK, the libp2p networking stack, or the arkworks/crypto stack, and
+# cannot be removed without an upstream bump. Each is annotated with the crate
+# and why. They are tracked: revisit on dependency bumps (several of the
+# networking-stack vulnerabilities below are likely resolvable by a future
+# `cargo update` of rustls/webpki/quinn once semver allows). A NEW advisory —
+# anything not on this list — fails the build, which is the point of the gate.
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+    # --- Solana / crypto stack (transitive, no fix without a Solana bump) ---
+    "RUSTSEC-2022-0093", # ed25519-dalek 1.x — double-public-key signing oracle
+    "RUSTSEC-2024-0344", # curve25519-dalek 3.x — timing variability in Scalar::sub
+    "RUSTSEC-2023-0033", # borsh 0.10.x — unsound zero-sized-type parsing
+    "RUSTSEC-2025-0161", # libsecp256k1 — unmaintained
+    "RUSTSEC-2025-0057", # fxhash — unmaintained
+    "RUSTSEC-2025-0141", # bincode — unmaintained
+
+    # --- libp2p networking / TLS / QUIC stack (transitive) ---
+    "RUSTSEC-2026-0037", # quinn — denial of service in endpoints
+    "RUSTSEC-2026-0007", # bytes — integer overflow in BytesMut::reserve
+    "RUSTSEC-2026-0009", # denial of service via stack exhaustion
+    "RUSTSEC-2026-0049", # webpki — CRLs not authoritative by distribution point
+    "RUSTSEC-2026-0098", # rustls-webpki — name constraints for URI names accepted
+    "RUSTSEC-2026-0099", # rustls-webpki — wildcard name constraints accepted
+    "RUSTSEC-2026-0104", # rustls-webpki — reachable panic in CRL parsing
+    "RUSTSEC-2025-0055", # tracing-subscriber — ANSI escape log poisoning
+    "RUSTSEC-2026-0097", # rand — unsound with a custom logger using rand::rng()
+
+    # --- Unmaintained transitive utility crates (no active vulnerability) ---
+    "RUSTSEC-2024-0375", # atty — unmaintained
+    "RUSTSEC-2021-0145", # atty — potential unaligned read (Windows-only)
+    "RUSTSEC-2024-0388", # derivative — unmaintained
+    "RUSTSEC-2024-0436", # paste — unmaintained
+    "RUSTSEC-2025-0119", # number_prefix — unmaintained
+    "RUSTSEC-2026-0105", # core2 — unmaintained, all versions yanked
+    "RUSTSEC-2024-0320", # yaml-rust — unmaintained
+]

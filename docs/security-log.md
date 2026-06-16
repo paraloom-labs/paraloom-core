@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Blocking dependency-advisory gate in CI** (in-house security audit). The
+  repository's only dependency scan was a Snyk job that runs with
+  `continue-on-error`, so a newly published advisory in the dependency tree
+  never failed a build. A `cargo-deny` advisories check now runs on every push
+  and pull request (and weekly), and it fails the build on any RUSTSEC advisory
+  not already accounted for. The advisories present in the tree today — all
+  transitive through the Solana SDK, the libp2p networking/TLS/QUIC stack, or the
+  crypto stack, and none removable without an upstream bump — are enumerated and
+  annotated in `deny.toml` and tracked for resolution on future dependency bumps.
+  Anything new fails CI, which is the point of the gate. Defense-in-depth
+  hardening; the gate runs in CI pre-mainnet on devnet.
+
 - **Slashing a validator below the minimum stake deactivates it** (in-house
   security audit). `slash_validator` reduced a validator's recorded stake and
   moved the slashed lamports to the vault, but left the validator `is_active` and

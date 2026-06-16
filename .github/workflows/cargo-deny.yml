@@ -1,0 +1,28 @@
+name: cargo-deny
+
+# A blocking dependency security-advisory gate. The existing Snyk scan runs with
+# continue-on-error, so it never fails a build; this job does, so a newly
+# published RUSTSEC advisory in the workspace dependency tree is caught before
+# merge. The weekly schedule re-checks the unchanged tree against newly
+# published advisories. Known, unavoidable Solana-transitive advisories are
+# allow-listed in deny.toml.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * 1'  # weekly on Monday
+
+jobs:
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
