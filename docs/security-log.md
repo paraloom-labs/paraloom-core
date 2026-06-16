@@ -10,6 +10,24 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Unauthenticated shielded-transaction gossip no longer mutates pool state**
+  (in-house security audit). One gossip message variant carried a shielded
+  transaction that the node applied straight to its local shielded pool —
+  marking nullifiers spent and appending output commitments — with no zk-proof
+  verification and no authentication of the sender. No honest code path ever
+  publishes this message: deposits, transfers and withdrawals settle through the
+  proof-gated verification-request path, so the variant was an unauthenticated,
+  untrusted ingress. A peer on the gossip mesh could mark arbitrary nullifiers as
+  spent (freezing honest users' notes) or append junk commitments (perturbing the
+  node's local Merkle root, which proof verification is checked against). The
+  off-chain pool is not the source of truth — on-chain settlement stays
+  proof-gated — so funds were never directly at risk, but the path enabled
+  griefing and could degrade a node's local verification view. The handler now
+  drops the message without touching pool state; the wire variant is retained so
+  deployed nodes' message framing stays stable. Fixed pre-mainnet on devnet;
+  covered by a test that a gossiped withdraw does not mark its nullifier spent and
+  a gossiped transfer changes neither the commitment count nor the Merkle root.
+
 - **Native-SOL swap output reconciled against the realized balance** (in-house
   security audit). When a private swap's output was native SOL, the relayer
   re-shielded the **quote estimate** rather than the amount actually delivered.
