@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Native-SOL swap output reconciled against the realized balance** (in-house
+  security audit). When a private swap's output was native SOL, the relayer
+  re-shielded the **quote estimate** rather than the amount actually delivered.
+  An over-quote (ordinary slippage) meant the re-deposit asked for more lamports
+  than the ephemeral held — the deposit failed, and because the input note's
+  nullifier was already spent, the funds were stranded at the relayer-generated
+  ephemeral address. The relayer now reads the ephemeral's realized lamport
+  balance and re-shields that minus a small reserve for the re-deposit fee
+  (mirroring the SPL-output path), falling back to the quote only when the
+  balance can't be read. Fixed pre-mainnet on devnet; covered by a test that an
+  over-quote re-shields the realized balance, not the quote.
+
 - **Relayer no longer double-charges the swap fee** (in-house security audit).
   The private-swap relayer applied its fee twice: the swap provider took its
   `platformFeeBps` inside the route — so the swap output already excluded it —
