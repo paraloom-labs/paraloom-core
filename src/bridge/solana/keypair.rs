@@ -54,6 +54,19 @@ pub fn save_keypair_to_file(keypair: &Keypair, path: &str) -> Result<()> {
     fs::write(path, json)
         .map_err(|e| BridgeError::ConfigError(format!("Failed to write keypair file: {}", e)))?;
 
+    // The file holds the secret key — restrict it to the owner (0600) so it is
+    // never left world-readable at the process umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            BridgeError::ConfigError(format!(
+                "Failed to restrict keypair file permissions: {}",
+                e
+            ))
+        })?;
+    }
+
     Ok(())
 }
 
@@ -74,6 +87,20 @@ mod tests {
 
         // Save keypair
         save_keypair_to_file(&keypair, path).unwrap();
+
+        // The saved secret-key file must be owner-only (0600), never
+        // world/group-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "keypair file must be 0600, got {:o}",
+                mode & 0o777
+            );
+        }
 
         // Load keypair
         let loaded = load_keypair_from_file(path).unwrap();

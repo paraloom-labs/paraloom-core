@@ -10,6 +10,16 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Wallet key files written owner-only** (in-house security audit). The CLI's
+  `wallet new-address` wrote the generated spending key to
+  `.paraloom/keys/<label>.key` with a plain write, so the file landed at the
+  process umask — commonly world- or group-readable (0644/0664) — even though it
+  holds the private key. The bridge's `save_keypair_to_file` helper had the same
+  gap. Key files and the keys directory are now created owner-only on Unix — 0600
+  for the file, 0700 for the directory — so a spending key is never left readable
+  by other local users. Fixed pre-mainnet on devnet; covered by a test asserting
+  a saved key file is mode 0600.
+
 - **Shielded transfer marked spent only after on-chain settlement** (in-house
   security audit). The transfer twin of the withdrawal spend-after-settle fix
   below: the transfer submitter applied the settlement to its local pool —
