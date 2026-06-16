@@ -288,52 +288,22 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 
             // Privacy-related messages
             Message::ShieldedTransaction { transaction } => {
-                info!("Received shielded transaction: {}", transaction.id());
-
-                // Process transaction if privacy is enabled
-                if let Some(pool) = &self.shielded_pool {
-                    match transaction {
-                        crate::privacy::transaction::ShieldedTransaction::Deposit(tx) => match pool
-                            .deposit(tx.output_note.clone(), tx.amount - tx.fee)
-                            .await
-                        {
-                            Ok(commitment) => {
-                                info!("Deposit successful: commitment={}", commitment.to_hex());
-                            }
-                            Err(e) => {
-                                info!("Deposit failed: {}", e);
-                            }
-                        },
-                        crate::privacy::transaction::ShieldedTransaction::Transfer(tx) => {
-                            match pool
-                                .transfer(tx.input_nullifiers.clone(), tx.output_notes.clone())
-                                .await
-                            {
-                                Ok(commitments) => {
-                                    info!("Transfer successful: {} outputs", commitments.len());
-                                }
-                                Err(e) => {
-                                    info!("Transfer failed: {}", e);
-                                }
-                            }
-                        }
-                        crate::privacy::transaction::ShieldedTransaction::Withdraw(tx) => {
-                            match pool
-                                .withdraw(tx.input_nullifier.clone(), tx.amount, &tx.to_public)
-                                .await
-                            {
-                                Ok(()) => {
-                                    info!("Withdrawal successful: {} lamports", tx.amount);
-                                }
-                                Err(e) => {
-                                    info!("Withdrawal failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    info!("Privacy not enabled, ignoring transaction");
-                }
+                // This gossip message mutates shielded-pool state (nullifier set and
+                // commitment tree) directly, with no zk-proof verification and no
+                // authentication of the sender. No honest code path ever publishes it
+                // (the real, proof-gated flows are WithdrawalVerificationRequest and
+                // TransferVerificationRequest), so any traffic on this variant is
+                // unauthenticated and untrusted. Applying it would let any mesh peer
+                // mark arbitrary nullifiers spent (bricking honest notes) or append
+                // junk commitments (corrupting the Merkle root that proof verification
+                // is checked against). Drop it without touching pool state. The variant
+                // is retained so the wire enum's discriminants stay stable for deployed
+                // nodes; it is simply ignored.
+                log::warn!(
+                    "Ignoring unauthenticated ShieldedTransaction gossip ({}); \
+                     proof-gated settlement goes through the verification-request path",
+                    transaction.id()
+                );
             }
             Message::VerificationRequest {
                 task_id,
@@ -2663,5 +2633,83 @@ mod tests {
             .await
             .expect("initiate succeeds with a quorum-sized validator set");
         assert_eq!(request_id, "init-1");
+    }
+
+    // A ShieldedTransaction arriving over gossip must NOT mutate pool state. No
+    // honest path ever publishes this message (settlement goes through the
+    // proof-gated verification-request path), so any traffic on it is
+    // unauthenticated and untrusted. Applying it would let any mesh peer mark an
+    // arbitrary nullifier spent (bricking an honest user's note) or append junk
+    // commitments (corrupting the Merkle root that proof verification checks
+    // against). The handler now drops it without touching the pool.
+    #[tokio::test]
+    async fn shielded_transaction_gossip_does_not_mutate_pool() {
+        use crate::network::protocol::NetworkEventHandler;
+        use crate::privacy::transaction::{ShieldedTransaction, TransferTx, WithdrawTx};
+        use crate::privacy::types::{Note, Nullifier, ShieldedAddress};
+
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let pool = node
+            .shielded_pool
+            .clone()
+            .expect("bridge-enabled validator owns a pool");
+
+        let before_commitments = pool.commitment_count().await;
+        let before_root = pool.root().await;
+
+        // A nullifier an honest user might later legitimately spend.
+        let victim = Nullifier([0x42u8; 32]);
+        assert!(!pool.is_spent(&victim).await);
+
+        // (1) A forged Withdraw must not mark the nullifier spent.
+        let withdraw = ShieldedTransaction::Withdraw(WithdrawTx::new(
+            victim.clone(),
+            1_000,
+            vec![9u8; 32],
+            [0u8; 32],
+            0,
+        ));
+        node.handle_message(
+            NodeId(vec![7]),
+            Message::ShieldedTransaction {
+                transaction: withdraw,
+            },
+        )
+        .await
+        .expect("the handler drops the message without erroring");
+        assert!(
+            !pool.is_spent(&victim).await,
+            "an unauthenticated gossip withdraw must not brick the nullifier"
+        );
+
+        // (2) A forged Transfer must not append junk commitments to the tree.
+        let junk = Note::new_native(ShieldedAddress::from_bytes([5u8; 32]), 7, [1u8; 32]);
+        let transfer = ShieldedTransaction::Transfer(TransferTx::new(
+            vec![Nullifier([0x99u8; 32])],
+            vec![junk],
+            [0u8; 32],
+            0,
+        ));
+        node.handle_message(
+            NodeId(vec![7]),
+            Message::ShieldedTransaction {
+                transaction: transfer,
+            },
+        )
+        .await
+        .expect("the handler drops the message without erroring");
+
+        assert_eq!(
+            pool.commitment_count().await,
+            before_commitments,
+            "an unauthenticated gossip transfer must not pollute the commitment tree"
+        );
+        assert_eq!(
+            pool.root().await,
+            before_root,
+            "the Merkle root must be unchanged by dropped gossip"
+        );
     }
 }
