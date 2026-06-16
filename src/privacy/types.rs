@@ -4,7 +4,10 @@ use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use serde::{Deserialize, Serialize};
 
-use crate::privacy::poseidon::{poseidon_commit, poseidon_merkle_pair, poseidon_nullifier};
+use crate::privacy::poseidon::{
+    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier,
+    poseidon_nullifier_spend, poseidon_pubkey, poseidon_signature,
+};
 
 /// Serialize an `Fr` to 32 little-endian bytes. BN254 `Fr` is 254-bit,
 /// so the 32-byte buffer always fits and we pad trailing zeros if
@@ -103,6 +106,70 @@ impl Nullifier {
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
+}
+
+/// A shielded spend keypair (circuit v2, #293).
+///
+/// Reimplements the public Tornado-Nova spend-key construction in our own
+/// Poseidon: the public key `pubkey = Poseidon(privkey)` is bound into a note's
+/// commitment, and spending requires proving knowledge of `privkey` (folded
+/// into the nullifier through a signature). So a note's spend authority is a
+/// secret key — not merely knowledge of the note's opening, and not a free
+/// witness — which is what closes the free-secret double-spend and the
+/// spend-without-authorization gaps. The construction lives alongside the v1
+/// `Note::commitment` / `Nullifier::derive` until the circuits move over.
+#[derive(Clone, Debug)]
+pub struct SpendKeypair {
+    privkey: [u8; 32],
+    pubkey: [u8; 32],
+}
+
+impl SpendKeypair {
+    /// Derive a keypair from a 32-byte private key. `privkey` is lifted to `Fr`
+    /// by modular reduction, so any 32-byte value is a valid key.
+    pub fn from_privkey(privkey: [u8; 32]) -> Self {
+        let pk = poseidon_pubkey(Fr::from_le_bytes_mod_order(&privkey));
+        SpendKeypair {
+            privkey,
+            pubkey: fr_to_bytes_32(pk),
+        }
+    }
+
+    /// The public key bound into this owner's note commitments.
+    pub fn pubkey(&self) -> [u8; 32] {
+        self.pubkey
+    }
+
+    /// The nullifier for a note this key owns at `leaf_index`. Computes the
+    /// signature internally, so it requires the private key — only the
+    /// key-holder can produce a note's nullifier, and a note at a given tree
+    /// position yields exactly one.
+    pub fn nullifier(&self, commitment: &Commitment, leaf_index: u64) -> Nullifier {
+        let sk = Fr::from_le_bytes_mod_order(&self.privkey);
+        let c = Fr::from_le_bytes_mod_order(commitment.as_bytes());
+        let idx = Fr::from(leaf_index);
+        let signature = poseidon_signature(sk, c, idx);
+        Nullifier(fr_to_bytes_32(poseidon_nullifier_spend(c, idx, signature)))
+    }
+}
+
+/// Spend-key note commitment (circuit v2, #293):
+/// `Poseidon(amount, pubkey, blinding, asset_id)`. Binds the owner's spend
+/// public key, so the note cannot be re-bound to a different key without
+/// changing its commitment.
+pub fn spend_commitment(
+    amount: u64,
+    pubkey: &[u8; 32],
+    blinding: &[u8; 32],
+    asset_id: &AssetId,
+) -> Commitment {
+    let digest = poseidon_commit_spend(
+        Fr::from(amount),
+        Fr::from_le_bytes_mod_order(pubkey),
+        Fr::from_le_bytes_mod_order(blinding),
+        Fr::from_le_bytes_mod_order(asset_id),
+    );
+    Commitment(fr_to_bytes_32(digest))
 }
 
 /// Viewing key for discovering received notes (#196).
@@ -559,5 +626,71 @@ mod tests {
             };
             prop_assert!(mp.verify(&leaf, &root));
         }
+    }
+
+    // --- Spend-key construction (circuit v2, #293) ---
+
+    #[test]
+    fn pubkey_is_deterministic_and_key_specific() {
+        let a = SpendKeypair::from_privkey([7u8; 32]);
+        let b = SpendKeypair::from_privkey([7u8; 32]);
+        let c = SpendKeypair::from_privkey([8u8; 32]);
+        assert_eq!(a.pubkey(), b.pubkey(), "same privkey → same pubkey");
+        assert_ne!(
+            a.pubkey(),
+            c.pubkey(),
+            "different privkey → different pubkey"
+        );
+        assert_ne!(a.pubkey(), [7u8; 32], "pubkey is the hash, not the privkey");
+    }
+
+    #[test]
+    fn commitment_binds_the_spend_pubkey() {
+        let blinding = [3u8; 32];
+        let owner = SpendKeypair::from_privkey([7u8; 32]);
+        let other = SpendKeypair::from_privkey([8u8; 32]);
+
+        let c_owner = spend_commitment(1000, &owner.pubkey(), &blinding, &NATIVE_SOL_ASSET);
+        let c_same = spend_commitment(1000, &owner.pubkey(), &blinding, &NATIVE_SOL_ASSET);
+        let c_other = spend_commitment(1000, &other.pubkey(), &blinding, &NATIVE_SOL_ASSET);
+
+        assert_eq!(c_owner, c_same, "same inputs → same commitment");
+        // A note cannot be re-bound to a different key without changing the
+        // commitment — the core property that requires a spend key to spend.
+        assert_ne!(
+            c_owner, c_other,
+            "a different spend key yields a different commitment"
+        );
+
+        // The commitment also moves with amount and asset.
+        assert_ne!(
+            c_owner,
+            spend_commitment(1001, &owner.pubkey(), &blinding, &NATIVE_SOL_ASSET)
+        );
+        assert_ne!(
+            c_owner,
+            spend_commitment(1000, &owner.pubkey(), &blinding, &[9u8; 32])
+        );
+    }
+
+    #[test]
+    fn nullifier_is_deterministic_per_note_position_and_key() {
+        let owner = SpendKeypair::from_privkey([7u8; 32]);
+        let commitment = spend_commitment(1000, &owner.pubkey(), &[3u8; 32], &NATIVE_SOL_ASSET);
+
+        // Same (note, position, key) → exactly one nullifier (no free secret to
+        // vary, so the unlimited double-spend vector is gone).
+        let n0 = owner.nullifier(&commitment, 0);
+        assert_eq!(n0, owner.nullifier(&commitment, 0));
+
+        // Same note at a different tree position → a different nullifier.
+        assert_ne!(n0, owner.nullifier(&commitment, 1));
+
+        // A different key produces a different nullifier even over the same
+        // commitment bytes (the signature folds in the private key); in practice
+        // that other key could not have produced this commitment in the first
+        // place.
+        let other = SpendKeypair::from_privkey([8u8; 32]);
+        assert_ne!(n0, other.nullifier(&commitment, 0));
     }
 }
