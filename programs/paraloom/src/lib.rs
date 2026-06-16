@@ -859,6 +859,20 @@ pub mod paraloom_program {
             validator_account.stake_amount.saturating_sub(slash_amount);
         validator_account.times_slashed += 1;
 
+        // A slash that drops stake below the registry minimum deactivates the
+        // validator: registration requires `stake >= minimum_stake`, so a
+        // validator that no longer meets that bar must stop settling and stop
+        // counting toward the BFT quorum. Mirror the unregister accounting and
+        // guard on `is_active` so a validator slashed twice is not
+        // double-decremented out of `active_validators`.
+        if validator_account.is_active
+            && validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
+        {
+            validator_account.is_active = false;
+            let registry = &mut ctx.accounts.validator_registry;
+            registry.active_validators = registry.active_validators.saturating_sub(1);
+        }
+
         **validator_account
             .to_account_info()
             .try_borrow_mut_lamports()? -= slash_amount;
@@ -1385,6 +1399,7 @@ pub struct SlashValidator<'info> {
     pub bridge_vault: SystemAccount<'info>,
 
     #[account(
+        mut,
         seeds = [b"validator_registry"],
         bump,
         has_one = authority
