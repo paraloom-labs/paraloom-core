@@ -576,9 +576,16 @@ pub mod paraloom_program {
             payout,
         )?;
 
-        // Credit the retained fee to the settling validator and record the
-        // settlement against its activity — parity with the native path.
-        validator_account.pending_rewards += fee;
+        // Record the settlement against the validator's activity. Unlike the
+        // native path, the SPL fee is deliberately NOT added to
+        // `pending_rewards`: that balance is denominated in lamports and paid
+        // out by `claim_rewards` from the native `bridge_vault`, whereas the SPL
+        // fee is `fee` *tokens* that remain in this mint's `asset_vault`.
+        // Crediting it 1:1 into the lamport balance would let a validator
+        // settling SPL withdrawals accrue lamport-claimable rewards in
+        // proportion to token raw amounts and drain the native vault. The
+        // retained fee tokens accrue in `asset_vault` for a future per-asset
+        // payout.
         validator_account.successful_verifications += 1;
         validator_account.last_active = Clock::get()?.unix_timestamp;
 
