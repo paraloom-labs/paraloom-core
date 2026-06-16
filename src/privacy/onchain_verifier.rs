@@ -596,6 +596,122 @@ mod tests {
         rust_bytes("FIXTURE_PROOF_C", &wp.c);
     }
 
+    /// Dev tool — regenerates the on-chain program's withdraw verifying-key
+    /// constant and proof fixture for the **spend-key v2** circuit (#293). Loads
+    /// the v2 ceremony keys produced by `setup_withdrawal_ceremony_v2`, builds a
+    /// proof in the 5-input layout `[merkle_root, nullifier, withdraw_amount,
+    /// ext_data_hash, asset_id]` (6 IC points), and prints the constants to paste
+    /// into `programs/paraloom/src/withdraw_vk_data.rs` at cutover. Run with:
+    /// `cargo test --lib privacy::onchain_verifier::tests::emit_program_fixture_v2 \
+    ///   -- --ignored --nocapture`
+    #[test]
+    #[ignore = "dev fixture generator; needs keys/withdraw_v2_*.key locally"]
+    fn emit_program_fixture_v2() {
+        use crate::privacy::circuits::WithdrawCircuitV2;
+        use crate::privacy::merkle::DEFAULT_TREE_DEPTH;
+        use crate::privacy::poseidon::{
+            poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier_spend, poseidon_pubkey,
+            poseidon_signature,
+        };
+        use ark_bn254::Bn254;
+        use ark_groth16::{ProvingKey, VerifyingKey};
+        use ark_serialize::CanonicalDeserialize;
+
+        fn rust_bytes(name: &str, b: &[u8]) {
+            print!("pub const {name}: [u8; {}] = [", b.len());
+            for (i, x) in b.iter().enumerate() {
+                if i % 16 == 0 {
+                    print!("\n    ");
+                }
+                print!("{x},");
+            }
+            println!("\n];");
+        }
+
+        let pk_bytes = std::fs::read("keys/withdraw_v2_proving.key").expect("v2 proving key");
+        let vk_bytes = std::fs::read("keys/withdraw_v2_verifying.key").expect("v2 verifying key");
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+
+        // A spend-key note (1 SOL, native asset) at leaf 0 of a full-depth tree:
+        // all-left path with zero siblings, so leaf_index = 0 and the root folds
+        // the commitment up DEFAULT_TREE_DEPTH levels. The pool stores v1
+        // commitments, so the v2 leaf is built directly here.
+        let privkey = [9u8; 32];
+        let blinding = [3u8; 32];
+        let asset = [0u8; 32];
+        let value = 1_000_000_000u64;
+        let ext_data_hash = [0x11u8; 32];
+
+        let sk = Fr::from_le_bytes_mod_order(&privkey);
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(value),
+            poseidon_pubkey(sk),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+        let zero_sibling = Fr::from(0u64);
+        let mut root_fr = commitment_fr;
+        for _ in 0..DEFAULT_TREE_DEPTH {
+            root_fr = poseidon_merkle_pair(root_fr, zero_sibling);
+        }
+        let path = vec![([0u8; 32], true); DEFAULT_TREE_DEPTH];
+        let leaf_index = 0u64;
+
+        let signature = poseidon_signature(sk, commitment_fr, Fr::from(leaf_index));
+        let nullifier_fr = poseidon_nullifier_spend(commitment_fr, Fr::from(leaf_index), signature);
+        let root = fr_to_le_bytes_32(root_fr);
+        let nullifier = fr_to_le_bytes_32(nullifier_fr);
+
+        let circuit = WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nullifier),
+            withdraw_amount: Some(value),
+            ext_data_hash: Some(ext_data_hash),
+            input_value: Some(value),
+            blinding: Some(blinding),
+            privkey: Some(privkey),
+            asset_id: Some(asset),
+            input_path: Some(path),
+        };
+
+        let mut rng = thread_rng();
+        let proof = Groth16ProofSystem::prove(&pk, circuit, &mut rng).unwrap();
+
+        let wp = proof_to_wire(&proof);
+        let wvk = WireVerifyingKey::from_arkworks(&vk);
+        let pis = [
+            fr_to_be(&root_fr),
+            fr_to_be(&nullifier_fr),
+            fr_to_be(&Fr::from(value)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&ext_data_hash)),
+            fr_to_be(&Fr::from_le_bytes_mod_order(&asset)),
+        ];
+        assert_eq!(wvk.ic.len(), 6, "v2 withdraw VK must have 6 IC points");
+        assert!(
+            verify(&wp, &pis, &wvk.as_verifying_key()),
+            "emitted v2 fixture must verify"
+        );
+
+        println!("\n// ===== withdraw v2 verifying key (dev ceremony, spend-key) =====");
+        rust_bytes("VK_ALPHA_G1", &wvk.alpha);
+        rust_bytes("VK_BETA_G2", &wvk.beta);
+        rust_bytes("VK_GAMMA_G2", &wvk.gamma);
+        rust_bytes("VK_DELTA_G2", &wvk.delta);
+        for (i, ic) in wvk.ic.iter().enumerate() {
+            rust_bytes(&format!("VK_IC_{i}"), ic);
+        }
+        println!("\n// ===== withdraw v2 proof fixture =====");
+        rust_bytes("FIXTURE_ROOT", &root);
+        rust_bytes("FIXTURE_NULLIFIER", &nullifier);
+        println!("pub const FIXTURE_AMOUNT: u64 = {value};");
+        rust_bytes("FIXTURE_EXT_DATA_HASH", &ext_data_hash);
+        rust_bytes("FIXTURE_ASSET_ID", &asset);
+        rust_bytes("FIXTURE_PROOF_A", &wp.a);
+        rust_bytes("FIXTURE_PROOF_B", &wp.b);
+        rust_bytes("FIXTURE_PROOF_C", &wp.c);
+    }
+
     /// Dev tool — regenerates the transfer verifying-key constant + a 2-in/2-out
     /// transfer proof fixture for the on-chain transfer verifier (#194). Loads
     /// the transfer ceremony keys. Run with:
