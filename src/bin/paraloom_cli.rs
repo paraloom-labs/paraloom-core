@@ -930,6 +930,13 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             let keys_dir = std::path::Path::new(".paraloom/keys");
             if !keys_dir.exists() {
                 std::fs::create_dir_all(keys_dir).context("Failed to create keys directory")?;
+                // The directory holds spending keys — restrict it to the owner.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700))
+                        .context("Failed to restrict keys directory permissions")?;
+                }
             }
 
             let filename = if let Some(label_text) = &label {
@@ -952,8 +959,26 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     .as_secs()
             });
 
-            std::fs::write(&key_path, serde_json::to_string_pretty(&key_data)?)
-                .context("Failed to save keypair")?;
+            // The file contains the private spending key — create it readable and
+            // writable only by the owner (0600) so it never lands world-readable
+            // at the process umask. Non-Unix platforms fall back to a plain write.
+            let key_json = serde_json::to_string_pretty(&key_data)?;
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&key_path)
+                    .context("Failed to create key file")?;
+                f.write_all(key_json.as_bytes())
+                    .context("Failed to save keypair")?;
+            }
+            #[cfg(not(unix))]
+            std::fs::write(&key_path, key_json).context("Failed to save keypair")?;
 
             println!("\nKeypair saved to: {}", key_path.display());
             println!("\n[WARNING] Keep your private key safe! Anyone with access to this file can spend your funds.");
