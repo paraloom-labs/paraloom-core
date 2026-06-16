@@ -82,12 +82,36 @@ impl CoSignPayload {
     }
 }
 
+/// Upper bound on co-signers in a single settlement transaction.
+///
+/// Each quorum validator contributes two accounts to the instruction
+/// (`append_quorum_accounts`: the signing wallet and its registry PDA). A Solana
+/// transaction message indexes its accounts with a `u8`, so more than 255
+/// distinct accounts makes `Message::new_with_blockhash` panic while compiling.
+/// A co-sign request arrives over the network with an attacker-controllable
+/// `quorum_validators`, so an oversized set must be rejected as a typed error
+/// rather than crashing the node. The cap leaves ample headroom under the 255
+/// account limit (and well under the ~1232-byte transaction-size limit, which
+/// binds far sooner) while never constraining a realistic BFT quorum.
+pub const MAX_QUORUM_COSIGNERS: usize = 100;
+
 /// Rebuild the exact settlement transaction [`Message`] every co-signer signs.
 ///
 /// Deterministic in `payload`: the same payload always yields byte-identical
 /// `Message::serialize()` output, which is the property the multi-signature
 /// assembly relies on.
 pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
+    // Reject an oversized co-signer set before building the message: the count
+    // comes off the wire and more accounts than a transaction can index would
+    // panic the message compiler (see MAX_QUORUM_COSIGNERS).
+    if payload.quorum_validators.len() > MAX_QUORUM_COSIGNERS {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "co-sign quorum has {} validators, exceeds the {} maximum",
+            payload.quorum_validators.len(),
+            MAX_QUORUM_COSIGNERS
+        )));
+    }
+
     let program_id = Pubkey::new_from_array(payload.program_id);
     let authority = Pubkey::new_from_array(payload.authority);
     let quorum: Vec<Pubkey> = payload
@@ -224,6 +248,22 @@ mod tests {
             validator_message.serialize(),
             "a validator rebuilding from the transported payload must match the leader's message"
         );
+    }
+
+    #[test]
+    fn oversized_quorum_is_rejected_not_panicked() {
+        // The co-signer set arrives off the wire. An attacker-sized quorum that
+        // would overflow the transaction's u8 account index must return a typed
+        // error rather than panic the message compiler (remote node crash).
+        let mut payload = sample_withdrawal_payload();
+        payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS + 1];
+        let err =
+            build_settlement_message(&payload).expect_err("an oversized quorum must be rejected");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+
+        // A quorum exactly at the cap still builds (the bound is inclusive).
+        payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
+        build_settlement_message(&payload).expect("a quorum at the cap still builds");
     }
 
     #[test]
