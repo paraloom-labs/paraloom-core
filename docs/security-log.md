@@ -10,6 +10,20 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Slashing a validator below the minimum stake deactivates it** (in-house
+  security audit). `slash_validator` reduced a validator's recorded stake and
+  moved the slashed lamports to the vault, but left the validator `is_active` and
+  still counted in the registry's `active_validators` — the number the BFT
+  settlement quorum is sized against. So a validator slashed to (or below) zero
+  stake kept counting toward the quorum and could still co-sign settlements, even
+  though registration requires meeting a minimum stake. A slash that drops stake
+  below the registry minimum now clears `is_active` and decrements
+  `active_validators` (guarded so a validator slashed twice is not
+  double-decremented), so a depleted validator stops settling and stops counting.
+  Fixed pre-mainnet on devnet; covered by tests that a sub-minimum slash
+  deactivates and decrements the active set, while a slash that stays above the
+  minimum keeps the validator active.
+
 - **Wallet key files written owner-only** (in-house security audit). The CLI's
   `wallet new-address` wrote the generated spending key to
   `.paraloom/keys/<label>.key` with a plain write, so the file landed at the
