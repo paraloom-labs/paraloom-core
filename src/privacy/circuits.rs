@@ -811,7 +811,12 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
-        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+        // asset_id is a PUBLIC input (#293 finding A): exposing it lets the
+        // on-chain program bind the released vault's mint to the proven asset,
+        // so an asset-blind proof cannot drain a different asset's vault. It is
+        // bound into the commitment below, so the value proven also matches the
+        // committed asset.
+        let asset_id_var = FpVar::new_input(cs.clone(), || {
             Ok(self
                 .asset_id
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
@@ -995,9 +1000,11 @@ impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
                     .unwrap_or_else(|| Fr::from(0u64)))
             })?);
         }
-        // Single shared asset_id, bound into every input AND output commitment,
-        // so the balance check below is automatically per-asset.
-        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+        // Single shared asset_id, a PUBLIC input (#293 finding A), bound into
+        // every input AND output commitment — so the balance check below is
+        // automatically per-asset, and the on-chain program can bind the proven
+        // asset to the mint it settles.
+        let asset_id_var = FpVar::new_input(cs.clone(), || {
             Ok(self
                 .asset_id
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
@@ -1178,7 +1185,9 @@ impl ConstraintSynthesizer<Fr> for DepositCircuitV2 {
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
-        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+        // asset_id is a PUBLIC input (#293 finding A): the on-chain deposit
+        // handler binds the credited mint to this proven asset.
+        let asset_id_var = FpVar::new_input(cs.clone(), || {
             Ok(self
                 .asset_id
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
@@ -1978,6 +1987,26 @@ mod tests {
             blinding: Some(bl),
             privkey: Some(pk),
             asset_id: Some(asset),
+            input_path: Some(path),
+        }));
+    }
+
+    #[test]
+    fn withdraw_v2_binds_the_public_asset_id() {
+        // The note was committed under the native asset (all-zero). Claiming a
+        // different public asset_id makes the in-circuit commitment differ from
+        // the one in the tree, so membership fails — the proof is bound to its
+        // asset (the circuit half of finding A; the on-chain mint check is the
+        // other half).
+        let (root, nf, wd, val, bl, pk, _asset, path) = v2_withdraw_parts();
+        assert!(!synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nf),
+            withdraw_amount: Some(wd),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some([0xCCu8; 32]), // not the asset the note commits to
             input_path: Some(path),
         }));
     }
