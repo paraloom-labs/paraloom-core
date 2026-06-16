@@ -10,6 +10,21 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Bearer-token auth for the consensus-triggering ingress endpoints** (in-house
+  security audit). The withdrawal and transfer HTTP ingress endpoints each accept
+  a request and broadcast it into the consensus mesh — a write surface — but were
+  unauthenticated. They default to disabled and are meant for a loopback /
+  management interface, yet an operator who exposed one beyond loopback had no
+  way to require a caller to authenticate. A shared bearer token
+  (`bridge.ingress_token` / `BRIDGE_INGRESS_TOKEN`) can now be configured; when
+  set, `POST /withdrawal/submit` and `POST /transfer/submit` require
+  `Authorization: Bearer <token>` and refuse a missing or incorrect token with
+  401 before doing any work. With no token configured the behaviour is unchanged
+  (still default-disabled). The read-only transfer scan route is not gated, as it
+  is not a consensus write surface. Fixed pre-mainnet on devnet; covered by tests
+  that a configured token rejects an unauthenticated submit and accepts an
+  authenticated one.
+
 - **Blocking dependency-advisory gate in CI** (in-house security audit). The
   repository's only dependency scan was a Snyk job that runs with
   `continue-on-error`, so a newly published advisory in the dependency tree

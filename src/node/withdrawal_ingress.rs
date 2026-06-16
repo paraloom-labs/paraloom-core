@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::consensus::WithdrawalVerificationRequest;
+use crate::node::ingress_auth::{check_bearer, IngressToken};
 
 /// The single capability the ingress needs from a node: hand a withdrawal
 /// request to the consensus mesh and return its request id. Abstracted behind
@@ -83,8 +84,14 @@ fn parse_hex32(label: &str, s: &str) -> Result<[u8; 32], (StatusCode, String)> {
 
 async fn submit_handler(
     Extension(node): Extension<Arc<dyn WithdrawalIngress>>,
+    Extension(token): Extension<IngressToken>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, (StatusCode, String)> {
+    // This endpoint triggers consensus; reject an unauthenticated caller when a
+    // token is configured, before doing any work.
+    check_bearer(&headers, &token)?;
+
     let nullifier = parse_hex32("nullifier", &req.nullifier)?;
     let recipient = parse_hex32("recipient", &req.recipient)?;
 
@@ -126,17 +133,20 @@ async fn submit_handler(
 
 /// Build the ingress router. Exposed separately from [`serve`] so it can be
 /// mounted under a caller's own listener or driven directly in tests.
-pub fn router(node: Arc<dyn WithdrawalIngress>) -> Router {
+pub fn router(node: Arc<dyn WithdrawalIngress>, token: IngressToken) -> Router {
     Router::new()
         .route("/withdrawal/submit", post(submit_handler))
         .layer(Extension(node))
+        .layer(Extension(token))
 }
 
 /// Bind the ingress server on `addr` and serve until the task is
-/// dropped/aborted.
+/// dropped/aborted. `token` gates the endpoint when configured (see
+/// [`crate::node::ingress_auth`]).
 pub async fn serve(
     node: Arc<dyn WithdrawalIngress>,
     addr: SocketAddr,
+    token: IngressToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
         target: "paraloom::node::withdrawal_ingress",
@@ -144,7 +154,7 @@ pub async fn serve(
         addr
     );
     axum::Server::bind(&addr)
-        .serve(router(node).into_make_service())
+        .serve(router(node, token).into_make_service())
         .await?;
     Ok(())
 }
@@ -187,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn well_formed_request_is_accepted() {
-        let app = router(Arc::new(StubIngress { accept: true }));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"nullifier":"{}","recipient":"{}","proof":"{}","amount":1000000,"fee":0}}"#,
             "11".repeat(32),
@@ -200,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_nullifier_is_400() {
-        let app = router(Arc::new(StubIngress { accept: true }));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"nullifier":"nothex","recipient":"{}","proof":"{}","amount":1,"fee":0}}"#,
             "22".repeat(32),
@@ -212,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_proof_is_400() {
-        let app = router(Arc::new(StubIngress { accept: true }));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"nullifier":"{}","recipient":"{}","proof":"","amount":1,"fee":0}}"#,
             "11".repeat(32),
@@ -224,7 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_rejection_is_503() {
-        let app = router(Arc::new(StubIngress { accept: false }));
+        let app = router(Arc::new(StubIngress { accept: false }), None);
         let body = format!(
             r#"{{"nullifier":"{}","recipient":"{}","proof":"{}","amount":1,"fee":0}}"#,
             "11".repeat(32),
@@ -233,5 +243,33 @@ mod tests {
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn configured_token_rejects_unauthenticated_and_accepts_authenticated() {
+        let token = crate::node::ingress_auth::token_from_config("s3cret");
+        let body = format!(
+            r#"{{"nullifier":"{}","recipient":"{}","proof":"{}","amount":1000000,"fee":0}}"#,
+            "11".repeat(32),
+            "22".repeat(32),
+            "01".repeat(192)
+        );
+
+        // No bearer token → 401, and the request never reaches the node.
+        let app = router(Arc::new(StubIngress { accept: true }), token.clone());
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct bearer token → handled normally (200).
+        let app = router(Arc::new(StubIngress { accept: true }), token);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/withdrawal/submit")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

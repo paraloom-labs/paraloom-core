@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::consensus::TransferVerificationRequest;
+use crate::node::ingress_auth::{check_bearer, IngressToken};
 
 /// A delivered encrypted output note (#196): the output commitment and the
 /// opaque hex ciphertext (`EncryptedNote`) a recipient trial-decrypts.
@@ -113,8 +114,14 @@ fn parse_hex32_pair(label: &str, items: &[String]) -> Result<[[u8; 32]; 2], (Sta
 
 async fn submit_handler(
     Extension(node): Extension<Arc<dyn TransferIngress>>,
+    Extension(token): Extension<IngressToken>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, (StatusCode, String)> {
+    // This endpoint triggers consensus; reject an unauthenticated caller when a
+    // token is configured, before doing any work.
+    check_bearer(&headers, &token)?;
+
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let new_merkle_root = parse_hex32("new_merkle_root", &req.new_merkle_root)?;
@@ -185,17 +192,21 @@ async fn scan_handler(
 
 /// Build the ingress router. Exposed separately from [`serve`] so it can be
 /// mounted under a caller's own listener or driven directly in tests.
-pub fn router(node: Arc<dyn TransferIngress>) -> Router {
+pub fn router(node: Arc<dyn TransferIngress>, token: IngressToken) -> Router {
     Router::new()
         .route("/transfer/submit", post(submit_handler))
         .route("/transfer/scan", get(scan_handler))
         .layer(Extension(node))
+        .layer(Extension(token))
 }
 
 /// Bind the ingress server on `addr` and serve until the task is dropped.
+/// `token` gates the write endpoint when configured (see
+/// [`crate::node::ingress_auth`]).
 pub async fn serve(
     node: Arc<dyn TransferIngress>,
     addr: SocketAddr,
+    token: IngressToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
         target: "paraloom::node::transfer_ingress",
@@ -203,7 +214,7 @@ pub async fn serve(
         addr
     );
     axum::Server::bind(&addr)
-        .serve(router(node).into_make_service())
+        .serve(router(node, token).into_make_service())
         .await?;
     Ok(())
 }
@@ -264,14 +275,14 @@ mod tests {
 
     #[tokio::test]
     async fn well_formed_request_is_accepted() {
-        let app = router(Arc::new(StubIngress { accept: true }));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
         let resp = app.oneshot(post_json(&well_formed_body())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn wrong_nullifier_count_is_400() {
-        let app = router(Arc::new(StubIngress { accept: true }));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"nullifiers":["{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"{}","ciphertexts":["{}","{}"]}}"#,
             "11".repeat(32),
@@ -288,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_proof_is_400() {
-        let app = router(Arc::new(StubIngress { accept: true }));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"new_merkle_root":"{}","proof":"","ciphertexts":["{}","{}"]}}"#,
             "11".repeat(32),
@@ -305,9 +316,42 @@ mod tests {
 
     #[tokio::test]
     async fn node_rejection_is_503() {
-        let app = router(Arc::new(StubIngress { accept: false }));
+        let app = router(Arc::new(StubIngress { accept: false }), None);
         let resp = app.oneshot(post_json(&well_formed_body())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn configured_token_gates_submit_but_not_scan() {
+        let token = crate::node::ingress_auth::token_from_config("s3cret");
+
+        // Submit without a bearer token → 401, never reaching the node.
+        let app = router(Arc::new(StubIngress { accept: true }), token.clone());
+        let resp = app.oneshot(post_json(&well_formed_body())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Submit with the correct bearer token → handled normally (200).
+        let app = router(Arc::new(StubIngress { accept: true }), token.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/transfer/submit")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::from(well_formed_body()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The read-only scan route is not a consensus write surface, so the
+        // token does not gate it: an unauthenticated GET still succeeds.
+        let app = router(Arc::new(ScanStub), token);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transfer/scan")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Stub that serves a fixed delivered note, to exercise the scan route.
@@ -327,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_returns_delivered_notes() {
-        let app = router(Arc::new(ScanStub));
+        let app = router(Arc::new(ScanStub), None);
         let req = Request::builder()
             .method("GET")
             .uri("/transfer/scan")

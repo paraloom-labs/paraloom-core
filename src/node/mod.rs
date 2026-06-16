@@ -37,6 +37,7 @@ use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 
 pub mod cosign_round;
+pub mod ingress_auth;
 pub mod transfer_ingress;
 pub mod withdrawal_ingress;
 
@@ -1726,8 +1727,10 @@ impl Node {
                     Ok(addr) => {
                         let ingress: Arc<dyn withdrawal_ingress::WithdrawalIngress> =
                             Arc::new(self.clone());
+                        let token =
+                            ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = withdrawal_ingress::serve(ingress, addr).await {
+                            if let Err(e) = withdrawal_ingress::serve(ingress, addr, token).await {
                                 log::error!(
                                     target: "paraloom::node::withdrawal_ingress",
                                     "withdrawal ingress server exited: {}",
@@ -1777,8 +1780,10 @@ impl Node {
                     Ok(addr) => {
                         let ingress: Arc<dyn transfer_ingress::TransferIngress> =
                             Arc::new(self.clone());
+                        let token =
+                            ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
                         let handle = tokio::spawn(async move {
-                            if let Err(e) = transfer_ingress::serve(ingress, addr).await {
+                            if let Err(e) = transfer_ingress::serve(ingress, addr, token).await {
                                 log::error!(
                                     target: "paraloom::node::transfer_ingress",
                                     "transfer ingress server exited: {}",

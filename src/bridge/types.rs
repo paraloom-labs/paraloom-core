@@ -118,6 +118,14 @@ pub struct BridgeConfig {
     /// and the node broadcasts it into the consensus mesh. Triggers consensus,
     /// so it defaults to an empty string (disabled).
     pub transfer_ingress_address: String,
+
+    /// Shared bearer token the write-surface ingress endpoints
+    /// (`withdrawal_ingress_address` / `transfer_ingress_address`) require. When
+    /// non-empty, a request must present `Authorization: Bearer <token>` or it is
+    /// refused with 401 — so an ingress exposed beyond loopback cannot be driven
+    /// by an unauthenticated caller. Empty (the default) keeps the historical
+    /// no-auth behaviour, which is only safe on a loopback/management interface.
+    pub ingress_token: String,
 }
 
 impl Default for BridgeConfig {
@@ -155,6 +163,7 @@ impl Default for BridgeConfig {
                 .unwrap_or_default(),
             transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
                 .unwrap_or_default(),
+            ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
         }
     }
 }
