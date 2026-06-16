@@ -15,9 +15,13 @@
 //! CLI in a later PR. This module is the cryptographic safety
 //! check that makes the SRS trustworthy.
 
-use ark_bn254::{Bn254, G1Affine, G2Affine};
+use ark_bn254::{Bn254, Fr, G1Affine, G1Projective, G2Affine};
+use ark_ec::pairing::Pairing;
+use ark_ec::{CurveGroup, VariableBaseMSM};
+use ark_ff::{One, PrimeField};
 use ark_groth16::ProvingKey;
-use ark_serialize::CanonicalDeserialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use sha2::{Digest, Sha512};
 
 use super::bgm17::{verify_contribution_deltas, BgmError, DleqProof};
 use super::transcript::{Phase2Transcript, TranscriptError};
@@ -45,6 +49,21 @@ pub enum VerifyError {
          delta the chain culminates in"
     )]
     FinalPkDeltaMismatch,
+
+    #[error(
+        "final key element `{field}` was altered by the ceremony but a phase-2 \
+         contribution must leave it untouched"
+    )]
+    KeyElementAltered { field: &'static str },
+
+    #[error("final key vector `{field}` has a different length than the initial key")]
+    QueryLengthMismatch { field: &'static str },
+
+    #[error(
+        "final key `{field}` is not a consistent δ⁻¹ scaling of the initial key: \
+         the pairing consistency check failed"
+    )]
+    QueryInconsistent { field: &'static str },
 }
 
 /// Verify a finalised phase-2 transcript end to end.
@@ -127,6 +146,198 @@ pub fn verify_final_pk(
         return Err(VerifyError::FinalPkDeltaMismatch);
     }
     Ok(())
+}
+
+/// Verify the final key's δ-dependent vectors were consistently divided by the
+/// cumulative δ, and that every δ-INdependent element is byte-identical to the
+/// initial key.
+///
+/// [`verify_final_pk`] binds the final key's δ to the transcript, but a phase-2
+/// contribution touches more than δ: alongside `δ ← δ·δ_i` it divides every
+/// `h_query` and `l_query` element by `δ_i⁻¹`. An operator could present a key
+/// whose δ matches the chain end (passing [`verify_final_pk`]) yet whose
+/// `h_query`/`l_query` were left unscaled — or scaled by a δ they secretly
+/// know — keeping the Groth16 trapdoor recoverable and proofs forgeable.
+///
+/// We cannot divide by the cumulative δ in the clear: it is the toxic waste no
+/// honest party holds. So we check the relation *in the exponent* via a
+/// pairing. For each element `j`:
+///
+/// ```text
+///   e(final.h_query[j], final.δ_g2) == e(initial.h_query[j], initial.δ_g2)
+/// ```
+///
+/// Both sides collapse to `e(g1, g2)^{H_j}`: `h_query[j]` carries `H_j / δ` and
+/// `δ_g2` carries `δ`, so the product recovers the δ-invariant numerator `H_j`.
+/// Equality therefore holds iff `h_query[j]` was divided by exactly the δ that
+/// `δ_g2` multiplies up to. The thousands of per-element pairings are batched
+/// into a single random linear combination — Fiat-Shamir powers `ρ^j` seeded
+/// from both keys — collapsing each vector's check to two pairings with
+/// negligible soundness error.
+///
+/// Every other proving-key field is independent of δ; a contribution must leave
+/// it untouched, so we require exact equality. That stops a substituted phase-1
+/// element (`a_query`, `gamma_abc_g1`, …) from riding in on an honest
+/// transcript.
+///
+/// Call this *after* [`verify_final_pk`]: that one ties `final.δ_g2` to the
+/// transcript, this one ties the rest of the key to `final.δ_g2`.
+pub fn verify_final_pk_consistency(
+    initial_pk: &ProvingKey<Bn254>,
+    final_pk: &ProvingKey<Bn254>,
+) -> Result<(), VerifyError> {
+    // 1. Every δ-independent element must survive a contribution untouched.
+    if final_pk.vk.alpha_g1 != initial_pk.vk.alpha_g1 {
+        return Err(VerifyError::KeyElementAltered {
+            field: "vk.alpha_g1",
+        });
+    }
+    if final_pk.vk.beta_g2 != initial_pk.vk.beta_g2 {
+        return Err(VerifyError::KeyElementAltered {
+            field: "vk.beta_g2",
+        });
+    }
+    if final_pk.vk.gamma_g2 != initial_pk.vk.gamma_g2 {
+        return Err(VerifyError::KeyElementAltered {
+            field: "vk.gamma_g2",
+        });
+    }
+    if final_pk.vk.gamma_abc_g1 != initial_pk.vk.gamma_abc_g1 {
+        return Err(VerifyError::KeyElementAltered {
+            field: "vk.gamma_abc_g1",
+        });
+    }
+    if final_pk.beta_g1 != initial_pk.beta_g1 {
+        return Err(VerifyError::KeyElementAltered { field: "beta_g1" });
+    }
+    if final_pk.a_query != initial_pk.a_query {
+        return Err(VerifyError::KeyElementAltered { field: "a_query" });
+    }
+    if final_pk.b_g1_query != initial_pk.b_g1_query {
+        return Err(VerifyError::KeyElementAltered {
+            field: "b_g1_query",
+        });
+    }
+    if final_pk.b_g2_query != initial_pk.b_g2_query {
+        return Err(VerifyError::KeyElementAltered {
+            field: "b_g2_query",
+        });
+    }
+
+    // 2. The δ-dependent vectors must keep their length (an extra or missing
+    //    element would otherwise be silently dropped by the zip in step 3).
+    if final_pk.h_query.len() != initial_pk.h_query.len() {
+        return Err(VerifyError::QueryLengthMismatch { field: "h_query" });
+    }
+    if final_pk.l_query.len() != initial_pk.l_query.len() {
+        return Err(VerifyError::QueryLengthMismatch { field: "l_query" });
+    }
+
+    // 3. Pairing consistency, batched per vector.
+    check_query_consistency(
+        "h_query",
+        &initial_pk.h_query,
+        &final_pk.h_query,
+        &initial_pk.vk.delta_g2,
+        &final_pk.vk.delta_g2,
+    )?;
+    check_query_consistency(
+        "l_query",
+        &initial_pk.l_query,
+        &final_pk.l_query,
+        &initial_pk.vk.delta_g2,
+        &final_pk.vk.delta_g2,
+    )?;
+
+    Ok(())
+}
+
+/// Batched in-the-exponent check that `final[j]` is `initial[j]` scaled by the
+/// same δ-ratio that carries `initial_delta_g2` to `final_delta_g2`, for every
+/// `j`. See [`verify_final_pk_consistency`] for the algebra.
+///
+/// Takes a random linear combination `Σ ρ^j · P[j]` of each vector with
+/// Fiat-Shamir powers of a challenge ρ seeded from both vectors and both
+/// deltas, then compares the two pairings. A single inconsistent element makes
+/// the combined relation a non-trivial degree-`<n` polynomial in ρ, which the
+/// honest, key-derived ρ vanishes on only with negligible probability.
+fn check_query_consistency(
+    field: &'static str,
+    initial: &[G1Affine],
+    final_: &[G1Affine],
+    initial_delta_g2: &G2Affine,
+    final_delta_g2: &G2Affine,
+) -> Result<(), VerifyError> {
+    // Empty vectors carry no δ-dependent data and are trivially consistent.
+    if initial.is_empty() {
+        return Ok(());
+    }
+
+    let rho = fiat_shamir_rho(field, initial, final_, initial_delta_g2, final_delta_g2);
+    let scalars = scalar_powers(rho, initial.len());
+
+    // Σ ρ^j · P[j] over each vector. msm only errors on a length mismatch,
+    // which step 2 already ruled out, so the lengths here are equal by
+    // construction.
+    let final_combined = G1Projective::msm(final_, &scalars)
+        .expect("scalars and bases share a length")
+        .into_affine();
+    let initial_combined = G1Projective::msm(initial, &scalars)
+        .expect("scalars and bases share a length")
+        .into_affine();
+
+    // e(Σρ^j·final[j], final.δ_g2) == e(Σρ^j·initial[j], initial.δ_g2)
+    let lhs = Bn254::pairing(final_combined, *final_delta_g2);
+    let rhs = Bn254::pairing(initial_combined, *initial_delta_g2);
+    if lhs != rhs {
+        return Err(VerifyError::QueryInconsistent { field });
+    }
+    Ok(())
+}
+
+/// `[1, base, base², …, base^{n-1}]`.
+fn scalar_powers(base: Fr, n: usize) -> Vec<Fr> {
+    let mut out = Vec::with_capacity(n);
+    let mut acc = Fr::one();
+    for _ in 0..n {
+        out.push(acc);
+        acc *= base;
+    }
+    out
+}
+
+/// Fiat-Shamir challenge for the query-consistency RLC. Binding it to both
+/// vectors and both deltas means a malformed key cannot be crafted against a
+/// known combination: ρ depends on the very bytes the attacker would have to
+/// choose, leaving only a hash-grinding fixed point that is infeasible.
+fn fiat_shamir_rho(
+    domain: &str,
+    initial: &[G1Affine],
+    final_: &[G1Affine],
+    initial_delta_g2: &G2Affine,
+    final_delta_g2: &G2Affine,
+) -> Fr {
+    let mut hasher = Sha512::new();
+    hasher.update(b"paraloom-ceremony-query-consistency-v1");
+    hasher.update(domain.as_bytes());
+    write_canonical(&mut hasher, initial_delta_g2);
+    write_canonical(&mut hasher, final_delta_g2);
+    for point in initial {
+        write_canonical(&mut hasher, point);
+    }
+    for point in final_ {
+        write_canonical(&mut hasher, point);
+    }
+    let digest = hasher.finalize();
+    Fr::from_le_bytes_mod_order(&digest[..])
+}
+
+fn write_canonical<T: CanonicalSerialize>(hasher: &mut Sha512, value: &T) {
+    let mut bytes = Vec::new();
+    value
+        .serialize_compressed(&mut bytes)
+        .expect("arkworks types serialise to their compressed form");
+    hasher.update(&bytes);
 }
 
 #[cfg(test)]
@@ -302,6 +513,85 @@ mod tests {
         match verify_final_pk(&initial_pk, &transcript, &evil_pk) {
             Err(VerifyError::FinalPkDeltaMismatch) => {}
             other => panic!("expected FinalPkDeltaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn consistent_final_pk_passes_query_consistency() {
+        // The real final pk from a 3-contribution chain has its h_query and
+        // l_query divided by exactly the cumulative δ — the in-exponent check
+        // must accept it.
+        let (initial_pk, _transcript, final_pk) = build_real_transcript(3);
+        verify_final_pk_consistency(&initial_pk, &final_pk)
+            .expect("an honestly contributed key is δ⁻¹-consistent");
+    }
+
+    #[test]
+    fn unscaled_h_query_is_rejected() {
+        // δ matches the chain end (verify_final_pk would pass), but h_query was
+        // left at the initial key's value instead of being divided by δ. The
+        // pairing check must catch the inconsistency.
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(3);
+        final_pk.h_query = initial_pk.h_query.clone();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::QueryInconsistent { field: "h_query" }) => {}
+            other => panic!("expected QueryInconsistent(h_query), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tampered_single_l_query_element_is_rejected() {
+        // A single l_query element re-scaled by an unrelated scalar breaks the
+        // relation; the random linear combination surfaces it.
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(2);
+        let mut rng = StdRng::seed_from_u64(0x1234_5678_u64);
+        let bogus = Fr::rand(&mut rng);
+        final_pk.l_query[0] = (final_pk.l_query[0] * bogus).into_affine();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::QueryInconsistent { field: "l_query" }) => {}
+            other => panic!("expected QueryInconsistent(l_query), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn altered_a_query_is_rejected_as_key_element() {
+        // a_query is δ-independent; a contribution must not touch it. Swapping
+        // one element is caught by the byte-equality gate before any pairing.
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(1);
+        let mut rng = StdRng::seed_from_u64(0x9999_u64);
+        let bogus = Fr::rand(&mut rng);
+        final_pk.a_query[0] = (final_pk.a_query[0] * bogus).into_affine();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::KeyElementAltered { field: "a_query" }) => {}
+            other => panic!("expected KeyElementAltered(a_query), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn altered_gamma_abc_is_rejected_as_key_element() {
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(1);
+        let mut rng = StdRng::seed_from_u64(0xAAAA_u64);
+        let bogus = Fr::rand(&mut rng);
+        final_pk.vk.gamma_abc_g1[0] = (final_pk.vk.gamma_abc_g1[0] * bogus).into_affine();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::KeyElementAltered {
+                field: "vk.gamma_abc_g1",
+            }) => {}
+            other => panic!(
+                "expected KeyElementAltered(vk.gamma_abc_g1), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn h_query_length_mismatch_is_rejected() {
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(1);
+        let extra = final_pk.h_query[0];
+        final_pk.h_query.push(extra);
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::QueryLengthMismatch { field: "h_query" }) => {}
+            other => panic!("expected QueryLengthMismatch(h_query), got {:?}", other),
         }
     }
 

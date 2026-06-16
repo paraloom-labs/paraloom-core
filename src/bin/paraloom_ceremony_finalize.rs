@@ -20,7 +20,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use paraloom::ceremony::{
-    read_pk, read_transcript, verify_final_pk, verify_phase2_transcript, write_compressed,
+    read_pk, read_transcript, verify_final_pk, verify_final_pk_consistency,
+    verify_phase2_transcript, write_compressed,
 };
 
 #[derive(Parser, Debug)]
@@ -91,6 +92,19 @@ fn main() -> ExitCode {
     if let Err(e) = verify_final_pk(&initial_pk, &transcript, &ceremony_pk) {
         eprintln!(
             "ceremony PK does not match the transcript, refusing to write: {}",
+            e
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // verify_final_pk binds the key's delta to the transcript; this binds the
+    // rest of the key to that delta — h_query/l_query must be the cumulative
+    // delta^-1 scaling, and every delta-independent element must be unchanged.
+    // Together they reject a trapdoored key carrying the right delta but
+    // malformed queries.
+    if let Err(e) = verify_final_pk_consistency(&initial_pk, &ceremony_pk) {
+        eprintln!(
+            "ceremony PK is not delta-consistent with the initial key, refusing to write: {}",
             e
         );
         return ExitCode::FAILURE;
