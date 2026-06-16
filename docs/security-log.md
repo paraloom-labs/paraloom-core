@@ -10,6 +10,17 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Equivocation now costs the validator reputation** (in-house security audit).
+  A validator that cast two disagreeing votes on the same request had its
+  equivocation recorded as evidence but kept its full reputation — so provable
+  misbehaviour carried no off-chain consequence and the equivocator was never
+  gated out of consensus. The withdrawal and transfer coordinators now lower the
+  equivocator's reputation on detection, so repeated equivocation drops it below
+  the consensus-eligibility floor and its votes stop counting. (Slashing the
+  recorded stake on-chain remains a separate stake-economic-security item for
+  mainnet.) Fixed pre-mainnet on devnet; covered by a test that an equivocating
+  validator's reputation drops.
+
 - **Bounded reads on the compute request-response codecs** (in-house security
   audit). The compute job/query codecs read inbound payloads with an unbounded
   `read_to_end`, where every sibling protocol (result, heartbeat, co-sign) caps

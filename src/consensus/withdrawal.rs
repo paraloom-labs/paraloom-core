@@ -572,7 +572,12 @@ impl WithdrawalVerificationCoordinator {
             // Equivocation: a previous vote on this request from the
             // same validator disagreed with the new one. Record the
             // evidence and *do not* install the new vote — the
-            // original stands.
+            // original stands. Also penalise the equivocator's reputation
+            // (audit): provable misbehaviour must cost it standing and gate it
+            // out of future quorums, not just produce an in-memory log entry.
+            if let Err(e) = self.reputation_tracker.record_failure(&validator).await {
+                log::warn!("could not penalise equivocator {:?}: {}", validator, e);
+            }
             self.slashing_tracker.record(validator, evidence).await;
         }
 
@@ -1138,6 +1143,66 @@ mod tests {
             .await
             .unwrap();
         assert!(evidence.is_none());
+    }
+
+    /// Equivocation costs the validator reputation (audit), not just an
+    /// in-memory log entry — so provable misbehaviour gates it out of quorums.
+    #[tokio::test]
+    async fn equivocation_penalises_the_validator_reputation() {
+        let mut coordinator = WithdrawalVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(1, 1);
+        let v = NodeId(vec![7]);
+        coordinator.register_validator(v.clone()).await;
+        let before = coordinator
+            .reputation_tracker()
+            .get_reputation(&v)
+            .await
+            .unwrap();
+
+        let rid = coordinator
+            .start_verification(WithdrawalVerificationRequest {
+                request_id: "eq-rep".to_string(),
+                nullifier: [1u8; 32],
+                amount: 1000,
+                recipient: [2u8; 32],
+                proof: vec![0u8; 32],
+                fee: 0,
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
+
+        coordinator
+            .submit_result(WithdrawalVerificationResult {
+                request_id: rid.clone(),
+                validator: v.clone(),
+                vote: VerificationVote::Valid,
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
+        // The same validator flips its vote — equivocation.
+        coordinator
+            .submit_result(WithdrawalVerificationResult {
+                request_id: rid,
+                validator: v.clone(),
+                vote: VerificationVote::Invalid {
+                    reason: "flipped".to_string(),
+                },
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
+
+        let after = coordinator
+            .reputation_tracker()
+            .get_reputation(&v)
+            .await
+            .unwrap();
+        assert!(
+            after < before,
+            "equivocation must lower the validator's reputation (was {before}, now {after})"
+        );
     }
 
     /// A low-reputation validator's vote must not contribute to the
