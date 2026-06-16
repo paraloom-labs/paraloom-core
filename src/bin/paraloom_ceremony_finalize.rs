@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use paraloom::ceremony::{read_pk, read_transcript, verify_phase2_transcript, write_compressed};
+use paraloom::ceremony::{
+    read_pk, read_transcript, verify_final_pk, verify_phase2_transcript, write_compressed,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,6 +82,17 @@ fn main() -> ExitCode {
 
     if let Err(e) = verify_phase2_transcript(&initial_pk, &transcript) {
         eprintln!("transcript verification FAILED, refusing to write: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    // Bind the key we are about to promote to the verified transcript: refuse a
+    // ceremony PK whose delta is not the one the chain culminates in, so an
+    // honest transcript cannot be paired with a substituted (trapdoored) key.
+    if let Err(e) = verify_final_pk(&initial_pk, &transcript, &ceremony_pk) {
+        eprintln!(
+            "ceremony PK does not match the transcript, refusing to write: {}",
+            e
+        );
         return ExitCode::FAILURE;
     }
 

@@ -52,4 +52,4 @@ pub use transcript::{
     hash_contribution, try_hash_from_hex, CircuitId, Contribution, Phase2Transcript,
     TranscriptError, TranscriptHash, TRANSCRIPT_VERSION,
 };
-pub use verifier::{verify_phase2_transcript, VerifyError};
+pub use verifier::{verify_final_pk, verify_phase2_transcript, VerifyError};

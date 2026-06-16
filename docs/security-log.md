@@ -10,6 +10,21 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Ceremony finalize binds the promoted key to the verified transcript**
+  (in-house security audit). The trusted-setup finalize tool verified the
+  contribution transcript end-to-end, but then wrote the proving key it was
+  handed without checking that key against the transcript. An operator could
+  therefore pair an honest, fully-verified transcript with an arbitrary,
+  separately-generated proving key, and finalize would promote it to a
+  production key — the path by which a trapdoored verifying key could reach the
+  chain. Finalize now additionally requires the key's delta to equal the delta
+  the verified contribution chain culminates in, so a substituted key carrying
+  any other delta is refused before anything is written. (A deeper consistency
+  check on the key's internal query vectors against the cumulative delta remains
+  tracked separately.) The MPC ceremony is still unexecuted and remains a hard
+  pre-mainnet gate; fixed in the tooling before it runs, covered by tests that a
+  matching key passes and a substituted key is rejected.
+
 - **Transfer scan buffer recorded only after the proof verifies, and bounded**
   (in-house security audit). A gossiped transfer-verification request had its
   encrypted output notes recorded into the node's in-memory scan buffer *before*
