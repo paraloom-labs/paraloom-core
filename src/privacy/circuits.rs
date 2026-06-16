@@ -1102,6 +1102,102 @@ impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
     }
 }
 
+/// Deposit circuit, spend-key construction (circuit v2, #293).
+///
+/// The public→shielded successor to [`DepositCircuit`]: it proves the output
+/// note's commitment is a well-formed spend-key commitment binding the
+/// recipient's spend public key. A deposit creates a note rather than spending
+/// one, so there is no nullifier, Merkle path or signature — the depositor only
+/// needs the recipient's *public* key (only the recipient, holding the matching
+/// private key, can later spend it). Additive — alongside v1 until cutover.
+pub struct DepositCircuitV2 {
+    // Public input.
+    pub output_commitment: Option<[u8; 32]>,
+    // Private witnesses.
+    pub value: Option<u64>,
+    pub blinding: Option<[u8; 32]>,
+    pub recipient_pubkey: Option<[u8; 32]>,
+    pub asset_id: Option<[u8; 32]>,
+}
+
+impl DepositCircuitV2 {
+    pub fn new() -> Self {
+        DepositCircuitV2 {
+            output_commitment: None,
+            value: None,
+            blinding: None,
+            recipient_pubkey: None,
+            asset_id: None,
+        }
+    }
+
+    pub fn with_witness(
+        output_commitment: [u8; 32],
+        value: u64,
+        blinding: [u8; 32],
+        recipient_pubkey: [u8; 32],
+        asset_id: [u8; 32],
+    ) -> Self {
+        DepositCircuitV2 {
+            output_commitment: Some(output_commitment),
+            value: Some(value),
+            blinding: Some(blinding),
+            recipient_pubkey: Some(recipient_pubkey),
+            asset_id: Some(asset_id),
+        }
+    }
+}
+
+impl Default for DepositCircuitV2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConstraintSynthesizer<Fr> for DepositCircuitV2 {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let commitment_var = FpVar::new_input(cs.clone(), || {
+            Ok(self
+                .output_commitment
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+
+        // Amount is range-constrained to [0, 2^64) so a near-field-prime value
+        // cannot be committed (the unbounded-mint vector, #60).
+        let (_value_bits, value_var) = alloc_u64_witness(cs.clone(), self.value)?;
+        let blinding_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .blinding
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let recipient_pubkey_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .recipient_pubkey
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+        let asset_id_var = FpVar::new_witness(cs.clone(), || {
+            Ok(self
+                .asset_id
+                .map(|b| Fr::from_le_bytes_mod_order(&b))
+                .unwrap_or_else(|| Fr::from(0u64)))
+        })?;
+
+        let computed = poseidon_commit_spend_gadget(
+            cs,
+            &value_var,
+            &recipient_pubkey_var,
+            &blinding_var,
+            &asset_id_var,
+        )?;
+        computed.enforce_equal(&commitment_var)?;
+
+        Ok(())
+    }
+}
+
 /// Groth16 proof system wrapper
 pub struct Groth16ProofSystem;
 
@@ -2050,6 +2146,62 @@ mod tests {
             vec![ob0, ob1],
             vec![opk0, opk1],
             [0u8; 32],
+        )));
+    }
+
+    // --- DepositCircuitV2 (spend-key construction, #293) ---
+
+    fn synth_v2_deposit(c: DepositCircuitV2) -> bool {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        match c.generate_constraints(cs.clone()) {
+            Ok(()) => cs.is_satisfied().expect("constraint system query"),
+            Err(_) => false,
+        }
+    }
+
+    fn v2_deposit_commitment(
+        value: u64,
+        recipient_pubkey: [u8; 32],
+        blinding: [u8; 32],
+    ) -> [u8; 32] {
+        fr_to_bytes_32(poseidon_commit_spend(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&recipient_pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from(0u64),
+        ))
+    }
+
+    #[test]
+    fn deposit_v2_valid_commitment_satisfies() {
+        let (value, opk, blinding) = (1_000u64, [8u8; 32], [3u8; 32]);
+        let commitment = v2_deposit_commitment(value, opk, blinding);
+        assert!(synth_v2_deposit(DepositCircuitV2::with_witness(
+            commitment, value, blinding, opk, [0u8; 32],
+        )));
+    }
+
+    #[test]
+    fn deposit_v2_rejects_tampered_commitment() {
+        assert!(!synth_v2_deposit(DepositCircuitV2::with_witness(
+            [0xABu8; 32], // not the commitment of these witnesses
+            1_000,
+            [3u8; 32],
+            [8u8; 32],
+            [0u8; 32],
+        )));
+    }
+
+    #[test]
+    fn deposit_v2_rejects_value_not_matching_commitment() {
+        // A commitment formed for value 1000, but the witness claims 2000 — the
+        // recomputed commitment differs, so the note cannot be minted at an
+        // amount other than the one it commits to.
+        let (opk, blinding) = ([8u8; 32], [3u8; 32]);
+        let commitment = v2_deposit_commitment(1_000, opk, blinding);
+        assert!(!synth_v2_deposit(DepositCircuitV2::with_witness(
+            commitment, 2_000, // wrong amount
+            blinding, opk, [0u8; 32],
         )));
     }
 }
