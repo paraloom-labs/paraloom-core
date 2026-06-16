@@ -525,11 +525,6 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     request.request_id
                 );
 
-                // Record the encrypted output notes for recipient scanning
-                // (#196); any validator that sees the broadcast can serve scan.
-                self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
-                    .await;
-
                 // Verify the transfer zkSNARK proof if a privacy pool is
                 // available, mirroring the withdrawal path (#194).
                 let vote = if let Some(pool) = &self.shielded_pool {
@@ -539,6 +534,15 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                                 "Transfer proof verified successfully: {}",
                                 request.request_id
                             );
+                            // Record the encrypted output notes for recipient
+                            // scanning (#196) only AFTER the proof verifies — an
+                            // unauthenticated peer cannot pollute the scan buffer
+                            // with notes from an unverified (garbage) transfer.
+                            self.record_delivered_notes(
+                                &request.output_commitments,
+                                &request.ciphertexts,
+                            )
+                            .await;
                             crate::consensus::vote_tally::VerificationVote::Valid
                         }
                         Ok(false) => {
@@ -1981,17 +1985,27 @@ impl Node {
         output_commitments: &[[u8; 32]; 2],
         ciphertexts: &[String; 2],
     ) {
+        // Bound the in-memory scan buffer so a high volume of transfers cannot
+        // grow it without limit (this records only proof-verified transfers, so
+        // it is not cheaply floodable, but the bound is defence in depth).
+        const MAX_DELIVERED_NOTES: usize = 50_000;
+
         let mut store = self.delivered_notes.lock().await;
         for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
             let note = transfer_ingress::DeliveredNote {
                 output_commitment: hex::encode(commitment),
                 ciphertext: ciphertext.clone(),
             };
-            if !store.iter().any(|d| {
+            if store.iter().any(|d| {
                 d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
             }) {
-                store.push(note);
+                continue;
             }
+            // Evict the oldest note when at capacity (FIFO).
+            if store.len() >= MAX_DELIVERED_NOTES {
+                store.remove(0);
+            }
+            store.push(note);
         }
     }
 
@@ -2715,6 +2729,41 @@ mod tests {
             pool.root().await,
             before_root,
             "the Merkle root must be unchanged by dropped gossip"
+        );
+    }
+
+    // A gossiped transfer whose proof does not verify must NOT record its output
+    // notes into the scan buffer — otherwise any peer could pollute it with
+    // notes from unverified (garbage) transfers. The notes are now recorded only
+    // after the proof verifies.
+    #[tokio::test]
+    async fn unverified_transfer_gossip_does_not_record_notes() {
+        use crate::network::protocol::NetworkEventHandler;
+
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        assert!(node.delivered_transfer_notes().await.is_empty());
+
+        let request = crate::consensus::TransferVerificationRequest {
+            request_id: "t-gossip".to_string(),
+            nullifiers: [[1u8; 32], [2u8; 32]],
+            output_commitments: [[3u8; 32], [4u8; 32]],
+            new_merkle_root: [5u8; 32],
+            proof: vec![0u8; 256], // garbage — does not verify
+            ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
+            timestamp: 0,
+        };
+        node.handle_message(
+            NodeId(vec![9]),
+            Message::TransferVerificationRequest { request },
+        )
+        .await
+        .expect("the handler processes the message");
+
+        assert!(
+            node.delivered_transfer_notes().await.is_empty(),
+            "an unverified gossip transfer must not record notes into the scan buffer"
         );
     }
 }
