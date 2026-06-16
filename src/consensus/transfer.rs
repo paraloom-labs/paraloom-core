@@ -336,7 +336,13 @@ impl TransferVerificationCoordinator {
             .submit_vote(validator.clone(), result.vote)
             .await?
         {
-            // Equivocation: record the evidence; the original vote stands.
+            // Equivocation: record the evidence; the original vote stands. Also
+            // penalise the equivocator's reputation (audit) so the misbehaviour
+            // costs it standing and gates it out of future quorums, mirroring
+            // the withdrawal path.
+            if let Err(e) = self.reputation_tracker.record_failure(&validator).await {
+                log::warn!("could not penalise equivocator {:?}: {}", validator, e);
+            }
             self.slashing_tracker.record(validator, evidence).await;
         }
 
