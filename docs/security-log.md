@@ -10,6 +10,21 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Shielded transfer marked spent only after on-chain settlement** (in-house
+  security audit). The transfer twin of the withdrawal spend-after-settle fix
+  below: the transfer submitter applied the settlement to its local pool —
+  marking the input nullifiers spent and appending the output commitments —
+  **before** submitting the on-chain `shielded_transfer`, with no rollback on
+  failure. A transient submit failure (an RPC error, an expired blockhash, a
+  momentary quorum miss) left the input notes marked spent locally while they
+  stayed unspent on-chain, so every retry was rejected locally as "already
+  spent", freezing them. The submitter now submits on-chain first and applies to
+  the local pool only on success; a read-only nullifier pre-check still
+  fast-fails an obvious replay before paying RPC fees, and the on-chain nullifier
+  PDAs remain the authoritative double-spend defence. Fixed pre-mainnet on
+  devnet; covered by a test asserting a failed transfer submit leaves the inputs
+  spendable.
+
 - **Co-sign settlement assembly rejects an oversized validator set** (in-house
   security audit). A co-sign request arrives over the network carrying the
   quorum validator set used to rebuild the settlement transaction every

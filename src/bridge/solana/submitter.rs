@@ -183,14 +183,26 @@ impl ResultSubmitter {
             .map(Commitment)
             .collect();
 
-        // Local pool state first; a double-spend here surfaces before we pay
-        // RPC fees. The on-chain nullifier PDAs are the authoritative replay
-        // guard, but this keeps the node's own view consistent.
-        self.pool
-            .apply_transfer(nullifiers, output_commitments)
-            .await
-            .map_err(|e| BridgeError::WithdrawalFailed(e.to_string()))?;
+        // Fast-fail on a known replay before paying RPC fees — a read-only
+        // check that does NOT mutate pool state. The on-chain nullifier PDAs
+        // are the authoritative replay guard.
+        for nullifier in &nullifiers {
+            if self.pool.is_spent(nullifier).await {
+                return Err(BridgeError::InvalidTransaction(
+                    "Nullifier already spent".to_string(),
+                ));
+            }
+        }
 
+        // Submit on-chain FIRST. The input nullifiers are marked spent in the
+        // local pool only after the chain accepts the settlement (audit — the
+        // transfer twin of the withdrawal spend-after-settle fix), so a
+        // transient submit failure — RPC error, blockhash expiry, a momentary
+        // QuorumNotMet — leaves the notes spendable for a retry instead of
+        // freezing them while the funds are untouched. If the chain did settle
+        // but this call still returned an error, a later attempt is rejected
+        // on-chain by the nullifier PDAs — the double-spend defence lives
+        // on-chain, not in this local flag.
         let signature = self
             .program
             .submit_shielded_transfer(
@@ -200,6 +212,22 @@ impl ResultSubmitter {
                 &approved.proof,
             )
             .await?;
+
+        // Settled on-chain → record the spend and append the outputs locally. A
+        // failure here does not undo the settlement, so log and continue; the
+        // on-chain nullifier PDAs remain the source of truth for double-spend.
+        if let Err(e) = self
+            .pool
+            .apply_transfer(nullifiers, output_commitments)
+            .await
+        {
+            log::error!(
+                target: "paraloom::bridge::solana",
+                "shielded transfer settled on-chain ({}) but failed to apply to the local pool: {}",
+                signature,
+                e
+            );
+        }
 
         log::info!("Shielded transfer settled: {}", signature);
         Ok(signature)
@@ -496,6 +524,41 @@ mod tests {
             !pool.is_spent(&nullifier).await,
             "a failed on-chain submit must leave the note spendable, not frozen"
         );
+    }
+
+    /// Audit (transfer twin of `a_failed_submit_leaves_the_note_spendable`): a
+    /// shielded transfer whose on-chain submit fails must NOT mark its input
+    /// nullifiers spent in the local pool. Otherwise the input notes are frozen
+    /// — still unspent on-chain, but every retry is rejected locally as "already
+    /// spent". The fix submits on-chain first and applies to the pool only on
+    /// success.
+    #[tokio::test]
+    async fn a_failed_transfer_submit_leaves_the_inputs_spendable() {
+        use crate::privacy::Nullifier;
+        let pool = Arc::new(ShieldedPool::new());
+
+        let approved = ApprovedTransfer {
+            request_id: "t1".to_string(),
+            nullifiers: [[0x11; 32], [0x22; 32]],
+            output_commitments: [[0x33; 32], [0x44; 32]],
+            new_merkle_root: [0x55; 32],
+            proof: vec![1u8; 256],
+        };
+        let input_nullifiers = approved.nullifiers; // Copy, kept past the move below
+
+        // The dummy RPC points at an unreachable local node and there is no
+        // authority keypair, so the on-chain submit fails.
+        let submitter = submitter_for(pool.clone());
+        assert!(
+            submitter.submit_approved_transfer(approved).await.is_err(),
+            "submit must fail when the chain does not accept the transfer"
+        );
+        for n in input_nullifiers {
+            assert!(
+                !pool.is_spent(&Nullifier(n)).await,
+                "a failed on-chain transfer submit must leave the inputs spendable, not frozen"
+            );
+        }
     }
 
     /// An empty proof is rejected before any consensus / chain work.
