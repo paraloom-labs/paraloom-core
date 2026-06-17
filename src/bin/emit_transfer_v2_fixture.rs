@@ -11,7 +11,7 @@
 //! `cargo run --release --bin emit_transfer_v2_fixture`
 //! A real multi-party MPC ceremony remains the mainnet gate (#64).
 
-use ark_bn254::{Bn254, Fr};
+use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalSerialize;
 use paraloom::privacy::circuits::{Groth16ProofSystem, TransferCircuitV2};
