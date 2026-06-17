@@ -290,7 +290,13 @@ mod tests {
     /// wire form, and verify it through the vendored `alt_bn128` verifier — the
     /// exact path the Solana program will run. A self-contained, in-memory
     /// trusted setup keeps the test independent of `keys/`.
+    ///
+    /// v1 path: the pool now produces spend-key (v2) commitments, so the v1
+    /// `WithdrawCircuit` no longer matches a pool note. Superseded by
+    /// `withdraw_v2_verifies_through_alt_bn128_with_asset_and_ext_data_bound`;
+    /// remove with the rest of the v1 legacy at cleanup.
     #[tokio::test]
+    #[ignore = "v1 path superseded by the v2 alt_bn128 test; remove at v1 cleanup"]
     async fn withdrawal_proof_verifies_through_alt_bn128() {
         let _ = env_logger::builder().is_test(true).try_init();
 
