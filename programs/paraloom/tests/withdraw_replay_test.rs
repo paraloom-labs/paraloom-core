@@ -51,7 +51,7 @@ async fn withdraw_with_same_nullifier_is_rejected() {
         &program_id,
     );
 
-    let recipient = Keypair::new();
+    let recipient = Pubkey::new_from_array(fx::FIXTURE_RECIPIENT);
 
     // Both attempts use the SAME valid fixture proof and the SAME nullifier
     // (the whole point of the test). To keep the two transaction signatures
@@ -73,7 +73,7 @@ async fn withdraw_with_same_nullifier_is_rejected() {
                 bridge_state: state_pda,
                 bridge_vault: vault_pda,
                 nullifier_account: nullifier_pda,
-                recipient: recipient.pubkey(),
+                recipient,
                 validator_account: validator_pda,
                 validator_registry: registry_pda,
                 authority: upgrade_authority.pubkey(),

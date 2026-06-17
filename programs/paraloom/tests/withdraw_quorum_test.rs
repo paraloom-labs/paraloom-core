@@ -56,7 +56,7 @@ async fn withdraw_is_rejected_without_a_validator_quorum() {
     let (validator2_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator2.pubkey().as_ref()], &program_id);
 
-    let recipient = Keypair::new();
+    let recipient = Pubkey::new_from_array(fx::FIXTURE_RECIPIENT);
 
     async fn send(
         banks_client: &mut solana_program_test::BanksClient,
@@ -199,7 +199,7 @@ async fn withdraw_is_rejected_without_a_validator_quorum() {
             bridge_state: state_pda,
             bridge_vault: vault_pda,
             nullifier_account: nullifier_pda,
-            recipient: recipient.pubkey(),
+            recipient,
             validator_account: validator_pda,
             validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),

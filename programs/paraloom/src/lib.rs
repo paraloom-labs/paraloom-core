@@ -12,6 +12,7 @@ pub mod transfer_fixture_data;
 mod transfer_verifier;
 mod transfer_vk_data;
 pub mod withdraw_fixture_data;
+pub mod withdraw_spl_fixture_data;
 mod withdraw_verifier;
 mod withdraw_vk_data;
 
@@ -79,6 +80,21 @@ fn require_canonical_nullifier(nullifier: &[u8; 32]) -> Result<()> {
         BridgeError::NonCanonicalNullifier
     );
     Ok(())
+}
+
+/// Asset id of native SOL (#235): the all-zero 32 bytes. SPL assets use their
+/// mint's pubkey bytes instead.
+pub const NATIVE_SOL_ASSET: [u8; 32] = [0u8; 32];
+
+/// Hash of the external withdrawal data bound into the spend-key proof as the
+/// `ext_data_hash` public input (finding D): the destination and amount. The
+/// program derives it from the recipient it is about to pay, so a valid proof
+/// commits to exactly that recipient — a settling validator cannot redirect the
+/// payout. The off-chain prover MUST derive `ext_data_hash` identically:
+/// `sha256(recipient_pubkey || amount.to_le_bytes())`.
+fn withdraw_ext_data_hash(recipient: &Pubkey, amount: u64) -> [u8; 32] {
+    anchor_lang::solana_program::hash::hashv(&[recipient.as_ref(), &amount.to_le_bytes()])
+        .to_bytes()
 }
 
 #[program]
@@ -197,6 +213,10 @@ pub mod paraloom_program {
         require!(!proof.is_empty(), BridgeError::InvalidProof);
         require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
 
+        // Bind the proof to the actual destination (finding D); native SOL is
+        // asset id all-zero (finding A). Captured before the mutable borrow.
+        let ext_data_hash = withdraw_ext_data_hash(&ctx.accounts.recipient.key(), amount);
+
         let current_slot = Clock::get()?.slot;
         require!(
             current_slot <= expiration_slot,
@@ -217,14 +237,17 @@ pub mod paraloom_program {
 
         // Verify the Groth16 withdrawal proof on-chain (#165). The proof is
         // bound to the program's published Merkle root and this withdrawal's
-        // nullifier + amount, so the settling validator cannot forge a
-        // withdrawal or redirect it to a different amount even though it holds
-        // the settlement authority.
+        // nullifier, amount, destination (ext_data_hash) and asset, so the
+        // settling validator cannot forge a withdrawal, redirect it to a
+        // different recipient (finding D) or release it as a different asset
+        // (finding A) even though it holds the settlement authority.
         require!(
             withdraw_verifier::verify_withdrawal(
                 &bridge_state.merkle_root,
                 &nullifier,
                 amount,
+                &ext_data_hash,
+                &NATIVE_SOL_ASSET,
                 &proof,
             ),
             BridgeError::InvalidProof
@@ -501,6 +524,14 @@ pub mod paraloom_program {
         require!(!proof.is_empty(), BridgeError::InvalidProof);
         require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
 
+        // The asset id IS the mint's pubkey (#235), so binding the proof to it
+        // is the on-chain mint check (finding A): a note committed under one
+        // mint cannot release another mint's vault. ext_data_hash binds the
+        // recipient token account (finding D). Both captured before the borrow.
+        let asset_id = ctx.accounts.mint.key().to_bytes();
+        let ext_data_hash =
+            withdraw_ext_data_hash(&ctx.accounts.recipient_token.key(), amount);
+
         let current_slot = Clock::get()?.slot;
         require!(
             current_slot <= expiration_slot,
@@ -521,15 +552,19 @@ pub mod paraloom_program {
         )?;
 
         // Verify the Groth16 withdrawal proof on-chain (#165), bound to the
-        // published Merkle root and this withdrawal's nullifier + amount, so a
-        // settling validator cannot release tokens for a note that does not
-        // exist. (Notes of every asset share the off-chain commitment tree and
-        // the published `merkle_root`.)
+        // published Merkle root and this withdrawal's nullifier, amount,
+        // destination and asset, so a settling validator cannot release tokens
+        // for a note that does not exist, redirect them (finding D) or release
+        // a note committed under a different mint from this vault (finding A —
+        // asset_id is the mint pubkey). Notes of every asset share the off-chain
+        // commitment tree and the published `merkle_root`.
         require!(
             withdraw_verifier::verify_withdrawal(
                 &bridge_state.merkle_root,
                 &nullifier,
                 amount,
+                &ext_data_hash,
+                &asset_id,
                 &proof,
             ),
             BridgeError::InvalidProof

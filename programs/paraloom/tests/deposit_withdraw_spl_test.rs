@@ -16,13 +16,14 @@
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use anchor_spl::token::spl_token;
-use paraloom_program::withdraw_fixture_data as fx;
+use paraloom_program::withdraw_spl_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount, ValidatorAccount};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     signature::{Keypair, Signer},
+    signer::keypair::keypair_from_seed,
     system_instruction,
     transaction::Transaction,
 };
@@ -148,7 +149,9 @@ async fn deposit_spl_then_withdraw_spl_retains_fee_in_vault_without_lamport_cred
     .await;
 
     // 4. create an SPL mint owned by `payer`; the mint pubkey is the asset id.
-    let mint = Keypair::new();
+    //    Fixed seed so the mint pubkey equals the SPL fixture's bound asset_id
+    //    (the proof is verified against it on-chain — finding A).
+    let mint = keypair_from_seed(&[11u8; 32]).unwrap();
     let rent = banks_client.get_rent().await.unwrap();
     let mint_rent = rent.minimum_balance(spl_token::state::Mint::LEN);
     send(
@@ -264,8 +267,10 @@ async fn deposit_spl_then_withdraw_spl_retains_fee_in_vault_without_lamport_cred
     assert_eq!(state.deposit_count, 1);
 
     // 7. create a recipient token account for the withdraw destination.
+    //    Fixed seed so its pubkey matches the SPL fixture's ext_data_hash
+    //    preimage (sha256(recipient_token || amount) — finding D).
     let recipient_owner = Keypair::new();
-    let recipient_token = Keypair::new();
+    let recipient_token = keypair_from_seed(&[22u8; 32]).unwrap();
     send(
         &mut banks_client,
         recent_blockhash,
