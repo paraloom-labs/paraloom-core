@@ -10,6 +10,34 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Withdraw proofs bound to their asset and destination on-chain**
+  (in-house security audit). The on-chain withdraw verifier checked a proof
+  against the published Merkle root, nullifier and amount — but not the asset
+  being released or the recipient being paid. A settling validator could
+  therefore present a real note's proof while releasing a different asset's
+  vault, or pay the proven note out to a recipient of its choosing. The
+  spend-key circuit v2 adds both as public inputs, and the program now derives
+  them on-chain from the accounts the instruction acts on, so neither can be set
+  by the submitter: the released vault's mint becomes the proof's asset id (a
+  note committed under one mint cannot release another's vault), and a hash of
+  the actual recipient and amount becomes its external-data hash (the payout
+  cannot be redirected). This lands in the program ahead of the devnet redeploy
+  and pool reset that put circuit v2 live. Part of #293; covered by verifier
+  tests that reject a mismatched asset or destination and by integration tests
+  across the native and SPL withdraw paths.
+
+- **Ceremony key's query vectors checked against the cumulative delta**
+  (in-house security audit). The deeper consistency check the entry below
+  deferred is now in place. Binding the final key's delta to the transcript
+  stopped a wholly substituted key, but not one that kept the correct delta
+  while leaving its internal query vectors inconsistent with it — a malformed
+  proving key that could leave the Groth16 trapdoor recoverable. Finalize now
+  verifies, in the exponent via a pairing, that those vectors were divided by
+  exactly the cumulative delta the contribution chain produced, and that every
+  delta-independent element is unchanged. The MPC ceremony remains a hard
+  pre-mainnet gate; fixed in the tooling before it runs, covered by tests that a
+  consistent key passes and unscaled or tampered vectors are rejected.
+
 - **Ceremony finalize binds the promoted key to the verified transcript**
   (in-house security audit). The trusted-setup finalize tool verified the
   contribution transcript end-to-end, but then wrote the proving key it was
