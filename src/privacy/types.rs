@@ -5,8 +5,8 @@ use ark_ff::{BigInteger, PrimeField};
 use serde::{Deserialize, Serialize};
 
 use crate::privacy::poseidon::{
-    poseidon_commit, poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier,
-    poseidon_nullifier_spend, poseidon_pubkey, poseidon_signature,
+    poseidon_commit_spend, poseidon_merkle_pair, poseidon_nullifier, poseidon_nullifier_spend,
+    poseidon_pubkey, poseidon_signature,
 };
 
 /// Serialize an `Fr` to 32 little-endian bytes. BN254 `Fr` is 254-bit,
@@ -244,21 +244,20 @@ impl Note {
         Note::new(recipient, amount, randomness, NATIVE_SOL_ASSET)
     }
 
-    /// Compute commitment for this note.
+    /// Compute the spend-key commitment for this note (circuit v2, #293).
     ///
-    /// Uses domain-separated Poseidon (`poseidon::domain::COMMITMENT`) to
-    /// match the circuit-side `poseidon_commit_gadget`. The amount maps
-    /// directly via `Fr::from(u64)`; randomness and recipient are
-    /// 32-byte blobs lifted to `Fr` via modular reduction.
-    ///
-    /// Argument order to the hash function is fixed as
-    /// `(amount, randomness, recipient, asset_id)` — callers must not reorder.
+    /// `Poseidon(amount, pubkey, blinding, asset_id)`, matching the circuit's
+    /// `poseidon_commit_spend_gadget` and the wallet's `note_commitment_v2`. In
+    /// the v2 model the note's `recipient` field carries the owner's spend
+    /// *public key* (`Poseidon(privkey)`) and `randomness` is the blinding, so
+    /// the commitment binds the key — the note cannot be re-bound to a different
+    /// key without changing its commitment.
     pub fn commitment(&self) -> Commitment {
         let amount_fr = Fr::from(self.amount);
-        let randomness_fr = Fr::from_le_bytes_mod_order(&self.randomness);
-        let recipient_fr = Fr::from_le_bytes_mod_order(self.recipient.as_bytes());
+        let pubkey_fr = Fr::from_le_bytes_mod_order(self.recipient.as_bytes());
+        let blinding_fr = Fr::from_le_bytes_mod_order(&self.randomness);
         let asset_id_fr = Fr::from_le_bytes_mod_order(&self.asset_id);
-        let digest = poseidon_commit(amount_fr, randomness_fr, recipient_fr, asset_id_fr);
+        let digest = poseidon_commit_spend(amount_fr, pubkey_fr, blinding_fr, asset_id_fr);
         Commitment(fr_to_bytes_32(digest))
     }
 }
