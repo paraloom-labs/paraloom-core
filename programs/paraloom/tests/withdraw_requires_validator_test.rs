@@ -40,7 +40,9 @@ async fn withdraw_fails_when_authority_is_not_a_registered_validator() {
     );
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
-    let recipient = Keypair::new();
+    // Any destination: this tx is rejected before the proof is even reached
+    // (no registered validator → quorum gate), so the recipient is irrelevant.
+    let recipient = Pubkey::new_from_array([5u8; 32]);
 
     async fn send(
         banks_client: &mut solana_program_test::BanksClient,
@@ -119,7 +121,7 @@ async fn withdraw_fails_when_authority_is_not_a_registered_validator() {
                 bridge_state: state_pda,
                 bridge_vault: vault_pda,
                 nullifier_account: nullifier_pda,
-                recipient: recipient.pubkey(),
+                recipient,
                 validator_account: validator_pda,
                 validator_registry: registry_pda,
                 authority: upgrade_authority.pubkey(),

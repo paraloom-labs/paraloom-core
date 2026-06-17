@@ -12,6 +12,7 @@ pub mod transfer_fixture_data;
 mod transfer_verifier;
 mod transfer_vk_data;
 pub mod withdraw_fixture_data;
+pub mod withdraw_spl_fixture_data;
 mod withdraw_verifier;
 mod withdraw_vk_data;
 

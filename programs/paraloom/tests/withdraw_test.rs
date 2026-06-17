@@ -59,7 +59,10 @@ async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
         &program_id,
     );
 
-    let recipient = Keypair::new();
+    // Fixed recipient the native v2 fixture's ext_data_hash is bound to
+    // (sha256(FIXTURE_RECIPIENT || FIXTURE_AMOUNT)); a different destination
+    // would not verify (finding D).
+    let recipient = Pubkey::new_from_array(fx::FIXTURE_RECIPIENT);
 
     // Helper to land a single ix signed by `signer` (also tx payer).
     async fn send(
@@ -184,7 +187,7 @@ async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
                     bridge_state: state_pda,
                     bridge_vault: vault_pda,
                     nullifier_account: nullifier_pda,
-                    recipient: recipient.pubkey(),
+                    recipient,
                     validator_account: validator_pda,
                     validator_registry: registry_pda,
                     authority: upgrade_authority.pubkey(),
@@ -208,7 +211,7 @@ async fn withdraw_pays_recipient_net_and_credits_validator_fee() {
 
     // The recipient receives the amount net of the validator fee.
     let recipient_acc = banks_client
-        .get_account(recipient.pubkey())
+        .get_account(recipient)
         .await
         .unwrap()
         .expect("recipient funded by the withdraw");

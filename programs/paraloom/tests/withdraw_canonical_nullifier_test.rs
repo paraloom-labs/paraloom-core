@@ -70,7 +70,7 @@ async fn withdraw_rejects_a_non_canonical_nullifier_replay() {
         &program_id,
     );
 
-    let recipient = Keypair::new();
+    let recipient = Pubkey::new_from_array(fx::FIXTURE_RECIPIENT);
 
     async fn send(
         banks_client: &mut solana_program_test::BanksClient,
@@ -175,7 +175,7 @@ async fn withdraw_rejects_a_non_canonical_nullifier_replay() {
             bridge_state: state_pda,
             bridge_vault: vault_pda,
             nullifier_account: npda,
-            recipient: recipient.pubkey(),
+            recipient,
             validator_account: validator_pda,
             validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
