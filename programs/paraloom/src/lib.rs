@@ -381,15 +381,18 @@ pub mod paraloom_program {
         )?;
 
         // Verify the Groth16 transfer proof on-chain (#194) against the current
-        // (pre-update) Merkle root and the transfer's nullifiers + output
-        // commitments, before recording any state. As with `withdraw`, this
-        // means the settling validator cannot forge a transfer even though it
-        // holds the settlement authority.
+        // (pre-update) Merkle root and the transfer's nullifiers, output
+        // commitments and asset, before recording any state. As with `withdraw`,
+        // this means the settling validator cannot forge a transfer even though
+        // it holds the settlement authority. Shielded transfers are native-only,
+        // so the bound asset is NATIVE_SOL (finding A: a note of another asset
+        // cannot be spent into a native transfer).
         require!(
             transfer_verifier::verify_transfer(
                 &bridge_state.merkle_root,
                 &nullifiers,
                 &output_commitments,
+                &NATIVE_SOL_ASSET,
                 &proof,
             ),
             BridgeError::InvalidProof

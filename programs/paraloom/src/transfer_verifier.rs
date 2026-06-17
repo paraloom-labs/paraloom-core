@@ -1,9 +1,14 @@
-//! On-chain shielded-transfer proof verification (#194).
+//! On-chain shielded-transfer proof verification (#194, spend-key circuit v2 #293).
 //!
 //! Verifies a wire-form 2-in/2-out transfer proof against the program's
-//! published Merkle root and the transfer's two nullifiers + two output
-//! commitments. The transfer circuit exposes five public inputs, in order:
-//! `[merkle_root, nullifier0, nullifier1, commitment0, commitment1]`.
+//! published Merkle root and the transfer's two nullifiers, two output
+//! commitments and asset. The spend-key transfer circuit exposes six public
+//! inputs, in order:
+//! `[merkle_root, nullifier0, nullifier1, commitment0, commitment1, asset_id]`.
+//!
+//! `asset_id` binds every input and output note to one asset (finding A); the
+//! caller passes the asset the transfer is for (all-zero for native SOL), so a
+//! note of one asset cannot be spent into another asset's transfer.
 //!
 //! The proof blob is the 256-byte `alt_bn128` wire form
 //! (`proof_a[64] || proof_b[128] || proof_c[64]`), with `proof_a` already
@@ -15,8 +20,8 @@ use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 
 /// Transfer circuit public-input count:
-/// `[merkle_root, nullifier0, nullifier1, commitment0, commitment1]`.
-const NUM_PUBLIC_INPUTS: usize = 5;
+/// `[merkle_root, nullifier0, nullifier1, commitment0, commitment1, asset_id]`.
+const NUM_PUBLIC_INPUTS: usize = 6;
 
 /// Length of the `alt_bn128` wire proof: `a(64) + b(128) + c(64)`.
 pub const WIRE_PROOF_LEN: usize = 256;
@@ -28,6 +33,7 @@ const VK_IC: [[u8; 64]; NUM_PUBLIC_INPUTS + 1] = [
     vk::VK_IC_3,
     vk::VK_IC_4,
     vk::VK_IC_5,
+    vk::VK_IC_6,
 ];
 
 fn verifying_key() -> Groth16Verifyingkey<'static> {
@@ -51,12 +57,14 @@ fn fr_to_be(f: &Fr) -> [u8; 32] {
 }
 
 /// Verify a 2-in/2-out transfer proof. Returns `true` only if `proof` is a
-/// valid Groth16 proof for `[merkle_root, nullifiers.., commitments..]` under
-/// the embedded verifying key.
+/// valid Groth16 proof for `[merkle_root, nullifiers.., commitments.., asset_id]`
+/// under the embedded verifying key. `asset_id` is the asset the transfer is for
+/// (all-zero for native SOL), supplied by the caller and bound into the proof.
 pub fn verify_transfer(
     merkle_root: &[u8; 32],
     nullifiers: &[[u8; 32]; 2],
     commitments: &[[u8; 32]; 2],
+    asset_id: &[u8; 32],
     proof: &[u8],
 ) -> bool {
     if proof.len() != WIRE_PROOF_LEN {
@@ -81,6 +89,7 @@ pub fn verify_transfer(
         fr_to_be(&Fr::from_le_bytes_mod_order(&nullifiers[1])),
         fr_to_be(&Fr::from_le_bytes_mod_order(&commitments[0])),
         fr_to_be(&Fr::from_le_bytes_mod_order(&commitments[1])),
+        fr_to_be(&Fr::from_le_bytes_mod_order(asset_id)),
     ];
 
     let vk = verifying_key();
@@ -117,6 +126,7 @@ mod tests {
             &fx::FIXTURE_ROOT,
             &nullifiers(),
             &commitments(),
+            &fx::FIXTURE_ASSET_ID,
             &fixture_proof(),
         ));
     }
@@ -129,6 +139,7 @@ mod tests {
             &root,
             &nullifiers(),
             &commitments(),
+            &fx::FIXTURE_ASSET_ID,
             &fixture_proof(),
         ));
     }
@@ -141,6 +152,7 @@ mod tests {
             &fx::FIXTURE_ROOT,
             &nullifiers(),
             &swapped,
+            &fx::FIXTURE_ASSET_ID,
             &fixture_proof(),
         ));
     }
@@ -153,6 +165,7 @@ mod tests {
             &fx::FIXTURE_ROOT,
             &nullifiers(),
             &commitments(),
+            &fx::FIXTURE_ASSET_ID,
             &p,
         ));
     }
@@ -163,6 +176,7 @@ mod tests {
             &fx::FIXTURE_ROOT,
             &nullifiers(),
             &commitments(),
+            &fx::FIXTURE_ASSET_ID,
             &[0u8; 255],
         ));
     }
