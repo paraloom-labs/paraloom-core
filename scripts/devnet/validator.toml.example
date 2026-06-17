@@ -76,3 +76,4 @@ merkle_path_query_address = "127.0.0.1:9090"
 # accepts wallet-submitted withdrawal / transfer requests.
 withdrawal_ingress_address = ""
 transfer_ingress_address = ""
+ingress_token = ""
