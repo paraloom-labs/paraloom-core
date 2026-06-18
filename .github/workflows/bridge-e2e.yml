@@ -28,6 +28,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job compiles the on-chain program .so, the full node binary and the
+      # e2e tests on one runner, which exhausts the default image's disk. Reclaim
+      # the space the other CI jobs already free (ci.yaml) so the build does not
+      # fail with "No space left on device".
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          sudo apt-get clean
+          df -h
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 

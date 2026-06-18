@@ -12,6 +12,7 @@ use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -87,6 +88,9 @@ struct PollerState {
     /// [`SIGNATURE_BATCH_LIMIT`]; tests set it small to exercise pagination
     /// without synthesising a thousand transactions.
     batch_limit: usize,
+    /// Where to persist the scan cursor after each advance. `None` keeps the
+    /// cursor in memory only (the default and what tests use).
+    cursor_path: Option<PathBuf>,
 }
 
 impl EventListener {
@@ -125,6 +129,22 @@ impl EventListener {
 
         *self.running.write().await = true;
 
+        // Resume from the persisted cursor if one exists, so a restart does not
+        // re-scan from the chain tip and lose deposits that landed while the node
+        // was down. A missing or unparsable cursor falls back to an in-memory
+        // cold start.
+        if let Some(path) = &self.config.cursor_path {
+            if let Some(sig) = Self::load_cursor(path).await {
+                *self.last_signature.write().await = Some(sig);
+                log::info!(
+                    target: "paraloom::bridge::solana",
+                    "resumed deposit listener cursor {} from {}",
+                    sig,
+                    path.display()
+                );
+            }
+        }
+
         let state = PollerState {
             rpc: Arc::clone(&self.rpc),
             program_id,
@@ -135,6 +155,7 @@ impl EventListener {
             last_processed_slot: Arc::clone(&self.last_processed_slot),
             lag_warn_threshold_slots: self.config.event_lag_warn_threshold_slots,
             batch_limit: SIGNATURE_BATCH_LIMIT,
+            cursor_path: self.config.cursor_path.clone(),
         };
         let running = Arc::clone(&self.running);
         let poll_interval = self.config.poll_interval_secs;
@@ -173,6 +194,49 @@ impl EventListener {
     pub async fn stop(&mut self) -> Result<()> {
         *self.running.write().await = false;
         Ok(())
+    }
+
+    /// Read the persisted scan cursor. A missing file (first run) or an
+    /// unparsable one yields `None` so the listener cold-starts rather than
+    /// failing — a corrupt cursor is recoverable, a refusal to start is not.
+    async fn load_cursor(path: &Path) -> Option<Signature> {
+        let raw = tokio::fs::read_to_string(path).await.ok()?;
+        match raw.trim().parse::<Signature>() {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "ignoring unparsable persisted cursor at {}: {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Persist the scan cursor durably. Writes to a sibling temp file and
+    /// renames it over the target so a crash mid-write cannot leave a truncated
+    /// cursor (the rename is atomic on a single filesystem).
+    async fn persist_cursor(path: &Path, sig: &Signature) {
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = tokio::fs::write(&tmp, sig.to_string()).await {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "failed to write deposit cursor to {}: {}",
+                tmp.display(),
+                e
+            );
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "failed to commit deposit cursor to {}: {}",
+                path.display(),
+                e
+            );
+        }
     }
 
     /// Run a single poll cycle: fetch new signatures, decode any deposits,
@@ -219,6 +283,12 @@ impl EventListener {
 
         if let Some(sig) = latest_signature {
             *state.last_signature.write().await = Some(sig);
+            // Persist the advanced cursor so a restart resumes here. Best-effort:
+            // a write failure is logged but does not fail the poll — the
+            // in-memory cursor still drives this run.
+            if let Some(path) = &state.cursor_path {
+                Self::persist_cursor(path, &sig).await;
+            }
         }
         if latest_slot > 0 {
             // `last_block` tracks the most recent DEPOSIT slot for stats; the
@@ -497,6 +567,7 @@ mod tests {
             last_processed_slot: Arc::new(RwLock::new(0)),
             lag_warn_threshold_slots: 100,
             batch_limit: SIGNATURE_BATCH_LIMIT,
+            cursor_path: None,
         }
     }
 
@@ -693,6 +764,69 @@ mod tests {
         assert_eq!(state.pool.commitment_count().await, 3);
         // The cursor advances to the newest processed signature.
         assert_eq!(*state.last_signature.read().await, Some(sigs[0]));
+    }
+
+    #[tokio::test]
+    async fn cursor_persists_and_reloads_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge_cursor");
+        let sig = Signature::new_unique();
+        EventListener::persist_cursor(&path, &sig).await;
+        // A fresh listener (the restart) reads the same signature back.
+        assert_eq!(EventListener::load_cursor(&path).await, Some(sig));
+    }
+
+    #[tokio::test]
+    async fn load_cursor_cold_starts_on_a_missing_or_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file (first run) → cold start, not an error.
+        let missing = dir.path().join("absent");
+        assert_eq!(EventListener::load_cursor(&missing).await, None);
+        // Corrupt contents → cold start rather than a refusal to start.
+        let corrupt = dir.path().join("corrupt");
+        tokio::fs::write(&corrupt, "not-a-signature").await.unwrap();
+        assert_eq!(EventListener::load_cursor(&corrupt).await, None);
+    }
+
+    #[tokio::test]
+    async fn poll_persists_the_advanced_cursor_to_disk() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bridge_cursor");
+        let sig = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: sig.to_string(),
+                slot: 7,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(synth_deposit_tx(
+            sig,
+            7,
+            &program_id,
+            &depositor,
+            1_000,
+            [9u8; 32],
+            [11u8; 32],
+        )));
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(7));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+        state.cursor_path = Some(path.clone());
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 1);
+        // The cursor advanced and was committed to disk, so a restart resumes here.
+        assert_eq!(EventListener::load_cursor(&path).await, Some(sig));
     }
 
     /// A signature already in `state.seen_signatures` must be filtered

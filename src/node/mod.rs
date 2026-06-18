@@ -1245,7 +1245,13 @@ impl Node {
             None
         };
         let bridge = if runs_bridge {
-            Some(Arc::new(Mutex::new(Bridge::new(settings.bridge.clone()))))
+            // Persist the deposit listener's scan cursor under the node's data
+            // directory so a restart resumes where it left off instead of
+            // re-scanning from the chain tip and losing deposits taken while down.
+            let mut bridge_cfg = settings.bridge.clone();
+            bridge_cfg.cursor_path =
+                Some(format!("{}/bridge_cursor", settings.storage.data_dir).into());
+            Some(Arc::new(Mutex::new(Bridge::new(bridge_cfg))))
         } else {
             None
         };

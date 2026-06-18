@@ -10,6 +10,16 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **The deposit listener resumes from a durable cursor across restarts**
+  (in-house security audit). The listener tracked its scan cursor — the last
+  processed signature — only in memory, so a restart reset it and re-scanned
+  from the chain tip; any deposit that landed while the node was down and was
+  older than the newest batch was never indexed and silently lost. The cursor
+  is now written to a file under the node's data directory after each advance
+  (atomically, via a temp file plus rename) and reloaded on start, so a restart
+  resumes exactly where it left off. A missing or corrupt cursor cold-starts
+  rather than refusing to boot. Devnet, pre-mainnet.
+
 - **The deposit listener paginates a backlog larger than one batch** (in-house
   security audit). The listener polls `getSignaturesForAddress`, which returns
   the newest transactions capped at a batch limit. When more program

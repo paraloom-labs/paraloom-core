@@ -130,6 +130,15 @@ pub struct BridgeConfig {
     /// by an unauthenticated caller. Empty (the default) keeps the historical
     /// no-auth behaviour, which is only safe on a loopback/management interface.
     pub ingress_token: String,
+
+    /// File the deposit listener persists its scan cursor (the last processed
+    /// signature) to, so a restart resumes from that point instead of
+    /// re-scanning from the chain tip and losing deposits that landed while the
+    /// node was down. Injected by the node from its data directory, not a user
+    /// config knob — `#[serde(skip)]` keeps it out of config files. `None`
+    /// (the default, and what tests use) keeps the cursor in memory only.
+    #[serde(skip)]
+    pub cursor_path: Option<std::path::PathBuf>,
 }
 
 impl Default for BridgeConfig {
@@ -168,6 +177,7 @@ impl Default for BridgeConfig {
             transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
                 .unwrap_or_default(),
             ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
+            cursor_path: None,
         }
     }
 }
