@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **The deposit listener retries a deposit that failed to process** (in-house
+  security audit). The listener advanced its scan cursor to the last
+  successfully processed signature, so a deposit that hit a transient error
+  while a later deposit in the same batch succeeded was stepped over by the next
+  poll's boundary and never retried — its funds sat in the vault, indexed by no
+  shielded note and therefore unwithdrawable. The cursor now advances only
+  through the unbroken run of successes, stopping before the first failure, and
+  the failed signatures are re-fetched and retried on the next poll. So the
+  retry cannot double-index a deposit, a pool deposit is now idempotent: a
+  commitment already in the pool is a no-op instead of a duplicate Merkle leaf
+  and a double-credited supply. Devnet, pre-mainnet.
+
 - **The deposit listener resumes from a durable cursor across restarts**
   (in-house security audit). The listener tracked its scan cursor — the last
   processed signature — only in memory, so a restart reset it and re-scanned
