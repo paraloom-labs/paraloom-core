@@ -10,6 +10,15 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Approved transfers settle through the validator co-signing quorum**
+  (in-house security audit). The transfer twin of the withdrawal fix: the node
+  settled quorum-approved shielded transfers single-key, which cannot meet the
+  program's #260 supermajority on a multi-validator network. The transfer
+  submitter now gathers the approving validators' signatures into one multi-sig
+  `shielded_transfer` transaction and submits that, so a transfer is authorised
+  by the same quorum the program checks; the single-key fallback still applies
+  when no co-signing key is configured. Devnet, pre-mainnet.
+
 - **Approved withdrawals settle through the validator co-signing quorum**
   (in-house security audit). The on-chain program gates settlement on a #260
   validator supermajority, but the node still submitted approved withdrawals
