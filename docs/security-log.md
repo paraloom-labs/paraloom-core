@@ -10,6 +10,20 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Shielded transfers settle only a Merkle root consistent with their own
+  commitments** (in-house security audit). A shielded transfer advances the
+  pool's published Merkle root to a post-state value, but that value was carried
+  through from the client request and never checked against the output
+  commitments the transfer actually adds — the root is not one of the proof's
+  public inputs. A settling party could therefore advance the published root to
+  a tree of its own construction. Verifying validators now recompute the root
+  the transfer's output commitments produce (a non-mutating preview of the tree)
+  and refuse to approve a transfer whose proposed root differs, so an honest
+  quorum will not settle a root inconsistent with the transfer. Devnet,
+  pre-mainnet — the live program still settles under a single key; this lands
+  ahead of the quorum-wired deployment, and a deeper in-circuit binding of the
+  post-insertion root is tracked for mainnet hardening.
+
 - **Withdraw proofs bound to their asset and destination on-chain**
   (in-house security audit). The on-chain withdraw verifier checked a proof
   against the published Merkle root, nullifier and amount — but not the asset
