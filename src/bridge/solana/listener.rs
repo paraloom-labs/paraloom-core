@@ -239,6 +239,32 @@ impl EventListener {
         }
     }
 
+    /// Decide how far the scan cursor may advance, given each processed
+    /// deposit's `(signature, succeeded)` in the ascending order they were
+    /// handled. The cursor may move up only through the unbroken run of
+    /// successes from the old cursor: the moment one fails it must stop before
+    /// that signature, or the next poll's `until` boundary would skip the failed
+    /// deposit forever (a later success would otherwise carry the cursor past an
+    /// earlier failure). Returns the new cursor (the last contiguous success, if
+    /// any) and every failed signature, which the caller un-sees so the next
+    /// poll re-fetches and retries them.
+    fn contiguous_cursor(outcomes: &[(Signature, bool)]) -> (Option<Signature>, Vec<Signature>) {
+        let mut cursor = None;
+        let mut frozen = false;
+        let mut failed = Vec::new();
+        for (sig, ok) in outcomes {
+            if *ok {
+                if !frozen {
+                    cursor = Some(*sig);
+                }
+            } else {
+                frozen = true;
+                failed.push(*sig);
+            }
+        }
+        (cursor, failed)
+    }
+
     /// Run a single poll cycle: fetch new signatures, decode any deposits,
     /// process them into the pool. Returns the number of events processed.
     async fn poll_events(state: &PollerState) -> Result<usize> {
@@ -246,13 +272,16 @@ impl EventListener {
         let events = Self::fetch_events(state, cursor).await?;
 
         let mut processed = 0;
-        let mut latest_signature: Option<Signature> = None;
         let mut latest_slot: u64 = 0;
+        // Per-signature outcome, in the ascending order deposits are processed,
+        // so the cursor can advance only through the unbroken run of successes.
+        let mut outcomes: Vec<(Signature, bool)> = Vec::new();
 
         for event in events {
             let amount = event.amount;
             let slot = event.block;
             let sig_str = event.signature.clone();
+            let parsed = sig_str.parse::<Signature>().ok();
 
             match Self::process_deposit(&state.pool, event).await {
                 Ok(_) => {
@@ -260,14 +289,13 @@ impl EventListener {
                     let mut stats_guard = state.stats.write().await;
                     stats_guard.total_deposits += 1;
                     stats_guard.volume_deposited += amount;
+                    drop(stats_guard);
 
-                    // Track the cursor (signatures are processed in
-                    // ascending slot order — see fetch_events).
-                    if let Ok(parsed) = sig_str.parse::<Signature>() {
-                        latest_signature = Some(parsed);
-                    }
                     if slot > latest_slot {
                         latest_slot = slot;
+                    }
+                    if let Some(sig) = parsed {
+                        outcomes.push((sig, true));
                     }
                 }
                 Err(e) => {
@@ -277,11 +305,27 @@ impl EventListener {
                         sig_str,
                         e
                     );
+                    if let Some(sig) = parsed {
+                        outcomes.push((sig, false));
+                    }
                 }
             }
         }
 
-        if let Some(sig) = latest_signature {
+        let (cursor_advance, failed) = Self::contiguous_cursor(&outcomes);
+
+        // Un-see the failed signatures so the next poll re-fetches and retries
+        // them. The cursor stays below the first failure, so the re-fetch's
+        // `until` boundary actually returns them; re-processing is idempotent at
+        // the pool, so the successes after a failure are no-ops on retry.
+        if !failed.is_empty() {
+            let mut seen = state.seen_signatures.write().await;
+            for sig in &failed {
+                seen.remove(sig);
+            }
+        }
+
+        if let Some(sig) = cursor_advance {
             *state.last_signature.write().await = Some(sig);
             // Persist the advanced cursor so a restart resumes here. Best-effort:
             // a write failure is logged but does not fail the poll — the
@@ -827,6 +871,36 @@ mod tests {
         assert_eq!(processed, 1);
         // The cursor advanced and was committed to disk, so a restart resumes here.
         assert_eq!(EventListener::load_cursor(&path).await, Some(sig));
+    }
+
+    #[test]
+    fn contiguous_cursor_stops_before_the_first_failure() {
+        let a = Signature::new_unique();
+        let b = Signature::new_unique();
+        let c = Signature::new_unique();
+
+        // All succeed → the cursor advances to the last, nothing to retry.
+        let (cursor, failed) = EventListener::contiguous_cursor(&[(a, true), (b, true), (c, true)]);
+        assert_eq!(cursor, Some(c));
+        assert!(failed.is_empty());
+
+        // A failure in the middle freezes the cursor at the last success before
+        // it; the later success must NOT carry the cursor past the failure, and
+        // the failure is reported for retry.
+        let (cursor, failed) =
+            EventListener::contiguous_cursor(&[(a, true), (b, false), (c, true)]);
+        assert_eq!(cursor, Some(a));
+        assert_eq!(failed, vec![b]);
+
+        // A failure first leaves the cursor unmoved.
+        let (cursor, failed) = EventListener::contiguous_cursor(&[(a, false), (b, true)]);
+        assert_eq!(cursor, None);
+        assert_eq!(failed, vec![a]);
+
+        // Nothing processed → no movement.
+        let (cursor, failed) = EventListener::contiguous_cursor(&[]);
+        assert_eq!(cursor, None);
+        assert!(failed.is_empty());
     }
 
     /// A signature already in `state.seen_signatures` must be filtered

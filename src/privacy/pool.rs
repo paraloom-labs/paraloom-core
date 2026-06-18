@@ -88,6 +88,17 @@ impl ShieldedPool {
         // Create commitment
         let commitment = note.commitment();
 
+        // Idempotent: a deposit whose commitment is already in the pool must not
+        // be inserted or credited again. The bridge listener re-fetches a
+        // deposit that failed to process on a prior poll, and a restart replays
+        // recent signatures against a pool reloaded from storage — without this
+        // guard either path would append a duplicate leaf and double-credit the
+        // asset's supply. The note carries fresh randomness per deposit, so an
+        // equal commitment means the same deposit, not a distinct one.
+        if self.notes.read().await.contains_key(&commitment) {
+            return Ok(commitment);
+        }
+
         // Add to commitment tree (auto-persists if storage available).
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
@@ -347,6 +358,25 @@ mod tests {
         assert_eq!(pool.total_supply().await, 1000);
         assert_eq!(pool.commitment_count().await, 1);
         assert!(pool.get_note(&commitment).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn deposit_is_idempotent_for_a_repeated_commitment() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([7u8; 32]);
+        // The same deposit (same recipient, amount and randomness → same
+        // commitment) processed twice — as the bridge listener does when it
+        // retries a deposit that failed on a prior poll, or replays recent
+        // signatures after a restart.
+        let note = Note::new_native(addr, 1000, [9u8; 32]);
+        let first = pool.deposit(note.clone(), 1000).await.unwrap();
+        let second = pool.deposit(note, 1000).await.unwrap();
+
+        // Same commitment, but the second deposit is a no-op: no duplicate leaf
+        // and no double-credited supply.
+        assert_eq!(first, second);
+        assert_eq!(pool.commitment_count().await, 1);
+        assert_eq!(pool.total_supply().await, 1000);
     }
 
     #[tokio::test]
