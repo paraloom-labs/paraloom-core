@@ -39,10 +39,9 @@ pub struct MockBridgeRpc {
     pub get_signatures_pages:
         Mutex<VecDeque<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>>>,
     pub next_get_transaction: Mutex<Option<Result<EncodedConfirmedTransactionWithStatusMeta>>>,
-    /// `getTransaction` responses keyed by signature, returned on every call for
-    /// that signature (so a re-fetched signature resolves again). When it has no
-    /// entry for the requested signature the mock falls back to
-    /// `next_get_transaction`.
+    /// `getTransaction` responses keyed by signature, consumed once per
+    /// signature (the value is not `Clone`). When it has no entry for the
+    /// requested signature the mock falls back to `next_get_transaction`.
     pub get_transactions: Mutex<HashMap<Signature, EncodedConfirmedTransactionWithStatusMeta>>,
     pub next_get_latest_blockhash: Mutex<Option<Result<Hash>>>,
     pub next_send_and_confirm: Mutex<Option<Result<Signature>>>,
@@ -145,8 +144,8 @@ impl BridgeRpc for MockBridgeRpc {
         signature: &Signature,
         _encoding: UiTransactionEncoding,
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
-        if let Some(tx) = self.get_transactions.lock().unwrap().get(signature) {
-            return Ok(tx.clone());
+        if let Some(tx) = self.get_transactions.lock().unwrap().remove(signature) {
+            return Ok(tx);
         }
         take(&self.next_get_transaction, "get_transaction")
     }
