@@ -808,30 +808,6 @@ pub mod paraloom_program {
         Ok(())
     }
 
-    /// Distribute withdrawal fee to leader
-    pub fn distribute_fee(
-        ctx: Context<DistributeFee>,
-        leader: Pubkey,
-        fee_amount: u64,
-    ) -> Result<()> {
-        let validator_account = &mut ctx.accounts.validator_account;
-
-        require!(
-            validator_account.validator == leader,
-            BridgeError::InvalidValidator
-        );
-        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
-
-        validator_account.pending_rewards += fee_amount;
-
-        msg!(
-            "Fee distributed to leader {}: {} lamports",
-            leader,
-            fee_amount
-        );
-        Ok(())
-    }
-
     /// Claim pending rewards
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
         let validator_account = &mut ctx.accounts.validator_account;
@@ -1361,25 +1337,6 @@ pub struct UnregisterValidator<'info> {
 
 #[derive(Accounts)]
 pub struct UpdateReputation<'info> {
-    #[account(
-        mut,
-        seeds = [b"validator", validator_account.validator.as_ref()],
-        bump
-    )]
-    pub validator_account: Account<'info, ValidatorAccount>,
-
-    #[account(
-        seeds = [b"validator_registry"],
-        bump,
-        has_one = authority
-    )]
-    pub validator_registry: Account<'info, ValidatorRegistry>,
-
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct DistributeFee<'info> {
     #[account(
         mut,
         seeds = [b"validator", validator_account.validator.as_ref()],
