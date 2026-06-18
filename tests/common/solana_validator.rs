@@ -193,18 +193,6 @@ pub fn confirm_within(
     ))
 }
 
-/// Airdrop `lamports` to a fresh keypair and poll until the balance
-/// reflects it, then return the funded keypair. Tests use this to
-/// avoid relying on a pre-existing `~/.config/solana/id.json`.
-pub fn fund_new_keypair(
-    rpc: &RpcClient,
-    lamports: u64,
-) -> Result<solana_sdk::signature::Keypair, String> {
-    let kp = solana_sdk::signature::Keypair::new();
-    fund_keypair(rpc, &kp, lamports)?;
-    Ok(kp)
-}
-
 /// Airdrop `lamports` to an EXISTING keypair and poll until it lands. Used
 /// when the keypair must be generated before the validator launches (e.g. it
 /// is the upgrade authority passed to `launch_with_upgradeable_program`).
