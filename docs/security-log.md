@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Removed an admin instruction that could credit unbacked validator rewards**
+  (in-house security audit). A standalone `distribute_fee` instruction let the
+  bridge authority add an arbitrary amount to any validator's pending rewards,
+  which `claim_rewards` then pays out of the bridge vault where native deposits
+  are held — so a single key could credit and withdraw funds it never earned.
+  The instruction was redundant: the withdrawal path already credits the
+  settling validator its real fee, the only legitimate source of pending
+  rewards, and no production code path ever called `distribute_fee`. The
+  instruction and its accounts were removed; reward claiming is unchanged and is
+  now exercised over the real flow (a withdrawal credits the fee, then it is
+  claimed). Devnet, pre-mainnet.
+
 - **Shielded transfers settle only a Merkle root consistent with their own
   commitments** (in-house security audit). A shielded transfer advances the
   pool's published Merkle root to a post-state value, but that value was carried
