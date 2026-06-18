@@ -47,6 +47,13 @@ use crate::privacy::types::{AssetId, Note, Nullifier, ShieldedAddress, NATIVE_SO
 use solana_sdk::signature::{Keypair, Signer};
 use thiserror::Error;
 
+/// The protocol withdrawal fee in basis points, mirrored from the on-chain
+/// program (`programs/paraloom` `WITHDRAWAL_FEE_BPS`). Every withdraw — including
+/// the relayer's withdraw-to-fresh leg — credits this fee to the settling
+/// validator, so the fresh address receives `amount - fee`, never the gross
+/// note value. The swap leg must trade that realized amount.
+const WITHDRAWAL_FEE_BPS: u64 = 25;
+
 /// Errors raised while orchestrating a private swap.
 #[derive(Error, Debug)]
 pub enum RelayerError {
@@ -364,16 +371,32 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // signs and submits the public trade from `ephemeral`, so the trade
         // originates at the unlinkable fresh address.
         //
-        // On a native-SOL input leg the fresh address pays the swap's rent and
-        // fees out of the same lamports, so trade `amount_in` minus the overhead
-        // reserve — never the full note (see `native_swap_overhead_lamports`).
+        // The on-chain withdraw deducts the protocol withdrawal fee
+        // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
+        // fresh address holds `amount_in - fee`, not the gross note value.
+        // Swapping the gross amount would exceed the fresh address's balance and
+        // fail *after* the nullifier is already burned, stranding the funds —
+        // so the swap trades the realized post-fee amount.
+        let withdrawal_fee = amount_in
+            .checked_mul(WITHDRAWAL_FEE_BPS)
+            .map(|x| x / 10_000)
+            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+        let withdrawn = amount_in
+            .checked_sub(withdrawal_fee)
+            .filter(|&a| a > 0)
+            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+
+        // On a native-SOL input leg the fresh address also pays the swap's rent
+        // and fees out of the same lamports, so trade the realized amount minus
+        // the overhead reserve — never the full note (see
+        // `native_swap_overhead_lamports`).
         let swap_amount = if asset_in == NATIVE_SOL_ASSET {
-            amount_in
+            withdrawn
                 .checked_sub(self.native_swap_overhead_lamports)
                 .filter(|&a| a > 0)
                 .ok_or(RelayerError::InvalidAmount(amount_in))?
         } else {
-            amount_in
+            withdrawn
         };
         let swap = self
             .swap_provider
@@ -522,25 +545,29 @@ mod tests {
     #[tokio::test]
     async fn composes_withdraw_swap_fee_redeposit_end_to_end() {
         let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
-        // 1:1 swap of 1_000_000. The mock provider takes no fee, and the
-        // orchestrator no longer takes a second cut, so the full output is
-        // re-shielded.
+        // 1:1 swap of 1_000_000. The on-chain withdraw deducts the 25bps protocol
+        // fee, so 997_500 reaches the fresh address and is what the swap trades;
+        // the mock provider takes no fee and the orchestrator no second cut, so
+        // that realized amount is re-shielded in full.
+        let withdrawn = 1_000_000 - 1_000_000 * 25 / 10_000; // 997_500
         let req = request(native_note(1_000_000), NATIVE_SOL_ASSET, 50);
         let out = relayer.execute(req).await.expect("swap executes");
 
-        assert_eq!(out.gross_out_amount, 1_000_000);
+        assert_eq!(out.gross_out_amount, withdrawn);
         assert_eq!(out.relayer_fee, 0);
-        assert_eq!(out.net_out_amount, 1_000_000);
-        // The re-shielded note carries the full output and the user's recipient.
-        assert_eq!(out.output_note.amount, 1_000_000);
+        assert_eq!(out.net_out_amount, withdrawn);
+        // The re-shielded note carries the realized output and the user's recipient.
+        assert_eq!(out.output_note.amount, withdrawn);
         assert_eq!(
             out.output_note.recipient,
             ShieldedAddress::from_bytes([9u8; 32])
         );
 
-        // Both legs were submitted, withdraw then deposit.
+        // Both legs were submitted, withdraw then deposit. The withdraw leg
+        // submits the gross note value (the fee is taken on-chain); the deposit
+        // re-shields the realized post-fee output.
         assert_eq!(out.withdraw_leg.amount, 1_000_000);
-        assert_eq!(out.deposit_leg.amount, 1_000_000);
+        assert_eq!(out.deposit_leg.amount, withdrawn);
     }
 
     #[tokio::test]
@@ -554,8 +581,9 @@ mod tests {
             .expect("swap executes");
         // The full note is withdrawn to the fresh address...
         assert_eq!(out.withdraw_leg.amount, 1_000_000);
-        // ...but only `amount - overhead` is swapped, leaving lamports for rent/fees.
-        assert_eq!(out.gross_out_amount, 995_000);
+        // ...but only `realized - overhead` is swapped, leaving lamports for
+        // rent/fees: 1_000_000 - 2_500 (25bps withdraw fee) - 5_000 overhead.
+        assert_eq!(out.gross_out_amount, 1_000_000 - 2_500 - 5_000);
     }
 
     #[tokio::test]
@@ -568,7 +596,9 @@ mod tests {
             .execute(request(spl_note(mint, 1_000_000), NATIVE_SOL_ASSET, 0))
             .await
             .expect("swap executes");
-        assert_eq!(out.gross_out_amount, 1_000_000);
+        // The 25bps withdraw fee still applies, but the native overhead reserve
+        // does not touch an SPL leg: 1_000_000 - 2_500, with no 5_000 subtracted.
+        assert_eq!(out.gross_out_amount, 1_000_000 - 2_500);
     }
 
     #[tokio::test]
@@ -584,19 +614,20 @@ mod tests {
 
     #[tokio::test]
     async fn orchestrator_takes_no_second_fee_from_the_swap_output() {
-        // 2:1 swap of 400 -> gross 800. Even with a non-zero request fee_bps,
-        // the orchestrator no longer deducts a second cut (the fee is realized
-        // by the swap provider), so the full output is re-shielded — closing the
-        // double-charge.
+        // 2:1 swap of 400. The 25bps withdraw fee leaves 399 on the fresh
+        // address (400 - 1), so the provider trades 399 -> gross 798. Even with a
+        // non-zero request fee_bps, the orchestrator no longer deducts a second
+        // cut (the fee is realized by the swap provider), so the full realized
+        // output is re-shielded — closing the double-charge.
         let relayer =
             PrivateSwapRelayer::new(MockSwapProvider::with_rate(2, 1), MockSubmitter::new());
         let out = relayer
             .execute(request(native_note(400), NATIVE_SOL_ASSET, 250))
             .await
             .expect("swap executes");
-        assert_eq!(out.gross_out_amount, 800);
+        assert_eq!(out.gross_out_amount, (400 - 1) * 2);
         assert_eq!(out.relayer_fee, 0);
-        assert_eq!(out.net_out_amount, 800);
+        assert_eq!(out.net_out_amount, (400 - 1) * 2);
     }
 
     #[tokio::test]

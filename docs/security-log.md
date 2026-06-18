@@ -10,6 +10,17 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **The private-swap relayer trades the realized post-fee amount** (in-house
+  security audit). The relayer withdraws a shielded note to a fresh ephemeral
+  address and then swaps from it, but the on-chain withdraw deducts the 25bps
+  protocol fee, so the fresh address receives `amount - fee` — not the gross
+  note value the swap leg asked the router to trade. On a real submitter the
+  swap would exceed the fresh address's balance and fail *after* the note's
+  nullifier was already burned on-chain, stranding the funds with no way to
+  retry. The relayer now computes the realized post-fee amount (and, for a
+  native input, subtracts the rent/fee overhead reserve from that) before
+  routing the swap. Devnet, pre-mainnet.
+
 - **Publishing a Merkle root requires a validator quorum** (in-house security
   audit). The bridge state's published Merkle root anchors every withdrawal
   proof, but the `update_merkle_root` instruction was gated only by a single
