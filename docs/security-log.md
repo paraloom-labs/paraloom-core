@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Publishing a Merkle root requires a validator quorum** (in-house security
+  audit). The bridge state's published Merkle root anchors every withdrawal
+  proof, but the `update_merkle_root` instruction was gated only by a single
+  authority key — so one key could install an arbitrary root (for a forged tree
+  or an old state that un-spends a nullifier) and then withdraw against it,
+  draining the vault. The instruction now requires the same BFT validator
+  quorum (#260) as `withdraw` and `shielded_transfer`: the new root must be
+  co-signed by a supermajority of registered validators, each of which
+  recomputes the appended root before signing. A unit test proves the rejection
+  without a quorum and the positive control once a quorum co-signs. Devnet,
+  pre-mainnet.
+
 - **SPL deposits are indexed into the shielded pool** (in-house security
   audit). The bridge listener decoded only the native deposit instruction, so an
   SPL deposit moved real tokens into a per-asset vault but no shielded note was
