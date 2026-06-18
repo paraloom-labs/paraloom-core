@@ -10,6 +10,17 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **The deposit listener paginates a backlog larger than one batch** (in-house
+  security audit). The listener polls `getSignaturesForAddress`, which returns
+  the newest transactions capped at a batch limit. When more program
+  transactions than one batch accumulated since the last cursor — a burst of
+  activity, or resuming after the node was down — a single call returned only
+  the newest batch, and deposits older than it (but newer than the cursor) were
+  never fetched and silently lost. The listener now walks older pages with the
+  `before` boundary until a short page reaches the cursor, bounded by a generous
+  page cap that logs loudly rather than dropping the tail silently; a cold start
+  with no cursor still scans only from now. Devnet, pre-mainnet.
+
 - **The private-swap relayer trades the realized post-fee amount** (in-house
   security audit). The relayer withdraws a shielded note to a fresh ephemeral
   address and then swaps from it, but the on-chain withdraw deducts the 25bps
