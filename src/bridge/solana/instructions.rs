@@ -391,13 +391,19 @@ pub fn create_shielded_transfer_instruction(
     })
 }
 
-/// Create update merkle root instruction
+/// Create update merkle root instruction. Publishing a root anchors every
+/// later withdrawal proof, so the program gates it on the same BFT validator
+/// quorum (#260) as settlement: pass the co-signing validators in
+/// `quorum_validators` so they are appended as remaining accounts.
 pub fn create_update_merkle_root_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
     new_merkle_root: [u8; 32],
+    quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (validator_registry_pda, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], program_id);
 
     #[derive(BorshSerialize)]
     struct UpdateMerkleRootData {
@@ -411,12 +417,16 @@ pub fn create_update_merkle_root_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
+    let mut accounts = vec![
+        AccountMeta::new(bridge_state_pda, false),
+        AccountMeta::new_readonly(validator_registry_pda, false),
+        AccountMeta::new_readonly(*authority, true),
+    ];
+    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
+
     Ok(Instruction {
         program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
+        accounts,
         data: instruction_data,
     })
 }
