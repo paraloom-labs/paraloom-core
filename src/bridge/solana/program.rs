@@ -291,9 +291,20 @@ impl ProgramInterface {
         Ok(())
     }
 
-    /// Update Merkle root on Solana program
-    /// This should be called after processing deposits to sync the on-chain state
-    pub async fn update_merkle_root(&self, new_merkle_root: [u8; 32]) -> Result<String> {
+    /// Update Merkle root on Solana program.
+    ///
+    /// Publishing a root anchors every later withdrawal proof, so the program
+    /// now gates it on the same BFT validator quorum (#260) as settlement
+    /// (`quorum_validators`). This single-key submitter only attaches the
+    /// authority's payer/co-signer signature, so it satisfies the quorum only
+    /// when the authority is itself the registered validator that meets the
+    /// threshold (the single-operator case); a multi-validator set must gather
+    /// the co-signatures over the #260 cosign path before submitting.
+    pub async fn update_merkle_root(
+        &self,
+        new_merkle_root: [u8; 32],
+        quorum_validators: &[Pubkey],
+    ) -> Result<String> {
         log::info!("Updating merkle root to: {:?}", &new_merkle_root[..8]);
 
         // Verify we have authority keypair
@@ -306,6 +317,7 @@ impl ProgramInterface {
             &self.program_id,
             &authority.pubkey(),
             new_merkle_root,
+            quorum_validators,
         )?;
 
         let recent_blockhash = self.rpc.get_latest_blockhash().await?;
@@ -441,7 +453,7 @@ mod tests {
     async fn update_merkle_root_fails_fast_when_authority_missing() {
         let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
         let err = program
-            .update_merkle_root([0u8; 32])
+            .update_merkle_root([0u8; 32], &[])
             .await
             .expect_err("missing authority must fail before any RPC call");
         assert!(matches!(err, BridgeError::ConfigError(_)));

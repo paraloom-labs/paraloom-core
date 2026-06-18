@@ -136,6 +136,19 @@ pub mod paraloom_program {
         ctx: Context<UpdateMerkleRoot>,
         new_merkle_root: [u8; 32],
     ) -> Result<()> {
+        // Publishing a new Merkle root anchors every subsequent withdrawal
+        // proof, so it carries the same fund-safety weight as settlement: a
+        // single key could otherwise install a forged root and drain the vault.
+        // Require the same BFT validator quorum (#260) that gates `withdraw` and
+        // `shielded_transfer`. The co-signers each recompute the appended root
+        // off-chain (#309) before signing, which is what enforces the
+        // append-only monotonicity the program cannot check without the tree.
+        quorum::verify_validator_quorum(
+            ctx.program_id,
+            &ctx.accounts.validator_registry,
+            ctx.remaining_accounts,
+        )?;
+
         let bridge_state = &mut ctx.accounts.bridge_state;
         bridge_state.merkle_root = new_merkle_root;
 
@@ -1258,6 +1271,12 @@ pub struct UpdateMerkleRoot<'info> {
         has_one = authority
     )]
     pub bridge_state: Account<'info, BridgeState>,
+
+    /// Sets the quorum threshold (#260): a new Merkle root must be co-signed by
+    /// a supermajority of registered validators, passed as `(wallet, validator
+    /// PDA)` pairs in `remaining_accounts`.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
 
     pub authority: Signer<'info>,
 }
