@@ -1862,12 +1862,28 @@ impl Node {
             self.transfer_coordinator.clone(),
             self.transfer_approval_rx.lock().await.take(),
         ) {
+            // Settle via the #260 co-signing quorum when configured to and a
+            // co-signing key is present; otherwise fall back to the single-key
+            // submitter (a solo operator with no peers to co-sign).
+            let use_cosign =
+                self.settings.bridge.use_cosign_settlement && self.cosign_keypair.is_some();
+            let node = self.clone();
             let handle = tokio::spawn(settle_approved_transfers(rx, move |approved| {
                 let bridge = bridge.clone();
-                async move { bridge.lock().await.submit_approved_transfer(approved).await }
+                let node = node.clone();
+                async move {
+                    if use_cosign {
+                        node.settle_transfer_via_cosign(approved).await
+                    } else {
+                        bridge.lock().await.submit_approved_transfer(approved).await
+                    }
+                }
             }));
             *self.transfer_submitter_task.lock().await = Some(handle);
-            info!("transfer submitter task started");
+            info!(
+                "transfer submitter task started (co-signing: {})",
+                use_cosign
+            );
         }
 
         // Periodically update resource information
@@ -2192,6 +2208,103 @@ impl Node {
             .cosign_settlement_tx(&approved, blockhash, expiration_slot)
             .await
             .map_err(|e| BridgeError::WithdrawalFailed(format!("co-signing round: {e}")))?;
+
+        bridge.lock().await.submit_signed_transaction(&tx).await
+    }
+
+    /// Assemble the co-signed multi-sig transaction for a quorum-approved
+    /// shielded transfer (#260) — the transfer twin of `cosign_settlement_tx`.
+    /// No funds move, so there is no expiration window or vault payout: the
+    /// `shielded_transfer` instruction nullifies two inputs and appends two
+    /// output commitments. The approving validators co-sign over libp2p and the
+    /// leader assembles their signatures into one transaction.
+    pub async fn cosign_settlement_transfer_tx(
+        &self,
+        approved: &ApprovedTransfer,
+        blockhash: [u8; 32],
+    ) -> Result<Transaction> {
+        let leader = self
+            .cosign_keypair
+            .as_ref()
+            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
+        let coordinator = self
+            .transfer_coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow!("no transfer coordinator"))?;
+
+        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
+            .map_err(|e| anyhow!("invalid program id: {e}"))?;
+        let (vault, _) = derive_bridge_vault(&program_id);
+
+        // The validators that approved this transfer become the co-signer
+        // quorum, mapped to their advertised settlement wallets; the leader
+        // signs as itself and is excluded from the peers it requests from.
+        let self_id = self.node_info.id.clone();
+        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+        for voter in coordinator.valid_voters(&approved.request_id).await {
+            if voter == self_id {
+                continue;
+            }
+            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
+                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                    peers.push((pubkey, voter));
+                }
+            }
+        }
+        let mut quorum_wallets = vec![leader.pubkey()];
+        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+        let threshold = quorum_wallets.len();
+
+        let onchain_proof =
+            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&approved.proof)
+                .map_err(|e| anyhow!("transfer proof: {e}"))?;
+        let params = SettlementParams::Transfer {
+            nullifiers: approved.nullifiers,
+            output_commitments: approved.output_commitments,
+            new_merkle_root: approved.new_merkle_root,
+            proof: onchain_proof.to_vec(),
+        };
+
+        let network = self.network.clone();
+        cosign_round::run_cosign_round(
+            leader,
+            program_id,
+            vault,
+            blockhash,
+            &approved.request_id,
+            SettlementKind::Transfer,
+            params,
+            quorum_wallets,
+            &peers,
+            threshold,
+            |peer, request| {
+                let network = network.clone();
+                async move { network.send_cosign_request(peer, request).await.ok() }
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("co-signing round failed: {e}"))
+    }
+
+    /// Settle a quorum-approved shielded transfer via the #260 co-signing path,
+    /// the transfer twin of `settle_via_cosign`. The on-chain submit error is
+    /// preserved as its `BridgeError` so the caller's replay detection still
+    /// applies; a co-signing-round failure maps to `Network`.
+    async fn settle_transfer_via_cosign(
+        &self,
+        approved: ApprovedTransfer,
+    ) -> std::result::Result<String, crate::bridge::BridgeError> {
+        use crate::bridge::BridgeError;
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| BridgeError::ConfigError("no bridge configured".to_string()))?;
+
+        let blockhash = bridge.lock().await.latest_blockhash().await?;
+        let tx = self
+            .cosign_settlement_transfer_tx(&approved, blockhash)
+            .await
+            .map_err(|e| BridgeError::Network(format!("transfer co-signing round: {e}")))?;
 
         bridge.lock().await.submit_signed_transaction(&tx).await
     }
