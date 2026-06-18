@@ -530,20 +530,44 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 let vote = if let Some(pool) = &self.shielded_pool {
                     match self.verify_transfer_proof(&request, pool).await {
                         Ok(true) => {
-                            info!(
-                                "Transfer proof verified successfully: {}",
-                                request.request_id
-                            );
-                            // Record the encrypted output notes for recipient
-                            // scanning (#196) only AFTER the proof verifies — an
-                            // unauthenticated peer cannot pollute the scan buffer
-                            // with notes from an unverified (garbage) transfer.
-                            self.record_delivered_notes(
-                                &request.output_commitments,
-                                &request.ciphertexts,
-                            )
-                            .await;
-                            crate::consensus::vote_tally::VerificationVote::Valid
+                            // The proof proves the inputs are in the CURRENT
+                            // root, but settlement also advances the published
+                            // root to `new_merkle_root`, which is not a proof
+                            // input. Recompute the root this transfer's output
+                            // commitments actually produce and refuse to vote
+                            // Valid on a mismatch — otherwise a settler could
+                            // advance the root to a fabricated-note tree and
+                            // then withdraw against it.
+                            let appended: Vec<crate::privacy::types::Commitment> = request
+                                .output_commitments
+                                .iter()
+                                .map(|c| crate::privacy::types::Commitment::from_bytes(*c))
+                                .collect();
+                            let expected_root = pool.root_after(&appended).await;
+                            if expected_root != request.new_merkle_root {
+                                log::warn!(
+                                    "Transfer {} proposes a new_merkle_root inconsistent with its output commitments; voting Invalid",
+                                    request.request_id
+                                );
+                                crate::consensus::vote_tally::VerificationVote::Invalid {
+                                    reason: "new_merkle_root does not match the appended output commitments".to_string(),
+                                }
+                            } else {
+                                info!(
+                                    "Transfer proof verified successfully: {}",
+                                    request.request_id
+                                );
+                                // Record the encrypted output notes for recipient
+                                // scanning (#196) only AFTER the proof verifies — an
+                                // unauthenticated peer cannot pollute the scan buffer
+                                // with notes from an unverified (garbage) transfer.
+                                self.record_delivered_notes(
+                                    &request.output_commitments,
+                                    &request.ciphertexts,
+                                )
+                                .await;
+                                crate::consensus::vote_tally::VerificationVote::Valid
+                            }
                         }
                         Ok(false) => {
                             log::warn!(
