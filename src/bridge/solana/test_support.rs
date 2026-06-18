@@ -24,6 +24,7 @@ use solana_transaction_status::{
     EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage, UiRawMessage,
     UiTransaction, UiTransactionEncoding,
 };
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -32,7 +33,17 @@ pub struct MockBridgeRpc {
     pub next_get_balance: Mutex<Option<Result<u64>>>,
     pub next_get_slot: Mutex<Option<Result<u64>>>,
     pub next_get_signatures: Mutex<Option<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>>>,
+    /// Successive `getSignaturesForAddress` pages, consumed front-first. When
+    /// non-empty this takes precedence over `next_get_signatures`, letting a
+    /// test drive the pagination loop across multiple calls.
+    pub get_signatures_pages:
+        Mutex<VecDeque<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>>>,
     pub next_get_transaction: Mutex<Option<Result<EncodedConfirmedTransactionWithStatusMeta>>>,
+    /// `getTransaction` responses keyed by signature, returned on every call for
+    /// that signature (so a re-fetched signature resolves again). When it has no
+    /// entry for the requested signature the mock falls back to
+    /// `next_get_transaction`.
+    pub get_transactions: Mutex<HashMap<Signature, EncodedConfirmedTransactionWithStatusMeta>>,
     pub next_get_latest_blockhash: Mutex<Option<Result<Hash>>>,
     pub next_send_and_confirm: Mutex<Option<Result<Signature>>>,
 }
@@ -123,14 +134,20 @@ impl BridgeRpc for MockBridgeRpc {
         _address: &Pubkey,
         _config: GetConfirmedSignaturesForAddress2Config,
     ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        if let Some(page) = self.get_signatures_pages.lock().unwrap().pop_front() {
+            return page;
+        }
         take(&self.next_get_signatures, "get_signatures_for_address")
     }
 
     async fn get_transaction(
         &self,
-        _signature: &Signature,
+        signature: &Signature,
         _encoding: UiTransactionEncoding,
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
+        if let Some(tx) = self.get_transactions.lock().unwrap().get(signature) {
+            return Ok(tx.clone());
+        }
         take(&self.next_get_transaction, "get_transaction")
     }
 

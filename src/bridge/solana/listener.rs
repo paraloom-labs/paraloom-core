@@ -18,10 +18,17 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
 /// Maximum number of signatures to request per RPC call. Bounded to
-/// keep memory and round-trip latency predictable; if the program
-/// volume ever exceeds one batch per poll interval the cursor still
-/// converges, just over multiple polls.
+/// keep memory and round-trip latency predictable; when the program
+/// volume between two polls exceeds one batch, `fetch_events` paginates
+/// (walking older pages with `before`) so no deposit in the gap is lost.
 const SIGNATURE_BATCH_LIMIT: usize = 1_000;
+
+/// Safety cap on how many `SIGNATURE_BATCH_LIMIT` pages a single poll walks
+/// back toward the cursor. At 50 pages that is 50k program transactions in one
+/// poll interval — far beyond any real load — so it never fires in practice; it
+/// exists only to bound a pathological backlog or a misbehaving RPC. If it ever
+/// fires the listener logs it loudly rather than silently dropping the tail.
+const MAX_SIGNATURE_PAGES: usize = 50;
 
 /// Cap on the in-memory dedup set so a long-running listener cannot
 /// grow it without bound. Once the cap is reached the oldest entries
@@ -76,6 +83,10 @@ struct PollerState {
     /// Slot count above which the listener emits a warning each poll —
     /// pulled from [`BridgeConfig::event_lag_warn_threshold_slots`].
     lag_warn_threshold_slots: u64,
+    /// Signatures requested per `getSignaturesForAddress` page. Production uses
+    /// [`SIGNATURE_BATCH_LIMIT`]; tests set it small to exercise pagination
+    /// without synthesising a thousand transactions.
+    batch_limit: usize,
 }
 
 impl EventListener {
@@ -123,6 +134,7 @@ impl EventListener {
             seen_signatures: Arc::clone(&self.seen_signatures),
             last_processed_slot: Arc::clone(&self.last_processed_slot),
             lag_warn_threshold_slots: self.config.event_lag_warn_threshold_slots,
+            batch_limit: SIGNATURE_BATCH_LIMIT,
         };
         let running = Arc::clone(&self.running);
         let poll_interval = self.config.poll_interval_secs;
@@ -287,18 +299,69 @@ impl EventListener {
         // RPC calls go through the BridgeRpc trait — RealBridgeRpc
         // handles the spawn_blocking + ClientError mapping, mocks
         // return canned data directly.
-        let signatures = state
-            .rpc
-            .get_signatures_for_address_with_config(
-                &state.program_id,
-                GetConfirmedSignaturesForAddress2Config {
-                    before: None,
-                    until: cursor,
-                    limit: Some(SIGNATURE_BATCH_LIMIT),
-                    commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
-                },
-            )
-            .await?;
+        //
+        // `getSignaturesForAddress` returns newest-first, capped at
+        // `SIGNATURE_BATCH_LIMIT`. When more than one batch of program
+        // transactions accumulated since `cursor` (a burst, or a resume after
+        // downtime), a single call would return only the newest batch and drop
+        // every deposit older than it. Walk older pages with `before` until a
+        // short page reaches `cursor` (or history runs out), so the gap is never
+        // dropped. On a cold start (`cursor == None`) there is no resume point,
+        // so take only the newest page and begin scanning from now rather than
+        // replaying the program's entire history.
+        let mut signatures = Vec::new();
+        let mut before: Option<Signature> = None;
+        let mut pages = 0usize;
+        loop {
+            let batch = state
+                .rpc
+                .get_signatures_for_address_with_config(
+                    &state.program_id,
+                    GetConfirmedSignaturesForAddress2Config {
+                        before,
+                        until: cursor,
+                        limit: Some(state.batch_limit),
+                        commitment: Some(
+                            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                        ),
+                    },
+                )
+                .await?;
+            let batch_len = batch.len();
+            if batch_len == 0 {
+                break;
+            }
+            // The batch is newest-first, so its last entry is the oldest — the
+            // boundary for the next, older page.
+            let oldest = batch
+                .last()
+                .and_then(|s| s.signature.parse::<Signature>().ok());
+            signatures.extend(batch);
+            pages += 1;
+
+            // A short page means this batch reached `cursor` (or the end of
+            // history): there is nothing older left to walk.
+            if batch_len < state.batch_limit {
+                break;
+            }
+            // Cold start: take only the newest page, do not walk all history.
+            if cursor.is_none() {
+                break;
+            }
+            if pages >= MAX_SIGNATURE_PAGES {
+                log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
+                    MAX_SIGNATURE_PAGES,
+                    MAX_SIGNATURE_PAGES * state.batch_limit
+                );
+                break;
+            }
+            match oldest {
+                Some(sig) => before = Some(sig),
+                None => break,
+            }
+        }
 
         if signatures.is_empty() {
             return Ok(Vec::new());
@@ -433,6 +496,7 @@ mod tests {
             seen_signatures: Arc::new(RwLock::new(HashSet::new())),
             last_processed_slot: Arc::new(RwLock::new(0)),
             lag_warn_threshold_slots: 100,
+            batch_limit: SIGNATURE_BATCH_LIMIT,
         }
     }
 
@@ -567,6 +631,68 @@ mod tests {
         assert_eq!(processed, 1, "exactly one deposit must process");
         assert_eq!(*state.last_signature.read().await, Some(sig));
         assert_eq!(state.pool.commitment_count().await, 1);
+    }
+
+    /// A backlog larger than one signature batch must be walked across pages,
+    /// not truncated to the newest batch. With `batch_limit = 2` the first page
+    /// returns full (== limit), so the listener must fetch a second page with
+    /// `before` to reach the cursor; the deposit on that older page would be
+    /// silently dropped without pagination.
+    #[tokio::test]
+    async fn poll_paginates_a_backlog_larger_than_one_batch() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        // Three deposits, newest-first across two pages: page1 = [s0, s1] (full),
+        // page2 = [s2] (short, reaches the cursor).
+        let sigs: Vec<Signature> = (0..3).map(|_| Signature::new_unique()).collect();
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+        mock.get_signatures_pages.lock().unwrap().extend([
+            Ok(vec![status(&sigs[0], 30), status(&sigs[1], 20)]),
+            Ok(vec![status(&sigs[2], 10)]),
+        ]);
+        for (i, sig) in sigs.iter().enumerate() {
+            // Distinct randomness per deposit so the commitments differ.
+            mock.get_transactions.lock().unwrap().insert(
+                *sig,
+                synth_deposit_tx(
+                    *sig,
+                    30 - i as u64 * 10,
+                    &program_id,
+                    &depositor,
+                    1_000,
+                    [9u8; 32],
+                    [11u8 + i as u8; 32],
+                ),
+            );
+        }
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(30));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+        state.batch_limit = 2;
+        // A resume cursor (not a cold start) so pagination engages.
+        *state.last_signature.write().await = Some(Signature::new_unique());
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(
+            processed, 3,
+            "every deposit across both pages must process, not just the newest batch"
+        );
+        assert_eq!(state.pool.commitment_count().await, 3);
+        // The cursor advances to the newest processed signature.
+        assert_eq!(*state.last_signature.read().await, Some(sigs[0]));
     }
 
     /// A signature already in `state.seen_signatures` must be filtered
