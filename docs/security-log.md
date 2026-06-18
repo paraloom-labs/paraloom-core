@@ -10,6 +10,16 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **SPL deposits are indexed into the shielded pool** (in-house security
+  audit). The bridge listener decoded only the native deposit instruction, so an
+  SPL deposit moved real tokens into a per-asset vault but no shielded note was
+  created and no commitment was ever inserted into the pool — the deposit's
+  Merkle path could not be found and an SPL withdrawal could never prove
+  membership, stranding the tokens in the vault. The listener now also decodes
+  the `deposit_spl` instruction, binding the mint as the deposit's asset id, and
+  creates the note asset-aware so it is indexed under its asset and is
+  withdrawable through `withdraw_spl`. Devnet, pre-mainnet.
+
 - **Removed an admin instruction that could credit unbacked validator rewards**
   (in-house security audit). A standalone `distribute_fee` instruction let the
   bridge authority add an arbitrary amount to any validator's pending rewards,

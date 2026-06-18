@@ -65,6 +65,7 @@ async fn test_deposit_event_structure() {
         amount: 1000,
         recipient: [0x02u8; 32],
         randomness,
+        asset_id: [0u8; 32],
         fee: 10,
         block: 12345,
         timestamp: 1699564800,

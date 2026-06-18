@@ -373,13 +373,15 @@ impl EventListener {
         // Create shielded address from recipient
         let recipient = ShieldedAddress(event.recipient);
 
-        // Create deposit transaction
-        let deposit_tx = DepositTx::new(
+        // Create deposit transaction, indexed under the deposit's asset (#237):
+        // an SPL deposit carries its mint, a native deposit NATIVE_SOL.
+        let deposit_tx = DepositTx::new_asset(
             event.from.to_vec(),
             event.amount,
             recipient,
             event.randomness,
             event.fee,
+            event.asset_id,
         );
 
         // Verify deposit transaction
@@ -632,6 +634,7 @@ mod tests {
             amount: 1000,
             recipient: [2u8; 32],
             randomness,
+            asset_id: crate::privacy::types::NATIVE_SOL_ASSET,
             fee: 10,
             block: 100,
             timestamp: 0,
