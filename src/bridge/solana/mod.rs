@@ -124,6 +124,24 @@ impl SolanaBridge {
         self.submitter.submit_approved_transfer(approved).await
     }
 
+    /// Latest blockhash for a node-assembled co-signed settlement tx (#260).
+    pub async fn latest_blockhash(&self) -> Result<[u8; 32]> {
+        self.program.latest_blockhash().await
+    }
+
+    /// Current slot, for deriving a settlement's expiration window.
+    pub async fn current_slot(&self) -> Result<u64> {
+        self.program.get_slot().await
+    }
+
+    /// Submit a pre-assembled, co-signed settlement transaction (#260).
+    pub async fn submit_signed_transaction(
+        &self,
+        transaction: &solana_sdk::transaction::Transaction,
+    ) -> Result<String> {
+        self.program.submit_signed_transaction(transaction).await
+    }
+
     /// Get program interface
     pub fn program(&self) -> &ProgramInterface {
         &self.program

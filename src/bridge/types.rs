@@ -131,6 +131,15 @@ pub struct BridgeConfig {
     /// no-auth behaviour, which is only safe on a loopback/management interface.
     pub ingress_token: String,
 
+    /// When true (the default) the node settles consensus-approved withdrawals
+    /// by gathering a #260 validator co-signing quorum
+    /// (`Node::cosign_settlement_tx`) and submitting the multi-sig transaction,
+    /// rather than signing single-key. The single-key path is still used when no
+    /// `cosign_keypair` is configured (a solo operator with no peers to
+    /// co-sign), so this flag only takes effect on a node set up to co-sign.
+    #[serde(default = "default_use_cosign_settlement")]
+    pub use_cosign_settlement: bool,
+
     /// File the deposit listener persists its scan cursor (the last processed
     /// signature) to, so a restart resumes from that point instead of
     /// re-scanning from the chain tip and losing deposits that landed while the
@@ -177,9 +186,17 @@ impl Default for BridgeConfig {
             transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
                 .unwrap_or_default(),
             ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
+            use_cosign_settlement: default_use_cosign_settlement(),
             cursor_path: None,
         }
     }
+}
+
+/// Default for [`BridgeConfig::use_cosign_settlement`] — co-signing is the
+/// intended settlement path (#260); the single-key fallback is automatic when
+/// no co-signing keypair is configured.
+fn default_use_cosign_settlement() -> bool {
+    true
 }
 
 /// Bridge statistics

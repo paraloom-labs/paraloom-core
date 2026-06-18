@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Approved withdrawals settle through the validator co-signing quorum**
+  (in-house security audit). The on-chain program gates settlement on a #260
+  validator supermajority, but the node still submitted approved withdrawals
+  signed by a single key — so on a multi-validator network one key could never
+  meet the quorum (settlement would simply fail), and the live path never
+  exercised the BFT co-signing the quorum exists to enforce. The withdrawal
+  submitter now gathers the approving validators' signatures into one multi-sig
+  transaction and submits that, so settlement is authorised by the same quorum
+  the program checks; a solo operator with no co-signing key still falls back to
+  the single-key path. Controlled by a `use_cosign_settlement` config flag
+  (default on). Devnet, pre-mainnet.
+
 - **The deposit listener retries a deposit that failed to process** (in-house
   security audit). The listener advanced its scan cursor to the last
   successfully processed signature, so a deposit that hit a transient error
