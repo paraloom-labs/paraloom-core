@@ -18,6 +18,7 @@ use paraloom::config::Settings;
 use paraloom::consensus::vote_tally::VerificationVote;
 use paraloom::consensus::TransferVerificationRequest;
 use paraloom::node::Node;
+use paraloom::privacy::{Commitment, ShieldedPool};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -81,7 +82,7 @@ where
 
 /// A distinct transfer request per call (nanosecond-keyed id + nullifiers) so
 /// retried `initiate` calls never collide on the same pending entry.
-fn sample_request() -> TransferVerificationRequest {
+async fn sample_request() -> TransferVerificationRequest {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -90,11 +91,19 @@ fn sample_request() -> TransferVerificationRequest {
     n0[..16].copy_from_slice(&nanos.to_le_bytes());
     let mut n1 = [1u8; 32];
     n1[..16].copy_from_slice(&nanos.to_le_bytes());
+    let c0 = [3u8; 32];
+    let c1 = [4u8; 32];
+    // Verifying nodes recompute the post-transfer root from these commitments
+    // against their (empty) pool and reject a mismatch, so the request must
+    // carry the consistent root rather than an arbitrary placeholder.
+    let new_merkle_root = ShieldedPool::new()
+        .root_after(&[Commitment::from_bytes(c0), Commitment::from_bytes(c1)])
+        .await;
     TransferVerificationRequest {
         request_id: format!("xfer-{nanos}"),
         nullifiers: [n0, n1],
-        output_commitments: [[3u8; 32], [4u8; 32]],
-        new_merkle_root: [7u8; 32],
+        output_commitments: [c0, c1],
+        new_merkle_root,
         proof: vec![1u8; 192],
         ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
         timestamp: now_secs(),
@@ -160,7 +169,10 @@ async fn two_node_transfer_reaches_quorum_over_libp2p() {
 
     let until = Instant::now() + Duration::from_secs(30);
     let request_id = loop {
-        match node0.initiate_transfer_verification(sample_request()).await {
+        match node0
+            .initiate_transfer_verification(sample_request().await)
+            .await
+        {
             Ok(rid) => break rid,
             Err(e) if Instant::now() < until => {
                 log::debug!("initiate not ready yet ({e}); retrying");
@@ -275,7 +287,10 @@ async fn five_node_byzantine_transfer_quorum_holds() {
 
     let until = Instant::now() + Duration::from_secs(30);
     let request_id = loop {
-        match node0.initiate_transfer_verification(sample_request()).await {
+        match node0
+            .initiate_transfer_verification(sample_request().await)
+            .await
+        {
             Ok(rid) => break rid,
             Err(e) if Instant::now() < until => {
                 log::debug!("initiate not ready yet ({e}); retrying");
