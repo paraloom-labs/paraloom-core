@@ -161,6 +161,22 @@ impl MerkleTree {
         root
     }
 
+    /// The root the tree WOULD have after appending `commitments`, computed
+    /// without mutating the tree. A settling validator uses this to check a
+    /// proposed post-transfer root against the commitments the transfer
+    /// actually adds: the root is not a proof input, so without this check a
+    /// settler could advance the published root to an arbitrary (e.g.
+    /// fabricated-note) tree and then withdraw against it. Append order matches
+    /// `insert`, so it agrees with the state `apply_transfer` later commits.
+    pub async fn root_after(&self, commitments: &[Commitment]) -> [u8; 32] {
+        let leaves = self.leaves.read().await;
+        let mut extended = leaves.clone();
+        for c in commitments {
+            extended.push(*c.as_bytes());
+        }
+        self.compute_root(&extended)
+    }
+
     /// Find the index of a commitment among the current leaves, if it is
     /// present. The stored leaf bytes are exactly `commitment.as_bytes()`
     /// (see [`MerkleTree::insert`]), so raw-byte equality identifies the
@@ -367,6 +383,30 @@ mod tests {
             .expect("in-memory insert");
         let root3 = tree.root().await;
         assert_ne!(root3, root2);
+    }
+
+    #[tokio::test]
+    async fn test_root_after_matches_real_insert_and_does_not_mutate() {
+        let tree = MerkleTree::new();
+        tree.insert(&Commitment([7u8; 32])).await.unwrap();
+        let before = tree.root().await;
+
+        let appended = [Commitment([8u8; 32]), Commitment([9u8; 32])];
+
+        // The preview equals the root we'd get by actually inserting both, in
+        // the same order — so a validator can validate a proposed new root.
+        let preview = tree.root_after(&appended).await;
+        assert_ne!(preview, before, "appending must move the root");
+        // ...and it left the tree untouched.
+        assert_eq!(tree.root().await, before, "root_after must not mutate");
+
+        tree.insert(&appended[0]).await.unwrap();
+        tree.insert(&appended[1]).await.unwrap();
+        assert_eq!(
+            tree.root().await,
+            preview,
+            "root_after must equal the post-insert root"
+        );
     }
 
     #[tokio::test]

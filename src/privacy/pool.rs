@@ -225,6 +225,14 @@ impl ShieldedPool {
         self.commitment_tree.root().await
     }
 
+    /// The root this pool would publish after a transfer appends `commitments`,
+    /// without mutating the pool. A settling validator checks a proposed
+    /// `new_merkle_root` against this so it cannot be advanced to an arbitrary
+    /// value (see [`crate::privacy::merkle::MerkleTree::root_after`]).
+    pub async fn root_after(&self, commitments: &[Commitment]) -> [u8; 32] {
+        self.commitment_tree.root_after(commitments).await
+    }
+
     /// Get the Merkle authentication path for a commitment.
     ///
     /// Resolves the commitment to its leaf index in the tree and returns
