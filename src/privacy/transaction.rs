@@ -75,8 +75,30 @@ impl DepositTx {
         randomness: [u8; 32],
         fee: u64,
     ) -> Self {
+        Self::new_asset(
+            from_public,
+            amount,
+            recipient,
+            randomness,
+            fee,
+            crate::privacy::types::NATIVE_SOL_ASSET,
+        )
+    }
+
+    /// Asset-aware deposit (#237): the output note carries `asset_id` (the
+    /// SPL mint's bytes, or `NATIVE_SOL_ASSET` for native SOL), so an SPL
+    /// deposit is indexed into the pool under its asset and can later be
+    /// withdrawn through `withdraw_spl`.
+    pub fn new_asset(
+        from_public: Vec<u8>,
+        amount: u64,
+        recipient: ShieldedAddress,
+        randomness: [u8; 32],
+        fee: u64,
+        asset_id: crate::privacy::types::AssetId,
+    ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new_native(recipient, amount - fee, randomness);
+        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()

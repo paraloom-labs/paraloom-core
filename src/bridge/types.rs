@@ -23,6 +23,10 @@ pub struct DepositEvent {
     /// Randomness for commitment
     pub randomness: [u8; 32],
 
+    /// Asset id of the deposit (#237): the SPL mint's 32 bytes, or all-zero
+    /// `NATIVE_SOL_ASSET` for native SOL. The note is indexed under this asset.
+    pub asset_id: [u8; 32],
+
     /// Fee paid
     pub fee: u64,
 

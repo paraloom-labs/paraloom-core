@@ -129,7 +129,13 @@ pub fn extract_deposit_events(
 struct DecodedDeposit {
     data: DepositInstructionData,
     depositor: Pubkey,
+    /// The deposited asset (#237): the SPL mint's bytes, or `NATIVE_SOL_ASSET`.
+    asset_id: [u8; 32],
 }
+
+/// `deposit_spl` account layout: bridge_state(0), mint(1), …, depositor(5).
+const SPL_MINT_ACCOUNT_INDEX: usize = 1;
+const SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 5;
 
 /// Try to interpret a single compiled instruction as a Paraloom
 /// deposit. Returns `None` if the instruction targets a different
@@ -150,19 +156,34 @@ fn decode_compiled_deposit(
     if raw_data.len() < discriminators::DEPOSIT.len() {
         return None;
     }
-    if raw_data[..discriminators::DEPOSIT.len()] != discriminators::DEPOSIT {
-        return None;
-    }
 
-    let payload = &raw_data[discriminators::DEPOSIT.len()..];
+    // Native `deposit` and `deposit_spl` share the same borsh payload
+    // (amount, recipient, randomness) but differ in discriminator, account
+    // layout, and asset. The SPL deposit's asset id is the mint account; the
+    // native deposit's is NATIVE_SOL.
+    let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT {
+        (
+            DEPOSITOR_ACCOUNT_INDEX,
+            crate::privacy::types::NATIVE_SOL_ASSET,
+        )
+    } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
+        let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
+        let mint = account_keys.get(mint_index)?;
+        (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes())
+    } else {
+        return None;
+    };
+
+    let payload = &raw_data[8..];
     let data = DepositInstructionData::try_from_slice(payload).ok()?;
 
-    let depositor_index = *compiled.accounts.get(DEPOSITOR_ACCOUNT_INDEX)? as usize;
+    let depositor_index = *compiled.accounts.get(depositor_index)? as usize;
     let depositor = account_keys.get(depositor_index)?;
 
     Some(DecodedDeposit {
         data,
         depositor: *depositor,
+        asset_id,
     })
 }
 
@@ -177,6 +198,7 @@ fn build_event(
         amount: decoded.data.amount,
         recipient: decoded.data.recipient,
         randomness: decoded.data.randomness,
+        asset_id: decoded.asset_id,
         // Fees are charged inside the on-chain program rather than
         // being part of the deposit instruction payload. Until the
         // program emits an explicit fee component, we report 0 and let
@@ -243,6 +265,45 @@ mod tests {
         assert_eq!(decoded.data.recipient, recipient);
         assert_eq!(decoded.data.randomness, randomness);
         assert_eq!(decoded.depositor, depositor);
+        assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+    }
+
+    #[test]
+    fn decodes_a_well_formed_spl_deposit() {
+        // deposit_spl shares the payload but uses the SPL account layout
+        // (mint @ index 1, depositor @ index 5) and binds the mint as asset_id.
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        // account_keys: program@0, mint@2, depositor@7.
+        let account_keys = vec![
+            program_id, other, mint, other, other, other, other, depositor,
+        ];
+
+        let amount = 5_000u64;
+        let recipient = [3u8; 32];
+        let randomness = [4u8; 32];
+        let payload = DepositInstructionData {
+            amount,
+            recipient,
+            randomness,
+        };
+        let mut bytes = discriminators::DEPOSIT_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let ix = UiCompiledInstruction {
+            program_id_index: 0,
+            // deposit_spl ix accounts: position 1 = mint(key 2), position 5 = depositor(key 7).
+            accounts: vec![1, 2, 3, 4, 5, 7, 1, 1, 1],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("well-formed SPL deposit must decode");
+        assert_eq!(decoded.data.amount, amount);
+        assert_eq!(decoded.depositor, depositor);
+        assert_eq!(decoded.asset_id, mint.to_bytes());
     }
 
     #[test]
