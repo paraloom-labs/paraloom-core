@@ -258,6 +258,20 @@ impl ProgramInterface {
         self.rpc.get_slot().await
     }
 
+    /// Latest blockhash as raw bytes. The node bakes this into the multi-sig
+    /// settlement transaction it assembles in the #260 co-signing round, so it
+    /// needs the same blockhash this RPC will later confirm against.
+    pub async fn latest_blockhash(&self) -> Result<[u8; 32]> {
+        Ok(self.rpc.get_latest_blockhash().await?.to_bytes())
+    }
+
+    /// Submit a transaction the caller already assembled and signed — the
+    /// co-signed settlement multi-sig tx (#260) — and confirm it on-chain.
+    pub async fn submit_signed_transaction(&self, transaction: &Transaction) -> Result<String> {
+        let signature = self.rpc.send_and_confirm_transaction(transaction).await?;
+        Ok(signature.to_string())
+    }
+
     /// Read the deployed program's `program_version` from the
     /// `BridgeState` PDA. The version sits at byte offset 8..12 of the
     /// account data — Anchor prepends an 8-byte discriminator and the

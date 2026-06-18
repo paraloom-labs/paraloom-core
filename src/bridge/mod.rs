@@ -129,6 +129,43 @@ impl Bridge {
             ))
         }
     }
+
+    /// Latest blockhash for a node-assembled co-signed settlement tx (#260).
+    pub async fn latest_blockhash(&self) -> Result<[u8; 32]> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.latest_blockhash().await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// Current slot, for deriving a settlement's expiration window.
+    pub async fn current_slot(&self) -> Result<u64> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.current_slot().await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
+
+    /// Submit a pre-assembled, co-signed settlement transaction (#260) — the
+    /// multi-sig withdrawal the node gathered from the approving validators.
+    pub async fn submit_signed_transaction(
+        &self,
+        transaction: &solana_sdk::transaction::Transaction,
+    ) -> Result<String> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.submit_signed_transaction(transaction).await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

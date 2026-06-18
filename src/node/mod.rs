@@ -1797,12 +1797,28 @@ impl Node {
             self.withdrawal_coordinator.clone(),
             self.approval_rx.lock().await.take(),
         ) {
+            // Settle via the #260 co-signing quorum when configured to and a
+            // co-signing key is present; otherwise fall back to the single-key
+            // submitter (a solo operator with no peers to co-sign).
+            let use_cosign =
+                self.settings.bridge.use_cosign_settlement && self.cosign_keypair.is_some();
+            let node = self.clone();
             let handle = tokio::spawn(settle_approved_withdrawals(rx, move |approved| {
                 let bridge = bridge.clone();
-                async move { bridge.lock().await.submit_approved(approved).await }
+                let node = node.clone();
+                async move {
+                    if use_cosign {
+                        node.settle_via_cosign(approved).await
+                    } else {
+                        bridge.lock().await.submit_approved(approved).await
+                    }
+                }
             }));
             *self.submitter_task.lock().await = Some(handle);
-            info!("withdrawal submitter task started");
+            info!(
+                "withdrawal submitter task started (co-signing: {})",
+                use_cosign
+            );
         }
 
         // Serve the transfer-verification ingress over HTTP (#194), the
@@ -2146,6 +2162,38 @@ impl Node {
         )
         .await
         .map_err(|e| anyhow!("co-signing round failed: {e}"))
+    }
+
+    /// Settle a quorum-approved withdrawal via the #260 co-signing path: gather
+    /// the approving validators' signatures into one multi-sig transaction and
+    /// submit it, instead of signing single-key. The blockhash baked into the
+    /// co-signed transaction is the one this submit will confirm against. A
+    /// co-signing-round failure maps to `WithdrawalFailed`; the on-chain submit
+    /// error is preserved as its `BridgeError` so the caller's replay detection
+    /// (nullifier already spent) still applies.
+    async fn settle_via_cosign(
+        &self,
+        approved: ApprovedWithdrawal,
+    ) -> std::result::Result<String, crate::bridge::BridgeError> {
+        use crate::bridge::BridgeError;
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| BridgeError::ConfigError("no bridge configured".to_string()))?;
+
+        let (blockhash, current_slot) = {
+            let b = bridge.lock().await;
+            (b.latest_blockhash().await?, b.current_slot().await?)
+        };
+        let expiration_slot =
+            current_slot + self.settings.bridge.withdrawal_expiration_window_slots;
+
+        let tx = self
+            .cosign_settlement_tx(&approved, blockhash, expiration_slot)
+            .await
+            .map_err(|e| BridgeError::WithdrawalFailed(format!("co-signing round: {e}")))?;
+
+        bridge.lock().await.submit_signed_transaction(&tx).await
     }
 
     // Compute layer API methods
