@@ -10,6 +10,18 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **SPL deposits credit their own asset's shielded supply** (in-house security
+  audit). The deposit listener built each note asset-aware — binding the real
+  mint into the commitment — but then indexed it through the native-SOL supply
+  helper, so an SPL deposit credited the native-SOL supply ledger instead of the
+  mint's: `supply_of(mint)` stayed zero while the gossiped `total_supply` was
+  inflated by the token amount. Accounting and state-visibility only — on-chain
+  custody is gated by the program's per-asset vaults, and no settlement path
+  consulted the off-chain per-asset supply, so no funds were affected. The
+  listener now credits the deposit's own asset, with a regression test asserting
+  an SPL deposit credits the mint and leaves native SOL at zero. Devnet,
+  pre-mainnet.
+
 - **Approved transfers settle through the validator co-signing quorum**
   (in-house security audit). The transfer twin of the withdrawal fix: the node
   settled quorum-approved shielded transfers single-key, which cannot meet the
