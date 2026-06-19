@@ -129,6 +129,9 @@ pub struct BridgeConfig {
     /// refused with 401 — so an ingress exposed beyond loopback cannot be driven
     /// by an unauthenticated caller. Empty (the default) keeps the historical
     /// no-auth behaviour, which is only safe on a loopback/management interface.
+    /// `#[serde(default)]` so a config predating this field still parses (and
+    /// gets the empty, no-auth default) instead of failing to load.
+    #[serde(default)]
     pub ingress_token: String,
 
     /// When true (the default) the node settles consensus-approved withdrawals
