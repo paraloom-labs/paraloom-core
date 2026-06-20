@@ -927,8 +927,22 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         _source: NodeId,
         request: CoSignRequest,
     ) -> Result<CoSignResponse> {
+        // Pin the program to our own config before the signer sees the request:
+        // an unparseable configured id means we cannot bind it, so decline
+        // rather than sign against a requester-supplied program.
+        let expected_program_id = match self.settings.bridge.program_id.parse::<Pubkey>() {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(CoSignResponse {
+                    request_id: request.request_id,
+                    wallet_pubkey: String::new(),
+                    signature: None,
+                });
+            }
+        };
         Ok(cosign_settlement(
             self.cosign_keypair.as_ref(),
+            &expected_program_id,
             &self.verified_withdrawals,
             &self.verified_transfers,
             request,
@@ -944,6 +958,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 /// unit-tested without standing up a full node.
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
+    expected_program_id: &Pubkey,
     verified_withdrawals: &Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
     verified_transfers: &Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
     request: CoSignRequest,
@@ -967,6 +982,13 @@ async fn cosign_settlement(
         Ok(p) => p,
         Err(e) => return declined(&format!("undecodable payload: {e}")),
     };
+
+    // Pin the program to our own configuration: never sign a settlement message
+    // that invokes a program the requester chose, which would turn the validator
+    // into a cross-program signing oracle for its settlement wallet.
+    if payload.program_id != expected_program_id.to_bytes() {
+        return declined("payload program id does not match our configured program");
+    }
 
     // Match the payload against a settlement we verified Valid, by request id
     // and binding parameters.
@@ -2646,6 +2668,7 @@ mod tests {
         let payload = wd_payload(kp.pubkey().to_bytes(), recipient, amount, nullifier);
         let resp = cosign_settlement(
             Some(&kp),
+            &configured_program(),
             &wds,
             &trs,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
@@ -2679,6 +2702,7 @@ mod tests {
         let tampered = wd_payload(kp.pubkey().to_bytes(), [0xFF; 32], amount, nullifier);
         let resp = cosign_settlement(
             Some(&kp),
+            &configured_program(),
             &wds,
             &trs,
             cosign_req("w1", SettlementKind::Withdrawal, &tampered),
@@ -2700,6 +2724,7 @@ mod tests {
         // Never verified this request id.
         let unknown = cosign_settlement(
             Some(&kp),
+            &configured_program(),
             &wds,
             &trs,
             cosign_req("nope", SettlementKind::Withdrawal, &payload),
@@ -2713,12 +2738,47 @@ mod tests {
             .insert("w1".into(), wd_request("w1", [9u8; 32], 1, [7u8; 32]));
         let no_key = cosign_settlement(
             None,
+            &configured_program(),
             &wds,
             &trs,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
         .await;
         assert_eq!(no_key.signature, None);
+    }
+
+    /// The program id baked into the test payloads (`wd_payload`).
+    fn configured_program() -> Pubkey {
+        Pubkey::new_from_array([1u8; 32])
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_a_program_id_we_did_not_configure() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+
+        let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
+        wds.lock()
+            .await
+            .insert("w1".into(), wd_request("w1", recipient, amount, nullifier));
+
+        // The payload carries the program we configured ([1u8; 32]); we pass a
+        // DIFFERENT configured program, so the co-signer must refuse to sign a
+        // message invoking a program it did not configure.
+        let payload = wd_payload(kp.pubkey().to_bytes(), recipient, amount, nullifier);
+        let resp = cosign_settlement(
+            Some(&kp),
+            &Pubkey::new_from_array([2u8; 32]),
+            &wds,
+            &trs,
+            cosign_req("w1", SettlementKind::Withdrawal, &payload),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "a payload program id that does not match our config must be declined"
+        );
     }
 
     fn approval(id: &str) -> ApprovedWithdrawal {
