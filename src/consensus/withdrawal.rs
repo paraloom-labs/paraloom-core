@@ -855,6 +855,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_timeouts_removes_only_timed_out_verifications() {
+        let coordinator = WithdrawalVerificationCoordinator::new();
+        let req = |id: &str| WithdrawalVerificationRequest {
+            request_id: id.to_string(),
+            nullifier: [1u8; 32],
+            amount: 1000,
+            recipient: [2u8; 32],
+            proof: vec![0u8; 128],
+            fee: 10,
+            timestamp: 0,
+        };
+        {
+            let mut pending = coordinator.pending.write().await;
+            let fresh = WithdrawalConsensus::new(req("fresh"));
+            let mut stale = WithdrawalConsensus::new(req("stale"));
+            stale.tally.deadline = 0; // already past => is_timed_out()
+            pending.insert("fresh".to_string(), fresh);
+            pending.insert("stale".to_string(), stale);
+        }
+        let removed = coordinator.cleanup_timeouts().await.unwrap();
+        assert_eq!(removed, 1);
+        let pending = coordinator.pending.read().await;
+        assert!(pending.contains_key("fresh"));
+        assert!(!pending.contains_key("stale"));
+    }
+
+    #[tokio::test]
     async fn test_consensus_voting() {
         let request = WithdrawalVerificationRequest {
             request_id: "test123".to_string(),

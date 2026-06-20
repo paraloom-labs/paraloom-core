@@ -1628,6 +1628,41 @@ impl Node {
             info!("Timeout monitoring started for coordinator node");
         }
 
+        // Sweep timed-out verification entries so the consensus pending maps
+        // cannot grow unbounded. The ingress write-surface inserts a request
+        // before any proof check, and entries that never reach quorum were
+        // never reclaimed; this drives the existing per-coordinator cleanup.
+        if self.withdrawal_coordinator.is_some() || self.transfer_coordinator.is_some() {
+            let withdrawal = self.withdrawal_coordinator.clone();
+            let transfer = self.transfer_coordinator.clone();
+            let status_clone = self.status.clone();
+            tokio::spawn(async move {
+                loop {
+                    let current_status = status_clone.lock().await.clone();
+                    if !matches!(current_status, NodeStatus::Running) {
+                        info!("Verification timeout sweeper shutting down");
+                        break;
+                    }
+                    if let Some(w) = &withdrawal {
+                        if let Ok(n) = w.cleanup_timeouts().await {
+                            if n > 0 {
+                                info!("Swept {} timed-out withdrawal verifications", n);
+                            }
+                        }
+                    }
+                    if let Some(t) = &transfer {
+                        if let Ok(n) = t.cleanup_timeouts().await {
+                            if n > 0 {
+                                info!("Swept {} timed-out transfer verifications", n);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                }
+            });
+            info!("Verification timeout sweeper started");
+        }
+
         // Start result reporting for ResourceProvider nodes
         if let Some(executor) = &self.compute_executor {
             let executor_clone = executor.clone();

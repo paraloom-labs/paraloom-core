@@ -10,6 +10,17 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Timed-out verification requests are swept from the consensus pending maps**
+  (in-house security audit). The withdrawal and transfer verification
+  coordinators inserted each incoming request into an in-memory `pending` map,
+  but the `cleanup_timeouts` routine that removes requests which never reach
+  quorum was never called — so the maps grew for the process lifetime, and a
+  flood at the (loopback, token-gated) ingress could exhaust memory and stop the
+  node co-signing. A periodic sweeper now drives `cleanup_timeouts` on both
+  coordinators (transfer gained the routine, mirroring withdrawal), reclaiming
+  timed-out entries. Availability only — no funds were at risk, as settlement
+  still requires a valid proof and an on-chain quorum. Devnet, pre-mainnet.
+
 - **The deposit listener credits a deposit only once it is finalized** (in-house
   security audit). The listener enumerated and credited program deposits at the
   `confirmed` commitment, which is not rooted: a deposit credited at confirmed
