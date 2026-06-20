@@ -60,7 +60,7 @@ static JOB_EXECUTOR: Lazy<Arc<JobExecutor>> = Lazy::new(|| {
 #[derive(Parser)]
 #[command(name = "paraloom")]
 #[command(author = "Paraloom Team")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Privacy-preserving distributed computing on Solana", long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
@@ -377,8 +377,9 @@ fn print_banner() {
  |_|   \__,_|_|  \__,_|_|\___/ \___/|_| |_| |_|
 
  Privacy-preserving distributed computing on Solana
- True Decentralized Privacy | v0.1.0
-"#
+ True Decentralized Privacy | v{}
+"#,
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -390,7 +391,7 @@ async fn main() -> Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    log::info!("Paraloom CLI v0.1.0");
+    log::info!("Paraloom CLI v{}", env!("CARGO_PKG_VERSION"));
 
     // Load config if specified
     if let Some(config_path) = &cli.config {
