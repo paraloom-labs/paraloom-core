@@ -570,7 +570,7 @@ impl EventListener {
 
         // Process deposit into pool
         let net_amount = event.amount.saturating_sub(event.fee);
-        pool.deposit(deposit_tx.output_note, net_amount)
+        pool.deposit_asset(deposit_tx.output_note, net_amount, event.asset_id)
             .await
             .map_err(|e| BridgeError::DepositFailed(e.to_string()))?;
 
@@ -979,6 +979,38 @@ mod tests {
 
         // Verify deposit was added to pool
         assert_eq!(pool.total_supply().await, 990); // 1000 - 10 fee
+        assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_deposit_credits_the_deposits_own_asset() {
+        // An SPL deposit must credit its mint's supply, not native SOL's. The
+        // note is built asset-aware (`new_asset`), so the supply ledger has to
+        // be keyed by the same asset or `supply_of` / the gossiped total drift.
+        let pool = Arc::new(ShieldedPool::new());
+        let randomness = pedersen::generate_randomness();
+        let mint: crate::privacy::types::AssetId = [7u8; 32];
+
+        let event = DepositEvent {
+            signature: "spl_sig".to_string(),
+            from: [1u8; 32],
+            amount: 1000,
+            recipient: [2u8; 32],
+            randomness,
+            asset_id: mint,
+            fee: 10,
+            block: 100,
+            timestamp: 0,
+        };
+
+        EventListener::process_deposit(&pool, event).await.unwrap();
+
+        // Credited to the mint, not to native SOL.
+        assert_eq!(pool.supply_of(mint).await, 990);
+        assert_eq!(
+            pool.supply_of(crate::privacy::types::NATIVE_SOL_ASSET).await,
+            0
+        );
         assert_eq!(pool.commitment_count().await, 1);
     }
 }
