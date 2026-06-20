@@ -10,6 +10,15 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **The deposit listener credits a deposit only once it is finalized** (in-house
+  security audit). The listener enumerated and credited program deposits at the
+  `confirmed` commitment, which is not rooted: a deposit credited at confirmed
+  and then orphaned by a fork-choice switch would leave the shielded pool's
+  supply believing more value exists than the on-chain vault custodies. The
+  listener now enumerates at `finalized`, so a deposit is credited only once it
+  can no longer be reorged — a few seconds of added deposit latency bought for
+  reorg safety. No funds were at risk on devnet. Devnet, pre-mainnet.
+
 - **SPL deposits credit their own asset's shielded supply** (in-house security
   audit). The deposit listener built each note asset-aware — binding the real
   mint into the commitment — but then indexed it through the native-SOL supply
