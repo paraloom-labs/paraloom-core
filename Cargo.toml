@@ -139,7 +139,7 @@ tokio = { version = "1.25.0", features = ["full"] }
 axum = "0.6"
 tower = "0.4"
 tower-http = { version = "0.4", features = ["fs", "cors"] }
-hyper = "0.14"
+hyper = "0.14.32"
 
 # Serialization & Data handling
 serde = { version = "1.0.152", features = ["derive"] }
