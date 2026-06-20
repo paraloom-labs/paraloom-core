@@ -10,6 +10,26 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Bearer-token ingress auth compares in constant time** (in-house security
+  audit). The optional ingress bearer token was compared with `==`, which
+  short-circuits on the first differing byte and leaks a per-byte timing signal
+  on the shared secret. The token only authorizes still-proof-gated,
+  still-quorum-gated relaying — not a signing key — and defaults to no token on
+  a loopback interface, so no funds were at risk; the comparison is now
+  constant-time regardless. Devnet, pre-mainnet.
+
+- **A co-signer pins the settlement program to its own configuration** (in-house
+  security audit). The co-signing validator rebuilt and signed the settlement
+  message from the requester-supplied payload without checking that the
+  payload's program id matched its own configured program — so any peer that had
+  seen a legitimate verification round could obtain a genuine signature by the
+  validator's settlement wallet over a message invoking an attacker-chosen
+  program. No paraloom funds were reachable (the on-chain program re-derives its
+  PDAs and binds the proof, and quorum wallets are appended as read-only
+  signers), but the signature was a cross-program oracle. The co-signer now
+  declines any payload whose program id is not the one it configured. Devnet,
+  pre-mainnet.
+
 - **Timed-out verification requests are swept from the consensus pending maps**
   (in-house security audit). The withdrawal and transfer verification
   coordinators inserted each incoming request into an in-memory `pending` map,
