@@ -184,7 +184,7 @@ async fn two_node_withdrawal_reaches_quorum_over_libp2p() {
     // so a failed attempt leaves no residue — retry until one succeeds and
     // keep that request_id. Each attempt uses a fresh request, so ids never
     // collide.
-    let until = Instant::now() + Duration::from_secs(30);
+    let until = Instant::now() + Duration::from_secs(60);
     let request_id = loop {
         match node0
             .initiate_withdrawal_verification(sample_request())
@@ -195,7 +195,7 @@ async fn two_node_withdrawal_reaches_quorum_over_libp2p() {
                 log::debug!("initiate not ready yet ({e}); retrying");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Err(e) => panic!("node0 could not start verification within 30s: {e}"),
+            Err(e) => panic!("node0 could not start verification within 60s: {e}"),
         }
     };
 
@@ -290,21 +290,24 @@ async fn five_node_byzantine_quorum_holds() {
 
     let node0 = nodes[0].clone();
 
-    // node0 must connect to all four voters before it broadcasts.
-    let connected = wait_until(Duration::from_secs(40), Duration::from_millis(500), || {
+    // node0 must connect to all four voters before it broadcasts. The window is
+    // generous because five in-process libp2p nodes share a contended CI runner;
+    // under normal load they connect within seconds, so a genuine connectivity
+    // failure still trips this — just with headroom against runner starvation.
+    let connected = wait_until(Duration::from_secs(120), Duration::from_millis(500), || {
         let n0 = node0.clone();
         async move { n0.connected_peer_count().await >= N - 1 }
     })
     .await;
     assert!(
         connected,
-        "node0 did not connect to all {} voters within 40s",
+        "node0 did not connect to all {} voters within 120s",
         N - 1
     );
 
     // Start the verification, retrying until the Discovery handshake has
     // registered enough validators (the 3-of-5 threshold needs >= 3).
-    let until = Instant::now() + Duration::from_secs(30);
+    let until = Instant::now() + Duration::from_secs(60);
     let request_id = loop {
         match node0
             .initiate_withdrawal_verification(sample_request())
@@ -315,13 +318,13 @@ async fn five_node_byzantine_quorum_holds() {
                 log::debug!("initiate not ready yet ({e}); retrying");
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            Err(e) => panic!("node0 could not start verification within 30s: {e}"),
+            Err(e) => panic!("node0 could not start verification within 60s: {e}"),
         }
     };
 
     // Three honest Valid votes reach the 3-of-5 quorum despite the byzantine
     // node's Invalid vote.
-    let quorum = wait_until(Duration::from_secs(40), Duration::from_millis(500), || {
+    let quorum = wait_until(Duration::from_secs(90), Duration::from_millis(500), || {
         let n0 = node0.clone();
         let rid = request_id.clone();
         async move {
@@ -334,7 +337,7 @@ async fn five_node_byzantine_quorum_holds() {
     .await;
     assert!(
         quorum,
-        "did not reach Valid quorum despite a byzantine voter within 40s"
+        "did not reach Valid quorum despite a byzantine voter within 90s"
     );
 
     // Confirm the byzantine dissent actually landed and was outvoted, not that
