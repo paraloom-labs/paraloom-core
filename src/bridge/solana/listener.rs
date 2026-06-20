@@ -1014,7 +1014,8 @@ mod tests {
         // Credited to the mint, not to native SOL.
         assert_eq!(pool.supply_of(mint).await, 990);
         assert_eq!(
-            pool.supply_of(crate::privacy::types::NATIVE_SOL_ASSET).await,
+            pool.supply_of(crate::privacy::types::NATIVE_SOL_ASSET)
+                .await,
             0
         );
         assert_eq!(pool.commitment_count().await, 1);

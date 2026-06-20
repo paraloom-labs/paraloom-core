@@ -427,6 +427,24 @@ impl TransferVerificationCoordinator {
         log::debug!("Cleaned up transfer verification: {}", request_id);
         Ok(())
     }
+
+    /// Remove timed-out pending verifications so the map cannot grow unbounded.
+    /// The ingress write-surface inserts a request before any vote arrives, so
+    /// requests that never reach quorum must be reclaimed by a periodic sweep.
+    pub async fn cleanup_timeouts(&self) -> Result<usize> {
+        let mut pending = self.pending.write().await;
+        let timed_out: Vec<String> = pending
+            .iter()
+            .filter(|(_, consensus)| consensus.tally.is_timed_out())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let count = timed_out.len();
+        for id in timed_out {
+            pending.remove(&id);
+            log::warn!("Cleaned up timed out transfer verification: {}", id);
+        }
+        Ok(count)
+    }
 }
 
 impl Default for TransferVerificationCoordinator {
