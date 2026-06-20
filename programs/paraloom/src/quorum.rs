@@ -18,23 +18,26 @@
 use crate::{BridgeError, ValidatorAccount, ValidatorRegistry};
 use anchor_lang::prelude::*;
 
-/// BFT supermajority threshold: strictly more than 2/3 of the active set,
-/// i.e. `floor(2N/3) + 1`. With 0 active validators the threshold is 1, so no
-/// settlement can be authorized by an empty set.
-pub fn quorum_threshold(active_validators: u64) -> u64 {
-    active_validators.saturating_mul(2) / 3 + 1
+/// BFT supermajority threshold: strictly more than 2/3 of the active validator
+/// STAKE, i.e. `floor(2·stake/3) + 1`. With 0 active stake the threshold is 1,
+/// so no settlement can be authorized by an empty (or zero-stake) set. Weighting
+/// by stake rather than head count is what stops a permissionless registry from
+/// being Sybil-forged with many tiny validators.
+pub fn quorum_threshold(total_active_stake: u64) -> u64 {
+    total_active_stake.saturating_mul(2) / 3 + 1
 }
 
-/// Verify that a supermajority of registered, active validators co-signed this
-/// transaction. Returns [`BridgeError::QuorumNotMet`] if fewer than
-/// [`quorum_threshold`] distinct active validators are present and signing.
+/// Verify that a stake-weighted supermajority of registered, active validators
+/// co-signed this transaction. Returns [`BridgeError::QuorumNotMet`] if the
+/// summed stake of the distinct active validators present and signing is below
+/// [`quorum_threshold`] of the registry's total active stake.
 pub fn verify_validator_quorum(
     program_id: &Pubkey,
     registry: &ValidatorRegistry,
     quorum_accounts: &[AccountInfo],
 ) -> Result<()> {
-    let threshold = quorum_threshold(registry.active_validators);
-    let mut counted: u64 = 0;
+    let threshold = quorum_threshold(registry.total_active_stake);
+    let mut counted_stake: u64 = 0;
     let mut seen: Vec<Pubkey> = Vec::new();
 
     for pair in quorum_accounts.chunks(2) {
@@ -72,10 +75,11 @@ pub fn verify_validator_quorum(
             continue;
         }
         seen.push(*wallet.key);
-        counted += 1;
+        // Weight by the validator's staked amount, not a head count.
+        counted_stake = counted_stake.saturating_add(validator.stake_amount);
     }
 
-    require!(counted >= threshold, BridgeError::QuorumNotMet);
+    require!(counted_stake >= threshold, BridgeError::QuorumNotMet);
     Ok(())
 }
 
@@ -88,18 +92,29 @@ mod tests {
     }
 
     fn registry(active: u64) -> ValidatorRegistry {
+        // Each test validator stakes 1 SOL, so N active validators carry N SOL
+        // of active stake.
+        registry_with_stake(active, active.saturating_mul(1_000_000_000))
+    }
+
+    fn registry_with_stake(active: u64, total_active_stake: u64) -> ValidatorRegistry {
         ValidatorRegistry {
             authority: prog(),
             total_validators: active,
             active_validators: active,
             minimum_stake: 0,
+            total_active_stake,
         }
     }
 
     fn validator_data(wallet: Pubkey, is_active: bool) -> Vec<u8> {
+        validator_data_staked(wallet, is_active, 1_000_000_000)
+    }
+
+    fn validator_data_staked(wallet: Pubkey, is_active: bool, stake_amount: u64) -> Vec<u8> {
         let v = ValidatorAccount {
             validator: wallet,
-            stake_amount: 1_000_000_000,
+            stake_amount,
             reputation_score: 0,
             total_tasks_verified: 0,
             successful_verifications: 0,
@@ -235,5 +250,44 @@ mod tests {
         let a0b = AccountInfo::new(&pda0, false, false, &mut lp0b, &mut d0b, &p, false, 0);
         let accts = [s0, a0, s0b, a0b];
         assert!(verify_validator_quorum(&p, &registry(2), &accts).is_err());
+    }
+
+    #[test]
+    fn quorum_is_weighted_by_stake_not_head_count() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+
+        // Total active stake is 9 SOL, so the 2/3 threshold is 6 SOL. One 7-SOL
+        // validator alone clears it — a head-count scheme would have rejected a
+        // single signer.
+        let big = Pubkey::new_unique();
+        let (pda_big, _) = Pubkey::find_program_address(&[b"validator", big.as_ref()], &p);
+        let mut d_big = validator_data_staked(big, true, 7_000_000_000);
+        let (mut lb, mut lpb) = (0u64, 0u64);
+        let mut eb = [0u8; 0];
+        let s_big = AccountInfo::new(&big, true, false, &mut lb, &mut eb, &sys, false, 0);
+        let a_big = AccountInfo::new(&pda_big, false, false, &mut lpb, &mut d_big, &p, false, 0);
+        assert!(
+            verify_validator_quorum(&p, &registry_with_stake(3, 9_000_000_000), &[s_big, a_big])
+                .is_ok()
+        );
+
+        // A lone 1-SOL validator against the same 9-SOL total is below 2/3, so
+        // many tiny Sybil validators cannot forge the quorum one signature at a
+        // time.
+        let small = Pubkey::new_unique();
+        let (pda_small, _) = Pubkey::find_program_address(&[b"validator", small.as_ref()], &p);
+        let mut d_small = validator_data_staked(small, true, 1_000_000_000);
+        let (mut ls, mut lps) = (0u64, 0u64);
+        let mut es = [0u8; 0];
+        let s_small = AccountInfo::new(&small, true, false, &mut ls, &mut es, &sys, false, 0);
+        let a_small =
+            AccountInfo::new(&pda_small, false, false, &mut lps, &mut d_small, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(3, 9_000_000_000),
+            &[s_small, a_small]
+        )
+        .is_err());
     }
 }
