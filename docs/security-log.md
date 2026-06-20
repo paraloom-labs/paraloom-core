@@ -10,6 +10,14 @@ issue, email security@paraloom.network.
 
 ## 2026-06
 
+- **Bearer-token ingress auth compares in constant time** (in-house security
+  audit). The optional ingress bearer token was compared with `==`, which
+  short-circuits on the first differing byte and leaks a per-byte timing signal
+  on the shared secret. The token only authorizes still-proof-gated,
+  still-quorum-gated relaying — not a signing key — and defaults to no token on
+  a loopback interface, so no funds were at risk; the comparison is now
+  constant-time regardless. Devnet, pre-mainnet.
+
 - **A co-signer pins the settlement program to its own configuration** (in-house
   security audit). The co-signing validator rebuilt and signed the settlement
   message from the requester-supplied payload without checking that the

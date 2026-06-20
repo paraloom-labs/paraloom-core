@@ -27,8 +27,8 @@ pub fn token_from_config(configured: &str) -> IngressToken {
 }
 
 /// `Ok` if no token is configured, or the request carries the matching bearer
-/// token; otherwise `401`. The token gates a management endpoint (not a signing
-/// key), so a plain comparison is used.
+/// token; otherwise `401`. The token is compared in constant time so it cannot
+/// be recovered byte-by-byte through a timing side channel.
 pub fn check_bearer(headers: &HeaderMap, token: &IngressToken) -> Result<(), (StatusCode, String)> {
     let Some(expected) = token.as_ref() else {
         return Ok(());
@@ -38,12 +38,27 @@ pub fn check_bearer(headers: &HeaderMap, token: &IngressToken) -> Result<(), (St
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
-        Some(t) if t == expected.as_ref() => Ok(()),
+        Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => Err((
             StatusCode::UNAUTHORIZED,
             "missing or invalid bearer token".to_string(),
         )),
     }
+}
+
+/// Constant-time byte-slice equality. The length is not treated as secret (a
+/// bearer token's length is low-entropy), but the content comparison does not
+/// short-circuit on the first mismatch, so it does not leak the token through
+/// per-byte timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
