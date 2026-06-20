@@ -435,8 +435,14 @@ impl EventListener {
                         before,
                         until: cursor,
                         limit: Some(state.batch_limit),
+                        // Enumerate (and therefore credit) deposits only once
+                        // finalized. A `confirmed` slot is not rooted: a deposit
+                        // credited at confirmed, then orphaned by a fork-choice
+                        // switch, would leave the shielded pool believing more
+                        // value exists than the vault custodies. Finality costs a
+                        // few seconds of deposit latency for reorg safety.
                         commitment: Some(
-                            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                            solana_sdk::commitment_config::CommitmentConfig::finalized(),
                         ),
                     },
                 )
