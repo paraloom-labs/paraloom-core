@@ -2113,6 +2113,53 @@ impl Node {
             anyhow!("node has no withdrawal coordinator (bridge disabled or non-validator)")
         })?;
         let request_id = coordinator.start_verification(request.clone()).await?;
+
+        // The initiating node must vote on its OWN withdrawal. libp2p gossipsub
+        // does not echo a node's own published message, so the broadcast below
+        // never comes back to us via the receive handler — without this a solo
+        // anchor receives no eligible vote and the verification times out. Verify
+        // against the in-process pool (the same Arc the path server served the
+        // wallet's root from, so the root matches by construction) and submit our
+        // own vote, registering self into the validator set first so it is
+        // non-empty. With the 1/1 devnet quorum this completes consensus and the
+        // coordinator emits the approval the submitter task settles on-chain.
+        if let Some(pool) = &self.shielded_pool {
+            let self_id = self.node_info.id.clone();
+            let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
+            coordinator
+                .register_validator_with_wallet(self_id.clone(), wallet)
+                .await;
+            let vote = match self.verify_withdrawal_proof(&request, pool).await {
+                Ok(true) => {
+                    cache_verified(
+                        &self.verified_withdrawals,
+                        request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
+                    crate::consensus::withdrawal::VerificationVote::Valid
+                }
+                Ok(false) => crate::consensus::withdrawal::VerificationVote::Invalid {
+                    reason: "self-verify: proof verification failed".to_string(),
+                },
+                Err(e) => crate::consensus::withdrawal::VerificationVote::Invalid {
+                    reason: format!("self-verify error: {e}"),
+                },
+            };
+            let result = crate::consensus::withdrawal::WithdrawalVerificationResult {
+                request_id: request_id.clone(),
+                validator: self_id,
+                vote,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = coordinator.submit_result(result).await {
+                log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+            }
+        }
+
         // send_message broadcasts to the whole gossip topic — the peer
         // argument is ignored by the network layer — so every validator
         // receives the request to verify.
@@ -2317,6 +2364,35 @@ impl Node {
         };
         let expiration_slot =
             current_slot + self.settings.bridge.withdrawal_expiration_window_slots;
+
+        // Publish the live pool root on-chain before settling. The on-chain
+        // `withdraw` verifies the proof against `bridge_state.merkle_root`, but
+        // the deposit listener never advances it (`process_deposit` only calls
+        // `pool.deposit_asset`), so it is frozen at the Initialize-time root and
+        // the withdraw submit would fail `InvalidProof` against the root the
+        // wallet actually proved against. `update_merkle_root` is quorum-gated
+        // on-chain (`verify_validator_quorum`); this does NOT bypass the quorum —
+        // the anchor is a registered validator co-signing as quorum member.
+        //
+        // TODO(devnet-only, revert at ceremony — see #329): this uses the
+        // SINGLE-KEY client form (authority signs + quorum=[self]) which only
+        // satisfies the quorum because of the devnet quorum cap=1. The mainnet
+        // form is a full co-signing round over the real validator set (mirror
+        // `cosign_settlement_tx`), AND the root should be published on the
+        // deposit/settle path under full quorum rather than ad hoc here.
+        if let Some(pool) = &self.shielded_pool {
+            if let Some(wallet) = self.cosign_keypair.as_ref().map(|k| k.pubkey()) {
+                let root = pool.root().await;
+                bridge
+                    .lock()
+                    .await
+                    .update_merkle_root(root, &[wallet])
+                    .await
+                    .map_err(|e| {
+                        BridgeError::WithdrawalFailed(format!("publish merkle root: {e}"))
+                    })?;
+            }
+        }
 
         let tx = self
             .cosign_settlement_tx(&approved, blockhash, expiration_slot)
@@ -2565,10 +2641,17 @@ impl Node {
         // inputs with `bytes_to_field`, so a real proof never verified — it
         // only passed under the injected verifier above.
         let merkle_root = pool.root().await;
+        // WithdrawCircuitV2 binds the recipient via ext_data_hash and the asset
+        // id; derive them exactly as the on-chain program and the prover-wasm do
+        // so the off-chain verifier lifts the same five public inputs.
+        let ext_data_hash =
+            crate::privacy::proof::withdraw_ext_data_hash(&request.recipient, request.amount);
         let result = crate::privacy::ProofVerifier::verify_withdrawal_parts(
             &merkle_root,
             &request.nullifier,
             request.amount,
+            &ext_data_hash,
+            &crate::privacy::proof::NATIVE_SOL_ASSET_ID,
             &request.proof,
         );
         if let crate::privacy::VerificationResult::Invalid { reason } = &result {

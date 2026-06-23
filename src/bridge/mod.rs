@@ -166,6 +166,27 @@ impl Bridge {
             ))
         }
     }
+
+    /// Publish the live shielded-pool root on-chain via the quorum-gated
+    /// `update_merkle_root` instruction (#260), so the on-chain `withdraw`
+    /// verifies proofs against the same root the wallet proved against (the
+    /// deposit listener never advances `bridge_state.merkle_root`).
+    pub async fn update_merkle_root(
+        &self,
+        new_root: [u8; 32],
+        quorum_validators: &[solana_sdk::pubkey::Pubkey],
+    ) -> Result<String> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge
+                .program()
+                .update_merkle_root(new_root, quorum_validators)
+                .await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

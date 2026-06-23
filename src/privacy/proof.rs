@@ -10,8 +10,24 @@ use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// Native-SOL asset id (the v2 withdraw circuit binds the asset; native is the
+/// all-zero id, matching the on-chain `NATIVE_SOL` and the prover-wasm).
+pub const NATIVE_SOL_ASSET_ID: [u8; 32] = [0u8; 32];
+
+/// The withdrawal `ext_data_hash` public input bound by `WithdrawCircuitV2`:
+/// `sha256(recipient || amount.to_le_bytes())`. Byte-identical to the on-chain
+/// `withdraw_ext_data_hash` (`programs/paraloom/src/lib.rs`) and the wallet's
+/// prover-wasm, so the off-chain verifier lifts the same input the prover bound.
+pub fn withdraw_ext_data_hash(recipient: &[u8], amount: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(recipient);
+    hasher.update(amount.to_le_bytes());
+    hasher.finalize().into()
+}
 use thiserror::Error;
 
 /// True iff `b` is the *canonical* little-endian encoding of its own field
@@ -457,10 +473,15 @@ impl ProofVerifier {
             };
         }
 
+        // v2 layout: bind the recipient via ext_data_hash and native SOL as the
+        // asset (the on-chain settlement pays `to_public`).
+        let ext_data_hash = withdraw_ext_data_hash(&tx.to_public, tx.amount);
         Self::verify_withdrawal_parts(
             &tx.merkle_root,
             &tx.input_nullifier.0,
             tx.amount,
+            &ext_data_hash,
+            &NATIVE_SOL_ASSET_ID,
             &tx.zk_proof,
         )
     }
@@ -478,6 +499,8 @@ impl ProofVerifier {
         merkle_root: &[u8; 32],
         nullifier: &[u8; 32],
         amount: u64,
+        ext_data_hash: &[u8; 32],
+        asset_id: &[u8; 32],
         zk_proof: &[u8],
     ) -> VerificationResult {
         let verifying_key = match Self::get_verifying_key() {
@@ -514,10 +537,18 @@ impl ProofVerifier {
             };
         }
 
+        // WithdrawCircuitV2 (#293): five public inputs, in the exact order the
+        // shipped circuit and the on-chain `withdraw_verifier` read them —
+        // [merkle_root, nullifier, amount, ext_data_hash, asset_id]. arkworks
+        // Groth16 requires `public_inputs.len() == IC.len() - 1`, so supplying
+        // the v1 three-input layout against the v2 verifying key fails every
+        // real proof.
         let public_inputs = vec![
             Fr::from_le_bytes_mod_order(merkle_root),
             Fr::from_le_bytes_mod_order(nullifier),
             Fr::from(amount),
+            Fr::from_le_bytes_mod_order(ext_data_hash),
+            Fr::from_le_bytes_mod_order(asset_id),
         ];
 
         match Groth16ProofSystem::verify(verifying_key, &public_inputs, &proof) {
