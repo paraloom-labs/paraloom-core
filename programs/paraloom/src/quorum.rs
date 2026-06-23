@@ -18,11 +18,22 @@
 use crate::{BridgeError, ValidatorAccount, ValidatorRegistry};
 use anchor_lang::prelude::*;
 
+/// TODO(devnet-only, revert at ceremony redeploy — see #329): cap the on-chain
+/// quorum at this value so the single live anchor (the only wallet-bearing
+/// co-signer devnet currently has) can self-settle without mustering a real 2/3
+/// supermajority. The real Sybil-resistant 2/3 stake-weighted quorum lands with
+/// #329 at the ceremony redeploy. MUST be removed before mainnet.
+const DEVNET_QUORUM_CAP: u64 = 1;
+
 /// BFT supermajority threshold: strictly more than 2/3 of the active set,
 /// i.e. `floor(2N/3) + 1`. With 0 active validators the threshold is 1, so no
 /// settlement can be authorized by an empty set.
+///
+/// NOTE: currently capped by [`DEVNET_QUORUM_CAP`] (devnet-only hack — see the
+/// const's TODO).
 pub fn quorum_threshold(active_validators: u64) -> u64 {
-    active_validators.saturating_mul(2) / 3 + 1
+    let bft = active_validators.saturating_mul(2) / 3 + 1;
+    bft.min(DEVNET_QUORUM_CAP)
 }
 
 /// Verify that a supermajority of registered, active validators co-signed this
@@ -117,15 +128,16 @@ mod tests {
 
     #[test]
     fn threshold_is_bft_supermajority() {
-        // floor(2N/3) + 1 — strictly more than two thirds.
+        // TODO(devnet-only, revert at ceremony redeploy — see #329): while
+        // DEVNET_QUORUM_CAP == 1 the threshold is floored to 1 regardless of the
+        // active set. Restore these asserts to the `floor(2N/3) + 1` values when
+        // the cap is removed:
+        //   quorum_threshold(2)==2, (3)==3, (4)==3, (5)==4, (7)==5, (10)==7
         assert_eq!(quorum_threshold(0), 1);
         assert_eq!(quorum_threshold(1), 1);
-        assert_eq!(quorum_threshold(2), 2);
-        assert_eq!(quorum_threshold(3), 3);
-        assert_eq!(quorum_threshold(4), 3);
-        assert_eq!(quorum_threshold(5), 4);
-        assert_eq!(quorum_threshold(7), 5);
-        assert_eq!(quorum_threshold(10), 7);
+        assert_eq!(quorum_threshold(2), 1);
+        assert_eq!(quorum_threshold(10), 1);
+        assert_eq!(quorum_threshold(22), 1);
     }
 
     #[test]

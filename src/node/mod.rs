@@ -1282,7 +1282,13 @@ impl Node {
         // Built only on bridge-enabled validator/bridge nodes; the
         // receiver is held until run() spawns the submitter task.
         let (withdrawal_coordinator, approval_rx) = if runs_bridge {
-            let (coord, rx) = WithdrawalVerificationCoordinator::new_with_approvals();
+            let (mut coord, rx) = WithdrawalVerificationCoordinator::new_with_approvals();
+            // TODO(devnet-only, revert at ceremony redeploy — see #329): drop the
+            // consensus reputation floor to 0 so validators seeded from live
+            // connections (which start at base reputation and have not yet earned
+            // standing) can have their votes counted on devnet. Restore
+            // DEFAULT_MIN_REPUTATION_FOR_CONSENSUS before mainnet.
+            coord.set_min_reputation_for_consensus(0);
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
