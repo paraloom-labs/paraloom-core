@@ -1289,6 +1289,11 @@ impl Node {
             // standing) can have their votes counted on devnet. Restore
             // DEFAULT_MIN_REPUTATION_FOR_CONSENSUS before mainnet.
             coord.set_min_reputation_for_consensus(0);
+            // TODO(devnet-only, revert at ceremony redeploy — see #329): require
+            // only 1 eligible voter so the anchor self-settles on devnet without
+            // waiting for a 7-of-N cohort to reconnect after a restart. Restore
+            // DEFAULT_MIN/TOTAL_VALIDATORS_FOR_CONSENSUS before mainnet.
+            coord.set_consensus_thresholds(1, 1);
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
