@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1576,6 +1576,52 @@ impl Node {
                 Arc::clone(&self.network).start_kad_bootstrap_refresh(Duration::from_secs(300));
             *self.kad_refresh.lock().await = Some(handle);
             info!("Kademlia bootstrap-refresh task spawned (interval 300s)");
+        }
+
+        // Spawn the consensus validator-set reconciler. A peer announces its
+        // NodeInfo to the consensus coordinators exactly once, at startup, over a
+        // best-effort gossipsub publish that races the topic-mesh GRAFT and is
+        // never re-sent (see the `Message::Discovery` handler). So a validator
+        // that connected before its single Discovery landed — or any validator
+        // once this coordinator restarts — never enters the in-memory consensus
+        // set, and `start_verification` returns "No validators available" despite
+        // live connections. Periodically reconcile the withdrawal/transfer
+        // coordinators against the currently-connected libp2p peers so the
+        // consensus set tracks real connectivity, independent of gossip timing.
+        // Peers added here carry no wallet; a wallet advertised via Discovery is
+        // preserved (registration is add-if-absent) and is what the on-chain
+        // (#260) co-sign step uses.
+        if self.withdrawal_coordinator.is_some() || self.transfer_coordinator.is_some() {
+            let network = Arc::clone(&self.network);
+            let withdrawal = self.withdrawal_coordinator.clone();
+            let transfer = self.transfer_coordinator.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                let mut registered: HashSet<NodeId> = HashSet::new();
+                loop {
+                    ticker.tick().await;
+                    let connected: HashSet<NodeId> =
+                        network.connected_peers().await.into_iter().collect();
+                    for peer in connected.difference(&registered) {
+                        if let Some(w) = &withdrawal {
+                            w.register_validator_with_wallet(peer.clone(), None).await;
+                        }
+                        if let Some(t) = &transfer {
+                            t.register_validator_with_wallet(peer.clone(), None).await;
+                        }
+                    }
+                    for peer in registered.difference(&connected) {
+                        if let Some(w) = &withdrawal {
+                            w.unregister_validator(peer).await;
+                        }
+                        if let Some(t) = &transfer {
+                            t.unregister_validator(peer).await;
+                        }
+                    }
+                    registered = connected;
+                }
+            });
+            info!("Consensus validator-set reconciler spawned (interval 30s)");
         }
 
         // Spawn coordinator-HA loops based on the configured role
