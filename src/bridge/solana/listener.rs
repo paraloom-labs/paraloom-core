@@ -196,6 +196,34 @@ impl EventListener {
         Ok(())
     }
 
+    /// True when an RPC error reports the `until`/`before` boundary signature as
+    /// unknown (JSON-RPC error -32020). This happens when the persisted cursor
+    /// ages out of a provider's signature history: the boundary can never be
+    /// satisfied again, so retrying it forever would stall the listener. The
+    /// caller drops the cursor and cold-starts instead.
+    fn is_stale_until_cursor(e: &BridgeError) -> bool {
+        matches!(e, BridgeError::SolanaRpc(msg) if msg.contains("-32020"))
+    }
+
+    /// Drop the scan cursor — in memory and on disk — so the next fetch resumes
+    /// from the latest signatures (a cold start). Used when the cursor ages out
+    /// of the RPC's history and can no longer serve as an `until` boundary.
+    async fn clear_cursor(state: &PollerState) {
+        *state.last_signature.write().await = None;
+        if let Some(path) = &state.cursor_path {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "failed to remove stale deposit cursor at {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
     /// Read the persisted scan cursor. A missing file (first run) or an
     /// unparsable one yields `None` so the listener cold-starts rather than
     /// failing — a corrupt cursor is recoverable, a refusal to start is not.
@@ -426,14 +454,22 @@ impl EventListener {
         let mut signatures = Vec::new();
         let mut before: Option<Signature> = None;
         let mut pages = 0usize;
+        // The cursor is the `until` boundary. If it ages out of the RPC's
+        // queryable history (some providers retain devnet signatures only
+        // briefly), the RPC rejects it as a boundary with a "Transaction not
+        // found" (-32020) error, and every poll fails forever — the listener
+        // stalls and stops indexing deposits. Detect that, drop the stale
+        // cursor, and resume from the latest page (a cold start) so the listener
+        // self-heals. `effective_cursor` may be reset to `None` mid-loop.
+        let mut effective_cursor = cursor;
         loop {
-            let batch = state
+            let batch = match state
                 .rpc
                 .get_signatures_for_address_with_config(
                     &state.program_id,
                     GetConfirmedSignaturesForAddress2Config {
                         before,
-                        until: cursor,
+                        until: effective_cursor,
                         limit: Some(state.batch_limit),
                         // Enumerate (and therefore credit) deposits only once
                         // finalized. A `confirmed` slot is not rooted: a deposit
@@ -446,7 +482,25 @@ impl EventListener {
                         ),
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(batch) => batch,
+                Err(e) if effective_cursor.is_some() && Self::is_stale_until_cursor(&e) => {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "deposit listener cursor {} is no longer resolvable by the RPC ({}); resetting it and resuming from the latest signatures",
+                        effective_cursor.expect("guarded by effective_cursor.is_some()"),
+                        e
+                    );
+                    Self::clear_cursor(state).await;
+                    effective_cursor = None;
+                    before = None;
+                    pages = 0;
+                    signatures.clear();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let batch_len = batch.len();
             if batch_len == 0 {
                 break;
@@ -465,7 +519,7 @@ impl EventListener {
                 break;
             }
             // Cold start: take only the newest page, do not walk all history.
-            if cursor.is_none() {
+            if effective_cursor.is_none() {
                 break;
             }
             if pages >= MAX_SIGNATURE_PAGES {
@@ -634,6 +688,88 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
+    }
+
+    /// When the persisted cursor ages out of the RPC's history, the boundary
+    /// `getSignaturesForAddress(until = cursor)` call fails with -32020
+    /// "Transaction not found" *forever* — the listener would stall and stop
+    /// indexing deposits. `fetch_events` must detect that, drop the stale cursor,
+    /// and cold-start from the latest page so deposits keep flowing. Models the
+    /// real Helius-devnet failure that stalled the anchor for ~3 days.
+    #[tokio::test]
+    async fn fetch_events_self_heals_when_cursor_ages_out() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let stale = Signature::new_unique();
+        let fresh = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        // First page (the `until = stale` boundary call) is rejected: the RPC no
+        // longer knows the cursor signature. Second page (the cold-start retry,
+        // `until = None`) returns a real deposit.
+        {
+            let mut pages = mock.get_signatures_pages.lock().unwrap();
+            pages.push_back(Err(BridgeError::SolanaRpc(format!(
+                "getSignaturesForAddress: RPC response error -32020: Transaction {stale} not found"
+            ))));
+            pages.push_back(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: fresh.to_string(),
+                slot: 9,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        }
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(synth_deposit_tx(
+            fresh,
+            9,
+            &program_id,
+            &depositor,
+            2_000,
+            [7u8; 32],
+            [13u8; 32],
+        )));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+        *state.last_signature.write().await = Some(stale);
+
+        let events = EventListener::fetch_events(&state, Some(stale))
+            .await
+            .expect("a stale cursor must self-heal, not propagate the error");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "the cold-start retry must recover the deposit"
+        );
+        assert_eq!(
+            *state.last_signature.read().await,
+            None,
+            "the stale cursor must be cleared so a restart does not reload it"
+        );
+    }
+
+    /// A non-cursor RPC failure (one that is not the -32020 stale-boundary case)
+    /// must still propagate: self-healing is scoped to the aged-out cursor, not a
+    /// blanket "swallow every RPC error".
+    #[tokio::test]
+    async fn fetch_events_propagates_non_cursor_rpc_errors() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() = Some(Err(BridgeError::SolanaRpc(
+            "getSignaturesForAddress: connection reset".to_string(),
+        )));
+        let state = make_state(mock);
+        let result = EventListener::fetch_events(&state, Some(Signature::new_unique())).await;
+        assert!(
+            result.is_err(),
+            "a non-cursor RPC error must not be swallowed"
+        );
     }
 
     /// `update_lag_metric` writes `current_slot - last_processed_slot`
