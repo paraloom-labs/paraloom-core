@@ -45,6 +45,7 @@ fn request(id: &str) -> WithdrawalVerificationRequest {
         proof: vec![1u8; 192],
         fee: 0,
         timestamp: 0,
+        prover_root: [0u8; 32],
     }
 }
 

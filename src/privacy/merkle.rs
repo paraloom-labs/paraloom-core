@@ -16,6 +16,16 @@ use tokio::sync::RwLock;
 pub const DEFAULT_TREE_DEPTH: usize = 32;
 
 /// Merkle tree for commitments
+/// How many recent roots the tree remembers for withdrawal/transfer proof
+/// verification. A proof is built against the root the prover observed (served
+/// by the path server); by the time a validator verifies it, more deposits may
+/// have advanced the tree past that root. Accepting any of the last
+/// `ROOT_HISTORY_LEN` roots lets independently-advancing validators verify the
+/// same proof without holding byte-identical trees, the way Tornado-style pools
+/// keep a roots ring buffer. Double-spend is still prevented by the nullifier,
+/// independent of which historical root a proof names.
+pub const ROOT_HISTORY_LEN: usize = 256;
+
 pub struct MerkleTree {
     /// Tree depth
     depth: usize,
@@ -23,6 +33,9 @@ pub struct MerkleTree {
     leaves: Arc<RwLock<Vec<[u8; 32]>>>,
     /// Cached root
     cached_root: Arc<RwLock<Option<[u8; 32]>>>,
+    /// Bounded history of recently-computed roots (newest at the back), for
+    /// [`Self::knows_root`]. Capped at [`ROOT_HISTORY_LEN`].
+    recent_roots: Arc<RwLock<std::collections::VecDeque<[u8; 32]>>>,
     /// Optional persistent storage
     storage: Option<Arc<PrivacyStorage>>,
 }
@@ -39,6 +52,7 @@ impl MerkleTree {
             depth,
             leaves: Arc::new(RwLock::new(Vec::new())),
             cached_root: Arc::new(RwLock::new(None)),
+            recent_roots: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             storage: None,
         }
     }
@@ -52,10 +66,17 @@ impl MerkleTree {
         // Load cached root if available
         let cached_root = storage.get_merkle_root()?;
 
+        // Seed the recent-roots window with the reloaded tip so a proof built
+        // against the just-restored root verifies immediately after a restart.
+        let recent_roots = match cached_root {
+            Some(r) => std::collections::VecDeque::from([r]),
+            None => std::collections::VecDeque::new(),
+        };
         Ok(MerkleTree {
             depth: DEFAULT_TREE_DEPTH,
             leaves: Arc::new(RwLock::new(leaves)),
             cached_root: Arc::new(RwLock::new(cached_root)),
+            recent_roots: Arc::new(RwLock::new(recent_roots)),
             storage: Some(storage),
         })
     }
@@ -140,6 +161,20 @@ impl MerkleTree {
         // Cache it
         let mut cached_root = self.cached_root.write().await;
         *cached_root = Some(root);
+        drop(cached_root);
+
+        // Record this root in the bounded history so a proof naming it still
+        // verifies after later deposits advance the tree (see [`knows_root`] and
+        // [`ROOT_HISTORY_LEN`]). Skip consecutive duplicates.
+        {
+            let mut recent = self.recent_roots.write().await;
+            if recent.back() != Some(&root) {
+                recent.push_back(root);
+                while recent.len() > ROOT_HISTORY_LEN {
+                    recent.pop_front();
+                }
+            }
+        }
 
         // Persist root to storage if available. Unlike leaf inserts,
         // root persistence is a cache: on restart the tree rebuilds the
@@ -159,6 +194,20 @@ impl MerkleTree {
         }
 
         root
+    }
+
+    /// Whether `root` is the current tip or one of the last [`ROOT_HISTORY_LEN`]
+    /// roots this tree computed. A verifier accepts a withdrawal/transfer proof
+    /// built against any such root, so nodes whose trees have advanced by
+    /// different amounts can still verify the same proof without holding
+    /// byte-identical trees. Computing the current root first guarantees the
+    /// live tip is always considered even before it entered the history.
+    pub async fn knows_root(&self, root: &[u8; 32]) -> bool {
+        if &self.root().await == root {
+            return true;
+        }
+        let recent = self.recent_roots.read().await;
+        recent.iter().any(|r| r == root)
     }
 
     /// The root the tree WOULD have after appending `commitments`, computed
@@ -336,6 +385,7 @@ impl Clone for MerkleTree {
             depth: self.depth,
             leaves: Arc::clone(&self.leaves),
             cached_root: Arc::clone(&self.cached_root),
+            recent_roots: Arc::clone(&self.recent_roots),
             storage: self.storage.clone(),
         }
     }
@@ -538,5 +588,51 @@ mod tests {
         // Path for nonexistent leaf
         let path = tree.path(10).await;
         assert!(path.is_none());
+    }
+
+    #[tokio::test]
+    async fn knows_root_recognizes_recent_roots_not_strangers() {
+        let tree = MerkleTree::new();
+
+        // Capture the root at each tree state as deposits advance it.
+        let r0 = tree.root().await;
+        tree.insert(&Commitment([1u8; 32])).await.unwrap();
+        let r1 = tree.root().await;
+        tree.insert(&Commitment([2u8; 32])).await.unwrap();
+        let r2 = tree.root().await;
+
+        // Each distinct state advanced the root.
+        assert_ne!(r0, r1);
+        assert_ne!(r1, r2);
+
+        // A proof built against any of these roots is still recognized after the
+        // tree advanced past it — this is what lets a validator on a divergent
+        // tip verify a proof a slower peer built earlier.
+        assert!(tree.knows_root(&r0).await, "empty-tree root must be known");
+        assert!(tree.knows_root(&r1).await, "prior root must be known");
+        assert!(tree.knows_root(&r2).await, "current tip must be known");
+
+        // A root the tree never computed is rejected.
+        assert!(!tree.knows_root(&[0xAB; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn recent_roots_history_is_bounded() {
+        let tree = MerkleTree::new();
+        // Advance the tree well past the history bound; the oldest roots fall
+        // out of the window while recent ones stay known.
+        let early = tree.root().await;
+        for i in 0..(ROOT_HISTORY_LEN as u32 + 10) {
+            let mut leaf = [0u8; 32];
+            leaf[..4].copy_from_slice(&i.to_le_bytes());
+            tree.insert(&Commitment(leaf)).await.unwrap();
+            tree.root().await;
+        }
+        let tip = tree.root().await;
+        assert!(tree.knows_root(&tip).await, "tip stays known");
+        assert!(
+            !tree.knows_root(&early).await,
+            "a root older than the history window is forgotten"
+        );
     }
 }

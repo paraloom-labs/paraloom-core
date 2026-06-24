@@ -73,6 +73,18 @@ pub struct WithdrawalVerificationRequest {
 
     /// Timestamp when request was created
     pub timestamp: u64,
+
+    /// The Merkle root the prover built this proof against — i.e. the root the
+    /// path server served when the wallet fetched its note's path. A verifier
+    /// checks the proof against THIS root (not its own current tip) and
+    /// separately confirms the root is one its pool computed recently
+    /// ([`crate::privacy::ShieldedPool::knows_root`]), so validators whose trees
+    /// have advanced by different amounts still accept the same proof.
+    /// `#[serde(default)]` (all-zero) keeps wire-compatibility with senders that
+    /// predate this field; the initiating node fills its own current root in
+    /// that case (see `Node::initiate_withdrawal_verification`).
+    #[serde(default)]
+    pub prover_root: [u8; 32],
 }
 
 impl WithdrawalVerificationRequest {
@@ -88,6 +100,9 @@ impl WithdrawalVerificationRequest {
             proof: request.proof.clone(),
             fee: request.fee,
             timestamp,
+            // The bridge-side request carries no prover root; the initiating
+            // node fills its own current root before broadcasting/verifying.
+            prover_root: [0u8; 32],
         }
     }
 }
@@ -857,6 +872,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
 
         let consensus = WithdrawalConsensus::new(request);
@@ -880,6 +896,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         {
             let mut pending = coordinator.pending.write().await;
@@ -906,6 +923,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
 
         let consensus = WithdrawalConsensus::new(request);
@@ -947,6 +965,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
 
         let consensus = WithdrawalConsensus::new(request);
@@ -1061,6 +1080,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
 
         let request_id = coordinator.start_verification(request).await.unwrap();
@@ -1083,6 +1103,7 @@ mod tests {
             proof: vec![7u8; 64],
             fee: 9,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         coordinator
             .start_verification(request.clone())
@@ -1145,6 +1166,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
 
         let consensus = WithdrawalConsensus::new(request);
@@ -1177,6 +1199,7 @@ mod tests {
             proof: vec![0u8; 32],
             fee: 0,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         let consensus = WithdrawalConsensus::new(request);
         let validator = NodeId(vec![1]);
@@ -1242,6 +1265,7 @@ mod tests {
                 proof: vec![0u8; 32],
                 fee: 0,
                 timestamp: 0,
+                prover_root: [0u8; 32],
             })
             .await
             .unwrap();
@@ -1313,6 +1337,7 @@ mod tests {
             proof: vec![0u8; 32],
             fee: 0,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         let consensus = WithdrawalConsensus::new(request);
 
@@ -1417,6 +1442,7 @@ mod tests {
             proof: vec![0u8; 32],
             fee: 0,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         coordinator
             .start_verification(request.clone())
@@ -1531,6 +1557,7 @@ mod tests {
             proof: vec![0u8; 32],
             fee: 0,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         coordinator
             .start_verification(request.clone())

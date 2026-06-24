@@ -51,6 +51,7 @@ async fn test_multi_validator_consensus_success() {
         proof: vec![0u8; 192], // Mock proof
         fee: 1000,
         timestamp: 1234567890,
+        prover_root: [0u8; 32],
     };
 
     // Start verification
@@ -120,6 +121,7 @@ async fn test_multi_validator_consensus_rejection() {
         proof: vec![0u8; 192],
         fee: 1000,
         timestamp: 1234567890,
+        prover_root: [0u8; 32],
     };
 
     // Start verification
@@ -185,6 +187,7 @@ async fn test_byzantine_fault_tolerance() {
         proof: vec![0u8; 192],
         fee: 1000,
         timestamp: 1234567890,
+        prover_root: [0u8; 32],
     };
 
     coordinator
@@ -250,6 +253,7 @@ async fn test_reputation_updates_after_consensus() {
         proof: vec![0u8; 192],
         fee: 1000,
         timestamp: 1234567890,
+        prover_root: [0u8; 32],
     };
 
     coordinator
@@ -381,6 +385,7 @@ async fn test_timeout_handling() {
         proof: vec![0u8; 192],
         fee: 1000,
         timestamp: 1234567890,
+        prover_root: [0u8; 32],
     };
 
     coordinator
@@ -433,6 +438,7 @@ async fn test_multiple_concurrent_withdrawals() {
             proof: vec![0u8; 192],
             fee: 1000,
             timestamp: 1234567890,
+            prover_root: [0u8; 32],
         },
         WithdrawalVerificationRequest {
             request_id: "withdrawal-B".to_string(),
@@ -442,6 +448,7 @@ async fn test_multiple_concurrent_withdrawals() {
             proof: vec![0u8; 192],
             fee: 1000,
             timestamp: 1234567891,
+            prover_root: [0u8; 32],
         },
         WithdrawalVerificationRequest {
             request_id: "withdrawal-C".to_string(),
@@ -451,6 +458,7 @@ async fn test_multiple_concurrent_withdrawals() {
             proof: vec![0u8; 192],
             fee: 1000,
             timestamp: 1234567892,
+            prover_root: [0u8; 32],
         },
     ];
 
@@ -518,6 +526,7 @@ async fn test_reputation_bounds() {
             proof: vec![0u8; 192],
             fee: 1000,
             timestamp: 1234567890,
+            prover_root: [0u8; 32],
         };
 
         coordinator
@@ -554,6 +563,7 @@ async fn test_reputation_bounds() {
             proof: vec![0u8; 192],
             fee: 1000,
             timestamp: 1234567890,
+            prover_root: [0u8; 32],
         };
 
         coordinator
