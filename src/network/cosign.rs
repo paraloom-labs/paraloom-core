@@ -41,6 +41,11 @@ pub enum SettlementKind {
     Withdrawal,
     /// A `shielded_transfer` settlement (nullify-and-re-commit, no funds move).
     Transfer,
+    /// An `update_merkle_root` settlement (#260): publish the live pool root
+    /// on-chain under the validator quorum so a subsequent withdraw verifies
+    /// against it. Moves no funds; a co-signer signs only after confirming the
+    /// proposed root is one its own pool computed.
+    UpdateMerkleRoot,
 }
 
 /// Leader → validator: please co-sign this settlement transaction.

@@ -945,6 +945,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             &expected_program_id,
             &self.verified_withdrawals,
             &self.verified_transfers,
+            self.shielded_pool.as_ref(),
             request,
         )
         .await)
@@ -961,6 +962,7 @@ async fn cosign_settlement(
     expected_program_id: &Pubkey,
     verified_withdrawals: &Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
     verified_transfers: &Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
+    shielded_pool: Option<&Arc<crate::privacy::pool::ShieldedPool>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -1022,6 +1024,22 @@ async fn cosign_settlement(
                     && req.output_commitments == *output_commitments
                     && req.new_merkle_root == *new_merkle_root
             })
+        }
+        (
+            SettlementKind::UpdateMerkleRoot,
+            SettlementParams::UpdateMerkleRoot { new_merkle_root },
+        ) => {
+            // Co-sign a root publish only if the proposed root is one our OWN
+            // pool computed (current tip or a recent root) — so a malicious
+            // leader cannot muster the quorum to publish a forged root that a
+            // fabricated-note withdrawal could then verify against. Unlike the
+            // withdrawal/transfer arms this is keyed on pool state, not a cached
+            // request id: any node can propose the live root and every honest
+            // co-signer independently agrees it is real.
+            match shielded_pool {
+                Some(pool) => pool.knows_root(new_merkle_root).await,
+                None => false,
+            }
         }
         _ => false,
     };
@@ -2807,6 +2825,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cosign_update_merkle_root_only_for_a_root_the_pool_knows() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+
+        // A pool whose live root we will propose, plus a stranger root we won't.
+        let pool = Arc::new(crate::privacy::pool::ShieldedPool::new());
+        let known_root = pool.root().await;
+        let stranger_root = [0xABu8; 32];
+
+        let payload = |root: [u8; 32]| CoSignPayload {
+            program_id: configured_program().to_bytes(),
+            authority: kp.pubkey().to_bytes(),
+            bridge_vault: [0u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![kp.pubkey().to_bytes()],
+            params: SettlementParams::UpdateMerkleRoot {
+                new_merkle_root: root,
+            },
+        };
+
+        // A root our pool actually computed → co-signed.
+        let ok = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &wds,
+            &trs,
+            Some(&pool),
+            cosign_req("r1", SettlementKind::UpdateMerkleRoot, &payload(known_root)),
+        )
+        .await;
+        assert!(
+            ok.signature.is_some(),
+            "must co-sign a root the pool knows (no cached request id needed)"
+        );
+
+        // A root the pool never computed → declined, even though it is otherwise
+        // a well-formed request. This is the guard against a leader mustering the
+        // quorum to publish a forged root.
+        let no = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &wds,
+            &trs,
+            Some(&pool),
+            cosign_req(
+                "r2",
+                SettlementKind::UpdateMerkleRoot,
+                &payload(stranger_root),
+            ),
+        )
+        .await;
+        assert!(no.signature.is_none(), "must not co-sign an unknown root");
+
+        // No pool wired (non-bridge node) → cannot verify, so it declines.
+        let nopool = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &wds,
+            &trs,
+            None,
+            cosign_req("r3", SettlementKind::UpdateMerkleRoot, &payload(known_root)),
+        )
+        .await;
+        assert!(nopool.signature.is_none());
+    }
+
+    #[tokio::test]
     async fn cosign_signs_a_settlement_we_verified() {
         let kp = Arc::new(Keypair::new());
         let wds = Arc::new(Mutex::new(HashMap::new()));
@@ -2823,6 +2909,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            None,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
         .await;
@@ -2857,6 +2944,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            None,
             cosign_req("w1", SettlementKind::Withdrawal, &tampered),
         )
         .await;
@@ -2879,6 +2967,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            None,
             cosign_req("nope", SettlementKind::Withdrawal, &payload),
         )
         .await;
@@ -2893,6 +2982,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            None,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
         .await;
@@ -2924,6 +3014,7 @@ mod tests {
             &Pubkey::new_from_array([2u8; 32]),
             &wds,
             &trs,
+            None,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
         .await;

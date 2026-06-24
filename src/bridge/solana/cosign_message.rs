@@ -18,7 +18,10 @@
 //! amount past a validator: the validator only ever signs a message it built
 //! from parameters it verified.
 
-use super::instructions::{create_shielded_transfer_instruction, create_withdraw_instruction};
+use super::instructions::{
+    create_shielded_transfer_instruction, create_update_merkle_root_instruction,
+    create_withdraw_instruction,
+};
 use crate::bridge::{BridgeError, Result};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{hash::Hash, message::Message, pubkey::Pubkey};
@@ -44,6 +47,11 @@ pub enum SettlementParams {
         /// 256-byte alt_bn128 wire proof.
         proof: Vec<u8>,
     },
+    /// An `update_merkle_root` settlement (#260): publish the live shielded-pool
+    /// root on-chain so a subsequent `withdraw` verifies against the same root
+    /// the prover used. Quorum-gated on-chain exactly like the others, so it is
+    /// co-signed by the validator set rather than the authority alone.
+    UpdateMerkleRoot { new_merkle_root: [u8; 32] },
 }
 
 /// Everything needed to rebuild the settlement transaction message a co-signer
@@ -156,6 +164,14 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
             proof.clone(),
             &quorum,
         )?,
+        SettlementParams::UpdateMerkleRoot { new_merkle_root } => {
+            create_update_merkle_root_instruction(
+                &program_id,
+                &authority,
+                *new_merkle_root,
+                &quorum,
+            )?
+        }
     };
 
     let blockhash = Hash::new_from_array(payload.blockhash);
