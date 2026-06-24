@@ -262,6 +262,16 @@ impl NetworkManager {
         const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 1024 * 1024;
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
+            // Flood-publish so a message is sent to every peer subscribed to the
+            // topic, not only the local mesh peers. The mesh takes a few
+            // heartbeats to form after a connection, so without this the first
+            // Discovery/vote a freshly connected node publishes can be dropped
+            // before its mesh is grafted — exactly the window in which a late
+            // joiner or restarted node needs its NodeInfo+wallet to propagate.
+            .flood_publish(true)
+            // Tighten the mesh maintenance interval (default 1s already, but pin
+            // it) so GRAFT/PRUNE and the flood set converge quickly.
+            .heartbeat_interval(std::time::Duration::from_secs(1))
             .build()
             .map_err(|e| anyhow!("Failed to build gossipsub config: {}", e))?;
 
