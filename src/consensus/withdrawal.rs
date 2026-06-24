@@ -142,6 +142,11 @@ pub struct ApprovedWithdrawal {
     pub recipient: [u8; 32],
     pub proof: Vec<u8>,
     pub fee: u64,
+    /// The Merkle root the proof was built against (from the request). The settle
+    /// path publishes THIS root on-chain (via the co-signed update_merkle_root
+    /// round) before the withdraw, so the on-chain verify runs against the same
+    /// root — not whatever the pool's tip happens to be at settle time.
+    pub prover_root: [u8; 32],
 }
 
 /// Consensus state for a withdrawal verification.
@@ -640,6 +645,7 @@ impl WithdrawalVerificationCoordinator {
                     recipient: req.recipient,
                     proof: req.proof.clone(),
                     fee: req.fee,
+                    prover_root: req.prover_root,
                 };
                 // A closed receiver just means no submitter is listening
                 // (e.g. a non-bridge node); that is not an error here.

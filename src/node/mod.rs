@@ -2378,6 +2378,70 @@ impl Node {
         .map_err(|e| anyhow!("co-signing round failed: {e}"))
     }
 
+    /// Assemble the co-signed multi-sig `update_merkle_root` transaction (#260):
+    /// publish `new_merkle_root` on-chain under the validator quorum so a
+    /// subsequent `withdraw` verifies against it (the deposit listener never
+    /// advances `bridge_state.merkle_root`). The co-signer set is the registered
+    /// validators that advertised a wallet — this root publish is not tied to one
+    /// approved request, and every co-signer independently confirms the root
+    /// against its own pool before signing (see `cosign_settlement`).
+    pub async fn cosign_update_merkle_root_tx(
+        &self,
+        new_merkle_root: [u8; 32],
+        blockhash: [u8; 32],
+    ) -> Result<Transaction> {
+        let leader = self
+            .cosign_keypair
+            .as_ref()
+            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
+        let coordinator = self
+            .withdrawal_coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow!("no withdrawal coordinator"))?;
+
+        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
+            .map_err(|e| anyhow!("invalid program id: {e}"))?;
+        // build_settlement_message ignores the vault for this settlement kind;
+        // derive it anyway so the payload shape matches the withdrawal round.
+        let (vault, _) = derive_bridge_vault(&program_id);
+
+        let self_id = self.node_info.id.clone();
+        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+        for v in coordinator.get_validators_by_weight().await {
+            if v.node_id == self_id {
+                continue;
+            }
+            if let Some(pubkey) = v.wallet_pubkey.and_then(|w| w.parse::<Pubkey>().ok()) {
+                peers.push((pubkey, v.node_id));
+            }
+        }
+        let mut quorum_wallets = vec![leader.pubkey()];
+        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+        let threshold = quorum_wallets.len();
+
+        let params = SettlementParams::UpdateMerkleRoot { new_merkle_root };
+        let request_id = format!("update-root-{}", hex::encode(new_merkle_root));
+        let network = self.network.clone();
+        cosign_round::run_cosign_round(
+            leader,
+            program_id,
+            vault,
+            blockhash,
+            &request_id,
+            SettlementKind::UpdateMerkleRoot,
+            params,
+            quorum_wallets,
+            &peers,
+            threshold,
+            |peer, request| {
+                let network = network.clone();
+                async move { network.send_cosign_request(peer, request).await.ok() }
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("update_merkle_root co-signing round failed: {e}"))
+    }
+
     /// Settle a quorum-approved withdrawal via the #260 co-signing path: gather
     /// the approving validators' signatures into one multi-sig transaction and
     /// submit it, instead of signing single-key. The blockhash baked into the
@@ -2401,6 +2465,25 @@ impl Node {
         };
         let expiration_slot =
             current_slot + self.settings.bridge.withdrawal_expiration_window_slots;
+
+        // Publish the root the proof was built against, via the co-signed
+        // update_merkle_root round, BEFORE the withdraw — the on-chain withdraw
+        // verifies the proof against bridge_state.merkle_root, which the deposit
+        // listener never advances, so without this it would verify against a
+        // stale root. Submit (and confirm) it first so the withdraw that follows
+        // sees the updated root. Skipped when the prover root is unset (an older
+        // wallet that didn't send its root): the on-chain root is then left as-is.
+        if approved.prover_root != [0u8; 32] {
+            let root_tx = self
+                .cosign_update_merkle_root_tx(approved.prover_root, blockhash)
+                .await
+                .map_err(|e| BridgeError::WithdrawalFailed(format!("root publish round: {e}")))?;
+            bridge
+                .lock()
+                .await
+                .submit_signed_transaction(&root_tx)
+                .await?;
+        }
 
         let tx = self
             .cosign_settlement_tx(&approved, blockhash, expiration_slot)
@@ -3032,6 +3115,7 @@ mod tests {
             recipient: [0u8; 32],
             proof: Vec::new(),
             fee: 0,
+            prover_root: [0u8; 32],
         }
     }
 
