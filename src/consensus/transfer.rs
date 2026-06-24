@@ -242,10 +242,44 @@ impl TransferVerificationCoordinator {
             .register_validator(validator.clone())
             .await;
 
-        let validator_info =
-            ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey);
+        // Preserve an existing leader-selector entry's stake/reputation; only a
+        // new validator is added with defaults, and an existing one only adopts a
+        // freshly advertised co-sign wallet (#260). Mirrors the withdrawal
+        // coordinator so a wallet-less reconciler pass / periodic Discovery never
+        // clobbers a known wallet or resets accumulated state.
         let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.register_validator(validator_info);
+        match leader_selector.get_validator(&validator).cloned() {
+            Some(existing) => {
+                if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
+                    leader_selector.update_validator(existing.with_wallet(wallet_pubkey));
+                }
+            }
+            None => {
+                leader_selector.register_validator(
+                    ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey),
+                );
+            }
+        }
+    }
+
+    /// Remove a validator from the transfer-consensus set — e.g. when it
+    /// disconnects. Mirrors [`Self::register_validator_with_wallet`] so the
+    /// validator-set reconciler can drop peers that are no longer connected.
+    pub async fn unregister_validator(&self, validator: &NodeId) {
+        let mut validators = self.validators.write().await;
+        validators.retain(|v| v != validator);
+
+        self.reputation_tracker
+            .unregister_validator(validator)
+            .await;
+
+        let mut leader_selector = self.leader_selector.write().await;
+        leader_selector.unregister_validator(validator);
+
+        log::info!(
+            "Validator unregistered from transfer consensus: {:?}",
+            validator
+        );
     }
 
     /// Look up the Solana wallet pubkey a registered validator co-signs
@@ -450,5 +484,49 @@ impl TransferVerificationCoordinator {
 impl Default for TransferVerificationCoordinator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The validator-set reconciler (#333) registers currently-connected peers
+    /// and drops those that disconnect. `unregister_validator` is the removal
+    /// half; it must shrink the transfer-consensus set so a stale peer stops
+    /// counting toward (and being selected for) transfer settlement.
+    #[tokio::test]
+    async fn register_then_unregister_tracks_the_validator_set() {
+        let coordinator = TransferVerificationCoordinator::new();
+
+        coordinator.register_validator(NodeId(vec![1])).await;
+        coordinator.register_validator(NodeId(vec![2])).await;
+        assert_eq!(coordinator.validator_count().await, 2);
+
+        coordinator.unregister_validator(&NodeId(vec![1])).await;
+        assert_eq!(coordinator.validator_count().await, 1);
+
+        // Unregistering an absent validator is a no-op, not an error.
+        coordinator.unregister_validator(&NodeId(vec![9])).await;
+        assert_eq!(coordinator.validator_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn reconciler_reregister_preserves_the_advertised_wallet() {
+        // Same #260 wallet-preservation guarantee as the withdrawal coordinator:
+        // a wallet-less reconciler re-register must not clobber a wallet learned
+        // via Discovery.
+        let coordinator = TransferVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("WaLLet1111".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), None)
+            .await;
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![1])).await,
+            Some("WaLLet1111".to_string()),
+            "a wallet-less re-register must not clobber the advertised wallet"
+        );
     }
 }
