@@ -215,6 +215,7 @@ async fn leader_assembles_a_co_signed_settlement_transaction() {
         recipient: request.recipient,
         proof: request.proof.clone(),
         fee: request.fee,
+        prover_root: request.prover_root,
     };
 
     // Run the co-signing round, retrying while node1's advertised wallet
