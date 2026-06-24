@@ -143,6 +143,22 @@ pub struct BridgeConfig {
     #[serde(default = "default_use_cosign_settlement")]
     pub use_cosign_settlement: bool,
 
+    /// Off-chain consensus thresholds — optional override of the BFT defaults
+    /// (`DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS` / `_TOTAL_VALIDATORS_` /
+    /// `_MIN_REPUTATION_FOR_CONSENSUS`, i.e. 7-of-10 / rep 200). Left unset on
+    /// mainnet so the coordinator keeps the secure defaults; devnet operators
+    /// lower them in `validator.toml` to settle with a small live cohort. The
+    /// on-chain 2/3 stake-weighted quorum is the real security gate — this is an
+    /// off-chain availability knob only.
+    #[serde(default)]
+    pub consensus_min_validators: Option<usize>,
+    /// See [`Self::consensus_min_validators`] — the percentage divisor.
+    #[serde(default)]
+    pub consensus_total_validators: Option<usize>,
+    /// See [`Self::consensus_min_validators`] — the reputation floor.
+    #[serde(default)]
+    pub consensus_min_reputation: Option<u64>,
+
     /// File the deposit listener persists its scan cursor (the last processed
     /// signature) to, so a restart resumes from that point instead of
     /// re-scanning from the chain tip and losing deposits that landed while the
@@ -190,6 +206,9 @@ impl Default for BridgeConfig {
                 .unwrap_or_default(),
             ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
             use_cosign_settlement: default_use_cosign_settlement(),
+            consensus_min_validators: None,
+            consensus_total_validators: None,
+            consensus_min_reputation: None,
             cursor_path: None,
         }
     }
@@ -200,6 +219,47 @@ impl Default for BridgeConfig {
 /// no co-signing keypair is configured.
 fn default_use_cosign_settlement() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consensus_thresholds_default_to_none() {
+        // No override by default → the node keeps the coordinator's mainnet BFT
+        // thresholds (7/10/rep200). A devnet config opts into lower values; a
+        // mainnet config MUST leave them unset.
+        let cfg = BridgeConfig::default();
+        assert_eq!(cfg.consensus_min_validators, None);
+        assert_eq!(cfg.consensus_total_validators, None);
+        assert_eq!(cfg.consensus_min_reputation, None);
+    }
+
+    #[test]
+    fn consensus_thresholds_parse_from_toml() {
+        // A devnet validator.toml lowering the cohort round-trips into the
+        // optional fields (absent fields stay None via #[serde(default)]).
+        let cfg: BridgeConfig = toml::from_str(
+            r#"
+            solana_rpc_url = "http://localhost:8899"
+            program_id = ""
+            poll_interval_secs = 5
+            enabled = true
+            event_lag_warn_threshold_slots = 1500
+            withdrawal_expiration_window_slots = 150
+            merkle_path_query_address = "127.0.0.1:9090"
+            withdrawal_ingress_address = ""
+            transfer_ingress_address = ""
+            consensus_min_validators = 2
+            consensus_total_validators = 3
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(cfg.consensus_min_validators, Some(2));
+        assert_eq!(cfg.consensus_total_validators, Some(3));
+        assert_eq!(cfg.consensus_min_reputation, None);
+    }
 }
 
 /// Bridge statistics
