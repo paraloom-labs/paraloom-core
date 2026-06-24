@@ -2508,10 +2508,17 @@ impl Node {
         // inputs with `bytes_to_field`, so a real proof never verified — it
         // only passed under the injected verifier above.
         let merkle_root = pool.root().await;
+        // WithdrawCircuitV2 binds the recipient via ext_data_hash and the asset
+        // id; derive them exactly as the on-chain program and the prover-wasm do
+        // so the off-chain verifier lifts the same five public inputs.
+        let ext_data_hash =
+            crate::privacy::proof::withdraw_ext_data_hash(&request.recipient, request.amount);
         let result = crate::privacy::ProofVerifier::verify_withdrawal_parts(
             &merkle_root,
             &request.nullifier,
             request.amount,
+            &ext_data_hash,
+            &crate::privacy::proof::NATIVE_SOL_ASSET_ID,
             &request.proof,
         );
         if let crate::privacy::VerificationResult::Invalid { reason } = &result {
