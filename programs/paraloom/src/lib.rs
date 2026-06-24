@@ -746,6 +746,9 @@ pub mod paraloom_program {
 
         validator_registry.total_validators += 1;
         validator_registry.active_validators += 1;
+        validator_registry.total_active_stake = validator_registry
+            .total_active_stake
+            .saturating_add(stake_amount);
 
         emit!(ValidatorRegisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -785,6 +788,9 @@ pub mod paraloom_program {
         validator_account.stake_amount = 0;
 
         validator_registry.active_validators -= 1;
+        validator_registry.total_active_stake = validator_registry
+            .total_active_stake
+            .saturating_sub(stake_amount);
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -895,9 +901,16 @@ pub mod paraloom_program {
         if validator_account.is_active
             && validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
         {
+            // Deactivated: the validator no longer counts toward the quorum, so
+            // remove its full pre-slash active stake from the weighted total.
             validator_account.is_active = false;
             let registry = &mut ctx.accounts.validator_registry;
             registry.active_validators = registry.active_validators.saturating_sub(1);
+            registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+        } else if validator_account.is_active {
+            // Still active: only the slashed portion leaves the active-stake total.
+            let registry = &mut ctx.accounts.validator_registry;
+            registry.total_active_stake = registry.total_active_stake.saturating_sub(slash_amount);
         }
 
         **validator_account
@@ -935,6 +948,7 @@ pub mod paraloom_program {
         registry.total_validators = 0;
         registry.active_validators = 0;
         registry.minimum_stake = MIN_VALIDATOR_STAKE;
+        registry.total_active_stake = 0;
 
         msg!("Validator registry initialized");
         Ok(())
@@ -1456,6 +1470,11 @@ pub struct ValidatorRegistry {
     pub total_validators: u64,
     pub active_validators: u64,
     pub minimum_stake: u64,
+    /// Sum of `stake_amount` over all currently-active validators. The BFT
+    /// quorum is weighted by this (a supermajority of stake, not of head count)
+    /// so a permissionless registry cannot be Sybil-forged with many tiny
+    /// validators. Maintained on register / unregister / slash.
+    pub total_active_stake: u64,
 }
 
 #[account]
