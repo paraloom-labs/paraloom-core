@@ -417,16 +417,31 @@ impl WithdrawalVerificationCoordinator {
             validators.push(validator.clone());
         }
 
-        // Register with reputation tracker
+        // Register with reputation tracker (idempotent — preserves reputation).
         self.reputation_tracker
             .register_validator(validator.clone())
             .await;
 
-        // Also register with leader selector (default stake/reputation)
-        let validator_info =
-            ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey);
+        // Register with the leader selector, preserving any entry that already
+        // exists: a new validator is added with default stake/reputation and
+        // whatever wallet it advertised; an existing one only adopts a freshly
+        // advertised co-sign wallet (#260). A wallet-less re-register (the #333
+        // reconciler) or a periodic Discovery re-announce therefore neither
+        // clobbers a known wallet with None nor resets accumulated
+        // stake/reputation back to the defaults.
         let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.register_validator(validator_info);
+        match leader_selector.get_validator(&validator).cloned() {
+            Some(existing) => {
+                if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
+                    leader_selector.update_validator(existing.with_wallet(wallet_pubkey));
+                }
+            }
+            None => {
+                leader_selector.register_validator(
+                    ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey),
+                );
+            }
+        }
     }
 
     /// Look up the Solana wallet pubkey a registered validator co-signs
@@ -995,6 +1010,38 @@ mod tests {
         );
         assert_eq!(coordinator.validator_wallet(&NodeId(vec![2])).await, None);
         assert_eq!(coordinator.validator_wallet(&NodeId(vec![9])).await, None);
+    }
+
+    #[tokio::test]
+    async fn reconciler_reregister_preserves_the_advertised_wallet() {
+        // A validator advertises its co-sign wallet via Discovery, then the
+        // wallet-less reconciler (#333) re-registers the same connected peer.
+        // The wallet must survive — a clobber to None would silently drop the
+        // validator from the #260 co-signing set.
+        let coordinator = WithdrawalVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("WaLLet1111".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), None)
+            .await;
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![1])).await,
+            Some("WaLLet1111".to_string()),
+            "a wallet-less re-register must not clobber the advertised wallet"
+        );
+
+        // A later Discovery can still upgrade an unknown wallet to a known one.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), None)
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("WaLLet2222".to_string()))
+            .await;
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![2])).await,
+            Some("WaLLet2222".to_string()),
+        );
     }
 
     #[tokio::test]

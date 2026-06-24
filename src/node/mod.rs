@@ -1564,6 +1564,50 @@ impl Node {
             });
         }
 
+        // Reconcile the consensus validator set against live connectivity. The
+        // periodic Discovery re-announce above carries each peer's NodeInfo +
+        // co-sign wallet, but it is still best-effort gossip; a peer that
+        // connected in a gap, or any coordinator that just restarted, could
+        // otherwise sit with an empty in-memory set and reject withdrawals with
+        // "No validators available". This backstop registers every currently
+        // connected libp2p peer (wallet `None`) and unregisters peers that have
+        // dropped, so the set tracks real connectivity independent of gossip
+        // timing. A wallet learned via Discovery is preserved — registration is
+        // wallet-preserving — and is what the #260 co-sign step uses.
+        if self.withdrawal_coordinator.is_some() || self.transfer_coordinator.is_some() {
+            let network = Arc::clone(&self.network);
+            let withdrawal = self.withdrawal_coordinator.clone();
+            let transfer = self.transfer_coordinator.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut registered: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                loop {
+                    ticker.tick().await;
+                    let connected: std::collections::HashSet<NodeId> =
+                        network.connected_peers().await.into_iter().collect();
+                    for peer in connected.difference(&registered) {
+                        if let Some(w) = &withdrawal {
+                            w.register_validator_with_wallet(peer.clone(), None).await;
+                        }
+                        if let Some(t) = &transfer {
+                            t.register_validator_with_wallet(peer.clone(), None).await;
+                        }
+                    }
+                    for peer in registered.difference(&connected) {
+                        if let Some(w) = &withdrawal {
+                            w.unregister_validator(peer).await;
+                        }
+                        if let Some(t) = &transfer {
+                            t.unregister_validator(peer).await;
+                        }
+                    }
+                    registered = connected;
+                }
+            });
+            info!("Consensus validator-set reconciler spawned (interval 30s)");
+        }
+
         // Reserve a relay slot AFTER bootstrap (#226). Order matters: when
         // relay_address points at a node we also bootstrap from (the common
         // case — the anchor is both bootstrap and relay), the bootstrap dial
