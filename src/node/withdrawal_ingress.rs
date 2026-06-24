@@ -60,6 +60,13 @@ struct SubmitRequest {
     amount: u64,
     #[serde(default)]
     fee: u64,
+    /// The Merkle root (hex32) the wallet built its proof against — the root the
+    /// path server served for the spent note. Optional for wire-compatibility;
+    /// when absent the initiating node fills its own current root, which keeps
+    /// the single-anchor flow working but cannot cross-verify on a divergent
+    /// validator. Wallets should send it.
+    #[serde(default)]
+    merkle_root: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -111,6 +118,11 @@ async fn submit_handler(
         .unwrap_or(0);
     let request_id = format!("ingress-{timestamp}-{}", hex::encode(&nullifier[..8]));
 
+    let prover_root = match req.merkle_root.as_deref() {
+        Some(s) => parse_hex32("merkle_root", s)?,
+        None => [0u8; 32],
+    };
+
     let request = WithdrawalVerificationRequest {
         request_id,
         nullifier,
@@ -119,6 +131,7 @@ async fn submit_handler(
         proof,
         fee: req.fee,
         timestamp,
+        prover_root,
     };
 
     let id = node

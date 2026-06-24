@@ -383,5 +383,6 @@ fn sample_request() -> WithdrawalVerificationRequest {
         proof: vec![1u8; 192],
         fee: 0,
         timestamp: now_secs(),
+        prover_root: [0u8; 32],
     }
 }

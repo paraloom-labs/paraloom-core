@@ -45,6 +45,7 @@ async fn partition_heals_and_pool_blocks_double_execution() {
         proof: vec![0u8; 192],
         fee: 1_000,
         timestamp: 0,
+        prover_root: [0u8; 32],
     };
     coordinator
         .start_verification(request.clone())

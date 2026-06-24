@@ -194,6 +194,7 @@ async fn test_withdrawal_consensus_with_validators() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
+        prover_root: [0u8; 32],
     };
 
     log::info!("PASS: Verification request created");

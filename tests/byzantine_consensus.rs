@@ -27,6 +27,7 @@ async fn ten_validators_three_byzantine_consensus_holds_and_flags_equivocator() 
         proof: vec![0u8; 192],
         fee: 1_000,
         timestamp: 0,
+        prover_root: [0u8; 32],
     };
     coordinator
         .start_verification(request.clone())

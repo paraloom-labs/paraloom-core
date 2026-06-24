@@ -2115,8 +2115,19 @@ impl Node {
     /// set is below the consensus quorum).
     pub async fn initiate_withdrawal_verification(
         &self,
-        request: crate::consensus::WithdrawalVerificationRequest,
+        mut request: crate::consensus::WithdrawalVerificationRequest,
     ) -> Result<String> {
+        // Fill the prover root with our current pool root when the submitter did
+        // not provide one (an older wallet that predates the field). Doing it
+        // before the broadcast means our own self-verify and every remote
+        // validator check the proof against a concrete, knowable root rather
+        // than the all-zero default. A wallet that DID send its root keeps it,
+        // which is what lets a validator on a divergent tip still verify.
+        if request.prover_root == [0u8; 32] {
+            if let Some(pool) = &self.shielded_pool {
+                request.prover_root = pool.root().await;
+            }
+        }
         let coordinator = self.withdrawal_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no withdrawal coordinator (bridge disabled or non-validator)")
         })?;
@@ -2619,7 +2630,22 @@ impl Node {
         // earlier path here generated an ephemeral seed-0 key and lifted the
         // inputs with `bytes_to_field`, so a real proof never verified — it
         // only passed under the injected verifier above.
-        let merkle_root = pool.root().await;
+        // Verify against the root the PROVER built the proof against (carried in
+        // the request), not our own current tip: a validator whose tree has
+        // advanced past that root would otherwise reject a perfectly valid proof
+        // on a benign root mismatch. Gate on the pool having actually computed
+        // that root recently so a forged/arbitrary root cannot be presented —
+        // and the nullifier independently prevents double-spends regardless of
+        // which historical root the proof names.
+        let merkle_root = request.prover_root;
+        if !pool.knows_root(&merkle_root).await {
+            log::warn!(
+                "withdrawal proof rejected for {}: prover root {} not recognized by this pool",
+                request.request_id,
+                hex::encode(merkle_root)
+            );
+            return Ok(false);
+        }
         // WithdrawCircuitV2 binds the recipient via ext_data_hash and the asset
         // id; derive them exactly as the on-chain program and the prover-wasm do
         // so the off-chain verifier lifts the same five public inputs.
@@ -2658,6 +2684,12 @@ impl Node {
             return Ok(verifier(request));
         }
 
+        // NOTE: the transfer path still verifies against this node's own current
+        // root. The cross-node root-binding the withdrawal path uses (carry the
+        // prover's root in the request + accept any recently-known root) should
+        // be mirrored here so transfers also settle across validators with
+        // divergent tips. TransferVerificationRequest needs a `prover_root` field
+        // for that; tracked as a follow-up to keep this PR scoped to withdrawals.
         let merkle_root = pool.root().await;
         let result = crate::privacy::ProofVerifier::verify_transfer_parts(
             &merkle_root,
@@ -2740,6 +2772,7 @@ mod tests {
             proof: vec![0u8; 256],
             fee: 0,
             timestamp: 0,
+            prover_root: [0u8; 32],
         }
     }
 
@@ -3019,6 +3052,7 @@ mod tests {
             proof: vec![0u8; 8],
             fee: 0,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         assert!(node
             .initiate_withdrawal_verification(request)
@@ -3051,6 +3085,7 @@ mod tests {
             proof: vec![0u8; 128],
             fee: 10,
             timestamp: 0,
+            prover_root: [0u8; 32],
         };
         let request_id = node
             .initiate_withdrawal_verification(request)

@@ -236,6 +236,14 @@ impl ShieldedPool {
         self.commitment_tree.root().await
     }
 
+    /// Whether `root` is the pool's current root or one it computed recently
+    /// (see [`crate::privacy::merkle::MerkleTree::knows_root`]). A withdrawal /
+    /// transfer verifier checks the prover's root against this so a validator
+    /// whose tree has advanced past the proof's root still accepts the proof.
+    pub async fn knows_root(&self, root: &[u8; 32]) -> bool {
+        self.commitment_tree.knows_root(root).await
+    }
+
     /// The root this pool would publish after a transfer appends `commitments`,
     /// without mutating the pool. A settling validator checks a proposed
     /// `new_merkle_root` against this so it cannot be advanced to an arbitrary

@@ -174,6 +174,7 @@ async fn leader_assembles_a_co_signed_settlement_transaction() {
         proof: valid_compressed_proof(),
         fee: 0,
         timestamp: now_secs(),
+        prover_root: [0u8; 32],
     };
 
     // Initiate, retrying until node0's validator set is populated by discovery.
