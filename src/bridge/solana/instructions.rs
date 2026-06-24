@@ -65,7 +65,10 @@ pub mod discriminators {
     /// `sha256("global:shielded_transfer")[..8]` (#193). Verified against the
     /// generated IDL by `anchor build`.
     pub const SHIELDED_TRANSFER: [u8; 8] = [191, 130, 5, 127, 124, 187, 238, 188];
-    pub const UPDATE_MERKLE_ROOT: [u8; 8] = [240, 174, 252, 99, 208, 105, 45, 104];
+    // Anchor sighash sha256("global:update_merkle_root")[..8] = c3ad263cf2cb9e5d.
+    // (The previous value was stale and never exercised — update_merkle_root had
+    // no live caller until the settle path published the root.)
+    pub const UPDATE_MERKLE_ROOT: [u8; 8] = [195, 173, 38, 60, 242, 203, 158, 93];
     #[allow(dead_code)]
     pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
     #[allow(dead_code)]
