@@ -1282,7 +1282,20 @@ impl Node {
         // Built only on bridge-enabled validator/bridge nodes; the
         // receiver is held until run() spawns the submitter task.
         let (withdrawal_coordinator, approval_rx) = if runs_bridge {
-            let (coord, rx) = WithdrawalVerificationCoordinator::new_with_approvals();
+            let (mut coord, rx) = WithdrawalVerificationCoordinator::new_with_approvals();
+            // Optional config override of the BFT consensus defaults (7/10/rep200).
+            // Unset on mainnet → the secure defaults stand; devnet lowers them in
+            // validator.toml to settle with a small live cohort. The on-chain
+            // stake-weighted 2/3 quorum remains the real security gate.
+            if let (Some(min), Some(total)) = (
+                settings.bridge.consensus_min_validators,
+                settings.bridge.consensus_total_validators,
+            ) {
+                coord.set_consensus_thresholds(min, total);
+            }
+            if let Some(rep) = settings.bridge.consensus_min_reputation {
+                coord.set_min_reputation_for_consensus(rep);
+            }
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
@@ -2056,6 +2069,53 @@ impl Node {
             anyhow!("node has no withdrawal coordinator (bridge disabled or non-validator)")
         })?;
         let request_id = coordinator.start_verification(request.clone()).await?;
+
+        // The initiating node must vote on its OWN withdrawal. libp2p gossipsub
+        // does not echo a node's own published message, so the broadcast below
+        // never returns to us via the receive handler — without this the
+        // initiator contributes no vote of its own. Verify against the
+        // in-process pool (the same Arc the path server served the wallet's root
+        // from) and submit our own vote, registering self into the validator set
+        // first so it is non-empty. This is one vote toward the BFT quorum, not a
+        // bypass of it: with the mainnet 2/3 threshold the initiator still needs
+        // the rest of the cohort.
+        if let Some(pool) = &self.shielded_pool {
+            let self_id = self.node_info.id.clone();
+            let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
+            coordinator
+                .register_validator_with_wallet(self_id.clone(), wallet)
+                .await;
+            let vote = match self.verify_withdrawal_proof(&request, pool).await {
+                Ok(true) => {
+                    cache_verified(
+                        &self.verified_withdrawals,
+                        request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
+                    crate::consensus::withdrawal::VerificationVote::Valid
+                }
+                Ok(false) => crate::consensus::withdrawal::VerificationVote::Invalid {
+                    reason: "self-verify: proof verification failed".to_string(),
+                },
+                Err(e) => crate::consensus::withdrawal::VerificationVote::Invalid {
+                    reason: format!("self-verify error: {e}"),
+                },
+            };
+            let result = crate::consensus::withdrawal::WithdrawalVerificationResult {
+                request_id: request_id.clone(),
+                validator: self_id,
+                vote,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = coordinator.submit_result(result).await {
+                log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+            }
+        }
+
         // send_message broadcasts to the whole gossip topic — the peer
         // argument is ignored by the network layer — so every validator
         // receives the request to verify.

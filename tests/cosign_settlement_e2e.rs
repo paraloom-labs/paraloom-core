@@ -217,13 +217,23 @@ async fn leader_assembles_a_co_signed_settlement_transaction() {
     };
 
     // Run the co-signing round, retrying while node1's advertised wallet
-    // propagates and its cache settles. Success means an assembled transaction.
+    // propagates and its cache settles. Success means an assembled transaction
+    // carrying BOTH signatures. The leader's own self-vote satisfies the 1-of-2
+    // off-chain threshold the instant it initiates, so consensus can flip Valid
+    // before node1's vote propagates — an early round then assembles only the
+    // leader's signature. Retry until node1 has co-signed (or time out and let
+    // the assertion below report the final count).
     let until = Instant::now() + Duration::from_secs(30);
     let tx = loop {
         match node0
             .cosign_settlement_tx(&approved, [0u8; 32], u64::MAX)
             .await
         {
+            Ok(tx) if tx.signatures.len() >= 2 => break tx,
+            Ok(_) if Instant::now() < until => {
+                log::debug!("cosign round assembled only the leader so far; retrying");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             Ok(tx) => break tx,
             Err(e) if Instant::now() < until => {
                 log::debug!("cosign round not ready yet ({e}); retrying");
