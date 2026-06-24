@@ -1534,26 +1534,34 @@ impl Node {
                     MAX_BOOTSTRAP_ATTEMPTS
                 );
             }
+        }
 
-            // Send discovery to every connected peer so they register this
-            // node (validators learn the consensus set this way).
-            let discovery_msg = Message::Discovery {
-                node_info: self.node_info.clone(),
-            };
-            let peers = self.network.connected_peers().await;
-            info!(
-                "Sending discovery message to {} connected peers",
-                peers.len()
-            );
-            for peer in peers {
-                if let Err(e) = self.network.send_message(peer, discovery_msg.clone()).await {
-                    log::warn!("Failed to send discovery message to peer: {}", e);
+        // Re-announce this node's NodeInfo (+ co-signing wallet) on a fixed
+        // cadence, unconditionally, on EVERY node. The previous one-shot publish
+        // was gated on having bootstrap peers, so the anchor — which has none —
+        // never announced itself, and a single publish was lost whenever a peer
+        // joined later, restarted, or missed the unformed-mesh window. A
+        // periodic broadcast (the first tick fires immediately) means every peer
+        // (re)learns the consensus set within one interval; combined with
+        // gossipsub flood_publish the first announce lands even before the mesh
+        // grafts. `send_message(NodeId(vec![]), ..)` publishes to the whole
+        // gossip topic — the peer argument is ignored by the network layer.
+        {
+            const DISCOVERY_REANNOUNCE_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(15);
+            let me = self.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(DISCOVERY_REANNOUNCE_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    let msg = Message::Discovery {
+                        node_info: me.node_info.clone(),
+                    };
+                    if let Err(e) = me.network.send_message(NodeId(vec![]), msg).await {
+                        log::debug!("periodic discovery re-announce failed: {e}");
+                    }
                 }
-            }
-            info!(
-                "Discovery broadcast complete for {:?}",
-                self.node_info.node_type
-            );
+            });
         }
 
         // Reserve a relay slot AFTER bootstrap (#226). Order matters: when
