@@ -2389,6 +2389,7 @@ impl Node {
         &self,
         new_merkle_root: [u8; 32],
         blockhash: [u8; 32],
+        request_id: &str,
     ) -> Result<Transaction> {
         let leader = self
             .cosign_keypair
@@ -2405,14 +2406,23 @@ impl Node {
         // derive it anyway so the payload shape matches the withdrawal round.
         let (vault, _) = derive_bridge_vault(&program_id);
 
+        // Co-signer set = the validators that voted Valid on THIS withdrawal (the
+        // same set the withdraw round uses), NOT the whole advertised registry.
+        // Those voters already verified the proof against this exact root (the
+        // verify is gated on pool.knows_root), so they agree it is real; and a
+        // peer that merely advertised a co-sign wallet over Discovery without
+        // voting is excluded. That closes the n-of-n griefing where one
+        // unsignable advertised wallet would stall every withdrawal's root round.
         let self_id = self.node_info.id.clone();
         let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for v in coordinator.get_validators_by_weight().await {
-            if v.node_id == self_id {
+        for voter in coordinator.valid_voters(request_id).await {
+            if voter == self_id {
                 continue;
             }
-            if let Some(pubkey) = v.wallet_pubkey.and_then(|w| w.parse::<Pubkey>().ok()) {
-                peers.push((pubkey, v.node_id));
+            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
+                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                    peers.push((pubkey, voter));
+                }
             }
         }
         let mut quorum_wallets = vec![leader.pubkey()];
@@ -2420,14 +2430,14 @@ impl Node {
         let threshold = quorum_wallets.len();
 
         let params = SettlementParams::UpdateMerkleRoot { new_merkle_root };
-        let request_id = format!("update-root-{}", hex::encode(new_merkle_root));
+        let round_id = format!("update-root-{}", hex::encode(new_merkle_root));
         let network = self.network.clone();
         cosign_round::run_cosign_round(
             leader,
             program_id,
             vault,
             blockhash,
-            &request_id,
+            &round_id,
             SettlementKind::UpdateMerkleRoot,
             params,
             quorum_wallets,
@@ -2475,7 +2485,7 @@ impl Node {
         // wallet that didn't send its root): the on-chain root is then left as-is.
         if approved.prover_root != [0u8; 32] {
             let root_tx = self
-                .cosign_update_merkle_root_tx(approved.prover_root, blockhash)
+                .cosign_update_merkle_root_tx(approved.prover_root, blockhash, &approved.request_id)
                 .await
                 .map_err(|e| BridgeError::WithdrawalFailed(format!("root publish round: {e}")))?;
             bridge
