@@ -147,9 +147,19 @@ pub struct BridgeConfig {
     /// (`DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS` / `_TOTAL_VALIDATORS_` /
     /// `_MIN_REPUTATION_FOR_CONSENSUS`, i.e. 7-of-10 / rep 200). Left unset on
     /// mainnet so the coordinator keeps the secure defaults; devnet operators
-    /// lower them in `validator.toml` to settle with a small live cohort. The
-    /// on-chain 2/3 stake-weighted quorum is the real security gate — this is an
-    /// off-chain availability knob only.
+    /// lower them in `validator.toml` to settle with a small live cohort. This
+    /// is an off-chain availability knob only — it cannot release funds.
+    ///
+    /// HONEST TRUST NOTE (pre-mainnet): the on-chain validator quorum is
+    /// enforced on every settlement, but it is NOT yet Sybil-resistant —
+    /// `register_validator` is permissionless (a refundable 1-SOL bond) and the
+    /// threshold is counted over the active set, so an attacker holding the
+    /// single bridge authority key could register their own validators to meet
+    /// it. So the BINDING fund gate on this build is still the single bridge
+    /// authority key (`has_one = authority` on every fund instruction), with the
+    /// quorum as defence-in-depth on top — NOT a trustless multi-validator gate.
+    /// A Sybil-resistant quorum (permissioned set and/or meaningful
+    /// stake-weighting) is a tracked mainnet-hardening gate.
     #[serde(default)]
     pub consensus_min_validators: Option<usize>,
     /// See [`Self::consensus_min_validators`] — the percentage divisor.
