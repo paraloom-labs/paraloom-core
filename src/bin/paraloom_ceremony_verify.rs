@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use paraloom::ceremony::{read_pk, read_transcript, verify_phase2_transcript};
+use paraloom::ceremony::{hash_contribution, read_pk, read_transcript, verify_phase2_transcript};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,6 +61,16 @@ fn main() -> ExitCode {
                 transcript.circuit.label(),
                 transcript.len()
             );
+            // The chain-tip hash is what `paraloom_ceremony_finalize
+            // --final-contribution-hash` pins: print it after every
+            // verification so the coordinator can record the exact
+            // chain they approved.
+            if let Some(tip) = transcript.contributions.last() {
+                println!(
+                    "  final contribution hash: {}",
+                    hex::encode(hash_contribution(tip))
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

@@ -8,6 +8,25 @@ can verify it.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-07
+
+- **Ceremony finalization fails closed** (community responsible disclosure to
+  security@paraloom.network, independently overlapping an in-house audit
+  finding). `paraloom_ceremony_finalize` verified that a transcript's
+  contribution chain was cryptographically honest, but imposed no floor on
+  what it would promote: an empty transcript verified vacuously, and for an
+  empty transcript the final-key binding accepted the initial single-party
+  key itself as the "ceremony output" — so a finalize run against the wrong
+  or never-contributed files could have promoted a key whose trapdoor one
+  party still held. Finalize now refuses an empty transcript, enforces a
+  minimum contribution count, requires an operator-pinned SHA-512 of the
+  initial proving key to match both the transcript's recorded initial SRS
+  hash and the file on disk, rejects a final key whose delta is unchanged
+  from the initial key, and can pin the expected chain-tip contribution
+  hash. Contributor signature enforcement remains a mainnet-ceremony gate
+  (#64). Caught before any finalize was ever run — the live devnet
+  transcript passes every new gate. Devnet, pre-mainnet.
+
 ## 2026-06
 
 - **Bearer-token ingress auth compares in constant time** (in-house security
