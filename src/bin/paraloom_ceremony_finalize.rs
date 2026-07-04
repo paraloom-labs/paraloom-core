@@ -20,9 +20,11 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use paraloom::ceremony::{
-    read_pk, read_transcript, verify_final_pk, verify_final_pk_consistency,
-    verify_phase2_transcript, write_compressed,
+    enforce_finalize_policy, hash_contribution, read_pk, read_transcript, try_hash_from_hex,
+    verify_final_pk, verify_final_pk_consistency, verify_phase2_transcript, write_compressed,
+    FinalizePolicy,
 };
+use sha2::{Digest, Sha512};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +55,25 @@ struct Args {
     /// `keys/<circuit>_verifying_v3.key`.
     #[arg(long)]
     output_vk: PathBuf,
+
+    /// Hex-encoded SHA-512 of the initial proving key file — the same
+    /// value the first contributor was given. Finalize refuses to run
+    /// unless it matches both the transcript's recorded initial SRS
+    /// hash and the `--initial-pk` file on disk.
+    #[arg(long)]
+    initial_srs_hash: String,
+
+    /// Minimum number of contributions the transcript must carry.
+    /// An empty transcript is refused regardless of this value.
+    #[arg(long, default_value_t = 2)]
+    min_contributions: usize,
+
+    /// Optional hex-encoded SHA-512 of the expected last contribution
+    /// (printed by this tool and by `paraloom_ceremony_verify`).
+    /// When set, finalize refuses a transcript whose chain tip
+    /// differs from the one the coordinator verified.
+    #[arg(long)]
+    final_contribution_hash: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -80,6 +101,56 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Fail-closed policy gate, before any cryptographic verification:
+    // an empty or under-contributed transcript, a mispinned initial
+    // key, an unchanged final key, or an unexpected chain tip must be
+    // refused outright — the verifiers below prove the chain honest,
+    // not sufficient.
+    let pinned_initial = match try_hash_from_hex(&args.initial_srs_hash) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("--initial-srs-hash: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    let pinned_tail = match &args.final_contribution_hash {
+        Some(s) => match try_hash_from_hex(s) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("--final-contribution-hash: {}", e);
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let initial_pk_file_hash: [u8; 64] = match std::fs::read(&args.initial_pk) {
+        Ok(bytes) => {
+            let digest = Sha512::digest(&bytes);
+            let mut out = [0u8; 64];
+            out.copy_from_slice(&digest[..]);
+            out
+        }
+        Err(e) => {
+            eprintln!("failed to re-read initial PK for hashing: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    let policy = FinalizePolicy {
+        min_contributions: args.min_contributions,
+        initial_srs_hash: pinned_initial,
+        final_contribution_hash: pinned_tail,
+    };
+    if let Err(e) = enforce_finalize_policy(
+        &policy,
+        &initial_pk_file_hash,
+        &initial_pk,
+        &ceremony_pk,
+        &transcript,
+    ) {
+        eprintln!("finalize policy REFUSED the transcript: {}", e);
+        return ExitCode::FAILURE;
+    }
 
     if let Err(e) = verify_phase2_transcript(&initial_pk, &transcript) {
         eprintln!("transcript verification FAILED, refusing to write: {}", e);
@@ -124,6 +195,15 @@ fn main() -> ExitCode {
         transcript.circuit.label(),
         transcript.len()
     );
+    // The chain-tip hash is part of the public audit trail: publish it
+    // alongside the transcript so anyone can pin the exact chain this
+    // finalize promoted.
+    if let Some(tip) = transcript.contributions.last() {
+        println!(
+            "  final contribution hash: {}",
+            hex::encode(hash_contribution(tip))
+        );
+    }
     println!("  proving key  -> {:?}", args.output_pk);
     println!("  verifying key -> {:?}", args.output_vk);
     ExitCode::SUCCESS
