@@ -38,6 +38,7 @@
 
 pub mod bgm17;
 pub mod contribute;
+pub mod policy;
 pub mod transcript;
 pub mod verifier;
 
@@ -48,6 +49,7 @@ pub use contribute::{
     contribute, read_pk, read_transcript, write_compressed, write_pk, write_transcript,
     ContributeError,
 };
+pub use policy::{enforce_finalize_policy, FinalizePolicy, PolicyError};
 pub use transcript::{
     hash_contribution, try_hash_from_hex, CircuitId, Contribution, Phase2Transcript,
     TranscriptError, TranscriptHash, TRANSCRIPT_VERSION,
