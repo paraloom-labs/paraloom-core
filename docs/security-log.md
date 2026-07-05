@@ -10,6 +10,28 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **The settlement co-sign set is the same reputation-eligible set that formed
+  the quorum** (in-house security audit). A withdrawal or transfer reached
+  consensus among the validators whose reputation was at or above the
+  threshold, but the leader then collected on-chain co-signatures from every
+  validator that had voted `Valid` — including ones the quorum count had
+  excluded for low reputation. The on-chain program still re-checks each
+  co-signer against its staked, active validator account, so no unstaked party
+  could contribute a settling signature and no funds were reachable; the
+  mismatch let a validator the quorum had discounted still be asked to sign.
+  `valid_voters` is now gated on the same reputation view `has_consensus` and
+  `consensus_result` use, so the co-sign set matches the set that formed the
+  quorum. Devnet, pre-mainnet.
+
+- **Verification-round ids derive from the full nullifier** (in-house security
+  audit). A round id was `ingress-<timestamp>-<first 8 bytes of nullifier>`, so
+  two distinct withdrawals submitted in the same second whose nullifiers shared
+  an 8-byte prefix would collide onto one id and clobber each other's
+  verification round — a liveness hazard, not a fund path (the nullifier itself
+  still gates on-chain replay). The id now carries the full 32-byte nullifier,
+  which is unique per spend, so distinct spends can never share a round id.
+  Devnet, pre-mainnet.
+
 - **Ceremony finalization fails closed** (community responsible disclosure to
   security@paraloom.network, independently overlapping an in-house audit
   finding). `paraloom_ceremony_finalize` verified that a transcript's
