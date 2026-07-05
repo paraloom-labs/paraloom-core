@@ -86,6 +86,11 @@ pub mod discriminators {
     /// `sha256("global:withdraw_spl")[..8]` (#237). Asset-aware withdrawal of an
     /// SPL token from its per-asset vault.
     pub const WITHDRAW_SPL: [u8; 8] = [181, 154, 94, 86, 62, 115, 6, 186];
+    /// `sha256("global:reset_validator_registry")[..8]`. Ceremony-redeploy
+    /// registry migration: grows the registry PDA to the current layout and
+    /// rebuilds its counters from the co-signer validator PDAs in
+    /// `remaining_accounts`.
+    pub const RESET_VALIDATOR_REGISTRY: [u8; 8] = [101, 188, 0, 99, 248, 198, 207, 7];
 }
 
 /// SPL Token program id (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the
@@ -195,6 +200,39 @@ pub fn create_initialize_validator_registry_instruction(
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data: discriminators::INITIALIZE_VALIDATOR_REGISTRY.to_vec(),
+    })
+}
+
+/// Create a `reset_validator_registry` instruction (#204-gated to the program's
+/// upgrade authority). Grows the registry PDA to the current layout and rebuilds
+/// its counters from `co_signers` — the validator wallets whose PDAs are passed
+/// as `remaining_accounts`. Only these are counted, so stale registrations are
+/// dropped from the stake-weighted quorum denominator. Used once at the
+/// ceremony-key redeploy.
+pub fn create_reset_validator_registry_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    co_signers: &[Pubkey],
+) -> Result<Instruction> {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    let mut accounts = vec![
+        AccountMeta::new(registry_pda, false),
+        AccountMeta::new(*authority, true),
+        AccountMeta::new_readonly(program_data_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    // Each co-signer's validator PDA, read-only, as remaining_accounts.
+    for wallet in co_signers {
+        let (validator_pda, _) = derive_validator_account(program_id, wallet);
+        accounts.push(AccountMeta::new_readonly(validator_pda, false));
+    }
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts,
+        data: discriminators::RESET_VALIDATOR_REGISTRY.to_vec(),
     })
 }
 
