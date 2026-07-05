@@ -545,8 +545,7 @@ pub mod paraloom_program {
         // mint cannot release another mint's vault. ext_data_hash binds the
         // recipient token account (finding D). Both captured before the borrow.
         let asset_id = ctx.accounts.mint.key().to_bytes();
-        let ext_data_hash =
-            withdraw_ext_data_hash(&ctx.accounts.recipient_token.key(), amount);
+        let ext_data_hash = withdraw_ext_data_hash(&ctx.accounts.recipient_token.key(), amount);
 
         let current_slot = Clock::get()?.slot;
         require!(
@@ -953,6 +952,105 @@ pub mod paraloom_program {
         msg!("Validator registry initialized");
         Ok(())
     }
+
+    /// Migrate and reset the validator registry for the ceremony-key redeploy.
+    ///
+    /// The registry PDA deployed before the stake-weighted quorum (#329) is 8
+    /// bytes shorter than the current [`ValidatorRegistry`] layout, so the
+    /// redeployed program cannot even load it as a typed account. This
+    /// one-shot instruction — gated to the program's upgrade authority, like
+    /// [`initialize`] (#204) — grows the PDA to the current size and rebuilds
+    /// its counters from EXACTLY the active validator accounts passed in
+    /// `remaining_accounts`: the real co-signer set for the redeployed program.
+    /// Stale registrations are dropped simply by not being passed, so the
+    /// stake-weighted quorum denominator reflects only validators that actually
+    /// co-sign. Validator stake and the validator PDAs themselves are untouched.
+    ///
+    /// The account is taken untyped ([`UncheckedAccount`]) precisely because
+    /// the pre-migration bytes do not deserialize into the current struct; its
+    /// address is pinned by the seeds constraint and its identity re-checked
+    /// against the `ValidatorRegistry` discriminator in the body.
+    pub fn reset_validator_registry(ctx: Context<ResetValidatorRegistry>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let registry_ai = ctx.accounts.validator_registry.to_account_info();
+
+        // Confirm the pinned PDA actually is a ValidatorRegistry, so a wrong
+        // account cannot be reshaped into one.
+        {
+            let data = registry_ai.try_borrow_data()?;
+            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(
+                data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
+                BridgeError::UnauthorizedInit
+            );
+        }
+
+        // Grow to the current layout, topping up rent for the extra bytes.
+        let new_len = 8 + ValidatorRegistry::INIT_SPACE;
+        let rent = Rent::get()?;
+        let min_balance = rent.minimum_balance(new_len);
+        let current = registry_ai.lamports();
+        if min_balance > current {
+            let delta = min_balance - current;
+            let ix = anchor_lang::solana_program::system_instruction::transfer(
+                &ctx.accounts.authority.key(),
+                &registry_ai.key(),
+                delta,
+            );
+            anchor_lang::solana_program::program::invoke(
+                &ix,
+                &[
+                    ctx.accounts.authority.to_account_info(),
+                    registry_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+        registry_ai.resize(new_len)?;
+
+        // Rebuild counters from the passed active validator PDAs.
+        let mut total_active_stake: u64 = 0;
+        let mut active: u64 = 0;
+        for acc in ctx.remaining_accounts.iter() {
+            require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
+            let data = acc.try_borrow_data()?;
+            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(
+                data[0..8] == *ValidatorAccount::DISCRIMINATOR,
+                BridgeError::UnauthorizedInit
+            );
+            let validator = ValidatorAccount::try_deserialize(&mut &data[..])?;
+            // The PDA must be the canonical account for the key it claims.
+            let (expected, _) = Pubkey::find_program_address(
+                &[b"validator", validator.validator.as_ref()],
+                &crate::ID,
+            );
+            require!(&expected == acc.key, BridgeError::UnauthorizedInit);
+            require!(validator.is_active, BridgeError::UnauthorizedInit);
+            total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
+            active = active.saturating_add(1);
+        }
+
+        // Write the rebuilt registry.
+        let registry = ValidatorRegistry {
+            authority: ctx.accounts.authority.key(),
+            total_validators: active,
+            active_validators: active,
+            minimum_stake: MIN_VALIDATOR_STAKE,
+            total_active_stake,
+        };
+        let mut data = registry_ai.try_borrow_mut_data()?;
+        let mut cursor = std::io::Cursor::new(&mut data[..]);
+        registry.try_serialize(&mut cursor)?;
+
+        msg!(
+            "Validator registry reset: {} active validators, {} total stake",
+            active,
+            total_active_stake
+        );
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -1066,6 +1164,33 @@ pub struct Withdraw<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ResetValidatorRegistry<'info> {
+    /// The registry PDA. Taken untyped because the pre-migration bytes are a
+    /// byte shorter than the current `ValidatorRegistry` and would fail typed
+    /// deserialization; the body reallocs it and re-checks its discriminator.
+    ///
+    /// CHECK: address pinned by seeds; identity + realloc validated in the body.
+    #[account(mut, seeds = [b"validator_registry"], bump)]
+    pub validator_registry: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204), same as `Initialize` /
+    /// `InitializeValidatorRegistry`.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }

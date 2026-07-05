@@ -267,10 +267,12 @@ mod tests {
         let mut eb = [0u8; 0];
         let s_big = AccountInfo::new(&big, true, false, &mut lb, &mut eb, &sys, false, 0);
         let a_big = AccountInfo::new(&pda_big, false, false, &mut lpb, &mut d_big, &p, false, 0);
-        assert!(
-            verify_validator_quorum(&p, &registry_with_stake(3, 9_000_000_000), &[s_big, a_big])
-                .is_ok()
-        );
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(3, 9_000_000_000),
+            &[s_big, a_big]
+        )
+        .is_ok());
 
         // A lone 1-SOL validator against the same 9-SOL total is below 2/3, so
         // many tiny Sybil validators cannot forge the quorum one signature at a
@@ -281,8 +283,16 @@ mod tests {
         let (mut ls, mut lps) = (0u64, 0u64);
         let mut es = [0u8; 0];
         let s_small = AccountInfo::new(&small, true, false, &mut ls, &mut es, &sys, false, 0);
-        let a_small =
-            AccountInfo::new(&pda_small, false, false, &mut lps, &mut d_small, &p, false, 0);
+        let a_small = AccountInfo::new(
+            &pda_small,
+            false,
+            false,
+            &mut lps,
+            &mut d_small,
+            &p,
+            false,
+            0,
+        );
         assert!(verify_validator_quorum(
             &p,
             &registry_with_stake(3, 9_000_000_000),

@@ -139,8 +139,16 @@ fn fr_to_le(f: &Fr) -> [u8; 32] {
 }
 
 fn main() {
-    let pk_bytes = std::fs::read("keys/withdraw_v2_proving.key").expect("v2 proving key");
-    let vk_bytes = std::fs::read("keys/withdraw_v2_verifying.key").expect("v2 verifying key");
+    // Key paths default to the repo v2 keys but can be overridden via env so the
+    // same prove+verify round-trip can validate ceremony-produced keys (point
+    // these at a finalized ceremony output to confirm it produces on-chain-
+    // verifiable proofs before trusting the chain).
+    let pk_path = std::env::var("WITHDRAW_V2_PROVING_KEY")
+        .unwrap_or_else(|_| "keys/withdraw_v2_proving.key".to_string());
+    let vk_path = std::env::var("WITHDRAW_V2_VERIFYING_KEY")
+        .unwrap_or_else(|_| "keys/withdraw_v2_verifying.key".to_string());
+    let pk_bytes = std::fs::read(&pk_path).expect("v2 proving key");
+    let vk_bytes = std::fs::read(&vk_path).expect("v2 verifying key");
     let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
     let vk = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
     let vk_wire = WireVerifyingKey::from_arkworks(&vk);

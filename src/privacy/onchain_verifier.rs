@@ -634,8 +634,16 @@ mod tests {
             println!("\n];");
         }
 
-        let pk_bytes = std::fs::read("keys/withdraw_v2_proving.key").expect("v2 proving key");
-        let vk_bytes = std::fs::read("keys/withdraw_v2_verifying.key").expect("v2 verifying key");
+        // Key paths default to the repo dev keys but can be overridden via env,
+        // so this same generator can regenerate withdraw_vk_data.rs from a
+        // finalized CEREMONY verifying key at cutover (point the env vars at the
+        // ceremony output and check the emitted constants compile + verify).
+        let pk_path = std::env::var("WITHDRAW_V2_PROVING_KEY")
+            .unwrap_or_else(|_| "keys/withdraw_v2_proving.key".to_string());
+        let vk_path = std::env::var("WITHDRAW_V2_VERIFYING_KEY")
+            .unwrap_or_else(|_| "keys/withdraw_v2_verifying.key".to_string());
+        let pk_bytes = std::fs::read(&pk_path).expect("v2 proving key");
+        let vk_bytes = std::fs::read(&vk_path).expect("v2 verifying key");
         let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
         let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
 

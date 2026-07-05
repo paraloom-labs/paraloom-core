@@ -35,45 +35,18 @@ use std::time::Duration;
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 const WITHDRAWAL_FEE_BPS: u64 = 25;
 
-// Valid withdrawal proof fixture matching the program's embedded verifying key
-// (same data as programs/paraloom/src/withdraw_fixture_data.rs). The bridge is
-// initialized with FIXTURE_ROOT so this proof verifies on-chain.
-const FIXTURE_ROOT: [u8; 32] = [
-    47, 84, 196, 123, 85, 59, 134, 71, 150, 197, 0, 225, 103, 229, 16, 83, 195, 133, 20, 202, 42,
-    63, 52, 169, 140, 220, 197, 55, 101, 210, 243, 10,
-];
-const FIXTURE_NULLIFIER: [u8; 32] = [
-    193, 236, 245, 0, 121, 36, 11, 2, 101, 68, 92, 233, 30, 137, 43, 131, 96, 80, 130, 226, 106,
-    133, 155, 56, 170, 30, 59, 149, 202, 0, 191, 20,
-];
-const FIXTURE_AMOUNT: u64 = 1_000_000_000;
-// The spend-key v2 proof binds `ext_data_hash = sha256(FIXTURE_RECIPIENT || amount)`
-// with NATIVE asset, so the on-chain `withdraw` must pay exactly this recipient.
-const FIXTURE_RECIPIENT: [u8; 32] = [
-    154, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 16, 32, 48, 64, 80,
-    96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 1,
-];
-const FIXTURE_PROOF_A: [u8; 64] = [
-    21, 90, 173, 60, 66, 17, 41, 84, 10, 25, 93, 39, 213, 77, 226, 251, 85, 120, 7, 236, 55, 146,
-    224, 228, 234, 149, 121, 160, 210, 143, 188, 19, 154, 14, 160, 68, 110, 11, 72, 130, 104, 164,
-    49, 178, 221, 94, 127, 37, 20, 126, 100, 18, 124, 235, 93, 127, 64, 12, 22, 117, 229, 36, 67,
-    38,
-];
-const FIXTURE_PROOF_B: [u8; 128] = [
-    43, 246, 70, 32, 106, 88, 100, 254, 75, 247, 218, 79, 17, 153, 173, 255, 5, 250, 94, 27, 125,
-    169, 135, 40, 131, 10, 35, 72, 44, 23, 44, 108, 43, 20, 225, 117, 207, 230, 230, 51, 178, 170,
-    238, 112, 93, 126, 204, 246, 113, 244, 40, 218, 255, 86, 94, 202, 104, 150, 37, 251, 80, 242,
-    236, 46, 162, 182, 205, 125, 254, 118, 112, 227, 219, 29, 20, 138, 59, 114, 173, 53, 211, 204,
-    157, 63, 173, 206, 68, 68, 33, 196, 16, 226, 13, 252, 16, 159, 12, 124, 44, 184, 46, 200, 217,
-    44, 7, 144, 88, 247, 187, 233, 231, 244, 61, 80, 253, 140, 206, 185, 227, 162, 132, 124, 118,
-    209, 151, 83, 52, 15,
-];
-const FIXTURE_PROOF_C: [u8; 64] = [
-    32, 160, 216, 211, 177, 132, 82, 56, 180, 207, 14, 15, 50, 63, 236, 55, 20, 236, 177, 219, 58,
-    213, 204, 200, 92, 233, 211, 172, 232, 141, 71, 218, 162, 160, 135, 31, 95, 219, 81, 86, 38,
-    112, 247, 33, 91, 61, 78, 217, 253, 105, 67, 16, 68, 111, 31, 133, 100, 239, 238, 151, 143, 95,
-    192, 243,
-];
+// Valid withdrawal proof fixture matching the program's embedded verifying
+// key — pulled from the program crate's own fixture module via #[path] so
+// there is exactly ONE copy of these bytes: when the keys rotate (e.g. the
+// ceremony cutover) regenerating the program fixtures updates this test too,
+// instead of a stale duplicate failing on-chain with InvalidProof. The
+// bridge is initialized with FIXTURE_ROOT so this proof verifies on-chain.
+#[path = "../programs/paraloom/src/withdraw_fixture_data.rs"]
+mod withdraw_fixture_data;
+use withdraw_fixture_data::{
+    FIXTURE_AMOUNT, FIXTURE_NULLIFIER, FIXTURE_PROOF_A, FIXTURE_PROOF_B, FIXTURE_PROOF_C,
+    FIXTURE_RECIPIENT, FIXTURE_ROOT,
+};
 
 /// The 256-byte alt_bn128 wire proof from the fixture.
 fn fixture_proof() -> Vec<u8> {
