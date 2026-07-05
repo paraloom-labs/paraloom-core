@@ -11,9 +11,10 @@
 //! `cargo run --release --bin emit_transfer_v2_fixture`
 //! A real multi-party MPC ceremony remains the mainnet gate (#64).
 
-use ark_bn254::Fr;
+use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
-use ark_serialize::CanonicalSerialize;
+use ark_groth16::{ProvingKey, VerifyingKey};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use paraloom::privacy::circuits::{Groth16ProofSystem, TransferCircuitV2};
 use paraloom::privacy::merkle::DEFAULT_TREE_DEPTH;
 use paraloom::privacy::onchain_verifier::{fr_to_be, proof_to_wire, verify, WireVerifyingKey};
@@ -65,31 +66,53 @@ fn input_note(
 fn main() {
     let mut rng = ark_std::rand::thread_rng();
 
-    // Setup against the fixed 2-in/2-out, full-depth shape.
-    let full_path = vec![([0u8; 32], true); DEFAULT_TREE_DEPTH];
-    let setup = TransferCircuitV2::with_witness(
-        [0u8; 32],
-        vec![[0u8; 32]; 2],
-        vec![[0u8; 32]; 2],
-        vec![0u64; 2],
-        vec![[0u8; 32]; 2],
-        vec![[0u8; 32]; 2],
-        vec![full_path.clone(), full_path.clone()],
-        vec![0u64; 2],
-        vec![[0u8; 32]; 2],
-        vec![[0u8; 32]; 2],
-        NATIVE_SOL,
-    );
-    let (pk, vk) =
-        Groth16ProofSystem::setup::<TransferCircuitV2, _>(setup, &mut rng).expect("setup");
+    // Key source: with TRANSFER_V2_PROVING_KEY / TRANSFER_V2_VERIFYING_KEY set,
+    // load that pair instead of generating — the same prove+verify round-trip
+    // then validates ceremony-produced keys (point these at a finalized
+    // ceremony output to confirm it yields on-chain-verifiable proofs and to
+    // emit its vk_data constants). Without the env vars, run the single-party
+    // setup and write the dev keys, as before.
+    let env_keys = match (
+        std::env::var("TRANSFER_V2_PROVING_KEY"),
+        std::env::var("TRANSFER_V2_VERIFYING_KEY"),
+    ) {
+        (Ok(pk_path), Ok(vk_path)) => Some((pk_path, vk_path)),
+        _ => None,
+    };
+    let (pk, vk) = if let Some((pk_path, vk_path)) = env_keys {
+        let pk_bytes = fs::read(&pk_path).expect("transfer v2 proving key");
+        let vk_bytes = fs::read(&vk_path).expect("transfer v2 verifying key");
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+        (pk, vk)
+    } else {
+        // Setup against the fixed 2-in/2-out, full-depth shape.
+        let full_path = vec![([0u8; 32], true); DEFAULT_TREE_DEPTH];
+        let setup = TransferCircuitV2::with_witness(
+            [0u8; 32],
+            vec![[0u8; 32]; 2],
+            vec![[0u8; 32]; 2],
+            vec![0u64; 2],
+            vec![[0u8; 32]; 2],
+            vec![[0u8; 32]; 2],
+            vec![full_path.clone(), full_path.clone()],
+            vec![0u64; 2],
+            vec![[0u8; 32]; 2],
+            vec![[0u8; 32]; 2],
+            NATIVE_SOL,
+        );
+        let (pk, vk) =
+            Groth16ProofSystem::setup::<TransferCircuitV2, _>(setup, &mut rng).expect("setup");
 
-    fs::create_dir_all("keys").unwrap();
-    let mut pk_bytes = Vec::new();
-    pk.serialize_compressed(&mut pk_bytes).unwrap();
-    fs::write("keys/transfer_v2_proving.key", &pk_bytes).unwrap();
-    let mut vk_bytes = Vec::new();
-    vk.serialize_compressed(&mut vk_bytes).unwrap();
-    fs::write("keys/transfer_v2_verifying.key", &vk_bytes).unwrap();
+        fs::create_dir_all("keys").unwrap();
+        let mut pk_bytes = Vec::new();
+        pk.serialize_compressed(&mut pk_bytes).unwrap();
+        fs::write("keys/transfer_v2_proving.key", &pk_bytes).unwrap();
+        let mut vk_bytes = Vec::new();
+        vk.serialize_compressed(&mut vk_bytes).unwrap();
+        fs::write("keys/transfer_v2_verifying.key", &vk_bytes).unwrap();
+        (pk, vk)
+    };
 
     // Two input notes at leaves 0 and 1 of an otherwise-empty full-depth tree.
     let (c0, nf0) = input_note([9u8; 32], [3u8; 32], 600, 0);
