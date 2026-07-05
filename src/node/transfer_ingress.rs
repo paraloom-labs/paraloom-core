@@ -159,7 +159,10 @@ async fn submit_handler(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let request_id = format!("transfer-{timestamp}-{}", hex::encode(&nullifiers[0][..8]));
+    // Full first-nullifier, not an 8-byte prefix (audit #17): a prefix
+    // collision within the same second would merge two distinct transfers onto
+    // one verification round. The nullifier is unique per spend.
+    let request_id = format!("transfer-{timestamp}-{}", hex::encode(nullifiers[0]));
 
     let request = TransferVerificationRequest {
         request_id,

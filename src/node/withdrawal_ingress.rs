@@ -116,7 +116,12 @@ async fn submit_handler(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let request_id = format!("ingress-{timestamp}-{}", hex::encode(&nullifier[..8]));
+    // Derive the request id from the FULL nullifier, not an 8-byte prefix
+    // (audit #17): two distinct withdrawals submitted in the same second whose
+    // nullifiers share a prefix would otherwise collide onto one request id and
+    // clobber each other's verification round. The nullifier is unique per
+    // spend, so the full 32 bytes make the id collision-free.
+    let request_id = format!("ingress-{timestamp}-{}", hex::encode(nullifier));
 
     let prover_root = match req.merkle_root.as_deref() {
         Some(s) => parse_hex32("merkle_root", s)?,
