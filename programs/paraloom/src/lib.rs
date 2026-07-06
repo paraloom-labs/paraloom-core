@@ -7,7 +7,7 @@ use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 mod groth16;
-mod merkle_tree;
+pub mod merkle_tree;
 mod quorum;
 pub mod transact_fixture_data;
 mod transact_verifier;
@@ -957,6 +957,20 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Initialize the on-chain commitment Merkle tree (circuit v3, #350).
+    ///
+    /// Creates the program-owned tree account and seeds it with the empty-tree
+    /// state. Gated to the program's upgrade authority, like the other
+    /// `initialize_*` instructions (#204). After this the `transact` path
+    /// appends output commitments and recomputes the root on-chain, so no
+    /// settled transaction can install an attacker-chosen root.
+    pub fn initialize_merkle_tree(ctx: Context<InitializeMerkleTree>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        ctx.accounts.merkle_tree.initialize()?;
+        msg!("Merkle tree initialized");
+        Ok(())
+    }
+
     /// Migrate and reset the validator registry for the ceremony-key redeploy.
     ///
     /// The registry PDA deployed before the stake-weighted quorum (#329) is 8
@@ -1440,6 +1454,33 @@ pub struct InitializeValidatorRegistry<'info> {
 
     /// Same upgrade-authority gate as `Initialize` (#204) — closes the init
     /// front-run race for the validator registry.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeMerkleTree<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + crate::merkle_tree::IncrementalMerkleTree::INIT_SPACE,
+        seeds = [b"merkle_tree"],
+        bump
+    )]
+    pub merkle_tree: Account<'info, crate::merkle_tree::IncrementalMerkleTree>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204), same as the other `initialize_*`.
     ///
     /// CHECK: validated by seeds + `check_upgrade_authority` body call.
     #[account(

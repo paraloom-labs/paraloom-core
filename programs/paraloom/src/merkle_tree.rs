@@ -83,12 +83,16 @@ pub const ZERO_HASHES: [[u8; 32]; TREE_DEPTH + 1] = [
     [47, 104, 161, 197, 142, 37, 126, 66, 161, 122, 108, 97, 223, 245, 85, 30, 213, 96, 185, 146, 42, 177, 25, 213, 172, 142, 24, 76, 151, 52, 234, 217],
 ];
 
-/// The incremental Merkle tree state embedded in the on-chain pool account.
+/// The incremental Merkle commitment tree, a program-owned account (`seeds =
+/// [b"merkle_tree"]`). The program appends output commitments and recomputes
+/// the root here, so a settled transaction can only advance the root to
+/// `insert(old_root, outputs)` — the prover never supplies it.
 ///
 /// `filled_subtrees[i]` is the last-seen left-child hash at level `i` (the
 /// value an even index deposits there and an odd index pairs against), the
 /// standard append-only incremental-tree working set.
-#[derive(Clone)]
+#[account]
+#[derive(InitSpace)]
 pub struct IncrementalMerkleTree {
     pub next_index: u64,
     pub root: [u8; 32],
