@@ -141,4 +141,18 @@ pub enum Message {
         memory_used_bytes: u64,
         instructions_executed: u64,
     },
+
+    // v3 unified-transact consensus messages (#350). Appended at the very end
+    // of the enum, NOT next to the transfer twins: this enum travels gossip
+    // bincode-encoded, and bincode encodes the variant index, so inserting
+    // mid-enum would shift every later variant and break rolling upgrades.
+    /// Transact verification request (broadcast to all validators, #350)
+    TransactVerificationRequest {
+        request: crate::consensus::transact::TransactVerificationRequest,
+    },
+
+    /// Transact verification result (validator -> coordinator, #350)
+    TransactVerificationResult {
+        result: crate::consensus::transact::TransactVerificationResult,
+    },
 }
