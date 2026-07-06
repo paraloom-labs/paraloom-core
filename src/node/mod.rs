@@ -39,6 +39,7 @@ use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 
 pub mod cosign_round;
 pub mod ingress_auth;
+pub mod transact_ingress;
 pub mod transfer_ingress;
 pub mod withdrawal_ingress;
 
@@ -2275,6 +2276,40 @@ impl Node {
                     Err(e) => {
                         log::warn!(
                             "invalid bridge.transfer_ingress_address '{}': {} — ingress not started",
+                            addr_str,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Serve the transact-verification ingress over HTTP (#350), the v3
+        // unified-transact twin of the transfer ingress above.
+        if self.transact_coordinator.is_some() {
+            let addr_str = self.settings.bridge.transact_ingress_address.trim();
+            if !addr_str.is_empty() {
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let ingress: Arc<dyn transact_ingress::TransactIngress> =
+                            Arc::new(self.clone());
+                        let token =
+                            ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = transact_ingress::serve(ingress, addr, token).await {
+                                log::error!(
+                                    target: "paraloom::node::transact_ingress",
+                                    "transact ingress server exited: {}",
+                                    e
+                                );
+                            }
+                        });
+                        *self.transact_ingress.lock().await = Some(handle);
+                        info!("Transact ingress server started on {}", addr_str);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "invalid bridge.transact_ingress_address '{}': {} — ingress not started",
                             addr_str,
                             e
                         );

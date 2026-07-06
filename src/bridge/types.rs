@@ -123,11 +123,22 @@ pub struct BridgeConfig {
     /// so it defaults to an empty string (disabled).
     pub transfer_ingress_address: String,
 
+    /// Address the transact-verification ingress HTTP server binds to on a
+    /// bridge-enabled node (#350), the v3 unified-transact twin of
+    /// `transfer_ingress_address`. A client POSTs a 2-in/2-out transact (pure
+    /// shielded transfer or withdrawal) here and the node broadcasts it into
+    /// the consensus mesh. Triggers consensus, so it defaults to an empty
+    /// string (disabled). `#[serde(default)]` so a config predating this
+    /// field still parses (and stays disabled) instead of failing to load.
+    #[serde(default)]
+    pub transact_ingress_address: String,
+
     /// Shared bearer token the write-surface ingress endpoints
-    /// (`withdrawal_ingress_address` / `transfer_ingress_address`) require. When
-    /// non-empty, a request must present `Authorization: Bearer <token>` or it is
-    /// refused with 401 — so an ingress exposed beyond loopback cannot be driven
-    /// by an unauthenticated caller. Empty (the default) keeps the historical
+    /// (`withdrawal_ingress_address` / `transfer_ingress_address` /
+    /// `transact_ingress_address`) require. When non-empty, a request must
+    /// present `Authorization: Bearer <token>` or it is refused with 401 — so an
+    /// ingress exposed beyond loopback cannot be driven by an unauthenticated
+    /// caller. Empty (the default) keeps the historical
     /// no-auth behaviour, which is only safe on a loopback/management interface.
     /// `#[serde(default)]` so a config predating this field still parses (and
     /// gets the empty, no-auth default) instead of failing to load.
@@ -213,6 +224,8 @@ impl Default for BridgeConfig {
             withdrawal_ingress_address: std::env::var("BRIDGE_WITHDRAWAL_INGRESS_ADDRESS")
                 .unwrap_or_default(),
             transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
+                .unwrap_or_default(),
+            transact_ingress_address: std::env::var("BRIDGE_TRANSACT_INGRESS_ADDRESS")
                 .unwrap_or_default(),
             ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
             use_cosign_settlement: default_use_cosign_settlement(),
