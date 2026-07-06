@@ -41,6 +41,12 @@ ark-bn254 = { version = "0.5", features = [] }
 ark-ff = { version = "0.5", features = [] }
 num-bigint = "0.4"
 solana-bn254 = "2.2"
+# Poseidon hashing for the on-chain incremental Merkle tree (circuit v3, #350).
+# On-chain this calls the `sol_poseidon` syscall (circomlib BN254 x5); off-chain
+# (tests) it falls back to light-poseidon 0.2, the same implementation the
+# workspace crate's `circom_poseidon` uses — so the tree's hash is bit-identical
+# to the circuit's membership hash.
+solana-poseidon = "2.3"
 
 [dev-dependencies]
 solana-program-test = "2.3.13"
