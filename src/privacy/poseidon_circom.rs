@@ -101,6 +101,112 @@ pub fn circom_poseidon_gadget(
     Ok(state[0].clone())
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// v3 note hashes (circom fixed-width; domain separation by WIDTH).
+//
+// The UTXO construction of the audited Tornado-Nova / privacy-cash transaction
+// circuit, reimplemented on our circom Poseidon so the host and the in-circuit
+// gadget agree and the on-chain tree (syscall) sees the same commitments:
+//
+//   pubkey      = Poseidon(1)([privkey])
+//   commitment  = Poseidon(4)([amount, pubkey, blinding, asset_id])
+//   signature   = Poseidon(3)([privkey, commitment, leaf_index])
+//   nullifier   = Poseidon(3)([commitment, leaf_index, signature])
+//   merkle node = Poseidon(2)([left, right])
+//
+// `leaf_index` is the note's tree position, folded into the signature and
+// nullifier so a note at a given position yields exactly one nullifier that
+// only its key-holder can produce. `asset_id` is bound into every commitment
+// so a note of one asset cannot be spent as another.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Host: spend public key `Poseidon(1)([privkey])`.
+pub fn v3_pubkey(privkey: Fr) -> Fr {
+    circom_poseidon(&[privkey])
+}
+
+/// Host: note commitment `Poseidon(4)([amount, pubkey, blinding, asset_id])`.
+pub fn v3_commit(amount: Fr, pubkey: Fr, blinding: Fr, asset_id: Fr) -> Fr {
+    circom_poseidon(&[amount, pubkey, blinding, asset_id])
+}
+
+/// Host: spend signature `Poseidon(3)([privkey, commitment, leaf_index])`.
+pub fn v3_signature(privkey: Fr, commitment: Fr, leaf_index: Fr) -> Fr {
+    circom_poseidon(&[privkey, commitment, leaf_index])
+}
+
+/// Host: nullifier `Poseidon(3)([commitment, leaf_index, signature])`.
+pub fn v3_nullifier(commitment: Fr, leaf_index: Fr, signature: Fr) -> Fr {
+    circom_poseidon(&[commitment, leaf_index, signature])
+}
+
+/// Host: Merkle inner node `Poseidon(2)([left, right])`.
+pub fn v3_merkle_pair(left: Fr, right: Fr) -> Fr {
+    circom_poseidon(&[left, right])
+}
+
+/// In-circuit: `Poseidon(1)([privkey])`.
+pub fn v3_pubkey_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    privkey: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    circom_poseidon_gadget(cs, &[privkey.clone()])
+}
+
+/// In-circuit: `Poseidon(4)([amount, pubkey, blinding, asset_id])`.
+pub fn v3_commit_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    amount: &FpVar<Fr>,
+    pubkey: &FpVar<Fr>,
+    blinding: &FpVar<Fr>,
+    asset_id: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    circom_poseidon_gadget(
+        cs,
+        &[
+            amount.clone(),
+            pubkey.clone(),
+            blinding.clone(),
+            asset_id.clone(),
+        ],
+    )
+}
+
+/// In-circuit: `Poseidon(3)([privkey, commitment, leaf_index])`.
+pub fn v3_signature_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    privkey: &FpVar<Fr>,
+    commitment: &FpVar<Fr>,
+    leaf_index: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    circom_poseidon_gadget(
+        cs,
+        &[privkey.clone(), commitment.clone(), leaf_index.clone()],
+    )
+}
+
+/// In-circuit: `Poseidon(3)([commitment, leaf_index, signature])`.
+pub fn v3_nullifier_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    commitment: &FpVar<Fr>,
+    leaf_index: &FpVar<Fr>,
+    signature: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    circom_poseidon_gadget(
+        cs,
+        &[commitment.clone(), leaf_index.clone(), signature.clone()],
+    )
+}
+
+/// In-circuit: `Poseidon(2)([left, right])`.
+pub fn v3_merkle_pair_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    left: &FpVar<Fr>,
+    right: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    circom_poseidon_gadget(cs, &[left.clone(), right.clone()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +244,47 @@ mod tests {
                     n + 1
                 );
             }
+        }
+    }
+
+    /// The v3 note-hash helpers (pubkey/commit/signature/nullifier/merkle) each
+    /// match their in-circuit gadget for random inputs — the whole UTXO note
+    /// construction is host/gadget consistent.
+    #[test]
+    fn v3_note_hashes_host_matches_gadget() {
+        let mut rng = StdRng::seed_from_u64(0x00DE);
+        for _ in 0..8 {
+            let sk = Fr::from(rng.gen::<u64>());
+            let amt = Fr::from(rng.gen::<u64>());
+            let bl = Fr::from(rng.gen::<u64>());
+            let asset = Fr::from(rng.gen::<u64>());
+            let idx = Fr::from(rng.gen::<u32>() as u64);
+
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            let w = |x: Fr| FpVar::new_witness(cs.clone(), || Ok(x)).unwrap();
+            let (skv, amtv, blv, assetv, idxv) = (w(sk), w(amt), w(bl), w(asset), w(idx));
+
+            let pk = v3_pubkey(sk);
+            let pkv = v3_pubkey_gadget(cs.clone(), &skv).unwrap();
+            assert_eq!(pk, pkv.value().unwrap(), "pubkey");
+
+            let c = v3_commit(amt, pk, bl, asset);
+            let cv = v3_commit_gadget(cs.clone(), &amtv, &pkv, &blv, &assetv).unwrap();
+            assert_eq!(c, cv.value().unwrap(), "commit");
+
+            let s = v3_signature(sk, c, idx);
+            let sv = v3_signature_gadget(cs.clone(), &skv, &cv, &idxv).unwrap();
+            assert_eq!(s, sv.value().unwrap(), "signature");
+
+            let n = v3_nullifier(c, idx, s);
+            let nv = v3_nullifier_gadget(cs.clone(), &cv, &idxv, &sv).unwrap();
+            assert_eq!(n, nv.value().unwrap(), "nullifier");
+
+            let m = v3_merkle_pair(c, n);
+            let mv = v3_merkle_pair_gadget(cs.clone(), &cv, &nv).unwrap();
+            assert_eq!(m, mv.value().unwrap(), "merkle");
+
+            assert!(cs.is_satisfied().unwrap());
         }
     }
 

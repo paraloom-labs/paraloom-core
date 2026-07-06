@@ -13,7 +13,7 @@ use ark_ff::PrimeField;
 use ark_groth16::{PreparedVerifyingKey, Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::{
     alloc::AllocVar, boolean::Boolean, eq::EqGadget, fields::fp::FpVar, fields::FieldVar,
-    uint64::UInt64,
+    uint32::UInt32, uint64::UInt64,
 };
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
@@ -23,6 +23,10 @@ use crate::privacy::poseidon::{
     poseidon_commit_gadget, poseidon_commit_spend_gadget, poseidon_merkle_pair_gadget,
     poseidon_nullifier_gadget, poseidon_nullifier_spend_gadget, poseidon_pubkey_gadget,
     poseidon_signature_gadget,
+};
+use crate::privacy::poseidon_circom::{
+    v3_commit_gadget, v3_merkle_pair_gadget, v3_nullifier_gadget, v3_pubkey_gadget,
+    v3_signature_gadget,
 };
 
 /// Allocate a private witness `u64` and return both the bit-decomposed
@@ -1233,6 +1237,214 @@ impl ConstraintSynthesizer<Fr> for DepositCircuitV2 {
     }
 }
 
+/// Merkle tree depth for the v3 transact circuit — matches the on-chain
+/// incremental tree (`programs/paraloom/merkle_tree::TREE_DEPTH`).
+pub const TX_LEVELS: usize = 32;
+/// Fixed inputs / outputs of the v3 UTXO transaction (2-in / 2-out).
+pub const TX_NINS: usize = 2;
+pub const TX_NOUTS: usize = 2;
+
+/// Unified UTXO transaction circuit (circuit v3, #350).
+///
+/// A single circuit for deposit / withdraw / transfer, the audited Tornado-Nova
+/// / privacy-cash construction reimplemented on our circom Poseidon. `n` inputs
+/// are spent and `n` outputs created; the signed `public_amount` (`> 0` deposit,
+/// `< 0` withdraw as the field element `p − x`, `0` internal transfer) balances
+/// the two: `Σ in + public_amount = Σ out`. The program owns the tree and
+/// appends the output commitments, so this circuit never names a post-insert
+/// root — it only proves membership of the spent notes against a known `root`.
+///
+/// Per input: the note commitment `Poseidon(4)([amount, pubkey, blinding,
+/// asset_id])` (with `pubkey = Poseidon(1)([privkey])`) is a member of `root`
+/// (checked only when `amount ≠ 0`, so a deposit or single-input spend can use
+/// zero-amount dummies), and the revealed nullifier `Poseidon(3)([commitment,
+/// leaf_index, Poseidon(3)([privkey, commitment, leaf_index])])` binds the
+/// note's position and requires its private key. Per output: the commitment is
+/// re-derived and the amount range-bound to `u64`. The two input nullifiers
+/// must differ; `ext_data_hash` (the recipient/fee binding) is constrained so
+/// it cannot be swapped.
+///
+/// Public inputs, in Groth16 slice order:
+/// `[root, public_amount, ext_data_hash, asset_id, nullifier0, nullifier1,
+///   out_commitment0, out_commitment1]`.
+#[derive(Clone)]
+pub struct TransactCircuitV3 {
+    // Public inputs.
+    pub root: Option<[u8; 32]>,
+    pub public_amount: Option<[u8; 32]>,
+    pub ext_data_hash: Option<[u8; 32]>,
+    pub asset_id: Option<[u8; 32]>,
+    pub input_nullifiers: Vec<Option<[u8; 32]>>,
+    pub output_commitments: Vec<Option<[u8; 32]>>,
+    // Private input-note witnesses (length TX_NINS).
+    pub in_amounts: Vec<Option<u64>>,
+    pub in_privkeys: Vec<Option<[u8; 32]>>,
+    pub in_blindings: Vec<Option<[u8; 32]>>,
+    pub in_leaf_indices: Vec<Option<u64>>,
+    /// `in_paths[tx][i]` = the sibling at level `i`; the direction comes from
+    /// bit `i` of `leaf_index`, so no separate direction witness is needed.
+    pub in_paths: Vec<Option<Vec<[u8; 32]>>>,
+    // Private output-note witnesses (length TX_NOUTS).
+    pub out_amounts: Vec<Option<u64>>,
+    pub out_pubkeys: Vec<Option<[u8; 32]>>,
+    pub out_blindings: Vec<Option<[u8; 32]>>,
+}
+
+impl TransactCircuitV3 {
+    /// Blank instance for `setup` (fixes the R1CS shape; carries no values).
+    pub fn blank() -> Self {
+        TransactCircuitV3 {
+            root: None,
+            public_amount: None,
+            ext_data_hash: None,
+            asset_id: None,
+            input_nullifiers: vec![None; TX_NINS],
+            output_commitments: vec![None; TX_NOUTS],
+            in_amounts: vec![None; TX_NINS],
+            in_privkeys: vec![None; TX_NINS],
+            in_blindings: vec![None; TX_NINS],
+            in_leaf_indices: vec![None; TX_NINS],
+            in_paths: vec![None; TX_NINS],
+            out_amounts: vec![None; TX_NOUTS],
+            out_pubkeys: vec![None; TX_NOUTS],
+            out_blindings: vec![None; TX_NOUTS],
+        }
+    }
+}
+
+impl Default for TransactCircuitV3 {
+    fn default() -> Self {
+        Self::blank()
+    }
+}
+
+impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // Field-element public input from optional LE bytes.
+        let input_fe = |cs: ConstraintSystemRef<Fr>, v: Option<[u8; 32]>| {
+            FpVar::new_input(cs, || {
+                v.map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .ok_or(SynthesisError::AssignmentMissing)
+            })
+        };
+        let witness_fe = |cs: ConstraintSystemRef<Fr>, v: Option<[u8; 32]>| {
+            FpVar::new_witness(cs, || {
+                v.map(|b| Fr::from_le_bytes_mod_order(&b))
+                    .ok_or(SynthesisError::AssignmentMissing)
+            })
+        };
+
+        // --- Public inputs (order = Groth16 public-input slice order) ---
+        let root_var = input_fe(cs.clone(), self.root)?;
+        let public_amount_var = input_fe(cs.clone(), self.public_amount)?;
+        let ext_data_hash_var = input_fe(cs.clone(), self.ext_data_hash)?;
+        let asset_id_var = input_fe(cs.clone(), self.asset_id)?;
+        let mut nullifier_pub = Vec::with_capacity(TX_NINS);
+        for tx in 0..TX_NINS {
+            nullifier_pub.push(input_fe(cs.clone(), self.input_nullifiers[tx])?);
+        }
+        let mut commitment_pub = Vec::with_capacity(TX_NOUTS);
+        for tx in 0..TX_NOUTS {
+            commitment_pub.push(input_fe(cs.clone(), self.output_commitments[tx])?);
+        }
+
+        // Bind ext_data_hash into a real constraint so a valid proof cannot be
+        // replayed against a different one (it is otherwise unreferenced).
+        let _ext_data_square = &ext_data_hash_var * &ext_data_hash_var;
+
+        let zero = FpVar::constant(Fr::from(0u64));
+        let mut sum_ins = zero.clone();
+
+        // --- Inputs ---
+        for tx in 0..TX_NINS {
+            let amount_var = FpVar::new_witness(cs.clone(), || {
+                self.in_amounts[tx]
+                    .map(Fr::from)
+                    .ok_or(SynthesisError::AssignmentMissing)
+            })?;
+            let privkey_var = witness_fe(cs.clone(), self.in_privkeys[tx])?;
+            let blinding_var = witness_fe(cs.clone(), self.in_blindings[tx])?;
+
+            // leaf_index as 32 bits: gives both the field element (bound into the
+            // signature/nullifier) and the per-level direction selectors.
+            let idx_u32 = UInt32::new_witness(cs.clone(), || {
+                self.in_leaf_indices[tx]
+                    .map(|i| i as u32)
+                    .ok_or(SynthesisError::AssignmentMissing)
+            })?;
+            let idx_bits = idx_u32.to_bits_le();
+            let leaf_index_var = Boolean::le_bits_to_fp_var(&idx_bits)?;
+
+            let pubkey_var = v3_pubkey_gadget(cs.clone(), &privkey_var)?;
+            let commitment_var = v3_commit_gadget(
+                cs.clone(),
+                &amount_var,
+                &pubkey_var,
+                &blinding_var,
+                &asset_id_var,
+            )?;
+            let signature_var =
+                v3_signature_gadget(cs.clone(), &privkey_var, &commitment_var, &leaf_index_var)?;
+            let nullifier_var =
+                v3_nullifier_gadget(cs.clone(), &commitment_var, &leaf_index_var, &signature_var)?;
+            nullifier_var.enforce_equal(&nullifier_pub[tx])?;
+
+            // Membership fold: direction bit `i` picks (current,sibling) order.
+            let mut current = commitment_var;
+            for (i, bit) in idx_bits.iter().enumerate() {
+                let sibling = FpVar::new_witness(cs.clone(), || {
+                    self.in_paths[tx]
+                        .as_ref()
+                        .and_then(|p| p.get(i))
+                        .map(|b| Fr::from_le_bytes_mod_order(b))
+                        .ok_or(SynthesisError::AssignmentMissing)
+                })?;
+                let left = bit.select(&sibling, &current)?;
+                let right = bit.select(&current, &sibling)?;
+                current = v3_merkle_pair_gadget(cs.clone(), &left, &right)?;
+            }
+            // Membership is enforced only for non-zero-amount inputs:
+            // `(folded_root − root) · amount = 0`.
+            let diff = &current - &root_var;
+            (&diff * &amount_var).enforce_equal(&zero)?;
+
+            sum_ins = &sum_ins + &amount_var;
+        }
+
+        // --- Outputs ---
+        let mut sum_outs = zero.clone();
+        for tx in 0..TX_NOUTS {
+            // Range-bound the output amount to u64 (prevents supply forgery).
+            let (_bits, amount_var) = alloc_u64_witness(cs.clone(), self.out_amounts[tx])?;
+            let pubkey_var = witness_fe(cs.clone(), self.out_pubkeys[tx])?;
+            let blinding_var = witness_fe(cs.clone(), self.out_blindings[tx])?;
+
+            let commitment_var = v3_commit_gadget(
+                cs.clone(),
+                &amount_var,
+                &pubkey_var,
+                &blinding_var,
+                &asset_id_var,
+            )?;
+            commitment_var.enforce_equal(&commitment_pub[tx])?;
+
+            sum_outs = &sum_outs + &amount_var;
+        }
+
+        // The two input nullifiers must differ (no double-spend within a tx):
+        // enforce `nullifier0 − nullifier1` is invertible (i.e. non-zero).
+        let ndiff = &nullifier_pub[0] - &nullifier_pub[1];
+        // `inverse()` constrains `ndiff` to be non-zero (an inverse exists only
+        // for a non-zero element), i.e. the two nullifiers differ.
+        let _ndiff_inv = ndiff.inverse()?;
+
+        // Value invariant: Σ in + public_amount = Σ out.
+        (&sum_ins + &public_amount_var).enforce_equal(&sum_outs)?;
+
+        Ok(())
+    }
+}
+
 /// Groth16 proof system wrapper
 pub struct Groth16ProofSystem;
 
@@ -2317,5 +2529,414 @@ mod tests {
             commitment, 2_000, // wrong amount
             blinding, opk, [0u8; 32],
         )));
+    }
+
+    // ── TransactCircuitV3 (unified UTXO, circuit v3, #350) ──────────────────
+
+    mod v3 {
+        use super::*;
+        use crate::privacy::poseidon_circom::{
+            v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature,
+        };
+        use ark_ff::{BigInteger, PrimeField};
+
+        fn fr_le(f: Fr) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            let b = f.into_bigint().to_bytes_le();
+            out[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+            out
+        }
+
+        /// Empty-subtree hashes under the v3 Merkle hash: `z[0] = 0`,
+        /// `z[k+1] = Poseidon(z[k], z[k])`.
+        fn zeros() -> Vec<Fr> {
+            let mut z = vec![Fr::from(0u64)];
+            for k in 0..TX_LEVELS {
+                z.push(v3_merkle_pair(z[k], z[k]));
+            }
+            z
+        }
+
+        /// Root and path for `leaf` placed at `index` in an otherwise-empty
+        /// tree: every sibling on the path is a zero-subtree hash.
+        fn member_root_and_path(leaf: Fr, index: u64) -> ([u8; 32], Vec<[u8; 32]>) {
+            let z = zeros();
+            let mut current = leaf;
+            for (i, zi) in z.iter().enumerate().take(TX_LEVELS) {
+                let bit = (index >> i) & 1;
+                current = if bit == 0 {
+                    v3_merkle_pair(current, *zi)
+                } else {
+                    v3_merkle_pair(*zi, current)
+                };
+            }
+            let path = z[..TX_LEVELS].iter().map(|f| fr_le(*f)).collect();
+            (fr_le(current), path)
+        }
+
+        struct InNote {
+            amount: u64,
+            privkey: Fr,
+            blinding: Fr,
+            index: u64,
+        }
+        struct OutNote {
+            amount: u64,
+            pubkey: Fr,
+            blinding: Fr,
+        }
+
+        /// Build a valid circuit from input/output notes over one asset. Inputs
+        /// with `amount == 0` are dummies (membership skipped); a single real
+        /// input is placed in a fresh tree and `root` is its membership root.
+        fn build(
+            ins: [InNote; 2],
+            outs: [OutNote; 2],
+            asset: Fr,
+            ext_data_hash: [u8; 32],
+        ) -> TransactCircuitV3 {
+            // Root: from the first real (non-zero) input, else an empty tree.
+            let mut root = fr_le(*zeros().last().unwrap());
+            let mut paths: Vec<Vec<[u8; 32]>> = Vec::new();
+            let mut nullifiers = Vec::new();
+            let mut sum_in = 0u128;
+            for n in &ins {
+                let pk = v3_pubkey(n.privkey);
+                let c = v3_commit(Fr::from(n.amount), pk, n.blinding, asset);
+                let sig = v3_signature(n.privkey, c, Fr::from(n.index));
+                nullifiers.push(fr_le(v3_nullifier(c, Fr::from(n.index), sig)));
+                if n.amount != 0 {
+                    let (r, p) = member_root_and_path(c, n.index);
+                    root = r;
+                    paths.push(p);
+                } else {
+                    // Dummy: path is irrelevant (membership disabled); use zeros.
+                    paths.push(zeros()[..TX_LEVELS].iter().map(|f| fr_le(*f)).collect());
+                }
+                sum_in += n.amount as u128;
+            }
+            let mut commitments = Vec::new();
+            let mut sum_out = 0u128;
+            for n in &outs {
+                commitments.push(fr_le(v3_commit(
+                    Fr::from(n.amount),
+                    n.pubkey,
+                    n.blinding,
+                    asset,
+                )));
+                sum_out += n.amount as u128;
+            }
+            // public_amount = Σout − Σin (as a field element; negative wraps).
+            let public_amount = Fr::from(sum_out) - Fr::from(sum_in);
+
+            TransactCircuitV3 {
+                root: Some(root),
+                public_amount: Some(fr_le(public_amount)),
+                ext_data_hash: Some(ext_data_hash),
+                asset_id: Some(fr_le(asset)),
+                input_nullifiers: nullifiers.into_iter().map(Some).collect(),
+                output_commitments: commitments.into_iter().map(Some).collect(),
+                in_amounts: ins.iter().map(|n| Some(n.amount)).collect(),
+                in_privkeys: ins.iter().map(|n| Some(fr_le(n.privkey))).collect(),
+                in_blindings: ins.iter().map(|n| Some(fr_le(n.blinding))).collect(),
+                in_leaf_indices: ins.iter().map(|n| Some(n.index)).collect(),
+                in_paths: paths.into_iter().map(Some).collect(),
+                out_amounts: outs.iter().map(|n| Some(n.amount)).collect(),
+                out_pubkeys: outs.iter().map(|n| Some(fr_le(n.pubkey))).collect(),
+                out_blindings: outs.iter().map(|n| Some(fr_le(n.blinding))).collect(),
+            }
+        }
+
+        fn synth(c: TransactCircuitV3) -> bool {
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            match c.generate_constraints(cs.clone()) {
+                Ok(()) => cs.is_satisfied().expect("cs query"),
+                Err(_) => false,
+            }
+        }
+
+        fn asset() -> Fr {
+            Fr::from(0u64) // NATIVE_SOL
+        }
+
+        /// Deposit: two zero-amount dummy inputs, two real outputs summing to
+        /// the deposit; `public_amount = +deposit`.
+        #[test]
+        fn deposit_satisfies() {
+            let ins = [
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(11u64),
+                    blinding: Fr::from(1u64),
+                    index: 0,
+                },
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(12u64),
+                    blinding: Fr::from(2u64),
+                    index: 0,
+                },
+            ];
+            let outs = [
+                OutNote {
+                    amount: 700,
+                    pubkey: v3_pubkey(Fr::from(21u64)),
+                    blinding: Fr::from(5u64),
+                },
+                OutNote {
+                    amount: 300,
+                    pubkey: v3_pubkey(Fr::from(22u64)),
+                    blinding: Fr::from(6u64),
+                },
+            ];
+            assert!(synth(build(ins, outs, asset(), [7u8; 32])));
+        }
+
+        /// Withdrawal/transfer: one real input (member of a tree) + one dummy;
+        /// outputs sum to less than the input, the rest withdrawn via a negative
+        /// `public_amount`.
+        #[test]
+        fn spend_satisfies() {
+            let ins = [
+                InNote {
+                    amount: 1000,
+                    privkey: Fr::from(31u64),
+                    blinding: Fr::from(3u64),
+                    index: 5,
+                },
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(32u64),
+                    blinding: Fr::from(4u64),
+                    index: 0,
+                },
+            ];
+            let outs = [
+                OutNote {
+                    amount: 250,
+                    pubkey: v3_pubkey(Fr::from(41u64)),
+                    blinding: Fr::from(7u64),
+                },
+                OutNote {
+                    amount: 0,
+                    pubkey: v3_pubkey(Fr::from(42u64)),
+                    blinding: Fr::from(8u64),
+                },
+            ];
+            // Σout = 250, Σin = 1000 → public_amount = −750 (withdraw 750).
+            assert!(synth(build(ins, outs, asset(), [9u8; 32])));
+        }
+
+        /// An unbalanced transaction (outputs don't match inputs + public_amount)
+        /// is rejected.
+        #[test]
+        fn rejects_unbalanced() {
+            let mut c = build(
+                [
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(1u64),
+                        blinding: Fr::from(1u64),
+                        index: 0,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(2u64),
+                        blinding: Fr::from(2u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 500,
+                        pubkey: v3_pubkey(Fr::from(3u64)),
+                        blinding: Fr::from(3u64),
+                    },
+                    OutNote {
+                        amount: 500,
+                        pubkey: v3_pubkey(Fr::from(4u64)),
+                        blinding: Fr::from(4u64),
+                    },
+                ],
+                asset(),
+                [1u8; 32],
+            );
+            // Corrupt public_amount so Σin + public_amount ≠ Σout.
+            c.public_amount = Some(fr_le(Fr::from(999u64)));
+            assert!(!synth(c));
+        }
+
+        /// A tampered nullifier (not the one the note derives) is rejected.
+        #[test]
+        fn rejects_tampered_nullifier() {
+            let mut c = build(
+                [
+                    InNote {
+                        amount: 1000,
+                        privkey: Fr::from(5u64),
+                        blinding: Fr::from(5u64),
+                        index: 2,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(6u64),
+                        blinding: Fr::from(6u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 1000,
+                        pubkey: v3_pubkey(Fr::from(7u64)),
+                        blinding: Fr::from(7u64),
+                    },
+                    OutNote {
+                        amount: 0,
+                        pubkey: v3_pubkey(Fr::from(8u64)),
+                        blinding: Fr::from(8u64),
+                    },
+                ],
+                asset(),
+                [2u8; 32],
+            );
+            c.input_nullifiers[0] = Some([0xABu8; 32]);
+            assert!(!synth(c));
+        }
+
+        /// Two identical input notes yield the same nullifier; the uniqueness
+        /// constraint rejects the transaction (in-tx double spend).
+        #[test]
+        fn rejects_duplicate_nullifiers() {
+            // Both inputs are the SAME note (same key/blinding/index) → identical
+            // nullifiers. Build manually so both are real and equal.
+            let sk = Fr::from(9u64);
+            let bl = Fr::from(9u64);
+            let a = asset();
+            let pk = v3_pubkey(sk);
+            let c0 = v3_commit(Fr::from(1000u64), pk, bl, a);
+            let sig = v3_signature(sk, c0, Fr::from(3u64));
+            let nf = fr_le(v3_nullifier(c0, Fr::from(3u64), sig));
+            let (root, path) = member_root_and_path(c0, 3);
+            let opk = v3_pubkey(Fr::from(10u64));
+            let circuit = TransactCircuitV3 {
+                root: Some(root),
+                public_amount: Some(fr_le(Fr::from(0u64))), // Σin(2000) + pa = Σout(2000)
+                ext_data_hash: Some([3u8; 32]),
+                asset_id: Some(fr_le(a)),
+                input_nullifiers: vec![Some(nf), Some(nf)],
+                output_commitments: vec![
+                    Some(fr_le(v3_commit(Fr::from(2000u64), opk, Fr::from(1u64), a))),
+                    Some(fr_le(v3_commit(Fr::from(0u64), opk, Fr::from(2u64), a))),
+                ],
+                in_amounts: vec![Some(1000), Some(1000)],
+                in_privkeys: vec![Some(fr_le(sk)), Some(fr_le(sk))],
+                in_blindings: vec![Some(fr_le(bl)), Some(fr_le(bl))],
+                in_leaf_indices: vec![Some(3), Some(3)],
+                in_paths: vec![Some(path.clone()), Some(path)],
+                out_amounts: vec![Some(2000), Some(0)],
+                out_pubkeys: vec![Some(fr_le(opk)), Some(fr_le(opk))],
+                out_blindings: vec![Some(fr_le(Fr::from(1u64))), Some(fr_le(Fr::from(2u64)))],
+            };
+            assert!(!synth(circuit));
+        }
+
+        /// A real input whose commitment is not in the tree (wrong root) fails
+        /// membership.
+        #[test]
+        fn rejects_non_member() {
+            let mut c = build(
+                [
+                    InNote {
+                        amount: 1000,
+                        privkey: Fr::from(13u64),
+                        blinding: Fr::from(13u64),
+                        index: 1,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(14u64),
+                        blinding: Fr::from(14u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 1000,
+                        pubkey: v3_pubkey(Fr::from(15u64)),
+                        blinding: Fr::from(9u64),
+                    },
+                    OutNote {
+                        amount: 0,
+                        pubkey: v3_pubkey(Fr::from(16u64)),
+                        blinding: Fr::from(10u64),
+                    },
+                ],
+                asset(),
+                [4u8; 32],
+            );
+            c.root = Some([0x55u8; 32]); // not the real membership root
+            assert!(!synth(c));
+        }
+
+        /// Full Groth16 setup → prove → verify with the public-input vector in
+        /// slice order, confirming the public wiring end to end.
+        #[test]
+        fn full_groth16_roundtrip() {
+            use ark_std::rand::{rngs::StdRng, SeedableRng};
+            let mut rng = StdRng::seed_from_u64(0x7A3C);
+
+            let circuit = build(
+                [
+                    InNote {
+                        amount: 1000,
+                        privkey: Fr::from(51u64),
+                        blinding: Fr::from(5u64),
+                        index: 7,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(52u64),
+                        blinding: Fr::from(6u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 400,
+                        pubkey: v3_pubkey(Fr::from(61u64)),
+                        blinding: Fr::from(1u64),
+                    },
+                    OutNote {
+                        amount: 100,
+                        pubkey: v3_pubkey(Fr::from(62u64)),
+                        blinding: Fr::from(2u64),
+                    },
+                ],
+                asset(),
+                [7u8; 32],
+            );
+
+            let (pk, vk) =
+                Groth16ProofSystem::setup(TransactCircuitV3::blank(), &mut rng).expect("setup");
+            let proof = Groth16ProofSystem::prove(&pk, circuit.clone(), &mut rng).expect("prove");
+
+            let to_fr = |b: [u8; 32]| Fr::from_le_bytes_mod_order(&b);
+            let public_inputs: Vec<Fr> = vec![
+                to_fr(circuit.root.unwrap()),
+                to_fr(circuit.public_amount.unwrap()),
+                to_fr(circuit.ext_data_hash.unwrap()),
+                to_fr(circuit.asset_id.unwrap()),
+                to_fr(circuit.input_nullifiers[0].unwrap()),
+                to_fr(circuit.input_nullifiers[1].unwrap()),
+                to_fr(circuit.output_commitments[0].unwrap()),
+                to_fr(circuit.output_commitments[1].unwrap()),
+            ];
+            assert!(Groth16ProofSystem::verify(&vk, &public_inputs, &proof).expect("verify"));
+
+            // A wrong public input (tampered root) must fail verification.
+            let mut bad = public_inputs.clone();
+            bad[0] = Fr::from(123u64);
+            assert!(!Groth16ProofSystem::verify(&vk, &bad, &proof).expect("verify"));
+        }
     }
 }
