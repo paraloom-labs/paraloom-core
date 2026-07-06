@@ -7,6 +7,7 @@ use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 mod groth16;
+mod merkle_tree;
 mod quorum;
 pub mod transfer_fixture_data;
 mod transfer_verifier;
