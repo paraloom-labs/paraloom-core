@@ -3196,6 +3196,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "ouroboros",
  "solana-bn254",
+ "solana-poseidon",
  "solana-program-test",
  "solana-sdk",
 ]

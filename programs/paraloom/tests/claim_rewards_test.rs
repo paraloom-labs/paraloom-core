@@ -181,7 +181,11 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     .await;
 
     // The fee is now pending; nothing claimed yet.
-    let before = banks_client.get_account(validator_pda).await.unwrap().unwrap();
+    let before = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
     let before = ValidatorAccount::try_deserialize(&mut before.data.as_slice()).unwrap();
     assert_eq!(before.pending_rewards, EXPECTED_FEE);
     assert_eq!(before.total_earnings, 0);
