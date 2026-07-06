@@ -30,6 +30,7 @@ pub mod path_server;
 pub mod pedersen;
 pub mod pool;
 pub mod poseidon;
+pub mod poseidon_circom;
 pub mod proof;
 pub mod proof_codec;
 pub mod sparse_merkle;
