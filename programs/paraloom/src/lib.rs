@@ -203,6 +203,64 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Deposit SOL and append the resulting note commitment to the on-chain
+    /// tree (circuit v3, #350).
+    ///
+    /// The v3 deposit: moves `amount` into the vault and appends the note
+    /// commitment — computed on-chain as `Poseidon(4)([amount, pubkey, blinding,
+    /// asset])` — to the program-owned Merkle tree. Computing the commitment
+    /// here binds the appended leaf to the amount actually deposited, so a
+    /// depositor cannot append a leaf claiming more value than it paid in. The
+    /// emitted event carries the leaf index so the wallet learns where its note
+    /// landed. Permissionless (the depositor's own funds), no proof or quorum —
+    /// a deposit only *adds* value and creates a note the depositor controls.
+    pub fn deposit_note(
+        ctx: Context<DepositNote>,
+        amount: u64,
+        pubkey: [u8; 32],
+        blinding: [u8; 32],
+    ) -> Result<()> {
+        require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
+        require!(amount > 0, BridgeError::InvalidAmount);
+
+        let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.depositor.key(),
+            &ctx.accounts.bridge_vault.key(),
+            amount,
+        );
+        anchor_lang::solana_program::program::invoke(
+            &transfer_ix,
+            &[
+                ctx.accounts.depositor.to_account_info(),
+                ctx.accounts.bridge_vault.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        let commitment =
+            crate::merkle_tree::commitment(amount, &pubkey, &blinding, &NATIVE_SOL_ASSET)?;
+        let leaf_index = ctx.accounts.merkle_tree.next_index;
+        ctx.accounts.merkle_tree.append(commitment)?;
+
+        let bridge_state = &mut ctx.accounts.bridge_state;
+        bridge_state.total_deposited = bridge_state
+            .total_deposited
+            .checked_add(amount)
+            .ok_or(BridgeError::InvalidAmount)?;
+        bridge_state.deposit_count += 1;
+
+        emit!(DepositNoteEvent {
+            depositor: ctx.accounts.depositor.key(),
+            amount,
+            commitment,
+            leaf_index,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        msg!("Deposit note appended at leaf {}", leaf_index);
+        Ok(())
+    }
+
     /// Withdraw SOL from the privacy pool.
     ///
     /// Replay protection has two layers:
@@ -1128,6 +1186,23 @@ pub struct Deposit<'info> {
 }
 
 #[derive(Accounts)]
+pub struct DepositNote<'info> {
+    #[account(mut, seeds = [b"bridge_state"], bump)]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    #[account(mut, seeds = [b"bridge_vault"], bump)]
+    pub bridge_vault: SystemAccount<'info>,
+
+    #[account(mut, seeds = [b"merkle_tree"], bump)]
+    pub merkle_tree: Account<'info, crate::merkle_tree::IncrementalMerkleTree>,
+
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(nullifier: [u8; 32])]
 pub struct Withdraw<'info> {
     // `has_one = authority` binds the signer to the authority recorded at
@@ -1671,6 +1746,17 @@ pub struct DepositEvent {
     pub randomness: [u8; 32],
     pub timestamp: i64,
     pub deposit_id: u64,
+}
+
+/// Emitted by `deposit_note` (circuit v3): the appended note commitment and its
+/// tree position, so the wallet learns where its note landed.
+#[event]
+pub struct DepositNoteEvent {
+    pub depositor: Pubkey,
+    pub amount: u64,
+    pub commitment: [u8; 32],
+    pub leaf_index: u64,
+    pub timestamp: i64,
 }
 
 #[event]

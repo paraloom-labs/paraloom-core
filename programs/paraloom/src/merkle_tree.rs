@@ -49,6 +49,29 @@ fn poseidon2(left: &[u8; 32], right: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(h.to_bytes())
 }
 
+/// The v3 note commitment `Poseidon(4)([amount, pubkey, blinding, asset])`,
+/// computed on-chain so a deposit's appended leaf is bound to the amount it
+/// actually moved into the vault (a depositor cannot append a leaf claiming
+/// more value than it deposited). Bit-identical to the circuit's `v3_commit`:
+/// the same circomlib `Poseidon(4)` over the same little-endian field-element
+/// bytes (`amount` is the u64 as a little-endian field element).
+pub fn commitment(
+    amount: u64,
+    pubkey: &[u8; 32],
+    blinding: &[u8; 32],
+    asset: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let mut amount_le = [0u8; 32];
+    amount_le[..8].copy_from_slice(&amount.to_le_bytes());
+    let h = hashv(
+        Parameters::Bn254X5,
+        Endianness::LittleEndian,
+        &[&amount_le, pubkey, blinding, asset],
+    )
+    .map_err(|_| error!(BridgeError::InvalidProof))?;
+    Ok(h.to_bytes())
+}
+
 /// Empty-subtree hashes: `ZERO_HASHES[0]` is the empty leaf (`0`) and
 /// `ZERO_HASHES[k+1] = Poseidon(ZERO_HASHES[k], ZERO_HASHES[k])`, the root of a
 /// fully empty subtree of height `k` — the sibling for never-filled positions.
@@ -293,5 +316,30 @@ mod tests {
             107, 76, 246, 61, 65, 144, 214, 231, 245, 192, 92, 17,
         ];
         assert_eq!(poseidon2(&one, &two).unwrap(), expected);
+    }
+
+    /// The on-chain `commitment` equals the circuit's `v3_commit` for the same
+    /// note. Pinned against a value computed by the workspace crate's
+    /// `v3_commit(1000, v3_pubkey(51), 5, 0)` (little-endian), so a divergence
+    /// between the on-chain leaf and the proven commitment is caught here.
+    #[test]
+    fn commitment_matches_circuit_v3_commit() {
+        // v3_pubkey(51) little-endian bytes.
+        let pubkey: [u8; 32] = [
+            132, 52, 141, 61, 228, 27, 184, 227, 184, 242, 182, 222, 39, 209, 111, 33, 111, 92,
+            165, 142, 254, 122, 175, 141, 206, 84, 88, 88, 9, 26, 87, 8,
+        ];
+        let mut blinding = [0u8; 32];
+        blinding[0] = 5; // little-endian 5
+        let asset = [0u8; 32]; // native SOL
+                               // v3_commit(1000, pubkey, 5, 0) little-endian bytes.
+        let expected: [u8; 32] = [
+            133, 56, 189, 24, 154, 24, 130, 156, 210, 94, 242, 255, 117, 193, 232, 59, 154, 76,
+            231, 28, 0, 114, 32, 27, 219, 31, 106, 201, 217, 38, 252, 14,
+        ];
+        assert_eq!(
+            commitment(1000, &pubkey, &blinding, &asset).unwrap(),
+            expected
+        );
     }
 }
