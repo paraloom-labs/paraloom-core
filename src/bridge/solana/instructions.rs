@@ -91,6 +91,50 @@ pub mod discriminators {
     /// rebuilds its counters from the co-signer validator PDAs in
     /// `remaining_accounts`.
     pub const RESET_VALIDATOR_REGISTRY: [u8; 8] = [101, 188, 0, 99, 248, 198, 207, 7];
+    /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
+    /// the on-chain incremental tree.
+    #[allow(dead_code)]
+    pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
+    /// `sha256("global:deposit_note")[..8]` (#350). v3 deposit that appends the
+    /// note commitment to the on-chain tree.
+    #[allow(dead_code)]
+    pub const DEPOSIT_NOTE: [u8; 8] = [75, 212, 96, 185, 178, 167, 29, 57];
+    /// `sha256("global:initialize_merkle_tree")[..8]` (#350). One-time,
+    /// upgrade-authority-gated tree account creation.
+    #[allow(dead_code)]
+    pub const INITIALIZE_MERKLE_TREE: [u8; 8] = [67, 143, 80, 157, 177, 227, 11, 238];
+}
+
+/// Instruction data for `transact` (circuit v3, #350).
+///
+/// Layout matches the on-chain `transact` function exactly:
+/// `(nullifiers, output_commitments, root, ext_amount, proof)`. `root` is a
+/// root from the program's on-chain history the proof proves membership
+/// against; `ext_amount` is the signed external flow (`< 0` withdraws
+/// `|ext_amount|`, `== 0` is a pure shielded transfer; deposits go through
+/// `deposit_note` and `> 0` is rejected on-chain).
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct TransactInstructionData {
+    pub nullifiers: [[u8; 32]; 2],
+    pub output_commitments: [[u8; 32]; 2],
+    pub root: [u8; 32],
+    pub ext_amount: i64,
+    pub proof: Vec<u8>,
+}
+
+/// Instruction data for `deposit_note` (circuit v3, #350).
+///
+/// Layout matches the on-chain `deposit_note` function:
+/// `(amount, pubkey, blinding)`. The program computes the note commitment
+/// `Poseidon(amount, pubkey, blinding, asset)` itself and appends it to the
+/// on-chain tree, so the leaf is bound to the lamports actually deposited.
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct DepositNoteInstructionData {
+    pub amount: u64,
+    pub pubkey: [u8; 32],
+    pub blinding: [u8; 32],
 }
 
 /// SPL Token program id (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the
@@ -432,6 +476,136 @@ pub fn create_shielded_transfer_instruction(
     })
 }
 
+/// Create the `transact` instruction (circuit v3, #350).
+///
+/// Unified 2-in/2-out settlement against the program's own on-chain tree:
+/// the proof is verified against `root` (which must be in the on-chain root
+/// history), both nullifier PDAs are `init`'d, and the program appends both
+/// output commitments itself. The account order must match the `Transact`
+/// accounts struct in the program. Quorum-gated exactly like
+/// [`create_withdraw_instruction`] (#260).
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn create_transact_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    bridge_vault: &Pubkey,
+    recipient: SolanaAddress,
+    nullifiers: [[u8; 32]; 2],
+    output_commitments: [[u8; 32]; 2],
+    root: [u8; 32],
+    ext_amount: i64,
+    proof: Vec<u8>,
+    quorum_validators: &[Pubkey],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+    let (validator_registry_pda, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], program_id);
+    let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
+    let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
+    let (validator_pda, _) = derive_validator_account(program_id, authority);
+    let recipient_pubkey = Pubkey::new_from_array(recipient);
+
+    let data = TransactInstructionData {
+        nullifiers,
+        output_commitments,
+        root,
+        ext_amount,
+        proof,
+    };
+
+    let mut instruction_data = discriminators::TRANSACT.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    let mut accounts = vec![
+        AccountMeta::new(bridge_state_pda, false),
+        AccountMeta::new(merkle_tree_pda, false),
+        AccountMeta::new(*bridge_vault, false),
+        AccountMeta::new(nullifier_pda_0, false), // Nullifier account 0 (will be created)
+        AccountMeta::new(nullifier_pda_1, false), // Nullifier account 1 (will be created)
+        AccountMeta::new(recipient_pubkey, false),
+        AccountMeta::new(validator_pda, false), // Settling validator (fee credited here)
+        AccountMeta::new_readonly(validator_registry_pda, false),
+        AccountMeta::new(*authority, true),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts,
+        data: instruction_data,
+    })
+}
+
+/// Create the `deposit_note` instruction (circuit v3, #350).
+///
+/// Permissionless: the depositor moves their own lamports into the vault and
+/// the program computes + appends the note commitment on-chain. The account
+/// order must match the `DepositNote` accounts struct in the program.
+#[allow(dead_code)]
+pub fn create_deposit_note_instruction(
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    bridge_vault: &Pubkey,
+    amount: u64,
+    pubkey: [u8; 32],
+    blinding: [u8; 32],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+
+    let data = DepositNoteInstructionData {
+        amount,
+        pubkey,
+        blinding,
+    };
+
+    let mut instruction_data = discriminators::DEPOSIT_NOTE.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new(*bridge_vault, false),
+            AccountMeta::new(merkle_tree_pda, false),
+            AccountMeta::new(*depositor, true),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create the `initialize_merkle_tree` instruction (circuit v3, #350).
+///
+/// One-time creation of the on-chain incremental tree, gated to the program
+/// upgrade authority like the other `initialize_*` instructions (#204).
+#[allow(dead_code)]
+pub fn create_initialize_merkle_tree_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+) -> Instruction {
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(merkle_tree_pda, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: discriminators::INITIALIZE_MERKLE_TREE.to_vec(),
+    }
+}
+
 /// Create update merkle root instruction. Publishing a root anchors every
 /// later withdrawal proof, so the program gates it on the same BFT validator
 /// quorum (#260) as settlement: pass the co-signing validators in
@@ -528,6 +702,12 @@ pub fn derive_validator_account(program_id: &Pubkey, validator: &Pubkey) -> (Pub
 /// Derive the validator registry PDA.
 pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"validator_registry"], program_id)
+}
+
+/// Derive the on-chain incremental Merkle tree PDA (circuit v3, #350).
+#[allow(dead_code)]
+pub fn derive_merkle_tree(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"merkle_tree"], program_id)
 }
 
 /// Derive the BPFLoaderUpgradeable `ProgramData` PDA for `program_id` — the
@@ -989,5 +1169,137 @@ mod tests {
         assert_eq!(&bytes[64..96], &[0x11; 32]);
         assert_eq!(&bytes[96..128], &[0x22; 32]);
         assert_eq!(&bytes[128..160], &[0x33; 32]);
+    }
+
+    #[test]
+    fn test_create_transact_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let bridge_vault = Pubkey::new_unique();
+        let cosigner = Pubkey::new_unique();
+
+        let ix = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -500,
+            vec![0u8; 256],
+            &[authority, cosigner],
+        )
+        .expect("build transact instruction");
+
+        assert_eq!(ix.program_id, program_id);
+        // bridge_state, merkle_tree, bridge_vault, nullifier_0, nullifier_1,
+        // recipient, validator_account, validator_registry, authority (signer),
+        // system_program — then 2 quorum (wallet, PDA) pairs (#260).
+        assert_eq!(ix.accounts.len(), 10 + 4);
+        assert_eq!(ix.accounts[1].pubkey, derive_merkle_tree(&program_id).0);
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_nullifier_account(&program_id, &[1u8; 32]).0
+        );
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_nullifier_account(&program_id, &[2u8; 32]).0
+        );
+        assert_eq!(ix.accounts[5].pubkey, Pubkey::new_from_array([9u8; 32]));
+        // The settling validator's account is bound to the authority signer.
+        assert_eq!(
+            ix.accounts[6].pubkey,
+            derive_validator_account(&program_id, &authority).0
+        );
+        assert_eq!(ix.accounts[8].pubkey, authority);
+        assert!(ix.accounts[8].is_signer);
+        // Quorum pairs: each wallet signs, its PDA does not.
+        assert_eq!(ix.accounts[10].pubkey, authority);
+        assert!(ix.accounts[10].is_signer);
+        assert_eq!(ix.accounts[12].pubkey, cosigner);
+        assert!(ix.accounts[12].is_signer);
+        assert!(!ix.accounts[13].is_signer);
+
+        assert_eq!(&ix.data[..8], &discriminators::TRANSACT);
+    }
+
+    /// Field ordering is observable on the wire — Anchor decodes borsh fields
+    /// in declaration order. Pins the layout
+    /// `[nullifiers (64) | output_commitments (64) | root (32) | ext_amount (8, i64 LE) | proof_len (4) | proof…]`
+    /// including the two's-complement encoding of a negative `ext_amount`
+    /// (a withdrawal), which a `u64` mix-up would corrupt silently.
+    #[test]
+    fn test_transact_instruction_data_field_order() {
+        let payload = TransactInstructionData {
+            nullifiers: [[0xAB; 32], [0xCD; 32]],
+            output_commitments: [[0x11; 32], [0x22; 32]],
+            root: [0x33; 32],
+            ext_amount: -2,
+            proof: vec![0xEF; 3],
+        };
+        let bytes = borsh::to_vec(&payload).expect("borsh serialize");
+        let decoded = TransactInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
+        assert_eq!(decoded, payload);
+
+        assert_eq!(&bytes[..32], &[0xAB; 32]);
+        assert_eq!(&bytes[32..64], &[0xCD; 32]);
+        assert_eq!(&bytes[64..96], &[0x11; 32]);
+        assert_eq!(&bytes[96..128], &[0x22; 32]);
+        assert_eq!(&bytes[128..160], &[0x33; 32]);
+        // ext_amount = -2 as little-endian two's complement.
+        assert_eq!(
+            &bytes[160..168],
+            &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        // proof: u32 length prefix then the bytes.
+        assert_eq!(&bytes[168..172], &[3, 0, 0, 0]);
+        assert_eq!(&bytes[172..], &[0xEF; 3]);
+    }
+
+    #[test]
+    fn test_create_deposit_note_instruction() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let bridge_vault = Pubkey::new_unique();
+
+        let ix = create_deposit_note_instruction(
+            &program_id,
+            &depositor,
+            &bridge_vault,
+            1_000_000,
+            [7u8; 32],
+            [8u8; 32],
+        )
+        .expect("build deposit_note instruction");
+
+        // bridge_state, bridge_vault, merkle_tree, depositor (signer),
+        // system_program.
+        assert_eq!(ix.accounts.len(), 5);
+        assert_eq!(ix.accounts[2].pubkey, derive_merkle_tree(&program_id).0);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, depositor);
+        assert!(ix.accounts[3].is_signer);
+
+        assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE);
+        // amount immediately follows the discriminator (borsh u64 LE).
+        assert_eq!(&ix.data[8..16], &1_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_initialize_merkle_tree_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+
+        let ix = create_initialize_merkle_tree_instruction(&program_id, &authority);
+
+        // merkle_tree, authority (signer), program_data, system_program.
+        assert_eq!(ix.accounts.len(), 4);
+        assert_eq!(ix.accounts[0].pubkey, derive_merkle_tree(&program_id).0);
+        assert_eq!(ix.accounts[1].pubkey, authority);
+        assert!(ix.accounts[1].is_signer);
+        assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(ix.data, discriminators::INITIALIZE_MERKLE_TREE.to_vec());
     }
 }
