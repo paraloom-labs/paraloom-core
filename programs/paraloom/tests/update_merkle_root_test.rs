@@ -167,11 +167,7 @@ async fn update_merkle_root_requires_quorum_then_replaces_state_field() {
         .await
         .expect("a full quorum must publish the new root");
 
-    let raw = banks_client
-        .get_account(state_pda)
-        .await
-        .unwrap()
-        .unwrap();
+    let raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut raw.data.as_slice()).unwrap();
     assert_eq!(state.merkle_root, new_root);
 }

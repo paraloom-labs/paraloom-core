@@ -211,7 +211,10 @@ async fn withdraw_rejects_a_non_canonical_nullifier_replay() {
     // reduced field element) and the PDA is a fresh one, so only the canonical
     // check stands between this and a double-spend. It must be rejected.
     let non_canonical = add_modulus(NULLIFIER);
-    assert_ne!(non_canonical, NULLIFIER, "n + p must differ from n in raw bytes");
+    assert_ne!(
+        non_canonical, NULLIFIER,
+        "n + p must differ from n in raw bytes"
+    );
     let result = send(
         &mut banks_client,
         recent_blockhash,

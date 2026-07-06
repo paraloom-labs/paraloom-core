@@ -56,14 +56,32 @@ fn member_root_and_path(leaf: Fr) -> (Fr, Vec<[u8; 32]>) {
     (current, path)
 }
 
+/// SHA-256 of `recipient || ext_amount.to_le_bytes()` — the same bytes the
+/// on-chain `transact_ext_data_hash` computes (Solana's `hashv` is SHA-256), so
+/// the fixture's `ext_data_hash` matches what the program derives at
+/// settlement. This lets the on-chain `transact` instruction bind the payout to
+/// its recipient (finding D) while still verifying this fixture proof.
+fn transact_ext_data_hash(recipient: &[u8; 32], ext_amount: i64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(recipient);
+    hasher.update(ext_amount.to_le_bytes());
+    hasher.finalize().into()
+}
+
 fn main() {
     // A spend: one real 1000-unit input at leaf 0 + one zero dummy, two outputs
     // (400 + 100), so 500 is withdrawn via public_amount = 500 − 1000 = −500.
     const IN_AMOUNT: u64 = 1000;
     const OUT0: u64 = 400;
     const OUT1: u64 = 100;
+    // Signed external flow: −500 withdraws 500 lamports from the vault. The
+    // recipient is a fixed devnet-test address so the derived `ext_data_hash`
+    // is reproducible in the on-chain e2e test.
+    const EXT_AMOUNT: i64 = -500;
+    const RECIPIENT: [u8; 32] = [3u8; 32];
     let asset = Fr::from(0u64); // NATIVE_SOL
-    let ext_data_hash = [7u8; 32];
+    let ext_data_hash = transact_ext_data_hash(&RECIPIENT, EXT_AMOUNT);
 
     // Real input note.
     let sk0 = Fr::from(51u64);
@@ -156,4 +174,14 @@ fn main() {
     rust_bytes("FIXTURE_PROOF_A", &wp.a);
     rust_bytes("FIXTURE_PROOF_B", &wp.b);
     rust_bytes("FIXTURE_PROOF_C", &wp.c);
+
+    // Parameters the on-chain e2e test feeds to `deposit_note` to recreate the
+    // spent input note (leaf 0) so the on-chain tree reaches `FIXTURE_ROOT`,
+    // plus the external-flow inputs `transact` consumes.
+    println!("\n// ===== deposit + external-flow inputs for the on-chain e2e test =====");
+    println!("pub const FIXTURE_DEPOSIT_AMOUNT: u64 = {IN_AMOUNT};");
+    rust_bytes("FIXTURE_DEPOSIT_PUBKEY", &fr_to_le(&pk0));
+    rust_bytes("FIXTURE_DEPOSIT_BLINDING", &fr_to_le(&bl0));
+    rust_bytes("FIXTURE_RECIPIENT", &RECIPIENT);
+    println!("pub const FIXTURE_EXT_AMOUNT: i64 = {EXT_AMOUNT};");
 }

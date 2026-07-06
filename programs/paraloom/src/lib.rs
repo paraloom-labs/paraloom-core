@@ -101,6 +101,37 @@ fn withdraw_ext_data_hash(recipient: &Pubkey, amount: u64) -> [u8; 32] {
         .to_bytes()
 }
 
+/// External-data hash binding a `transact` settlement to its destination and
+/// signed external amount (circuit v3, finding D). The prover computes the
+/// same hash off-chain and feeds it as the `ext_data_hash` public input, so a
+/// settling validator cannot redirect the payout or change the amount even
+/// though it holds the settlement authority.
+fn transact_ext_data_hash(recipient: &Pubkey, ext_amount: i64) -> [u8; 32] {
+    anchor_lang::solana_program::hash::hashv(&[recipient.as_ref(), &ext_amount.to_le_bytes()])
+        .to_bytes()
+}
+
+/// Little-endian BN254 field encoding of the signed `ext_amount`, matching the
+/// circuit's `public_amount` (`sumOut - sumIn`): a withdrawal (`ext_amount <
+/// 0`) encodes as `p - |ext_amount|`. Deriving `public_amount` on-chain from
+/// `ext_amount` — instead of accepting it as a free argument — binds the funds
+/// actually moved to the balance the owner proved. A free `public_amount`
+/// would let a submitter prove a small net spend yet withdraw a larger
+/// `ext_amount`, stealing the difference.
+fn public_amount_bytes(ext_amount: i64) -> [u8; 32] {
+    use ark_ff::{BigInteger, PrimeField};
+    let magnitude = ark_bn254::Fr::from(ext_amount.unsigned_abs());
+    let field = if ext_amount < 0 {
+        -magnitude
+    } else {
+        magnitude
+    };
+    let mut out = [0u8; 32];
+    let le = field.into_bigint().to_bytes_le();
+    out[..le.len()].copy_from_slice(&le);
+    out
+}
+
 #[program]
 pub mod paraloom_program {
     use super::*;
@@ -498,6 +529,173 @@ pub mod paraloom_program {
         });
 
         msg!("Shielded transfer settled");
+        Ok(())
+    }
+
+    /// Unified v3 settlement: spend two input notes, create two output notes,
+    /// and move `ext_amount` lamports across the pool boundary (#350).
+    ///
+    /// This is the circuit-v3 money path. Unlike `withdraw`/`shielded_transfer`
+    /// (which advance an *off-chain* root the leader supplies), `transact`
+    /// proves membership against the program's own on-chain incremental tree
+    /// and appends the two output commitments itself, so the tree the proof is
+    /// checked against and the tree the outputs land in are the same account —
+    /// an attacker cannot cite a root the program never published (audit #1).
+    ///
+    /// `ext_amount` is the signed external flow: `< 0` withdraws `|ext_amount|`
+    /// from the vault to `recipient` (minus the validator fee), `== 0` is a
+    /// pure shielded transfer that moves no external funds. Deposits keep using
+    /// `deposit_note`, so `ext_amount > 0` is rejected here.
+    ///
+    /// Settlement is quorum-gated exactly like `withdraw` (#260): the signer
+    /// must be a registered validator and a supermajority of validators must
+    /// co-sign, passed as `(wallet, validator PDA)` pairs in
+    /// `remaining_accounts`. No single key can settle alone.
+    pub fn transact(
+        ctx: Context<Transact>,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        root: [u8; 32],
+        ext_amount: i64,
+        proof: Vec<u8>,
+    ) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+
+        require!(!bridge_state.paused, BridgeError::BridgePaused);
+        require!(!proof.is_empty(), BridgeError::InvalidProof);
+        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
+
+        // Deposits are public and go through `deposit_note`; `transact` only
+        // spends existing notes (withdraw or internal transfer).
+        require!(ext_amount <= 0, BridgeError::InvalidAmount);
+
+        // Both nullifiers must be canonical field elements and distinct. The
+        // circuit already enforces distinctness, and the two nullifier PDAs
+        // are `init`ed (so a repeat across transactions fails), but rejecting a
+        // duplicate here gives a clear error instead of a PDA collision.
+        require_canonical_nullifier(&nullifiers[0])?;
+        require_canonical_nullifier(&nullifiers[1])?;
+        require!(
+            nullifiers[0] != nullifiers[1],
+            BridgeError::DuplicateNullifier
+        );
+
+        // The proof proves the spent notes are members of `root`; that root
+        // must be one the program actually published (ring buffer), so a spend
+        // cannot be proven against a fabricated tree state (audit #1).
+        require!(
+            ctx.accounts.merkle_tree.is_known_root(root),
+            BridgeError::UnknownMerkleRoot
+        );
+
+        // Bind the settlement to the recipient and signed amount (finding D),
+        // and derive `public_amount` from `ext_amount` so the funds moved can
+        // never exceed the balance the owner proved (see `public_amount_bytes`).
+        let ext_data_hash = transact_ext_data_hash(&ctx.accounts.recipient.key(), ext_amount);
+        let public_amount = public_amount_bytes(ext_amount);
+
+        // Supermajority co-sign (#260) — no single key settles.
+        quorum::verify_validator_quorum(
+            ctx.program_id,
+            &ctx.accounts.validator_registry,
+            ctx.remaining_accounts,
+        )?;
+
+        // Verify the v3 Groth16 proof against the eight public inputs, in the
+        // circuit's `new_input` order.
+        require!(
+            transact_verifier::verify_transact(
+                &root,
+                &public_amount,
+                &ext_data_hash,
+                &NATIVE_SOL_ASSET,
+                &nullifiers[0],
+                &nullifiers[1],
+                &output_commitments[0],
+                &output_commitments[1],
+                &proof,
+            ),
+            BridgeError::InvalidProof
+        );
+
+        // Record both input nullifiers (double-spend defense). The PDAs are
+        // `init`ed in `Transact`, so a note already spent on either the
+        // `withdraw`, `shielded_transfer` or `transact` path fails here.
+        let now = Clock::get()?.unix_timestamp;
+        let settlement_id = bridge_state.withdrawal_count + 1;
+        let nf0 = &mut ctx.accounts.nullifier_account_0;
+        nf0.nullifier = nullifiers[0];
+        nf0.used_at = now;
+        nf0.withdrawal_id = settlement_id;
+        let nf1 = &mut ctx.accounts.nullifier_account_1;
+        nf1.nullifier = nullifiers[1];
+        nf1.used_at = now;
+        nf1.withdrawal_id = settlement_id;
+
+        // Append both output commitments to the on-chain tree. `root` (the
+        // pre-append root the proof was checked against) is untouched; the new
+        // notes extend the tree for future spends.
+        let tree = &mut ctx.accounts.merkle_tree;
+        tree.append(output_commitments[0])?;
+        let new_root = tree.append(output_commitments[1])?;
+
+        // Move external funds. `ext_amount < 0` withdraws from the vault; the
+        // settling validator earns the same 25 bps fee as `withdraw`.
+        let validator_account = &mut ctx.accounts.validator_account;
+        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
+
+        let mut fee = 0u64;
+        if ext_amount < 0 {
+            let gross = ext_amount.unsigned_abs();
+            let vault_balance = ctx.accounts.bridge_vault.lamports();
+            require!(vault_balance >= gross, BridgeError::InsufficientFunds);
+
+            fee = gross
+                .checked_mul(WITHDRAWAL_FEE_BPS)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(BridgeError::InvalidAmount)?;
+            let payout = gross - fee;
+
+            let vault_bump = ctx.bumps.bridge_vault;
+            let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
+            let signer_seeds = &[&seeds[..]];
+            anchor_lang::system_program::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.bridge_vault.to_account_info(),
+                        to: ctx.accounts.recipient.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                payout,
+            )?;
+            validator_account.pending_rewards += fee;
+        }
+
+        validator_account.successful_verifications += 1;
+        validator_account.last_active = now;
+        bridge_state.withdrawal_count = settlement_id;
+
+        emit!(TransactEvent {
+            nullifier0: nullifiers[0],
+            nullifier1: nullifiers[1],
+            out_commitment0: output_commitments[0],
+            out_commitment1: output_commitments[1],
+            new_root,
+            ext_amount,
+            fee,
+            recipient: ctx.accounts.recipient.key(),
+            timestamp: now,
+            settlement_id,
+        });
+
+        msg!(
+            "Transact settled: ext_amount {}, fee {} to validator {}",
+            ext_amount,
+            fee,
+            validator_account.validator
+        );
         Ok(())
     }
 
@@ -1336,6 +1534,85 @@ pub struct ShieldedTransfer<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(nullifiers: [[u8; 32]; 2])]
+pub struct Transact<'info> {
+    // `has_one = authority` binds settlement to the bridge authority /
+    // consensus leader, exactly as `Withdraw` does (#178).
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump,
+        has_one = authority
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    /// The on-chain incremental tree the proof proves membership against and
+    /// the two output commitments are appended to (#350).
+    #[account(
+        mut,
+        seeds = [b"merkle_tree"],
+        bump
+    )]
+    pub merkle_tree: Account<'info, merkle_tree::IncrementalMerkleTree>,
+
+    #[account(
+        mut,
+        seeds = [b"bridge_vault"],
+        bump
+    )]
+    pub bridge_vault: SystemAccount<'info>,
+
+    /// First input nullifier. Shares the `b"nullifier"` namespace with
+    /// `withdraw`/`shielded_transfer`, so `init` fails on a replay across any
+    /// spend path.
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifiers[0].as_ref()],
+        bump
+    )]
+    pub nullifier_account_0: Account<'info, NullifierAccount>,
+
+    /// Second input nullifier (a random dummy when only one real note is
+    /// spent).
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifiers[1].as_ref()],
+        bump
+    )]
+    pub nullifier_account_1: Account<'info, NullifierAccount>,
+
+    /// Destination for a withdrawal (`ext_amount < 0`). Bound into the proof
+    /// via `ext_data_hash`, so the settling validator cannot redirect it.
+    #[account(mut)]
+    pub recipient: SystemAccount<'info>,
+
+    /// The settling validator's account, bound by seeds to the `authority`
+    /// signer: only a registered validator can settle, and the fee is credited
+    /// here (mirrors `Withdraw`).
+    #[account(
+        mut,
+        seeds = [b"validator", authority.key().as_ref()],
+        bump
+    )]
+    pub validator_account: Account<'info, ValidatorAccount>,
+
+    /// Validator registry; sets the quorum threshold (#260). Settlement must be
+    /// co-signed by a supermajority, passed as `(wallet, validator PDA)` pairs
+    /// in `remaining_accounts`.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct DepositSpl<'info> {
     #[account(
         mut,
@@ -1769,6 +2046,20 @@ pub struct WithdrawalEvent {
 }
 
 #[event]
+pub struct TransactEvent {
+    pub nullifier0: [u8; 32],
+    pub nullifier1: [u8; 32],
+    pub out_commitment0: [u8; 32],
+    pub out_commitment1: [u8; 32],
+    pub new_root: [u8; 32],
+    pub ext_amount: i64,
+    pub fee: u64,
+    pub recipient: Pubkey,
+    pub timestamp: i64,
+    pub settlement_id: u64,
+}
+
+#[event]
 pub struct DepositSplEvent {
     pub depositor: Pubkey,
     /// The deposited asset's id == the SPL mint's pubkey bytes (#235).
@@ -1874,4 +2165,7 @@ pub enum BridgeError {
 
     #[msg("Validator quorum not met for settlement")]
     QuorumNotMet,
+
+    #[msg("Merkle root is not in the on-chain root history")]
+    UnknownMerkleRoot,
 }
