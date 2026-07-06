@@ -192,6 +192,12 @@ pub const DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH: &str = "keys/withdraw_v2_verify
 /// fixed-depth, 2-in/2-out transfer circuit.
 pub const DEFAULT_TRANSFER_VERIFYING_KEY_PATH: &str = "keys/transfer_v2_verifying.key";
 
+/// Default location of the transact v3 verifying key (#350), relative to the
+/// node's working directory. Emitted by `emit_transact_v3_fixture` alongside
+/// the persistent proving key; replaced by the ceremony key before mainnet
+/// (#64).
+pub const DEFAULT_TRANSACT_VERIFYING_KEY_PATH: &str = "keys/transact_v3_verifying.key";
+
 /// Errors that can arise when loading the withdrawal verifying key from
 /// disk. Surfacing these as a typed enum (instead of `expect`-style
 /// panics) keeps a misconfigured node from crashing on the verification
@@ -236,6 +242,10 @@ static WITHDRAWAL_VERIFYING_KEY: OnceLock<VerifyingKey<Bn254>> = OnceLock::new()
 /// semantics as [`WITHDRAWAL_VERIFYING_KEY`].
 static TRANSFER_VERIFYING_KEY: OnceLock<VerifyingKey<Bn254>> = OnceLock::new();
 
+/// Cached transact v3 verifying key (#350). Same first-write-wins
+/// semantics as [`WITHDRAWAL_VERIFYING_KEY`].
+static TRANSACT_VERIFYING_KEY: OnceLock<VerifyingKey<Bn254>> = OnceLock::new();
+
 /// Resolve the on-disk path of the withdrawal verifying key, honoring
 /// the `WITHDRAWAL_VERIFYING_KEY_PATH` environment variable as an
 /// override and falling back to [`DEFAULT_WITHDRAWAL_VERIFYING_KEY_PATH`].
@@ -252,6 +262,15 @@ fn resolve_transfer_key_path() -> PathBuf {
     std::env::var_os("TRANSFER_VERIFYING_KEY_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TRANSFER_VERIFYING_KEY_PATH))
+}
+
+/// Resolve the transact v3 verifying-key path (#350), consulting the
+/// `TRANSACT_VERIFYING_KEY_PATH` environment variable and falling back to
+/// [`DEFAULT_TRANSACT_VERIFYING_KEY_PATH`].
+fn resolve_transact_key_path() -> PathBuf {
+    std::env::var_os("TRANSACT_VERIFYING_KEY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_TRANSACT_VERIFYING_KEY_PATH))
 }
 
 /// Load and deserialize a Groth16 verifying key from a specific path.
@@ -348,6 +367,152 @@ impl ProofVerifier {
         Ok(TRANSFER_VERIFYING_KEY
             .get()
             .expect("transfer verifying key cache populated above"))
+    }
+
+    /// Load the transact v3 verifying key from disk (cached on success).
+    /// Mirrors [`get_verifying_key`](Self::get_verifying_key) but for the
+    /// unified transact circuit (#350).
+    fn get_transact_verifying_key() -> Result<&'static VerifyingKey<Bn254>, KeyLoadError> {
+        if let Some(vk) = TRANSACT_VERIFYING_KEY.get() {
+            return Ok(vk);
+        }
+
+        let path = resolve_transact_key_path();
+        let key = load_verifying_key(&path).inspect_err(|e| {
+            log::error!(
+                target: "paraloom::privacy::proof",
+                "transact verifying key load failed: {}",
+                e
+            );
+        })?;
+
+        if TRANSACT_VERIFYING_KEY.set(key).is_err() {
+            log::debug!(
+                target: "paraloom::privacy::proof",
+                "transact verifying key was already cached by a concurrent caller"
+            );
+        }
+        Ok(TRANSACT_VERIFYING_KEY
+            .get()
+            .expect("transact verifying key cache populated above"))
+    }
+
+    /// Verify a v3 unified transact proof from its raw parts (#350).
+    ///
+    /// The eight public inputs are lifted in the exact order
+    /// `TransactCircuitV3::generate_constraints` reads them —
+    /// `[root, public_amount, ext_data_hash, asset_id, nullifier0, nullifier1,
+    /// out_commitment0, out_commitment1]` — every 32-byte blob via
+    /// `Fr::from_le_bytes_mod_order`, matching the host prover and the
+    /// on-chain `transact_verifier`.
+    ///
+    /// `public_amount` and `ext_data_hash` are NOT accepted from the caller:
+    /// they are derived here from `ext_amount` and `recipient` exactly the way
+    /// the on-chain `transact` instruction derives them, so a request that
+    /// verifies off-chain settles with the same binding on-chain — a submitter
+    /// cannot present one (recipient, amount) to the quorum and another to the
+    /// program.
+    ///
+    /// `ext_amount > 0` is rejected: deposits enter through `deposit_note`
+    /// (no proof), so a positive external flow is never a valid spend request.
+    pub fn verify_transact_parts(
+        root: &[u8; 32],
+        recipient: &[u8; 32],
+        ext_amount: i64,
+        asset_id: &[u8; 32],
+        nullifiers: &[[u8; 32]; 2],
+        output_commitments: &[[u8; 32]; 2],
+        zk_proof: &[u8],
+    ) -> VerificationResult {
+        if ext_amount > 0 {
+            return VerificationResult::Invalid {
+                reason: "positive ext_amount: deposits go through deposit_note".to_string(),
+            };
+        }
+
+        // Reject non-canonical encodings (see `is_canonical_le`) before any
+        // disk or crypto work: the nullifier bytes seed the on-chain PDA and
+        // the output-commitment bytes are appended verbatim to the on-chain
+        // tree, so `b` and `b + p` must not both be presentable.
+        // `ext_data_hash` is exempt — it is a SHA-256 digest derived below,
+        // lifted mod p on every side consistently.
+        if !is_canonical_le(root) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical root encoding".to_string(),
+            };
+        }
+        for nullifier in nullifiers {
+            if !is_canonical_le(nullifier) {
+                return VerificationResult::Invalid {
+                    reason: "non-canonical nullifier encoding".to_string(),
+                };
+            }
+        }
+        for commitment in output_commitments {
+            if !is_canonical_le(commitment) {
+                return VerificationResult::Invalid {
+                    reason: "non-canonical output commitment encoding".to_string(),
+                };
+            }
+        }
+
+        let proof = match Proof::<Bn254>::deserialize_compressed(zk_proof) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Failed to deserialize transact proof: {}", e);
+                return VerificationResult::Invalid {
+                    reason: format!("Invalid proof format: {}", e),
+                };
+            }
+        };
+
+        let verifying_key = match Self::get_transact_verifying_key() {
+            Ok(vk) => vk,
+            Err(e) => {
+                return VerificationResult::Invalid {
+                    reason: format!("transact verifying key unavailable: {}", e),
+                };
+            }
+        };
+
+        // Derived bindings — identical bytes to the on-chain instruction:
+        // ext_data_hash = SHA-256(recipient || ext_amount_le), and
+        // public_amount is the field encoding of the signed ext_amount
+        // (negative = p - |ext_amount|).
+        let ext_data_hash: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(recipient);
+            hasher.update(ext_amount.to_le_bytes());
+            hasher.finalize().into()
+        };
+        let magnitude = Fr::from(ext_amount.unsigned_abs());
+        let public_amount = if ext_amount < 0 {
+            -magnitude
+        } else {
+            magnitude
+        };
+
+        let public_inputs = vec![
+            Fr::from_le_bytes_mod_order(root),
+            public_amount,
+            Fr::from_le_bytes_mod_order(&ext_data_hash),
+            Fr::from_le_bytes_mod_order(asset_id),
+            Fr::from_le_bytes_mod_order(&nullifiers[0]),
+            Fr::from_le_bytes_mod_order(&nullifiers[1]),
+            Fr::from_le_bytes_mod_order(&output_commitments[0]),
+            Fr::from_le_bytes_mod_order(&output_commitments[1]),
+        ];
+
+        match Groth16ProofSystem::verify(verifying_key, &public_inputs, &proof) {
+            Ok(true) => VerificationResult::Valid,
+            Ok(false) => VerificationResult::Invalid {
+                reason: "transact zkSNARK proof verification failed".to_string(),
+            },
+            Err(e) => VerificationResult::Invalid {
+                reason: format!("Verification error: {}", e),
+            },
+        }
     }
 
     /// Verify a transfer zkSNARK proof from its raw parts against the transfer
@@ -636,6 +801,74 @@ mod tests {
             !is_canonical_le(&non_canonical),
             "non-canonical encoding (b + p) must be rejected"
         );
+    }
+
+    /// The transact verifier's cheap input gates fire before any key or
+    /// crypto work, so they are exercisable without the (gitignored) key
+    /// files CI does not have.
+    #[test]
+    fn transact_parts_rejects_positive_ext_amount() {
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            500, // a deposit — never a valid spend request
+            &[0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("positive ext_amount"), "{reason}")
+            }
+            _ => panic!("positive ext_amount must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_non_canonical_nullifier() {
+        // The scalar modulus p as 32 LE bytes lifts to 0 but is a
+        // non-canonical encoding.
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus = [0u8; 32];
+        modulus[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[modulus, [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical nullifier"), "{reason}")
+            }
+            _ => panic!("non-canonical nullifier must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_garbage_proof_bytes() {
+        // Canonical inputs but an undecodable proof blob: rejected at the
+        // parse step, before the verifying key is ever consulted.
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0xFFu8; 8],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("Invalid proof format"), "{reason}")
+            }
+            _ => panic!("garbage proof bytes must be invalid"),
+        }
     }
 
     #[test]
