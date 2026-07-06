@@ -16,11 +16,12 @@ use crate::bridge::solana::{
 use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
+use crate::consensus::transact::TransactVerificationRequest;
 use crate::consensus::transfer::TransferVerificationRequest;
 use crate::consensus::withdrawal::WithdrawalVerificationRequest;
 use crate::consensus::{
-    ApprovedTransfer, ApprovedWithdrawal, TransferVerificationCoordinator,
-    WithdrawalVerificationCoordinator,
+    ApprovedTransact, ApprovedTransfer, ApprovedWithdrawal, TransactVerificationCoordinator,
+    TransferVerificationCoordinator, WithdrawalVerificationCoordinator,
 };
 use crate::coordinator::Coordinator;
 use crate::network::{
@@ -57,6 +58,13 @@ pub type WithdrawalProofVerifier =
 /// closure to exercise the gossip → vote → quorum wiring without proving.
 pub type TransferProofVerifier =
     Arc<dyn Fn(&crate::consensus::transfer::TransferVerificationRequest) -> bool + Send + Sync>;
+
+/// Transact-proof verifier override (#350), the v3 unified-transact twin of
+/// [`TransferProofVerifier`]. `None` in production, so `verify_transact_proof`
+/// runs the real Groth16 path; a multi-node consensus E2E injects a closure to
+/// exercise the gossip → vote → quorum wiring without proving.
+pub type TransactProofVerifier =
+    Arc<dyn Fn(&crate::consensus::transact::TransactVerificationRequest) -> bool + Send + Sync>;
 
 pub struct Node {
     settings: Settings,
@@ -161,6 +169,26 @@ pub struct Node {
     /// `bridge.transfer_ingress_address` is set; aborted in stop().
     transfer_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
 
+    /// Transact consensus coordinator (#350), the v3 unified-transact twin of
+    /// `transfer_coordinator`. Incoming `TransactVerificationResult` votes
+    /// route into it; a quorum-approved transact is pushed onto the approval
+    /// channel below.
+    transact_coordinator: Option<Arc<TransactVerificationCoordinator>>,
+
+    /// Receiver half of the transact coordinator's approval channel (#350).
+    /// Held here for the transact submitter task (a later PR) to take;
+    /// nothing consumes it yet.
+    transact_approval_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ApprovedTransact>>>>,
+
+    /// Optional transact-proof verifier override (#350 testing seam). `None`
+    /// in production.
+    transact_proof_verifier_override: Option<TransactProofVerifier>,
+
+    /// Transact-ingress HTTP server handle (#350). Not spawned yet — the
+    /// ingress surface lands with the submitter PR; the field mirrors
+    /// `transfer_ingress` so stop() is already wired to abort it.
+    transact_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
+
     /// Encrypted output notes this node has seen (#196), served from
     /// `GET /transfer/scan` for recipients to trial-decrypt. Populated when the
     /// node initiates or receives a transfer verification request. In-memory;
@@ -183,6 +211,9 @@ pub struct Node {
 
     /// Transfer twin of `verified_withdrawals` (#260).
     verified_transfers: Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
+
+    /// Transact twin of `verified_withdrawals` (#350).
+    verified_transacts: Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
 }
 
 /// Upper bound on the per-node verified-settlement caches (#260). Entries are
@@ -254,6 +285,19 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 if let Some(transfer) = &self.transfer_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
                         transfer
+                            .register_validator_with_wallet(
+                                source.clone(),
+                                node_info.wallet_pubkey.clone(),
+                            )
+                            .await;
+                    }
+                }
+
+                // Mirror into the transact coordinator (#350) for the same
+                // reason.
+                if let Some(transact) = &self.transact_coordinator {
+                    if node_info.node_type == NodeType::ResourceProvider {
+                        transact
                             .register_validator_with_wallet(
                                 source.clone(),
                                 node_info.wallet_pubkey.clone(),
@@ -647,6 +691,114 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     }
                 }
             }
+            Message::TransactVerificationRequest { request } => {
+                info!(
+                    "Received transact verification request: {}",
+                    request.request_id
+                );
+
+                // Verify the transact zkSNARK proof, mirroring the transfer
+                // path (#350). Unlike a transfer, the v3 proof binds
+                // `request.root` directly (the on-chain incremental-tree root
+                // carried in the request), so verification needs no pool
+                // state; the pool gate below only keeps non-bridge nodes from
+                // voting on settlements they do not participate in.
+                let vote = if self.shielded_pool.is_some() {
+                    match self.verify_transact_proof(&request).await {
+                        Ok(true) => {
+                            info!(
+                                "Transact proof verified successfully: {}",
+                                request.request_id
+                            );
+                            // Record the encrypted output notes for recipient
+                            // scanning (#196) only AFTER the proof verifies — an
+                            // unauthenticated peer cannot pollute the scan buffer
+                            // with notes from an unverified (garbage) transact.
+                            self.record_delivered_notes(
+                                &request.output_commitments,
+                                &request.ciphertexts,
+                            )
+                            .await;
+                            crate::consensus::vote_tally::VerificationVote::Valid
+                        }
+                        Ok(false) => {
+                            log::warn!(
+                                "Transact proof verification failed: {}",
+                                request.request_id
+                            );
+                            crate::consensus::vote_tally::VerificationVote::Invalid {
+                                reason: "Proof verification failed".to_string(),
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Error verifying transact proof {}: {}",
+                                request.request_id,
+                                e
+                            );
+                            crate::consensus::vote_tally::VerificationVote::Invalid {
+                                reason: format!("Verification error: {}", e),
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!("Privacy pool not available, cannot verify transact proof");
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "Privacy pool not available".to_string(),
+                    }
+                };
+
+                // Remember a transact we verified Valid so we can later co-sign
+                // its settlement against the exact parameters we saw (#260).
+                if matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid) {
+                    cache_verified(
+                        &self.verified_transacts,
+                        request.request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
+                }
+
+                let result = crate::consensus::transact::TransactVerificationResult {
+                    request_id: request.request_id,
+                    validator: self.node_info.id.clone(),
+                    vote,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                };
+
+                let response = Message::TransactVerificationResult { result };
+                if let Err(e) = self.network.send_message(source.clone(), response).await {
+                    log::error!("Failed to send transact verification result: {}", e);
+                }
+            }
+            Message::TransactVerificationResult { result } => {
+                info!(
+                    "Received transact verification result: {}",
+                    result.request_id
+                );
+                // The vote must come from the validator it claims to be (audit),
+                // mirroring the withdrawal path: reject any whose claimed
+                // validator does not match the authenticated gossip sender.
+                if result.validator != source {
+                    log::warn!(
+                        "dropping transact vote for {}: claimed validator {:?} != sender {:?}",
+                        result.request_id,
+                        result.validator,
+                        source
+                    );
+                    return Ok(());
+                }
+                // Route the vote into the transact coordinator (#350); a node
+                // that never started this request drops it.
+                if let Some(coordinator) = &self.transact_coordinator {
+                    if let Err(e) = coordinator.submit_result(result).await {
+                        log::debug!("dropping transact vote: {}", e);
+                    }
+                }
+            }
             Message::ValidatorRegistration {
                 validator_id,
                 stake_amount,
@@ -945,6 +1097,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             &expected_program_id,
             &self.verified_withdrawals,
             &self.verified_transfers,
+            &self.verified_transacts,
             self.shielded_pool.as_ref(),
             request,
         )
@@ -962,6 +1115,7 @@ async fn cosign_settlement(
     expected_program_id: &Pubkey,
     verified_withdrawals: &Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
     verified_transfers: &Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
+    verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     shielded_pool: Option<&Arc<crate::privacy::pool::ShieldedPool>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
@@ -1023,6 +1177,26 @@ async fn cosign_settlement(
                 req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.new_merkle_root == *new_merkle_root
+            })
+        }
+        (
+            SettlementKind::Transact,
+            SettlementParams::Transact {
+                recipient,
+                nullifiers,
+                output_commitments,
+                root,
+                ext_amount,
+                ..
+            },
+        ) => {
+            let cache = verified_transacts.lock().await;
+            cache.get(&request.request_id).is_some_and(|req| {
+                req.recipient == *recipient
+                    && req.nullifiers == *nullifiers
+                    && req.output_commitments == *output_commitments
+                    && req.root == *root
+                    && req.ext_amount == *ext_amount
             })
         }
         (
@@ -1328,6 +1502,17 @@ impl Node {
             (None, None)
         };
 
+        // Transact consensus coordinator + its approval channel (#350), the
+        // v3 unified-transact twin of the transfer pair above. The receiver is
+        // held so the transact submitter task (a later PR) can drain it;
+        // nothing consumes it yet.
+        let (transact_coordinator, transact_approval_rx) = if runs_bridge {
+            let (coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            (Some(Arc::new(coord)), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let node = Node {
             settings,
             network: network_arc,
@@ -1359,10 +1544,15 @@ impl Node {
             transfer_submitter_task: Arc::new(Mutex::new(None)),
             transfer_proof_verifier_override: None,
             transfer_ingress: Arc::new(Mutex::new(None)),
+            transact_coordinator,
+            transact_approval_rx: Arc::new(Mutex::new(transact_approval_rx)),
+            transact_proof_verifier_override: None,
+            transact_ingress: Arc::new(Mutex::new(None)),
             delivered_notes: Arc::new(Mutex::new(Vec::new())),
             cosign_keypair,
             verified_withdrawals: Arc::new(Mutex::new(HashMap::new())),
             verified_transfers: Arc::new(Mutex::new(HashMap::new())),
+            verified_transacts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         Ok(node)
@@ -1421,6 +1611,54 @@ impl Node {
             coordinator.set_consensus_thresholds(min_validators, total_validators);
         }
         self
+    }
+
+    /// Inject a transact-proof verifier override (#350 testing seam), the
+    /// transact twin of [`with_proof_verifier`](Self::with_proof_verifier).
+    pub fn with_transact_proof_verifier(mut self, verifier: TransactProofVerifier) -> Self {
+        self.transact_proof_verifier_override = Some(verifier);
+        self
+    }
+
+    /// Override the transact-consensus quorum thresholds (#350 testing seam),
+    /// the transact twin of [`with_consensus_thresholds`](Self::with_consensus_thresholds).
+    /// Must be called right after `new()`, before `run()` clones the node.
+    pub fn with_transact_consensus_thresholds(
+        mut self,
+        min_validators: usize,
+        total_validators: usize,
+    ) -> Self {
+        if let Some(coordinator) = self.transact_coordinator.as_mut().and_then(Arc::get_mut) {
+            coordinator.set_consensus_thresholds(min_validators, total_validators);
+        }
+        self
+    }
+
+    /// Quorum status for a transact verification this node initiated (#350).
+    /// `Ok(Some(vote))` once a quorum is reached, `Ok(None)` while votes
+    /// accumulate or on a node with no transact coordinator.
+    pub async fn transact_consensus_status(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::consensus::vote_tally::VerificationVote>> {
+        match &self.transact_coordinator {
+            Some(coordinator) => coordinator.check_consensus(request_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// `(valid, invalid)` transact-vote tally for a request this node
+    /// initiated (#350), the transact twin of
+    /// [`transfer_vote_counts`](Self::transfer_vote_counts). `Ok(None)` on a
+    /// node with no transact coordinator.
+    pub async fn transact_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
+        match &self.transact_coordinator {
+            Some(coordinator) => {
+                let (_pct, valid, invalid) = coordinator.get_status(request_id).await?;
+                Ok(Some((valid, invalid)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Quorum status for a transfer verification this node initiated (#194).
@@ -1592,10 +1830,14 @@ impl Node {
         // dropped, so the set tracks real connectivity independent of gossip
         // timing. A wallet learned via Discovery is preserved — registration is
         // wallet-preserving — and is what the #260 co-sign step uses.
-        if self.withdrawal_coordinator.is_some() || self.transfer_coordinator.is_some() {
+        if self.withdrawal_coordinator.is_some()
+            || self.transfer_coordinator.is_some()
+            || self.transact_coordinator.is_some()
+        {
             let network = Arc::clone(&self.network);
             let withdrawal = self.withdrawal_coordinator.clone();
             let transfer = self.transfer_coordinator.clone();
+            let transact = self.transact_coordinator.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
                 let mut registered: std::collections::HashSet<NodeId> =
@@ -1611,12 +1853,18 @@ impl Node {
                         if let Some(t) = &transfer {
                             t.register_validator_with_wallet(peer.clone(), None).await;
                         }
+                        if let Some(t) = &transact {
+                            t.register_validator_with_wallet(peer.clone(), None).await;
+                        }
                     }
                     for peer in registered.difference(&connected) {
                         if let Some(w) = &withdrawal {
                             w.unregister_validator(peer).await;
                         }
                         if let Some(t) = &transfer {
+                            t.unregister_validator(peer).await;
+                        }
+                        if let Some(t) = &transact {
                             t.unregister_validator(peer).await;
                         }
                     }
@@ -1737,9 +1985,13 @@ impl Node {
         // cannot grow unbounded. The ingress write-surface inserts a request
         // before any proof check, and entries that never reach quorum were
         // never reclaimed; this drives the existing per-coordinator cleanup.
-        if self.withdrawal_coordinator.is_some() || self.transfer_coordinator.is_some() {
+        if self.withdrawal_coordinator.is_some()
+            || self.transfer_coordinator.is_some()
+            || self.transact_coordinator.is_some()
+        {
             let withdrawal = self.withdrawal_coordinator.clone();
             let transfer = self.transfer_coordinator.clone();
+            let transact = self.transact_coordinator.clone();
             let status_clone = self.status.clone();
             tokio::spawn(async move {
                 loop {
@@ -1759,6 +2011,13 @@ impl Node {
                         if let Ok(n) = t.cleanup_timeouts().await {
                             if n > 0 {
                                 info!("Swept {} timed-out transfer verifications", n);
+                            }
+                        }
+                    }
+                    if let Some(t) = &transact {
+                        if let Ok(n) = t.cleanup_timeouts().await {
+                            if n > 0 {
+                                info!("Swept {} timed-out transact verifications", n);
                             }
                         }
                     }
@@ -2083,6 +2342,9 @@ impl Node {
         if let Some(handle) = self.transfer_ingress.lock().await.take() {
             handle.abort();
         }
+        if let Some(handle) = self.transact_ingress.lock().await.take() {
+            handle.abort();
+        }
         // Stop the bridge deposit listener (#163) so its poll loop
         // winds down on the next tick. A failure here must not block
         // the rest of shutdown, so it is logged rather than propagated.
@@ -2234,6 +2496,34 @@ impl Node {
             )
             .await?;
         info!("initiated transfer verification: {}", request_id);
+        Ok(request_id)
+    }
+
+    /// Initiate distributed verification of a v3 unified transact (#350), the
+    /// transact twin of [`initiate_transfer_verification`](Self::initiate_transfer_verification).
+    /// Records the request with this node's transact coordinator and broadcasts
+    /// it over the gossip mesh; validators verify and vote. The approval a
+    /// quorum produces is queued on `transact_approval_rx` for the transact
+    /// submitter task (a later PR) to settle on-chain.
+    pub async fn initiate_transact_verification(
+        &self,
+        request: crate::consensus::TransactVerificationRequest,
+    ) -> Result<String> {
+        let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
+            anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
+        })?;
+        let request_id = coordinator.start_verification(request.clone()).await?;
+        // Record the encrypted notes locally (#196): the initiator does not
+        // receive its own gossip broadcast, so it stores here to serve scan.
+        self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
+            .await;
+        self.network
+            .send_message(
+                NodeId(vec![]),
+                Message::TransactVerificationRequest { request },
+            )
+            .await?;
+        info!("initiated transact verification: {}", request_id);
         Ok(request_id)
     }
 
@@ -2817,6 +3107,44 @@ impl Node {
         }
         Ok(matches!(result, crate::privacy::VerificationResult::Valid))
     }
+
+    /// Verify a v3 unified-transact zkSNARK proof (#350), the transact twin of
+    /// [`verify_transfer_proof`](Self::verify_transfer_proof).
+    ///
+    /// Deliberately NOT verified against `pool.root().await`: the v3 proof is
+    /// built against `request.root` — the on-chain incremental-tree root
+    /// carried in the request — and the root's legitimacy is enforced at
+    /// settlement by the program's `is_known_root` check over its root
+    /// history. The method therefore needs no pool state at all, which is why
+    /// it takes no pool parameter.
+    async fn verify_transact_proof(
+        &self,
+        request: &crate::consensus::transact::TransactVerificationRequest,
+    ) -> Result<bool> {
+        // Override seam (#350): use the injected verifier when present.
+        if let Some(verifier) = &self.transact_proof_verifier_override {
+            return Ok(verifier(request));
+        }
+
+        // Asset is native SOL (the all-zero asset id) for now.
+        let result = crate::privacy::ProofVerifier::verify_transact_parts(
+            &request.root,
+            &request.recipient,
+            request.ext_amount,
+            &[0u8; 32],
+            &request.nullifiers,
+            &request.output_commitments,
+            &request.proof,
+        );
+        if let crate::privacy::VerificationResult::Invalid { reason } = &result {
+            log::warn!(
+                "transact proof rejected for {}: {}",
+                request.request_id,
+                reason
+            );
+        }
+        Ok(matches!(result, crate::privacy::VerificationResult::Valid))
+    }
 }
 
 // Clone is needed for the async_trait implementation
@@ -2853,10 +3181,15 @@ impl Clone for Node {
             transfer_submitter_task: self.transfer_submitter_task.clone(),
             transfer_proof_verifier_override: self.transfer_proof_verifier_override.clone(),
             transfer_ingress: self.transfer_ingress.clone(),
+            transact_coordinator: self.transact_coordinator.clone(),
+            transact_approval_rx: self.transact_approval_rx.clone(),
+            transact_proof_verifier_override: self.transact_proof_verifier_override.clone(),
+            transact_ingress: self.transact_ingress.clone(),
             delivered_notes: self.delivered_notes.clone(),
             cosign_keypair: self.cosign_keypair.clone(),
             verified_withdrawals: self.verified_withdrawals.clone(),
             verified_transfers: self.verified_transfers.clone(),
+            verified_transacts: self.verified_transacts.clone(),
         }
     }
 }
@@ -2922,6 +3255,7 @@ mod tests {
         let kp = Arc::new(Keypair::new());
         let wds = Arc::new(Mutex::new(HashMap::new()));
         let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
 
         // A pool whose live root we will propose, plus a stranger root we won't.
         let pool = Arc::new(crate::privacy::pool::ShieldedPool::new());
@@ -2945,6 +3279,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             Some(&pool),
             cosign_req("r1", SettlementKind::UpdateMerkleRoot, &payload(known_root)),
         )
@@ -2962,6 +3297,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             Some(&pool),
             cosign_req(
                 "r2",
@@ -2978,6 +3314,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             None,
             cosign_req("r3", SettlementKind::UpdateMerkleRoot, &payload(known_root)),
         )
@@ -2990,6 +3327,7 @@ mod tests {
         let kp = Arc::new(Keypair::new());
         let wds = Arc::new(Mutex::new(HashMap::new()));
         let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
 
         let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
         wds.lock()
@@ -3002,6 +3340,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             None,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
@@ -3024,6 +3363,7 @@ mod tests {
         let kp = Arc::new(Keypair::new());
         let wds = Arc::new(Mutex::new(HashMap::new()));
         let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
 
         let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
         wds.lock()
@@ -3037,6 +3377,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             None,
             cosign_req("w1", SettlementKind::Withdrawal, &tampered),
         )
@@ -3052,6 +3393,7 @@ mod tests {
         let kp = Arc::new(Keypair::new());
         let wds = Arc::new(Mutex::new(HashMap::new()));
         let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
         let payload = wd_payload(kp.pubkey().to_bytes(), [9u8; 32], 1, [7u8; 32]);
 
         // Never verified this request id.
@@ -3060,6 +3402,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             None,
             cosign_req("nope", SettlementKind::Withdrawal, &payload),
         )
@@ -3075,6 +3418,7 @@ mod tests {
             &configured_program(),
             &wds,
             &trs,
+            &tas,
             None,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
@@ -3092,6 +3436,7 @@ mod tests {
         let kp = Arc::new(Keypair::new());
         let wds = Arc::new(Mutex::new(HashMap::new()));
         let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
 
         let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
         wds.lock()
@@ -3107,6 +3452,7 @@ mod tests {
             &Pubkey::new_from_array([2u8; 32]),
             &wds,
             &trs,
+            &tas,
             None,
             cosign_req("w1", SettlementKind::Withdrawal, &payload),
         )
@@ -3114,6 +3460,168 @@ mod tests {
         assert_eq!(
             resp.signature, None,
             "a payload program id that does not match our config must be declined"
+        );
+    }
+
+    // --- #350 co-sign handler, v3 unified-transact settlements ---
+
+    fn ta_request(
+        id: &str,
+        recipient: [u8; 32],
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        root: [u8; 32],
+        ext_amount: i64,
+    ) -> TransactVerificationRequest {
+        TransactVerificationRequest {
+            request_id: id.to_string(),
+            recipient,
+            nullifiers,
+            output_commitments,
+            root,
+            ext_amount,
+            proof: vec![0u8; 256],
+            ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
+            timestamp: 0,
+        }
+    }
+
+    fn ta_payload(
+        authority: [u8; 32],
+        recipient: [u8; 32],
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        root: [u8; 32],
+        ext_amount: i64,
+    ) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority,
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![authority],
+            params: SettlementParams::Transact {
+                recipient,
+                nullifiers,
+                output_commitments,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cosign_signs_a_transact_we_verified() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &wds,
+            &trs,
+            &tas,
+            None,
+            cosign_req("t1", SettlementKind::Transact, &payload),
+        )
+        .await;
+
+        assert_eq!(resp.request_id, "t1");
+        assert_eq!(resp.wallet_pubkey, kp.pubkey().to_string());
+        let sig_bytes = resp.signature.expect("must sign a transact it verified");
+        // The signature must verify against the message we would actually submit.
+        let message = build_settlement_message(&payload).expect("build message");
+        let sig = solana_sdk::signature::Signature::try_from(sig_bytes.as_slice()).expect("sig");
+        assert!(
+            sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
+            "the returned signature must be valid over the rebuilt settlement message"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_a_tampered_transact_parameter() {
+        let kp = Arc::new(Keypair::new());
+        let wds = Arc::new(Mutex::new(HashMap::new()));
+        let trs = Arc::new(Mutex::new(HashMap::new()));
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        // Leader tries to redirect the withdrawal leg to a different recipient.
+        let tampered_recipient = ta_payload(
+            kp.pubkey().to_bytes(),
+            [0xFF; 32],
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &wds,
+            &trs,
+            &tas,
+            None,
+            cosign_req("t1", SettlementKind::Transact, &tampered_recipient),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "a substituted recipient must be declined even though we verified the original"
+        );
+
+        // Leader tries to withdraw more than the amount we verified.
+        let tampered_ext = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            -2_000_000_000i64,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &wds,
+            &trs,
+            &tas,
+            None,
+            cosign_req("t1", SettlementKind::Transact, &tampered_ext),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "a substituted ext_amount must be declined"
         );
     }
 
