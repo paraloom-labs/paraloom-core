@@ -1356,6 +1356,8 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
         let mut sum_ins = zero.clone();
 
         // --- Inputs ---
+        // `tx` indexes several parallel witness vectors plus `nullifier_pub`.
+        #[allow(clippy::needless_range_loop)]
         for tx in 0..TX_NINS {
             let amount_var = FpVar::new_witness(cs.clone(), || {
                 self.in_amounts[tx]
@@ -1413,6 +1415,8 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
 
         // --- Outputs ---
         let mut sum_outs = zero.clone();
+        // `tx` indexes several parallel witness vectors plus `commitment_pub`.
+        #[allow(clippy::needless_range_loop)]
         for tx in 0..TX_NOUTS {
             // Range-bound the output amount to u64 (prevents supply forgery).
             let (_bits, amount_var) = alloc_u64_witness(cs.clone(), self.out_amounts[tx])?;

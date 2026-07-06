@@ -150,7 +150,7 @@ pub fn v3_pubkey_gadget(
     cs: ConstraintSystemRef<Fr>,
     privkey: &FpVar<Fr>,
 ) -> Result<FpVar<Fr>, SynthesisError> {
-    circom_poseidon_gadget(cs, &[privkey.clone()])
+    circom_poseidon_gadget(cs, std::slice::from_ref(privkey))
 }
 
 /// In-circuit: `Poseidon(4)([amount, pubkey, blinding, asset_id])`.
