@@ -319,6 +319,12 @@ jobs:
       - name: Run co-sign settlement E2E (ignored)
         run: cargo test --test cosign_settlement_e2e --all-features -- --ignored --test-threads=1 --nocapture
 
+      # #350 v3 transact settlement E2E: the transact twin of the above — two
+      # validators verify a transact request over the mesh and the leader
+      # assembles the multi-signature transact settlement. Same constraints.
+      - name: Run transact settlement E2E (ignored)
+        run: cargo test --test transact_cosign_e2e --all-features -- --ignored --test-threads=1 --nocapture
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
