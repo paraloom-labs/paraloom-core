@@ -128,9 +128,45 @@ fn main() {
         out_blindings: vec![Some(fr_to_le(&obl0)), Some(fr_to_le(&obl1))],
     };
 
+    // Load the persistent transact v3 keys, or generate + save them on first
+    // run. The node (verify-then-sign) and the wallet prover must use the SAME
+    // key the on-chain VK constants were emitted from — a setup regenerated per
+    // run would silently orphan every previously emitted constant. Paths are
+    // env-overridable so the same emit path can validate ceremony-produced
+    // keys (#64) before trusting them on-chain.
+    let pk_path = std::env::var("TRANSACT_V3_PROVING_KEY")
+        .unwrap_or_else(|_| "keys/transact_v3_proving.key".to_string());
+    let vk_path = std::env::var("TRANSACT_V3_VERIFYING_KEY")
+        .unwrap_or_else(|_| "keys/transact_v3_verifying.key".to_string());
+
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    let (pk, vk) = if std::path::Path::new(&pk_path).exists() {
+        let pk_bytes = std::fs::read(&pk_path).expect("read transact v3 proving key");
+        let vk_bytes = std::fs::read(&vk_path).expect("read transact v3 verifying key");
+        let pk = ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&pk_bytes[..])
+            .expect("deserialize proving key");
+        let vk =
+            ark_groth16::VerifyingKey::<ark_bn254::Bn254>::deserialize_compressed(&vk_bytes[..])
+                .expect("deserialize verifying key");
+        eprintln!("loaded persistent keys from {pk_path}");
+        (pk, vk)
+    } else {
+        let mut rng = ark_std::rand::thread_rng();
+        let (pk, vk) = Groth16ProofSystem::setup(TransactCircuitV3::blank(), &mut rng)
+            .expect("setup dev keys");
+        let mut pk_bytes = Vec::new();
+        pk.serialize_compressed(&mut pk_bytes)
+            .expect("serialize pk");
+        let mut vk_bytes = Vec::new();
+        vk.serialize_compressed(&mut vk_bytes)
+            .expect("serialize vk");
+        std::fs::write(&pk_path, pk_bytes).expect("write transact v3 proving key");
+        std::fs::write(&vk_path, vk_bytes).expect("write transact v3 verifying key");
+        eprintln!("generated + saved persistent keys to {pk_path}");
+        (pk, vk)
+    };
+
     let mut rng = ark_std::rand::thread_rng();
-    let (pk, vk) =
-        Groth16ProofSystem::setup(TransactCircuitV3::blank(), &mut rng).expect("setup dev keys");
     let proof = Groth16ProofSystem::prove(&pk, circuit, &mut rng).expect("prove");
 
     let wvk = WireVerifyingKey::from_arkworks(&vk);
