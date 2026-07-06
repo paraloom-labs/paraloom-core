@@ -19,8 +19,8 @@
 //! from parameters it verified.
 
 use super::instructions::{
-    create_shielded_transfer_instruction, create_update_merkle_root_instruction,
-    create_withdraw_instruction,
+    create_shielded_transfer_instruction, create_transact_instruction,
+    create_update_merkle_root_instruction, create_withdraw_instruction,
 };
 use crate::bridge::{BridgeError, Result};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,21 @@ pub enum SettlementParams {
     /// the prover used. Quorum-gated on-chain exactly like the others, so it is
     /// co-signed by the validator set rather than the authority alone.
     UpdateMerkleRoot { new_merkle_root: [u8; 32] },
+    /// A v3 `transact` settlement (#350): unified 2-in/2-out spend against the
+    /// program's on-chain incremental tree. `root` must be in the on-chain root
+    /// history; `ext_amount < 0` withdraws `|ext_amount|` to `recipient`,
+    /// `== 0` is a pure shielded transfer. Appended last so the bincode
+    /// variant indices of the existing settlements stay wire-stable across a
+    /// rolling upgrade.
+    Transact {
+        recipient: [u8; 32],
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        root: [u8; 32],
+        ext_amount: i64,
+        /// 256-byte alt_bn128 wire proof.
+        proof: Vec<u8>,
+    },
 }
 
 /// Everything needed to rebuild the settlement transaction message a co-signer
@@ -172,6 +187,28 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &quorum,
             )?
         }
+        SettlementParams::Transact {
+            recipient,
+            nullifiers,
+            output_commitments,
+            root,
+            ext_amount,
+            proof,
+        } => {
+            let vault = Pubkey::new_from_array(payload.bridge_vault);
+            create_transact_instruction(
+                &program_id,
+                &authority,
+                &vault,
+                *recipient,
+                *nullifiers,
+                *output_commitments,
+                *root,
+                *ext_amount,
+                proof.clone(),
+                &quorum,
+            )?
+        }
     };
 
     let blockhash = Hash::new_from_array(payload.blockhash);
@@ -219,13 +256,82 @@ mod tests {
         }
     }
 
+    fn sample_transact_payload() -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::Transact {
+                recipient: [6u8; 32],
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
     #[test]
     fn payload_round_trips_through_bytes() {
-        for payload in [sample_withdrawal_payload(), sample_transfer_payload()] {
+        for payload in [
+            sample_withdrawal_payload(),
+            sample_transfer_payload(),
+            sample_transact_payload(),
+        ] {
             let bytes = payload.to_bytes().expect("serialize");
             let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
             assert_eq!(decoded, payload);
         }
+    }
+
+    /// The `Transact` variant was appended after the settlements already on the
+    /// wire; bincode encodes an enum as its variant index, so the pre-existing
+    /// variants' indices must never shift — a node running the previous release
+    /// must still decode a `Withdrawal` payload from a node running this one
+    /// during a rolling upgrade. Pins the first four bytes (the little-endian
+    /// u32 variant index) of each variant's encoding.
+    #[test]
+    fn settlement_variant_indices_are_wire_stable() {
+        let cases: [(CoSignPayload, u32); 3] = [
+            (sample_withdrawal_payload(), 0),
+            (sample_transfer_payload(), 1),
+            (sample_transact_payload(), 3),
+        ];
+        for (payload, index) in cases {
+            let bytes = bincode::serialize(&payload.params).expect("serialize params");
+            assert_eq!(
+                &bytes[..4],
+                &index.to_le_bytes(),
+                "variant index drifted — this breaks rolling-upgrade decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn message_build_is_deterministic_for_transact() {
+        let payload = sample_transact_payload();
+        let a = build_settlement_message(&payload).expect("build a");
+        let b = build_settlement_message(&payload).expect("build b");
+        assert_eq!(a.serialize(), b.serialize());
+    }
+
+    #[test]
+    fn different_transact_recipient_changes_the_message() {
+        // Same security property as withdraw: a validator that rebuilds from
+        // verified parameters never signs a substituted transact recipient.
+        let mut tampered = sample_transact_payload();
+        if let SettlementParams::Transact {
+            ref mut recipient, ..
+        } = tampered.params
+        {
+            *recipient = [99u8; 32];
+        }
+        let original = build_settlement_message(&sample_transact_payload()).expect("build");
+        let changed = build_settlement_message(&tampered).expect("build tampered");
+        assert_ne!(original.serialize(), changed.serialize());
     }
 
     #[test]
