@@ -176,16 +176,19 @@ pub struct Node {
     transact_coordinator: Option<Arc<TransactVerificationCoordinator>>,
 
     /// Receiver half of the transact coordinator's approval channel (#350).
-    /// Held here for the transact submitter task (a later PR) to take;
-    /// nothing consumes it yet.
+    /// Taken once by run() to drive the transact submitter task.
     transact_approval_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ApprovedTransact>>>>,
+
+    /// Transact submitter task handle (#350): drains approved transacts and
+    /// settles them on-chain. Spawned in run(), aborted in stop().
+    transact_submitter_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 
     /// Optional transact-proof verifier override (#350 testing seam). `None`
     /// in production.
     transact_proof_verifier_override: Option<TransactProofVerifier>,
 
     /// Transact-ingress HTTP server handle (#350). Not spawned yet — the
-    /// ingress surface lands with the submitter PR; the field mirrors
+    /// ingress surface lands in a follow-up PR; the field mirrors
     /// `transfer_ingress` so stop() is already wired to abort it.
     transact_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
 
@@ -1310,6 +1313,32 @@ async fn settle_approved_transfers<F, Fut>(
     }
 }
 
+/// Drain the transact coordinator's approval channel and settle each approved
+/// unified transact on-chain (#350), the v3 twin of [`settle_approved_transfers`].
+/// A per-message failure — including a replay whose nullifier is already spent —
+/// is logged and skipped so it cannot stall later approvals.
+async fn settle_approved_transacts<F, Fut>(
+    mut rx: mpsc::UnboundedReceiver<ApprovedTransact>,
+    mut submit: F,
+) where
+    F: FnMut(ApprovedTransact) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
+{
+    while let Some(approved) = rx.recv().await {
+        let request_id = approved.request.request_id.clone();
+        match submit(approved).await {
+            Ok(sig) => info!("on-chain transact settled for {}: {}", request_id, sig),
+            Err(e) if is_replay_error(&e) => {
+                log::debug!(
+                    "transact {} already settled (nullifier spent), skipping",
+                    request_id
+                )
+            }
+            Err(e) => log::warn!("transact {} submit failed: {}", request_id, e),
+        }
+    }
+}
+
 impl Node {
     /// Create a new node
     pub fn new(settings: Settings) -> Result<Self> {
@@ -1503,9 +1532,8 @@ impl Node {
         };
 
         // Transact consensus coordinator + its approval channel (#350), the
-        // v3 unified-transact twin of the transfer pair above. The receiver is
-        // held so the transact submitter task (a later PR) can drain it;
-        // nothing consumes it yet.
+        // v3 unified-transact twin of the transfer pair above; the receiver
+        // is held until run() spawns the transact submitter task.
         let (transact_coordinator, transact_approval_rx) = if runs_bridge {
             let (coord, rx) = TransactVerificationCoordinator::new_with_approvals();
             (Some(Arc::new(coord)), Some(rx))
@@ -1546,6 +1574,7 @@ impl Node {
             transfer_ingress: Arc::new(Mutex::new(None)),
             transact_coordinator,
             transact_approval_rx: Arc::new(Mutex::new(transact_approval_rx)),
+            transact_submitter_task: Arc::new(Mutex::new(None)),
             transact_proof_verifier_override: None,
             transact_ingress: Arc::new(Mutex::new(None)),
             delivered_notes: Arc::new(Mutex::new(Vec::new())),
@@ -2285,6 +2314,26 @@ impl Node {
             );
         }
 
+        // Settle consensus-approved unified transacts (#350), the v3 twin of
+        // the transfer submitter task above. Unlike the older paths there is
+        // no single-key fallback: the `transact` instruction settles
+        // exclusively through the #260 co-signing quorum, so a node without a
+        // settlement keypair logs each approval's failure rather than
+        // settling it single-key.
+        if let (Some(_bridge), Some(_coordinator), Some(rx)) = (
+            self.bridge.clone(),
+            self.transact_coordinator.clone(),
+            self.transact_approval_rx.lock().await.take(),
+        ) {
+            let node = self.clone();
+            let handle = tokio::spawn(settle_approved_transacts(rx, move |approved| {
+                let node = node.clone();
+                async move { node.settle_transact_via_cosign(approved).await }
+            }));
+            *self.transact_submitter_task.lock().await = Some(handle);
+            info!("transact submitter task started (co-signing)");
+        }
+
         // Periodically update resource information
         let status = self.status.clone();
         loop {
@@ -2340,6 +2389,9 @@ impl Node {
             handle.abort();
         }
         if let Some(handle) = self.transfer_ingress.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.transact_submitter_task.lock().await.take() {
             handle.abort();
         }
         if let Some(handle) = self.transact_ingress.lock().await.take() {
@@ -2504,7 +2556,7 @@ impl Node {
     /// Records the request with this node's transact coordinator and broadcasts
     /// it over the gossip mesh; validators verify and vote. The approval a
     /// quorum produces is queued on `transact_approval_rx` for the transact
-    /// submitter task (a later PR) to settle on-chain.
+    /// submitter task to settle on-chain.
     pub async fn initiate_transact_verification(
         &self,
         request: crate::consensus::TransactVerificationRequest,
@@ -2890,6 +2942,109 @@ impl Node {
         bridge.lock().await.submit_signed_transaction(&tx).await
     }
 
+    /// Assemble the co-signed multi-sig transaction for a quorum-approved
+    /// unified transact (#350) — the v3 twin of `cosign_settlement_transfer_tx`.
+    /// The `transact` instruction nullifies two inputs, appends two output
+    /// commitments, and pays out `|ext_amount|` from the vault when the signed
+    /// external flow is negative (zero for a pure shielded transfer). The
+    /// approving validators co-sign over libp2p and the leader assembles their
+    /// signatures into one transaction.
+    pub async fn cosign_settlement_transact_tx(
+        &self,
+        approved: &ApprovedTransact,
+        blockhash: [u8; 32],
+    ) -> Result<Transaction> {
+        let leader = self
+            .cosign_keypair
+            .as_ref()
+            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
+        let coordinator = self
+            .transact_coordinator
+            .as_ref()
+            .ok_or_else(|| anyhow!("no transact coordinator"))?;
+        let request = &approved.request;
+
+        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
+            .map_err(|e| anyhow!("invalid program id: {e}"))?;
+        let (vault, _) = derive_bridge_vault(&program_id);
+
+        // The validators that approved this transact become the co-signer
+        // quorum, mapped to their advertised settlement wallets; the leader
+        // signs as itself and is excluded from the peers it requests from.
+        let self_id = self.node_info.id.clone();
+        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+        for voter in coordinator.valid_voters(&request.request_id).await {
+            if voter == self_id {
+                continue;
+            }
+            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
+                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                    peers.push((pubkey, voter));
+                }
+            }
+        }
+        let mut quorum_wallets = vec![leader.pubkey()];
+        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+        let threshold = quorum_wallets.len();
+
+        // The on-chain program verifies the proof in its 256-byte alt_bn128
+        // wire form; convert the prover's compressed proof.
+        let onchain_proof =
+            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&request.proof)
+                .map_err(|e| anyhow!("transact proof: {e}"))?;
+        let params = SettlementParams::Transact {
+            recipient: request.recipient,
+            nullifiers: request.nullifiers,
+            output_commitments: request.output_commitments,
+            root: request.root,
+            ext_amount: request.ext_amount,
+            proof: onchain_proof.to_vec(),
+        };
+
+        let network = self.network.clone();
+        cosign_round::run_cosign_round(
+            leader,
+            program_id,
+            vault,
+            blockhash,
+            &request.request_id,
+            SettlementKind::Transact,
+            params,
+            quorum_wallets,
+            &peers,
+            threshold,
+            |peer, request| {
+                let network = network.clone();
+                async move { network.send_cosign_request(peer, request).await.ok() }
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("co-signing round failed: {e}"))
+    }
+
+    /// Settle a quorum-approved unified transact via the #260 co-signing path,
+    /// the v3 twin of `settle_transfer_via_cosign`. The on-chain submit error
+    /// is preserved as its `BridgeError` so the caller's replay detection still
+    /// applies; a co-signing-round failure maps to `Network`.
+    async fn settle_transact_via_cosign(
+        &self,
+        approved: ApprovedTransact,
+    ) -> std::result::Result<String, crate::bridge::BridgeError> {
+        use crate::bridge::BridgeError;
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| BridgeError::ConfigError("no bridge configured".to_string()))?;
+
+        let blockhash = bridge.lock().await.latest_blockhash().await?;
+        let tx = self
+            .cosign_settlement_transact_tx(&approved, blockhash)
+            .await
+            .map_err(|e| BridgeError::Network(format!("transact co-signing round: {e}")))?;
+
+        bridge.lock().await.submit_signed_transaction(&tx).await
+    }
+
     // Compute layer API methods
 
     /// Submit a compute job for execution (for ResourceProvider nodes)
@@ -3183,6 +3338,7 @@ impl Clone for Node {
             transfer_ingress: self.transfer_ingress.clone(),
             transact_coordinator: self.transact_coordinator.clone(),
             transact_approval_rx: self.transact_approval_rx.clone(),
+            transact_submitter_task: self.transact_submitter_task.clone(),
             transact_proof_verifier_override: self.transact_proof_verifier_override.clone(),
             transact_ingress: self.transact_ingress.clone(),
             delivered_notes: self.delivered_notes.clone(),
@@ -3676,6 +3832,72 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         settle_approved_withdrawals(rx, move |_approved| {
+            let counter = counter.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(crate::bridge::BridgeError::InvalidTransaction(
+                        "nullifier already spent".to_string(),
+                    ))
+                } else {
+                    Ok("signature".to_string())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn ta_approval(id: &str) -> ApprovedTransact {
+        ApprovedTransact {
+            request: ta_request(
+                id,
+                [0u8; 32],
+                [[1u8; 32], [2u8; 32]],
+                [[3u8; 32], [4u8; 32]],
+                [5u8; 32],
+                0,
+            ),
+        }
+    }
+
+    // The transact submitter drains every approval into the settle closure,
+    // ungated — the v3 twin of `settles_every_approval_without_gating`.
+    #[tokio::test]
+    async fn settles_every_transact_approval_without_gating() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..3 {
+            tx.send(ta_approval(&format!("ta-{i}"))).unwrap();
+        }
+        drop(tx);
+
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let counter = submitted.clone();
+        settle_approved_transacts(rx, move |_approved| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok("signature".to_string())
+            }
+        })
+        .await;
+
+        assert_eq!(submitted.load(Ordering::SeqCst), 3);
+    }
+
+    // A transact replay (nullifier already spent) is skipped quietly and does
+    // not stop the task from settling later approvals.
+    #[tokio::test]
+    async fn transact_replay_error_does_not_stall_later_approvals() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("replayed")).unwrap();
+        tx.send(ta_approval("fresh")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(rx, move |_approved| {
             let counter = counter.clone();
             async move {
                 let n = counter.fetch_add(1, Ordering::SeqCst);
