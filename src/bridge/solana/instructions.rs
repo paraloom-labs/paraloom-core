@@ -93,7 +93,6 @@ pub mod discriminators {
     pub const RESET_VALIDATOR_REGISTRY: [u8; 8] = [101, 188, 0, 99, 248, 198, 207, 7];
     /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
     /// the on-chain incremental tree.
-    #[allow(dead_code)]
     pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
     /// `sha256("global:deposit_note")[..8]` (#350). v3 deposit that appends the
     /// note commitment to the on-chain tree.
@@ -114,7 +113,6 @@ pub mod discriminators {
 /// `|ext_amount|`, `== 0` is a pure shielded transfer; deposits go through
 /// `deposit_note` and `> 0` is rejected on-chain).
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct TransactInstructionData {
     pub nullifiers: [[u8; 32]; 2],
     pub output_commitments: [[u8; 32]; 2],
@@ -485,7 +483,6 @@ pub fn create_shielded_transfer_instruction(
 /// accounts struct in the program. Quorum-gated exactly like
 /// [`create_withdraw_instruction`] (#260).
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub fn create_transact_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -705,7 +702,6 @@ pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
 }
 
 /// Derive the on-chain incremental Merkle tree PDA (circuit v3, #350).
-#[allow(dead_code)]
 pub fn derive_merkle_tree(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"merkle_tree"], program_id)
 }
