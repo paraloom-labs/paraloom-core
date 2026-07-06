@@ -243,15 +243,32 @@ impl VoteTally {
         (valid, invalid)
     }
 
-    /// The validators that voted `Valid` (#260) — the eligible co-signers the
-    /// round leader collects settlement signatures from.
-    pub async fn valid_voters(&self) -> Vec<NodeId> {
+    /// The validators that voted `Valid` (#260) **and** currently sit at or
+    /// above `min_reputation` — the eligible co-signers the round leader
+    /// collects settlement signatures from. Gating this on the same
+    /// reputation view [`has_consensus`](Self::has_consensus) and
+    /// [`consensus_result`](Self::consensus_result) use (audit #17) keeps the
+    /// co-sign set consistent with the set that actually formed the quorum: a
+    /// vote that was excluded from the count must not then be asked to
+    /// co-sign, or the leader gathers signatures from validators the quorum
+    /// never counted.
+    pub async fn valid_voters(
+        &self,
+        reputation_tracker: &ReputationTracker,
+        min_reputation: u64,
+    ) -> Vec<NodeId> {
         let votes = self.votes.read().await;
-        votes
-            .iter()
-            .filter(|(_, vote)| vote.is_valid())
-            .map(|(node, _)| node.clone())
-            .collect()
+        let mut out = Vec::new();
+        for (node, vote) in votes.iter() {
+            if !vote.is_valid() {
+                continue;
+            }
+            let reputation = reputation_tracker.get_reputation(node).await.unwrap_or(0);
+            if reputation >= min_reputation {
+                out.push(node.clone());
+            }
+        }
+        out
     }
 }
 
@@ -260,7 +277,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn valid_voters_lists_only_the_valid_votes() {
+    async fn valid_voters_lists_only_eligible_valid_votes() {
         let tally = VoteTally::new("req-1".to_string(), 2, 3);
         tally
             .submit_vote(NodeId(vec![1]), VerificationVote::Valid)
@@ -280,8 +297,39 @@ mod tests {
             .await
             .unwrap();
 
-        let mut voters = tally.valid_voters().await;
+        let reputation = ReputationTracker::new();
+        for id in [1u8, 2, 3] {
+            reputation.register_validator(NodeId(vec![id])).await;
+        }
+
+        // Both Valid voters are in good standing → both are eligible co-signers.
+        let mut voters = tally.valid_voters(&reputation, 200).await;
         voters.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(voters, vec![NodeId(vec![1]), NodeId(vec![3])]);
+    }
+
+    #[tokio::test]
+    async fn valid_voters_excludes_below_reputation_valid_votes() {
+        let tally = VoteTally::new("req-1".to_string(), 1, 3);
+        tally
+            .submit_vote(NodeId(vec![1]), VerificationVote::Valid)
+            .await
+            .unwrap();
+        tally
+            .submit_vote(NodeId(vec![3]), VerificationVote::Valid)
+            .await
+            .unwrap();
+
+        let reputation = ReputationTracker::new();
+        reputation.register_validator(NodeId(vec![1])).await;
+        reputation.register_validator(NodeId(vec![3])).await;
+        // Drop validator 3 below the threshold; its Valid vote must not make it
+        // an eligible co-signer even though it voted Valid.
+        for _ in 0..50 {
+            let _ = reputation.record_failure(&NodeId(vec![3])).await;
+        }
+
+        let voters = tally.valid_voters(&reputation, 200).await;
+        assert_eq!(voters, vec![NodeId(vec![1])]);
     }
 }

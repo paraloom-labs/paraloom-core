@@ -296,7 +296,12 @@ impl TransferVerificationCoordinator {
     pub async fn valid_voters(&self, request_id: &str) -> Vec<NodeId> {
         let pending = self.pending.read().await;
         match pending.get(request_id) {
-            Some(consensus) => consensus.tally.valid_voters().await,
+            Some(consensus) => {
+                consensus
+                    .tally
+                    .valid_voters(&self.reputation_tracker, self.min_reputation_for_consensus)
+                    .await
+            }
             None => Vec::new(),
         }
     }
