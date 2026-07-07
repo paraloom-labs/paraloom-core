@@ -270,8 +270,9 @@ pub mod paraloom_program {
 
         let commitment =
             crate::merkle_tree::commitment(amount, &pubkey, &blinding, &NATIVE_SOL_ASSET)?;
-        let leaf_index = ctx.accounts.merkle_tree.next_index;
-        ctx.accounts.merkle_tree.append(commitment)?;
+        let mut tree = ctx.accounts.merkle_tree.load_mut()?;
+        let leaf_index = tree.next_index;
+        tree.append(commitment)?;
 
         let bridge_state = &mut ctx.accounts.bridge_state;
         bridge_state.total_deposited = bridge_state
@@ -584,7 +585,7 @@ pub mod paraloom_program {
         // must be one the program actually published (ring buffer), so a spend
         // cannot be proven against a fabricated tree state (audit #1).
         require!(
-            ctx.accounts.merkle_tree.is_known_root(root),
+            ctx.accounts.merkle_tree.load()?.is_known_root(root),
             BridgeError::UnknownMerkleRoot
         );
 
@@ -635,9 +636,10 @@ pub mod paraloom_program {
         // Append both output commitments to the on-chain tree. `root` (the
         // pre-append root the proof was checked against) is untouched; the new
         // notes extend the tree for future spends.
-        let tree = &mut ctx.accounts.merkle_tree;
+        let mut tree = ctx.accounts.merkle_tree.load_mut()?;
         tree.append(output_commitments[0])?;
         let new_root = tree.append(output_commitments[1])?;
+        drop(tree);
 
         // Move external funds. `ext_amount < 0` withdraws from the vault; the
         // settling validator earns the same 25 bps fee as `withdraw`.
@@ -1222,7 +1224,7 @@ pub mod paraloom_program {
     /// settled transaction can install an attacker-chosen root.
     pub fn initialize_merkle_tree(ctx: Context<InitializeMerkleTree>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
-        ctx.accounts.merkle_tree.initialize()?;
+        ctx.accounts.merkle_tree.load_init()?.initialize()?;
         msg!("Merkle tree initialized");
         Ok(())
     }
@@ -1392,7 +1394,7 @@ pub struct DepositNote<'info> {
     pub bridge_vault: SystemAccount<'info>,
 
     #[account(mut, seeds = [b"merkle_tree"], bump)]
-    pub merkle_tree: Box<Account<'info, crate::merkle_tree::IncrementalMerkleTree>>,
+    pub merkle_tree: AccountLoader<'info, crate::merkle_tree::IncrementalMerkleTree>,
 
     #[account(mut)]
     pub depositor: Signer<'info>,
@@ -1553,7 +1555,7 @@ pub struct Transact<'info> {
         seeds = [b"merkle_tree"],
         bump
     )]
-    pub merkle_tree: Box<Account<'info, merkle_tree::IncrementalMerkleTree>>,
+    pub merkle_tree: AccountLoader<'info, merkle_tree::IncrementalMerkleTree>,
 
     #[account(
         mut,
@@ -1823,11 +1825,11 @@ pub struct InitializeMerkleTree<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + crate::merkle_tree::IncrementalMerkleTree::INIT_SPACE,
+        space = 8 + crate::merkle_tree::MERKLE_TREE_SIZE,
         seeds = [b"merkle_tree"],
         bump
     )]
-    pub merkle_tree: Box<Account<'info, crate::merkle_tree::IncrementalMerkleTree>>,
+    pub merkle_tree: AccountLoader<'info, crate::merkle_tree::IncrementalMerkleTree>,
 
     #[account(mut)]
     pub authority: Signer<'info>,

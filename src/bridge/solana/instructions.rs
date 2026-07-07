@@ -583,7 +583,6 @@ pub fn create_deposit_note_instruction(
 ///
 /// One-time creation of the on-chain incremental tree, gated to the program
 /// upgrade authority like the other `initialize_*` instructions (#204).
-#[allow(dead_code)]
 pub fn create_initialize_merkle_tree_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
