@@ -2630,8 +2630,12 @@ impl Node {
                 .await;
             let vote = match self.verify_transact_proof(&request).await {
                 Ok(true) => {
-                    cache_verified(&self.verified_transacts, request_id.clone(), request.clone())
-                        .await;
+                    cache_verified(
+                        &self.verified_transacts,
+                        request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
                     crate::consensus::vote_tally::VerificationVote::Valid
                 }
                 Ok(false) => crate::consensus::vote_tally::VerificationVote::Invalid {
