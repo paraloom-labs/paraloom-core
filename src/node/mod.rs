@@ -2615,6 +2615,46 @@ impl Node {
         // receive its own gossip broadcast, so it stores here to serve scan.
         self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
             .await;
+
+        // The initiator does not receive its own gossip broadcast, so it must
+        // self-verify and submit its own vote (registering self into the
+        // validator set first so it is non-empty) — the withdrawal/transfer
+        // twins do the same. Without it a 2-node cohort only ever collects the
+        // remote vote and never reaches the quorum. Still one vote toward the
+        // BFT threshold, not a bypass of it.
+        {
+            let self_id = self.node_info.id.clone();
+            let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
+            coordinator
+                .register_validator_with_wallet(self_id.clone(), wallet)
+                .await;
+            let vote = match self.verify_transact_proof(&request).await {
+                Ok(true) => {
+                    cache_verified(&self.verified_transacts, request_id.clone(), request.clone())
+                        .await;
+                    crate::consensus::vote_tally::VerificationVote::Valid
+                }
+                Ok(false) => crate::consensus::vote_tally::VerificationVote::Invalid {
+                    reason: "self-verify: proof verification failed".to_string(),
+                },
+                Err(e) => crate::consensus::vote_tally::VerificationVote::Invalid {
+                    reason: format!("self-verify error: {e}"),
+                },
+            };
+            let result = crate::consensus::TransactVerificationResult {
+                request_id: request_id.clone(),
+                validator: self_id,
+                vote,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = coordinator.submit_result(result).await {
+                log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+            }
+        }
+
         self.network
             .send_message(
                 NodeId(vec![]),
