@@ -28,6 +28,10 @@ default = []
 # `init-if-needed` lets the first depositor of an SPL mint lazily create that
 # mint's vault token account (#237); reused unchanged by every later deposit.
 anchor-lang = { version = "0.31", features = ["init-if-needed"] }
+# Required by `#[account(zero_copy)]` on the incremental Merkle tree (too large
+# to stack-deserialize as a plain `Account<T>`); the derive's Pod/Zeroable
+# bounds resolve against this crate. Matches the version anchor-lang 0.31 pulls.
+bytemuck = { version = "1", features = ["derive"] }
 # SPL-token CPIs for asset-aware deposit/withdraw into per-asset vaults (#237).
 # Version-pinned to match anchor-lang 0.31 so the generated CPI types line up.
 anchor-spl = "0.31"

@@ -125,15 +125,26 @@ pub const ZERO_HASHES: [[u8; 32]; TREE_DEPTH + 1] = [
 /// `filled_subtrees[i]` is the last-seen left-child hash at level `i` (the
 /// value an even index deposits there and an odd index pairs against), the
 /// standard append-only incremental-tree working set.
-#[account]
-#[derive(InitSpace)]
+/// Zero-copy: the tree is ~3.1KB (32 filled subtrees + a 64-root ring buffer),
+/// which overflows the 4KB BPF stack frame if Anchor deserializes it as a plain
+/// `Account<T>` (`cargo build-sbf` flags `try_accounts`/`try_deserialize` at
+/// 5248 bytes). `AccountLoader` accesses the account data in place instead, so
+/// nothing large lands on the stack. The two `u64`s lead so the byte arrays are
+/// contiguous and the `repr(C)` layout has no interior padding (bytemuck `Pod`
+/// requires it); total 3120 bytes, 8-aligned.
+#[account(zero_copy)]
+#[repr(C)]
 pub struct IncrementalMerkleTree {
     pub next_index: u64,
+    pub root_index: u64,
     pub root: [u8; 32],
     pub filled_subtrees: [[u8; 32]; TREE_DEPTH],
     pub root_history: [[u8; 32]; ROOT_HISTORY_SIZE],
-    pub root_index: u64,
 }
+
+/// On-chain byte size of the zero-copy account (excluding the 8-byte
+/// discriminator): `2*8 + 32 + 32*32 + 64*32`.
+pub const MERKLE_TREE_SIZE: usize = core::mem::size_of::<IncrementalMerkleTree>();
 
 impl IncrementalMerkleTree {
     /// Initialise an empty tree: every `filled_subtree[i]` and the root are the
