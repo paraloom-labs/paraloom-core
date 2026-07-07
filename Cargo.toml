@@ -115,6 +115,10 @@ name = "init-validator-registry"
 path = "src/bin/init_validator_registry.rs"
 
 [[bin]]
+name = "init-merkle-tree"
+path = "src/bin/init_merkle_tree.rs"
+
+[[bin]]
 name = "register-validator"
 path = "src/bin/register_validator.rs"
 
