@@ -1536,7 +1536,18 @@ impl Node {
         // v3 unified-transact twin of the transfer pair above; the receiver
         // is held until run() spawns the transact submitter task.
         let (transact_coordinator, transact_approval_rx) = if runs_bridge {
-            let (coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            let (mut coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            // Same config override as the withdrawal/transfer coordinators: without
+            // it the transact coordinator keeps the 7/10 BFT defaults, so a small
+            // live cohort (devnet 2/2) never reaches a Valid quorum and settlement
+            // silently times out. The on-chain stake-weighted quorum stays the
+            // real security gate.
+            if let (Some(min), Some(total)) = (
+                settings.bridge.consensus_min_validators,
+                settings.bridge.consensus_total_validators,
+            ) {
+                coord.set_consensus_thresholds(min, total);
+            }
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
