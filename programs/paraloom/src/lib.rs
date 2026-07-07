@@ -1392,7 +1392,7 @@ pub struct DepositNote<'info> {
     pub bridge_vault: SystemAccount<'info>,
 
     #[account(mut, seeds = [b"merkle_tree"], bump)]
-    pub merkle_tree: Account<'info, crate::merkle_tree::IncrementalMerkleTree>,
+    pub merkle_tree: Box<Account<'info, crate::merkle_tree::IncrementalMerkleTree>>,
 
     #[account(mut)]
     pub depositor: Signer<'info>,
@@ -1553,7 +1553,7 @@ pub struct Transact<'info> {
         seeds = [b"merkle_tree"],
         bump
     )]
-    pub merkle_tree: Account<'info, merkle_tree::IncrementalMerkleTree>,
+    pub merkle_tree: Box<Account<'info, merkle_tree::IncrementalMerkleTree>>,
 
     #[account(
         mut,
@@ -1827,7 +1827,7 @@ pub struct InitializeMerkleTree<'info> {
         seeds = [b"merkle_tree"],
         bump
     )]
-    pub merkle_tree: Account<'info, crate::merkle_tree::IncrementalMerkleTree>,
+    pub merkle_tree: Box<Account<'info, crate::merkle_tree::IncrementalMerkleTree>>,
 
     #[account(mut)]
     pub authority: Signer<'info>,
