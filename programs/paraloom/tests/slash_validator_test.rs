@@ -112,7 +112,12 @@ async fn slash_reduces_stake_and_credits_vault() {
         .unwrap()
         .unwrap();
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
-    assert_eq!(acc.stake_amount, MIN_VALIDATOR_STAKE / 2);
+    // The 50% slash drops stake below the minimum, deactivating the validator;
+    // the unslashed remainder (MIN/2) is routed into unbonding (a deactivated
+    // validator can't `unregister` to reclaim it), so active stake is now zero.
+    assert_eq!(acc.stake_amount, 0);
+    assert_eq!(acc.unbonding_amount, MIN_VALIDATOR_STAKE / 2);
+    assert!(acc.unbonding_slot > 0, "unbonding slot must be set");
     assert_eq!(acc.times_slashed, 1);
 
     // A 50% slash drops stake to MIN/2, below the registry minimum, so the

@@ -145,6 +145,8 @@ mod tests {
             pending_rewards: 0,
             total_earnings: 0,
             times_slashed: 0,
+            unbonding_amount: 0,
+            unbonding_slot: 0,
         };
         let mut buf = Vec::new();
         v.try_serialize(&mut buf).unwrap();
