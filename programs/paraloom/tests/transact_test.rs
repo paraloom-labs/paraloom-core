@@ -318,10 +318,7 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         &[&upgrade_authority, &cosigner],
         recent_blockhash,
     );
-    banks_client
-        .process_transaction(transact_tx)
-        .await
-        .unwrap();
+    banks_client.process_transaction(transact_tx).await.unwrap();
 
     // The withdrawn amount is |ext_amount| = 500; fee = 500 * 25 / 10000 = 1.
     let gross = fx::FIXTURE_EXT_AMOUNT.unsigned_abs();

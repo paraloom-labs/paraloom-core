@@ -16,6 +16,13 @@ declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
+/// Slots a validator's stake stays locked after it unregisters (or is slashed
+/// below the minimum) before it can be withdrawn. ~1 day at ~2.5 slots/s. The
+/// window keeps the stake reachable by slashing while any misbehavior it
+/// co-signed can still be proven, so quorum stake is real at-risk capital and
+/// not free to weaponize (register → co-sign → instantly unregister).
+pub const UNBONDING_SLOTS: u64 = 216_000;
+
 /// Upper bound on the settlement proof blob. A BN254 Groth16 proof in the
 /// `alt_bn128` wire form is exactly 256 bytes (see
 /// [`transact_verifier::WIRE_PROOF_LEN`]); the cap rejects oversized blobs that
@@ -492,20 +499,21 @@ pub mod paraloom_program {
         require!(validator_account.is_active, BridgeError::ValidatorNotActive);
 
         let stake_amount = validator_account.stake_amount;
-        **validator_account
-            .to_account_info()
-            .try_borrow_mut_lamports()? -= stake_amount;
-        **ctx
-            .accounts
-            .validator
-            .to_account_info()
-            .try_borrow_mut_lamports()? += stake_amount;
-
+        // Deactivate immediately so the validator stops counting toward the
+        // settlement quorum at once (preserving the invariant
+        // `total_active_stake == Σ active-PDA stake`), but do NOT return the
+        // lamports yet: they enter an unbonding window during which the stake
+        // is still slashable, and are released by `withdraw_unbonded_stake`
+        // after `UNBONDING_SLOTS`. This makes quorum stake real at-risk capital
+        // rather than something an attacker can register, co-sign with, and
+        // instantly reclaim.
+        let now_slot = Clock::get()?.slot;
         validator_account.is_active = false;
-        // Stake lamports were just returned to the wallet; zero the recorded
-        // amount so `status`/`list` and the explorer don't show a phantom
-        // stake on an unregistered account.
         validator_account.stake_amount = 0;
+        validator_account.unbonding_amount = validator_account
+            .unbonding_amount
+            .saturating_add(stake_amount);
+        validator_account.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
 
         validator_registry.active_validators -= 1;
         validator_registry.total_active_stake = validator_registry
@@ -514,11 +522,16 @@ pub mod paraloom_program {
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
-            stake_returned: stake_amount,
+            // Nothing is returned now — the stake is unbonding.
+            stake_returned: 0,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
-        msg!("Validator unregistered: {}", ctx.accounts.validator.key());
+        msg!(
+            "Validator unregistered; stake unbonding until slot {}: {}",
+            validator_account.unbonding_slot,
+            ctx.accounts.validator.key()
+        );
         Ok(())
     }
 
@@ -627,6 +640,15 @@ pub mod paraloom_program {
             let registry = &mut ctx.accounts.validator_registry;
             registry.active_validators = registry.active_validators.saturating_sub(1);
             registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+            // The unslashed remainder would otherwise be stranded — a
+            // deactivated validator cannot `unregister` — so route it into
+            // unbonding, reclaimable via `withdraw_unbonded_stake` after the
+            // delay. The slashed portion has already gone to the vault below.
+            let residual = validator_account.stake_amount;
+            validator_account.unbonding_amount =
+                validator_account.unbonding_amount.saturating_add(residual);
+            validator_account.unbonding_slot = Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
+            validator_account.stake_amount = 0;
         } else if validator_account.is_active {
             // Still active: only the slashed portion leaves the active-stake total.
             let registry = &mut ctx.accounts.validator_registry;
@@ -807,6 +829,90 @@ pub mod paraloom_program {
             registry.active_validators = registry.active_validators.saturating_sub(1);
         }
         msg!("Validator deactivated: {}", who);
+        Ok(())
+    }
+
+    /// Withdraw stake that has finished unbonding. Self-signed; returns the
+    /// withheld `unbonding_amount` from the validator PDA to the wallet once
+    /// `unbonding_slot` has passed. The registry counters were already updated
+    /// when the stake left the active set (unregister / deactivating slash), so
+    /// this only moves lamports.
+    pub fn withdraw_unbonded_stake(ctx: Context<WithdrawUnbondedStake>) -> Result<()> {
+        let validator_account = &mut ctx.accounts.validator_account;
+        let amount = validator_account.unbonding_amount;
+        require!(amount > 0, BridgeError::NothingUnbonding);
+        require!(
+            Clock::get()?.slot >= validator_account.unbonding_slot,
+            BridgeError::UnbondingNotElapsed
+        );
+        // The staked lamports live in the PDA itself; `unbonding_amount` is
+        // always the delta above the account's rent-exempt minimum, so this
+        // debit cannot drop the PDA below rent exemption.
+        **validator_account
+            .to_account_info()
+            .try_borrow_mut_lamports()? -= amount;
+        **ctx
+            .accounts
+            .validator
+            .to_account_info()
+            .try_borrow_mut_lamports()? += amount;
+        validator_account.unbonding_amount = 0;
+
+        emit!(UnbondedStakeWithdrawnEvent {
+            validator: validator_account.validator,
+            amount,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        msg!(
+            "Unbonded stake withdrawn: {} ({} lamports)",
+            validator_account.validator,
+            amount
+        );
+        Ok(())
+    }
+
+    /// One-time migration: grow an existing `ValidatorAccount` PDA to the
+    /// current layout. The added unbonding fields zero-fill (resize clears the
+    /// tail), which reads as "nothing pending". Upgrade-authority gated (#204),
+    /// mirroring the registry migration; idempotent (a no-op once the account
+    /// is already the new size).
+    pub fn migrate_validator_account(
+        ctx: Context<MigrateValidatorAccount>,
+        _validator: Pubkey,
+    ) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        let ai = ctx.accounts.validator_account.to_account_info();
+        {
+            let data = ai.try_borrow_data()?;
+            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(
+                data[0..8] == *ValidatorAccount::DISCRIMINATOR,
+                BridgeError::UnauthorizedInit
+            );
+        }
+        let new_len = 8 + ValidatorAccount::INIT_SPACE;
+        if ai.data_len() < new_len {
+            let rent = Rent::get()?;
+            let min_balance = rent.minimum_balance(new_len);
+            let current = ai.lamports();
+            if min_balance > current {
+                let delta = min_balance - current;
+                let ix = anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &ai.key(),
+                    delta,
+                );
+                anchor_lang::solana_program::program::invoke(
+                    &ix,
+                    &[
+                        ctx.accounts.authority.to_account_info(),
+                        ai.clone(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                )?;
+            }
+            ai.resize(new_len)?;
+        }
         Ok(())
     }
 }
@@ -1157,6 +1263,47 @@ pub struct DeactivateValidator<'info> {
 }
 
 #[derive(Accounts)]
+pub struct WithdrawUnbondedStake<'info> {
+    #[account(
+        mut,
+        seeds = [b"validator", validator.key().as_ref()],
+        bump,
+        has_one = validator
+    )]
+    pub validator_account: Account<'info, ValidatorAccount>,
+
+    #[account(mut)]
+    pub validator: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(validator: Pubkey)]
+pub struct MigrateValidatorAccount<'info> {
+    /// The validator PDA to grow. Untyped because pre-migration bytes are
+    /// shorter than the current `ValidatorAccount`; the body re-checks the
+    /// discriminator and reallocs.
+    ///
+    /// CHECK: address pinned by seeds; identity + realloc validated in the body.
+    #[account(mut, seeds = [b"validator", validator.as_ref()], bump)]
+    pub validator_account: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204), same as the registry migration.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct SlashValidator<'info> {
     #[account(
         mut,
@@ -1245,6 +1392,11 @@ pub struct ValidatorAccount {
     pub pending_rewards: u64,
     pub total_earnings: u64,
     pub times_slashed: u64,
+    /// Lamports withheld after `unregister_validator` or a deactivating slash,
+    /// pending release by `withdraw_unbonded_stake` (0 when nothing is pending).
+    pub unbonding_amount: u64,
+    /// Earliest slot at which withheld `unbonding_amount` may be withdrawn.
+    pub unbonding_slot: u64,
 }
 
 /// Emitted by `deposit_note` (circuit v3): the appended note commitment and its
@@ -1283,6 +1435,13 @@ pub struct ValidatorRegisteredEvent {
 pub struct ValidatorUnregisteredEvent {
     pub validator: Pubkey,
     pub stake_returned: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct UnbondedStakeWithdrawnEvent {
+    pub validator: Pubkey,
+    pub amount: u64,
     pub timestamp: i64,
 }
 
@@ -1346,6 +1505,12 @@ pub enum BridgeError {
 
     #[msg("Validator quorum not met for settlement")]
     QuorumNotMet,
+
+    #[msg("Unbonding period has not elapsed yet")]
+    UnbondingNotElapsed,
+
+    #[msg("No unbonding stake is pending withdrawal")]
+    NothingUnbonding,
 
     #[msg("Merkle root is not in the on-chain root history")]
     UnknownMerkleRoot,

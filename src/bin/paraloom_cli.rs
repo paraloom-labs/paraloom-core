@@ -302,8 +302,23 @@ enum ValidatorCommands {
         program_id: Option<String>,
     },
 
-    /// Unregister this validator on-chain (returns the staked SOL)
+    /// Unregister this validator on-chain (moves the stake into unbonding)
     Unregister {
+        /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
+    /// Withdraw stake that has finished unbonding (after unregister)
+    WithdrawUnbonded {
         /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
         #[arg(long)]
         keypair: Option<PathBuf>,
@@ -1521,7 +1536,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     blockhash,
                 );
 
-                println!("Unregistering and returning stake...");
+                println!("Unregistering (stake enters unbonding)...");
                 let signature = client
                     .send_and_confirm_transaction(&tx)
                     .context("Failed to send transaction")?;
@@ -1529,7 +1544,87 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("\n[OK] Validator unregistered!");
                 println!("  Transaction: {}", signature);
                 println!("  Validator:   {}", validator.pubkey());
-                println!("  Stake returned to your wallet.");
+                println!(
+                    "  Stake is now unbonding and still slashable. Reclaim it after the \
+                     unbonding period with: paraloom validator withdraw-unbonded"
+                );
+                println!("\nVerify with: paraloom validator list");
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
+
+            Ok(())
+        }
+
+        ValidatorCommands::WithdrawUnbonded {
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Withdrawing unbonded validator stake...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("VALIDATOR_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Validator Keypair: {}\n", keypair_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let validator =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Validator Address: {}\n", validator.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let ix =
+                    create_withdraw_unbonded_stake_instruction(&program_id, &validator.pubkey());
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    blockhash,
+                );
+
+                println!("Releasing unbonded stake to your wallet...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Unbonded stake withdrawn!");
+                println!("  Transaction: {}", signature);
+                println!("  Validator:   {}", validator.pubkey());
+                println!("  Stake released to your wallet.");
                 println!("\nVerify with: paraloom validator list");
             }
 
