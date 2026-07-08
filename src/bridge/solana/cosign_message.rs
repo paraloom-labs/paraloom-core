@@ -24,7 +24,16 @@ use super::instructions::{
 };
 use crate::bridge::{BridgeError, Result};
 use serde::{Deserialize, Serialize};
-use solana_sdk::{hash::Hash, message::Message, pubkey::Pubkey};
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction, hash::Hash, message::Message, pubkey::Pubkey,
+};
+
+/// Compute-unit ceiling for a `transact` settlement. The on-chain instruction
+/// verifies a Groth16/alt_bn128 proof, which far exceeds the default 200k-CU
+/// budget; without this the transaction fails simulation with "Computational
+/// budget exceeded". Pinned into the co-signed message so every validator
+/// rebuilds the byte-identical transaction (see the module invariant).
+const TRANSACT_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
 /// The settlement-specific parameters of a co-sign payload — the fields the
 /// validator matches against the request it approved before signing.
@@ -211,9 +220,20 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         }
     };
 
+    // A transact settlement verifies its proof on-chain and needs the raised
+    // compute-unit ceiling prepended; every co-signer builds the same message,
+    // so the extra instruction stays part of what they all sign over.
+    let mut instructions = Vec::with_capacity(2);
+    if matches!(payload.params, SettlementParams::Transact { .. }) {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+            TRANSACT_COMPUTE_UNIT_LIMIT,
+        ));
+    }
+    instructions.push(instruction);
+
     let blockhash = Hash::new_from_array(payload.blockhash);
     Ok(Message::new_with_blockhash(
-        &[instruction],
+        &instructions,
         Some(&authority),
         &blockhash,
     ))

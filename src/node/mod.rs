@@ -1536,7 +1536,18 @@ impl Node {
         // v3 unified-transact twin of the transfer pair above; the receiver
         // is held until run() spawns the transact submitter task.
         let (transact_coordinator, transact_approval_rx) = if runs_bridge {
-            let (coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            let (mut coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            // Same config override as the withdrawal/transfer coordinators: without
+            // it the transact coordinator keeps the 7/10 BFT defaults, so a small
+            // live cohort (devnet 2/2) never reaches a Valid quorum and settlement
+            // silently times out. The on-chain stake-weighted quorum stays the
+            // real security gate.
+            if let (Some(min), Some(total)) = (
+                settings.bridge.consensus_min_validators,
+                settings.bridge.consensus_total_validators,
+            ) {
+                coord.set_consensus_thresholds(min, total);
+            }
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
@@ -2604,6 +2615,50 @@ impl Node {
         // receive its own gossip broadcast, so it stores here to serve scan.
         self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
             .await;
+
+        // The initiator does not receive its own gossip broadcast, so it must
+        // self-verify and submit its own vote (registering self into the
+        // validator set first so it is non-empty) — the withdrawal/transfer
+        // twins do the same. Without it a 2-node cohort only ever collects the
+        // remote vote and never reaches the quorum. Still one vote toward the
+        // BFT threshold, not a bypass of it.
+        {
+            let self_id = self.node_info.id.clone();
+            let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
+            coordinator
+                .register_validator_with_wallet(self_id.clone(), wallet)
+                .await;
+            let vote = match self.verify_transact_proof(&request).await {
+                Ok(true) => {
+                    cache_verified(
+                        &self.verified_transacts,
+                        request_id.clone(),
+                        request.clone(),
+                    )
+                    .await;
+                    crate::consensus::vote_tally::VerificationVote::Valid
+                }
+                Ok(false) => crate::consensus::vote_tally::VerificationVote::Invalid {
+                    reason: "self-verify: proof verification failed".to_string(),
+                },
+                Err(e) => crate::consensus::vote_tally::VerificationVote::Invalid {
+                    reason: format!("self-verify error: {e}"),
+                },
+            };
+            let result = crate::consensus::TransactVerificationResult {
+                request_id: request_id.clone(),
+                validator: self_id,
+                vote,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            if let Err(e) = coordinator.submit_result(result).await {
+                log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+            }
+        }
+
         self.network
             .send_message(
                 NodeId(vec![]),
