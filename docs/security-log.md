@@ -10,6 +10,25 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Validator stake is locked for an unbonding period, not instantly
+  refundable** (in-house security audit). Validator registration is
+  permissionless at the minimum stake, and `unregister_validator` returned the
+  full stake immediately with no lockup — so the Sybil resistance the
+  stake-weighted quorum relies on (controlling a supermajority of stake being
+  expensive) cost almost nothing: a party could register validators, use them
+  to co-sign a settlement, and reclaim the stake in the very next transaction,
+  never leaving it at risk. Unregistering (and a slash that deactivates a
+  validator) now stop it counting toward the quorum immediately but withhold
+  the staked lamports for an unbonding window (~1 day), released only by a new
+  `withdraw_unbonded_stake` instruction after the delay — so the stake stays
+  locked and slashable through the window in which any misbehavior it co-signed
+  can be proven. A deactivating slash routes the unslashed remainder into the
+  same unbonding path so honest residual capital is not stranded. This closes
+  the "free to weaponize" property; evidence-based automatic slashing of an
+  equivocating co-signer is a tracked follow-up, with the admin slash remaining
+  the interim backstop (now meaningful because the stake is still reachable).
+  Devnet, pre-mainnet (PR #375).
+
 - **The settlement quorum is an independent, consistent factor** (in-house
   security audit). The on-chain validator quorum counted any active validator
   PDA that co-signed, weighted by stake, against the registry's recorded total
