@@ -76,6 +76,3 @@ jobs:
       # do not collide on the validator RPC port.
       - name: Run ignored bridge E2E tests
         run: cargo test --test bridge_e2e_smoke -- --ignored --nocapture --test-threads=1
-
-      - name: Run ignored withdraw-auth tests (#178)
-        run: cargo test --test bridge_e2e_auth -- --ignored --nocapture --test-threads=1

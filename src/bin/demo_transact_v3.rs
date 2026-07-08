@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // filled_subtrees[32][32] starts at offset disc(8)+next_index(8)+root_index(8)+root(32)=56.
     let mut path: Vec<[u8; 32]> = Vec::with_capacity(TX_LEVELS);
+    #[allow(clippy::needless_range_loop)]
     for level in 0..TX_LEVELS {
         let sib = if (leaf_index >> level) & 1 == 1 {
             let off = 56 + level * 32;
@@ -214,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("      node-path verify: {r:?}");
         // Where do they differ? public_amount is the prime suspect.
-        let node_pa = -Fr::from((ext_amount.unsigned_abs()) as u64);
+        let node_pa = -Fr::from(ext_amount.unsigned_abs());
         println!(
             "      public_amount circuit={} node={} eq={}",
             hex::encode(fr_to_le(&public_amount)),

@@ -9,7 +9,7 @@
 //! through the program-owned-tree `transact` instruction (which requires a v3
 //! Groth16 proof and a validator co-sign quorum), and SPL support was dropped
 //! for now (native-only). Re-expressing the relayer's two legs over `transact`
-//! + `deposit_note` is a follow-up; until then this submitter's on-chain legs
+//! and `deposit_note` is a follow-up; until then this submitter's on-chain legs
 //! return a clear error rather than building instructions that no longer exist
 //! on-chain. The struct and constructor are retained so the `private_swap_demo`
 //! binary and the mock-tested orchestration layer keep compiling.
