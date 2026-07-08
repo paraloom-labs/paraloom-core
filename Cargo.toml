@@ -111,6 +111,10 @@ name = "register-validator"
 path = "src/bin/register_validator.rs"
 
 [[bin]]
+name = "reconcile-validators"
+path = "src/bin/reconcile_validators.rs"
+
+[[bin]]
 name = "private-swap-demo"
 path = "src/bin/private_swap_demo.rs"
 
