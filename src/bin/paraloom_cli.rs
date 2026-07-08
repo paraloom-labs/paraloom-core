@@ -624,162 +624,20 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             keypair,
             program_id,
         } => {
-            println!("Withdrawing {} SOL to {}...\n", amount, to);
-
-            #[cfg(feature = "solana-bridge")]
-            {
-                // Get RPC URL
-                let rpc_url = rpc_url
-                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
-
-                // Get keypair path
-                let keypair_path = keypair
-                    .or_else(|| std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH").ok().map(PathBuf::from))
-                    .context("Authority keypair not specified. Use --keypair or BRIDGE_AUTHORITY_KEYPAIR_PATH")?;
-
-                // Get program ID
-                let program_id_str = program_id
-                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .context(
-                        "Bridge program ID not specified. Use --program-id or SOLANA_PROGRAM_ID",
-                    )?;
-
-                println!("RPC URL: {}", rpc_url);
-                println!("Program ID: {}", program_id_str);
-                println!("Authority Keypair: {}\n", keypair_path.display());
-
-                // Parse program ID
-                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
-
-                // Load authority keypair
-                println!("Loading authority keypair...");
-                let authority =
-                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
-                        .context("Failed to load keypair")?;
-                println!("Authority Address: {}\n", authority.pubkey());
-
-                // Create RPC client
-                println!("Connecting to Solana...");
-                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-
-                // Check authority balance
-                let balance = client
-                    .get_balance(&authority.pubkey())
-                    .context("Failed to get balance")?;
-                println!(
-                    "Authority Balance: {} SOL\n",
-                    balance as f64 / LAMPORTS_PER_SOL as f64
-                );
-
-                // Derive bridge vault PDA
-                let (bridge_vault, _vault_bump) = derive_bridge_vault(&program_id);
-                println!("Bridge Vault PDA: {}\n", bridge_vault);
-
-                // Check vault balance
-                let vault_balance = client
-                    .get_balance(&bridge_vault)
-                    .context("Failed to get vault balance")?;
-                println!(
-                    "Bridge Vault Balance: {} SOL\n",
-                    vault_balance as f64 / LAMPORTS_PER_SOL as f64
-                );
-
-                let withdrawal_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
-                if vault_balance < withdrawal_lamports {
-                    anyhow::bail!(
-                        "Insufficient vault balance. Vault has {} SOL, need {} SOL",
-                        vault_balance as f64 / LAMPORTS_PER_SOL as f64,
-                        amount
-                    );
-                }
-
-                // Parse recipient address
-                let recipient_pubkey =
-                    Pubkey::from_str(&to).context("Invalid recipient address")?;
-                let recipient = recipient_pubkey.to_bytes();
-
-                println!("Recipient Address: {}", recipient_pubkey);
-
-                // Generate withdrawal parameters
-                let nullifier = rand::random::<[u8; 32]>(); // Unique nullifier for this withdrawal
-                let proof = vec![0u8; 128]; // Mock zkSNARK proof (verification skipped in MVP)
-
-                println!("Withdrawal Amount: {} SOL", amount);
-                println!("Nullifier: {}", hex::encode(&nullifier[..8]));
-                println!("Proof length: {} bytes\n", proof.len());
-
-                // Create withdraw instruction. The CLI is a manual flow
-                // tool; production callers compute the expiration_slot
-                // from `getSlot() + bridge_config.withdrawal_expiration_window_slots`.
-                println!("Creating withdraw instruction...");
-                let expiration_slot = u64::MAX;
-                let ix = create_withdraw_instruction(
-                    &program_id,
-                    &authority.pubkey(),
-                    &bridge_vault,
-                    recipient,
-                    nullifier,
-                    withdrawal_lamports,
-                    expiration_slot,
-                    proof,
-                    &[authority.pubkey()], // quorum co-signers (#260)
-                )
-                .context("Failed to create withdraw instruction")?;
-
-                // Get recent blockhash
-                println!("Getting recent blockhash...");
-                let blockhash = client
-                    .get_latest_blockhash()
-                    .context("Failed to get blockhash")?;
-
-                // Create and sign transaction
-                println!("Creating and signing transaction...");
-                let tx = Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&authority.pubkey()),
-                    &[&authority],
-                    blockhash,
-                );
-
-                // Send transaction
-                println!("Sending transaction...");
-                let signature = client
-                    .send_and_confirm_transaction(&tx)
-                    .context("Failed to send transaction")?;
-
-                println!("\n[OK] Withdrawal successful!");
-                println!("  Transaction: {}", signature);
-                println!("  Destination: {}", to);
-                println!("  Amount: {} SOL", amount);
-                println!("\nView transaction:");
-                println!("  solana confirm -v {}", signature);
-
-                // Verify balances
-                println!("\nVerifying balances...");
-                let vault_balance_after = client
-                    .get_balance(&bridge_vault)
-                    .context("Failed to get vault balance")?;
-                let recipient_balance = client
-                    .get_balance(&recipient_pubkey)
-                    .context("Failed to get recipient balance")?;
-
-                println!(
-                    "  Bridge Vault Balance (after): {} SOL",
-                    vault_balance_after as f64 / LAMPORTS_PER_SOL as f64
-                );
-                println!(
-                    "  Recipient Balance: {} SOL",
-                    recipient_balance as f64 / LAMPORTS_PER_SOL as f64
-                );
-            }
-
-            #[cfg(not(feature = "solana-bridge"))]
-            {
-                anyhow::bail!("Solana bridge feature not enabled");
-            }
-
-            Ok(())
+            // The legacy single-key `withdraw` instruction (and its mock-proof
+            // CLI flow) was removed with the off-chain-root shielded path.
+            // Native withdrawals now settle through the v3 `transact`
+            // instruction, which requires a real Groth16 proof and a validator
+            // co-sign quorum — driven by the wallet + the node's transact
+            // ingress, not this manual CLI.
+            let _ = (&rpc_url, &keypair, &program_id);
+            anyhow::bail!(
+                "`wallet withdraw` for {} SOL to {} is no longer settled by this CLI: native \
+                 withdrawals now go through the v3 shielded `transact` flow (real proof + \
+                 validator co-sign quorum). Use the Paraloom wallet, which drives that flow.",
+                amount,
+                to
+            );
         }
 
         WalletCommands::Balance {

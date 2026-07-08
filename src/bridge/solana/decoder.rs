@@ -326,9 +326,9 @@ mod tests {
         let depositor = Pubkey::new_unique();
         let account_keys = vec![program_id, program_id, depositor, program_id];
 
-        // Build a buffer that targets the program but starts with the
-        // withdraw discriminator instead.
-        let mut bytes = discriminators::WITHDRAW.to_vec();
+        // Build a buffer that targets the program but starts with a
+        // non-deposit discriminator instead.
+        let mut bytes = discriminators::SET_BRIDGE_AUTHORITY.to_vec();
         bytes.extend_from_slice(&[0u8; 16]);
         let ix = make_compiled_ix(3, 2, bs58::encode(bytes).into_string());
 

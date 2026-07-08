@@ -37,20 +37,11 @@ pub const MAX_COSIGN_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// handler can match it against the right pending-approval set before signing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettlementKind {
-    /// A `withdraw` settlement (funds leave the bridge vault).
-    Withdrawal,
-    /// A `shielded_transfer` settlement (nullify-and-re-commit, no funds move).
-    Transfer,
-    /// An `update_merkle_root` settlement (#260): publish the live pool root
-    /// on-chain under the validator quorum so a subsequent withdraw verifies
-    /// against it. Moves no funds; a co-signer signs only after confirming the
-    /// proposed root is one its own pool computed.
-    UpdateMerkleRoot,
     /// A v3 `transact` settlement (#350): unified 2-in/2-out spend against the
     /// program's on-chain incremental tree, covering both a withdrawal
     /// (`ext_amount < 0`) and a pure shielded transfer (`ext_amount == 0`).
-    /// Appended last so the bincode variant indices of the existing kinds stay
-    /// wire-stable across a rolling upgrade.
+    /// This is the sole settlement kind — the legacy off-chain-root
+    /// `Withdrawal` / `Transfer` / `UpdateMerkleRoot` kinds were removed.
     Transact,
 }
 
@@ -215,7 +206,7 @@ mod tests {
     fn cosign_request_round_trips_through_bincode() {
         let request = CoSignRequest {
             request_id: "round-42".to_string(),
-            kind: SettlementKind::Withdrawal,
+            kind: SettlementKind::Transact,
             message: vec![0x01, 0x02, 0x03, 0x04],
         };
         let encoded = bincode::serialize(&request).expect("serialize");
@@ -253,23 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn settlement_kind_round_trips_all_variants_with_stable_wire_indices() {
-        // The bincode u32 variant tag IS the wire encoding, so the existing
-        // kinds' indices must never shift — new kinds are appended last.
-        for (kind, index) in [
-            (SettlementKind::Withdrawal, 0u32),
-            (SettlementKind::Transfer, 1),
-            (SettlementKind::UpdateMerkleRoot, 2),
-            (SettlementKind::Transact, 3),
-        ] {
-            let encoded = bincode::serialize(&kind).expect("serialize");
-            assert_eq!(
-                encoded,
-                index.to_le_bytes().to_vec(),
-                "wire index for {kind:?} shifted"
-            );
-            let decoded: SettlementKind = bincode::deserialize(&encoded).expect("deserialize");
-            assert_eq!(decoded, kind);
-        }
+    fn settlement_kind_transact_round_trips() {
+        let kind = SettlementKind::Transact;
+        let encoded = bincode::serialize(&kind).expect("serialize");
+        let decoded: SettlementKind = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(decoded, kind);
     }
 }

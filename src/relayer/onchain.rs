@@ -1,48 +1,24 @@
-//! Production [`Submitter`] for the private-swap relayer (#240): settles the
-//! withdraw-to-fresh and re-deposit-from-fresh legs as real on-chain
-//! transactions, branching native vs. SPL on the [`WithdrawLeg`].
+//! Production [`Submitter`] for the private-swap relayer (#240).
 //!
-//! # Who signs what
+//! # Status: pending v3 rework
 //!
-//! The two legs are signed by different keys, and that split is the point:
-//!
-//! * **Withdraw leg** — signed by the bridge **authority** (the settlement
-//!   key), exactly like [`crate::bin`]'s `demo_flow`. The on-chain `withdraw` /
-//!   `withdraw_spl` are `has_one = authority` and credit the validator fee to
-//!   the authority's validator account, so the authority must be a registered
-//!   validator. Value lands at the fresh ephemeral address (native: its system
-//!   account; SPL: its associated token account, created idempotently here).
-//! * **Deposit-from-fresh leg** — signed by the per-swap **ephemeral** keypair,
-//!   because on-chain `deposit` / `deposit_spl` require the depositor (the
-//!   funds' owner) to sign, and after the swap that owner is the fresh address.
-//!   The relayer threads that keypair in through
-//!   [`Submitter::submit_deposit_from_fresh`].
-//!
-//! No key is shared between the user's original deposit and these legs, so the
-//! on-chain trace never ties the user to the swap — the relayer-layer
-//! expression of the withdrawal nullifier's link-severing.
-//!
-//! # Honest scope
-//!
-//! `RpcClient` is blocking, so every call is run on a blocking thread. This
-//! submitter needs a live validator and a registered-validator authority key;
-//! it is exercised end to end by the `private_swap_demo` binary against a
-//! localnet (mainnet-fork for the swap leg), not in CI.
+//! This submitter previously settled the withdraw-to-fresh and
+//! re-deposit-from-fresh legs through the legacy off-chain-root `withdraw` /
+//! `withdraw_spl` / `deposit_spl` instructions. Those instructions were removed
+//! with the off-chain-root shielded path — all shielded settlement now goes
+//! through the program-owned-tree `transact` instruction (which requires a v3
+//! Groth16 proof and a validator co-sign quorum), and SPL support was dropped
+//! for now (native-only). Re-expressing the relayer's two legs over `transact`
+//! + `deposit_note` is a follow-up; until then this submitter's on-chain legs
+//! return a clear error rather than building instructions that no longer exist
+//! on-chain. The struct and constructor are retained so the `private_swap_demo`
+//! binary and the mock-tested orchestration layer keep compiling.
 
-use crate::bridge::solana::{
-    create_associated_token_account_idempotent_instruction, create_deposit_instruction,
-    create_deposit_spl_instruction, create_withdraw_instruction, create_withdraw_spl_instruction,
-    derive_associated_token_address, derive_bridge_vault,
-};
 use crate::privacy::types::{Nullifier, ShieldedAddress};
 use crate::relayer::private_swap::{RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg};
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    instruction::Instruction,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::Transaction,
 };
 use std::sync::Arc;
 
@@ -78,53 +54,16 @@ impl OnChainSubmitter {
         }
     }
 
-    fn client(&self) -> RpcClient {
-        RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::confirmed())
-    }
-
-    /// Sign `instructions` with `signers` (payer first) and send+confirm, off
-    /// the async runtime. Returns the transaction signature string.
-    async fn send(
-        &self,
-        instructions: Vec<Instruction>,
-        signers: Vec<Arc<Keypair>>,
-    ) -> Result<String> {
-        let rpc_url = self.rpc_url.clone();
-        tokio::task::spawn_blocking(move || {
-            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-            let payer = signers[0].pubkey();
-            let blockhash = client
-                .get_latest_blockhash()
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
-            let signer_refs: Vec<&Keypair> = signers.iter().map(|s| s.as_ref()).collect();
-            let tx = Transaction::new_signed_with_payer(
-                &instructions,
-                Some(&payer),
-                &signer_refs,
-                blockhash,
-            );
-            client
-                .send_and_confirm_transaction(&tx)
-                .map(|sig| sig.to_string())
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))
-        })
-        .await
-        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
-    }
-
-    /// Current slot + the configured window, the `expiration_slot` the on-chain
-    /// withdraw enforces.
-    async fn expiration_slot(&self) -> Result<u64> {
-        let client = self.client();
-        let window = self.expiration_window_slots;
-        tokio::task::spawn_blocking(move || {
-            client
-                .get_slot()
-                .map(|slot| slot + window)
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))
-        })
-        .await
-        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    /// Error returned by both on-chain legs while the relayer awaits its v3
+    /// rework. References the retained config so the fields are not dead.
+    fn pending_v3(&self) -> RelayerError {
+        RelayerError::SubmissionFailed(format!(
+            "on-chain relayer legs were removed with the off-chain-root shielded path \
+             (program {}, rpc {}, expiration window {} slots); the private-swap relayer \
+             must be re-expressed over the v3 transact + deposit_note flow before it can \
+             settle on-chain",
+            self.program_id, self.rpc_url, self.expiration_window_slots
+        ))
     }
 }
 
@@ -132,127 +71,24 @@ impl OnChainSubmitter {
 impl Submitter for OnChainSubmitter {
     async fn submit_withdraw_to_fresh(
         &self,
-        leg: WithdrawLeg,
-        nullifier: Nullifier,
-        amount: u64,
-        fresh_address: [u8; 32],
-        proof: Vec<u8>,
+        _leg: WithdrawLeg,
+        _nullifier: Nullifier,
+        _amount: u64,
+        _fresh_address: [u8; 32],
+        _proof: Vec<u8>,
     ) -> Result<SubmittedLeg> {
-        let expiration_slot = self.expiration_slot().await?;
-        let fresh = Pubkey::new_from_array(fresh_address);
-        let nullifier_bytes = *nullifier.as_bytes();
-
-        // The prover hands us the arkworks-compressed proof; the on-chain
-        // verifier expects the 256-byte alt_bn128 wire form. Convert at this
-        // submission boundary (#249).
-        let proof = crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&proof)
-            .map_err(|e| RelayerError::SubmissionFailed(format!("proof encoding: {e}")))?
-            .to_vec();
-
-        let signature = match leg {
-            WithdrawLeg::Native => {
-                let (bridge_vault, _) = derive_bridge_vault(&self.program_id);
-                let ix = create_withdraw_instruction(
-                    &self.program_id,
-                    &self.authority.pubkey(),
-                    &bridge_vault,
-                    fresh_address,
-                    nullifier_bytes,
-                    amount,
-                    expiration_slot,
-                    proof,
-                    &[self.authority.pubkey()], // quorum co-signers (#260)
-                )
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
-                self.send(vec![ix], vec![self.authority.clone()]).await?
-            }
-            WithdrawLeg::Spl(mint_bytes) => {
-                let mint = Pubkey::new_from_array(mint_bytes);
-                // Ensure the fresh address has an ATA to receive into; the
-                // authority pays the rent. Idempotent, so a pre-existing ATA is
-                // fine.
-                let create_ata = create_associated_token_account_idempotent_instruction(
-                    &self.authority.pubkey(),
-                    &fresh,
-                    &mint,
-                );
-                let recipient_token = derive_associated_token_address(&fresh, &mint);
-                let withdraw = create_withdraw_spl_instruction(
-                    &self.program_id,
-                    &self.authority.pubkey(),
-                    &mint,
-                    &recipient_token,
-                    nullifier_bytes,
-                    amount,
-                    expiration_slot,
-                    proof,
-                    // Quorum co-signers (#260); the node-side round that gathers
-                    // the full validator quorum into the tx is the next step.
-                    &[self.authority.pubkey()],
-                )
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
-                self.send(vec![create_ata, withdraw], vec![self.authority.clone()])
-                    .await?
-            }
-        };
-
-        Ok(SubmittedLeg {
-            leg,
-            amount,
-            fresh_address,
-            signature,
-        })
+        let _ = self.authority.pubkey();
+        Err(self.pending_v3())
     }
 
     async fn submit_deposit_from_fresh(
         &self,
-        leg: WithdrawLeg,
-        amount: u64,
-        signer: &Keypair,
-        recipient: ShieldedAddress,
-        randomness: [u8; 32],
+        _leg: WithdrawLeg,
+        _amount: u64,
+        _signer: &Keypair,
+        _recipient: ShieldedAddress,
+        _randomness: [u8; 32],
     ) -> Result<SubmittedLeg> {
-        let fresh_address = signer.pubkey().to_bytes();
-        // The ephemeral key signs (and pays) — it owns the post-swap funds.
-        let ephemeral = Arc::new(signer.insecure_clone());
-        let recipient_bytes = *recipient.as_bytes();
-
-        let signature = match leg {
-            WithdrawLeg::Native => {
-                let (bridge_vault, _) = derive_bridge_vault(&self.program_id);
-                let ix = create_deposit_instruction(
-                    &self.program_id,
-                    &signer.pubkey(),
-                    &bridge_vault,
-                    amount,
-                    recipient_bytes,
-                    randomness,
-                )
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
-                self.send(vec![ix], vec![ephemeral]).await?
-            }
-            WithdrawLeg::Spl(mint_bytes) => {
-                let mint = Pubkey::new_from_array(mint_bytes);
-                let depositor_token = derive_associated_token_address(&signer.pubkey(), &mint);
-                let ix = create_deposit_spl_instruction(
-                    &self.program_id,
-                    &signer.pubkey(),
-                    &mint,
-                    &depositor_token,
-                    amount,
-                    recipient_bytes,
-                    randomness,
-                )
-                .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
-                self.send(vec![ix], vec![ephemeral]).await?
-            }
-        };
-
-        Ok(SubmittedLeg {
-            leg,
-            amount,
-            fresh_address,
-            signature,
-        })
+        Err(self.pending_v3())
     }
 }

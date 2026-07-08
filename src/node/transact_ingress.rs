@@ -37,7 +37,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::consensus::transact::TransactVerificationRequest;
 use crate::node::ingress_auth::{check_bearer, IngressToken};
-use crate::node::transfer_ingress::DeliveredNote;
+
+/// A delivered encrypted output note (#196): the output commitment and the
+/// opaque hex ciphertext (`EncryptedNote`) a recipient trial-decrypts. (Moved
+/// here from the retired `transfer_ingress` module.)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeliveredNote {
+    pub output_commitment: String,
+    pub ciphertext: String,
+}
 
 /// The capabilities the ingress needs: hand a transact to the consensus mesh,
 /// and serve the encrypted notes delivered so far for recipients to scan.

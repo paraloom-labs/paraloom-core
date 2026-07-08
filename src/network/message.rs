@@ -74,27 +74,10 @@ pub enum Message {
         is_spent: bool,
     },
 
-    // Consensus-related messages
-    /// Withdrawal verification request (broadcast to all validators)
-    WithdrawalVerificationRequest {
-        request: crate::consensus::withdrawal::WithdrawalVerificationRequest,
-    },
-
-    /// Withdrawal verification result (validator -> coordinator)
-    WithdrawalVerificationResult {
-        result: crate::consensus::withdrawal::WithdrawalVerificationResult,
-    },
-
-    /// Transfer verification request (broadcast to all validators, #194)
-    TransferVerificationRequest {
-        request: crate::consensus::transfer::TransferVerificationRequest,
-    },
-
-    /// Transfer verification result (validator -> coordinator, #194)
-    TransferVerificationResult {
-        result: crate::consensus::transfer::TransferVerificationResult,
-    },
-
+    // Consensus-related messages. The legacy off-chain-root
+    // `Withdrawal`/`Transfer` verification messages were removed; the surviving
+    // consensus flow is the unified `Transact` (appended at the end of the enum
+    // to keep the bincode variant indices of the other messages stable).
     /// Validator registration announcement
     ValidatorRegistration {
         validator_id: crate::types::NodeId,
