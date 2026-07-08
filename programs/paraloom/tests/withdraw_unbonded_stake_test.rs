@@ -274,3 +274,154 @@ async fn stake_unbonds_then_withdraws_after_delay() {
         "second withdraw must fail with NothingUnbonding"
     );
 }
+
+/// Regression (audit fix B1): `deactivate_validator` must no longer strand the
+/// stake. A deactivated validator cannot `unregister` (that path requires
+/// `is_active`), so before the fix its lamports had no exit and were frozen
+/// forever. The fix routes `stake_amount` into the unbonding window, so the
+/// stake is reclaimable via `withdraw_unbonded_stake` after the delay — exactly
+/// like `unregister`. This proves the full exit: deactivate (admin-signed) moves
+/// the stake to unbonding and drops the registry counters, then a post-window
+/// withdraw credits the wallet and clears the unbonding balance.
+#[tokio::test]
+async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let mut ctx = pt.start_with_context().await;
+
+    // `ctx.payer` doubles as the validator wallet (self-signs register +
+    // withdraw); `upgrade_authority` is the registry authority that deactivates.
+    let validator = ctx.payer.insecure_clone();
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    // 1. Registry init (upgrade authority, #204).
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("init registry");
+
+    // 2. Register — PDA holds the stake, registry counts it.
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: validator.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("register");
+
+    // 3. Deactivate — admin-signed (the registry authority). Routes the stake
+    //    into unbonding instead of stranding it.
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivate");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active, "deactivate must clear is_active");
+    assert_eq!(acc.stake_amount, 0, "active stake zeroed on deactivate");
+    assert_eq!(
+        acc.unbonding_amount, MIN_VALIDATOR_STAKE,
+        "the full stake must be routed into unbonding, not stranded"
+    );
+    assert!(
+        acc.unbonding_slot >= UNBONDING_SLOTS,
+        "unbonding_slot = deactivation-era slot + UNBONDING_SLOTS"
+    );
+
+    // Registry counters dropped as the validator left the active set.
+    let registry_raw = ctx
+        .banks_client
+        .get_account(registry_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = ValidatorRegistry::try_deserialize(&mut registry_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        registry.active_validators, 0,
+        "deactivate must decrement active_validators"
+    );
+    assert_eq!(
+        registry.total_active_stake, 0,
+        "deactivate must remove the stake from the weighted total"
+    );
+
+    // 4. Warp past the unbonding window and withdraw — this is the key proof
+    //    that a deactivated validator's stake is no longer stranded.
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    let wallet_before = balance(&mut ctx, validator.pubkey()).await;
+    let pda_before = balance(&mut ctx, validator_pda).await;
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::WithdrawUnbondedStake {}.data(),
+            accounts: accounts::WithdrawUnbondedStake {
+                validator_account: validator_pda,
+                validator: validator.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivated validator must be able to withdraw its unbonded stake");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert_eq!(acc.unbonding_amount, 0, "unbonding cleared after withdraw");
+
+    let wallet_after = balance(&mut ctx, validator.pubkey()).await;
+    let pda_after = balance(&mut ctx, validator_pda).await;
+    assert_eq!(
+        pda_before - pda_after,
+        MIN_VALIDATOR_STAKE,
+        "PDA debited by exactly the unbonded stake"
+    );
+    assert!(
+        wallet_after > wallet_before,
+        "wallet credited by the released stake"
+    );
+}

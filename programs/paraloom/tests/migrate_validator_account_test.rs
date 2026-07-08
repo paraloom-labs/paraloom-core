@@ -14,17 +14,34 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{Discriminator, InstructionData, Space, ToAccountMetas};
-use paraloom_program::{accounts, instruction, ValidatorAccount};
-use solana_program_test::{processor, tokio, ProgramTest, ProgramTestBanksClientExt};
+use paraloom_program::{
+    accounts, instruction, ValidatorAccount, MIN_VALIDATOR_STAKE, UNBONDING_SLOTS,
+};
+use solana_program_test::{
+    processor, tokio, BanksClientError, ProgramTest, ProgramTestBanksClientExt, ProgramTestContext,
+};
 use solana_sdk::{
     account::Account,
     instruction::Instruction,
+    rent::Rent,
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
 
 mod common;
 use common::{add_program_data, entry};
+
+/// Send `ix` signed by `signer` (also the fee payer) on a fresh blockhash.
+async fn send(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    ix: Instruction,
+) -> std::result::Result<(), BanksClientError> {
+    let blockhash = ctx.get_new_latest_blockhash().await.expect("new blockhash");
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&signer.pubkey()));
+    tx.sign(&[signer], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
 
 #[tokio::test]
 async fn migrate_grows_legacy_validator_account() {
@@ -116,4 +133,208 @@ async fn migrate_grows_legacy_validator_account() {
         .unwrap()
         .unwrap();
     assert_eq!(raw2.data.len(), new_len, "size unchanged on re-migrate");
+}
+
+/// Regression (audit fix B2): migrating a STAKED legacy PDA must top up the
+/// incremental rent so the stake stays fully withdrawable. The old
+/// `min_balance(new_len) > current` guard never fired on a staked PDA (the
+/// stake dwarfs the ~111k-lamport rent delta), so the account was left funded
+/// only to the OLD rent floor once the stake was withdrawn — reverting a later
+/// `withdraw_unbonded_stake` for dropping below rent-exemption. The fix adds the
+/// `rent(129) - rent(113)` delta unconditionally.
+///
+/// This builds a raw legacy-layout (113-byte) STAKED account (is_active=true,
+/// stake_amount=MIN, lamports = rent(113) + MIN), migrates it, confirms the rent
+/// top-up, then drives the stake through unbonding (deactivate) and asserts the
+/// post-window `withdraw_unbonded_stake` SUCCEEDS leaving the PDA rent-exempt at
+/// the NEW 129-byte floor.
+#[tokio::test]
+async fn migrate_staked_legacy_account_stays_withdrawable() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let new_len = 8 + ValidatorAccount::INIT_SPACE; // 129
+    let legacy_len = new_len - 16; // 113 (no unbonding fields yet)
+
+    // The validator wallet the legacy PDA belongs to. It must self-sign the
+    // eventual withdraw, so seed it as a funded system account.
+    let validator = Keypair::new();
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    // Build the raw legacy STAKED body. Old 113-byte account = 8-byte
+    // discriminator + 105-byte body with NO unbonding fields. Field offsets
+    // within the discriminator-prefixed account: validator [8..40],
+    // stake_amount [40..48], is_active [88].
+    let mut data = ValidatorAccount::DISCRIMINATOR.to_vec();
+    data.resize(legacy_len, 0);
+    data[8..40].copy_from_slice(validator.pubkey().as_ref());
+    data[40..48].copy_from_slice(&MIN_VALIDATOR_STAKE.to_le_bytes());
+    data[88] = 1; // is_active = true
+
+    let rent_legacy = Rent::default().minimum_balance(legacy_len);
+    let rent_new = Rent::default().minimum_balance(new_len);
+    let expected_delta = rent_new - rent_legacy; // 111_360 for the default rent
+
+    // A real staked legacy PDA holds exactly its old rent floor + the stake.
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: rent_legacy + MIN_VALIDATOR_STAKE,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    // Fund the validator wallet so it can pay the withdraw fee.
+    pt.add_account(
+        validator.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+
+    // Registry init (needed for deactivate).
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("init registry");
+
+    // Migrate the staked legacy PDA.
+    let pda_before_migrate = ctx
+        .banks_client
+        .get_balance(validator_pda)
+        .await
+        .expect("balance");
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::MigrateValidatorAccount {
+                _validator: validator.pubkey(),
+            }
+            .data(),
+            accounts: accounts::MigrateValidatorAccount {
+                validator_account: validator_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("migrate staked legacy account");
+
+    let raw = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw.data.len(), new_len, "account grown to current layout");
+    // The incremental rent for the 16 added bytes was topped up (the whole point
+    // of the fix), so the PDA holds the stake ON TOP OF the new rent floor.
+    assert_eq!(
+        raw.lamports - pda_before_migrate,
+        expected_delta,
+        "migrate must add exactly the incremental rent delta"
+    );
+    assert_eq!(
+        expected_delta, 111_360,
+        "rent(129) - rent(113) under default rent"
+    );
+    assert!(
+        raw.lamports >= rent_new + MIN_VALIDATOR_STAKE,
+        "staked PDA must be rent-exempt at the new floor with the stake intact"
+    );
+    let acc = ValidatorAccount::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert!(acc.is_active, "migration preserves the staked/active body");
+    assert_eq!(acc.stake_amount, MIN_VALIDATOR_STAKE);
+    assert_eq!(acc.unbonding_amount, 0);
+
+    // Drive the stake into unbonding via deactivate (admin-signed), then withdraw
+    // after the window. This is what would revert pre-fix: a PDA left at the old
+    // rent floor drops below rent-exemption when the stake is withdrawn.
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivate");
+
+    let raw = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(acc.unbonding_amount, MIN_VALIDATOR_STAKE);
+    assert!(acc.unbonding_slot >= UNBONDING_SLOTS);
+
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp past unbonding window");
+
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::WithdrawUnbondedStake {}.data(),
+            accounts: accounts::WithdrawUnbondedStake {
+                validator_account: validator_pda,
+                validator: validator.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("withdraw must SUCCEED on a rent-topped-up migrated staked PDA");
+
+    let raw = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .expect("PDA still exists (rent-exempt, not reclaimed)");
+    let acc = ValidatorAccount::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(acc.unbonding_amount, 0, "unbonding cleared after withdraw");
+    assert!(
+        raw.lamports >= rent_new,
+        "PDA must remain rent-exempt at the new floor after withdrawing the stake"
+    );
 }
