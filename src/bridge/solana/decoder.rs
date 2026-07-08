@@ -15,9 +15,10 @@ use solana_transaction_status::{
     UiTransactionEncoding,
 };
 
-/// Account-index position of the depositor (signer) in a deposit
-/// instruction's account list. Must match the account ordering produced
-/// by `create_deposit_instruction` in the sister module.
+/// Account-index position of the depositor (signer) in a legacy deposit
+/// instruction's account list `[bridge_state, bridge_vault, depositor,
+/// system_program]`. The legacy off-chain-root `deposit` builder was removed,
+/// but this decoder still reads historical deposits from that layout.
 const DEPOSITOR_ACCOUNT_INDEX: usize = 2;
 
 /// Recommended encoding to request from `getTransaction` for the

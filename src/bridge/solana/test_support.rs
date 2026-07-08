@@ -66,7 +66,7 @@ fn take<T>(slot: &Mutex<Option<Result<T>>>, label: &'static str) -> Result<T> {
 /// shaped like what `getTransaction` returns for a real Paraloom
 /// deposit. Used by listener tests that need to drive
 /// `extract_deposit_events` end to end without booting a validator.
-/// Account ordering matches `create_deposit_instruction`'s account
+/// Account ordering matches the legacy deposit instruction's account
 /// metas: `[bridge_state, bridge_vault, depositor, system_program,
 /// program]` (program is at index 4 so the program-id-index in the
 /// instruction lands there, with `depositor` at index 2 to match

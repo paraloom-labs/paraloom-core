@@ -14,7 +14,7 @@ mod test_support;
 pub use cosign_assembly::{assemble_transaction, gather_signatures};
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
-    create_deposit_instruction, create_deposit_note_instruction, create_initialize_instruction,
+    create_deposit_note_instruction, create_initialize_instruction,
     create_initialize_merkle_tree_instruction, create_initialize_validator_registry_instruction,
     create_register_validator_instruction, create_reset_validator_registry_instruction,
     create_set_bridge_authority_instruction, create_transact_instruction, derive_asset_vault,

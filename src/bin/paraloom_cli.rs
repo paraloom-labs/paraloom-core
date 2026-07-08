@@ -27,7 +27,13 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[cfg(feature = "solana-bridge")]
+use ark_bn254::Fr;
+#[cfg(feature = "solana-bridge")]
+use ark_ff::{BigInteger, PrimeField};
+#[cfg(feature = "solana-bridge")]
 use paraloom::bridge::solana::*;
+#[cfg(feature = "solana-bridge")]
+use paraloom::privacy::poseidon_circom::v3_pubkey;
 #[cfg(feature = "solana-bridge")]
 use solana_client::rpc_client::RpcClient;
 #[cfg(feature = "solana-bridge")]
@@ -479,28 +485,47 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 let (bridge_vault, _vault_bump) = derive_bridge_vault(&program_id);
                 println!("Bridge Vault PDA: {}\n", bridge_vault);
 
-                // Generate deposit parameters
-                let recipient = rand::random::<[u8; 32]>(); // Random recipient address in privacy pool
-                let randomness = rand::random::<[u8; 32]>(); // Random blinding factor
+                // Generate a fresh v3 note: a spend secret key + blinding. The
+                // program computes and appends the note commitment
+                // Poseidon(amount, pubkey, blinding, asset) on-chain
+                // (`deposit_note`, #350); the legacy off-chain-root `deposit`
+                // handler was removed.
+                let fr_to_le = |f: &Fr| -> [u8; 32] {
+                    let mut out = [0u8; 32];
+                    let le = f.into_bigint().to_bytes_le();
+                    out[..le.len().min(32)].copy_from_slice(&le[..le.len().min(32)]);
+                    out
+                };
+                let note_sk = Fr::from_le_bytes_mod_order(&rand::random::<[u8; 32]>());
+                let note_blinding = Fr::from_le_bytes_mod_order(&rand::random::<[u8; 32]>());
+                let note_pubkey = v3_pubkey(note_sk);
+                let pubkey_bytes = fr_to_le(&note_pubkey);
+                let blinding_bytes = fr_to_le(&note_blinding);
 
                 println!("Deposit Amount: {} SOL", amount);
+                println!("Note pubkey: {}", hex::encode(pubkey_bytes));
+                // The spend key + blinding are the ONLY way to spend this note
+                // later. This CLI does not persist them, so record them now.
                 println!(
-                    "Recipient (privacy address): {}",
-                    hex::encode(&recipient[..8])
+                    "Note spend key (SAVE THIS): {}",
+                    hex::encode(fr_to_le(&note_sk))
                 );
-                println!("Randomness: {}\n", hex::encode(&randomness[..8]));
+                println!(
+                    "Note blinding  (SAVE THIS): {}\n",
+                    hex::encode(blinding_bytes)
+                );
 
-                // Create deposit instruction
-                println!("Creating deposit instruction...");
-                let ix = create_deposit_instruction(
+                // Create deposit_note instruction
+                println!("Creating deposit_note instruction...");
+                let ix = create_deposit_note_instruction(
                     &program_id,
                     &depositor.pubkey(),
                     &bridge_vault,
                     deposit_lamports,
-                    recipient,
-                    randomness,
+                    pubkey_bytes,
+                    blinding_bytes,
                 )
-                .context("Failed to create deposit instruction")?;
+                .context("Failed to create deposit_note instruction")?;
 
                 // Get recent blockhash
                 println!("Getting recent blockhash...");
@@ -526,10 +551,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 println!("\n[OK] Deposit successful!");
                 println!("  Transaction: {}", signature);
                 println!("  Shielded balance: {} SOL", amount);
-                println!(
-                    "  Shielded address: paraloom1{}",
-                    hex::encode(&recipient[..16])
-                );
+                println!("  Note pubkey: {}", hex::encode(pubkey_bytes));
                 println!("\nView transaction:");
                 println!("  solana confirm -v {}", signature);
             }

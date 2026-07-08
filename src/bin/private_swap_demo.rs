@@ -39,12 +39,13 @@
 //!   JUPITER_BASE_URL         Jupiter v6 base (quote-api.jup.ag/v6).
 
 use ark_bn254::{Bn254, Fr};
-use ark_ff::PrimeField;
+use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand as ark_rand;
 use paraloom::bridge::solana::*;
 use paraloom::privacy::circuits::{Groth16ProofSystem, WithdrawCircuit};
+use paraloom::privacy::poseidon_circom::v3_pubkey;
 use paraloom::privacy::types::{Note, Nullifier, ShieldedAddress};
 use paraloom::relayer::{
     JupiterSwapProvider, OnChainSubmitter, PrivateSwapRelayer, PrivateSwapRequest, RelayerError,
@@ -181,13 +182,28 @@ async fn main() -> anyhow::Result<()> {
     println!("Shielded address:  {}", recipient.to_hex());
     println!("Commitment:        {}", commitment.to_hex());
 
-    let ix_deposit = create_deposit_instruction(
+    // Fund the pool as a v3 note: the program computes and appends the note
+    // commitment Poseidon(amount, pubkey, blinding, asset) on-chain
+    // (`deposit_note`, #350). The legacy off-chain-root `deposit` handler this
+    // demo used to call was removed. The spend key / blinding are seeded from
+    // the same random material as the legacy note above; the withdraw + swap
+    // legs are the separately-tracked v3 relayer rework.
+    let fr_to_le = |f: &Fr| -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let le = f.into_bigint().to_bytes_le();
+        out[..le.len().min(32)].copy_from_slice(&le[..le.len().min(32)]);
+        out
+    };
+    let note_sk = Fr::from_le_bytes_mod_order(&randomness);
+    let note_blinding = Fr::from_le_bytes_mod_order(&recipient_bytes);
+    let note_pubkey = v3_pubkey(note_sk);
+    let ix_deposit = create_deposit_note_instruction(
         &program_id,
         &user.pubkey(),
         &bridge_vault,
         swap_amount,
-        recipient_bytes,
-        randomness,
+        fr_to_le(&note_pubkey),
+        fr_to_le(&note_blinding),
     )?;
     let blockhash = client.get_latest_blockhash()?;
     let deposit_tx = Transaction::new_signed_with_payer(

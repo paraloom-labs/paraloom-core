@@ -53,10 +53,6 @@ name = "bridge-init"
 path = "src/bin/bridge_init.rs"
 
 [[bin]]
-name = "test-deposit"
-path = "src/bin/test_deposit.rs"
-
-[[bin]]
 name = "compute-demo"
 path = "src/bin/compute_demo.rs"
 
@@ -84,10 +80,6 @@ path = "src/bin/compute_poseidon_inputs.rs"
 [[bin]]
 name = "generate-withdrawal-proof"
 path = "src/bin/generate_withdrawal_proof.rs"
-
-[[bin]]
-name = "privacy-deposit"
-path = "src/bin/privacy_deposit.rs"
 
 [[bin]]
 name = "verify-privacy"

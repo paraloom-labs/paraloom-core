@@ -244,42 +244,6 @@ pub fn create_register_validator_instruction(
     })
 }
 
-/// Create deposit instruction
-pub fn create_deposit_instruction(
-    program_id: &Pubkey,
-    depositor: &Pubkey,
-    bridge_vault: &Pubkey,
-    amount: u64,
-    recipient: [u8; 32],
-    randomness: [u8; 32],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-
-    let data = DepositInstructionData {
-        amount,
-        recipient,
-        randomness,
-    };
-
-    let mut instruction_data = discriminators::DEPOSIT.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let system_program_id = SYSTEM_PROGRAM_ID;
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new(*bridge_vault, false),
-            AccountMeta::new(*depositor, true),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
-        data: instruction_data,
-    })
-}
-
 /// Append the quorum co-signers as remaining accounts (#260): each validator's
 /// wallet (a signer) followed by its `ValidatorAccount` PDA. The program
 /// verifies on-chain that a supermajority of registered validators signed.
