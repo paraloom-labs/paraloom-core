@@ -17,11 +17,21 @@ use crate::consensus::leader::{LeaderSelector, ValidatorInfo};
 use crate::consensus::reputation::ReputationTracker;
 use crate::consensus::slashing::SlashingTracker;
 use crate::consensus::vote_tally::{VerificationVote, VoteTally};
-use crate::consensus::withdrawal::{
-    DEFAULT_MIN_REPUTATION_FOR_CONSENSUS, DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
-    DEFAULT_TOTAL_VALIDATORS,
-};
 use crate::types::NodeId;
+
+/// Default minimum registered validators that must approve before a transact
+/// settles (7-of-10 BFT). The actual threshold is configurable per
+/// coordinator; this is the fallback when no override is supplied. (Relocated
+/// here from the retired off-chain-root withdrawal consensus module.)
+pub const DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS: usize = 7;
+
+/// Default validator-set size for the 7-of-10 BFT consensus, used as the
+/// completion-percentage divisor when no override is supplied.
+pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
+
+/// Default reputation floor for consensus participation. A validator below this
+/// may still submit a vote, but the result is computed as if it had not.
+pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

@@ -101,12 +101,13 @@ where
 mod tests {
     use super::*;
 
-    fn withdrawal_params() -> SettlementParams {
-        SettlementParams::Withdrawal {
+    fn transact_params() -> SettlementParams {
+        SettlementParams::Transact {
             recipient: [6u8; 32],
-            amount: 1_000_000_000,
-            nullifier: [7u8; 32],
-            expiration_slot: u64::MAX,
+            nullifiers: [[7u8; 32], [8u8; 32]],
+            output_commitments: [[9u8; 32], [10u8; 32]],
+            root: [11u8; 32],
+            ext_amount: -1_000_000_000,
             proof: vec![0u8; 256],
         }
     }
@@ -142,8 +143,8 @@ mod tests {
             Pubkey::new_from_array([3u8; 32]),
             [4u8; 32],
             "req-1",
-            SettlementKind::Withdrawal,
-            withdrawal_params(),
+            SettlementKind::Transact,
+            transact_params(),
             quorum_wallets,
             &peers,
             3,
@@ -184,8 +185,8 @@ mod tests {
             Pubkey::new_from_array([3u8; 32]),
             [4u8; 32],
             "req-1",
-            SettlementKind::Withdrawal,
-            withdrawal_params(),
+            SettlementKind::Transact,
+            transact_params(),
             quorum_wallets,
             &peers,
             2,

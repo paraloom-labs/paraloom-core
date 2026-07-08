@@ -4,10 +4,7 @@
 
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, Result, SolanaAddress};
-use solana_sdk::{
-    pubkey::Pubkey, signature::Keypair, signature::Signature, signature::Signer,
-    transaction::Transaction,
-};
+use solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction};
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 
@@ -46,12 +43,6 @@ pub struct ProgramInterface {
 
     /// Program ID
     program_id: Pubkey,
-
-    /// Bridge authority keypair (for signing withdrawal transactions)
-    authority_keypair: Option<Keypair>,
-
-    /// Bridge vault address
-    bridge_vault: Option<Pubkey>,
 }
 
 impl ProgramInterface {
@@ -62,29 +53,7 @@ impl ProgramInterface {
             .parse::<Pubkey>()
             .map_err(|e| BridgeError::ConfigError(format!("Invalid program ID: {}", e)))?;
 
-        let authority_keypair = if let Some(ref path) = config.authority_keypair_path {
-            Some(super::load_keypair_from_file(path)?)
-        } else {
-            log::warn!("No authority keypair configured - withdrawal submission will not work");
-            None
-        };
-
-        let bridge_vault =
-            if let Some(ref vault_str) = config.bridge_vault {
-                Some(vault_str.parse::<Pubkey>().map_err(|e| {
-                    BridgeError::ConfigError(format!("Invalid vault address: {}", e))
-                })?)
-            } else {
-                let (vault_pda, _) = super::derive_bridge_vault(&program_id);
-                Some(vault_pda)
-            };
-
-        Ok(Self {
-            rpc,
-            program_id,
-            authority_keypair,
-            bridge_vault,
-        })
+        Ok(Self { rpc, program_id })
     }
 
     /// Get program ID
@@ -119,119 +88,6 @@ impl ProgramInterface {
 
         log::info!("Deposit verified: {} lamports", expected_amount);
         Ok(true)
-    }
-
-    /// Submit withdrawal transaction to Solana.
-    ///
-    /// `expiration_slot` is the Solana slot past which the on-chain
-    /// program will reject this transaction (#61). The submitter is
-    /// expected to compute it from the bridge config's expiration
-    /// window before calling here.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn submit_withdrawal(
-        &self,
-        recipient: SolanaAddress,
-        amount: u64,
-        nullifier: [u8; 32],
-        expiration_slot: u64,
-        proof: &[u8],
-    ) -> Result<String> {
-        log::info!(
-            "Submitting withdrawal: {} lamports to {:?} (expires at slot {})",
-            amount,
-            &recipient[..8],
-            expiration_slot
-        );
-
-        // Verify we have authority keypair
-        let authority = self.authority_keypair.as_ref().ok_or_else(|| {
-            BridgeError::ConfigError("No authority keypair configured".to_string())
-        })?;
-
-        // Verify we have bridge vault
-        let vault = self
-            .bridge_vault
-            .ok_or_else(|| BridgeError::ConfigError("No bridge vault configured".to_string()))?;
-
-        // The on-chain program verifies the proof (#165): convert the prover's
-        // compressed proof to the 256-byte alt_bn128 wire form it expects.
-        let onchain_proof =
-            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(proof)
-                .map_err(|e| BridgeError::Serialization(format!("withdrawal proof: {e}")))?;
-
-        // Create withdraw instruction
-        let instruction = super::create_withdraw_instruction(
-            &self.program_id,
-            &authority.pubkey(),
-            &vault,
-            recipient,
-            nullifier,
-            amount,
-            expiration_slot,
-            onchain_proof.to_vec(),
-            // Quorum co-signers (#260). The node-side round that gathers the
-            // full validator quorum into the tx is the next step; for now the
-            // settling authority co-signs.
-            &[authority.pubkey()],
-        )?;
-
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
-        let transaction = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&authority.pubkey()),
-            &[authority],
-            recent_blockhash,
-        );
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
-        log::info!("Withdrawal submitted successfully: {}", signature);
-        Ok(signature.to_string())
-    }
-
-    /// Submit a quorum-approved shielded transfer on-chain (#194).
-    ///
-    /// Builds the `shielded_transfer` instruction (nullify two inputs, append
-    /// two output commitments, advance the Merkle root) and sends it signed by
-    /// the bridge authority. No vault is involved — a transfer releases no
-    /// funds.
-    pub async fn submit_shielded_transfer(
-        &self,
-        nullifiers: [[u8; 32]; 2],
-        output_commitments: [[u8; 32]; 2],
-        new_merkle_root: [u8; 32],
-        proof: &[u8],
-    ) -> Result<String> {
-        log::info!("Submitting shielded transfer (advancing root)");
-
-        let authority = self.authority_keypair.as_ref().ok_or_else(|| {
-            BridgeError::ConfigError("No authority keypair configured".to_string())
-        })?;
-
-        // On-chain transfer verification (#194): convert the compressed proof to
-        // the 256-byte alt_bn128 wire form.
-        let onchain_proof =
-            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(proof)
-                .map_err(|e| BridgeError::Serialization(format!("transfer proof: {e}")))?;
-
-        let instruction = super::create_shielded_transfer_instruction(
-            &self.program_id,
-            &authority.pubkey(),
-            nullifiers,
-            output_commitments,
-            new_merkle_root,
-            onchain_proof.to_vec(),
-            &[authority.pubkey()], // quorum co-signers (#260); node-side round next
-        )?;
-
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
-        let transaction = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&authority.pubkey()),
-            &[authority],
-            recent_blockhash,
-        );
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
-        log::info!("Shielded transfer submitted successfully: {}", signature);
-        Ok(signature.to_string())
     }
 
     /// Get account balance
@@ -303,47 +159,6 @@ impl ProgramInterface {
             on_chain
         );
         Ok(())
-    }
-
-    /// Update Merkle root on Solana program.
-    ///
-    /// Publishing a root anchors every later withdrawal proof, so the program
-    /// now gates it on the same BFT validator quorum (#260) as settlement
-    /// (`quorum_validators`). This single-key submitter only attaches the
-    /// authority's payer/co-signer signature, so it satisfies the quorum only
-    /// when the authority is itself the registered validator that meets the
-    /// threshold (the single-operator case); a multi-validator set must gather
-    /// the co-signatures over the #260 cosign path before submitting.
-    pub async fn update_merkle_root(
-        &self,
-        new_merkle_root: [u8; 32],
-        quorum_validators: &[Pubkey],
-    ) -> Result<String> {
-        log::info!("Updating merkle root to: {:?}", &new_merkle_root[..8]);
-
-        // Verify we have authority keypair
-        let authority = self.authority_keypair.as_ref().ok_or_else(|| {
-            BridgeError::ConfigError("No authority keypair configured".to_string())
-        })?;
-
-        // Create update merkle root instruction
-        let instruction = super::create_update_merkle_root_instruction(
-            &self.program_id,
-            &authority.pubkey(),
-            new_merkle_root,
-            quorum_validators,
-        )?;
-
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
-        let transaction = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&authority.pubkey()),
-            &[authority],
-            recent_blockhash,
-        );
-        let signature = self.rpc.send_and_confirm_transaction(&transaction).await?;
-        log::info!("Merkle root updated successfully: {}", signature);
-        Ok(signature.to_string())
     }
 }
 
@@ -446,31 +261,6 @@ mod tests {
         *mock.next_get_slot.lock().unwrap() = Some(Ok(987_654_321));
         let program = program_with_mock(mock);
         assert_eq!(program.get_slot().await.unwrap(), 987_654_321);
-    }
-
-    /// Both signing handlers (`submit_withdrawal`, `update_merkle_root`)
-    /// guard against being called without an authority keypair —
-    /// without the guard a misconfigured node would silently no-op
-    /// withdrawals or root updates instead of failing loudly. The
-    /// mock is never reached because the guard short-circuits.
-    #[tokio::test]
-    async fn submit_withdrawal_fails_fast_when_authority_missing() {
-        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
-        let err = program
-            .submit_withdrawal([0u8; 32], 1, [0u8; 32], u64::MAX, &[0u8; 4])
-            .await
-            .expect_err("missing authority must fail before any RPC call");
-        assert!(matches!(err, BridgeError::ConfigError(_)));
-    }
-
-    #[tokio::test]
-    async fn update_merkle_root_fails_fast_when_authority_missing() {
-        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
-        let err = program
-            .update_merkle_root([0u8; 32], &[])
-            .await
-            .expect_err("missing authority must fail before any RPC call");
-        assert!(matches!(err, BridgeError::ConfigError(_)));
     }
 
     /// Synthesise a BridgeState account: 8 bytes of discriminator

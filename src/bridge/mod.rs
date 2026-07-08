@@ -87,49 +87,6 @@ impl Bridge {
         self.stats.read().await.clone()
     }
 
-    /// Submit a withdrawal to Solana
-    pub async fn submit_withdrawal(&self, request: WithdrawalRequest) -> Result<String> {
-        if let Some(ref bridge) = self.solana_bridge {
-            bridge.submit_withdrawal(request).await
-        } else {
-            Err(BridgeError::ConfigError(
-                "Solana bridge not initialized".to_string(),
-            ))
-        }
-    }
-
-    /// Settle a consensus-approved withdrawal on-chain (#164). Called by
-    /// the node's submitter task when the validator quorum approves a
-    /// withdrawal; the expiration slot is derived inside the submitter.
-    pub async fn submit_approved(
-        &self,
-        approved: crate::consensus::ApprovedWithdrawal,
-    ) -> Result<String> {
-        if let Some(ref bridge) = self.solana_bridge {
-            bridge.submit_approved(approved).await
-        } else {
-            Err(BridgeError::ConfigError(
-                "Solana bridge not initialized".to_string(),
-            ))
-        }
-    }
-
-    /// Settle a consensus-approved shielded transfer on-chain (#194). Called
-    /// by the node's transfer submitter task when the validator quorum
-    /// approves a transfer.
-    pub async fn submit_approved_transfer(
-        &self,
-        approved: crate::consensus::ApprovedTransfer,
-    ) -> Result<String> {
-        if let Some(ref bridge) = self.solana_bridge {
-            bridge.submit_approved_transfer(approved).await
-        } else {
-            Err(BridgeError::ConfigError(
-                "Solana bridge not initialized".to_string(),
-            ))
-        }
-    }
-
     /// Latest blockhash for a node-assembled co-signed settlement tx (#260).
     pub async fn latest_blockhash(&self) -> Result<[u8; 32]> {
         if let Some(ref bridge) = self.solana_bridge {

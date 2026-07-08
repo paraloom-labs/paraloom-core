@@ -28,47 +28,10 @@ pub struct DepositInstructionData {
     pub randomness: [u8; 32],
 }
 
-/// Instruction data for withdraw.
-///
-/// Layout matches the on-chain `withdraw` function exactly:
-/// `(nullifier, amount, expiration_slot, proof)`. The
-/// `expiration_slot` was added in #61 as the time-bound replay-
-/// protection layer; the on-chain program rejects calls where
-/// `Clock::slot > expiration_slot`.
-#[derive(BorshSerialize, BorshDeserialize, Debug)]
-pub struct WithdrawInstructionData {
-    pub nullifier: [u8; 32],
-    pub amount: u64,
-    pub expiration_slot: u64,
-    pub proof: Vec<u8>,
-}
-
-/// Instruction data for `shielded_transfer` (shielded → shielded, #193).
-///
-/// Layout matches the on-chain `shielded_transfer` function: fixed
-/// 2-in/2-out (`nullifiers`, `output_commitments`), the leader-computed
-/// `new_merkle_root`, and the `TransferCircuit` proof blob (recorded but
-/// not verified on-chain — verification is the L2 quorum's job, #194).
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ShieldedTransferInstructionData {
-    pub nullifiers: [[u8; 32]; 2],
-    pub output_commitments: [[u8; 32]; 2],
-    pub new_merkle_root: [u8; 32],
-    pub proof: Vec<u8>,
-}
-
 /// Instruction discriminators (matching Anchor's generated discriminators)
 pub mod discriminators {
     pub const INITIALIZE: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237];
     pub const DEPOSIT: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
-    pub const WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
-    /// `sha256("global:shielded_transfer")[..8]` (#193). Verified against the
-    /// generated IDL by `anchor build`.
-    pub const SHIELDED_TRANSFER: [u8; 8] = [191, 130, 5, 127, 124, 187, 238, 188];
-    // Anchor sighash sha256("global:update_merkle_root")[..8] = c3ad263cf2cb9e5d.
-    // (The previous value was stale and never exercised — update_merkle_root had
-    // no live caller until the settle path published the root.)
-    pub const UPDATE_MERKLE_ROOT: [u8; 8] = [195, 173, 38, 60, 242, 203, 158, 93];
     #[allow(dead_code)]
     pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
     #[allow(dead_code)]
@@ -83,9 +46,6 @@ pub mod discriminators {
     /// `sha256("global:deposit_spl")[..8]` (#237). Asset-aware deposit of an
     /// SPL token into a per-asset vault keyed by the mint.
     pub const DEPOSIT_SPL: [u8; 8] = [224, 0, 198, 175, 198, 47, 105, 204];
-    /// `sha256("global:withdraw_spl")[..8]` (#237). Asset-aware withdrawal of an
-    /// SPL token from its per-asset vault.
-    pub const WITHDRAW_SPL: [u8; 8] = [181, 154, 94, 86, 62, 115, 6, 186];
     /// `sha256("global:reset_validator_registry")[..8]`. Ceremony-redeploy
     /// registry migration: grows the registry PDA to the current layout and
     /// rebuilds its counters from the co-signer validator PDAs in
@@ -152,27 +112,6 @@ pub const SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID: Pubkey = Pubkey::new_from_arr
     140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131, 11, 90, 19, 153, 218,
     255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
 ]);
-
-/// Instruction data for `deposit_spl` (#237). Wire-identical to the native
-/// [`DepositInstructionData`] — the on-chain `deposit_spl` takes the same
-/// `(amount, recipient, randomness)` tuple; only the value-movement differs.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct DepositSplInstructionData {
-    pub amount: u64,
-    pub recipient: [u8; 32],
-    pub randomness: [u8; 32],
-}
-
-/// Instruction data for `withdraw_spl` (#237). Wire-identical to the native
-/// [`WithdrawInstructionData`]; the mint is passed as an account, not in the
-/// payload.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct WithdrawSplInstructionData {
-    pub nullifier: [u8; 32],
-    pub amount: u64,
-    pub expiration_slot: u64,
-    pub proof: Vec<u8>,
-}
 
 /// Create initialize instruction.
 ///
@@ -305,106 +244,6 @@ pub fn create_register_validator_instruction(
     })
 }
 
-/// Create deposit instruction
-pub fn create_deposit_instruction(
-    program_id: &Pubkey,
-    depositor: &Pubkey,
-    bridge_vault: &Pubkey,
-    amount: u64,
-    recipient: [u8; 32],
-    randomness: [u8; 32],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-
-    let data = DepositInstructionData {
-        amount,
-        recipient,
-        randomness,
-    };
-
-    let mut instruction_data = discriminators::DEPOSIT.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let system_program_id = SYSTEM_PROGRAM_ID;
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new(*bridge_vault, false),
-            AccountMeta::new(*depositor, true),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
-        data: instruction_data,
-    })
-}
-
-/// Create withdraw instruction.
-///
-/// `expiration_slot` is bound at construction time and forwarded to the
-/// on-chain program as part of [`WithdrawInstructionData`]. Callers
-/// typically compute it as `current_slot + withdrawal_expiration_window_slots`
-/// (see [`crate::bridge::BridgeConfig`]). A value in the past is not
-/// rejected here — the program does that — but doing so locally would
-/// be cheaper, and the submitter performs that check before this builder
-/// is reached.
-#[allow(clippy::too_many_arguments)]
-pub fn create_withdraw_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    bridge_vault: &Pubkey,
-    recipient: SolanaAddress,
-    nullifier: [u8; 32],
-    amount: u64,
-    expiration_slot: u64,
-    proof: Vec<u8>,
-    quorum_validators: &[Pubkey],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (nullifier_pda, _nullifier_bump) = derive_nullifier_account(program_id, &nullifier);
-    let (validator_registry_pda, _) =
-        Pubkey::find_program_address(&[b"validator_registry"], program_id);
-    // The settling validator's account, bound to the `authority` signer.
-    // The on-chain program credits the withdrawal fee here, so settlement
-    // requires the submitter to be a registered validator.
-    let (validator_pda, _validator_bump) = derive_validator_account(program_id, authority);
-    let recipient_pubkey = Pubkey::new_from_array(recipient);
-
-    let data = WithdrawInstructionData {
-        nullifier,
-        amount,
-        expiration_slot,
-        proof,
-    };
-
-    let mut instruction_data = discriminators::WITHDRAW.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let system_program_id = SYSTEM_PROGRAM_ID;
-
-    let mut accounts = vec![
-        AccountMeta::new(bridge_state_pda, false),
-        AccountMeta::new(*bridge_vault, false),
-        AccountMeta::new(nullifier_pda, false), // Nullifier account (will be created)
-        AccountMeta::new(recipient_pubkey, false),
-        AccountMeta::new(validator_pda, false), // Settling validator (fee credited here)
-        AccountMeta::new_readonly(validator_registry_pda, false),
-        AccountMeta::new(*authority, true),
-        AccountMeta::new_readonly(system_program_id, false),
-    ];
-    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts,
-        data: instruction_data,
-    })
-}
-
 /// Append the quorum co-signers as remaining accounts (#260): each validator's
 /// wallet (a signer) followed by its `ValidatorAccount` PDA. The program
 /// verifies on-chain that a supermajority of registered validators signed.
@@ -420,68 +259,14 @@ fn append_quorum_accounts(
     }
 }
 
-/// Create `shielded_transfer` instruction (#193).
-///
-/// Settles a shielded → shielded transfer: records both input nullifiers
-/// (their PDAs are `init`'d, so a replay fails on-chain) and advances the
-/// Merkle root to `new_merkle_root`, without moving any lamports. Mirrors
-/// [`create_withdraw_instruction`]; both nullifier PDAs are derived through
-/// the shared [`derive_nullifier_account`] helper, so the account order here
-/// must match the `ShieldedTransfer` accounts struct in the program.
-pub fn create_shielded_transfer_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    nullifiers: [[u8; 32]; 2],
-    output_commitments: [[u8; 32]; 2],
-    new_merkle_root: [u8; 32],
-    proof: Vec<u8>,
-    quorum_validators: &[Pubkey],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (validator_registry_pda, _) =
-        Pubkey::find_program_address(&[b"validator_registry"], program_id);
-    let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
-    let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
-
-    let data = ShieldedTransferInstructionData {
-        nullifiers,
-        output_commitments,
-        new_merkle_root,
-        proof,
-    };
-
-    let mut instruction_data = discriminators::SHIELDED_TRANSFER.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let system_program_id = SYSTEM_PROGRAM_ID;
-
-    let mut accounts = vec![
-        AccountMeta::new(bridge_state_pda, false),
-        AccountMeta::new(nullifier_pda_0, false), // Nullifier account 0 (will be created)
-        AccountMeta::new(nullifier_pda_1, false), // Nullifier account 1 (will be created)
-        AccountMeta::new_readonly(validator_registry_pda, false),
-        AccountMeta::new(*authority, true),
-        AccountMeta::new_readonly(system_program_id, false),
-    ];
-    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts,
-        data: instruction_data,
-    })
-}
-
 /// Create the `transact` instruction (circuit v3, #350).
 ///
 /// Unified 2-in/2-out settlement against the program's own on-chain tree:
 /// the proof is verified against `root` (which must be in the on-chain root
 /// history), both nullifier PDAs are `init`'d, and the program appends both
 /// output commitments itself. The account order must match the `Transact`
-/// accounts struct in the program. Quorum-gated exactly like
-/// [`create_withdraw_instruction`] (#260).
+/// accounts struct in the program. Quorum-gated by a supermajority of
+/// registered validators appended via [`append_quorum_accounts`] (#260).
 #[allow(clippy::too_many_arguments)]
 pub fn create_transact_instruction(
     program_id: &Pubkey,
@@ -543,7 +328,6 @@ pub fn create_transact_instruction(
 /// Permissionless: the depositor moves their own lamports into the vault and
 /// the program computes + appends the note commitment on-chain. The account
 /// order must match the `DepositNote` accounts struct in the program.
-#[allow(dead_code)]
 pub fn create_deposit_note_instruction(
     program_id: &Pubkey,
     depositor: &Pubkey,
@@ -600,46 +384,6 @@ pub fn create_initialize_merkle_tree_instruction(
         ],
         data: discriminators::INITIALIZE_MERKLE_TREE.to_vec(),
     }
-}
-
-/// Create update merkle root instruction. Publishing a root anchors every
-/// later withdrawal proof, so the program gates it on the same BFT validator
-/// quorum (#260) as settlement: pass the co-signing validators in
-/// `quorum_validators` so they are appended as remaining accounts.
-pub fn create_update_merkle_root_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    new_merkle_root: [u8; 32],
-    quorum_validators: &[Pubkey],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (validator_registry_pda, _) =
-        Pubkey::find_program_address(&[b"validator_registry"], program_id);
-
-    #[derive(BorshSerialize)]
-    struct UpdateMerkleRootData {
-        new_merkle_root: [u8; 32],
-    }
-
-    let data = UpdateMerkleRootData { new_merkle_root };
-
-    let mut instruction_data = discriminators::UPDATE_MERKLE_ROOT.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let mut accounts = vec![
-        AccountMeta::new(bridge_state_pda, false),
-        AccountMeta::new_readonly(validator_registry_pda, false),
-        AccountMeta::new_readonly(*authority, true),
-    ];
-    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts,
-        data: instruction_data,
-    })
 }
 
 /// Create a `set_bridge_authority` instruction (admin: rotate the bridge
@@ -745,136 +489,6 @@ pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey 
     .0
 }
 
-/// Build an idempotent "create associated token account" instruction (the
-/// ATA program's `CreateIdempotent`, discriminator byte `1`). `payer` funds the
-/// new account; `owner` will own it; it holds `mint`. Idempotent so re-running
-/// against an existing ATA is a no-op rather than an error — handy in a demo
-/// that may re-create the fresh address's token account.
-pub fn create_associated_token_account_idempotent_instruction(
-    payer: &Pubkey,
-    owner: &Pubkey,
-    mint: &Pubkey,
-) -> Instruction {
-    let ata = derive_associated_token_address(owner, mint);
-    Instruction {
-        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new(ata, false),
-            AccountMeta::new_readonly(*owner, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
-        ],
-        // `1` = CreateIdempotent (vs. `0` = Create).
-        data: vec![1],
-    }
-}
-
-/// Create a `deposit_spl` instruction (#237): move `amount` of `mint` from the
-/// depositor's `depositor_token` account into the program's per-asset vault,
-/// emitting a shielded note for `recipient`/`randomness`. The account order
-/// matches the on-chain `DepositSpl` accounts struct exactly: bridge_state,
-/// mint, asset_vault_authority, asset_vault, depositor_token, depositor
-/// (signer), token_program, system_program, rent.
-pub fn create_deposit_spl_instruction(
-    program_id: &Pubkey,
-    depositor: &Pubkey,
-    mint: &Pubkey,
-    depositor_token: &Pubkey,
-    amount: u64,
-    recipient: [u8; 32],
-    randomness: [u8; 32],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _) = derive_bridge_state(program_id);
-    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
-    let (asset_vault, _) = derive_asset_vault(program_id, mint);
-
-    let data = DepositSplInstructionData {
-        amount,
-        recipient,
-        randomness,
-    };
-    let mut instruction_data = discriminators::DEPOSIT_SPL.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(asset_vault_authority, false),
-            AccountMeta::new(asset_vault, false),
-            AccountMeta::new(*depositor_token, false),
-            AccountMeta::new(*depositor, true),
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
-        ],
-        data: instruction_data,
-    })
-}
-
-/// Create a `withdraw_spl` instruction (#237): release `amount` of `mint` from
-/// its per-asset vault to `recipient_token`, spending `nullifier`. The account
-/// order matches the on-chain `WithdrawSpl` accounts struct exactly:
-/// bridge_state, mint, asset_vault_authority, asset_vault, nullifier_account,
-/// recipient_token, validator_account, authority (signer), token_program,
-/// system_program.
-#[allow(clippy::too_many_arguments)]
-pub fn create_withdraw_spl_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    mint: &Pubkey,
-    recipient_token: &Pubkey,
-    nullifier: [u8; 32],
-    amount: u64,
-    expiration_slot: u64,
-    proof: Vec<u8>,
-    quorum_validators: &[Pubkey],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _) = derive_bridge_state(program_id);
-    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
-    let (asset_vault, _) = derive_asset_vault(program_id, mint);
-    let (nullifier_pda, _) = derive_nullifier_account(program_id, &nullifier);
-    let (validator_pda, _) = derive_validator_account(program_id, authority);
-    let (validator_registry_pda, _) = derive_validator_registry(program_id);
-
-    let data = WithdrawSplInstructionData {
-        nullifier,
-        amount,
-        expiration_slot,
-        proof,
-    };
-    let mut instruction_data = discriminators::WITHDRAW_SPL.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let mut accounts = vec![
-        AccountMeta::new(bridge_state_pda, false),
-        AccountMeta::new_readonly(*mint, false),
-        AccountMeta::new_readonly(asset_vault_authority, false),
-        AccountMeta::new(asset_vault, false),
-        AccountMeta::new(nullifier_pda, false),
-        AccountMeta::new(*recipient_token, false),
-        AccountMeta::new(validator_pda, false),
-        AccountMeta::new_readonly(validator_registry_pda, false),
-        AccountMeta::new(*authority, true),
-        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-    ];
-    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts,
-        data: instruction_data,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,50 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_withdraw_instruction() {
-        let program_id = Pubkey::new_unique();
-        let authority = Pubkey::new_unique();
-        let bridge_vault = Pubkey::new_unique();
-        let recipient = [0u8; 32];
-        let nullifier = [1u8; 32];
-        let proof = vec![0u8; 100];
-
-        let ix = create_withdraw_instruction(
-            &program_id,
-            &authority,
-            &bridge_vault,
-            recipient,
-            nullifier,
-            1000,
-            // expiration_slot — picked far enough in the future that
-            // the test does not depend on a real `Clock`.
-            u64::MAX,
-            proof,
-            &[],
-        );
-
-        assert!(ix.is_ok());
-        let instruction = ix.unwrap();
-        assert_eq!(instruction.program_id, program_id);
-        // bridge_state, bridge_vault, nullifier, recipient, validator_account,
-        // validator_registry, authority (signer), system_program.
-        assert_eq!(instruction.accounts.len(), 8);
-
-        // The settling validator's account is bound to the authority signer
-        // and sits between the recipient and the registry.
-        let (validator_pda, _) = derive_validator_account(&program_id, &authority);
-        assert_eq!(instruction.accounts[4].pubkey, validator_pda);
-        assert!(instruction.accounts[4].is_writable);
-        assert!(!instruction.accounts[4].is_signer);
-        // validator_registry (read-only) precedes the authority signer (#260).
-        let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
-        assert_eq!(instruction.accounts[5].pubkey, registry_pda);
-        assert!(!instruction.accounts[5].is_signer);
-        assert_eq!(instruction.accounts[6].pubkey, authority);
-        assert!(instruction.accounts[6].is_signer);
-    }
-
-    #[test]
     fn test_derive_nullifier_account() {
         let program_id = Pubkey::new_unique();
         let nullifier = [1u8; 32];
@@ -954,180 +524,6 @@ mod tests {
         assert_ne!(pda1, pda3);
     }
 
-    /// Round-trip the new \`expiration_slot\` field through borsh to
-    /// catch any drift between the L2 wire format and the on-chain
-    /// \`withdraw\` function signature. Belt-and-suspenders: the
-    /// on-chain decoder is anchor-derived from the same struct shape,
-    /// so a mismatch in field order or width here would surface as a
-    /// failed instruction at runtime — this test catches it at unit
-    /// time instead.
-    #[test]
-    fn test_withdraw_instruction_data_round_trip() {
-        let original = WithdrawInstructionData {
-            nullifier: [0xAB; 32],
-            amount: 12_345_678,
-            expiration_slot: 9_876_543,
-            proof: vec![0xCD; 64],
-        };
-
-        let bytes = borsh::to_vec(&original).expect("borsh serialize");
-        let decoded = WithdrawInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
-
-        assert_eq!(decoded.nullifier, original.nullifier);
-        assert_eq!(decoded.amount, original.amount);
-        assert_eq!(decoded.expiration_slot, original.expiration_slot);
-        assert_eq!(decoded.proof, original.proof);
-    }
-
-    /// Field ordering is observable on the wire — Anchor's discriminator
-    /// is followed by borsh fields in declaration order. A regression
-    /// where someone swaps \`amount\` and \`expiration_slot\` (both
-    /// \`u64\`, indistinguishable to the type system) would deploy
-    /// silently and cause every withdrawal to either fail expiration
-    /// or transfer a nonsensical amount. The byte-prefix check below
-    /// pins the layout: \`[nullifier (32) | amount (8) | expiration (8) | proof_len (4) | proof…]\`.
-    #[test]
-    fn test_withdraw_instruction_data_field_order() {
-        let payload = WithdrawInstructionData {
-            nullifier: [0u8; 32],
-            amount: 0x0807_0605_0403_0201,
-            expiration_slot: 0x1716_1514_1312_1110,
-            proof: vec![],
-        };
-        let bytes = borsh::to_vec(&payload).expect("borsh serialize");
-        // Skip the 32-byte nullifier; assert the next 16 bytes are
-        // amount-then-expiration_slot in little-endian order.
-        assert_eq!(
-            &bytes[32..32 + 8],
-            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
-        );
-        assert_eq!(
-            &bytes[32 + 8..32 + 16],
-            &[0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
-        );
-    }
-
-    #[test]
-    fn test_create_shielded_transfer_instruction() {
-        let program_id = Pubkey::new_unique();
-        let authority = Pubkey::new_unique();
-        let nullifiers = [[1u8; 32], [2u8; 32]];
-        let output_commitments = [[3u8; 32], [4u8; 32]];
-        let new_merkle_root = [5u8; 32];
-        let proof = vec![0u8; 192];
-
-        let ix = create_shielded_transfer_instruction(
-            &program_id,
-            &authority,
-            nullifiers,
-            output_commitments,
-            new_merkle_root,
-            proof,
-            &[],
-        )
-        .expect("builder");
-
-        assert_eq!(ix.program_id, program_id);
-        // bridge_state, nullifier_0, nullifier_1, validator_registry, authority,
-        // system_program.
-        assert_eq!(ix.accounts.len(), 6);
-        // The two nullifier PDAs must match the shared derivation helper and
-        // sit in slots 1 and 2 (after bridge_state).
-        let (n0, _) = derive_nullifier_account(&program_id, &nullifiers[0]);
-        let (n1, _) = derive_nullifier_account(&program_id, &nullifiers[1]);
-        assert_eq!(ix.accounts[1].pubkey, n0);
-        assert_eq!(ix.accounts[2].pubkey, n1);
-        // The wire payload is prefixed with the Anchor discriminator.
-        assert_eq!(&ix.data[..8], &discriminators::SHIELDED_TRANSFER);
-    }
-
-    #[test]
-    fn test_create_deposit_spl_instruction() {
-        let program_id = Pubkey::new_unique();
-        let depositor = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let depositor_token = Pubkey::new_unique();
-
-        let ix = create_deposit_spl_instruction(
-            &program_id,
-            &depositor,
-            &mint,
-            &depositor_token,
-            500,
-            [7u8; 32],
-            [9u8; 32],
-        )
-        .expect("builder");
-
-        assert_eq!(ix.program_id, program_id);
-        // bridge_state, mint, asset_vault_authority, asset_vault,
-        // depositor_token, depositor (signer), token_program, system_program,
-        // rent — exactly the on-chain `DepositSpl` order.
-        assert_eq!(ix.accounts.len(), 9);
-        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
-        assert_eq!(ix.accounts[1].pubkey, mint);
-        assert_eq!(
-            ix.accounts[2].pubkey,
-            derive_asset_vault_authority(&program_id).0
-        );
-        assert_eq!(
-            ix.accounts[3].pubkey,
-            derive_asset_vault(&program_id, &mint).0
-        );
-        assert_eq!(ix.accounts[4].pubkey, depositor_token);
-        assert!(ix.accounts[5].is_signer);
-        assert_eq!(ix.accounts[6].pubkey, SPL_TOKEN_PROGRAM_ID);
-        assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_SPL);
-    }
-
-    #[test]
-    fn test_create_withdraw_spl_instruction() {
-        let program_id = Pubkey::new_unique();
-        let authority = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let recipient_token = Pubkey::new_unique();
-        let nullifier = [1u8; 32];
-
-        let ix = create_withdraw_spl_instruction(
-            &program_id,
-            &authority,
-            &mint,
-            &recipient_token,
-            nullifier,
-            1000,
-            u64::MAX,
-            vec![0u8; 100],
-            &[],
-        )
-        .expect("builder");
-
-        assert_eq!(ix.program_id, program_id);
-        // bridge_state, mint, asset_vault_authority, asset_vault,
-        // nullifier_account, recipient_token, validator_account,
-        // validator_registry, authority (signer), token_program, system_program.
-        assert_eq!(ix.accounts.len(), 11);
-        assert_eq!(ix.accounts[1].pubkey, mint);
-        assert_eq!(
-            ix.accounts[3].pubkey,
-            derive_asset_vault(&program_id, &mint).0
-        );
-        assert_eq!(
-            ix.accounts[4].pubkey,
-            derive_nullifier_account(&program_id, &nullifier).0
-        );
-        assert_eq!(ix.accounts[5].pubkey, recipient_token);
-        assert_eq!(
-            ix.accounts[6].pubkey,
-            derive_validator_account(&program_id, &authority).0
-        );
-        assert_eq!(
-            ix.accounts[7].pubkey,
-            derive_validator_registry(&program_id).0
-        );
-        assert!(ix.accounts[8].is_signer);
-        assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_SPL);
-    }
-
     #[test]
     fn test_associated_token_address_is_deterministic() {
         let owner = Pubkey::new_unique();
@@ -1140,30 +536,6 @@ mod tests {
             a,
             derive_associated_token_address(&Pubkey::new_unique(), &mint)
         );
-    }
-
-    /// Round-trip the transfer payload through borsh to pin the wire format
-    /// against the on-chain `shielded_transfer` signature (#193).
-    #[test]
-    fn test_shielded_transfer_instruction_data_round_trip() {
-        let original = ShieldedTransferInstructionData {
-            nullifiers: [[0xAB; 32], [0xCD; 32]],
-            output_commitments: [[0x11; 32], [0x22; 32]],
-            new_merkle_root: [0x33; 32],
-            proof: vec![0xEF; 192],
-        };
-
-        let bytes = borsh::to_vec(&original).expect("borsh serialize");
-        let decoded =
-            ShieldedTransferInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
-
-        assert_eq!(decoded, original);
-        // Layout: [nullifiers (64) | output_commitments (64) | root (32) | proof_len (4) | proof…].
-        assert_eq!(&bytes[..32], &[0xAB; 32]);
-        assert_eq!(&bytes[32..64], &[0xCD; 32]);
-        assert_eq!(&bytes[64..96], &[0x11; 32]);
-        assert_eq!(&bytes[96..128], &[0x22; 32]);
-        assert_eq!(&bytes[128..160], &[0x33; 32]);
     }
 
     #[test]

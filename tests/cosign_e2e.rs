@@ -123,7 +123,7 @@ async fn cosign_request_round_trips_to_a_peer() {
     // A sends B a co-sign request and awaits the reply.
     let request = CoSignRequest {
         request_id: "e2e-round-1".to_string(),
-        kind: SettlementKind::Withdrawal,
+        kind: SettlementKind::Transact,
         message: vec![0xA1, 0xB2, 0xC3, 0xD4],
     };
     let response = mgr_a

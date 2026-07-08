@@ -15,9 +15,10 @@ use solana_transaction_status::{
     UiTransactionEncoding,
 };
 
-/// Account-index position of the depositor (signer) in a deposit
-/// instruction's account list. Must match the account ordering produced
-/// by `create_deposit_instruction` in the sister module.
+/// Account-index position of the depositor (signer) in a legacy deposit
+/// instruction's account list `[bridge_state, bridge_vault, depositor,
+/// system_program]`. The legacy off-chain-root `deposit` builder was removed,
+/// but this decoder still reads historical deposits from that layout.
 const DEPOSITOR_ACCOUNT_INDEX: usize = 2;
 
 /// Recommended encoding to request from `getTransaction` for the
@@ -326,9 +327,9 @@ mod tests {
         let depositor = Pubkey::new_unique();
         let account_keys = vec![program_id, program_id, depositor, program_id];
 
-        // Build a buffer that targets the program but starts with the
-        // withdraw discriminator instead.
-        let mut bytes = discriminators::WITHDRAW.to_vec();
+        // Build a buffer that targets the program but starts with a
+        // non-deposit discriminator instead.
+        let mut bytes = discriminators::SET_BRIDGE_AUTHORITY.to_vec();
         bytes.extend_from_slice(&[0u8; 16]);
         let ix = make_compiled_ix(3, 2, bs58::encode(bytes).into_string());
 

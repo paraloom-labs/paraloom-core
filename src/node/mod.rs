@@ -17,12 +17,7 @@ use crate::bridge::Bridge;
 use crate::compute::{JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
 use crate::consensus::transact::TransactVerificationRequest;
-use crate::consensus::transfer::TransferVerificationRequest;
-use crate::consensus::withdrawal::WithdrawalVerificationRequest;
-use crate::consensus::{
-    ApprovedTransact, ApprovedTransfer, ApprovedWithdrawal, TransactVerificationCoordinator,
-    TransferVerificationCoordinator, WithdrawalVerificationCoordinator,
-};
+use crate::consensus::{ApprovedTransact, TransactVerificationCoordinator};
 use crate::coordinator::Coordinator;
 use crate::network::{
     CoSignRequest, CoSignResponse, Message, NetworkManager, ResultRequest, ResultResponse,
@@ -40,30 +35,12 @@ use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 pub mod cosign_round;
 pub mod ingress_auth;
 pub mod transact_ingress;
-pub mod transfer_ingress;
-pub mod withdrawal_ingress;
 
-/// Node implementation
-/// Withdrawal-proof verifier hook (#181). A closure that decides whether a
-/// withdrawal request's proof is valid. Production never sets one — the node
-/// uses the real Groth16 path. The multi-node consensus E2E injects one via
-/// [`Node::with_proof_verifier`] to exercise the libp2p gossip → vote →
-/// quorum wiring independently of the cryptographic proof (which is covered
-/// by the privacy circuit tests and the on-chain settlement test).
-pub type WithdrawalProofVerifier =
-    Arc<dyn Fn(&crate::consensus::withdrawal::WithdrawalVerificationRequest) -> bool + Send + Sync>;
-
-/// Transfer-proof verifier override (#194), the transfer twin of
-/// [`WithdrawalProofVerifier`]. `None` in production, so `verify_transfer_proof`
-/// runs the real Groth16 path; the multi-node transfer consensus E2E injects a
-/// closure to exercise the gossip → vote → quorum wiring without proving.
-pub type TransferProofVerifier =
-    Arc<dyn Fn(&crate::consensus::transfer::TransferVerificationRequest) -> bool + Send + Sync>;
-
-/// Transact-proof verifier override (#350), the v3 unified-transact twin of
-/// [`TransferProofVerifier`]. `None` in production, so `verify_transact_proof`
-/// runs the real Groth16 path; a multi-node consensus E2E injects a closure to
-/// exercise the gossip → vote → quorum wiring without proving.
+/// Transact-proof verifier override (#350). `None` in production, so
+/// `verify_transact_proof` runs the real Groth16 path; a multi-node consensus
+/// E2E injects a closure to exercise the gossip → vote → quorum wiring without
+/// proving (which is covered by the privacy circuit tests and the on-chain
+/// settlement test).
 pub type TransactProofVerifier =
     Arc<dyn Fn(&crate::consensus::transact::TransactVerificationRequest) -> bool + Send + Sync>;
 
@@ -119,59 +96,9 @@ pub struct Node {
     /// other spawned-task handles so Clone of Node stays cheap.
     path_server: Arc<Mutex<Option<JoinHandle<()>>>>,
 
-    /// Withdrawal consensus coordinator (#164). Present on bridge-enabled
-    /// validator/bridge nodes. Incoming `WithdrawalVerificationResult`
-    /// votes are routed into it; when a validator quorum approves a
-    /// withdrawal it pushes the approval onto the channel drained by the
-    /// submitter task.
-    withdrawal_coordinator: Option<Arc<WithdrawalVerificationCoordinator>>,
-
-    /// Receiver half of the coordinator's approval channel (#164). Taken
-    /// once by run() to drive the submitter task. Wrapped so Clone of
-    /// Node stays cheap; the receiver itself is not `Clone`.
-    approval_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ApprovedWithdrawal>>>>,
-
-    /// Submitter task handle (#164): drains approvals and settles them
-    /// on-chain. Spawned in run(), aborted in stop().
-    submitter_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-
-    /// Optional withdrawal-proof verifier override (#181, Layer 2 testing
-    /// seam). `None` in production, so `verify_withdrawal_proof` runs the
-    /// real Groth16 path. The multi-node consensus E2E injects a closure
-    /// here to decouple the network/consensus wiring under test from the
-    /// cryptographic proof path. Set via [`Node::with_proof_verifier`].
-    proof_verifier_override: Option<WithdrawalProofVerifier>,
-
-    /// Withdrawal-ingress HTTP server handle (#184). Spawned in run() on a
-    /// bridge-enabled node when `bridge.withdrawal_ingress_address` is set;
-    /// aborted in stop(). Same Arc<Mutex<Option<...>>> shape as the other
-    /// spawned-task handles so Clone of Node stays cheap.
-    withdrawal_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
-
-    /// Transfer consensus coordinator (#194), the transfer twin of
-    /// `withdrawal_coordinator`. Incoming `TransferVerificationResult` votes
-    /// route into it; a quorum-approved transfer is pushed onto the channel
-    /// drained by the transfer submitter task.
-    transfer_coordinator: Option<Arc<TransferVerificationCoordinator>>,
-
-    /// Receiver half of the transfer coordinator's approval channel (#194).
-    /// Taken once by run() to drive the transfer submitter task.
-    transfer_approval_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ApprovedTransfer>>>>,
-
-    /// Transfer submitter task handle (#194): drains approved transfers and
-    /// settles them on-chain. Spawned in run(), aborted in stop().
-    transfer_submitter_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-
-    /// Optional transfer-proof verifier override (#194 testing seam). `None`
-    /// in production.
-    transfer_proof_verifier_override: Option<TransferProofVerifier>,
-
-    /// Transfer-ingress HTTP server handle (#194). Spawned in run() when
-    /// `bridge.transfer_ingress_address` is set; aborted in stop().
-    transfer_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
-
     /// Transact consensus coordinator (#350), the v3 unified-transact twin of
-    /// `transfer_coordinator`. Incoming `TransactVerificationResult` votes
+    /// the retired withdrawal/transfer coordinators. Incoming
+    /// `TransactVerificationResult` votes
     /// route into it; a quorum-approved transact is pushed onto the approval
     /// channel below.
     transact_coordinator: Option<Arc<TransactVerificationCoordinator>>,
@@ -188,16 +115,15 @@ pub struct Node {
     /// in production.
     transact_proof_verifier_override: Option<TransactProofVerifier>,
 
-    /// Transact-ingress HTTP server handle (#350). Not spawned yet — the
-    /// ingress surface lands in a follow-up PR; the field mirrors
-    /// `transfer_ingress` so stop() is already wired to abort it.
+    /// Transact-ingress HTTP server handle (#350). Spawned in run() when
+    /// `bridge.transact_ingress_address` is set; aborted in stop().
     transact_ingress: Arc<Mutex<Option<JoinHandle<()>>>>,
 
     /// Encrypted output notes this node has seen (#196), served from
-    /// `GET /transfer/scan` for recipients to trial-decrypt. Populated when the
-    /// node initiates or receives a transfer verification request. In-memory;
+    /// `GET /transact/scan` for recipients to trial-decrypt. Populated when the
+    /// node initiates or receives a transact verification request. In-memory;
     /// persistence across restart is a follow-up.
-    delivered_notes: Arc<Mutex<Vec<transfer_ingress::DeliveredNote>>>,
+    delivered_notes: Arc<Mutex<Vec<transact_ingress::DeliveredNote>>>,
 
     /// This validator's Solana settlement keypair (#260), loaded from
     /// `bridge.authority_keypair_path`. Used to co-sign settlement transactions
@@ -205,18 +131,12 @@ pub struct Node {
     /// without a configured keypair; such a node declines all co-sign requests.
     cosign_keypair: Option<Arc<Keypair>>,
 
-    /// Withdrawal requests this node verified as `Valid` (#260), keyed by
+    /// Transact requests this node verified as `Valid` (#260/#350), keyed by
     /// request id. A co-sign request is honoured only if its parameters match
     /// the request cached here — so the round leader cannot get this validator
-    /// to sign a withdrawal it never verified, nor one with a substituted
+    /// to sign a transact it never verified, nor one with a substituted
     /// recipient (the recipient is the one every validator saw in the gossiped
     /// request). Bounded by `MAX_VERIFIED_CACHE`; entries are short-lived.
-    verified_withdrawals: Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
-
-    /// Transfer twin of `verified_withdrawals` (#260).
-    verified_transfers: Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
-
-    /// Transact twin of `verified_withdrawals` (#350).
     verified_transacts: Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
 }
 
@@ -266,39 +186,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     info!("This is not a coordinator node");
                 }
 
-                // Mirror the registration into the withdrawal coordinator
-                // (#175) so it knows the validator set: start_verification
-                // requires a quorum-sized set, and leader selection weighs
-                // these members. Independent of the compute coordinator
-                // above — a bridge-enabled validator node has the former
-                // without being a compute Coordinator.
-                if let Some(withdrawal) = &self.withdrawal_coordinator {
-                    if node_info.node_type == NodeType::ResourceProvider {
-                        withdrawal
-                            .register_validator_with_wallet(
-                                source.clone(),
-                                node_info.wallet_pubkey.clone(),
-                            )
-                            .await;
-                    }
-                }
-
-                // Mirror into the transfer coordinator (#194) for the same
-                // reason — its `start_verification` also needs a quorum-sized
-                // validator set.
-                if let Some(transfer) = &self.transfer_coordinator {
-                    if node_info.node_type == NodeType::ResourceProvider {
-                        transfer
-                            .register_validator_with_wallet(
-                                source.clone(),
-                                node_info.wallet_pubkey.clone(),
-                            )
-                            .await;
-                    }
-                }
-
-                // Mirror into the transact coordinator (#350) for the same
-                // reason.
+                // Mirror the registration into the transact coordinator (#350)
+                // so it knows the validator set: start_verification requires a
+                // quorum-sized set, and leader selection weighs these members.
+                // Independent of the compute coordinator above — a
+                // bridge-enabled validator node has the former without being a
+                // compute Coordinator.
                 if let Some(transact) = &self.transact_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
                         transact
@@ -340,8 +233,8 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // This gossip message mutates shielded-pool state (nullifier set and
                 // commitment tree) directly, with no zk-proof verification and no
                 // authentication of the sender. No honest code path ever publishes it
-                // (the real, proof-gated flows are WithdrawalVerificationRequest and
-                // TransferVerificationRequest), so any traffic on this variant is
+                // (the real, proof-gated flow is TransactVerificationRequest),
+                // so any traffic on this variant is
                 // unauthenticated and untrusted. Applying it would let any mesh peer
                 // mark arbitrary nullifiers spent (bricking honest notes) or append
                 // junk commitments (corrupting the Merkle root that proof verification
@@ -465,236 +358,6 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             }
 
             // Consensus messages
-            Message::WithdrawalVerificationRequest { request } => {
-                info!(
-                    "Received withdrawal verification request: {}",
-                    request.request_id
-                );
-
-                // Verify withdrawal zkSNARK proof if privacy pool is available
-                let vote = if let Some(pool) = &self.shielded_pool {
-                    match self.verify_withdrawal_proof(&request, pool).await {
-                        Ok(true) => {
-                            info!(
-                                "Withdrawal proof verified successfully: {}",
-                                request.request_id
-                            );
-                            crate::consensus::withdrawal::VerificationVote::Valid
-                        }
-                        Ok(false) => {
-                            log::warn!(
-                                "Withdrawal proof verification failed: {}",
-                                request.request_id
-                            );
-                            crate::consensus::withdrawal::VerificationVote::Invalid {
-                                reason: "Proof verification failed".to_string(),
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Error verifying withdrawal proof {}: {}",
-                                request.request_id,
-                                e
-                            );
-                            crate::consensus::withdrawal::VerificationVote::Invalid {
-                                reason: format!("Verification error: {}", e),
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!("Privacy pool not available, cannot verify proof");
-                    crate::consensus::withdrawal::VerificationVote::Invalid {
-                        reason: "Privacy pool not available".to_string(),
-                    }
-                };
-
-                // Remember a request we verified Valid so we can later co-sign
-                // its settlement, but only the exact parameters we saw (#260).
-                if matches!(vote, crate::consensus::withdrawal::VerificationVote::Valid) {
-                    cache_verified(
-                        &self.verified_withdrawals,
-                        request.request_id.clone(),
-                        request.clone(),
-                    )
-                    .await;
-                }
-
-                // Send verification result back to source (coordinator)
-                let result = crate::consensus::withdrawal::WithdrawalVerificationResult {
-                    request_id: request.request_id,
-                    validator: self.node_info.id.clone(),
-                    vote,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                };
-
-                let response = Message::WithdrawalVerificationResult { result };
-                if let Err(e) = self.network.send_message(source.clone(), response).await {
-                    log::error!("Failed to send verification result: {}", e);
-                }
-            }
-            Message::WithdrawalVerificationResult { result } => {
-                info!(
-                    "Received withdrawal verification result: {}",
-                    result.request_id
-                );
-                // A vote must come from the validator it claims to be (audit):
-                // `result.validator` is set by the sender, so without this check
-                // one peer could submit votes under every validator's identity
-                // and fabricate a quorum. `source` is the authenticated gossip
-                // publisher, so reject any vote whose claimed validator does not
-                // match the sender.
-                if result.validator != source {
-                    log::warn!(
-                        "dropping withdrawal vote for {}: claimed validator {:?} != sender {:?}",
-                        result.request_id,
-                        result.validator,
-                        source
-                    );
-                    return Ok(());
-                }
-                // Route the vote into the withdrawal coordinator (#164).
-                // On the node that started this verification, a vote that
-                // completes the quorum makes the coordinator emit an
-                // approval, which the submitter task settles on-chain. A
-                // node that never started this request has no pending
-                // entry — submit_result errors and we drop the vote.
-                if let Some(coordinator) = &self.withdrawal_coordinator {
-                    if let Err(e) = coordinator.submit_result(result).await {
-                        log::debug!("dropping withdrawal vote: {}", e);
-                    }
-                }
-            }
-            Message::TransferVerificationRequest { request } => {
-                info!(
-                    "Received transfer verification request: {}",
-                    request.request_id
-                );
-
-                // Verify the transfer zkSNARK proof if a privacy pool is
-                // available, mirroring the withdrawal path (#194).
-                let vote = if let Some(pool) = &self.shielded_pool {
-                    match self.verify_transfer_proof(&request, pool).await {
-                        Ok(true) => {
-                            // The proof proves the inputs are in the CURRENT
-                            // root, but settlement also advances the published
-                            // root to `new_merkle_root`, which is not a proof
-                            // input. Recompute the root this transfer's output
-                            // commitments actually produce and refuse to vote
-                            // Valid on a mismatch — otherwise a settler could
-                            // advance the root to a fabricated-note tree and
-                            // then withdraw against it.
-                            let appended: Vec<crate::privacy::types::Commitment> = request
-                                .output_commitments
-                                .iter()
-                                .map(|c| crate::privacy::types::Commitment::from_bytes(*c))
-                                .collect();
-                            let expected_root = pool.root_after(&appended).await;
-                            if expected_root != request.new_merkle_root {
-                                log::warn!(
-                                    "Transfer {} proposes a new_merkle_root inconsistent with its output commitments; voting Invalid",
-                                    request.request_id
-                                );
-                                crate::consensus::vote_tally::VerificationVote::Invalid {
-                                    reason: "new_merkle_root does not match the appended output commitments".to_string(),
-                                }
-                            } else {
-                                info!(
-                                    "Transfer proof verified successfully: {}",
-                                    request.request_id
-                                );
-                                // Record the encrypted output notes for recipient
-                                // scanning (#196) only AFTER the proof verifies — an
-                                // unauthenticated peer cannot pollute the scan buffer
-                                // with notes from an unverified (garbage) transfer.
-                                self.record_delivered_notes(
-                                    &request.output_commitments,
-                                    &request.ciphertexts,
-                                )
-                                .await;
-                                crate::consensus::vote_tally::VerificationVote::Valid
-                            }
-                        }
-                        Ok(false) => {
-                            log::warn!(
-                                "Transfer proof verification failed: {}",
-                                request.request_id
-                            );
-                            crate::consensus::vote_tally::VerificationVote::Invalid {
-                                reason: "Proof verification failed".to_string(),
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Error verifying transfer proof {}: {}",
-                                request.request_id,
-                                e
-                            );
-                            crate::consensus::vote_tally::VerificationVote::Invalid {
-                                reason: format!("Verification error: {}", e),
-                            }
-                        }
-                    }
-                } else {
-                    log::warn!("Privacy pool not available, cannot verify transfer proof");
-                    crate::consensus::vote_tally::VerificationVote::Invalid {
-                        reason: "Privacy pool not available".to_string(),
-                    }
-                };
-
-                // Remember a transfer we verified Valid so we can later co-sign
-                // its settlement against the exact parameters we saw (#260).
-                if matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid) {
-                    cache_verified(
-                        &self.verified_transfers,
-                        request.request_id.clone(),
-                        request.clone(),
-                    )
-                    .await;
-                }
-
-                let result = crate::consensus::transfer::TransferVerificationResult {
-                    request_id: request.request_id,
-                    validator: self.node_info.id.clone(),
-                    vote,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                };
-
-                let response = Message::TransferVerificationResult { result };
-                if let Err(e) = self.network.send_message(source.clone(), response).await {
-                    log::error!("Failed to send transfer verification result: {}", e);
-                }
-            }
-            Message::TransferVerificationResult { result } => {
-                info!(
-                    "Received transfer verification result: {}",
-                    result.request_id
-                );
-                // The vote must come from the validator it claims to be (audit),
-                // mirroring the withdrawal path: reject any whose claimed
-                // validator does not match the authenticated gossip sender.
-                if result.validator != source {
-                    log::warn!(
-                        "dropping transfer vote for {}: claimed validator {:?} != sender {:?}",
-                        result.request_id,
-                        result.validator,
-                        source
-                    );
-                    return Ok(());
-                }
-                // Route the vote into the transfer coordinator (#194); a node
-                // that never started this request drops it.
-                if let Some(coordinator) = &self.transfer_coordinator {
-                    if let Err(e) = coordinator.submit_result(result).await {
-                        log::debug!("dropping transfer vote: {}", e);
-                    }
-                }
-            }
             Message::TransactVerificationRequest { request } => {
                 info!(
                     "Received transact verification request: {}",
@@ -1099,10 +762,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         Ok(cosign_settlement(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
-            &self.verified_withdrawals,
-            &self.verified_transfers,
             &self.verified_transacts,
-            self.shielded_pool.as_ref(),
             request,
         )
         .await)
@@ -1117,10 +777,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
-    verified_withdrawals: &Arc<Mutex<HashMap<String, WithdrawalVerificationRequest>>>,
-    verified_transfers: &Arc<Mutex<HashMap<String, TransferVerificationRequest>>>,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
-    shielded_pool: Option<&Arc<crate::privacy::pool::ShieldedPool>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -1154,36 +811,6 @@ async fn cosign_settlement(
     // and binding parameters.
     let approved = match (request.kind, &payload.params) {
         (
-            SettlementKind::Withdrawal,
-            SettlementParams::Withdrawal {
-                recipient,
-                amount,
-                nullifier,
-                ..
-            },
-        ) => {
-            let cache = verified_withdrawals.lock().await;
-            cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient && req.amount == *amount && req.nullifier == *nullifier
-            })
-        }
-        (
-            SettlementKind::Transfer,
-            SettlementParams::Transfer {
-                nullifiers,
-                output_commitments,
-                new_merkle_root,
-                ..
-            },
-        ) => {
-            let cache = verified_transfers.lock().await;
-            cache.get(&request.request_id).is_some_and(|req| {
-                req.nullifiers == *nullifiers
-                    && req.output_commitments == *output_commitments
-                    && req.new_merkle_root == *new_merkle_root
-            })
-        }
-        (
             SettlementKind::Transact,
             SettlementParams::Transact {
                 recipient,
@@ -1203,23 +830,6 @@ async fn cosign_settlement(
                     && req.ext_amount == *ext_amount
             })
         }
-        (
-            SettlementKind::UpdateMerkleRoot,
-            SettlementParams::UpdateMerkleRoot { new_merkle_root },
-        ) => {
-            // Co-sign a root publish only if the proposed root is one our OWN
-            // pool computed (current tip or a recent root) — so a malicious
-            // leader cannot muster the quorum to publish a forged root that a
-            // fabricated-note withdrawal could then verify against. Unlike the
-            // withdrawal/transfer arms this is keyed on pool state, not a cached
-            // request id: any node can propose the live root and every honest
-            // co-signer independently agrees it is real.
-            match shielded_pool {
-                Some(pool) => pool.knows_root(new_merkle_root).await,
-                None => false,
-            }
-        }
-        _ => false,
     };
     if !approved {
         return declined("parameters do not match a settlement we verified");
@@ -1250,72 +860,9 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
     )
 }
 
-/// Drain the consensus approval channel, settling each withdrawal via
-/// `submit` (#164).
-///
-/// The approval channel is local to the coordinator that reached quorum: only
-/// the node that gathered the votes for a request — the one the client
-/// submitted it to — emits an [`ApprovedWithdrawal`] here, so exactly one node
-/// settles and there is nothing to gate. (An earlier version gated submission
-/// on a deterministically-selected leader, assuming the approval was gossiped
-/// to every node. It is not — the channel is in-process — so the chosen leader
-/// usually did not hold the approval and the settlement was silently dropped.
-/// Replay protection on the nullifier PDA still makes a duplicate submit safe
-/// if the model ever changes to several nodes tallying independently.)
-///
-/// A per-message failure — including a replay whose nullifier is already spent
-/// — is logged and skipped so it cannot kill the task and stall later
-/// approvals.
-async fn settle_approved_withdrawals<F, Fut>(
-    mut rx: mpsc::UnboundedReceiver<ApprovedWithdrawal>,
-    mut submit: F,
-) where
-    F: FnMut(ApprovedWithdrawal) -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
-{
-    while let Some(approved) = rx.recv().await {
-        let request_id = approved.request_id.clone();
-        match submit(approved).await {
-            Ok(sig) => info!("on-chain withdraw submitted for {}: {}", request_id, sig),
-            Err(e) if is_replay_error(&e) => {
-                log::debug!(
-                    "withdrawal {} already settled (nullifier spent), skipping",
-                    request_id
-                )
-            }
-            Err(e) => log::warn!("withdrawal {} submit failed: {}", request_id, e),
-        }
-    }
-}
-
-/// Drain the transfer coordinator's approval channel and settle each approved
-/// transfer on-chain (#194), the transfer twin of [`settle_approved_withdrawals`].
-/// A per-message failure — including a replay whose nullifier is already spent —
-/// is logged and skipped so it cannot stall later approvals.
-async fn settle_approved_transfers<F, Fut>(
-    mut rx: mpsc::UnboundedReceiver<ApprovedTransfer>,
-    mut submit: F,
-) where
-    F: FnMut(ApprovedTransfer) -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
-{
-    while let Some(approved) = rx.recv().await {
-        let request_id = approved.request_id.clone();
-        match submit(approved).await {
-            Ok(sig) => info!("on-chain transfer settled for {}: {}", request_id, sig),
-            Err(e) if is_replay_error(&e) => {
-                log::debug!(
-                    "transfer {} already settled (nullifier spent), skipping",
-                    request_id
-                )
-            }
-            Err(e) => log::warn!("transfer {} submit failed: {}", request_id, e),
-        }
-    }
-}
-
 /// Drain the transact coordinator's approval channel and settle each approved
-/// unified transact on-chain (#350), the v3 twin of [`settle_approved_transfers`].
+/// unified transact on-chain (#350). The approval channel is local to the
+/// coordinator that reached quorum, so exactly one node settles.
 /// A per-message failure — including a replay whose nullifier is already spent —
 /// is logged and skipped so it cannot stall later approvals.
 async fn settle_approved_transacts<F, Fut>(
@@ -1503,45 +1050,17 @@ impl Node {
         // Withdrawal consensus coordinator + its approval channel (#164).
         // Built only on bridge-enabled validator/bridge nodes; the
         // receiver is held until run() spawns the submitter task.
-        let (withdrawal_coordinator, approval_rx) = if runs_bridge {
-            let (mut coord, rx) = WithdrawalVerificationCoordinator::new_with_approvals();
-            // Optional config override of the BFT consensus defaults (7/10/rep200).
-            // Unset on mainnet → the secure defaults stand; devnet lowers them in
-            // validator.toml to settle with a small live cohort. The on-chain
-            // stake-weighted 2/3 quorum remains the real security gate.
-            if let (Some(min), Some(total)) = (
-                settings.bridge.consensus_min_validators,
-                settings.bridge.consensus_total_validators,
-            ) {
-                coord.set_consensus_thresholds(min, total);
-            }
-            if let Some(rep) = settings.bridge.consensus_min_reputation {
-                coord.set_min_reputation_for_consensus(rep);
-            }
-            (Some(Arc::new(coord)), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        // Transfer consensus coordinator + its approval channel (#194), the
-        // transfer twin of the withdrawal pair above.
-        let (transfer_coordinator, transfer_approval_rx) = if runs_bridge {
-            let (coord, rx) = TransferVerificationCoordinator::new_with_approvals();
-            (Some(Arc::new(coord)), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        // Transact consensus coordinator + its approval channel (#350), the
-        // v3 unified-transact twin of the transfer pair above; the receiver
-        // is held until run() spawns the transact submitter task.
+        // Transact consensus coordinator + its approval channel (#350); the
+        // receiver is held until run() spawns the transact submitter task. This
+        // is the sole settlement consensus flow (the legacy off-chain-root
+        // withdrawal/transfer coordinators were removed).
         let (transact_coordinator, transact_approval_rx) = if runs_bridge {
             let (mut coord, rx) = TransactVerificationCoordinator::new_with_approvals();
-            // Same config override as the withdrawal/transfer coordinators: without
-            // it the transact coordinator keeps the 7/10 BFT defaults, so a small
-            // live cohort (devnet 2/2) never reaches a Valid quorum and settlement
-            // silently times out. The on-chain stake-weighted quorum stays the
-            // real security gate.
+            // Optional config override of the BFT consensus defaults (7/10/rep200).
+            // Unset on mainnet → the secure defaults stand; devnet lowers them in
+            // validator.toml to settle with a small live cohort (2/2), otherwise
+            // it never reaches a Valid quorum and settlement silently times out.
+            // The on-chain stake-weighted 2/3 quorum stays the real security gate.
             if let (Some(min), Some(total)) = (
                 settings.bridge.consensus_min_validators,
                 settings.bridge.consensus_total_validators,
@@ -1574,16 +1093,6 @@ impl Node {
             ha_watchdog: Arc::new(Mutex::new(None)),
             kad_refresh: Arc::new(Mutex::new(None)),
             path_server: Arc::new(Mutex::new(None)),
-            withdrawal_coordinator,
-            approval_rx: Arc::new(Mutex::new(approval_rx)),
-            submitter_task: Arc::new(Mutex::new(None)),
-            proof_verifier_override: None,
-            withdrawal_ingress: Arc::new(Mutex::new(None)),
-            transfer_coordinator,
-            transfer_approval_rx: Arc::new(Mutex::new(transfer_approval_rx)),
-            transfer_submitter_task: Arc::new(Mutex::new(None)),
-            transfer_proof_verifier_override: None,
-            transfer_ingress: Arc::new(Mutex::new(None)),
             transact_coordinator,
             transact_approval_rx: Arc::new(Mutex::new(transact_approval_rx)),
             transact_submitter_task: Arc::new(Mutex::new(None)),
@@ -1591,71 +1100,17 @@ impl Node {
             transact_ingress: Arc::new(Mutex::new(None)),
             delivered_notes: Arc::new(Mutex::new(Vec::new())),
             cosign_keypair,
-            verified_withdrawals: Arc::new(Mutex::new(HashMap::new())),
-            verified_transfers: Arc::new(Mutex::new(HashMap::new())),
             verified_transacts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         Ok(node)
     }
 
-    /// Inject a withdrawal-proof verifier, overriding the real Groth16 path
-    /// (#181). Intended for the multi-node consensus E2E, whose goal is to
+    /// Inject a transact-proof verifier override (#350 testing seam),
+    /// overriding the real Groth16 path so a multi-node consensus E2E can
     /// exercise the libp2p gossip → vote → quorum wiring rather than the
     /// cryptographic proof itself (covered by the privacy circuit tests and
-    /// the on-chain settlement test). Production never calls this, so
-    /// verification always uses the real verifier.
-    pub fn with_proof_verifier(mut self, verifier: WithdrawalProofVerifier) -> Self {
-        self.proof_verifier_override = Some(verifier);
-        self
-    }
-
-    /// Override the withdrawal-consensus quorum thresholds (#181, testing
-    /// seam — deliberately NOT wired to any config file). Production builds
-    /// the node via `new()`, which always uses the BFT-safe defaults
-    /// (7-of-10); because these thresholds are unreachable from a settings
-    /// file, an operator can never weaken the quorum by misconfiguration and
-    /// there is no runtime attack surface — reaching this requires writing
-    /// and compiling code. A multi-node E2E calls it to drive consensus with
-    /// a small validator set (e.g. 3-of-5).
-    ///
-    /// Must be called right after `new()`, before `run()` clones the node:
-    /// the coordinator is uniquely owned then, so `Arc::get_mut` succeeds.
-    /// A no-op on a node with no withdrawal coordinator, or once cloned.
-    pub fn with_consensus_thresholds(
-        mut self,
-        min_validators: usize,
-        total_validators: usize,
-    ) -> Self {
-        if let Some(coordinator) = self.withdrawal_coordinator.as_mut().and_then(Arc::get_mut) {
-            coordinator.set_consensus_thresholds(min_validators, total_validators);
-        }
-        self
-    }
-
-    /// Inject a transfer-proof verifier override (#194 testing seam), the
-    /// transfer twin of [`with_proof_verifier`](Self::with_proof_verifier).
-    pub fn with_transfer_proof_verifier(mut self, verifier: TransferProofVerifier) -> Self {
-        self.transfer_proof_verifier_override = Some(verifier);
-        self
-    }
-
-    /// Override the transfer-consensus quorum thresholds (#194 testing seam),
-    /// the transfer twin of [`with_consensus_thresholds`](Self::with_consensus_thresholds).
-    /// Must be called right after `new()`, before `run()` clones the node.
-    pub fn with_transfer_consensus_thresholds(
-        mut self,
-        min_validators: usize,
-        total_validators: usize,
-    ) -> Self {
-        if let Some(coordinator) = self.transfer_coordinator.as_mut().and_then(Arc::get_mut) {
-            coordinator.set_consensus_thresholds(min_validators, total_validators);
-        }
-        self
-    }
-
-    /// Inject a transact-proof verifier override (#350 testing seam), the
-    /// transact twin of [`with_proof_verifier`](Self::with_proof_verifier).
+    /// the on-chain settlement test). Production never calls this.
     pub fn with_transact_proof_verifier(mut self, verifier: TransactProofVerifier) -> Self {
         self.transact_proof_verifier_override = Some(verifier);
         self
@@ -1694,66 +1149,6 @@ impl Node {
     /// node with no transact coordinator.
     pub async fn transact_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
         match &self.transact_coordinator {
-            Some(coordinator) => {
-                let (_pct, valid, invalid) = coordinator.get_status(request_id).await?;
-                Ok(Some((valid, invalid)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Quorum status for a transfer verification this node initiated (#194).
-    /// `Ok(Some(vote))` once a quorum is reached, `Ok(None)` while votes
-    /// accumulate or on a node with no transfer coordinator.
-    pub async fn transfer_consensus_status(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<crate::consensus::vote_tally::VerificationVote>> {
-        match &self.transfer_coordinator {
-            Some(coordinator) => coordinator.check_consensus(request_id).await,
-            None => Ok(None),
-        }
-    }
-
-    /// `(valid, invalid)` transfer-vote tally for a request this node
-    /// initiated (#194), the transfer twin of
-    /// [`withdrawal_vote_counts`](Self::withdrawal_vote_counts). Lets a test
-    /// confirm a byzantine validator's dissent reached the quorum and was
-    /// outvoted. `Ok(None)` on a node with no transfer coordinator.
-    pub async fn transfer_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
-        match &self.transfer_coordinator {
-            Some(coordinator) => {
-                let (_pct, valid, invalid) = coordinator.get_status(request_id).await?;
-                Ok(Some((valid, invalid)))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Consensus status for a withdrawal verification this node initiated
-    /// (#181). Delegates to the withdrawal coordinator's quorum check:
-    /// `Ok(Some(vote))` once a validator quorum is reached, `Ok(None)` while
-    /// votes are still accumulating, `Ok(None)` on a node with no withdrawal
-    /// coordinator. Lets a test observe quorum without reaching into the
-    /// node's internals.
-    pub async fn withdrawal_consensus_status(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<crate::consensus::withdrawal::VerificationVote>> {
-        match &self.withdrawal_coordinator {
-            Some(coordinator) => coordinator.check_consensus(request_id).await,
-            None => Ok(None),
-        }
-    }
-
-    /// Tally of `(valid, invalid)` votes seen so far for a withdrawal
-    /// verification this node initiated (#181). Read-only view over the
-    /// coordinator's status — lets a test confirm that a byzantine
-    /// (Invalid-voting) validator's dissent actually reached the quorum and
-    /// was outvoted, rather than just observing the final Valid result.
-    /// `Ok(None)` on a node with no withdrawal coordinator.
-    pub async fn withdrawal_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
-        match &self.withdrawal_coordinator {
             Some(coordinator) => {
                 let (_pct, valid, invalid) = coordinator.get_status(request_id).await?;
                 Ok(Some((valid, invalid)))
@@ -1871,13 +1266,8 @@ impl Node {
         // dropped, so the set tracks real connectivity independent of gossip
         // timing. A wallet learned via Discovery is preserved — registration is
         // wallet-preserving — and is what the #260 co-sign step uses.
-        if self.withdrawal_coordinator.is_some()
-            || self.transfer_coordinator.is_some()
-            || self.transact_coordinator.is_some()
-        {
+        if self.transact_coordinator.is_some() {
             let network = Arc::clone(&self.network);
-            let withdrawal = self.withdrawal_coordinator.clone();
-            let transfer = self.transfer_coordinator.clone();
             let transact = self.transact_coordinator.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1888,23 +1278,11 @@ impl Node {
                     let connected: std::collections::HashSet<NodeId> =
                         network.connected_peers().await.into_iter().collect();
                     for peer in connected.difference(&registered) {
-                        if let Some(w) = &withdrawal {
-                            w.register_validator_with_wallet(peer.clone(), None).await;
-                        }
-                        if let Some(t) = &transfer {
-                            t.register_validator_with_wallet(peer.clone(), None).await;
-                        }
                         if let Some(t) = &transact {
                             t.register_validator_with_wallet(peer.clone(), None).await;
                         }
                     }
                     for peer in registered.difference(&connected) {
-                        if let Some(w) = &withdrawal {
-                            w.unregister_validator(peer).await;
-                        }
-                        if let Some(t) = &transfer {
-                            t.unregister_validator(peer).await;
-                        }
                         if let Some(t) = &transact {
                             t.unregister_validator(peer).await;
                         }
@@ -2026,12 +1404,7 @@ impl Node {
         // cannot grow unbounded. The ingress write-surface inserts a request
         // before any proof check, and entries that never reach quorum were
         // never reclaimed; this drives the existing per-coordinator cleanup.
-        if self.withdrawal_coordinator.is_some()
-            || self.transfer_coordinator.is_some()
-            || self.transact_coordinator.is_some()
-        {
-            let withdrawal = self.withdrawal_coordinator.clone();
-            let transfer = self.transfer_coordinator.clone();
+        if self.transact_coordinator.is_some() {
             let transact = self.transact_coordinator.clone();
             let status_clone = self.status.clone();
             tokio::spawn(async move {
@@ -2040,20 +1413,6 @@ impl Node {
                     if !matches!(current_status, NodeStatus::Running) {
                         info!("Verification timeout sweeper shutting down");
                         break;
-                    }
-                    if let Some(w) = &withdrawal {
-                        if let Ok(n) = w.cleanup_timeouts().await {
-                            if n > 0 {
-                                info!("Swept {} timed-out withdrawal verifications", n);
-                            }
-                        }
-                    }
-                    if let Some(t) = &transfer {
-                        if let Ok(n) = t.cleanup_timeouts().await {
-                            if n > 0 {
-                                info!("Swept {} timed-out transfer verifications", n);
-                            }
-                        }
                     }
                     if let Some(t) = &transact {
                         if let Ok(n) = t.cleanup_timeouts().await {
@@ -2189,114 +1548,11 @@ impl Node {
             }
         }
 
-        // Serve the withdrawal-verification ingress over HTTP (#184) so a
-        // client (wallet/CLI) can submit a withdrawal into the consensus
-        // mesh. Only runs on a node that has a withdrawal coordinator and a
-        // configured address; an empty address (the default) disables it, an
-        // unparseable one is logged and skipped rather than failing start-up.
-        if self.withdrawal_coordinator.is_some() {
-            let addr_str = self.settings.bridge.withdrawal_ingress_address.trim();
-            if !addr_str.is_empty() {
-                match addr_str.parse::<std::net::SocketAddr>() {
-                    Ok(addr) => {
-                        let ingress: Arc<dyn withdrawal_ingress::WithdrawalIngress> =
-                            Arc::new(self.clone());
-                        let token =
-                            ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
-                        let handle = tokio::spawn(async move {
-                            if let Err(e) = withdrawal_ingress::serve(ingress, addr, token).await {
-                                log::error!(
-                                    target: "paraloom::node::withdrawal_ingress",
-                                    "withdrawal ingress server exited: {}",
-                                    e
-                                );
-                            }
-                        });
-                        *self.withdrawal_ingress.lock().await = Some(handle);
-                        info!("Withdrawal ingress server started on {}", addr_str);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "invalid bridge.withdrawal_ingress_address '{}': {} — ingress not started",
-                            addr_str,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Settle consensus-approved withdrawals (#164). Drains the
-        // approval channel the withdrawal coordinator pushes to when a
-        // validator quorum approves a withdrawal, and submits each
-        // on-chain via the bridge. A per-message failure — including a
-        // replay whose nullifier is already spent — is logged and
-        // skipped so it cannot kill the task and stall later approvals.
-        if let (Some(bridge), Some(_coordinator), Some(rx)) = (
-            self.bridge.clone(),
-            self.withdrawal_coordinator.clone(),
-            self.approval_rx.lock().await.take(),
-        ) {
-            // Settle via the #260 co-signing quorum when configured to and a
-            // co-signing key is present; otherwise fall back to the single-key
-            // submitter (a solo operator with no peers to co-sign).
-            let use_cosign =
-                self.settings.bridge.use_cosign_settlement && self.cosign_keypair.is_some();
-            let node = self.clone();
-            let handle = tokio::spawn(settle_approved_withdrawals(rx, move |approved| {
-                let bridge = bridge.clone();
-                let node = node.clone();
-                async move {
-                    if use_cosign {
-                        node.settle_via_cosign(approved).await
-                    } else {
-                        bridge.lock().await.submit_approved(approved).await
-                    }
-                }
-            }));
-            *self.submitter_task.lock().await = Some(handle);
-            info!(
-                "withdrawal submitter task started (co-signing: {})",
-                use_cosign
-            );
-        }
-
-        // Serve the transfer-verification ingress over HTTP (#194), the
-        // transfer twin of the withdrawal ingress above.
-        if self.transfer_coordinator.is_some() {
-            let addr_str = self.settings.bridge.transfer_ingress_address.trim();
-            if !addr_str.is_empty() {
-                match addr_str.parse::<std::net::SocketAddr>() {
-                    Ok(addr) => {
-                        let ingress: Arc<dyn transfer_ingress::TransferIngress> =
-                            Arc::new(self.clone());
-                        let token =
-                            ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
-                        let handle = tokio::spawn(async move {
-                            if let Err(e) = transfer_ingress::serve(ingress, addr, token).await {
-                                log::error!(
-                                    target: "paraloom::node::transfer_ingress",
-                                    "transfer ingress server exited: {}",
-                                    e
-                                );
-                            }
-                        });
-                        *self.transfer_ingress.lock().await = Some(handle);
-                        info!("Transfer ingress server started on {}", addr_str);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "invalid bridge.transfer_ingress_address '{}': {} — ingress not started",
-                            addr_str,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Serve the transact-verification ingress over HTTP (#350), the v3
-        // unified-transact twin of the transfer ingress above.
+        // Serve the transact-verification ingress over HTTP (#350) so a client
+        // (wallet/CLI) can submit a settlement into the consensus mesh. Only
+        // runs on a node that has a transact coordinator and a configured
+        // address; an empty address (the default) disables it, an unparseable
+        // one is logged and skipped rather than failing start-up.
         if self.transact_coordinator.is_some() {
             let addr_str = self.settings.bridge.transact_ingress_address.trim();
             if !addr_str.is_empty() {
@@ -2329,43 +1585,10 @@ impl Node {
             }
         }
 
-        // Settle consensus-approved transfers (#194), the transfer twin of the
-        // withdrawal submitter task above.
-        if let (Some(bridge), Some(_coordinator), Some(rx)) = (
-            self.bridge.clone(),
-            self.transfer_coordinator.clone(),
-            self.transfer_approval_rx.lock().await.take(),
-        ) {
-            // Settle via the #260 co-signing quorum when configured to and a
-            // co-signing key is present; otherwise fall back to the single-key
-            // submitter (a solo operator with no peers to co-sign).
-            let use_cosign =
-                self.settings.bridge.use_cosign_settlement && self.cosign_keypair.is_some();
-            let node = self.clone();
-            let handle = tokio::spawn(settle_approved_transfers(rx, move |approved| {
-                let bridge = bridge.clone();
-                let node = node.clone();
-                async move {
-                    if use_cosign {
-                        node.settle_transfer_via_cosign(approved).await
-                    } else {
-                        bridge.lock().await.submit_approved_transfer(approved).await
-                    }
-                }
-            }));
-            *self.transfer_submitter_task.lock().await = Some(handle);
-            info!(
-                "transfer submitter task started (co-signing: {})",
-                use_cosign
-            );
-        }
-
-        // Settle consensus-approved unified transacts (#350), the v3 twin of
-        // the transfer submitter task above. Unlike the older paths there is
-        // no single-key fallback: the `transact` instruction settles
-        // exclusively through the #260 co-signing quorum, so a node without a
-        // settlement keypair logs each approval's failure rather than
-        // settling it single-key.
+        // Settle consensus-approved unified transacts (#350). The `transact`
+        // instruction settles exclusively through the #260 co-signing quorum
+        // (no single-key fallback), so a node without a settlement keypair logs
+        // each approval's failure rather than settling it single-key.
         if let (Some(_bridge), Some(_coordinator), Some(rx)) = (
             self.bridge.clone(),
             self.transact_coordinator.clone(),
@@ -2425,18 +1648,6 @@ impl Node {
         if let Some(handle) = self.path_server.lock().await.take() {
             handle.abort();
         }
-        if let Some(handle) = self.submitter_task.lock().await.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.withdrawal_ingress.lock().await.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.transfer_submitter_task.lock().await.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.transfer_ingress.lock().await.take() {
-            handle.abort();
-        }
         if let Some(handle) = self.transact_submitter_task.lock().await.take() {
             handle.abort();
         }
@@ -2470,135 +1681,7 @@ impl Node {
         self.coordinator.clone()
     }
 
-    /// Get the withdrawal consensus coordinator (#164), if this node runs
-    /// one. Exposed so an integration harness can drive verification
-    /// (start_verification + submit_result) against the same coordinator
-    /// whose approvals the node's submitter task settles on-chain.
-    pub fn withdrawal_coordinator(&self) -> Option<Arc<WithdrawalVerificationCoordinator>> {
-        self.withdrawal_coordinator.clone()
-    }
-
-    /// Initiate distributed verification of a withdrawal (#175).
-    ///
-    /// Records the request with this node's withdrawal coordinator and
-    /// broadcasts it to the validator set over the gossip mesh, so
-    /// validators verify and vote without the request having to be driven
-    /// into the coordinator by hand. Votes flood back as
-    /// `WithdrawalVerificationResult`, route into the coordinator (#164),
-    /// and the resulting approval is settled on-chain by the leader's
-    /// submitter task. Returns the request id.
-    ///
-    /// Errors if this node runs no withdrawal coordinator, or if
-    /// `start_verification` rejects the request (e.g. the known validator
-    /// set is below the consensus quorum).
-    pub async fn initiate_withdrawal_verification(
-        &self,
-        mut request: crate::consensus::WithdrawalVerificationRequest,
-    ) -> Result<String> {
-        // Fill the prover root with our current pool root when the submitter did
-        // not provide one (an older wallet that predates the field). Doing it
-        // before the broadcast means our own self-verify and every remote
-        // validator check the proof against a concrete, knowable root rather
-        // than the all-zero default. A wallet that DID send its root keeps it,
-        // which is what lets a validator on a divergent tip still verify.
-        if request.prover_root == [0u8; 32] {
-            if let Some(pool) = &self.shielded_pool {
-                request.prover_root = pool.root().await;
-            }
-        }
-        let coordinator = self.withdrawal_coordinator.as_ref().ok_or_else(|| {
-            anyhow!("node has no withdrawal coordinator (bridge disabled or non-validator)")
-        })?;
-        let request_id = coordinator.start_verification(request.clone()).await?;
-
-        // The initiating node must vote on its OWN withdrawal. libp2p gossipsub
-        // does not echo a node's own published message, so the broadcast below
-        // never returns to us via the receive handler — without this the
-        // initiator contributes no vote of its own. Verify against the
-        // in-process pool (the same Arc the path server served the wallet's root
-        // from) and submit our own vote, registering self into the validator set
-        // first so it is non-empty. This is one vote toward the BFT quorum, not a
-        // bypass of it: with the mainnet 2/3 threshold the initiator still needs
-        // the rest of the cohort.
-        if let Some(pool) = &self.shielded_pool {
-            let self_id = self.node_info.id.clone();
-            let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
-            coordinator
-                .register_validator_with_wallet(self_id.clone(), wallet)
-                .await;
-            let vote = match self.verify_withdrawal_proof(&request, pool).await {
-                Ok(true) => {
-                    cache_verified(
-                        &self.verified_withdrawals,
-                        request_id.clone(),
-                        request.clone(),
-                    )
-                    .await;
-                    crate::consensus::withdrawal::VerificationVote::Valid
-                }
-                Ok(false) => crate::consensus::withdrawal::VerificationVote::Invalid {
-                    reason: "self-verify: proof verification failed".to_string(),
-                },
-                Err(e) => crate::consensus::withdrawal::VerificationVote::Invalid {
-                    reason: format!("self-verify error: {e}"),
-                },
-            };
-            let result = crate::consensus::withdrawal::WithdrawalVerificationResult {
-                request_id: request_id.clone(),
-                validator: self_id,
-                vote,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            };
-            if let Err(e) = coordinator.submit_result(result).await {
-                log::debug!("self-vote submit_result dropped for {request_id}: {e}");
-            }
-        }
-
-        // send_message broadcasts to the whole gossip topic — the peer
-        // argument is ignored by the network layer — so every validator
-        // receives the request to verify.
-        self.network
-            .send_message(
-                NodeId(vec![]),
-                Message::WithdrawalVerificationRequest { request },
-            )
-            .await?;
-        info!("initiated withdrawal verification: {}", request_id);
-        Ok(request_id)
-    }
-
-    /// Initiate distributed verification of a shielded transfer (#194), the
-    /// transfer twin of [`initiate_withdrawal_verification`](Self::initiate_withdrawal_verification).
-    /// Records the request with this node's transfer coordinator and broadcasts
-    /// it over the gossip mesh; validators verify and vote, and the resulting
-    /// approval is settled on-chain by this node's transfer submitter task.
-    pub async fn initiate_transfer_verification(
-        &self,
-        request: crate::consensus::TransferVerificationRequest,
-    ) -> Result<String> {
-        let coordinator = self.transfer_coordinator.as_ref().ok_or_else(|| {
-            anyhow!("node has no transfer coordinator (bridge disabled or non-validator)")
-        })?;
-        let request_id = coordinator.start_verification(request.clone()).await?;
-        // Record the encrypted notes locally (#196): the initiator does not
-        // receive its own gossip broadcast, so it stores here to serve scan.
-        self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
-            .await;
-        self.network
-            .send_message(
-                NodeId(vec![]),
-                Message::TransferVerificationRequest { request },
-            )
-            .await?;
-        info!("initiated transfer verification: {}", request_id);
-        Ok(request_id)
-    }
-
-    /// Initiate distributed verification of a v3 unified transact (#350), the
-    /// transact twin of [`initiate_transfer_verification`](Self::initiate_transfer_verification).
+    /// Initiate distributed verification of a v3 unified transact (#350).
     /// Records the request with this node's transact coordinator and broadcasts
     /// it over the gossip mesh; validators verify and vote. The approval a
     /// quorum produces is queued on `transact_approval_rx` for the transact
@@ -2684,7 +1767,7 @@ impl Node {
 
         let mut store = self.delivered_notes.lock().await;
         for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
-            let note = transfer_ingress::DeliveredNote {
+            let note = transact_ingress::DeliveredNote {
                 output_commitment: hex::encode(commitment),
                 ciphertext: ciphertext.clone(),
             };
@@ -2702,8 +1785,8 @@ impl Node {
     }
 
     /// Snapshot of the encrypted notes this node has seen (#196), for the
-    /// `GET /transfer/scan` endpoint.
-    pub async fn delivered_transfer_notes(&self) -> Vec<transfer_ingress::DeliveredNote> {
+    /// `GET /transact/scan` endpoint.
+    pub async fn delivered_transfer_notes(&self) -> Vec<transact_ingress::DeliveredNote> {
         self.delivered_notes.lock().await.clone()
     }
 
@@ -2720,320 +1803,8 @@ impl Node {
         self.node_info.clone()
     }
 
-    /// Run the co-signing round for an approved withdrawal as the round leader
-    /// and return the assembled, fully-signed settlement transaction (#260).
-    ///
-    /// Collects signatures from the validators that approved this withdrawal —
-    /// mapped to their advertised settlement wallets — and assembles them to
-    /// meet the on-chain validator quorum. `blockhash` and `expiration_slot` are
-    /// supplied by the caller (the submitter fetches a live blockhash and bound;
-    /// tests pass fixed values). This is the integration point the settlement
-    /// submitter drives; it is `pub` so the multi-node end-to-end test can drive
-    /// the same path.
-    pub async fn cosign_settlement_tx(
-        &self,
-        approved: &ApprovedWithdrawal,
-        blockhash: [u8; 32],
-        expiration_slot: u64,
-    ) -> Result<Transaction> {
-        let leader = self
-            .cosign_keypair
-            .as_ref()
-            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
-        let coordinator = self
-            .withdrawal_coordinator
-            .as_ref()
-            .ok_or_else(|| anyhow!("no withdrawal coordinator"))?;
-
-        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
-            .map_err(|e| anyhow!("invalid program id: {e}"))?;
-        let (vault, _) = derive_bridge_vault(&program_id);
-
-        // The validators that approved this withdrawal become the co-signer
-        // quorum, mapped to the settlement wallets they advertised via
-        // discovery. The leader signs as itself and is excluded from the peers
-        // it requests from.
-        let self_id = self.node_info.id.clone();
-        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&approved.request_id).await {
-            if voter == self_id {
-                continue;
-            }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
-                }
-            }
-        }
-        let mut quorum_wallets = vec![leader.pubkey()];
-        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-
-        // Every wallet in the set is marked a required signer in the
-        // instruction, so the transaction is only valid once all of them have
-        // signed: the gather threshold is the whole set. The on-chain program
-        // enforces its own supermajority (programs/paraloom/src/quorum.rs) over
-        // the registry, so if too few operators participated the assembled
-        // transaction simply fails on submit rather than settling under-quorum.
-        let threshold = quorum_wallets.len();
-
-        // The on-chain program verifies the proof in its 256-byte alt_bn128 wire
-        // form; convert the prover's compressed proof.
-        let onchain_proof =
-            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&approved.proof)
-                .map_err(|e| anyhow!("withdrawal proof: {e}"))?;
-        let params = SettlementParams::Withdrawal {
-            recipient: approved.recipient,
-            amount: approved.amount,
-            nullifier: approved.nullifier,
-            expiration_slot,
-            proof: onchain_proof.to_vec(),
-        };
-
-        let network = self.network.clone();
-        cosign_round::run_cosign_round(
-            leader,
-            program_id,
-            vault,
-            blockhash,
-            &approved.request_id,
-            SettlementKind::Withdrawal,
-            params,
-            quorum_wallets,
-            &peers,
-            threshold,
-            |peer, request| {
-                let network = network.clone();
-                async move { network.send_cosign_request(peer, request).await.ok() }
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("co-signing round failed: {e}"))
-    }
-
-    /// Assemble the co-signed multi-sig `update_merkle_root` transaction (#260):
-    /// publish `new_merkle_root` on-chain under the validator quorum so a
-    /// subsequent `withdraw` verifies against it (the deposit listener never
-    /// advances `bridge_state.merkle_root`). The co-signer set is the registered
-    /// validators that advertised a wallet — this root publish is not tied to one
-    /// approved request, and every co-signer independently confirms the root
-    /// against its own pool before signing (see `cosign_settlement`).
-    pub async fn cosign_update_merkle_root_tx(
-        &self,
-        new_merkle_root: [u8; 32],
-        blockhash: [u8; 32],
-        request_id: &str,
-    ) -> Result<Transaction> {
-        let leader = self
-            .cosign_keypair
-            .as_ref()
-            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
-        let coordinator = self
-            .withdrawal_coordinator
-            .as_ref()
-            .ok_or_else(|| anyhow!("no withdrawal coordinator"))?;
-
-        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
-            .map_err(|e| anyhow!("invalid program id: {e}"))?;
-        // build_settlement_message ignores the vault for this settlement kind;
-        // derive it anyway so the payload shape matches the withdrawal round.
-        let (vault, _) = derive_bridge_vault(&program_id);
-
-        // Co-signer set = the validators that voted Valid on THIS withdrawal (the
-        // same set the withdraw round uses), NOT the whole advertised registry.
-        // Those voters already verified the proof against this exact root (the
-        // verify is gated on pool.knows_root), so they agree it is real; and a
-        // peer that merely advertised a co-sign wallet over Discovery without
-        // voting is excluded. That closes the n-of-n griefing where one
-        // unsignable advertised wallet would stall every withdrawal's root round.
-        let self_id = self.node_info.id.clone();
-        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(request_id).await {
-            if voter == self_id {
-                continue;
-            }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
-                }
-            }
-        }
-        let mut quorum_wallets = vec![leader.pubkey()];
-        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
-
-        let params = SettlementParams::UpdateMerkleRoot { new_merkle_root };
-        let round_id = format!("update-root-{}", hex::encode(new_merkle_root));
-        let network = self.network.clone();
-        cosign_round::run_cosign_round(
-            leader,
-            program_id,
-            vault,
-            blockhash,
-            &round_id,
-            SettlementKind::UpdateMerkleRoot,
-            params,
-            quorum_wallets,
-            &peers,
-            threshold,
-            |peer, request| {
-                let network = network.clone();
-                async move { network.send_cosign_request(peer, request).await.ok() }
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("update_merkle_root co-signing round failed: {e}"))
-    }
-
-    /// Settle a quorum-approved withdrawal via the #260 co-signing path: gather
-    /// the approving validators' signatures into one multi-sig transaction and
-    /// submit it, instead of signing single-key. The blockhash baked into the
-    /// co-signed transaction is the one this submit will confirm against. A
-    /// co-signing-round failure maps to `WithdrawalFailed`; the on-chain submit
-    /// error is preserved as its `BridgeError` so the caller's replay detection
-    /// (nullifier already spent) still applies.
-    async fn settle_via_cosign(
-        &self,
-        approved: ApprovedWithdrawal,
-    ) -> std::result::Result<String, crate::bridge::BridgeError> {
-        use crate::bridge::BridgeError;
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| BridgeError::ConfigError("no bridge configured".to_string()))?;
-
-        let (blockhash, current_slot) = {
-            let b = bridge.lock().await;
-            (b.latest_blockhash().await?, b.current_slot().await?)
-        };
-        let expiration_slot =
-            current_slot + self.settings.bridge.withdrawal_expiration_window_slots;
-
-        // Publish the root the proof was built against, via the co-signed
-        // update_merkle_root round, BEFORE the withdraw — the on-chain withdraw
-        // verifies the proof against bridge_state.merkle_root, which the deposit
-        // listener never advances, so without this it would verify against a
-        // stale root. Submit (and confirm) it first so the withdraw that follows
-        // sees the updated root. Skipped when the prover root is unset (an older
-        // wallet that didn't send its root): the on-chain root is then left as-is.
-        if approved.prover_root != [0u8; 32] {
-            let root_tx = self
-                .cosign_update_merkle_root_tx(approved.prover_root, blockhash, &approved.request_id)
-                .await
-                .map_err(|e| BridgeError::WithdrawalFailed(format!("root publish round: {e}")))?;
-            bridge
-                .lock()
-                .await
-                .submit_signed_transaction(&root_tx)
-                .await?;
-        }
-
-        let tx = self
-            .cosign_settlement_tx(&approved, blockhash, expiration_slot)
-            .await
-            .map_err(|e| BridgeError::WithdrawalFailed(format!("co-signing round: {e}")))?;
-
-        bridge.lock().await.submit_signed_transaction(&tx).await
-    }
-
     /// Assemble the co-signed multi-sig transaction for a quorum-approved
-    /// shielded transfer (#260) — the transfer twin of `cosign_settlement_tx`.
-    /// No funds move, so there is no expiration window or vault payout: the
-    /// `shielded_transfer` instruction nullifies two inputs and appends two
-    /// output commitments. The approving validators co-sign over libp2p and the
-    /// leader assembles their signatures into one transaction.
-    pub async fn cosign_settlement_transfer_tx(
-        &self,
-        approved: &ApprovedTransfer,
-        blockhash: [u8; 32],
-    ) -> Result<Transaction> {
-        let leader = self
-            .cosign_keypair
-            .as_ref()
-            .ok_or_else(|| anyhow!("no settlement keypair configured"))?;
-        let coordinator = self
-            .transfer_coordinator
-            .as_ref()
-            .ok_or_else(|| anyhow!("no transfer coordinator"))?;
-
-        let program_id = Pubkey::from_str(&self.settings.bridge.program_id)
-            .map_err(|e| anyhow!("invalid program id: {e}"))?;
-        let (vault, _) = derive_bridge_vault(&program_id);
-
-        // The validators that approved this transfer become the co-signer
-        // quorum, mapped to their advertised settlement wallets; the leader
-        // signs as itself and is excluded from the peers it requests from.
-        let self_id = self.node_info.id.clone();
-        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&approved.request_id).await {
-            if voter == self_id {
-                continue;
-            }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
-                }
-            }
-        }
-        let mut quorum_wallets = vec![leader.pubkey()];
-        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
-
-        let onchain_proof =
-            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&approved.proof)
-                .map_err(|e| anyhow!("transfer proof: {e}"))?;
-        let params = SettlementParams::Transfer {
-            nullifiers: approved.nullifiers,
-            output_commitments: approved.output_commitments,
-            new_merkle_root: approved.new_merkle_root,
-            proof: onchain_proof.to_vec(),
-        };
-
-        let network = self.network.clone();
-        cosign_round::run_cosign_round(
-            leader,
-            program_id,
-            vault,
-            blockhash,
-            &approved.request_id,
-            SettlementKind::Transfer,
-            params,
-            quorum_wallets,
-            &peers,
-            threshold,
-            |peer, request| {
-                let network = network.clone();
-                async move { network.send_cosign_request(peer, request).await.ok() }
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("co-signing round failed: {e}"))
-    }
-
-    /// Settle a quorum-approved shielded transfer via the #260 co-signing path,
-    /// the transfer twin of `settle_via_cosign`. The on-chain submit error is
-    /// preserved as its `BridgeError` so the caller's replay detection still
-    /// applies; a co-signing-round failure maps to `Network`.
-    async fn settle_transfer_via_cosign(
-        &self,
-        approved: ApprovedTransfer,
-    ) -> std::result::Result<String, crate::bridge::BridgeError> {
-        use crate::bridge::BridgeError;
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| BridgeError::ConfigError("no bridge configured".to_string()))?;
-
-        let blockhash = bridge.lock().await.latest_blockhash().await?;
-        let tx = self
-            .cosign_settlement_transfer_tx(&approved, blockhash)
-            .await
-            .map_err(|e| BridgeError::Network(format!("transfer co-signing round: {e}")))?;
-
-        bridge.lock().await.submit_signed_transaction(&tx).await
-    }
-
-    /// Assemble the co-signed multi-sig transaction for a quorum-approved
-    /// unified transact (#350) — the v3 twin of `cosign_settlement_transfer_tx`.
+    /// unified transact (#350). This is the sole settlement path.
     /// The `transact` instruction nullifies two inputs, appends two output
     /// commitments, and pays out `|ext_amount|` from the vault when the signed
     /// external flow is negative (zero for a pure shielded transfer). The
@@ -3258,103 +2029,7 @@ impl Node {
         self.compute_executor.clone()
     }
 
-    /// Verify withdrawal zkSNARK proof
-    async fn verify_withdrawal_proof(
-        &self,
-        request: &crate::consensus::withdrawal::WithdrawalVerificationRequest,
-        pool: &Arc<crate::privacy::pool::ShieldedPool>,
-    ) -> Result<bool> {
-        // Override seam (#181): when a verifier is injected, use it instead
-        // of the real Groth16 path. Never set in production.
-        if let Some(verifier) = &self.proof_verifier_override {
-            return Ok(verifier(request));
-        }
-
-        // Delegate to the canonical withdrawal verifier (#184) so the
-        // verifying key (the trusted-setup ceremony key) and the public-input
-        // layout match the prover (`generate-withdrawal-proof`) exactly. The
-        // earlier path here generated an ephemeral seed-0 key and lifted the
-        // inputs with `bytes_to_field`, so a real proof never verified — it
-        // only passed under the injected verifier above.
-        // Verify against the root the PROVER built the proof against (carried in
-        // the request), not our own current tip: a validator whose tree has
-        // advanced past that root would otherwise reject a perfectly valid proof
-        // on a benign root mismatch. Gate on the pool having actually computed
-        // that root recently so a forged/arbitrary root cannot be presented —
-        // and the nullifier independently prevents double-spends regardless of
-        // which historical root the proof names.
-        let merkle_root = request.prover_root;
-        if !pool.knows_root(&merkle_root).await {
-            log::warn!(
-                "withdrawal proof rejected for {}: prover root {} not recognized by this pool",
-                request.request_id,
-                hex::encode(merkle_root)
-            );
-            return Ok(false);
-        }
-        // WithdrawCircuitV2 binds the recipient via ext_data_hash and the asset
-        // id; derive them exactly as the on-chain program and the prover-wasm do
-        // so the off-chain verifier lifts the same five public inputs.
-        let ext_data_hash =
-            crate::privacy::proof::withdraw_ext_data_hash(&request.recipient, request.amount);
-        let result = crate::privacy::ProofVerifier::verify_withdrawal_parts(
-            &merkle_root,
-            &request.nullifier,
-            request.amount,
-            &ext_data_hash,
-            &crate::privacy::proof::NATIVE_SOL_ASSET_ID,
-            &request.proof,
-        );
-        if let crate::privacy::VerificationResult::Invalid { reason } = &result {
-            log::warn!(
-                "withdrawal proof rejected for {}: {}",
-                request.request_id,
-                reason
-            );
-        }
-        Ok(matches!(result, crate::privacy::VerificationResult::Valid))
-    }
-
-    /// Verify a transfer zkSNARK proof (#194), the transfer twin of
-    /// [`verify_withdrawal_proof`](Self::verify_withdrawal_proof). The proof's
-    /// membership root is the pool's *current* root (the request's
-    /// `new_merkle_root` is the post-state, used only at settle), and the
-    /// public inputs are `[root, nullifiers.., output_commitments..]`.
-    async fn verify_transfer_proof(
-        &self,
-        request: &crate::consensus::transfer::TransferVerificationRequest,
-        pool: &Arc<crate::privacy::pool::ShieldedPool>,
-    ) -> Result<bool> {
-        // Override seam (#194): use the injected verifier when present.
-        if let Some(verifier) = &self.transfer_proof_verifier_override {
-            return Ok(verifier(request));
-        }
-
-        // NOTE: the transfer path still verifies against this node's own current
-        // root. The cross-node root-binding the withdrawal path uses (carry the
-        // prover's root in the request + accept any recently-known root) should
-        // be mirrored here so transfers also settle across validators with
-        // divergent tips. TransferVerificationRequest needs a `prover_root` field
-        // for that; tracked as a follow-up to keep this PR scoped to withdrawals.
-        let merkle_root = pool.root().await;
-        let result = crate::privacy::ProofVerifier::verify_transfer_parts(
-            &merkle_root,
-            &request.nullifiers,
-            &request.output_commitments,
-            &request.proof,
-        );
-        if let crate::privacy::VerificationResult::Invalid { reason } = &result {
-            log::warn!(
-                "transfer proof rejected for {}: {}",
-                request.request_id,
-                reason
-            );
-        }
-        Ok(matches!(result, crate::privacy::VerificationResult::Valid))
-    }
-
-    /// Verify a v3 unified-transact zkSNARK proof (#350), the transact twin of
-    /// [`verify_transfer_proof`](Self::verify_transfer_proof).
+    /// Verify a v3 unified-transact zkSNARK proof (#350).
     ///
     /// Deliberately NOT verified against `pool.root().await`: the v3 proof is
     /// built against `request.root` — the on-chain incremental-tree root
@@ -3416,16 +2091,6 @@ impl Clone for Node {
             kad_refresh: self.kad_refresh.clone(),
             bridge: self.bridge.clone(),
             path_server: self.path_server.clone(),
-            withdrawal_coordinator: self.withdrawal_coordinator.clone(),
-            approval_rx: self.approval_rx.clone(),
-            submitter_task: self.submitter_task.clone(),
-            proof_verifier_override: self.proof_verifier_override.clone(),
-            withdrawal_ingress: self.withdrawal_ingress.clone(),
-            transfer_coordinator: self.transfer_coordinator.clone(),
-            transfer_approval_rx: self.transfer_approval_rx.clone(),
-            transfer_submitter_task: self.transfer_submitter_task.clone(),
-            transfer_proof_verifier_override: self.transfer_proof_verifier_override.clone(),
-            transfer_ingress: self.transfer_ingress.clone(),
             transact_coordinator: self.transact_coordinator.clone(),
             transact_approval_rx: self.transact_approval_rx.clone(),
             transact_submitter_task: self.transact_submitter_task.clone(),
@@ -3433,8 +2098,6 @@ impl Clone for Node {
             transact_ingress: self.transact_ingress.clone(),
             delivered_notes: self.delivered_notes.clone(),
             cosign_keypair: self.cosign_keypair.clone(),
-            verified_withdrawals: self.verified_withdrawals.clone(),
-            verified_transfers: self.verified_transfers.clone(),
             verified_transacts: self.verified_transacts.clone(),
         }
     }
@@ -3446,47 +2109,7 @@ mod tests {
     use crate::config::Settings;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // --- #260 co-sign handler (cosign_settlement) ---
-
-    fn wd_request(
-        id: &str,
-        recipient: [u8; 32],
-        amount: u64,
-        nullifier: [u8; 32],
-    ) -> WithdrawalVerificationRequest {
-        WithdrawalVerificationRequest {
-            request_id: id.to_string(),
-            nullifier,
-            amount,
-            recipient,
-            proof: vec![0u8; 256],
-            fee: 0,
-            timestamp: 0,
-            prover_root: [0u8; 32],
-        }
-    }
-
-    fn wd_payload(
-        authority: [u8; 32],
-        recipient: [u8; 32],
-        amount: u64,
-        nullifier: [u8; 32],
-    ) -> CoSignPayload {
-        CoSignPayload {
-            program_id: [1u8; 32],
-            authority,
-            bridge_vault: [3u8; 32],
-            blockhash: [4u8; 32],
-            quorum_validators: vec![authority],
-            params: SettlementParams::Withdrawal {
-                recipient,
-                amount,
-                nullifier,
-                expiration_slot: u64::MAX,
-                proof: vec![0u8; 256],
-            },
-        }
-    }
+    // --- #260/#350 co-sign handler (cosign_settlement), v3 transact ---
 
     fn cosign_req(id: &str, kind: SettlementKind, payload: &CoSignPayload) -> CoSignRequest {
         CoSignRequest {
@@ -3496,217 +2119,63 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn cosign_update_merkle_root_only_for_a_root_the_pool_knows() {
-        let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
-        let tas = Arc::new(Mutex::new(HashMap::new()));
-
-        // A pool whose live root we will propose, plus a stranger root we won't.
-        let pool = Arc::new(crate::privacy::pool::ShieldedPool::new());
-        let known_root = pool.root().await;
-        let stranger_root = [0xABu8; 32];
-
-        let payload = |root: [u8; 32]| CoSignPayload {
-            program_id: configured_program().to_bytes(),
-            authority: kp.pubkey().to_bytes(),
-            bridge_vault: [0u8; 32],
-            blockhash: [4u8; 32],
-            quorum_validators: vec![kp.pubkey().to_bytes()],
-            params: SettlementParams::UpdateMerkleRoot {
-                new_merkle_root: root,
-            },
-        };
-
-        // A root our pool actually computed → co-signed.
-        let ok = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            Some(&pool),
-            cosign_req("r1", SettlementKind::UpdateMerkleRoot, &payload(known_root)),
-        )
-        .await;
-        assert!(
-            ok.signature.is_some(),
-            "must co-sign a root the pool knows (no cached request id needed)"
-        );
-
-        // A root the pool never computed → declined, even though it is otherwise
-        // a well-formed request. This is the guard against a leader mustering the
-        // quorum to publish a forged root.
-        let no = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            Some(&pool),
-            cosign_req(
-                "r2",
-                SettlementKind::UpdateMerkleRoot,
-                &payload(stranger_root),
-            ),
-        )
-        .await;
-        assert!(no.signature.is_none(), "must not co-sign an unknown root");
-
-        // No pool wired (non-bridge node) → cannot verify, so it declines.
-        let nopool = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            None,
-            cosign_req("r3", SettlementKind::UpdateMerkleRoot, &payload(known_root)),
-        )
-        .await;
-        assert!(nopool.signature.is_none());
-    }
-
-    #[tokio::test]
-    async fn cosign_signs_a_settlement_we_verified() {
-        let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
-        let tas = Arc::new(Mutex::new(HashMap::new()));
-
-        let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
-        wds.lock()
-            .await
-            .insert("w1".into(), wd_request("w1", recipient, amount, nullifier));
-
-        let payload = wd_payload(kp.pubkey().to_bytes(), recipient, amount, nullifier);
-        let resp = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            None,
-            cosign_req("w1", SettlementKind::Withdrawal, &payload),
-        )
-        .await;
-
-        assert_eq!(resp.request_id, "w1");
-        assert_eq!(resp.wallet_pubkey, kp.pubkey().to_string());
-        let sig_bytes = resp.signature.expect("must sign a settlement it verified");
-        // The signature must verify against the message we would actually submit.
-        let message = build_settlement_message(&payload).expect("build message");
-        let sig = solana_sdk::signature::Signature::try_from(sig_bytes.as_slice()).expect("sig");
-        assert!(
-            sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
-            "the returned signature must be valid over the rebuilt settlement message"
-        );
-    }
-
-    #[tokio::test]
-    async fn cosign_declines_a_substituted_recipient() {
-        let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
-        let tas = Arc::new(Mutex::new(HashMap::new()));
-
-        let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
-        wds.lock()
-            .await
-            .insert("w1".into(), wd_request("w1", recipient, amount, nullifier));
-
-        // Leader tries to redirect the funds to a different recipient.
-        let tampered = wd_payload(kp.pubkey().to_bytes(), [0xFF; 32], amount, nullifier);
-        let resp = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            None,
-            cosign_req("w1", SettlementKind::Withdrawal, &tampered),
-        )
-        .await;
-        assert_eq!(
-            resp.signature, None,
-            "a substituted recipient must be declined even though we verified the original"
-        );
-    }
-
-    #[tokio::test]
-    async fn cosign_declines_unknown_request_and_without_keypair() {
-        let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
-        let tas = Arc::new(Mutex::new(HashMap::new()));
-        let payload = wd_payload(kp.pubkey().to_bytes(), [9u8; 32], 1, [7u8; 32]);
-
-        // Never verified this request id.
-        let unknown = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            None,
-            cosign_req("nope", SettlementKind::Withdrawal, &payload),
-        )
-        .await;
-        assert_eq!(unknown.signature, None);
-
-        // No keypair configured at all.
-        wds.lock()
-            .await
-            .insert("w1".into(), wd_request("w1", [9u8; 32], 1, [7u8; 32]));
-        let no_key = cosign_settlement(
-            None,
-            &configured_program(),
-            &wds,
-            &trs,
-            &tas,
-            None,
-            cosign_req("w1", SettlementKind::Withdrawal, &payload),
-        )
-        .await;
-        assert_eq!(no_key.signature, None);
-    }
-
-    /// The program id baked into the test payloads (`wd_payload`).
+    /// The program id baked into the test payloads (`ta_payload`).
     fn configured_program() -> Pubkey {
         Pubkey::new_from_array([1u8; 32])
     }
 
     #[tokio::test]
-    async fn cosign_declines_a_program_id_we_did_not_configure() {
+    async fn cosign_declines_unknown_request_and_without_keypair_and_wrong_program() {
         let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
         let tas = Arc::new(Mutex::new(HashMap::new()));
 
-        let (recipient, amount, nullifier) = ([9u8; 32], 1_000_000_000u64, [7u8; 32]);
-        wds.lock()
-            .await
-            .insert("w1".into(), wd_request("w1", recipient, amount, nullifier));
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1i64;
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
 
-        // The payload carries the program we configured ([1u8; 32]); we pass a
-        // DIFFERENT configured program, so the co-signer must refuse to sign a
-        // message invoking a program it did not configure.
-        let payload = wd_payload(kp.pubkey().to_bytes(), recipient, amount, nullifier);
-        let resp = cosign_settlement(
+        // Never verified this request id → declined.
+        let unknown = cosign_settlement(
             Some(&kp),
-            &Pubkey::new_from_array([2u8; 32]),
-            &wds,
-            &trs,
+            &configured_program(),
             &tas,
-            None,
-            cosign_req("w1", SettlementKind::Withdrawal, &payload),
+            cosign_req("nope", SettlementKind::Transact, &payload),
         )
         .await;
-        assert_eq!(
-            resp.signature, None,
-            "a payload program id that does not match our config must be declined"
+        assert_eq!(unknown.signature, None);
+
+        // No keypair configured at all → declined even for a verified request.
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
         );
+        let no_key = cosign_settlement(
+            None,
+            &configured_program(),
+            &tas,
+            cosign_req("t1", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(no_key.signature, None);
+
+        // A payload program id that does not match our config → declined.
+        let wrong_program = cosign_settlement(
+            Some(&kp),
+            &Pubkey::new_from_array([2u8; 32]),
+            &tas,
+            cosign_req("t1", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(wrong_program.signature, None);
     }
 
     // --- #350 co-sign handler, v3 unified-transact settlements ---
@@ -3760,8 +2229,6 @@ mod tests {
     #[tokio::test]
     async fn cosign_signs_a_transact_we_verified() {
         let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
         let tas = Arc::new(Mutex::new(HashMap::new()));
 
         let recipient = [9u8; 32];
@@ -3785,10 +2252,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
-            &wds,
-            &trs,
             &tas,
-            None,
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -3808,8 +2272,6 @@ mod tests {
     #[tokio::test]
     async fn cosign_declines_a_tampered_transact_parameter() {
         let kp = Arc::new(Keypair::new());
-        let wds = Arc::new(Mutex::new(HashMap::new()));
-        let trs = Arc::new(Mutex::new(HashMap::new()));
         let tas = Arc::new(Mutex::new(HashMap::new()));
 
         let recipient = [9u8; 32];
@@ -3834,10 +2296,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
-            &wds,
-            &trs,
             &tas,
-            None,
             cosign_req("t1", SettlementKind::Transact, &tampered_recipient),
         )
         .await;
@@ -3858,10 +2317,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
-            &wds,
-            &trs,
             &tas,
-            None,
             cosign_req("t1", SettlementKind::Transact, &tampered_ext),
         )
         .await;
@@ -3869,74 +2325,6 @@ mod tests {
             resp.signature, None,
             "a substituted ext_amount must be declined"
         );
-    }
-
-    fn approval(id: &str) -> ApprovedWithdrawal {
-        ApprovedWithdrawal {
-            request_id: id.to_string(),
-            nullifier: [0u8; 32],
-            amount: 1,
-            recipient: [0u8; 32],
-            proof: Vec::new(),
-            fee: 0,
-            prover_root: [0u8; 32],
-        }
-    }
-
-    // Every approval on the channel is settled: the submitter does not gate on
-    // leader selection. Regression for #164 — a leader gate here dropped
-    // approvals because the channel is in-process, not gossiped, so the
-    // deterministically-chosen leader rarely held the approval and the
-    // settlement was silently lost.
-    #[tokio::test]
-    async fn settles_every_approval_without_gating() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        for i in 0..3 {
-            tx.send(approval(&format!("req-{i}"))).unwrap();
-        }
-        drop(tx);
-
-        let submitted = Arc::new(AtomicUsize::new(0));
-        let counter = submitted.clone();
-        settle_approved_withdrawals(rx, move |_approved| {
-            let counter = counter.clone();
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok("signature".to_string())
-            }
-        })
-        .await;
-
-        assert_eq!(submitted.load(Ordering::SeqCst), 3);
-    }
-
-    // A replay (nullifier already spent) is skipped quietly and does not stop
-    // the task from settling later approvals.
-    #[tokio::test]
-    async fn replay_error_does_not_stall_later_approvals() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(approval("replayed")).unwrap();
-        tx.send(approval("fresh")).unwrap();
-        drop(tx);
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        settle_approved_withdrawals(rx, move |_approved| {
-            let counter = counter.clone();
-            async move {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    Err(crate::bridge::BridgeError::InvalidTransaction(
-                        "nullifier already spent".to_string(),
-                    ))
-                } else {
-                    Ok("signature".to_string())
-                }
-            }
-        })
-        .await;
-
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     fn ta_approval(id: &str) -> ApprovedTransact {
@@ -3953,7 +2341,10 @@ mod tests {
     }
 
     // The transact submitter drains every approval into the settle closure,
-    // ungated — the v3 twin of `settles_every_approval_without_gating`.
+    // ungated. Regression for #164 — a leader gate here dropped approvals
+    // because the channel is in-process, not gossiped, so the
+    // deterministically-chosen leader rarely held the approval and the
+    // settlement was silently lost.
     #[tokio::test]
     async fn settles_every_transact_approval_without_gating() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -4014,11 +2405,11 @@ mod tests {
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
-        assert!(node.withdrawal_coordinator.is_none());
+        assert!(node.transact_coordinator.is_none());
     }
 
     // A validator-class node (ResourceProvider) with the bridge enabled
-    // owns a shielded pool, a bridge manager, and a withdrawal
+    // owns a shielded pool, a bridge manager, and a transact
     // coordinator, so run() can start the deposit listener (#163) and the
     // consensus→submit pipeline (#164).
     #[test]
@@ -4028,7 +2419,7 @@ mod tests {
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_some());
         assert!(node.bridge.is_some());
-        assert!(node.withdrawal_coordinator.is_some());
+        assert!(node.transact_coordinator.is_some());
     }
 
     // A coordinator node does not index deposits even with the bridge
@@ -4041,174 +2432,6 @@ mod tests {
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
-        assert!(node.withdrawal_coordinator.is_none());
-    }
-
-    // A node without a withdrawal coordinator (bridge disabled) cannot
-    // initiate verification (#175).
-    #[tokio::test]
-    async fn initiate_withdrawal_errors_without_coordinator() {
-        let node = Node::new(Settings::development()).expect("construct node");
-        let request = crate::consensus::WithdrawalVerificationRequest {
-            request_id: "x".to_string(),
-            nullifier: [0u8; 32],
-            amount: 1,
-            recipient: [0u8; 32],
-            proof: vec![0u8; 8],
-            fee: 0,
-            timestamp: 0,
-            prover_root: [0u8; 32],
-        };
-        assert!(node
-            .initiate_withdrawal_verification(request)
-            .await
-            .is_err());
-    }
-
-    // On a bridge-enabled validator with a quorum-sized validator set
-    // registered, initiate_withdrawal_verification records the request
-    // and returns its id (#175). The broadcast is buffered on the network
-    // channel; delivery is exercised by the multi-node integration test.
-    #[tokio::test]
-    async fn initiate_withdrawal_starts_verification() {
-        let mut settings = Settings::development();
-        settings.bridge.enabled = true;
-        let node = Node::new(settings).expect("construct node");
-
-        let coordinator = node
-            .withdrawal_coordinator()
-            .expect("validator node has a withdrawal coordinator");
-        for i in 0..10u8 {
-            coordinator.register_validator(NodeId(vec![i])).await;
-        }
-
-        let request = crate::consensus::WithdrawalVerificationRequest {
-            request_id: "init-1".to_string(),
-            nullifier: [1u8; 32],
-            amount: 1000,
-            recipient: [2u8; 32],
-            proof: vec![0u8; 128],
-            fee: 10,
-            timestamp: 0,
-            prover_root: [0u8; 32],
-        };
-        let request_id = node
-            .initiate_withdrawal_verification(request)
-            .await
-            .expect("initiate succeeds with a quorum-sized validator set");
-        assert_eq!(request_id, "init-1");
-    }
-
-    // A ShieldedTransaction arriving over gossip must NOT mutate pool state. No
-    // honest path ever publishes this message (settlement goes through the
-    // proof-gated verification-request path), so any traffic on it is
-    // unauthenticated and untrusted. Applying it would let any mesh peer mark an
-    // arbitrary nullifier spent (bricking an honest user's note) or append junk
-    // commitments (corrupting the Merkle root that proof verification checks
-    // against). The handler now drops it without touching the pool.
-    #[tokio::test]
-    async fn shielded_transaction_gossip_does_not_mutate_pool() {
-        use crate::network::protocol::NetworkEventHandler;
-        use crate::privacy::transaction::{ShieldedTransaction, TransferTx, WithdrawTx};
-        use crate::privacy::types::{Note, Nullifier, ShieldedAddress};
-
-        let mut settings = Settings::development();
-        settings.bridge.enabled = true;
-        let node = Node::new(settings).expect("construct node");
-        let pool = node
-            .shielded_pool
-            .clone()
-            .expect("bridge-enabled validator owns a pool");
-
-        let before_commitments = pool.commitment_count().await;
-        let before_root = pool.root().await;
-
-        // A nullifier an honest user might later legitimately spend.
-        let victim = Nullifier([0x42u8; 32]);
-        assert!(!pool.is_spent(&victim).await);
-
-        // (1) A forged Withdraw must not mark the nullifier spent.
-        let withdraw = ShieldedTransaction::Withdraw(WithdrawTx::new(
-            victim.clone(),
-            1_000,
-            vec![9u8; 32],
-            [0u8; 32],
-            0,
-        ));
-        node.handle_message(
-            NodeId(vec![7]),
-            Message::ShieldedTransaction {
-                transaction: withdraw,
-            },
-        )
-        .await
-        .expect("the handler drops the message without erroring");
-        assert!(
-            !pool.is_spent(&victim).await,
-            "an unauthenticated gossip withdraw must not brick the nullifier"
-        );
-
-        // (2) A forged Transfer must not append junk commitments to the tree.
-        let junk = Note::new_native(ShieldedAddress::from_bytes([5u8; 32]), 7, [1u8; 32]);
-        let transfer = ShieldedTransaction::Transfer(TransferTx::new(
-            vec![Nullifier([0x99u8; 32])],
-            vec![junk],
-            [0u8; 32],
-            0,
-        ));
-        node.handle_message(
-            NodeId(vec![7]),
-            Message::ShieldedTransaction {
-                transaction: transfer,
-            },
-        )
-        .await
-        .expect("the handler drops the message without erroring");
-
-        assert_eq!(
-            pool.commitment_count().await,
-            before_commitments,
-            "an unauthenticated gossip transfer must not pollute the commitment tree"
-        );
-        assert_eq!(
-            pool.root().await,
-            before_root,
-            "the Merkle root must be unchanged by dropped gossip"
-        );
-    }
-
-    // A gossiped transfer whose proof does not verify must NOT record its output
-    // notes into the scan buffer — otherwise any peer could pollute it with
-    // notes from unverified (garbage) transfers. The notes are now recorded only
-    // after the proof verifies.
-    #[tokio::test]
-    async fn unverified_transfer_gossip_does_not_record_notes() {
-        use crate::network::protocol::NetworkEventHandler;
-
-        let mut settings = Settings::development();
-        settings.bridge.enabled = true;
-        let node = Node::new(settings).expect("construct node");
-        assert!(node.delivered_transfer_notes().await.is_empty());
-
-        let request = crate::consensus::TransferVerificationRequest {
-            request_id: "t-gossip".to_string(),
-            nullifiers: [[1u8; 32], [2u8; 32]],
-            output_commitments: [[3u8; 32], [4u8; 32]],
-            new_merkle_root: [5u8; 32],
-            proof: vec![0u8; 256], // garbage — does not verify
-            ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
-            timestamp: 0,
-        };
-        node.handle_message(
-            NodeId(vec![9]),
-            Message::TransferVerificationRequest { request },
-        )
-        .await
-        .expect("the handler processes the message");
-
-        assert!(
-            node.delivered_transfer_notes().await.is_empty(),
-            "an unverified gossip transfer must not record notes into the scan buffer"
-        );
+        assert!(node.transact_coordinator.is_none());
     }
 }

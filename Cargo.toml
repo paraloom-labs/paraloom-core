@@ -53,14 +53,6 @@ name = "bridge-init"
 path = "src/bin/bridge_init.rs"
 
 [[bin]]
-name = "test-deposit"
-path = "src/bin/test_deposit.rs"
-
-[[bin]]
-name = "test-withdraw"
-path = "src/bin/test_withdraw.rs"
-
-[[bin]]
 name = "compute-demo"
 path = "src/bin/compute_demo.rs"
 
@@ -90,14 +82,6 @@ name = "generate-withdrawal-proof"
 path = "src/bin/generate_withdrawal_proof.rs"
 
 [[bin]]
-name = "privacy-deposit"
-path = "src/bin/privacy_deposit.rs"
-
-[[bin]]
-name = "privacy-withdraw"
-path = "src/bin/privacy_withdraw.rs"
-
-[[bin]]
 name = "verify-privacy"
 path = "src/bin/verify_privacy.rs"
 
@@ -119,12 +103,12 @@ name = "init-merkle-tree"
 path = "src/bin/init_merkle_tree.rs"
 
 [[bin]]
-name = "register-validator"
-path = "src/bin/register_validator.rs"
+name = "demo-transact-v3"
+path = "src/bin/demo_transact_v3.rs"
 
 [[bin]]
-name = "demo-flow"
-path = "src/bin/demo_flow.rs"
+name = "register-validator"
+path = "src/bin/register_validator.rs"
 
 [[bin]]
 name = "private-swap-demo"

@@ -8,47 +8,37 @@ mod keypair;
 mod listener;
 mod program;
 pub mod rpc;
-mod submitter;
 #[cfg(test)]
 mod test_support;
 
 pub use cosign_assembly::{assemble_transaction, gather_signatures};
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
-    create_associated_token_account_idempotent_instruction, create_deposit_instruction,
-    create_deposit_spl_instruction, create_initialize_instruction,
+    create_deposit_note_instruction, create_initialize_instruction,
     create_initialize_merkle_tree_instruction, create_initialize_validator_registry_instruction,
     create_register_validator_instruction, create_reset_validator_registry_instruction,
-    create_set_bridge_authority_instruction, create_shielded_transfer_instruction,
-    create_update_merkle_root_instruction, create_withdraw_instruction,
-    create_withdraw_spl_instruction, derive_asset_vault, derive_asset_vault_authority,
-    derive_associated_token_address, derive_bridge_state, derive_bridge_vault,
-    derive_nullifier_account, derive_program_data, derive_validator_account,
-    derive_validator_registry, DepositInstructionData, DepositSplInstructionData,
-    ShieldedTransferInstructionData, WithdrawSplInstructionData,
-    SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+    create_set_bridge_authority_instruction, create_transact_instruction, derive_asset_vault,
+    derive_asset_vault_authority, derive_associated_token_address, derive_bridge_state,
+    derive_bridge_vault, derive_nullifier_account, derive_program_data, derive_validator_account,
+    derive_validator_registry, DepositInstructionData, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+    SPL_TOKEN_PROGRAM_ID,
 };
 pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;
 pub use program::ProgramInterface;
 pub use rpc::{BridgeRpc, RealBridgeRpc};
-pub use submitter::ResultSubmitter;
 
-use crate::bridge::{BridgeConfig, BridgeStats, Result, WithdrawalRequest};
-use crate::consensus::ApprovedWithdrawal;
+use crate::bridge::{BridgeConfig, BridgeStats, Result};
 use crate::privacy::ShieldedPool;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Solana bridge managing deposits and withdrawals
+/// Solana bridge managing deposits and settlement submission.
 pub struct SolanaBridge {
     /// Event listener for deposits
     listener: EventListener,
-
-    /// Result submitter for withdrawals
-    submitter: ResultSubmitter,
 
     /// Program interface
     program: ProgramInterface,
@@ -74,17 +64,11 @@ impl SolanaBridge {
             ),
         )));
         let program = ProgramInterface::new(config.clone(), Arc::clone(&rpc))?;
-        let listener = EventListener::new(
-            config.clone(),
-            Arc::clone(&rpc),
-            pool.clone(),
-            Arc::clone(&stats),
-        );
-        let submitter = ResultSubmitter::new(config, rpc, pool, Arc::clone(&stats))?;
+        let listener =
+            EventListener::new(config.clone(), Arc::clone(&rpc), pool, Arc::clone(&stats));
 
         Ok(Self {
             listener,
-            submitter,
             program,
             stats,
         })
@@ -105,24 +89,6 @@ impl SolanaBridge {
         self.listener.stop().await?;
 
         Ok(())
-    }
-
-    /// Submit a withdrawal to Solana
-    pub async fn submit_withdrawal(&self, request: WithdrawalRequest) -> Result<String> {
-        self.submitter.submit(request).await
-    }
-
-    /// Settle a consensus-approved withdrawal on-chain (#164).
-    pub async fn submit_approved(&self, approved: ApprovedWithdrawal) -> Result<String> {
-        self.submitter.submit_approved(approved).await
-    }
-
-    /// Settle a consensus-approved shielded transfer on-chain (#194).
-    pub async fn submit_approved_transfer(
-        &self,
-        approved: crate::consensus::ApprovedTransfer,
-    ) -> Result<String> {
-        self.submitter.submit_approved_transfer(approved).await
     }
 
     /// Latest blockhash for a node-assembled co-signed settlement tx (#260).

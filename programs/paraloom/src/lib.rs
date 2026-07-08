@@ -4,7 +4,6 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::bpf_loader_upgradeable;
-use anchor_spl::token::{transfer, Mint, Token, TokenAccount, Transfer};
 
 mod groth16;
 pub mod merkle_tree;
@@ -12,21 +11,14 @@ mod quorum;
 pub mod transact_fixture_data;
 mod transact_verifier;
 mod transact_vk_data;
-pub mod transfer_fixture_data;
-mod transfer_verifier;
-mod transfer_vk_data;
-pub mod withdraw_fixture_data;
-pub mod withdraw_spl_fixture_data;
-mod withdraw_verifier;
-mod withdraw_vk_data;
 
 declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
-/// Upper bound on the withdrawal proof blob. A BN254 Groth16 proof in the
+/// Upper bound on the settlement proof blob. A BN254 Groth16 proof in the
 /// `alt_bn128` wire form is exactly 256 bytes (see
-/// [`withdraw_verifier::WIRE_PROOF_LEN`]); the cap rejects oversized blobs that
+/// [`transact_verifier::WIRE_PROOF_LEN`]); the cap rejects oversized blobs that
 /// would only bloat the transaction (flagged alongside #178).
 pub const MAX_PROOF_LEN: usize = 256;
 
@@ -89,17 +81,6 @@ fn require_canonical_nullifier(nullifier: &[u8; 32]) -> Result<()> {
 /// Asset id of native SOL (#235): the all-zero 32 bytes. SPL assets use their
 /// mint's pubkey bytes instead.
 pub const NATIVE_SOL_ASSET: [u8; 32] = [0u8; 32];
-
-/// Hash of the external withdrawal data bound into the spend-key proof as the
-/// `ext_data_hash` public input (finding D): the destination and amount. The
-/// program derives it from the recipient it is about to pay, so a valid proof
-/// commits to exactly that recipient — a settling validator cannot redirect the
-/// payout. The off-chain prover MUST derive `ext_data_hash` identically:
-/// `sha256(recipient_pubkey || amount.to_le_bytes())`.
-fn withdraw_ext_data_hash(recipient: &Pubkey, amount: u64) -> [u8; 32] {
-    anchor_lang::solana_program::hash::hashv(&[recipient.as_ref(), &amount.to_le_bytes()])
-        .to_bytes()
-}
 
 /// External-data hash binding a `transact` settlement to its destination and
 /// signed external amount (circuit v3, finding D). The prover computes the
@@ -166,74 +147,6 @@ pub mod paraloom_program {
         Ok(())
     }
 
-    /// Update Merkle root
-    pub fn update_merkle_root(
-        ctx: Context<UpdateMerkleRoot>,
-        new_merkle_root: [u8; 32],
-    ) -> Result<()> {
-        // Publishing a new Merkle root anchors every subsequent withdrawal
-        // proof, so it carries the same fund-safety weight as settlement: a
-        // single key could otherwise install a forged root and drain the vault.
-        // Require the same BFT validator quorum (#260) that gates `withdraw` and
-        // `shielded_transfer`. The co-signers each recompute the appended root
-        // off-chain (#309) before signing, which is what enforces the
-        // append-only monotonicity the program cannot check without the tree.
-        quorum::verify_validator_quorum(
-            ctx.program_id,
-            &ctx.accounts.validator_registry,
-            ctx.remaining_accounts,
-        )?;
-
-        let bridge_state = &mut ctx.accounts.bridge_state;
-        bridge_state.merkle_root = new_merkle_root;
-
-        msg!("Merkle root updated");
-        Ok(())
-    }
-
-    /// Deposit SOL into the privacy pool
-    pub fn deposit(
-        ctx: Context<Deposit>,
-        amount: u64,
-        recipient: [u8; 32],
-        randomness: [u8; 32],
-    ) -> Result<()> {
-        let bridge_state = &mut ctx.accounts.bridge_state;
-
-        require!(!bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
-
-        let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.depositor.key(),
-            &ctx.accounts.bridge_vault.key(),
-            amount,
-        );
-
-        anchor_lang::solana_program::program::invoke(
-            &transfer_ix,
-            &[
-                ctx.accounts.depositor.to_account_info(),
-                ctx.accounts.bridge_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        bridge_state.total_deposited += amount;
-        bridge_state.deposit_count += 1;
-
-        emit!(DepositEvent {
-            depositor: ctx.accounts.depositor.key(),
-            amount,
-            recipient,
-            randomness,
-            timestamp: Clock::get()?.unix_timestamp,
-            deposit_id: bridge_state.deposit_count,
-        });
-
-        msg!("Deposit successful: {} lamports", amount);
-        Ok(())
-    }
-
     /// Deposit SOL and append the resulting note commitment to the on-chain
     /// tree (circuit v3, #350).
     ///
@@ -290,246 +203,6 @@ pub mod paraloom_program {
         });
 
         msg!("Deposit note appended at leaf {}", leaf_index);
-        Ok(())
-    }
-
-    /// Withdraw SOL from the privacy pool.
-    ///
-    /// Replay protection has two layers:
-    ///  1. The nullifier-keyed PDA (`seeds = [b"nullifier", nullifier]`)
-    ///     is `init`'d as part of this call. A second submission with
-    ///     the same nullifier — the bit-pattern uniquely identifying
-    ///     the spent note — fails on-chain because the PDA already
-    ///     exists. This is the primary defense.
-    ///  2. The caller commits to an `expiration_slot` at construction
-    ///     time. The program rejects the call if the current Solana
-    ///     slot is past it, so a request that leaks (e.g. through a
-    ///     stale RPC, a forked program state, or a long-running
-    ///     mempool) cannot be submitted indefinitely.
-    pub fn withdraw(
-        ctx: Context<Withdraw>,
-        nullifier: [u8; 32],
-        amount: u64,
-        expiration_slot: u64,
-        proof: Vec<u8>,
-    ) -> Result<()> {
-        let bridge_state = &mut ctx.accounts.bridge_state;
-
-        require!(!bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
-        require!(!proof.is_empty(), BridgeError::InvalidProof);
-        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
-
-        // Bind the proof to the actual destination (finding D); native SOL is
-        // asset id all-zero (finding A). Captured before the mutable borrow.
-        let ext_data_hash = withdraw_ext_data_hash(&ctx.accounts.recipient.key(), amount);
-
-        let current_slot = Clock::get()?.slot;
-        require!(
-            current_slot <= expiration_slot,
-            BridgeError::WithdrawalExpired
-        );
-
-        // Reject a non-canonical nullifier so a spent note cannot be re-settled
-        // under a different raw encoding that lifts to the same field element.
-        require_canonical_nullifier(&nullifier)?;
-
-        // Settlement requires a supermajority of registered validators to
-        // co-sign this transaction (#260) — no single key can settle alone.
-        quorum::verify_validator_quorum(
-            ctx.program_id,
-            &ctx.accounts.validator_registry,
-            ctx.remaining_accounts,
-        )?;
-
-        // Verify the Groth16 withdrawal proof on-chain (#165). The proof is
-        // bound to the program's published Merkle root and this withdrawal's
-        // nullifier, amount, destination (ext_data_hash) and asset, so the
-        // settling validator cannot forge a withdrawal, redirect it to a
-        // different recipient (finding D) or release it as a different asset
-        // (finding A) even though it holds the settlement authority.
-        require!(
-            withdraw_verifier::verify_withdrawal(
-                &bridge_state.merkle_root,
-                &nullifier,
-                amount,
-                &ext_data_hash,
-                &NATIVE_SOL_ASSET,
-                &proof,
-            ),
-            BridgeError::InvalidProof
-        );
-
-        let vault_balance = ctx.accounts.bridge_vault.lamports();
-        require!(vault_balance >= amount, BridgeError::InsufficientFunds);
-
-        // The settling validator earns a fee for gathering quorum and
-        // submitting this withdrawal. `has_one`-style seeds bind the
-        // `validator_account` to the `authority` signer, so the earner is
-        // exactly the validator that settled — no founder account, no
-        // third party. The fee is a cut of the amount: the recipient
-        // receives `amount - fee`, and `fee` stays in the vault as a claim
-        // recorded against the validator's `pending_rewards`.
-        let validator_account = &mut ctx.accounts.validator_account;
-        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
-
-        let fee = amount
-            .checked_mul(WITHDRAWAL_FEE_BPS)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(BridgeError::InvalidAmount)?;
-        // A fee of 0 (dust withdrawals below 1/WITHDRAWAL_FEE_BPS) is fine;
-        // the recipient simply receives the full amount. `fee < amount` is
-        // guaranteed since the rate is well under 100%.
-        let payout = amount - fee;
-
-        let nullifier_account = &mut ctx.accounts.nullifier_account;
-        nullifier_account.nullifier = nullifier;
-        nullifier_account.used_at = Clock::get()?.unix_timestamp;
-        nullifier_account.withdrawal_id = bridge_state.withdrawal_count + 1;
-
-        let vault_bump = ctx.bumps.bridge_vault;
-        let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
-        let signer_seeds = &[&seeds[..]];
-
-        anchor_lang::system_program::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.system_program.to_account_info(),
-                anchor_lang::system_program::Transfer {
-                    from: ctx.accounts.bridge_vault.to_account_info(),
-                    to: ctx.accounts.recipient.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            payout,
-        )?;
-
-        // Credit the fee to the settling validator (claimed later via
-        // `claim_rewards`) and record the settlement against its activity.
-        validator_account.pending_rewards += fee;
-        validator_account.successful_verifications += 1;
-        validator_account.last_active = Clock::get()?.unix_timestamp;
-
-        bridge_state.total_withdrawn += amount;
-        bridge_state.withdrawal_count += 1;
-
-        emit!(WithdrawalEvent {
-            recipient: ctx.accounts.recipient.key(),
-            amount,
-            nullifier,
-            timestamp: Clock::get()?.unix_timestamp,
-            withdrawal_id: bridge_state.withdrawal_count,
-        });
-
-        msg!(
-            "Withdrawal successful: {} lamports to recipient, {} fee to validator {}",
-            payout,
-            fee,
-            validator_account.validator
-        );
-        Ok(())
-    }
-
-    /// Settle a shielded → shielded transfer **without releasing funds**.
-    ///
-    /// Unlike `withdraw`, which always pays a recipient, a transfer spends
-    /// two input notes and creates two output notes that stay inside the
-    /// privacy pool. The program therefore:
-    ///  1. Records both input nullifiers as PDAs (`seeds = [b"nullifier",
-    ///     nullifier]`) — the same namespace `withdraw` uses, so a note can
-    ///     never be spent twice across either path. Anchor's `init` fails if
-    ///     a nullifier PDA already exists, which is the cross-transaction
-    ///     double-spend defense.
-    ///  2. Advances the Merkle root to the value the consensus leader
-    ///     computed after appending the two output commitments (the same
-    ///     off-chain-root model as `deposit` + `update_merkle_root`).
-    ///
-    /// Fixed 2-in/2-out (matching `MAX_INPUTS`/`MAX_OUTPUTS` in the circuit).
-    /// A single-note spend pads the second input with a random dummy
-    /// nullifier, so every transaction has a uniform shape and leaks nothing
-    /// about how many real notes were spent.
-    ///
-    /// As with `withdraw`, the Groth16 proof is verified on-chain (#194) via
-    /// `alt_bn128` against the current Merkle root and the transfer's
-    /// nullifiers + output commitments; the `has_one = authority` gate binds
-    /// settlement to the consensus leader.
-    pub fn shielded_transfer(
-        ctx: Context<ShieldedTransfer>,
-        nullifiers: [[u8; 32]; 2],
-        output_commitments: [[u8; 32]; 2],
-        new_merkle_root: [u8; 32],
-        proof: Vec<u8>,
-    ) -> Result<()> {
-        let bridge_state = &mut ctx.accounts.bridge_state;
-
-        require!(!bridge_state.paused, BridgeError::BridgePaused);
-        require!(!proof.is_empty(), BridgeError::InvalidProof);
-        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
-        // Reject non-canonical nullifiers so a spent note cannot be re-settled
-        // under a different raw encoding lifting to the same field element; this
-        // also keeps the distinctness check below from being bypassed by
-        // `n` vs `n + p` for the same note.
-        require_canonical_nullifier(&nullifiers[0])?;
-        require_canonical_nullifier(&nullifiers[1])?;
-
-        // Two equal input nullifiers would target the same PDA twice in one
-        // transaction; reject with a clear error instead of Anchor's opaque
-        // "account already initialized".
-        require!(
-            nullifiers[0] != nullifiers[1],
-            BridgeError::DuplicateNullifier
-        );
-
-        // Settlement requires a supermajority of registered validators to
-        // co-sign this transaction (#260) — no single key can settle alone.
-        quorum::verify_validator_quorum(
-            ctx.program_id,
-            &ctx.accounts.validator_registry,
-            ctx.remaining_accounts,
-        )?;
-
-        // Verify the Groth16 transfer proof on-chain (#194) against the current
-        // (pre-update) Merkle root and the transfer's nullifiers, output
-        // commitments and asset, before recording any state. As with `withdraw`,
-        // this means the settling validator cannot forge a transfer even though
-        // it holds the settlement authority. Shielded transfers are native-only,
-        // so the bound asset is NATIVE_SOL (finding A: a note of another asset
-        // cannot be spent into a native transfer).
-        require!(
-            transfer_verifier::verify_transfer(
-                &bridge_state.merkle_root,
-                &nullifiers,
-                &output_commitments,
-                &NATIVE_SOL_ASSET,
-                &proof,
-            ),
-            BridgeError::InvalidProof
-        );
-
-        let now = Clock::get()?.unix_timestamp;
-
-        // `withdrawal_id = 0` marks these nullifiers as transfer-spent rather
-        // than withdrawal-spent (transfers release nothing, so there is no
-        // withdrawal id to record).
-        let nullifier_account_0 = &mut ctx.accounts.nullifier_account_0;
-        nullifier_account_0.nullifier = nullifiers[0];
-        nullifier_account_0.used_at = now;
-        nullifier_account_0.withdrawal_id = 0;
-
-        let nullifier_account_1 = &mut ctx.accounts.nullifier_account_1;
-        nullifier_account_1.nullifier = nullifiers[1];
-        nullifier_account_1.used_at = now;
-        nullifier_account_1.withdrawal_id = 0;
-
-        bridge_state.merkle_root = new_merkle_root;
-
-        emit!(ShieldedTransferEvent {
-            nullifiers,
-            output_commitments,
-            new_merkle_root,
-            timestamp: now,
-        });
-
-        msg!("Shielded transfer settled");
         Ok(())
     }
 
@@ -701,228 +374,6 @@ pub mod paraloom_program {
         Ok(())
     }
 
-    /// Deposit an SPL token into the privacy pool (#237).
-    ///
-    /// The asset-aware twin of [`deposit`]: instead of moving native SOL into
-    /// the single `bridge_vault`, it moves `amount` of one SPL `mint` into a
-    /// per-asset vault — a program-owned `TokenAccount` PDA keyed by the mint
-    /// (`seeds = [b"asset_vault", mint]`). One vault per mint keeps each
-    /// asset's custody isolated; the first depositor of a mint creates the
-    /// vault (`init_if_needed`) and every later deposit reuses it.
-    ///
-    /// The deposited `asset_id` is the mint pubkey itself (the #235 convention:
-    /// an SPL asset's id == its mint's 32 bytes; native SOL is the all-zero
-    /// [`NATIVE_SOL_ASSET`]). A deposit is public — it reveals which asset and
-    /// how much entered the pool — exactly as the native deposit does; the
-    /// shielding happens later when the note is spent under a proof.
-    ///
-    /// Counters and the emitted event mirror [`deposit`] so the L2 indexes SPL
-    /// and native deposits through the same path; only the value-movement
-    /// (system transfer -> token CPI) and the vault differ.
-    pub fn deposit_spl(
-        ctx: Context<DepositSpl>,
-        amount: u64,
-        recipient: [u8; 32],
-        randomness: [u8; 32],
-    ) -> Result<()> {
-        let bridge_state = &mut ctx.accounts.bridge_state;
-
-        require!(!bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
-
-        // Move the tokens depositor -> per-asset vault. The depositor signs
-        // the transfer (it owns the source token account), so no PDA signer is
-        // needed on the deposit leg.
-        transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.depositor_token.to_account_info(),
-                    to: ctx.accounts.asset_vault.to_account_info(),
-                    authority: ctx.accounts.depositor.to_account_info(),
-                },
-            ),
-            amount,
-        )?;
-
-        bridge_state.total_deposited += amount;
-        bridge_state.deposit_count += 1;
-
-        emit!(DepositSplEvent {
-            depositor: ctx.accounts.depositor.key(),
-            asset_id: ctx.accounts.mint.key().to_bytes(),
-            amount,
-            recipient,
-            randomness,
-            timestamp: Clock::get()?.unix_timestamp,
-            deposit_id: bridge_state.deposit_count,
-        });
-
-        msg!(
-            "SPL deposit successful: {} of mint {}",
-            amount,
-            ctx.accounts.mint.key()
-        );
-        Ok(())
-    }
-
-    /// Withdraw an SPL token from the privacy pool (#237).
-    ///
-    /// The asset-aware twin of [`withdraw`]: it releases `amount` of one SPL
-    /// `mint` from that mint's per-asset vault to a recipient token account,
-    /// applying the identical replay, expiry, and fee rules as the native
-    /// path:
-    ///  * the nullifier PDA (`seeds = [b"nullifier", nullifier]`) is `init`'d
-    ///    here, sharing the namespace with `withdraw`/`shielded_transfer`, so a
-    ///    note can never be spent twice across any path;
-    ///  * the request is rejected past its `expiration_slot`;
-    ///  * the same 25 bps [`WITHDRAWAL_FEE_BPS`] cut is taken — the recipient
-    ///    token account receives `amount - fee`, and `fee` stays in the vault
-    ///    credited to the settling validator's `pending_rewards`. Because the
-    ///    fee is SPL tokens sitting in a per-asset vault rather than lamports,
-    ///    `pending_rewards` accrues in that asset's smallest unit;
-    ///    `claim_rewards` for SPL fees is a follow-up (this PR keeps fee
-    ///    accounting at parity with the native path).
-    ///
-    /// Value leaves the vault under a PDA signer (`asset_vault_authority`, the
-    /// token account's owner), not the depositor. As with the native `withdraw`,
-    /// settlement requires a validator quorum (#260) and the Groth16 proof is
-    /// verified on-chain (#165) against the published Merkle root.
-    pub fn withdraw_spl(
-        ctx: Context<WithdrawSpl>,
-        nullifier: [u8; 32],
-        amount: u64,
-        expiration_slot: u64,
-        proof: Vec<u8>,
-    ) -> Result<()> {
-        let bridge_state = &mut ctx.accounts.bridge_state;
-
-        require!(!bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
-        require!(!proof.is_empty(), BridgeError::InvalidProof);
-        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
-
-        // The asset id IS the mint's pubkey (#235), so binding the proof to it
-        // is the on-chain mint check (finding A): a note committed under one
-        // mint cannot release another mint's vault. ext_data_hash binds the
-        // recipient token account (finding D). Both captured before the borrow.
-        let asset_id = ctx.accounts.mint.key().to_bytes();
-        let ext_data_hash = withdraw_ext_data_hash(&ctx.accounts.recipient_token.key(), amount);
-
-        let current_slot = Clock::get()?.slot;
-        require!(
-            current_slot <= expiration_slot,
-            BridgeError::WithdrawalExpired
-        );
-
-        // Reject a non-canonical nullifier (same replay defence as the native
-        // withdraw); the raw bytes must canonically encode their field element.
-        require_canonical_nullifier(&nullifier)?;
-
-        // Settlement requires a supermajority of registered validators to
-        // co-sign this transaction (#260), exactly as the native `withdraw` —
-        // no single key can drain a per-asset vault alone.
-        quorum::verify_validator_quorum(
-            ctx.program_id,
-            &ctx.accounts.validator_registry,
-            ctx.remaining_accounts,
-        )?;
-
-        // Verify the Groth16 withdrawal proof on-chain (#165), bound to the
-        // published Merkle root and this withdrawal's nullifier, amount,
-        // destination and asset, so a settling validator cannot release tokens
-        // for a note that does not exist, redirect them (finding D) or release
-        // a note committed under a different mint from this vault (finding A —
-        // asset_id is the mint pubkey). Notes of every asset share the off-chain
-        // commitment tree and the published `merkle_root`.
-        require!(
-            withdraw_verifier::verify_withdrawal(
-                &bridge_state.merkle_root,
-                &nullifier,
-                amount,
-                &ext_data_hash,
-                &asset_id,
-                &proof,
-            ),
-            BridgeError::InvalidProof
-        );
-
-        require!(
-            ctx.accounts.asset_vault.amount >= amount,
-            BridgeError::InsufficientFunds
-        );
-
-        // Same fee/validator binding as the native withdraw: the settling
-        // validator is bound by seeds to the `authority` signer and earns the
-        // fee for gathering quorum and submitting the withdrawal.
-        let validator_account = &mut ctx.accounts.validator_account;
-        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
-
-        let fee = amount
-            .checked_mul(WITHDRAWAL_FEE_BPS)
-            .and_then(|v| v.checked_div(10_000))
-            .ok_or(BridgeError::InvalidAmount)?;
-        let payout = amount - fee;
-
-        let nullifier_account = &mut ctx.accounts.nullifier_account;
-        nullifier_account.nullifier = nullifier;
-        nullifier_account.used_at = Clock::get()?.unix_timestamp;
-        nullifier_account.withdrawal_id = bridge_state.withdrawal_count + 1;
-
-        // The vault's token authority is the program PDA `asset_vault_authority`;
-        // it signs the release. The fee tokens are left behind in the vault.
-        let authority_bump = ctx.bumps.asset_vault_authority;
-        let seeds = &[b"asset_vault_authority".as_ref(), &[authority_bump]];
-        let signer_seeds = &[&seeds[..]];
-
-        transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.asset_vault.to_account_info(),
-                    to: ctx.accounts.recipient_token.to_account_info(),
-                    authority: ctx.accounts.asset_vault_authority.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            payout,
-        )?;
-
-        // Record the settlement against the validator's activity. Unlike the
-        // native path, the SPL fee is deliberately NOT added to
-        // `pending_rewards`: that balance is denominated in lamports and paid
-        // out by `claim_rewards` from the native `bridge_vault`, whereas the SPL
-        // fee is `fee` *tokens* that remain in this mint's `asset_vault`.
-        // Crediting it 1:1 into the lamport balance would let a validator
-        // settling SPL withdrawals accrue lamport-claimable rewards in
-        // proportion to token raw amounts and drain the native vault. The
-        // retained fee tokens accrue in `asset_vault` for a future per-asset
-        // payout.
-        validator_account.successful_verifications += 1;
-        validator_account.last_active = Clock::get()?.unix_timestamp;
-
-        bridge_state.total_withdrawn += amount;
-        bridge_state.withdrawal_count += 1;
-
-        emit!(WithdrawalSplEvent {
-            recipient: ctx.accounts.recipient_token.key(),
-            asset_id: ctx.accounts.mint.key().to_bytes(),
-            amount,
-            nullifier,
-            timestamp: Clock::get()?.unix_timestamp,
-            withdrawal_id: bridge_state.withdrawal_count,
-        });
-
-        msg!(
-            "SPL withdrawal successful: {} of mint {} to recipient, {} fee to validator {}",
-            payout,
-            ctx.accounts.mint.key(),
-            fee,
-            validator_account.validator
-        );
-        Ok(())
-    }
-
     /// Pause the bridge
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
@@ -945,9 +396,9 @@ pub mod paraloom_program {
     ///
     /// `initialize` (#204) pins the bridge authority to the program's upgrade
     /// authority at genesis, to close the init front-run race. But ongoing
-    /// settlement (`withdraw` / `shielded_transfer` / `update_merkle_root`,
-    /// all `has_one = authority`) is performed by a node-resident validator
-    /// key — which must NOT be the upgrade authority sitting on a public
+    /// settlement (`transact`, `has_one = authority`) is performed by a
+    /// node-resident validator key — which must NOT be the upgrade authority
+    /// sitting on a public
     /// host. This hands settlement control from the genesis authority to the
     /// operating validator (a staked, slashable key), keeping the upgrade
     /// authority offline. Gated `has_one = authority`: only the current
@@ -1364,28 +815,6 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
-pub struct Deposit<'info> {
-    #[account(
-        mut,
-        seeds = [b"bridge_state"],
-        bump
-    )]
-    pub bridge_state: Account<'info, BridgeState>,
-
-    #[account(
-        mut,
-        seeds = [b"bridge_vault"],
-        bump
-    )]
-    pub bridge_vault: SystemAccount<'info>,
-
-    #[account(mut)]
-    pub depositor: Signer<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
 pub struct DepositNote<'info> {
     #[account(mut, seeds = [b"bridge_state"], bump)]
     pub bridge_state: Account<'info, BridgeState>,
@@ -1398,65 +827,6 @@ pub struct DepositNote<'info> {
 
     #[account(mut)]
     pub depositor: Signer<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-#[instruction(nullifier: [u8; 32])]
-pub struct Withdraw<'info> {
-    // `has_one = authority` binds the signer to the authority recorded at
-    // `initialize` (the bridge authority / consensus leader). Without it any
-    // signer could settle a withdrawal — see #178.
-    #[account(
-        mut,
-        seeds = [b"bridge_state"],
-        bump,
-        has_one = authority
-    )]
-    pub bridge_state: Account<'info, BridgeState>,
-
-    #[account(
-        mut,
-        seeds = [b"bridge_vault"],
-        bump
-    )]
-    pub bridge_vault: SystemAccount<'info>,
-
-    /// Nullifier account
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + NullifierAccount::INIT_SPACE,
-        seeds = [b"nullifier", nullifier.as_ref()],
-        bump
-    )]
-    pub nullifier_account: Account<'info, NullifierAccount>,
-
-    #[account(mut)]
-    pub recipient: SystemAccount<'info>,
-
-    // The settling validator's on-chain account, bound by seeds to the
-    // `authority` signer: only a registered validator can settle a
-    // withdrawal, and the withdrawal fee is credited here. The PDA must
-    // already exist (the validator registered via `register_validator`),
-    // so `withdraw` fails for any signer without a validator account.
-    #[account(
-        mut,
-        seeds = [b"validator", authority.key().as_ref()],
-        bump
-    )]
-    pub validator_account: Account<'info, ValidatorAccount>,
-
-    /// The validator registry; its `active_validators` count sets the quorum
-    /// threshold (#260). Settlement must be co-signed by a supermajority of
-    /// registered validators, passed as `(wallet, validator PDA)` pairs in
-    /// `remaining_accounts`.
-    #[account(seeds = [b"validator_registry"], bump)]
-    pub validator_registry: Account<'info, ValidatorRegistry>,
-
-    #[account(mut)]
-    pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -1484,53 +854,6 @@ pub struct ResetValidatorRegistry<'info> {
         seeds::program = bpf_loader_upgradeable::id(),
     )]
     pub program_data: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-#[instruction(nullifiers: [[u8; 32]; 2])]
-pub struct ShieldedTransfer<'info> {
-    // `has_one = authority` binds settlement to the bridge authority /
-    // consensus leader, exactly as `Withdraw` does (#178).
-    #[account(
-        mut,
-        seeds = [b"bridge_state"],
-        bump,
-        has_one = authority
-    )]
-    pub bridge_state: Account<'info, BridgeState>,
-
-    /// First input nullifier. Shares the `b"nullifier"` namespace with
-    /// `withdraw`, so `init` fails on a replay across either path.
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + NullifierAccount::INIT_SPACE,
-        seeds = [b"nullifier", nullifiers[0].as_ref()],
-        bump
-    )]
-    pub nullifier_account_0: Account<'info, NullifierAccount>,
-
-    /// Second input nullifier (a random dummy when only one real note is
-    /// spent).
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + NullifierAccount::INIT_SPACE,
-        seeds = [b"nullifier", nullifiers[1].as_ref()],
-        bump
-    )]
-    pub nullifier_account_1: Account<'info, NullifierAccount>,
-
-    /// Validator registry; sets the quorum threshold (#260). The transfer must
-    /// be co-signed by a supermajority of registered validators, passed as
-    /// `(wallet, validator PDA)` pairs in `remaining_accounts`.
-    #[account(seeds = [b"validator_registry"], bump)]
-    pub validator_registry: Account<'info, ValidatorRegistry>,
-
-    #[account(mut)]
-    pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -1615,139 +938,6 @@ pub struct Transact<'info> {
 }
 
 #[derive(Accounts)]
-pub struct DepositSpl<'info> {
-    #[account(
-        mut,
-        seeds = [b"bridge_state"],
-        bump
-    )]
-    pub bridge_state: Account<'info, BridgeState>,
-
-    /// The SPL mint being deposited. Its pubkey IS the asset id (#235).
-    pub mint: Account<'info, Mint>,
-
-    /// Program-owned PDA that owns every per-asset vault. A single
-    /// deterministic authority for all asset vaults; it never signs on the
-    /// deposit leg (the depositor signs that), but it is set as the vault's
-    /// `authority` here so the withdraw leg can sign releases.
-    ///
-    /// CHECK: a PDA used only as the token-account authority; constrained by
-    /// its seeds. Holds no data and is never deserialized.
-    #[account(
-        seeds = [b"asset_vault_authority"],
-        bump
-    )]
-    pub asset_vault_authority: UncheckedAccount<'info>,
-
-    /// The per-asset vault: a program-owned token account for this one mint.
-    /// `init_if_needed` so the first depositor of a mint creates it and every
-    /// later deposit reuses it. Owned by `asset_vault_authority`.
-    #[account(
-        init_if_needed,
-        payer = depositor,
-        token::mint = mint,
-        token::authority = asset_vault_authority,
-        seeds = [b"asset_vault", mint.key().as_ref()],
-        bump
-    )]
-    pub asset_vault: Account<'info, TokenAccount>,
-
-    /// The depositor's source token account for `mint`.
-    #[account(
-        mut,
-        token::mint = mint,
-        token::authority = depositor
-    )]
-    pub depositor_token: Account<'info, TokenAccount>,
-
-    #[account(mut)]
-    pub depositor: Signer<'info>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-#[instruction(nullifier: [u8; 32])]
-pub struct WithdrawSpl<'info> {
-    // `has_one = authority` binds the signer to the bridge authority recorded
-    // at `initialize` — same #178 settlement guard as the native withdraw.
-    #[account(
-        mut,
-        seeds = [b"bridge_state"],
-        bump,
-        has_one = authority
-    )]
-    pub bridge_state: Account<'info, BridgeState>,
-
-    /// The SPL mint being withdrawn. Its pubkey IS the asset id (#235) and
-    /// keys the vault PDA below.
-    pub mint: Account<'info, Mint>,
-
-    /// Program PDA that owns the vault and signs the release.
-    ///
-    /// CHECK: a PDA used only as the token-account authority; constrained by
-    /// its seeds. Holds no data and is never deserialized.
-    #[account(
-        seeds = [b"asset_vault_authority"],
-        bump
-    )]
-    pub asset_vault_authority: UncheckedAccount<'info>,
-
-    /// The per-asset vault tokens are released from. Must already exist (a
-    /// deposit created it); keyed by the mint exactly as `DepositSpl`.
-    #[account(
-        mut,
-        token::mint = mint,
-        token::authority = asset_vault_authority,
-        seeds = [b"asset_vault", mint.key().as_ref()],
-        bump
-    )]
-    pub asset_vault: Account<'info, TokenAccount>,
-
-    /// Nullifier account — shares the `b"nullifier"` namespace with the native
-    /// `withdraw` and `shielded_transfer`, so `init` fails on a replay across
-    /// any path.
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + NullifierAccount::INIT_SPACE,
-        seeds = [b"nullifier", nullifier.as_ref()],
-        bump
-    )]
-    pub nullifier_account: Account<'info, NullifierAccount>,
-
-    /// The recipient's destination token account for `mint`.
-    #[account(
-        mut,
-        token::mint = mint
-    )]
-    pub recipient_token: Account<'info, TokenAccount>,
-
-    // The settling validator's account, bound by seeds to the `authority`
-    // signer — same binding and fee-crediting as the native withdraw.
-    #[account(
-        mut,
-        seeds = [b"validator", authority.key().as_ref()],
-        bump
-    )]
-    pub validator_account: Account<'info, ValidatorAccount>,
-
-    /// The validator registry, against which the settlement quorum is verified
-    /// (#260) — same gate as the native `withdraw`. The co-signers are passed as
-    /// `(wallet, validator PDA)` pairs in `remaining_accounts`.
-    #[account(seeds = [b"validator_registry"], bump)]
-    pub validator_registry: Account<'info, ValidatorRegistry>,
-
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
 pub struct Pause<'info> {
     #[account(
         mut,
@@ -1769,25 +959,6 @@ pub struct SetBridgeAuthority<'info> {
         has_one = authority
     )]
     pub bridge_state: Account<'info, BridgeState>,
-
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct UpdateMerkleRoot<'info> {
-    #[account(
-        mut,
-        seeds = [b"bridge_state"],
-        bump,
-        has_one = authority
-    )]
-    pub bridge_state: Account<'info, BridgeState>,
-
-    /// Sets the quorum threshold (#260): a new Merkle root must be co-signed by
-    /// a supermajority of registered validators, passed as `(wallet, validator
-    /// PDA)` pairs in `remaining_accounts`.
-    #[account(seeds = [b"validator_registry"], bump)]
-    pub validator_registry: Account<'info, ValidatorRegistry>,
 
     pub authority: Signer<'info>,
 }
@@ -1976,6 +1147,14 @@ pub struct BridgeState {
     pub deposit_count: u64,
     pub withdrawal_count: u64,
     pub paused: bool,
+    /// DEPRECATED / RESERVED. The legacy off-chain-root shielded path
+    /// (`update_merkle_root` / `withdraw` / `shielded_transfer`) was removed;
+    /// all shielded settlement now goes through `transact`, which proves
+    /// membership against the program-owned incremental `merkle_tree` account
+    /// and its `is_known_root` ring buffer. This field is written only once, at
+    /// `initialize`, and read nowhere. It is retained solely to keep the
+    /// `BridgeState` account layout byte-compatible with already-deployed
+    /// state; do not reintroduce a reader.
     pub merkle_root: [u8; 32],
 }
 
@@ -2017,16 +1196,6 @@ pub struct ValidatorAccount {
     pub times_slashed: u64,
 }
 
-#[event]
-pub struct DepositEvent {
-    pub depositor: Pubkey,
-    pub amount: u64,
-    pub recipient: [u8; 32],
-    pub randomness: [u8; 32],
-    pub timestamp: i64,
-    pub deposit_id: u64,
-}
-
 /// Emitted by `deposit_note` (circuit v3): the appended note commitment and its
 /// tree position, so the wallet learns where its note landed.
 #[event]
@@ -2036,15 +1205,6 @@ pub struct DepositNoteEvent {
     pub commitment: [u8; 32],
     pub leaf_index: u64,
     pub timestamp: i64,
-}
-
-#[event]
-pub struct WithdrawalEvent {
-    pub recipient: Pubkey,
-    pub amount: u64,
-    pub nullifier: [u8; 32],
-    pub timestamp: i64,
-    pub withdrawal_id: u64,
 }
 
 #[event]
@@ -2059,38 +1219,6 @@ pub struct TransactEvent {
     pub recipient: Pubkey,
     pub timestamp: i64,
     pub settlement_id: u64,
-}
-
-#[event]
-pub struct DepositSplEvent {
-    pub depositor: Pubkey,
-    /// The deposited asset's id == the SPL mint's pubkey bytes (#235).
-    pub asset_id: [u8; 32],
-    pub amount: u64,
-    pub recipient: [u8; 32],
-    pub randomness: [u8; 32],
-    pub timestamp: i64,
-    pub deposit_id: u64,
-}
-
-#[event]
-pub struct WithdrawalSplEvent {
-    /// The recipient's destination token account.
-    pub recipient: Pubkey,
-    /// The withdrawn asset's id == the SPL mint's pubkey bytes (#235).
-    pub asset_id: [u8; 32],
-    pub amount: u64,
-    pub nullifier: [u8; 32],
-    pub timestamp: i64,
-    pub withdrawal_id: u64,
-}
-
-#[event]
-pub struct ShieldedTransferEvent {
-    pub nullifiers: [[u8; 32]; 2],
-    pub output_commitments: [[u8; 32]; 2],
-    pub new_merkle_root: [u8; 32],
-    pub timestamp: i64,
 }
 
 #[event]

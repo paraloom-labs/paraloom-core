@@ -293,14 +293,6 @@ jobs:
       # (which is path-filtered to the bridge sources). `--test-threads=1`
       # keeps the two nodes' fixed-lifetime ports and tasks from overlapping
       # with any future test in the same binary.
-      - name: Run consensus network E2E (ignored)
-        run: cargo test --test consensus_network_e2e --all-features -- --ignored --test-threads=1 --nocapture
-
-      # Transfer twin of the above (#194). Same override-seam approach — no
-      # real proof or transfer key needed, so it runs on a plain runner.
-      - name: Run transfer consensus network E2E (ignored)
-        run: cargo test --test transfer_consensus_network_e2e --all-features -- --ignored --test-threads=1 --nocapture
-
       # #226 relay reservation E2E. Also `#[ignore]`'d (binds loopback TCP,
       # depends on circuit-relay v2 reservation timing) and needs no Solana
       # validator, so it rides this same plain-runner job.
@@ -312,12 +304,6 @@ jobs:
       # rides this same plain-runner job.
       - name: Run co-sign protocol E2E (ignored)
         run: cargo test --test cosign_e2e --all-features -- --ignored --test-threads=1 --nocapture
-
-      # #260 co-sign settlement E2E: two validators co-sign and the leader
-      # assembles a multi-signature settlement transaction over a real mesh.
-      # `#[ignore]`'d (loopback TCP + gossip-mesh timing), no Solana validator.
-      - name: Run co-sign settlement E2E (ignored)
-        run: cargo test --test cosign_settlement_e2e --all-features -- --ignored --test-threads=1 --nocapture
 
       # #350 v3 transact settlement E2E: the transact twin of the above — two
       # validators verify a transact request over the mesh and the leader

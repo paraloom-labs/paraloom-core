@@ -5,18 +5,16 @@
 //! pipeline (today: the on-chain `slash_validator` instruction in
 //! `programs/paraloom`) can act on it. This module defines the
 //! evidence shape, a small in-memory store, and the helpers that the
-//! withdrawal consensus path uses to record the two conditions in
-//! scope for v0.4.0:
+//! consensus path uses to record the two conditions in scope:
 //!
 //!  1. **Equivocation** — a validator submits two distinct votes on
-//!     the same withdrawal request. The on-chain decision was
+//!     the same settlement request. The on-chain decision was
 //!     deterministic per `(request_id, validator)`, so any pair of
 //!     differing votes is provable misbehavior.
-//!  2. **Persistent unavailability** — a validator misses
-//!     [`crate::consensus::withdrawal::PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK`]
-//!     consecutive verification rounds. A single timeout is a network
-//!     blip; a streak of timeouts is a validator that is offline or
-//!     otherwise failing to do its job.
+//!  2. **Persistent unavailability** — a validator misses a
+//!     configured streak of consecutive verification rounds. A single
+//!     timeout is a network blip; a streak of timeouts is a validator
+//!     that is offline or otherwise failing to do its job.
 //!
 //! Persisting the evidence to RocksDB is out of scope for this PR —
 //! the in-memory store is enough to drive the integration test and the
@@ -24,7 +22,7 @@
 //! caller can park it inside an `Arc` and share it across coordinator
 //! threads.
 
-use crate::consensus::withdrawal::VerificationVote;
+use crate::consensus::vote_tally::VerificationVote;
 use crate::types::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
