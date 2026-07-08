@@ -11,9 +11,11 @@
 //! roots to the host circuit (`light_poseidon`) the proof was built against —
 //! if the two Poseidon implementations disagreed, no v3 proof would verify.
 //!
-//! Settlement is quorum-gated exactly like `withdraw` (#260): the authority is
-//! the sole registered validator (threshold 1), co-signing as a (wallet, PDA)
-//! pair in `remaining_accounts`.
+//! Settlement is quorum-gated exactly like `withdraw` (#260). Because the
+//! settling authority is excluded from its own quorum tally, an INDEPENDENT
+//! registered validator (`cosigner`) must co-sign the `transact` as a
+//! (wallet, PDA) pair in `remaining_accounts`; the transaction is signed by
+//! both the authority and that cosigner.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
@@ -90,6 +92,12 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         &[b"validator", upgrade_authority.pubkey().as_ref()],
         &program_id,
     );
+    // An independent validator that co-signs the quorum. The settling authority
+    // is excluded from its own tally, so a second, unrelated validator is what
+    // actually satisfies the quorum.
+    let cosigner = Keypair::new();
+    let (cosigner_pda, _) =
+        Pubkey::find_program_address(&[b"validator", cosigner.pubkey().as_ref()], &program_id);
     let (nf0_pda, _) =
         Pubkey::find_program_address(&[b"nullifier", &fx::FIXTURE_NULLIFIER_0], &program_id);
     let (nf1_pda, _) =
@@ -179,6 +187,43 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     )
     .await;
 
+    // 4b. register an INDEPENDENT validator that will co-sign the quorum. Fund it
+    //     from the payer (stake + fees), then self-register it (RegisterValidator
+    //     is permissionless — the validator signs for itself). This raises
+    //     total_active_stake to 2 SOL; with the authority's 1 SOL excluded, the
+    //     eligible stake is 1 SOL and the cosigner's 1 SOL clears the threshold.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &payer,
+        solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &cosigner.pubkey(),
+            MIN_VALIDATOR_STAKE + 100_000_000,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &cosigner,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: cosigner_pda,
+                validator_registry: registry_pda,
+                validator: cosigner.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
     // 5. fund the vault with 2 SOL so it stays comfortably above rent after the
     //    withdrawal. The vault is a program-owned `SystemAccount`, so a plain
     //    system transfer tops it up; the v3 tree is untouched (funding is not a
@@ -232,42 +277,51 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
 
     // 7. transact — spend the note, withdraw 500 (net of the 25 bps fee) to the
     //    recipient, record both nullifiers, append both output commitments.
-    send(
-        &mut banks_client,
-        recent_blockhash,
-        &upgrade_authority,
-        Instruction {
-            program_id,
-            data: instruction::Transact {
-                nullifiers: [fx::FIXTURE_NULLIFIER_0, fx::FIXTURE_NULLIFIER_1],
-                output_commitments: [fx::FIXTURE_COMMITMENT_0, fx::FIXTURE_COMMITMENT_1],
-                root: fx::FIXTURE_ROOT,
-                ext_amount: fx::FIXTURE_EXT_AMOUNT,
-                proof: fixture_proof(),
+    //    The authority is excluded from its own quorum, so the independent
+    //    `cosigner` supplies the (wallet, PDA) pair that satisfies it; the tx is
+    //    signed by both the authority (fee payer) and the cosigner.
+    let transact_ix = Instruction {
+        program_id,
+        data: instruction::Transact {
+            nullifiers: [fx::FIXTURE_NULLIFIER_0, fx::FIXTURE_NULLIFIER_1],
+            output_commitments: [fx::FIXTURE_COMMITMENT_0, fx::FIXTURE_COMMITMENT_1],
+            root: fx::FIXTURE_ROOT,
+            ext_amount: fx::FIXTURE_EXT_AMOUNT,
+            proof: fixture_proof(),
+        }
+        .data(),
+        accounts: {
+            let mut metas = accounts::Transact {
+                bridge_state: state_pda,
+                merkle_tree: tree_pda,
+                bridge_vault: vault_pda,
+                nullifier_account_0: nf0_pda,
+                nullifier_account_1: nf1_pda,
+                recipient,
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                system_program: solana_sdk::system_program::ID,
             }
-            .data(),
-            accounts: {
-                let mut metas = accounts::Transact {
-                    bridge_state: state_pda,
-                    merkle_tree: tree_pda,
-                    bridge_vault: vault_pda,
-                    nullifier_account_0: nf0_pda,
-                    nullifier_account_1: nf1_pda,
-                    recipient,
-                    validator_account: validator_pda,
-                    validator_registry: registry_pda,
-                    authority: upgrade_authority.pubkey(),
-                    system_program: solana_sdk::system_program::ID,
-                }
-                .to_account_metas(None);
-                // Quorum co-signers (#260): the sole registered validator.
-                metas.push(AccountMeta::new_readonly(upgrade_authority.pubkey(), true));
-                metas.push(AccountMeta::new_readonly(validator_pda, false));
-                metas
-            },
+            .to_account_metas(None);
+            // Quorum co-signer (#260): an INDEPENDENT registered validator,
+            // co-signing as a (wallet, PDA) pair. The authority's own pair is
+            // not needed — it is skipped in the tally.
+            metas.push(AccountMeta::new_readonly(cosigner.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(cosigner_pda, false));
+            metas
         },
-    )
-    .await;
+    };
+    let transact_tx = Transaction::new_signed_with_payer(
+        &[transact_ix],
+        Some(&upgrade_authority.pubkey()),
+        &[&upgrade_authority, &cosigner],
+        recent_blockhash,
+    );
+    banks_client
+        .process_transaction(transact_tx)
+        .await
+        .unwrap();
 
     // The withdrawn amount is |ext_amount| = 500; fee = 500 * 25 / 10000 = 1.
     let gross = fx::FIXTURE_EXT_AMOUNT.unsigned_abs();
