@@ -168,7 +168,9 @@ mod tests {
 
     #[test]
     fn empty_quorum_is_rejected() {
-        assert!(verify_validator_quorum(&prog(), &registry(3), &Pubkey::default(), 0, &[]).is_err());
+        assert!(
+            verify_validator_quorum(&prog(), &registry(3), &Pubkey::default(), 0, &[]).is_err()
+        );
     }
 
     #[test]
@@ -363,9 +365,7 @@ mod tests {
         let mut ei = [0u8; 0];
         let si = AccountInfo::new(&ind, true, false, &mut li, &mut ei, &sys, false, 0);
         let ai = AccountInfo::new(&pda_ind, false, false, &mut lpi, &mut d_ind, &p, false, 0);
-        assert!(
-            verify_validator_quorum(&p, &registry(2), &auth, 1_000_000_000, &[si, ai]).is_ok()
-        );
+        assert!(verify_validator_quorum(&p, &registry(2), &auth, 1_000_000_000, &[si, ai]).is_ok());
     }
 
     #[test]

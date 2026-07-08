@@ -645,9 +645,8 @@ pub mod paraloom_program {
             // unbonding, reclaimable via `withdraw_unbonded_stake` after the
             // delay. The slashed portion has already gone to the vault below.
             let residual = validator_account.stake_amount;
-            validator_account.unbonding_amount = validator_account
-                .unbonding_amount
-                .saturating_add(residual);
+            validator_account.unbonding_amount =
+                validator_account.unbonding_amount.saturating_add(residual);
             validator_account.unbonding_slot = Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
             validator_account.stake_amount = 0;
         } else if validator_account.is_active {

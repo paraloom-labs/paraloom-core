@@ -276,10 +276,7 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
         &[&upgrade_authority, &cosigner],
         recent_blockhash,
     );
-    banks_client
-        .process_transaction(transact_tx)
-        .await
-        .unwrap();
+    banks_client.process_transaction(transact_tx).await.unwrap();
 
     // The fee is now pending; nothing claimed yet.
     let before = banks_client
