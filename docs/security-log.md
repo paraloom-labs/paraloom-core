@@ -10,6 +10,27 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **The settlement quorum is an independent, consistent factor** (in-house
+  security audit). The on-chain validator quorum counted any active validator
+  PDA that co-signed, weighted by stake, against the registry's recorded total
+  active stake. Two gaps: the settling authority's own validator counted toward
+  its own quorum, so the quorum was not an independent second factor from the
+  settlement key; and because an earlier registry reset rebuilt the stake
+  counter while leaving the excluded validators active on-chain, the recorded
+  total could drift below the set of PDAs still eligible to sign — letting a
+  stale-low threshold be cleared by stake it did not account for. Both required
+  the settlement authority key (there was no external attacker path, and it was
+  the documented pre-mainnet single-operator trust model), but the quorum was
+  not the independent backstop it was meant to be. `verify_validator_quorum`
+  now excludes the settling authority from both the tally and the denominator
+  and rejects a counted stake above the eligible active total; a new admin
+  `deactivate_validator` instruction flips orphaned active PDAs inactive so the
+  recorded total and the live active set stay consistent. The threshold stays
+  appropriately low for a small honest validator set — it just can no longer be
+  satisfied by the settlement key alone or by orphaned PDAs. Bonding/slashing to
+  make Sybil stake non-refundable is a tracked follow-up. Devnet, pre-mainnet
+  (PR #373).
+
 - **Shielded withdrawals verified against an operator-published Merkle root**
   (in-house security audit). The legacy `update_merkle_root` instruction set
   the pool's Merkle root to whatever value the settlement authority passed —
