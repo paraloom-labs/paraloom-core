@@ -10,6 +10,24 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Shielded withdrawals verified against an operator-published Merkle root**
+  (in-house security audit). The legacy `update_merkle_root` instruction set
+  the pool's Merkle root to whatever value the settlement authority passed —
+  gated by the validator quorum but with no zk proof — and `withdraw` /
+  `shielded_transfer` / `withdraw_spl` then verified their proofs against that
+  operator-set root. Because the pre-mainnet quorum is authority-satisfiable,
+  a party holding the settlement key could have published a root committing a
+  note that did not correspond to any real deposit and settled it: value out
+  with no matching value in. The legacy off-chain root was also never
+  reconciled on-chain against deposit accounting. Fixed by removing the entire
+  off-chain-root path; all shielded operations now settle through the v3
+  `transact` instruction, which appends the output commitments and recomputes
+  the Merkle root itself on a program-owned tree and only accepts proofs
+  against roots it has published (`is_known_root`), so no root can enter
+  without the program having built it — the trusted off-chain root push is
+  gone. SPL settlement is temporarily native-only pending the v3 per-asset
+  follow-up. Devnet, pre-mainnet (PR #371).
+
 - **The settlement co-sign set is the same reputation-eligible set that formed
   the quorum** (in-house security audit). A withdrawal or transfer reached
   consensus among the validators whose reputation was at or above the
