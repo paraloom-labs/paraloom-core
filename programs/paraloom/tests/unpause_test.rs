@@ -6,7 +6,7 @@
 //! as bad as the safety bug pause_test guards against.
 //!
 //! Init / pause / unpause run as the program upgrade authority (#204);
-//! the permissionless `deposit` ix continues to use the auto-payer.
+//! the permissionless `deposit_note` ix continues to use the auto-payer.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
@@ -30,6 +30,7 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
 
     // Helper to land a single ix signed by `signer` (also tx payer).
     async fn send(
@@ -71,6 +72,24 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
         },
     )
     .await;
+    // Initialize the on-chain tree so `deposit_note` has its tree account.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeMerkleTree {}.data(),
+            accounts: accounts::InitializeMerkleTree {
+                merkle_tree: tree_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
     send(
         &mut banks_client,
         recent_blockhash,
@@ -101,15 +120,16 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
         &payer,
         Instruction {
             program_id,
-            data: instruction::Deposit {
+            data: instruction::DepositNote {
                 amount: 1_000_000,
-                recipient: [1u8; 32],
-                randomness: [2u8; 32],
+                pubkey: [1u8; 32],
+                blinding: [2u8; 32],
             }
             .data(),
-            accounts: accounts::Deposit {
+            accounts: accounts::DepositNote {
                 bridge_state: state_pda,
                 bridge_vault: vault_pda,
+                merkle_tree: tree_pda,
                 depositor: payer.pubkey(),
                 system_program: solana_sdk::system_program::ID,
             }

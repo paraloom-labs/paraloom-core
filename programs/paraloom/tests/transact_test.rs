@@ -180,28 +180,14 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     .await;
 
     // 5. fund the vault with 2 SOL so it stays comfortably above rent after the
-    //    withdrawal (this permissionless `Deposit` only adds lamports; it does
-    //    not touch the v3 tree).
+    //    withdrawal. The vault is a program-owned `SystemAccount`, so a plain
+    //    system transfer tops it up; the v3 tree is untouched (funding is not a
+    //    note-creating deposit).
     send(
         &mut banks_client,
         recent_blockhash,
         &payer,
-        Instruction {
-            program_id,
-            data: instruction::Deposit {
-                amount: 2_000_000_000,
-                recipient: [1u8; 32],
-                randomness: [2u8; 32],
-            }
-            .data(),
-            accounts: accounts::Deposit {
-                bridge_state: state_pda,
-                bridge_vault: vault_pda,
-                depositor: payer.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &vault_pda, 2_000_000_000),
     )
     .await;
 

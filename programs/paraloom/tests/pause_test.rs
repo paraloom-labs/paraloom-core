@@ -1,5 +1,5 @@
 //! Third on-chain unit test for #71. Pins the pause-flag contract:
-//! `pause` flips `BridgeState.paused`, and a subsequent `deposit`
+//! `pause` flips `BridgeState.paused`, and a subsequent `deposit_note`
 //! against the paused bridge fails on the handler's
 //! `require!(!paused, BridgePaused)` rather than silently
 //! succeeding. Without this test a regression that lost the require
@@ -26,6 +26,7 @@ async fn pause_flips_flag_and_blocks_deposit() {
 
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
 
     let init_ix = Instruction {
         program_id,
@@ -42,7 +43,21 @@ async fn pause_flips_flag_and_blocks_deposit() {
         }
         .to_account_metas(None),
     };
-    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    // Initialize the on-chain tree so the paused `deposit_note` below fails on
+    // the `BridgePaused` guard rather than on a missing tree account.
+    let init_tree_ix = Instruction {
+        program_id,
+        data: instruction::InitializeMerkleTree {}.data(),
+        accounts: accounts::InitializeMerkleTree {
+            merkle_tree: tree_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx =
+        Transaction::new_with_payer(&[init_ix, init_tree_ix], Some(&upgrade_authority.pubkey()));
     tx.sign(&[&upgrade_authority], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
@@ -69,15 +84,16 @@ async fn pause_flips_flag_and_blocks_deposit() {
 
     let deposit_ix = Instruction {
         program_id,
-        data: instruction::Deposit {
+        data: instruction::DepositNote {
             amount: 1_000_000,
-            recipient: [1u8; 32],
-            randomness: [2u8; 32],
+            pubkey: [1u8; 32],
+            blinding: [2u8; 32],
         }
         .data(),
-        accounts: accounts::Deposit {
+        accounts: accounts::DepositNote {
             bridge_state: bridge_state_pda,
             bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
             depositor: payer.pubkey(),
             system_program: solana_sdk::system_program::ID,
         }
