@@ -67,6 +67,15 @@ pub mod discriminators {
     /// upgrade-authority-gated tree account creation.
     #[allow(dead_code)]
     pub const INITIALIZE_MERKLE_TREE: [u8; 8] = [67, 143, 80, 157, 177, 227, 11, 238];
+    /// `sha256("global:unregister_validator")[..8]`. Deactivates a validator and
+    /// moves its stake into an unbonding window (no immediate refund).
+    pub const UNREGISTER_VALIDATOR: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
+    /// `sha256("global:withdraw_unbonded_stake")[..8]`. Releases a validator's
+    /// stake to its wallet once the unbonding period has elapsed.
+    pub const WITHDRAW_UNBONDED_STAKE: [u8; 8] = [239, 246, 61, 176, 60, 14, 5, 109];
+    /// `sha256("global:migrate_validator_account")[..8]`. Upgrade-authority-gated
+    /// one-time grow of a legacy `ValidatorAccount` PDA to the unbonding layout.
+    pub const MIGRATE_VALIDATOR_ACCOUNT: [u8; 8] = [141, 49, 52, 5, 175, 161, 182, 154];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -271,6 +280,80 @@ pub fn create_register_validator_instruction(
         ],
         data: instruction_data,
     })
+}
+
+/// Create an `unregister_validator` instruction. Self-signed: the validator
+/// deactivates itself and its stake enters the unbonding window (no immediate
+/// refund; reclaim later via [`create_withdraw_unbonded_stake_instruction`]).
+/// Account order matches the `UnregisterValidator` struct: validator_account,
+/// validator_registry, validator.
+pub fn create_unregister_validator_instruction(
+    program_id: &Pubkey,
+    validator: &Pubkey,
+) -> Instruction {
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*validator, true),
+        ],
+        data: discriminators::UNREGISTER_VALIDATOR.to_vec(),
+    }
+}
+
+/// Create a `withdraw_unbonded_stake` instruction. Self-signed: releases the
+/// validator's unbonded stake back to its wallet once `unbonding_slot` has
+/// passed. Account order matches the `WithdrawUnbondedStake` struct:
+/// validator_account (mut), validator (mut signer). Data is the discriminator
+/// only (no args).
+pub fn create_withdraw_unbonded_stake_instruction(
+    program_id: &Pubkey,
+    validator: &Pubkey,
+) -> Instruction {
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(*validator, true),
+        ],
+        data: discriminators::WITHDRAW_UNBONDED_STAKE.to_vec(),
+    }
+}
+
+/// Create a `migrate_validator_account` instruction (#204-gated to the program's
+/// upgrade authority). Grows a legacy `ValidatorAccount` PDA to the current
+/// unbonding layout; idempotent. `validator_wallet` is the wallet whose PDA is
+/// being migrated and is passed both as the seed source and as the on-chain
+/// `validator: Pubkey` argument (borsh-serialized after the discriminator).
+/// Account order matches the `MigrateValidatorAccount` struct: validator_account
+/// (mut), authority (mut signer), program_data (readonly), system_program.
+pub fn create_migrate_validator_account_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator_wallet: &Pubkey,
+) -> Instruction {
+    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    let mut instruction_data = discriminators::MIGRATE_VALIDATOR_ACCOUNT.to_vec();
+    instruction_data.extend_from_slice(&validator_wallet.to_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: instruction_data,
+    }
 }
 
 /// Append the quorum co-signers as remaining accounts (#260): each validator's
@@ -681,6 +764,81 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE);
         // amount immediately follows the discriminator (borsh u64 LE).
         assert_eq!(&ix.data[8..16], &1_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_withdraw_unbonded_stake_instruction() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let ix = create_withdraw_unbonded_stake_instruction(&program_id, &validator);
+
+        // Account order must match the `WithdrawUnbondedStake` struct:
+        // validator_account (mut), validator (mut signer).
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, validator);
+        assert!(ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+        // Discriminator only — no args.
+        assert_eq!(ix.data, discriminators::WITHDRAW_UNBONDED_STAKE.to_vec());
+    }
+
+    #[test]
+    fn test_create_unregister_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let ix = create_unregister_validator_instruction(&program_id, &validator);
+
+        // validator_account, validator_registry, validator (signer).
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert_eq!(ix.accounts[2].pubkey, validator);
+        assert!(ix.accounts[2].is_signer);
+        assert_eq!(ix.data, discriminators::UNREGISTER_VALIDATOR.to_vec());
+    }
+
+    #[test]
+    fn test_create_migrate_validator_account_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator_wallet = Pubkey::new_unique();
+
+        let ix = create_migrate_validator_account_instruction(
+            &program_id,
+            &authority,
+            &validator_wallet,
+        );
+
+        // validator_account (mut), authority (signer), program_data, system.
+        assert_eq!(ix.accounts.len(), 4);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator_wallet).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, authority);
+        assert!(ix.accounts[1].is_signer);
+        assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(ix.accounts[3].pubkey, SYSTEM_PROGRAM_ID);
+        // Discriminator then the validator pubkey arg (32 bytes borsh = raw).
+        assert_eq!(&ix.data[..8], &discriminators::MIGRATE_VALIDATOR_ACCOUNT);
+        assert_eq!(&ix.data[8..40], &validator_wallet.to_bytes());
+        assert_eq!(ix.data.len(), 40);
     }
 
     #[test]
