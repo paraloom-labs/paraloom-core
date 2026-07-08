@@ -617,42 +617,55 @@ pub mod paraloom_program {
             BridgeError::InvalidAmount
         );
 
-        let slash_amount =
-            (validator_account.stake_amount as u128 * slash_percentage as u128 / 100) as u64;
-
-        let old_stake = validator_account.stake_amount;
-        validator_account.stake_amount =
-            validator_account.stake_amount.saturating_sub(slash_amount);
+        // Slash the stake that is actually at risk: the active stake for a
+        // live validator, or the unbonding balance if the validator has already
+        // left the active set. Basing an inactive slash on `unbonding_amount`
+        // (rather than the recorded `stake_amount`, which is zeroed on exit)
+        // keeps stake slashable through the unbonding window and means a
+        // phantom `stake_amount` on an inactive account is never charged — so a
+        // rent-only PDA cannot be made to debit more lamports than it holds.
+        // `old_stake` here is the pre-slash at-risk amount: active stake for a
+        // live validator, or the unbonding balance once it has left the set.
+        let old_stake = if validator_account.is_active {
+            validator_account.stake_amount
+        } else {
+            validator_account.unbonding_amount
+        };
+        let slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
         validator_account.times_slashed += 1;
 
-        // A slash that drops stake below the registry minimum deactivates the
-        // validator: registration requires `stake >= minimum_stake`, so a
-        // validator that no longer meets that bar must stop settling and stop
-        // counting toward the BFT quorum. Mirror the unregister accounting and
-        // guard on `is_active` so a validator slashed twice is not
-        // double-decremented out of `active_validators`.
-        if validator_account.is_active
-            && validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
-        {
-            // Deactivated: the validator no longer counts toward the quorum, so
-            // remove its full pre-slash active stake from the weighted total.
-            validator_account.is_active = false;
-            let registry = &mut ctx.accounts.validator_registry;
-            registry.active_validators = registry.active_validators.saturating_sub(1);
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
-            // The unslashed remainder would otherwise be stranded — a
-            // deactivated validator cannot `unregister` — so route it into
-            // unbonding, reclaimable via `withdraw_unbonded_stake` after the
-            // delay. The slashed portion has already gone to the vault below.
-            let residual = validator_account.stake_amount;
-            validator_account.unbonding_amount =
-                validator_account.unbonding_amount.saturating_add(residual);
-            validator_account.unbonding_slot = Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
-            validator_account.stake_amount = 0;
-        } else if validator_account.is_active {
-            // Still active: only the slashed portion leaves the active-stake total.
-            let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(slash_amount);
+        if validator_account.is_active {
+            validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
+            // A slash that drops stake below the registry minimum deactivates
+            // the validator: registration requires `stake >= minimum_stake`, so
+            // a validator below that bar must stop settling and stop counting
+            // toward the BFT quorum.
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+                validator_account.is_active = false;
+                let registry = &mut ctx.accounts.validator_registry;
+                registry.active_validators = registry.active_validators.saturating_sub(1);
+                registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                // The unslashed remainder would otherwise be stranded — a
+                // deactivated validator cannot `unregister` — so route it into
+                // unbonding, reclaimable after the delay. The slashed portion
+                // has already gone to the vault below.
+                let residual = validator_account.stake_amount;
+                validator_account.unbonding_amount =
+                    validator_account.unbonding_amount.saturating_add(residual);
+                validator_account.unbonding_slot =
+                    Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
+                validator_account.stake_amount = 0;
+            } else {
+                // Still active: only the slashed portion leaves the total.
+                let registry = &mut ctx.accounts.validator_registry;
+                registry.total_active_stake =
+                    registry.total_active_stake.saturating_sub(slash_amount);
+            }
+        } else {
+            // Already unbonding: burn the slashed portion of the withheld stake.
+            validator_account.unbonding_amount = validator_account
+                .unbonding_amount
+                .saturating_sub(slash_amount);
         }
 
         **validator_account
@@ -769,6 +782,7 @@ pub mod paraloom_program {
         // Rebuild counters from the passed active validator PDAs.
         let mut total_active_stake: u64 = 0;
         let mut active: u64 = 0;
+        let mut seen: Vec<Pubkey> = Vec::new();
         for acc in ctx.remaining_accounts.iter() {
             require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
             let data = acc.try_borrow_data()?;
@@ -785,6 +799,10 @@ pub mod paraloom_program {
             );
             require!(&expected == acc.key, BridgeError::UnauthorizedInit);
             require!(validator.is_active, BridgeError::UnauthorizedInit);
+            // Reject a PDA passed twice so it cannot double-count into the stake
+            // total and inflate the quorum denominator.
+            require!(!seen.contains(acc.key), BridgeError::UnauthorizedInit);
+            seen.push(*acc.key);
             total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
             active = active.saturating_add(1);
         }
@@ -823,7 +841,17 @@ pub mod paraloom_program {
         let stake = ctx.accounts.validator_account.stake_amount;
         let who = ctx.accounts.validator_account.validator;
         if was_active {
-            ctx.accounts.validator_account.is_active = false;
+            let now_slot = Clock::get()?.slot;
+            let v = &mut ctx.accounts.validator_account;
+            v.is_active = false;
+            // Route the stake into unbonding rather than stranding it: a
+            // deactivated validator can't `unregister` (that requires
+            // is_active), so without this its lamports would have no exit and be
+            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
+            // the delay, same as unregister.
+            v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+            v.stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
@@ -891,16 +919,24 @@ pub mod paraloom_program {
             );
         }
         let new_len = 8 + ValidatorAccount::INIT_SPACE;
-        if ai.data_len() < new_len {
+        let old_len = ai.data_len();
+        if old_len < new_len {
             let rent = Rent::get()?;
-            let min_balance = rent.minimum_balance(new_len);
-            let current = ai.lamports();
-            if min_balance > current {
-                let delta = min_balance - current;
+            // Top up the INCREMENTAL rent for the added bytes, unconditionally.
+            // A `min_balance(new_len) > current` guard never fires on a staked
+            // PDA (the stake dwarfs the rent delta), which would leave the
+            // account funded only to the OLD rent floor once the stake is
+            // withdrawn — reverting a later `withdraw_unbonded_stake` or a full
+            // slash for dropping below rent-exemption. Adding the delta keeps
+            // the stake fully withdrawable on top of the new rent floor.
+            let extra_rent = rent
+                .minimum_balance(new_len)
+                .saturating_sub(rent.minimum_balance(old_len));
+            if extra_rent > 0 {
                 let ix = anchor_lang::solana_program::system_instruction::transfer(
                     &ctx.accounts.authority.key(),
                     &ai.key(),
-                    delta,
+                    extra_rent,
                 );
                 anchor_lang::solana_program::program::invoke(
                     &ix,
