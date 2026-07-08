@@ -272,6 +272,14 @@ pub mod paraloom_program {
         quorum::verify_validator_quorum(
             ctx.program_id,
             &ctx.accounts.validator_registry,
+            // The settling `authority` is excluded from its own quorum, so a
+            // supermajority of *independent* validator stake must co-sign.
+            &ctx.accounts.authority.key(),
+            if ctx.accounts.validator_account.is_active {
+                ctx.accounts.validator_account.stake_amount
+            } else {
+                0
+            },
             ctx.remaining_accounts,
         )?;
 
@@ -778,6 +786,29 @@ pub mod paraloom_program {
         );
         Ok(())
     }
+
+    /// Deactivate a single validator so it can no longer be counted toward the
+    /// settlement quorum, keeping the registry invariant
+    /// `total_active_stake == Σ active-PDA stake` intact. Admin-only (the
+    /// registry authority). This reconciles validators dropped from the active
+    /// set — e.g. `is_active` PDAs left behind by an earlier
+    /// `reset_validator_registry` that rebuilt the counters but did not
+    /// deactivate the excluded accounts, which would otherwise still clear a
+    /// stale-low quorum denominator. It does not move the staked lamports; those
+    /// are returned through `unregister_validator`.
+    pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
+        let was_active = ctx.accounts.validator_account.is_active;
+        let stake = ctx.accounts.validator_account.stake_amount;
+        let who = ctx.accounts.validator_account.validator;
+        if was_active {
+            ctx.accounts.validator_account.is_active = false;
+            let registry = &mut ctx.accounts.validator_registry;
+            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+            registry.active_validators = registry.active_validators.saturating_sub(1);
+        }
+        msg!("Validator deactivated: {}", who);
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -1103,6 +1134,26 @@ pub struct ClaimRewards<'info> {
     pub validator: Signer<'info>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DeactivateValidator<'info> {
+    #[account(
+        mut,
+        seeds = [b"validator", validator_account.validator.as_ref()],
+        bump
+    )]
+    pub validator_account: Account<'info, ValidatorAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]

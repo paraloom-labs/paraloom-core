@@ -51,6 +51,11 @@ pub mod discriminators {
     /// rebuilds its counters from the co-signer validator PDAs in
     /// `remaining_accounts`.
     pub const RESET_VALIDATOR_REGISTRY: [u8; 8] = [101, 188, 0, 99, 248, 198, 207, 7];
+    /// `sha256("global:deactivate_validator")[..8]`. Admin cleanup that flips a
+    /// validator to inactive and drops its stake from the registry counters,
+    /// keeping `total_active_stake == Σ active-PDA stake` so orphaned active
+    /// PDAs cannot be counted against a stale-low quorum denominator.
+    pub const DEACTIVATE_VALIDATOR: [u8; 8] = [0xbc, 0xe3, 0xe0, 0xbb, 0xe7, 0x34, 0x03, 0x93];
     /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
     /// the on-chain incremental tree.
     pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
@@ -214,6 +219,30 @@ pub fn create_reset_validator_registry_instruction(
         program_id: *program_id,
         accounts,
         data: discriminators::RESET_VALIDATOR_REGISTRY.to_vec(),
+    })
+}
+
+/// Create a `deactivate_validator` instruction. Admin-only (the registry
+/// authority). Flips `validator_wallet`'s canonical validator PDA to inactive
+/// and drops its stake from the registry counters, so an orphaned active PDA
+/// (e.g. one dropped from the active set by an earlier reset) can no longer be
+/// counted toward a settlement quorum. Does not move the staked lamports.
+pub fn create_deactivate_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator_wallet: &Pubkey,
+) -> Result<Instruction> {
+    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*authority, true),
+        ],
+        data: discriminators::DEACTIVATE_VALIDATOR.to_vec(),
     })
 }
 

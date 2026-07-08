@@ -76,6 +76,12 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
         &[b"validator", upgrade_authority.pubkey().as_ref()],
         &program_id,
     );
+    // An independent validator that co-signs the quorum. The settling authority
+    // is excluded from its own tally, so this second validator is what actually
+    // satisfies the quorum; the fee still accrues to the authority's validator.
+    let cosigner = Keypair::new();
+    let (cosigner_pda, _) =
+        Pubkey::find_program_address(&[b"validator", cosigner.pubkey().as_ref()], &program_id);
     let (nf0_pda, _) =
         Pubkey::find_program_address(&[b"nullifier", &fx::FIXTURE_NULLIFIER_0], &program_id);
     let (nf1_pda, _) =
@@ -158,6 +164,42 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     )
     .await;
 
+    // Register an INDEPENDENT validator to co-sign the quorum. Fund it from the
+    // payer (stake + fees), then self-register it (RegisterValidator is
+    // permissionless). total_active_stake becomes 2 SOL; with the authority's
+    // 1 SOL excluded, eligible stake is 1 SOL and the cosigner's 1 SOL clears it.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &payer,
+        solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &cosigner.pubkey(),
+            MIN_VALIDATOR_STAKE + 100_000_000,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &cosigner,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: cosigner_pda,
+                validator_registry: registry_pda,
+                validator: cosigner.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
     // Fund the vault (2 SOL) so it stays rent-exempt through the payout + claim.
     send(
         &mut banks_client,
@@ -194,43 +236,50 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     .await;
 
     // transact — credits EXPECTED_FEE to the settling validator's pending_rewards.
-    send(
-        &mut banks_client,
-        recent_blockhash,
-        &upgrade_authority,
-        Instruction {
-            program_id,
-            data: instruction::Transact {
-                nullifiers: [fx::FIXTURE_NULLIFIER_0, fx::FIXTURE_NULLIFIER_1],
-                output_commitments: [fx::FIXTURE_COMMITMENT_0, fx::FIXTURE_COMMITMENT_1],
-                root: fx::FIXTURE_ROOT,
-                ext_amount: fx::FIXTURE_EXT_AMOUNT,
-                proof: fixture_proof(),
+    // The authority is excluded from its own quorum, so the independent cosigner
+    // supplies the satisfying (wallet, PDA) pair; the tx is signed by both.
+    let transact_ix = Instruction {
+        program_id,
+        data: instruction::Transact {
+            nullifiers: [fx::FIXTURE_NULLIFIER_0, fx::FIXTURE_NULLIFIER_1],
+            output_commitments: [fx::FIXTURE_COMMITMENT_0, fx::FIXTURE_COMMITMENT_1],
+            root: fx::FIXTURE_ROOT,
+            ext_amount: fx::FIXTURE_EXT_AMOUNT,
+            proof: fixture_proof(),
+        }
+        .data(),
+        accounts: {
+            let mut metas = accounts::Transact {
+                bridge_state: state_pda,
+                merkle_tree: tree_pda,
+                bridge_vault: vault_pda,
+                nullifier_account_0: nf0_pda,
+                nullifier_account_1: nf1_pda,
+                recipient,
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                system_program: solana_sdk::system_program::ID,
             }
-            .data(),
-            accounts: {
-                let mut metas = accounts::Transact {
-                    bridge_state: state_pda,
-                    merkle_tree: tree_pda,
-                    bridge_vault: vault_pda,
-                    nullifier_account_0: nf0_pda,
-                    nullifier_account_1: nf1_pda,
-                    recipient,
-                    validator_account: validator_pda,
-                    validator_registry: registry_pda,
-                    authority: upgrade_authority.pubkey(),
-                    system_program: solana_sdk::system_program::ID,
-                }
-                .to_account_metas(None);
-                // Quorum co-signers (#260): the sole registered validator,
-                // co-signing as a (wallet, PDA) pair.
-                metas.push(AccountMeta::new_readonly(upgrade_authority.pubkey(), true));
-                metas.push(AccountMeta::new_readonly(validator_pda, false));
-                metas
-            },
+            .to_account_metas(None);
+            // Quorum co-signer (#260): an INDEPENDENT registered validator,
+            // co-signing as a (wallet, PDA) pair. The authority's own pair is
+            // not needed — it is skipped in the tally.
+            metas.push(AccountMeta::new_readonly(cosigner.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(cosigner_pda, false));
+            metas
         },
-    )
-    .await;
+    };
+    let transact_tx = Transaction::new_signed_with_payer(
+        &[transact_ix],
+        Some(&upgrade_authority.pubkey()),
+        &[&upgrade_authority, &cosigner],
+        recent_blockhash,
+    );
+    banks_client
+        .process_transaction(transact_tx)
+        .await
+        .unwrap();
 
     // The fee is now pending; nothing claimed yet.
     let before = banks_client

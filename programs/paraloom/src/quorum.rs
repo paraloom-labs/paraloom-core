@@ -34,9 +34,19 @@ pub fn quorum_threshold(total_active_stake: u64) -> u64 {
 pub fn verify_validator_quorum(
     program_id: &Pubkey,
     registry: &ValidatorRegistry,
+    settlement_authority: &Pubkey,
+    authority_active_stake: u64,
     quorum_accounts: &[AccountInfo],
 ) -> Result<()> {
-    let threshold = quorum_threshold(registry.total_active_stake);
+    // The settlement authority is not an independent second factor: its own
+    // stake counts toward neither the tally nor the denominator. Subtracting it
+    // keeps the threshold a supermajority of exactly the stake that can be
+    // counted, so a compromised settlement key still needs an independent
+    // supermajority to settle.
+    let eligible_stake = registry
+        .total_active_stake
+        .saturating_sub(authority_active_stake);
+    let threshold = quorum_threshold(eligible_stake);
     let mut counted_stake: u64 = 0;
     let mut seen: Vec<Pubkey> = Vec::new();
 
@@ -49,6 +59,11 @@ pub fn verify_validator_quorum(
 
         // The wallet must have signed this transaction.
         if !wallet.is_signer {
+            continue;
+        }
+        // The settlement authority never counts toward its own quorum, so the
+        // quorum stays a factor independent of the settlement key.
+        if wallet.key == settlement_authority {
             continue;
         }
         // The PDA must be one of our program's accounts...
@@ -79,6 +94,12 @@ pub fn verify_validator_quorum(
         counted_stake = counted_stake.saturating_add(validator.stake_amount);
     }
 
+    // No signer set may count more stake than the eligible active total. A
+    // `counted_stake` above `eligible_stake` proves the registry's recorded
+    // total has diverged from its live active set (e.g. orphaned `is_active`
+    // PDAs left behind by a reconcile), so reject rather than let a stale-low
+    // denominator be cleared by stake it does not account for.
+    require!(counted_stake <= eligible_stake, BridgeError::QuorumNotMet);
     require!(counted_stake >= threshold, BridgeError::QuorumNotMet);
     Ok(())
 }
@@ -145,7 +166,7 @@ mod tests {
 
     #[test]
     fn empty_quorum_is_rejected() {
-        assert!(verify_validator_quorum(&prog(), &registry(3), &[]).is_err());
+        assert!(verify_validator_quorum(&prog(), &registry(3), &Pubkey::default(), 0, &[]).is_err());
     }
 
     #[test]
@@ -166,7 +187,7 @@ mod tests {
         let s1 = AccountInfo::new(&w1, true, false, &mut l1, &mut e1, &sys, false, 0);
         let a1 = AccountInfo::new(&pda1, false, false, &mut lp1, &mut d1, &p, false, 0);
         let accts = [s0, a0, s1, a1];
-        assert!(verify_validator_quorum(&p, &registry(2), &accts).is_ok());
+        assert!(verify_validator_quorum(&p, &registry(2), &Pubkey::default(), 0, &accts).is_ok());
     }
 
     #[test]
@@ -182,7 +203,7 @@ mod tests {
         let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
         let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
         let accts = [s0, a0];
-        assert!(verify_validator_quorum(&p, &registry(3), &accts).is_err());
+        assert!(verify_validator_quorum(&p, &registry(3), &Pubkey::default(), 0, &accts).is_err());
     }
 
     #[test]
@@ -198,7 +219,7 @@ mod tests {
         let s0 = AccountInfo::new(&w0, false, false, &mut l0, &mut e0, &sys, false, 0);
         let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
         let accts = [s0, a0];
-        assert!(verify_validator_quorum(&p, &registry(1), &accts).is_err());
+        assert!(verify_validator_quorum(&p, &registry(1), &Pubkey::default(), 0, &accts).is_err());
     }
 
     #[test]
@@ -213,7 +234,7 @@ mod tests {
         let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
         let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
         let accts = [s0, a0];
-        assert!(verify_validator_quorum(&p, &registry(1), &accts).is_err());
+        assert!(verify_validator_quorum(&p, &registry(1), &Pubkey::default(), 0, &accts).is_err());
     }
 
     #[test]
@@ -230,7 +251,7 @@ mod tests {
         let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
         let a0 = AccountInfo::new(&bad_pda, false, false, &mut lp0, &mut d0, &p, false, 0);
         let accts = [s0, a0];
-        assert!(verify_validator_quorum(&p, &registry(1), &accts).is_err());
+        assert!(verify_validator_quorum(&p, &registry(1), &Pubkey::default(), 0, &accts).is_err());
     }
 
     #[test]
@@ -249,7 +270,7 @@ mod tests {
         let s0b = AccountInfo::new(&w0, true, false, &mut l0b, &mut e0b, &sys, false, 0);
         let a0b = AccountInfo::new(&pda0, false, false, &mut lp0b, &mut d0b, &p, false, 0);
         let accts = [s0, a0, s0b, a0b];
-        assert!(verify_validator_quorum(&p, &registry(2), &accts).is_err());
+        assert!(verify_validator_quorum(&p, &registry(2), &Pubkey::default(), 0, &accts).is_err());
     }
 
     #[test]
@@ -270,6 +291,8 @@ mod tests {
         assert!(verify_validator_quorum(
             &p,
             &registry_with_stake(3, 9_000_000_000),
+            &Pubkey::default(),
+            0,
             &[s_big, a_big]
         )
         .is_ok());
@@ -296,7 +319,75 @@ mod tests {
         assert!(verify_validator_quorum(
             &p,
             &registry_with_stake(3, 9_000_000_000),
+            &Pubkey::default(),
+            0,
             &[s_small, a_small]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn settlement_authority_does_not_count_toward_its_own_quorum() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Registry: 2 SOL total (the settling authority's 1 SOL + one
+        // independent validator's 1 SOL). The authority is excluded, so
+        // eligible = 1 SOL and threshold = quorum_threshold(1 SOL).
+        let auth = Pubkey::new_unique();
+        let (pda_auth, _) = Pubkey::find_program_address(&[b"validator", auth.as_ref()], &p);
+        let mut d_auth = validator_data(auth, true);
+        let (mut la, mut lpa) = (0u64, 0u64);
+        let mut ea = [0u8; 0];
+        let sa = AccountInfo::new(&auth, true, false, &mut la, &mut ea, &sys, false, 0);
+        let aa = AccountInfo::new(&pda_auth, false, false, &mut lpa, &mut d_auth, &p, false, 0);
+        // The authority signing by itself contributes 0 → below threshold.
+        assert!(
+            verify_validator_quorum(&p, &registry(2), &auth, 1_000_000_000, &[sa, aa]).is_err()
+        );
+    }
+
+    #[test]
+    fn independent_validator_clears_quorum_with_authority_excluded() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Same 2-SOL registry; the one independent validator (1 SOL) alone
+        // clears eligible = 1 SOL — the threshold stays appropriately low for a
+        // small honest set once the authority's own stake is removed.
+        let auth = Pubkey::new_unique();
+        let ind = Pubkey::new_unique();
+        let (pda_ind, _) = Pubkey::find_program_address(&[b"validator", ind.as_ref()], &p);
+        let mut d_ind = validator_data(ind, true);
+        let (mut li, mut lpi) = (0u64, 0u64);
+        let mut ei = [0u8; 0];
+        let si = AccountInfo::new(&ind, true, false, &mut li, &mut ei, &sys, false, 0);
+        let ai = AccountInfo::new(&pda_ind, false, false, &mut lpi, &mut d_ind, &p, false, 0);
+        assert!(
+            verify_validator_quorum(&p, &registry(2), &auth, 1_000_000_000, &[si, ai]).is_ok()
+        );
+    }
+
+    #[test]
+    fn counted_stake_above_eligible_is_rejected() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // The registry records 2 SOL total, but a signer's PDA claims 5 SOL —
+        // stake the denominator does not account for (e.g. an orphaned active
+        // PDA left by a reset). The bound rejects it even though 5 SOL would
+        // otherwise clear the 2-SOL threshold: the recorded total and the live
+        // active set have diverged.
+        let w = Pubkey::new_unique();
+        let (pda, _) = Pubkey::find_program_address(&[b"validator", w.as_ref()], &p);
+        let mut d = validator_data_staked(w, true, 5_000_000_000);
+        let (mut l, mut lp) = (0u64, 0u64);
+        let mut e = [0u8; 0];
+        let s = AccountInfo::new(&w, true, false, &mut l, &mut e, &sys, false, 0);
+        let a = AccountInfo::new(&pda, false, false, &mut lp, &mut d, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(2, 2_000_000_000),
+            &Pubkey::default(),
+            0,
+            &[s, a]
         )
         .is_err());
     }
