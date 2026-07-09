@@ -509,10 +509,12 @@ pub fn create_initialize_merkle_tree_instruction(
 /// authority. Used by the redeploy runbook to freeze the pool before upgrading.
 pub fn create_pause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Instruction {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (registry_pda, _) = derive_validator_registry(program_id);
     Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
             AccountMeta::new_readonly(*authority, true),
         ],
         data: discriminators::PAUSE.to_vec(),
@@ -522,10 +524,12 @@ pub fn create_pause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Inst
 /// Unpause the bridge. Same authority and accounts as [`create_pause_instruction`].
 pub fn create_unpause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Instruction {
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (registry_pda, _) = derive_validator_registry(program_id);
     Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
             AccountMeta::new_readonly(*authority, true),
         ],
         data: discriminators::UNPAUSE.to_vec(),
@@ -555,10 +559,12 @@ pub fn create_set_bridge_authority_instruction(
         &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
     );
 
+    let (registry_pda, _) = derive_validator_registry(program_id);
     Ok(Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
             AccountMeta::new_readonly(*authority, true),
         ],
         data: instruction_data,

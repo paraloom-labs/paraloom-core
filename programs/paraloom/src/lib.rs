@@ -416,8 +416,9 @@ pub mod paraloom_program {
     /// sitting on a public
     /// host. This hands settlement control from the genesis authority to the
     /// operating validator (a staked, slashable key), keeping the upgrade
-    /// authority offline. Gated `has_one = authority`: only the current
-    /// authority can rotate it.
+    /// authority offline. Gated on the COLD registry authority (not the current
+    /// bridge authority), so the cold key always manages the hot settlement key
+    /// and a compromised hot key cannot rotate control away.
     pub fn set_bridge_authority(
         ctx: Context<SetBridgeAuthority>,
         new_authority: Pubkey,
@@ -1115,10 +1116,22 @@ pub struct Pause<'info> {
     #[account(
         mut,
         seeds = [b"bridge_state"],
+        bump
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    // Freeze/rotate power is gated on the COLD registry authority, NOT the hot
+    // `bridge_state.authority` (the node-resident settlement key). Settlement
+    // (`transact`) stays bound to the hot key but is quorum-gated; pause/unpause
+    // and rotation are not quorum-gated, so a compromise of the deliberately-hot
+    // key must not be able to freeze the bridge or rotate itself in. Requiring
+    // the cold authority keeps those capabilities off the settlement host.
+    #[account(
+        seeds = [b"validator_registry"],
         bump,
         has_one = authority
     )]
-    pub bridge_state: Account<'info, BridgeState>,
+    pub validator_registry: Account<'info, ValidatorRegistry>,
 
     pub authority: Signer<'info>,
 }
@@ -1128,10 +1141,19 @@ pub struct SetBridgeAuthority<'info> {
     #[account(
         mut,
         seeds = [b"bridge_state"],
+        bump
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    // Rotation is a cold-authority operation (see `Pause`): the cold registry
+    // authority manages the hot settlement key, so a compromised hot key cannot
+    // rotate control away and lock out recovery.
+    #[account(
+        seeds = [b"validator_registry"],
         bump,
         has_one = authority
     )]
-    pub bridge_state: Account<'info, BridgeState>,
+    pub validator_registry: Account<'info, ValidatorRegistry>,
 
     pub authority: Signer<'info>,
 }

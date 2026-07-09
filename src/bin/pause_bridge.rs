@@ -1,16 +1,17 @@
 //! Pause / unpause the bridge.
 //!
-//! Freezes (or re-opens) deposits and settlement. Signed by the **bridge
-//! settlement authority** (the `Hky4Zx2…` settler key) — this is a DIFFERENT
-//! key from the upgrade/registry authority that `reconcile-validators` uses.
-//! The redeploy runbook pauses before the in-place upgrade and unpauses only
-//! after a co-signed smoke settlement succeeds.
+//! Freezes (or re-opens) deposits and settlement. Signed by the **cold registry
+//! authority** (the upgrade/registry key, the same one `reconcile-validators`
+//! uses) — NOT the hot settlement key. Freeze/rotate power is deliberately kept
+//! off the settlement host so a compromise of the node-resident settler cannot
+//! freeze the bridge or rotate itself in. The redeploy runbook pauses before the
+//! in-place upgrade and unpauses only after a co-signed smoke settlement succeeds.
 //!
 //! Usage:  pause-bridge pause | unpause
 //!
 //! Env:
 //!   SOLANA_RPC_URL, SOLANA_PROGRAM_ID
-//!   BRIDGE_SETTLER_KEYPAIR_PATH   the bridge settlement authority keypair
+//!   BRIDGE_AUTHORITY_KEYPAIR_PATH   the cold registry/upgrade authority keypair
 
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
@@ -47,12 +48,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_url =
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://localhost:8899".to_string());
     let program_id = Pubkey::from_str(&std::env::var("SOLANA_PROGRAM_ID")?)?;
-    let authority = load_keypair_from_file(&std::env::var("BRIDGE_SETTLER_KEYPAIR_PATH")?)?;
+    let authority = load_keypair_from_file(&std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?)?;
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
     println!("Program:   {program_id}");
-    println!("Authority: {} (bridge settler)", authority.pubkey());
+    println!(
+        "Authority: {} (cold registry authority)",
+        authority.pubkey()
+    );
     println!("Action:    {action}");
     println!("paused before: {}", read_paused(&client, &program_id)?);
 
