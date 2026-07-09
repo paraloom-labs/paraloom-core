@@ -26,9 +26,13 @@
 //!   BRIDGE_AUTHORITY_KEYPAIR_PATH  the upgrade == registry authority keypair
 //!   RECONCILE_KEEP                 comma-separated validator wallets to keep
 //!                                  active (MUST include the settler's wallet)
+//!   RECONCILE_SETTLER             the settlement authority's validator wallet;
+//!                                  required, must be in RECONCILE_KEEP, never
+//!                                  deactivated (else settlement bricks)
 //!   RECONCILE_EXECUTE=1            actually send (default: print the plan only)
 
 use paraloom::bridge::solana::*;
+use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
@@ -38,6 +42,26 @@ use solana_sdk::{
 };
 use std::collections::HashSet;
 use std::str::FromStr;
+
+/// `getProgramAccounts` config for enumerating `ValidatorAccount` PDAs.
+///
+/// MUST request Base64: after migration every PDA is 129 bytes and the RPC
+/// rejects base58 encoding above 128 bytes (`-32600 "Encoded binary (base 58)
+/// data should be less than 128 bytes"`). The default (base58) works today at
+/// 113 bytes but breaks the post-migrate verify and any idempotent re-run.
+fn validator_accounts_config() -> RpcProgramAccountsConfig {
+    RpcProgramAccountsConfig {
+        filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+            0,
+            VALIDATOR_DISC.to_vec(),
+        ))]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
 
 /// `sha256("account:ValidatorAccount")[..8]`.
 const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
@@ -70,21 +94,39 @@ fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
     })
 }
 
+/// Send one instruction, re-signing with a fresh blockhash on transient
+/// failures. A single dropped tx would otherwise abort a ~50-tx reconcile
+/// mid-run; each attempt fetches a new blockhash so a retry is never rejected
+/// as a stale duplicate. All txs are idempotent on-chain (migrate/deactivate/
+/// reset no-op when already applied), so a retry after an ambiguous confirm is
+/// safe.
 fn send(
     client: &RpcClient,
     authority: &solana_sdk::signature::Keypair,
     ix: solana_sdk::instruction::Instruction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let blockhash = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&authority.pubkey()),
-        &[authority],
-        blockhash,
-    );
-    let sig = client.send_and_confirm_transaction(&tx)?;
-    println!("    sig {sig}");
-    Ok(())
+    const MAX_ATTEMPTS: usize = 4;
+    let mut last_err: Option<Box<dyn std::error::Error>> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let blockhash = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            std::slice::from_ref(&ix),
+            Some(&authority.pubkey()),
+            &[authority],
+            blockhash,
+        );
+        match client.send_and_confirm_transaction(&tx) {
+            Ok(sig) => {
+                println!("    sig {sig}");
+                return Ok(());
+            }
+            Err(e) => {
+                println!("    attempt {attempt}/{MAX_ATTEMPTS} failed: {e}");
+                last_err = Some(Box::new(e));
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt ran"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -101,8 +143,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<std::result::Result<_, _>>()?;
     let execute = std::env::var("RECONCILE_EXECUTE").ok().as_deref() == Some("1");
 
+    // The settlement (bridge) authority's validator wallet MUST stay active — if
+    // the CLI deactivated it, every future `transact` would abort
+    // `ValidatorNotActive` with no reactivate path (recoverable only by rotating
+    // the bridge authority). The CLI can't infer which wallet is the settler, so
+    // require it explicitly and refuse to run unless it is in the keep-set.
+    let settler = Pubkey::from_str(&std::env::var("RECONCILE_SETTLER").map_err(|_| {
+        "RECONCILE_SETTLER is required (the settlement authority's validator wallet, e.g. Hky4Zx2…) — it must never be deactivated"
+    })?)?;
+
     if keep.is_empty() {
         return Err("RECONCILE_KEEP is empty — refusing to reset to zero validators".into());
+    }
+    if !keep.contains(&settler) {
+        return Err(format!(
+            "settler {settler} is not in RECONCILE_KEEP — deactivating it would brick settlement; add it to the keep-set"
+        )
+        .into());
     }
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
@@ -113,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Program:   {program_id}");
     println!("Authority: {}", authority.pubkey());
+    println!("Settler:   {settler} (protected — never deactivated)");
     println!(
         "Keep-set ({}): {:?}\n",
         keep.len(),
@@ -120,16 +178,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Enumerate every ValidatorAccount PDA (both 113 and 129 byte).
-    let cfg = RpcProgramAccountsConfig {
-        filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-            0,
-            VALIDATOR_DISC.to_vec(),
-        ))]),
-        account_config: RpcAccountInfoConfig::default(),
-        ..Default::default()
-    };
     let mut rows: Vec<ValidatorRow> = client
-        .get_program_accounts_with_config(&program_id, cfg)?
+        .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
         .filter_map(|(pda, acc)| decode(pda, &acc))
         .collect();
@@ -148,13 +198,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Warn if any keep-set wallet is missing on-chain — resetting to a
-    // non-existent PDA would fail, and omitting a real settler bricks quorum.
-    let present: HashSet<Pubkey> = rows.iter().map(|r| r.wallet).collect();
+    // Every keep-set wallet MUST exist on-chain AND be active before we touch
+    // anything: `reset_validator_registry` requires each remaining-account be
+    // `is_active` (it aborts otherwise), and it runs LAST — after migrate +
+    // deactivate have already committed. A missing/inactive keep entry would
+    // therefore strand the reconcile half-done. Hard-fail up front instead.
+    let by_wallet: std::collections::HashMap<Pubkey, &ValidatorRow> =
+        rows.iter().map(|r| (r.wallet, r)).collect();
+    let mut bad_keep: Vec<String> = Vec::new();
     for w in &keep {
-        if !present.contains(w) {
-            println!("  ⚠ keep-set wallet {w} has NO on-chain ValidatorAccount — it must be registered before reset");
+        match by_wallet.get(w) {
+            None => bad_keep.push(format!(
+                "{w} (no on-chain ValidatorAccount — register it first)"
+            )),
+            Some(r) if !r.is_active => bad_keep.push(format!("{w} (inactive — reset would abort)")),
+            Some(_) => {}
         }
+    }
+    if !bad_keep.is_empty() {
+        return Err(format!(
+            "keep-set has {} unusable wallet(s); fix before reconciling:\n  - {}",
+            bad_keep.len(),
+            bad_keep.join("\n  - ")
+        )
+        .into());
     }
 
     let to_migrate: Vec<&ValidatorRow> = rows.iter().filter(|r| r.data_len < NEW_LEN).collect();
@@ -224,17 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. verify the invariant on-chain.
     println!("[4/4] verifying invariant...");
     let refreshed: Vec<ValidatorRow> = client
-        .get_program_accounts_with_config(
-            &program_id,
-            RpcProgramAccountsConfig {
-                filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                    0,
-                    VALIDATOR_DISC.to_vec(),
-                ))]),
-                account_config: RpcAccountInfoConfig::default(),
-                ..Default::default()
-            },
-        )?
+        .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
         .filter_map(|(pda, acc)| decode(pda, &acc))
         .collect();
