@@ -258,7 +258,7 @@ impl VerificationCoordinator {
         let mut consensus_disagreements = 0;
         let mut insufficient_results = 0;
 
-        for (_job_id, validator_results) in results.iter() {
+        for validator_results in results.values() {
             if validator_results.len() < CONSENSUS_THRESHOLD {
                 insufficient_results += 1;
                 continue;
