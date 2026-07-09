@@ -25,6 +25,10 @@ We reward valid security findings. At this pre-mainnet stage rewards are
 severity-scaled and assessed case by case, and every fixed report is credited in
 the security log (unless you prefer to remain anonymous).
 
+**Stage 1 is live** — a $3,000 USDC pool on the shielded-pool settlement stack.
+See [`docs/bug-bounty.md`](docs/bug-bounty.md) for the reward tiers, pinned
+scope, known issues, and reporting rules.
+
 **In scope**
 
 - `programs/paraloom/` — the on-chain Solana program
