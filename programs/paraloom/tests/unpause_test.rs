@@ -31,6 +31,7 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
     // Helper to land a single ix signed by `signer` (also tx payer).
     async fn send(
@@ -46,6 +47,7 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
 
     let pause_meta = accounts::Pause {
         bridge_state: state_pda,
+        validator_registry: registry_pda,
         authority: upgrade_authority.pubkey(),
     }
     .to_account_metas(None);
@@ -82,6 +84,25 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
             data: instruction::InitializeMerkleTree {}.data(),
             accounts: accounts::InitializeMerkleTree {
                 merkle_tree: tree_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+    // Initialize the validator registry — its `authority` is the cold key that
+    // now gates pause/unpause.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
                 authority: upgrade_authority.pubkey(),
                 program_data: program_data_pda,
                 system_program: solana_sdk::system_program::ID,
