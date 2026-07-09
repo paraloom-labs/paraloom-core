@@ -32,10 +32,11 @@ pub struct DepositInstructionData {
 pub mod discriminators {
     pub const INITIALIZE: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237];
     pub const DEPOSIT: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
-    #[allow(dead_code)]
-    pub const PAUSE: [u8; 8] = [139, 98, 119, 98, 22, 6, 120, 33];
-    #[allow(dead_code)]
-    pub const UNPAUSE: [u8; 8] = [111, 51, 238, 100, 208, 146, 57, 103];
+    /// `sha256("global:pause")[..8]`. Halts deposits/settlement (bridge-authority
+    /// signed). Used by the redeploy runbook to freeze the pool before an upgrade.
+    pub const PAUSE: [u8; 8] = [211, 22, 221, 251, 74, 121, 193, 47];
+    /// `sha256("global:unpause")[..8]`. Re-opens the bridge after a verified upgrade.
+    pub const UNPAUSE: [u8; 8] = [169, 144, 4, 38, 10, 141, 188, 255];
     /// `sha256("global:set_bridge_authority")[..8]`. Rotates the bridge
     /// settlement authority (admin op, current-authority-signed).
     pub const SET_BRIDGE_AUTHORITY: [u8; 8] = [158, 241, 140, 64, 226, 16, 99, 251];
@@ -503,6 +504,34 @@ pub fn create_initialize_merkle_tree_instruction(
 /// `bridge_state.authority = new_authority`. Used to hand settlement control
 /// from the genesis (upgrade) authority to the node-resident validator key,
 /// keeping the upgrade authority offline.
+/// Pause the bridge (halts deposits + settlement). Signed by the bridge
+/// authority (the settlement key), which is distinct from the upgrade/registry
+/// authority. Used by the redeploy runbook to freeze the pool before upgrading.
+pub fn create_pause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Instruction {
+    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: discriminators::PAUSE.to_vec(),
+    }
+}
+
+/// Unpause the bridge. Same authority and accounts as [`create_pause_instruction`].
+pub fn create_unpause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Instruction {
+    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: discriminators::UNPAUSE.to_vec(),
+    }
+}
+
 pub fn create_set_bridge_authority_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
