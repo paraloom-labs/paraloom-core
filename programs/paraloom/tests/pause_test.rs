@@ -27,6 +27,7 @@ async fn pause_flips_flag_and_blocks_deposit() {
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
     let init_ix = Instruction {
         program_id,
@@ -56,8 +57,23 @@ async fn pause_flips_flag_and_blocks_deposit() {
         }
         .to_account_metas(None),
     };
-    let mut tx =
-        Transaction::new_with_payer(&[init_ix, init_tree_ix], Some(&upgrade_authority.pubkey()));
+    // Initialize the validator registry — its `authority` is the cold key that
+    // now gates pause/unpause.
+    let init_registry_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(
+        &[init_ix, init_tree_ix, init_registry_ix],
+        Some(&upgrade_authority.pubkey()),
+    );
     tx.sign(&[&upgrade_authority], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
@@ -66,6 +82,7 @@ async fn pause_flips_flag_and_blocks_deposit() {
         data: instruction::Pause {}.data(),
         accounts: accounts::Pause {
             bridge_state: bridge_state_pda,
+            validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
         }
         .to_account_metas(None),

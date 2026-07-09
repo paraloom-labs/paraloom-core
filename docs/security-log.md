@@ -10,6 +10,21 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Bridge freeze and authority rotation moved to the cold authority**
+  (in-house pre-bounty audit). `pause` / `unpause` / `set_bridge_authority`
+  were authorized by `bridge_state.authority` — which by design is a
+  node-resident settlement key kept on a public host, safe to expose only
+  because settlement (`transact`) additionally requires an independent
+  stake-weighted validator quorum. But the freeze and rotation instructions
+  were not quorum-gated, so a single compromise of that deliberately-hot key
+  could freeze all deposits and settlement, or rotate the authority away and
+  leave recovery only to a full program upgrade. These three instructions are
+  now gated on the cold registry authority (the upgrade key, kept off the
+  settlement host), so the hot key retains only its quorum-gated settlement
+  role. No funds were ever at risk — vault balances are unaffected and always
+  recoverable; this is an availability and operational-continuity fix. Devnet,
+  pre-mainnet (PR #380).
+
 - **Validator stake is locked for an unbonding period, not instantly
   refundable** (in-house security audit). Validator registration is
   permissionless at the minimum stake, and `unregister_validator` returned the

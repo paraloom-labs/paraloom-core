@@ -3,8 +3,11 @@
 //! `initialize` (#204) pins the bridge authority to the program upgrade
 //! authority at genesis. This rotates it to a separate operating key so the
 //! upgrade authority can stay offline while a node-resident validator key
-//! settles. Pins: (1) the current authority can rotate it; (2) a non-authority
-//! signer is rejected by `has_one = authority`.
+//! settles. Rotation is gated on the COLD registry authority (not the current
+//! bridge authority), so the cold key manages the hot settlement key and a
+//! compromised hot key cannot rotate control away. Pins: (1) the registry
+//! authority can rotate it; (2) a non-authority signer is rejected by
+//! `has_one = authority`.
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
@@ -27,6 +30,7 @@ async fn set_bridge_authority_rotates_and_rejects_non_authority() {
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
     // initialize — signed by the upgrade authority (#204); bridge_state.authority
     // becomes the upgrade authority.
@@ -51,7 +55,26 @@ async fn set_bridge_authority_rotates_and_rejects_non_authority() {
     tx.sign(&[&upgrade_authority], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
-    // Negative: a non-authority signer cannot rotate (has_one = authority).
+    // initialize the validator registry — its `authority` is the cold key that
+    // now gates rotation.
+    let mut tx = Transaction::new_with_payer(
+        &[Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        }],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
+    // Negative: a non-authority signer cannot rotate (registry has_one = authority).
     let new_authority = Keypair::new();
     let set_ix = |signer: &Pubkey| Instruction {
         program_id,
@@ -61,6 +84,7 @@ async fn set_bridge_authority_rotates_and_rejects_non_authority() {
         .data(),
         accounts: accounts::SetBridgeAuthority {
             bridge_state: state_pda,
+            validator_registry: registry_pda,
             authority: *signer,
         }
         .to_account_metas(None),
@@ -74,7 +98,7 @@ async fn set_bridge_authority_rotates_and_rejects_non_authority() {
         "a non-authority signer must not rotate the bridge authority"
     );
 
-    // Happy path: the current authority rotates to the new key.
+    // Happy path: the cold registry authority rotates to the new key.
     let mut tx = Transaction::new_with_payer(
         &[set_ix(&upgrade_authority.pubkey())],
         Some(&upgrade_authority.pubkey()),
