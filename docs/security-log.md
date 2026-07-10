@@ -10,6 +10,14 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Equivocation is detected on the vote decision, not its wording** (in-house
+  pattern audit prompted by the external bug-bounty findings). `VoteTally` flagged
+  equivocation by whole-vote equality, so a validator's own two `Invalid` votes
+  differing only in their free-text `reason` read as equivocation and
+  self-penalised its reputation. Equivocation is now the Valid/Invalid decision
+  flipping, so re-worded Invalid votes are idempotent. Off-chain robustness only.
+  Devnet, pre-mainnet.
+
 - **Transact verification requests are keyed by a content-bound id**
   (external bug-bounty report). The off-chain `request_id` on a transact
   verification request was a caller-chosen string, not derived from the
