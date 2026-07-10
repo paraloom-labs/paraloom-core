@@ -892,17 +892,48 @@ async fn settle_approved_transacts<F, Fut>(
     F: FnMut(ApprovedTransact) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
 {
+    // A settlement that fails on a transient error — an expired blockhash, a
+    // co-signer briefly offline, a co-sign wallet not yet gossiped — must not be
+    // dropped: the approval is emitted exactly once and never re-emitted, so
+    // dropping it strands the transact permanently (recoverable only by the
+    // client re-proving into a new canonical id). Retry the whole cosign+submit
+    // a few times with a short backoff. Re-settling an attempt that actually
+    // landed on-chain is safe — its nullifier is already spent, so the retry
+    // returns a replay error and is skipped here.
+    const MAX_SETTLE_ATTEMPTS: u32 = 3;
+    const SETTLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
     while let Some(approved) = rx.recv().await {
         let request_id = approved.request.request_id.clone();
-        match submit(approved).await {
-            Ok(sig) => info!("on-chain transact settled for {}: {}", request_id, sig),
-            Err(e) if is_replay_error(&e) => {
-                log::debug!(
-                    "transact {} already settled (nullifier spent), skipping",
-                    request_id
-                )
+        for attempt in 1..=MAX_SETTLE_ATTEMPTS {
+            match submit(approved.clone()).await {
+                Ok(sig) => {
+                    info!("on-chain transact settled for {}: {}", request_id, sig);
+                    break;
+                }
+                Err(e) if is_replay_error(&e) => {
+                    log::debug!(
+                        "transact {} already settled (nullifier spent), skipping",
+                        request_id
+                    );
+                    break;
+                }
+                Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
+                    log::warn!(
+                        "transact {} submit attempt {}/{} failed, retrying: {}",
+                        request_id,
+                        attempt,
+                        MAX_SETTLE_ATTEMPTS,
+                        e
+                    );
+                    tokio::time::sleep(SETTLE_RETRY_BACKOFF).await;
+                }
+                Err(e) => log::warn!(
+                    "transact {} submit failed after {} attempts: {}",
+                    request_id,
+                    MAX_SETTLE_ATTEMPTS,
+                    e
+                ),
             }
-            Err(e) => log::warn!("transact {} submit failed: {}", request_id, e),
         }
     }
 }
@@ -2375,6 +2406,60 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // A transient submit failure (expired blockhash, co-signer briefly offline)
+    // must be RETRIED, not dropped — the approval is emitted once and never
+    // re-emitted, so dropping it would strand the transact permanently. Two
+    // failures then a success settles on the third attempt.
+    #[tokio::test(start_paused = true)]
+    async fn transient_submit_failure_is_retried_until_it_settles() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("flaky")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(rx, move |_approved| {
+            let counter = counter.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(crate::bridge::BridgeError::InvalidTransaction(
+                        "blockhash not found".to_string(),
+                    ))
+                } else {
+                    Ok("signature".to_string())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    // A persistently-failing settlement gives up after MAX_SETTLE_ATTEMPTS
+    // instead of retrying forever.
+    #[tokio::test(start_paused = true)]
+    async fn persistent_submit_failure_gives_up_after_max_attempts() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("doomed")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(rx, move |_approved| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err::<String, _>(crate::bridge::BridgeError::InvalidTransaction(
+                    "still failing".to_string(),
+                ))
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     // With the bridge disabled (the default), a node owns neither a
