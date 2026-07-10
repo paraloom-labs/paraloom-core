@@ -176,13 +176,11 @@ async fn submit_handler(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Full first-nullifier, not an 8-byte prefix (audit #17): a prefix
-    // collision within the same second would merge two distinct transacts onto
-    // one verification round. The nullifier is unique per spend.
-    let request_id = format!("transact-{timestamp}-{}", hex::encode(nullifiers[0]));
-
-    let request = TransactVerificationRequest {
-        request_id,
+    // The id is the canonical digest of the settlement-bound fields (#383), so
+    // it cannot be chosen to collide two distinct transacts or poison a cache
+    // entry, and an exact replay is idempotent. Set after the struct is built.
+    let mut request = TransactVerificationRequest {
+        request_id: String::new(),
         recipient,
         nullifiers,
         output_commitments,
@@ -192,6 +190,7 @@ async fn submit_handler(
         ciphertexts,
         timestamp,
     };
+    request.request_id = request.canonical_id();
 
     let id = node
         .submit_transact(request)
@@ -337,10 +336,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let id = parsed["request_id"].as_str().unwrap();
         assert!(id.starts_with("transact-"));
-        assert!(id.ends_with(&"11".repeat(32)));
 
         // ...and the decoded request landed on the initiator intact.
         let seen = stub.seen.lock().await.clone().expect("request forwarded");
+        // The id is the canonical content-bound digest of that request (#383).
+        assert_eq!(id, seen.canonical_id());
         assert_eq!(seen.recipient, [0x66u8; 32]);
         assert_eq!(seen.nullifiers, [[0x11u8; 32], [0x22u8; 32]]);
         assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);

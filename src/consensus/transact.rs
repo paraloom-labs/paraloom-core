@@ -81,6 +81,33 @@ pub struct TransactVerificationRequest {
     pub timestamp: u64,
 }
 
+impl TransactVerificationRequest {
+    /// Canonical, content-bound request id: a domain-separated SHA-256 over the
+    /// proof/settlement-defining fields (#383). Keying consensus state by this,
+    /// rather than by a caller-chosen string, means a peer cannot pick an id to
+    /// overwrite or poison a cache entry; an exact replay is idempotent (same
+    /// id); and any mutated field yields a different id — so two distinct
+    /// transacts can never collide on one verification round (which previously
+    /// let an honest validator's Valid-then-Invalid votes read as equivocation).
+    /// Excludes `ciphertexts`, `timestamp`, and `request_id`, which are not
+    /// settlement-bound.
+    pub fn canonical_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"paraloom:transact-request:v1");
+        h.update(self.root);
+        h.update(self.recipient);
+        h.update(self.ext_amount.to_le_bytes());
+        h.update(self.nullifiers[0]);
+        h.update(self.nullifiers[1]);
+        h.update(self.output_commitments[0]);
+        h.update(self.output_commitments[1]);
+        h.update((self.proof.len() as u64).to_le_bytes());
+        h.update(&self.proof);
+        format!("transact-{}", hex::encode(h.finalize()))
+    }
+}
+
 /// Verification result from a validator for a transact request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactVerificationResult {
@@ -544,5 +571,57 @@ mod tests {
             Some("WaLLet1111".to_string()),
             "a wallet-less re-register must not clobber the advertised wallet"
         );
+    }
+
+    fn sample_request() -> TransactVerificationRequest {
+        TransactVerificationRequest {
+            request_id: "attacker-chosen".to_string(),
+            recipient: [1u8; 32],
+            nullifiers: [[2u8; 32], [3u8; 32]],
+            output_commitments: [[4u8; 32], [5u8; 32]],
+            root: [6u8; 32],
+            ext_amount: -100,
+            proof: vec![7, 8, 9],
+            ciphertexts: ["a".to_string(), "b".to_string()],
+            timestamp: 123,
+        }
+    }
+
+    #[test]
+    fn canonical_id_binds_only_settlement_fields() {
+        // The caller-chosen id, the ciphertexts, and the timestamp must not
+        // change the canonical id (#383/#382): an exact settlement replay is
+        // idempotent regardless of those non-bound fields.
+        let base = sample_request().canonical_id();
+        let mut r = sample_request();
+        r.request_id = "different".to_string();
+        r.ciphertexts = ["x".to_string(), "y".to_string()];
+        r.timestamp = 999;
+        assert_eq!(
+            r.canonical_id(),
+            base,
+            "id must bind only settlement fields"
+        );
+    }
+
+    #[test]
+    fn canonical_id_changes_when_a_settlement_field_changes() {
+        let base = sample_request().canonical_id();
+        for mutate in [
+            (|r: &mut TransactVerificationRequest| r.ext_amount = -101) as fn(&mut _),
+            |r| r.nullifiers[0] = [9u8; 32],
+            |r| r.output_commitments[1] = [9u8; 32],
+            |r| r.root = [9u8; 32],
+            |r| r.recipient = [9u8; 32],
+            |r| r.proof = vec![7, 8, 10],
+        ] {
+            let mut r = sample_request();
+            mutate(&mut r);
+            assert_ne!(
+                r.canonical_id(),
+                base,
+                "mutating a settlement field must change the canonical id"
+            );
+        }
     }
 }
