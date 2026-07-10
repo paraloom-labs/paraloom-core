@@ -10,6 +10,22 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Validator reputation is preserved across disconnect/reconnect** (external
+  bug-bounty report, billythebotman). The 30-second connectivity reconciler
+  removed a dropped peer from the transact-consensus coordinator, and that
+  removal also deleted the validator's `ReputationTracker` entry; a reconnect
+  recreated it at `BASE_REPUTATION`. A validator penalized below the
+  consensus-eligibility floor could therefore erase its Byzantine history and
+  regain eligibility by disconnecting for any duration and reconnecting.
+  Connectivity and security history are now separate lifecycle state:
+  `unregister_validator` drops the peer from the active voter set and leader
+  selection but preserves its reputation metrics, so a penalized validator stays
+  penalized across reconnects (reputation only decays with inactivity, it never
+  rises back over the floor). Off-chain only — the stake-weighted on-chain quorum
+  and the Groth16 proof check are independent, so no funds were ever at risk;
+  this closes an off-chain consensus-integrity/liveness defect. Devnet,
+  pre-mainnet.
+
 - **Removed the legacy off-chain Merkle path-query server** (hardening
   suggested by WakiyamaP alongside the reorder report). The `/merkle/path` HTTP
   server served inclusion paths from the off-chain shielded pool, but that pool
