@@ -90,12 +90,6 @@ pub struct Node {
     /// methods (init/start/stop) remain reachable behind &self.
     bridge: Option<Arc<Mutex<Bridge>>>,
 
-    /// Merkle path-query HTTP server handle (#163). Spawned in run()
-    /// when the bridge is enabled and a bind address is configured;
-    /// aborted in stop(). Same Arc<Mutex<Option<...>>> shape as the
-    /// other spawned-task handles so Clone of Node stays cheap.
-    path_server: Arc<Mutex<Option<JoinHandle<()>>>>,
-
     /// Transact consensus coordinator (#350), the v3 unified-transact twin of
     /// the retired withdrawal/transfer coordinators. Incoming
     /// `TransactVerificationResult` votes
@@ -1118,7 +1112,6 @@ impl Node {
             ha_broadcast: Arc::new(Mutex::new(None)),
             ha_watchdog: Arc::new(Mutex::new(None)),
             kad_refresh: Arc::new(Mutex::new(None)),
-            path_server: Arc::new(Mutex::new(None)),
             transact_coordinator,
             transact_approval_rx: Arc::new(Mutex::new(transact_approval_rx)),
             transact_submitter_task: Arc::new(Mutex::new(None)),
@@ -1540,40 +1533,6 @@ impl Node {
             info!("Solana bridge deposit listener started");
         }
 
-        // Serve Merkle paths over HTTP (#163) so a withdrawing client
-        // can fetch the (root, path) for the note it spends. Only runs
-        // when the node owns an indexed pool and a bind address is
-        // configured; an empty address disables it. An unparseable
-        // address is logged and skipped rather than failing start-up.
-        if let Some(pool) = &self.shielded_pool {
-            let addr_str = self.settings.bridge.merkle_path_query_address.trim();
-            if !addr_str.is_empty() {
-                match addr_str.parse::<std::net::SocketAddr>() {
-                    Ok(addr) => {
-                        let pool = pool.clone();
-                        let handle = tokio::spawn(async move {
-                            if let Err(e) = crate::privacy::path_server::serve(pool, addr).await {
-                                log::error!(
-                                    target: "paraloom::privacy::path_server",
-                                    "Merkle path query server exited: {}",
-                                    e
-                                );
-                            }
-                        });
-                        *self.path_server.lock().await = Some(handle);
-                        info!("Merkle path query server started on {}", addr_str);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "invalid bridge.merkle_path_query_address '{}': {} — path server not started",
-                            addr_str,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
         // Serve the transact-verification ingress over HTTP (#350) so a client
         // (wallet/CLI) can submit a settlement into the consensus mesh. Only
         // runs on a node that has a transact coordinator and a configured
@@ -1669,9 +1628,6 @@ impl Node {
             handle.abort();
         }
         if let Some(handle) = self.kad_refresh.lock().await.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.path_server.lock().await.take() {
             handle.abort();
         }
         if let Some(handle) = self.transact_submitter_task.lock().await.take() {
@@ -2116,7 +2072,6 @@ impl Clone for Node {
             ha_watchdog: self.ha_watchdog.clone(),
             kad_refresh: self.kad_refresh.clone(),
             bridge: self.bridge.clone(),
-            path_server: self.path_server.clone(),
             transact_coordinator: self.transact_coordinator.clone(),
             transact_approval_rx: self.transact_approval_rx.clone(),
             transact_submitter_task: self.transact_submitter_task.clone(),

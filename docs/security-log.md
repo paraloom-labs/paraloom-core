@@ -10,6 +10,17 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Removed the legacy off-chain Merkle path-query server** (hardening
+  suggested by WakiyamaP alongside the reorder report). The `/merkle/path` HTTP
+  server served inclusion paths from the off-chain shielded pool, but that pool
+  uses a pre-v3 commitment scheme and is not populated by v3 `deposit_note`
+  deposits — v3 clients derive their Merkle path directly from the program-owned
+  on-chain incremental tree, which is authoritative and gates settlement via
+  `is_known_root`. The server was dead plumbing on the v3 path, and keeping it
+  risked silently re-exposing the off-chain tree's reconstruction. Removing it
+  makes that unreachable by construction; no v3 client used it. Devnet,
+  pre-mainnet.
+
 - **Off-chain shielded-pool tree reconstructs in numeric-index order**
   (external bug-bounty report, WakiyamaP). Commitment leaves are stored keyed by
   `index.to_le_bytes()`, and `get_all_commitments()` rebuilt the tree by
