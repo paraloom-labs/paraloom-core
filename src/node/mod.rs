@@ -392,14 +392,26 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                                 request.request_id
                             );
                             // Record the encrypted output notes for recipient
-                            // scanning (#196) only AFTER the proof verifies — an
-                            // unauthenticated peer cannot pollute the scan buffer
-                            // with notes from an unverified (garbage) transact.
-                            self.record_delivered_notes(
-                                &request.output_commitments,
-                                &request.ciphertexts,
-                            )
-                            .await;
+                            // scanning (#196) only AFTER the proof verifies, and
+                            // only the FIRST time we see this canonical settlement
+                            // (#382). The ciphertexts are not proof-bound, so a
+                            // replay of the same valid transact with mutated
+                            // ciphertexts carries the same canonical id; gating on
+                            // first-seen id keeps such a replay from adding extra
+                            // scan records for the same commitments and evicting
+                            // the authentic ciphertext.
+                            let already_seen = self
+                                .verified_transacts
+                                .lock()
+                                .await
+                                .contains_key(&request.request_id);
+                            if !already_seen {
+                                self.record_delivered_notes(
+                                    &request.output_commitments,
+                                    &request.ciphertexts,
+                                )
+                                .await;
+                            }
                             crate::consensus::vote_tally::VerificationVote::Valid
                         }
                         Ok(false) => {

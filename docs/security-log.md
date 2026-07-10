@@ -24,6 +24,19 @@ issue, email security@paraloom.network.
   on-chain stake-weighted quorum, proof verification, and nullifier PDAs were
   never affected. Devnet, pre-mainnet (reported in #383).
 
+- **Encrypted output notes are recorded once per settlement** (external
+  bug-bounty report). The recipient-scan buffer recorded a transact's encrypted
+  output-note ciphertexts on every verified sighting, de-duplicated by
+  `(commitment, ciphertext)`. Because the ciphertexts are not proof-bound, a
+  replay of the same valid transact with mutated ciphertexts produced a new
+  record for the same commitment, so a replayer could pollute the bounded scan
+  store and eventually evict authentic ciphertexts. The buffer now records only
+  the first sighting of a canonical settlement (keyed by the content-bound
+  request id), so mutated replays are ignored. Off-chain note-delivery
+  integrity only — no on-chain, fund, or double-spend impact. Binding the
+  ciphertexts into the proof is a tracked pre-mainnet hardening. Devnet,
+  pre-mainnet (reported in #382).
+
 - **Bridge freeze and authority rotation moved to the cold authority**
   (in-house pre-bounty audit). `pause` / `unpause` / `set_bridge_authority`
   were authorized by `bridge_state.authority` — which by design is a
