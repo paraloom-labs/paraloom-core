@@ -305,22 +305,29 @@ impl TransactVerificationCoordinator {
         }
     }
 
-    /// Remove a validator from the transact-consensus set — e.g. when it
-    /// disconnects. Mirrors [`Self::register_validator_with_wallet`] so the
-    /// validator-set reconciler can drop peers that are no longer connected.
+    /// Remove a validator from the *active* transact-consensus set — e.g. when
+    /// it disconnects. Drops it from the live voter set and leader selection so
+    /// a stale peer stops counting toward (and being selected for) settlement,
+    /// but deliberately PRESERVES its `ReputationTracker` metrics.
+    ///
+    /// Connectivity and security history are separate lifecycle state. Deleting
+    /// the reputation entry on disconnect let a validator penalized below the
+    /// consensus-eligibility floor reset itself to `BASE_REPUTATION` simply by
+    /// reconnecting — for any offline duration — erasing its Byzantine history
+    /// and regaining eligibility. Preserving the entry keeps a penalized
+    /// validator penalized across reconnects: reputation only decays with
+    /// inactivity, it never rises back over the floor. A preserved entry for a
+    /// disconnected peer is inert (tallies only iterate over validators who
+    /// actually voted this round).
     pub async fn unregister_validator(&self, validator: &NodeId) {
         let mut validators = self.validators.write().await;
         validators.retain(|v| v != validator);
-
-        self.reputation_tracker
-            .unregister_validator(validator)
-            .await;
 
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.unregister_validator(validator);
 
         log::info!(
-            "Validator unregistered from transact consensus: {:?}",
+            "Validator unregistered from active transact consensus set (reputation preserved): {:?}",
             validator
         );
     }
@@ -570,6 +577,80 @@ mod tests {
             coordinator.validator_wallet(&NodeId(vec![1])).await,
             Some("WaLLet1111".to_string()),
             "a wallet-less re-register must not clobber the advertised wallet"
+        );
+    }
+
+    /// A validator penalized below the consensus-eligibility floor must not be
+    /// able to wipe that history by disconnecting and reconnecting. The
+    /// reconciler's `unregister_validator` drops the peer from the active set
+    /// but preserves its reputation, so a re-registration cannot reset it to
+    /// `BASE_REPUTATION` and make a previously-excluded vote count (#394).
+    #[tokio::test]
+    async fn reconnect_preserves_reputation_and_keeps_excluded_vote_excluded() {
+        let (mut coordinator, mut approvals) =
+            TransactVerificationCoordinator::new_with_approvals();
+        coordinator.set_consensus_thresholds(1, 1);
+        let validator = NodeId(vec![0x44]);
+        coordinator.register_validator(validator.clone()).await;
+
+        // Drive the validator below the eligibility floor (17 * 50 penalty).
+        for _ in 0..17 {
+            coordinator
+                .reputation_tracker
+                .record_failure(&validator)
+                .await
+                .unwrap();
+        }
+        let penalized = coordinator
+            .reputation_tracker
+            .get_reputation(&validator)
+            .await
+            .unwrap();
+        assert!(
+            penalized < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
+            "precondition: validator must be below the consensus floor"
+        );
+
+        // A below-floor vote must not reach quorum.
+        let mut request = sample_request();
+        request.request_id = request.canonical_id();
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+        let vote = TransactVerificationResult {
+            request_id: request.request_id.clone(),
+            validator: validator.clone(),
+            vote: VerificationVote::Valid,
+            timestamp: 1,
+        };
+        coordinator.submit_result(vote.clone()).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "a below-floor validator's vote must not reach quorum"
+        );
+
+        // Simulate a disconnect/reconnect across a reconciler tick.
+        coordinator.unregister_validator(&validator).await;
+        coordinator.register_validator(validator.clone()).await;
+
+        // Reputation must survive the round-trip, NOT reset to BASE_REPUTATION.
+        let after = coordinator
+            .reputation_tracker
+            .get_reputation(&validator)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, penalized,
+            "disconnect/reconnect must preserve reputation, not reset it to BASE"
+        );
+        assert!(after < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS);
+
+        // The same vote must still be excluded after the reconnect.
+        coordinator.submit_result(vote).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "disconnect/reconnect must not make a previously-excluded vote quorum-eligible"
         );
     }
 
