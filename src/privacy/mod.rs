@@ -26,7 +26,6 @@ pub mod merkle;
 pub mod note_crypto;
 pub mod nullifier;
 pub mod onchain_verifier;
-pub mod path_server;
 pub mod pedersen;
 pub mod pool;
 pub mod poseidon;
