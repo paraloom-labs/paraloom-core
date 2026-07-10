@@ -102,9 +102,12 @@ impl VoteTally {
     ) -> Result<Option<SlashingEvidence>> {
         let mut votes = self.votes.write().await;
         if let Some(previous) = votes.get(&validator) {
-            if previous == &vote {
-                // Idempotent re-send. Common when a validator retries
-                // over a flaky transport.
+            if previous.is_valid() == vote.is_valid() {
+                // Same decision — idempotent. Equivocation is a *flip* between
+                // Valid and Invalid, not two Invalid votes whose free-text
+                // `reason` differs; comparing the whole vote would let a
+                // validator's own two differently-worded Invalid votes read as
+                // equivocation and self-penalise its reputation.
                 return Ok(None);
             }
             let evidence = SlashingEvidence::Equivocation {
