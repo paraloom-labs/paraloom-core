@@ -336,10 +336,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let id = parsed["request_id"].as_str().unwrap();
         assert!(id.starts_with("transact-"));
-        assert!(id.ends_with(&"11".repeat(32)));
 
         // ...and the decoded request landed on the initiator intact.
         let seen = stub.seen.lock().await.clone().expect("request forwarded");
+        // The id is the canonical content-bound digest of that request (#383).
+        assert_eq!(id, seen.canonical_id());
         assert_eq!(seen.recipient, [0x66u8; 32]);
         assert_eq!(seen.nullifiers, [[0x11u8; 32], [0x22u8; 32]]);
         assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);

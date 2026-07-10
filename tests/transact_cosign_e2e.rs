@@ -169,8 +169,10 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
     let mut nf1 = [0u8; 32];
     nf1[..16].copy_from_slice(&nanos.to_le_bytes());
     nf1[16] = 1;
-    let request = TransactVerificationRequest {
-        request_id: format!("transact-{nanos}"),
+    // The request id must be the canonical content-bound digest (#383), or the
+    // receiving node drops it as non-canonical.
+    let mut request = TransactVerificationRequest {
+        request_id: String::new(),
         recipient: [7u8; 32],
         nullifiers: [nf0, nf1],
         output_commitments: [[11u8; 32], [12u8; 32]],
@@ -180,6 +182,7 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
         ciphertexts: [String::new(), String::new()],
         timestamp: now_secs(),
     };
+    request.request_id = request.canonical_id();
 
     // Initiate, retrying until node0's validator set is populated by discovery.
     let until = Instant::now() + Duration::from_secs(30);
