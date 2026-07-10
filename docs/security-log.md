@@ -10,6 +10,20 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Transact verification requests are keyed by a content-bound id**
+  (external bug-bounty report). The off-chain `request_id` on a transact
+  verification request was a caller-chosen string, not derived from the
+  settlement, so a connected mesh peer could choose an id to overwrite a cached
+  verification or collide two distinct transacts onto one round — halting a
+  targeted settlement round and making an honest validator's Valid-then-Invalid
+  votes read as equivocation (reputation griefing). The id is now the canonical
+  domain-separated digest of the settlement-bound fields (root, recipient,
+  signed external amount, nullifiers, output commitments, proof); it is set at
+  ingress and re-validated on receipt, so an exact replay is idempotent and any
+  mutation yields a different, isolated id. Off-chain liveness only — the
+  on-chain stake-weighted quorum, proof verification, and nullifier PDAs were
+  never affected. Devnet, pre-mainnet (reported in #383).
+
 - **Bridge freeze and authority rotation moved to the cold authority**
   (in-house pre-bounty audit). `pause` / `unpause` / `set_bridge_authority`
   were authorized by `bridge_state.authority` — which by design is a

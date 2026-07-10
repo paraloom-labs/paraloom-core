@@ -359,6 +359,20 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 
             // Consensus messages
             Message::TransactVerificationRequest { request } => {
+                // Bind the request id to the settlement content (#383): reject any
+                // request whose id is not the canonical digest of its fields, so a
+                // peer cannot choose an id to overwrite/poison a cache entry or
+                // collide two distinct transacts onto one verification round.
+                let canonical = request.canonical_id();
+                if request.request_id != canonical {
+                    log::warn!(
+                        "Dropping transact request with non-canonical id {} (expected {})",
+                        request.request_id,
+                        canonical
+                    );
+                    return Ok(());
+                }
+
                 info!(
                     "Received transact verification request: {}",
                     request.request_id
