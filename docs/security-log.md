@@ -10,6 +10,20 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Off-chain shielded-pool tree reconstructs in numeric-index order**
+  (external bug-bounty report, WakiyamaP). Commitment leaves are stored keyed by
+  `index.to_le_bytes()`, and `get_all_commitments()` rebuilt the tree by
+  iterating RocksDB in bytewise key order while discarding the key. For a `u64`
+  little-endian key, bytewise order matches numeric order only up to index 255,
+  so a pool with 257+ commitments reconstructed in a permuted order after a
+  restart, changing the off-chain tree's reported root. Reconstruction now
+  decodes each key and sorts by numeric index (migration-free). No fund impact:
+  v3 settlement verifies proofs against the program-owned on-chain
+  incremental-tree root (`request.root` + on-chain `is_known_root`), not the
+  off-chain pool root, so no withdrawal was ever gated on the permuted off-chain
+  tree; this closes an off-chain reconstruction defect and its reported root.
+  Devnet, pre-mainnet.
+
 - **Equivocation is detected on the vote decision, not its wording** (in-house
   pattern audit prompted by the external bug-bounty findings). `VoteTally` flagged
   equivocation by whole-vote equality, so a validator's own two `Invalid` votes

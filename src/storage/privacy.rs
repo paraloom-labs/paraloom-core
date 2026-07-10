@@ -187,20 +187,33 @@ impl PrivacyStorage {
             .cf_handle(CF_MERKLE_TREE)
             .ok_or_else(|| anyhow!("Merkle tree CF not found"))?;
 
-        let mut commitments = Vec::new();
+        // Return commitments in numeric leaf-index order. Leaves are stored
+        // keyed by `index.to_le_bytes()`, but RocksDB iterates keys bytewise and
+        // little-endian order diverges from numeric order past index 255 (the
+        // second byte becomes non-zero) — iterating without re-sorting would
+        // permute the tree on reconstruction and change its root and paths.
+        // Decode each key and sort by it so the rebuilt tree matches the order
+        // the leaves were appended in.
+        let mut indexed: Vec<(u64, Commitment)> = Vec::new();
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
 
         for item in iter {
-            let (_, value) = item?;
+            let (key, value) = item?;
             if value.len() != 32 {
                 return Err(anyhow!("Invalid commitment size in storage"));
             }
+            let idx_bytes: [u8; 8] = key
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow!("Invalid merkle-tree key length in storage"))?;
+            let index = u64::from_le_bytes(idx_bytes);
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&value);
-            commitments.push(Commitment::from_bytes(arr));
+            indexed.push((index, Commitment::from_bytes(arr)));
         }
 
-        Ok(commitments)
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed.into_iter().map(|(_, c)| c).collect())
     }
 
     // ========== Nullifier Set Operations ==========
@@ -659,5 +672,33 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert!(all.contains(&nullifiers[0]));
         assert!(all.contains(&nullifiers[1]));
+    }
+
+    #[test]
+    fn get_all_commitments_preserves_numeric_index_order_past_256() {
+        // Regression: leaves are keyed by `index.to_le_bytes()`, but RocksDB
+        // iterates keys bytewise, so little-endian key order diverges from
+        // numeric order past index 255. get_all_commitments() must re-sort by the
+        // decoded index, or the rebuilt tree permutes and its root/paths change
+        // on restart. Tag each leaf with its index so we can assert the order.
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        for i in 0u64..=256 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&i.to_le_bytes());
+            storage.insert_commitment(i, &Commitment(bytes)).unwrap();
+        }
+
+        let all = storage.get_all_commitments().unwrap();
+        assert_eq!(all.len(), 257);
+        for (pos, c) in all.iter().enumerate() {
+            let idx = u64::from_le_bytes(c.as_bytes()[..8].try_into().unwrap());
+            assert_eq!(
+                idx, pos as u64,
+                "leaf at position {pos} carries index {idx}; reconstruction must \
+                 follow numeric index order, not RocksDB bytewise key order"
+            );
+        }
     }
 }
