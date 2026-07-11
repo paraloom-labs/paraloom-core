@@ -676,7 +676,10 @@ mod tests {
         let mut request = sample_request();
         request.request_id = request.canonical_id();
         let id = request.request_id.clone();
-        coordinator.start_verification(request.clone()).await.unwrap();
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
 
         coordinator
             .submit_result(TransactVerificationResult {
