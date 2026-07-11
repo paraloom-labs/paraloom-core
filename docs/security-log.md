@@ -10,6 +10,15 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Nullifier storage-failure log now truncates the nullifier** (log-hygiene
+  suggested by rinonism). On an `insert_nullifier` persistence error the handler
+  logged the full hex nullifier; it now logs only the first 8 bytes. This is
+  defense-in-depth, not a privacy fix — a nullifier is already public (broadcast
+  in the gossiped transact request, emitted in the on-chain `TransactEvent`, and
+  used as the on-chain nullifier PDA seed), so the log never exposed anything not
+  already on chain. Aligns the nullifier log with the deposit listener's
+  address-truncation convention. Devnet, pre-mainnet.
+
 - **Validator reputation is preserved across disconnect/reconnect** (external
   bug-bounty report, billythebotman). The 30-second connectivity reconciler
   removed a dropped peer from the transact-consensus coordinator, and that

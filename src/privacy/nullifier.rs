@@ -64,8 +64,8 @@ impl NullifierSet {
             storage.insert_nullifier(&nullifier).map_err(|e| {
                 log::error!(
                     target: "paraloom::privacy::nullifier",
-                    "failed to persist nullifier {}: {} — in-memory set not advanced",
-                    hex::encode(nullifier.as_bytes()),
+                    "failed to persist nullifier {}…: {} — in-memory set not advanced",
+                    hex::encode(&nullifier.as_bytes()[..8]),
                     e
                 );
                 e
