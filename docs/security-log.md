@@ -10,6 +10,32 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Vote eligibility and co-signers are intersected with the active validator
+  set** (external bug-bounty report, billythebotman). The reputation-preservation
+  fix (below) keeps a validator's durable standing across a disconnect, but the
+  tally's eligibility (`count_eligible_votes` / `consensus_result` /
+  `valid_voters`) filtered by reputation alone, without checking that the voter is
+  still in the coordinator's active set. So a validator could vote, leave the
+  active set, and keep its stale vote counting — completing a quorum whose co-sign
+  set can no longer include the departed signer, stranding that settlement.
+  Eligibility and the returned co-signer set are now intersected with a snapshot
+  of the current active validator set, so only validators that are both active and
+  above the reputation floor count. Off-chain consensus correctness only — the
+  on-chain stake-weighted quorum and proof verification were never affected.
+  Devnet, pre-mainnet.
+
+- **Initiator records encrypted notes only after self-verify and once per
+  settlement** (external bug-bounty report, leansearch0). The record-once gate
+  that landed for the mesh path (below, #382) was not applied on the initiator
+  path: `initiate_transact_verification` recorded the encrypted output notes
+  before its own proof self-verify and without the first-seen canonical-id check,
+  so an invalid proof could leave notes on the initiator and a replay with mutated
+  (non-proof-bound) ciphertexts could add rows for the same commitment and
+  eventually FIFO-evict the authentic ciphertext. The initiator now records only
+  inside the verified (`Ok(true)`) branch and only the first time it sees a
+  canonical settlement, matching the mesh path. Off-chain note-delivery integrity
+  only — no on-chain, fund, or double-spend impact. Devnet, pre-mainnet.
+
 - **Nullifier storage-failure log now truncates the nullifier** (log-hygiene
   suggested by rinonism). On an `insert_nullifier` persistence error the handler
   logged the full hex nullifier; it now logs only the first 8 bytes. This is
