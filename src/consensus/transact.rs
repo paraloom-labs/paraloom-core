@@ -347,13 +347,26 @@ impl TransactVerificationCoordinator {
         let pending = self.pending.read().await;
         match pending.get(request_id) {
             Some(consensus) => {
+                let active = self.active_snapshot().await;
                 consensus
                     .tally
-                    .valid_voters(&self.reputation_tracker, self.min_reputation_for_consensus)
+                    .valid_voters(
+                        &self.reputation_tracker,
+                        self.min_reputation_for_consensus,
+                        &active,
+                    )
                     .await
             }
             None => Vec::new(),
         }
+    }
+
+    /// Snapshot of the validators currently in the active set. Vote eligibility
+    /// and co-signer selection are intersected with this so a validator that has
+    /// left the active set (e.g. disconnected) stops counting, even though its
+    /// durable reputation is preserved across the disconnect (#394/#408).
+    async fn active_snapshot(&self) -> HashSet<NodeId> {
+        self.validators.read().await.iter().cloned().collect()
     }
 
     /// Number of registered validators
@@ -445,11 +458,16 @@ impl TransactVerificationCoordinator {
         // quorum. Computed from the borrowed `consensus` directly, guarded by
         // the `emitted` set against later votes re-triggering it.
         if let Some(tx) = &self.approval_tx {
+            let active = self.active_snapshot().await;
             let mut emitted = self.emitted.write().await;
             if !emitted.contains(&result.request_id)
                 && consensus
                     .tally
-                    .has_consensus(&self.reputation_tracker, self.min_reputation_for_consensus)
+                    .has_consensus(
+                        &self.reputation_tracker,
+                        self.min_reputation_for_consensus,
+                        &active,
+                    )
                     .await
                 && matches!(
                     consensus
@@ -457,6 +475,7 @@ impl TransactVerificationCoordinator {
                         .consensus_result(
                             &self.reputation_tracker,
                             self.min_reputation_for_consensus,
+                            &active,
                         )
                         .await,
                     Ok(VerificationVote::Valid)
@@ -485,14 +504,23 @@ impl TransactVerificationCoordinator {
             return Err(anyhow!("Verification timed out"));
         }
 
+        let active = self.active_snapshot().await;
         if consensus
             .tally
-            .has_consensus(&self.reputation_tracker, self.min_reputation_for_consensus)
+            .has_consensus(
+                &self.reputation_tracker,
+                self.min_reputation_for_consensus,
+                &active,
+            )
             .await
         {
             let result = consensus
                 .tally
-                .consensus_result(&self.reputation_tracker, self.min_reputation_for_consensus)
+                .consensus_result(
+                    &self.reputation_tracker,
+                    self.min_reputation_for_consensus,
+                    &active,
+                )
                 .await?;
             Ok(Some(result))
         } else {
@@ -710,6 +738,65 @@ mod tests {
         assert!(
             approvals.try_recv().is_ok(),
             "re-starting an in-flight verification must preserve the first vote so the quorum completes"
+        );
+    }
+
+    /// A vote from a validator that has left the active set must stop counting
+    /// toward every in-flight round. Durable reputation survives a disconnect
+    /// (#394), but active-membership eligibility must not — otherwise a validator
+    /// can vote, disconnect, and let a later honest vote complete a quorum whose
+    /// co-sign set is missing the departed signer (#408). Regression from
+    /// billythebotman.
+    #[tokio::test]
+    async fn disconnected_validators_stale_votes_must_not_complete_quorum() {
+        let (mut coordinator, mut approvals) =
+            TransactVerificationCoordinator::new_with_approvals();
+        coordinator.set_consensus_thresholds(3, 3);
+
+        let leader = NodeId(vec![0x10]);
+        let attacker = NodeId(vec![0x20]);
+        let honest = NodeId(vec![0x30]);
+        coordinator.register_validator(leader.clone()).await;
+        coordinator.register_validator(attacker.clone()).await;
+        coordinator.register_validator(honest.clone()).await;
+
+        let mut request = sample_request();
+        request.request_id = request.canonical_id();
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        for (validator, timestamp) in [(leader, 1), (attacker.clone(), 2)] {
+            coordinator
+                .submit_result(TransactVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator,
+                    vote: VerificationVote::Valid,
+                    timestamp,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(approvals.try_recv().is_err(), "two of three is not quorum");
+
+        // Attacker disconnects — removed from the active set, reputation kept.
+        coordinator.unregister_validator(&attacker).await;
+        assert_eq!(coordinator.validator_count().await, 2);
+
+        coordinator
+            .submit_result(TransactVerificationResult {
+                request_id: request.request_id.clone(),
+                validator: honest,
+                vote: VerificationVote::Valid,
+                timestamp: 3,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            approvals.try_recv().is_err(),
+            "a disconnected validator's stale vote must not complete quorum"
         );
     }
 

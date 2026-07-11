@@ -14,7 +14,7 @@ use crate::consensus::slashing::SlashingEvidence;
 use crate::types::NodeId;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -131,9 +131,10 @@ impl VoteTally {
         &self,
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
+        active: &HashSet<NodeId>,
     ) -> bool {
         let eligible = self
-            .count_eligible_votes(reputation_tracker, min_reputation)
+            .count_eligible_votes(reputation_tracker, min_reputation, active)
             .await;
         eligible >= self.min_validators_for_consensus
     }
@@ -152,10 +153,19 @@ impl VoteTally {
         &self,
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
+        active: &HashSet<NodeId>,
     ) -> usize {
         let votes = self.votes.read().await;
         let mut count = 0;
         for validator in votes.keys() {
+            // A vote only counts if the validator is BOTH currently in the
+            // active set and at/above the reputation floor. Reputation is
+            // durable across a disconnect (#394), so without the active-set
+            // intersection a departed validator's stale vote would keep
+            // counting (#408).
+            if !active.contains(validator) {
+                continue;
+            }
             let reputation = reputation_tracker
                 .get_reputation(validator)
                 .await
@@ -180,14 +190,21 @@ impl VoteTally {
         &self,
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
+        active: &HashSet<NodeId>,
     ) -> Result<VerificationVote> {
         let votes = self.votes.read().await;
 
-        // Collect (validator, vote) pairs whose reputation is currently
-        // at or above the threshold.
+        // Collect (validator, vote) pairs from validators that are BOTH in the
+        // current active set and at/above the reputation threshold. The
+        // active-set intersection stops a disconnected validator's stale but
+        // still-reputable vote from counting (#408).
         let mut eligible: Vec<&VerificationVote> = Vec::with_capacity(votes.len());
         let mut excluded = 0usize;
         for (validator, vote) in votes.iter() {
+            if !active.contains(validator) {
+                excluded += 1;
+                continue;
+            }
             let reputation = reputation_tracker
                 .get_reputation(validator)
                 .await
@@ -259,11 +276,18 @@ impl VoteTally {
         &self,
         reputation_tracker: &ReputationTracker,
         min_reputation: u64,
+        active: &HashSet<NodeId>,
     ) -> Vec<NodeId> {
         let votes = self.votes.read().await;
         let mut out = Vec::new();
         for (node, vote) in votes.iter() {
             if !vote.is_valid() {
+                continue;
+            }
+            // Only currently-active validators can be co-signers — a departed
+            // validator can no longer be mapped to a wallet or asked to sign,
+            // so its stale Valid vote must not enter the co-sign set (#408).
+            if !active.contains(node) {
                 continue;
             }
             let reputation = reputation_tracker.get_reputation(node).await.unwrap_or(0);
@@ -306,7 +330,10 @@ mod tests {
         }
 
         // Both Valid voters are in good standing → both are eligible co-signers.
-        let mut voters = tally.valid_voters(&reputation, 200).await;
+        let active: HashSet<NodeId> = [NodeId(vec![1]), NodeId(vec![2]), NodeId(vec![3])]
+            .into_iter()
+            .collect();
+        let mut voters = tally.valid_voters(&reputation, 200, &active).await;
         voters.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(voters, vec![NodeId(vec![1]), NodeId(vec![3])]);
     }
@@ -332,7 +359,8 @@ mod tests {
             let _ = reputation.record_failure(&NodeId(vec![3])).await;
         }
 
-        let voters = tally.valid_voters(&reputation, 200).await;
+        let active: HashSet<NodeId> = [NodeId(vec![1]), NodeId(vec![3])].into_iter().collect();
+        let voters = tally.valid_voters(&reputation, 200, &active).await;
         assert_eq!(voters, vec![NodeId(vec![1])]);
     }
 }
