@@ -392,10 +392,16 @@ impl TransactVerificationCoordinator {
             self.total_validators,
         );
 
+        // Insert-if-absent: a duplicate start for an already in-flight canonical
+        // id (a client retry or a re-broadcast) must not discard the votes
+        // already collected for this round. The id is content-bound
+        // (`canonical_id`), so an existing entry is the same settlement — keep
+        // collecting on it rather than resetting the tally.
         self.pending
             .write()
             .await
-            .insert(request_id.clone(), consensus);
+            .entry(request_id.clone())
+            .or_insert(consensus);
 
         log::info!("Started transact verification: {}", request_id);
         Ok(request_id)
@@ -651,6 +657,59 @@ mod tests {
         assert!(
             approvals.try_recv().is_err(),
             "disconnect/reconnect must not make a previously-excluded vote quorum-eligible"
+        );
+    }
+
+    /// A duplicate `start_verification` for an in-flight canonical id must not
+    /// reset the vote tally — the first vote must survive so the quorum can
+    /// still complete (insert-if-absent).
+    #[tokio::test]
+    async fn restarting_an_in_flight_verification_preserves_collected_votes() {
+        let (mut coordinator, mut approvals) =
+            TransactVerificationCoordinator::new_with_approvals();
+        coordinator.set_consensus_thresholds(2, 2);
+        let v1 = NodeId(vec![1]);
+        let v2 = NodeId(vec![2]);
+        coordinator.register_validator(v1.clone()).await;
+        coordinator.register_validator(v2.clone()).await;
+
+        let mut request = sample_request();
+        request.request_id = request.canonical_id();
+        let id = request.request_id.clone();
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        coordinator
+            .submit_result(TransactVerificationResult {
+                request_id: id.clone(),
+                validator: v1.clone(),
+                vote: VerificationVote::Valid,
+                timestamp: 1,
+            })
+            .await
+            .unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "one of two votes must not reach quorum yet"
+        );
+
+        // Duplicate start for the same in-flight id — must be a no-op, not a reset.
+        coordinator.start_verification(request).await.unwrap();
+
+        coordinator
+            .submit_result(TransactVerificationResult {
+                request_id: id.clone(),
+                validator: v2.clone(),
+                vote: VerificationVote::Valid,
+                timestamp: 2,
+            })
+            .await
+            .unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "re-starting an in-flight verification must preserve the first vote so the quorum completes"
         );
     }
 
