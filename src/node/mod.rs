@@ -1707,10 +1707,6 @@ impl Node {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
         let request_id = coordinator.start_verification(request.clone()).await?;
-        // Record the encrypted notes locally (#196): the initiator does not
-        // receive its own gossip broadcast, so it stores here to serve scan.
-        self.record_delivered_notes(&request.output_commitments, &request.ciphertexts)
-            .await;
 
         // The initiator does not receive its own gossip broadcast, so it must
         // self-verify and submit its own vote (registering self into the
@@ -1726,6 +1722,25 @@ impl Node {
                 .await;
             let vote = match self.verify_transact_proof(&request).await {
                 Ok(true) => {
+                    // Record the encrypted notes (#196) only AFTER the proof
+                    // verifies and only the first time we see this canonical
+                    // settlement — mirroring the mesh path (#382). Recording
+                    // before verify would let an invalid proof leave notes;
+                    // recording on every sighting would let a replay with
+                    // mutated (non-proof-bound) ciphertexts pollute and
+                    // FIFO-evict the authentic ciphertext.
+                    let already_seen = self
+                        .verified_transacts
+                        .lock()
+                        .await
+                        .contains_key(&request_id);
+                    if !already_seen {
+                        self.record_delivered_notes(
+                            &request.output_commitments,
+                            &request.ciphertexts,
+                        )
+                        .await;
+                    }
                     cache_verified(
                         &self.verified_transacts,
                         request_id.clone(),
