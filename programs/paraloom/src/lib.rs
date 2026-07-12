@@ -794,6 +794,16 @@ pub mod paraloom_program {
     /// the pre-migration bytes do not deserialize into the current struct; its
     /// address is pinned by the seeds constraint and its identity re-checked
     /// against the `ValidatorRegistry` discriminator in the body.
+    ///
+    /// PRECONDITION — pass every currently-active validator PDA. An `is_active`
+    /// PDA left out of `remaining_accounts` is NOT deactivated here; it stays
+    /// active on-chain but uncounted, which drives the stake-weighted quorum
+    /// denominator stale-low and, if that orphan later co-signs, trips the
+    /// `counted_stake <= eligible_stake` check (settlement bricks — fail-closed,
+    /// never a theft). Completeness cannot be enforced on-chain (the program
+    /// cannot enumerate all PDAs), so it is the upgrade authority's
+    /// responsibility; reconcile any active-but-excluded PDA with
+    /// [`deactivate_validator`] before relying on the rebuilt denominator.
     pub fn reset_validator_registry(ctx: Context<ResetValidatorRegistry>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
