@@ -275,8 +275,19 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     task_id, validator_id
                 );
 
-                // Aggregate verification result if coordinator is enabled
-                if let Some(coord) = &self.verification_coordinator {
+                // Only accept a result attributed to the authenticated sender —
+                // a peer must not report a result under another validator's
+                // identity. Parity with the transact vote path's
+                // `result.validator == source` guard. The `verification_coordinator`
+                // is not wired today (always `None`), so this handler is dormant;
+                // the check keeps it safe against impersonation if it is ever wired.
+                if validator_id != source {
+                    log::warn!(
+                        "dropping VerificationResult: claimed validator {:?} != authenticated source {:?}",
+                        validator_id,
+                        source
+                    );
+                } else if let Some(coord) = &self.verification_coordinator {
                     let task_result = crate::privacy::verification::VerificationTaskResult {
                         task_id,
                         validator: validator_id,
