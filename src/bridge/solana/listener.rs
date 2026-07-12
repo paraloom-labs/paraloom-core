@@ -574,13 +574,25 @@ impl EventListener {
             let confirmed = match state.rpc.get_transaction(&sig, LISTENER_TX_ENCODING).await {
                 Ok(tx) => tx,
                 Err(e) => {
+                    // Do NOT skip. A `getTransaction` failure happens before we
+                    // can decode whether this finalized program signature was a
+                    // deposit, so it produces no outcome — and the
+                    // contiguous-cursor barrier only freezes on decoded
+                    // outcomes. If we skipped it and a newer deposit in the same
+                    // batch succeeded, the cursor would advance past this
+                    // un-fetched signature: the next poll's `until` boundary
+                    // would exclude it and a restart would resume past it,
+                    // durably losing a real deposit (#429). Propagate the error
+                    // so the cursor stays put; the next poll re-fetches this
+                    // signature (it was never marked seen), and re-processing is
+                    // idempotent at the pool.
                     log::warn!(
                         target: "paraloom::bridge::solana",
-                        "failed to fetch tx {}: {}",
+                        "failed to fetch tx {}: {} — aborting this poll so the cursor cannot advance past it",
                         sig,
                         e
                     );
-                    continue;
+                    return Err(e);
                 }
             };
 
@@ -888,6 +900,96 @@ mod tests {
         assert_eq!(processed, 1, "exactly one deposit must process");
         assert_eq!(*state.last_signature.read().await, Some(sig));
         assert_eq!(state.pool.commitment_count().await, 1);
+    }
+
+    /// #429 regression: a `getTransaction` failure on one signature must not let
+    /// the cursor advance past it when a newer deposit in the same batch
+    /// succeeds. Before the fix, `fetch_events` logged and continued on the
+    /// failed fetch, so the un-fetched signature produced no outcome and the
+    /// contiguous cursor advanced to the newer deposit — durably skipping the
+    /// older finalized deposit (the next poll's `until` boundary and the
+    /// persisted cursor both excluded it forever). The fix propagates the fetch
+    /// error so the cursor stays put and the next poll re-fetches and indexes
+    /// the older deposit.
+    #[tokio::test]
+    async fn poll_does_not_skip_a_deposit_whose_body_failed_to_fetch() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let older = Signature::new_unique();
+        let newer = Signature::new_unique();
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+
+        // Poll 1: the RPC lists [newer, older] (newest-first). The listener
+        // fetches in chain order (older first); `getTransaction(older)` fails.
+        // `newer`'s body is available but is never reached — the poll aborts.
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![status(&newer, 8), status(&older, 7)]));
+        *mock.next_get_transaction.lock().unwrap() = Some(Err(BridgeError::SolanaRpc(
+            "transient getTransaction failure".to_string(),
+        )));
+        mock.get_transactions.lock().unwrap().insert(
+            newer,
+            synth_deposit_tx(
+                newer,
+                8,
+                &program_id,
+                &depositor,
+                2_000,
+                [9u8; 32],
+                [11u8; 32],
+            ),
+        );
+
+        let poll1 = EventListener::poll_events(&state).await;
+        assert!(
+            poll1.is_err(),
+            "a getTransaction failure must abort the poll, not skip the signature"
+        );
+        assert_eq!(
+            *state.last_signature.read().await,
+            None,
+            "cursor must not advance past the un-fetched signature"
+        );
+        assert_eq!(state.pool.commitment_count().await, 0);
+
+        // Poll 2: the older body is now available and the cursor never advanced,
+        // so the same batch is re-fetched and BOTH deposits are indexed.
+        mock.get_transactions.lock().unwrap().insert(
+            older,
+            synth_deposit_tx(
+                older,
+                7,
+                &program_id,
+                &depositor,
+                1_000,
+                [7u8; 32],
+                [13u8; 32],
+            ),
+        );
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![status(&newer, 8), status(&older, 7)]));
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(
+            processed, 2,
+            "both deposits index once the older body is available"
+        );
+        assert_eq!(state.pool.commitment_count().await, 2);
+        assert_eq!(*state.last_signature.read().await, Some(newer));
     }
 
     /// A backlog larger than one signature batch must be walked across pages,
