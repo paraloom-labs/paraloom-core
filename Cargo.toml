@@ -66,20 +66,8 @@ path = "src/bin/paraloom_cli.rs"
 
 # Privacy/zkSNARK binaries
 [[bin]]
-name = "setup-withdrawal-ceremony"
-path = "src/bin/setup_withdrawal_ceremony.rs"
-
-[[bin]]
-name = "setup-transfer-ceremony"
-path = "src/bin/setup_transfer_ceremony.rs"
-
-[[bin]]
 name = "compute-poseidon-inputs"
 path = "src/bin/compute_poseidon_inputs.rs"
-
-[[bin]]
-name = "generate-withdrawal-proof"
-path = "src/bin/generate_withdrawal_proof.rs"
 
 [[bin]]
 name = "verify-privacy"
@@ -89,10 +77,6 @@ path = "src/bin/verify_privacy.rs"
 [[bin]]
 name = "check-validators"
 path = "src/bin/check_validators.rs"
-
-[[bin]]
-name = "demo-withdraw"
-path = "src/bin/demo_withdraw.rs"
 
 [[bin]]
 name = "init-validator-registry"
@@ -113,10 +97,6 @@ path = "src/bin/register_validator.rs"
 [[bin]]
 name = "reconcile-validators"
 path = "src/bin/reconcile_validators.rs"
-
-[[bin]]
-name = "private-swap-demo"
-path = "src/bin/private_swap_demo.rs"
 
 [features]
 default = ["solana-bridge"]

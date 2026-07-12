@@ -15,7 +15,6 @@
 #![deny(clippy::let_underscore_must_use)]
 
 pub mod batch;
-pub mod circuit_benchmark;
 pub mod circuits;
 
 pub mod commitment;
@@ -38,9 +37,7 @@ pub mod types;
 pub mod verification;
 
 pub use batch::{AdaptiveBatchVerifier, BatchVerificationResult, BatchVerifier};
-pub use circuits::{
-    DepositCircuit, Groth16ProofSystem, TransferCircuit, WithdrawCircuit, MAX_INPUTS, MAX_OUTPUTS,
-};
+pub use circuits::{Groth16ProofSystem, MAX_INPUTS, MAX_OUTPUTS};
 pub use commitment::{CommitmentBuilder, CommitmentGenerator};
 pub use error::{PrivacyError, Result};
 pub use merkle::MerkleTree;

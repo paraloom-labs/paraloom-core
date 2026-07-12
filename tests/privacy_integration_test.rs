@@ -135,10 +135,13 @@ async fn test_nullifier_generation_and_tracking() {
 #[tokio::test]
 #[ignore] // Proof generation is slow (60+ seconds), run manually with: cargo test --test privacy_integration_test test_proof_serialization_codec -- --ignored
 async fn test_proof_serialization_codec() {
-    use ark_bn254::Bn254;
+    use ark_bn254::{Bn254, Fr};
+    use ark_ff::{BigInteger, PrimeField};
     use ark_groth16::Proof;
     use ark_std::rand::rngs::StdRng;
     use ark_std::rand::SeedableRng;
+    use paraloom::privacy::circuits::DepositCircuitV2;
+    use paraloom::privacy::poseidon::poseidon_commit_spend;
 
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -148,16 +151,33 @@ async fn test_proof_serialization_codec() {
 
     log::info!("=== Testing Proof Serialization Codec ===");
 
-    // Generate a test circuit and proof
+    // Generate a test circuit and proof. The codec under test is asset-
+    // agnostic, so any real Groth16 proof exercises it; use a satisfiable
+    // spend-key (v2) deposit note as the vehicle. The commitment must equal
+    // poseidon_commit_spend(value, recipient_pubkey, blinding, asset).
     let mut rng = StdRng::seed_from_u64(0u64);
-    let circuit = DepositCircuit::new();
+    let value = 1_000u64;
+    let blinding = [2u8; 32];
+    let recipient_pubkey = [3u8; 32];
+    let asset = [0u8; 32];
+    let commitment_fr = poseidon_commit_spend(
+        Fr::from(value),
+        Fr::from_le_bytes_mod_order(&recipient_pubkey),
+        Fr::from_le_bytes_mod_order(&blinding),
+        Fr::from_le_bytes_mod_order(&asset),
+    );
+    let bytes = commitment_fr.into_bigint().to_bytes_le();
+    let mut commitment = [0u8; 32];
+    let len = bytes.len().min(32);
+    commitment[..len].copy_from_slice(&bytes[..len]);
+    let mk =
+        || DepositCircuitV2::with_witness(commitment, value, blinding, recipient_pubkey, asset);
 
-    let (pk, _vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+    let (pk, _vk) = Groth16ProofSystem::setup(mk(), &mut rng).unwrap();
     log::info!("PASS: Circuit setup complete");
 
     // Create a proof
-    let prove_circuit = DepositCircuit::new();
-    let proof = Groth16ProofSystem::prove(&pk, prove_circuit, &mut rng).unwrap();
+    let proof = Groth16ProofSystem::prove(&pk, mk(), &mut rng).unwrap();
     log::info!("PASS: Proof generated");
 
     // Serialize the proof
