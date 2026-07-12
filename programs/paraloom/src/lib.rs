@@ -311,7 +311,7 @@ pub mod paraloom_program {
         // `init`ed in `Transact`, so a note already spent on either the
         // `withdraw`, `shielded_transfer` or `transact` path fails here.
         let now = Clock::get()?.unix_timestamp;
-        let settlement_id = bridge_state.withdrawal_count + 1;
+        let settlement_id = bridge_state.withdrawal_count.saturating_add(1);
         let nf0 = &mut ctx.accounts.nullifier_account_0;
         nf0.nullifier = nullifiers[0];
         nf0.used_at = now;
@@ -360,7 +360,10 @@ pub mod paraloom_program {
                 ),
                 payout,
             )?;
-            validator_account.pending_rewards += fee;
+            validator_account.pending_rewards = validator_account
+                .pending_rewards
+                .checked_add(fee)
+                .ok_or(BridgeError::InvalidAmount)?;
 
             // Maintain the public withdrawal-volume aggregate, mirroring
             // `total_deposited` on the deposit side. Checked, though a vault
@@ -608,7 +611,10 @@ pub mod paraloom_program {
         )?;
 
         validator_account.pending_rewards = 0;
-        validator_account.total_earnings += reward_amount;
+        validator_account.total_earnings = validator_account
+            .total_earnings
+            .checked_add(reward_amount)
+            .ok_or(BridgeError::InvalidAmount)?;
 
         emit!(RewardClaimedEvent {
             validator: ctx.accounts.validator.key(),
