@@ -10,6 +10,23 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Deposit listener aborts a poll instead of skipping a signature whose body
+  failed to fetch** (external bug-bounty report, gussamkodin). The
+  contiguous-cursor barrier that keeps the listener from advancing past an
+  unprocessed deposit only froze on decoded per-signature outcomes. A
+  `getTransaction` failure happens *before* decoding, so it produced no outcome:
+  `fetch_events` logged and continued, and a newer deposit in the same batch
+  could then advance the cursor past the un-fetched signature — the next poll's
+  `until` boundary and the persisted cursor excluded it durably, so this instance
+  never indexed that finalized deposit. `fetch_events` now propagates the fetch
+  error (like its other RPC-error paths) so the cursor cannot advance past an
+  un-fetched signature; the next poll re-fetches it and re-processing is
+  idempotent at the pool. Off-chain listener-index correctness only — the deposit
+  is on-chain, the on-chain merkle tree holds its commitment, and settlement
+  verifies against the on-chain root, so the skip degraded local pool
+  metrics/index (operator-recoverable), not funds, spends, or settlement. Devnet,
+  pre-mainnet.
+
 - **Vote eligibility and co-signers are intersected with the active validator
   set** (external bug-bounty report, billythebotman). The reputation-preservation
   fix (below) keeps a validator's durable standing across a disconnect, but the
