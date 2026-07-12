@@ -11,8 +11,8 @@
 //! for now (native-only). Re-expressing the relayer's two legs over `transact`
 //! and `deposit_note` is a follow-up; until then this submitter's on-chain legs
 //! return a clear error rather than building instructions that no longer exist
-//! on-chain. The struct and constructor are retained so the `private_swap_demo`
-//! binary and the mock-tested orchestration layer keep compiling.
+//! on-chain. The struct and constructor are retained so the mock-tested
+//! orchestration layer keeps compiling.
 
 use crate::privacy::types::{Nullifier, ShieldedAddress};
 use crate::relayer::private_swap::{RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg};

@@ -213,7 +213,7 @@ impl Default for AdaptiveBatchVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privacy::circuits::{DepositCircuit, Groth16ProofSystem};
+    use crate::privacy::circuits::{DepositCircuitV2, Groth16ProofSystem};
     use ark_std::rand::rngs::StdRng;
     use ark_std::rand::SeedableRng;
 
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_empty_batch() {
         let mut rng = StdRng::seed_from_u64(0u64);
-        let circuit = DepositCircuit::new();
+        let circuit = DepositCircuitV2::new();
         let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
         let verifier = BatchVerifier::new();
@@ -251,32 +251,34 @@ mod tests {
     /// the witness assignment is satisfiable.
     #[test]
     fn test_mismatched_inputs_and_proofs() {
-        use crate::privacy::poseidon::poseidon_commit;
+        use crate::privacy::poseidon::poseidon_commit_spend;
         use ark_ff::{BigInteger, PrimeField};
 
         let mut rng = StdRng::seed_from_u64(0u64);
-        let circuit = DepositCircuit::new();
+        let circuit = DepositCircuitV2::new();
         let (pk, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
-        // Build a satisfiable DepositCircuit: the commitment must
-        // equal `Poseidon(COMMIT_TAG, value, randomness, recipient)`
-        // exactly — same shape as `Note::commitment()` on the host
-        // side. Mirrors `fr_to_bytes_32` in `privacy::types`.
+        // Build a satisfiable DepositCircuitV2: the commitment must equal
+        // `poseidon_commit_spend(value, recipient_pubkey, blinding, asset)`
+        // exactly — the spend-key note shape the on-chain deposit handler
+        // checks. Mirrors `fr_to_bytes_32` in `privacy::types`.
         let value = 100u64;
-        let randomness = [2u8; 32];
-        let recipient = [3u8; 32];
-        let commitment_fr = poseidon_commit(
+        let blinding = [2u8; 32];
+        let recipient_pubkey = [3u8; 32];
+        let asset = [0u8; 32];
+        let commitment_fr = poseidon_commit_spend(
             Fr::from(value),
-            Fr::from_le_bytes_mod_order(&randomness),
-            Fr::from_le_bytes_mod_order(&recipient),
-            Fr::from(0u64),
+            Fr::from_le_bytes_mod_order(&recipient_pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
         );
         let bytes = commitment_fr.into_bigint().to_bytes_le();
         let mut commitment = [0u8; 32];
         let len = bytes.len().min(32);
         commitment[..len].copy_from_slice(&bytes[..len]);
 
-        let circuit1 = DepositCircuit::with_witness(commitment, value, randomness, recipient);
+        let circuit1 =
+            DepositCircuitV2::with_witness(commitment, value, blinding, recipient_pubkey, asset);
         let proof1 = Groth16ProofSystem::prove(&pk, circuit1, &mut rng).unwrap();
 
         let verifier = BatchVerifier::new();
@@ -299,7 +301,7 @@ mod tests {
         let verifier = AdaptiveBatchVerifier::new();
 
         let mut rng = StdRng::seed_from_u64(0u64);
-        let circuit = DepositCircuit::new();
+        let circuit = DepositCircuitV2::new();
         let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
         // Test with empty batch
@@ -315,7 +317,7 @@ mod tests {
         let verifier = BatchVerifier::new();
         let mut rng = StdRng::seed_from_u64(0u64);
 
-        let circuit = DepositCircuit::new();
+        let circuit = DepositCircuitV2::new();
         let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
         // Small batch (< 3) should work
