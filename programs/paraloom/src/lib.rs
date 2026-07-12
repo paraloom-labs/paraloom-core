@@ -199,7 +199,7 @@ pub mod paraloom_program {
             .total_deposited
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
-        bridge_state.deposit_count += 1;
+        bridge_state.deposit_count = bridge_state.deposit_count.saturating_add(1);
 
         emit!(DepositNoteEvent {
             depositor: ctx.accounts.depositor.key(),
@@ -374,8 +374,10 @@ pub mod paraloom_program {
         // Every settled transact is one verified task; keep the pair
         // (`total_tasks_verified`, `successful_verifications`) both live so a
         // derived success rate is well-defined rather than dividing by zero.
-        validator_account.total_tasks_verified += 1;
-        validator_account.successful_verifications += 1;
+        validator_account.total_tasks_verified =
+            validator_account.total_tasks_verified.saturating_add(1);
+        validator_account.successful_verifications =
+            validator_account.successful_verifications.saturating_add(1);
         validator_account.last_active = now;
         // NOTE: this is the monotonic *settlement* counter (it seeds
         // `settlement_id` for every transact, including pure shielded transfers
@@ -487,8 +489,9 @@ pub mod paraloom_program {
         validator_account.total_earnings = 0;
         validator_account.times_slashed = 0;
 
-        validator_registry.total_validators += 1;
-        validator_registry.active_validators += 1;
+        validator_registry.total_validators = validator_registry.total_validators.saturating_add(1);
+        validator_registry.active_validators =
+            validator_registry.active_validators.saturating_add(1);
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_add(stake_amount);
@@ -649,7 +652,7 @@ pub mod paraloom_program {
             validator_account.unbonding_amount
         };
         let slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
-        validator_account.times_slashed += 1;
+        validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
         if validator_account.is_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
