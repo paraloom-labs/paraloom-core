@@ -361,10 +361,25 @@ pub mod paraloom_program {
                 payout,
             )?;
             validator_account.pending_rewards += fee;
+
+            // Maintain the public withdrawal-volume aggregate, mirroring
+            // `total_deposited` on the deposit side. Checked, though a vault
+            // balance this large is unreachable.
+            bridge_state.total_withdrawn = bridge_state
+                .total_withdrawn
+                .checked_add(gross)
+                .ok_or(BridgeError::InvalidAmount)?;
         }
 
+        // Every settled transact is one verified task; keep the pair
+        // (`total_tasks_verified`, `successful_verifications`) both live so a
+        // derived success rate is well-defined rather than dividing by zero.
+        validator_account.total_tasks_verified += 1;
         validator_account.successful_verifications += 1;
         validator_account.last_active = now;
+        // NOTE: this is the monotonic *settlement* counter (it seeds
+        // `settlement_id` for every transact, including pure shielded transfers
+        // where `ext_amount == 0`), not a count of withdrawals only.
         bridge_state.withdrawal_count = settlement_id;
 
         emit!(TransactEvent {

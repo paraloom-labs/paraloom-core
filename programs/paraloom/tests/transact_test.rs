@@ -346,6 +346,8 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     let val = ValidatorAccount::try_deserialize(&mut val_raw.data.as_slice()).unwrap();
     assert_eq!(val.pending_rewards, fee);
     assert_eq!(val.successful_verifications, 1);
+    // The paired total is now maintained alongside successes (was dead).
+    assert_eq!(val.total_tasks_verified, 1);
 
     // Both input nullifiers were recorded (double-spend defense).
     for (pda, expected) in [
@@ -372,4 +374,6 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     let state_raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+    // Withdrawal volume is now tracked (gross = |ext_amount|, was stuck at 0).
+    assert_eq!(state.total_withdrawn, gross);
 }
