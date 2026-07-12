@@ -75,13 +75,24 @@ fn check_upgrade_authority(program_data: &UncheckedAccount, expected: &Pubkey) -
 /// the canonical little-endian encoding of their reduced field element restores
 /// the 1:1 byte↔field correspondence the off-chain code already maintains.
 fn require_canonical_nullifier(nullifier: &[u8; 32]) -> Result<()> {
+    require_canonical_field(nullifier, BridgeError::NonCanonicalNullifier)
+}
+
+/// Reject a 32-byte value that is not the canonical little-endian encoding of
+/// its reduced BN254 scalar field element. `Fr::from_le_bytes_mod_order` is
+/// non-injective (it maps both `n` and `n + p` to the same element), so any
+/// value later keyed on its raw bytes, appended to the tree, or matched against
+/// a stored root must be canonical for the byte↔field correspondence the
+/// off-chain verifier maintains to hold on chain as well.
+fn require_canonical_field(value: &[u8; 32], error: BridgeError) -> Result<()> {
     use ark_ff::{BigInteger, PrimeField};
-    let reduced = ark_bn254::Fr::from_le_bytes_mod_order(nullifier);
+    let reduced = ark_bn254::Fr::from_le_bytes_mod_order(value);
     let canonical = reduced.into_bigint().to_bytes_le();
-    require!(
-        canonical.as_slice() == nullifier.as_slice(),
-        BridgeError::NonCanonicalNullifier
-    );
+    // `require!` only accepts a literal error variant, so return explicitly to
+    // let the caller pass the field-specific error code.
+    if canonical.as_slice() != value.as_slice() {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -260,6 +271,23 @@ pub mod paraloom_program {
             nullifiers[0] != nullifiers[1],
             BridgeError::DuplicateNullifier
         );
+
+        // Parity with the off-chain verifier: the output commitments and the
+        // tree root are BN254 field elements, so reject any non-canonical
+        // encoding before it is proof-checked, appended to the tree, or matched
+        // against the root ring buffer. Not security-critical on its own
+        // (commitments are not PDA seeds like nullifiers, and `is_known_root`
+        // already rejects an unknown root), but it fails fast and keeps the
+        // on-chain input validation at parity with off-chain. (#418)
+        require_canonical_field(
+            &output_commitments[0],
+            BridgeError::NonCanonicalFieldElement,
+        )?;
+        require_canonical_field(
+            &output_commitments[1],
+            BridgeError::NonCanonicalFieldElement,
+        )?;
+        require_canonical_field(&root, BridgeError::NonCanonicalFieldElement)?;
 
         // The proof proves the spent notes are members of `root`; that root
         // must be one the program actually published (ring buffer), so a spend
@@ -1582,6 +1610,9 @@ pub enum BridgeError {
 
     #[msg("Nullifier is not a canonical field element (>= BN254 scalar modulus)")]
     NonCanonicalNullifier,
+
+    #[msg("Value is not a canonical field element (>= BN254 scalar modulus)")]
+    NonCanonicalFieldElement,
 
     #[msg("Initialize signer must be the program's upgrade authority")]
     UnauthorizedInit,
