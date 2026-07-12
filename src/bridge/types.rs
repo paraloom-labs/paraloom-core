@@ -292,12 +292,16 @@ pub struct BridgeStats {
     pub total_deposits: u64,
 
     /// Total withdrawals processed
+    /// DEPRECATED / not maintained: withdrawals settle on-chain; this
+    /// off-chain counter is never written.
     pub total_withdrawals: u64,
 
     /// Total volume deposited
     pub volume_deposited: u64,
 
     /// Total volume withdrawn
+    /// DEPRECATED / not maintained: withdrawals settle on-chain; this
+    /// off-chain counter is never written.
     pub volume_withdrawn: u64,
 
     /// Last processed block

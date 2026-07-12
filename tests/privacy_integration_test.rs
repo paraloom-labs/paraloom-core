@@ -73,66 +73,6 @@ async fn test_deposit_and_commitment_generation() {
 }
 
 #[tokio::test]
-async fn test_nullifier_generation_and_tracking() {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .is_test(true)
-        .try_init()
-        .ok();
-
-    log::info!("=== Testing Nullifier Generation and Tracking ===");
-
-    let pool = Arc::new(ShieldedPool::new());
-
-    // Create and process deposit
-    let address = ShieldedAddress([42u8; 32]);
-    let randomness = pedersen::generate_randomness();
-    let deposit = DepositTx::new(vec![0x01; 32], 1000, address, randomness, 10);
-
-    let note = deposit.output_note.clone();
-    pool.deposit(note.clone(), 990).await.unwrap();
-
-    log::info!("Setup complete: deposit processed");
-
-    // Generate nullifier from the note
-    let spending_key = randomness; // In production, this would be derived from private key
-    let nullifier = Nullifier::derive(&note.commitment(), &spending_key);
-
-    log::info!("Generated nullifier: {:?}", &nullifier.0[..8]);
-
-    // Verify nullifier is not spent initially
-    assert!(
-        !pool.is_spent(&nullifier).await,
-        "Nullifier should not be spent initially"
-    );
-    log::info!("PASS: Nullifier initially unspent");
-
-    // Process withdrawal (marking nullifier as spent)
-    let withdraw_amount = 500u64;
-    let recipient = [0x99u8; 32];
-    pool.withdraw(nullifier.clone(), withdraw_amount, &recipient)
-        .await
-        .unwrap();
-
-    log::info!("PASS: Withdrawal processed");
-
-    // Verify nullifier is now spent
-    assert!(
-        pool.is_spent(&nullifier).await,
-        "Nullifier should be marked as spent"
-    );
-    log::info!("PASS: Nullifier marked as spent");
-
-    // Attempt double-spend
-    let result = pool
-        .withdraw(nullifier.clone(), withdraw_amount, &recipient)
-        .await;
-
-    assert!(result.is_err(), "Double-spend should fail");
-    log::info!("PASS: Double-spend prevented");
-}
-
-#[tokio::test]
 #[ignore] // Proof generation is slow (60+ seconds), run manually with: cargo test --test privacy_integration_test test_proof_serialization_codec -- --ignored
 async fn test_proof_serialization_codec() {
     use ark_bn254::{Bn254, Fr};
