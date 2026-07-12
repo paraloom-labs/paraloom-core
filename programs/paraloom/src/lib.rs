@@ -531,7 +531,8 @@ pub mod paraloom_program {
             .saturating_add(stake_amount);
         validator_account.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
 
-        validator_registry.active_validators -= 1;
+        validator_registry.active_validators =
+            validator_registry.active_validators.saturating_sub(1);
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_sub(stake_amount);
