@@ -919,6 +919,16 @@ pub mod paraloom_program {
     /// `unbonding_slot` has passed. The registry counters were already updated
     /// when the stake left the active set (unregister / deactivating slash), so
     /// this only moves lamports.
+    ///
+    /// This is the validator's true end of life, so the PDA is `close`d here:
+    /// its rent is refunded to the wallet and the `[b"validator", wallet]`
+    /// address is freed, so the same wallet can `register_validator` again later
+    /// (#392 — the `init` in `RegisterValidator` would otherwise fail with
+    /// `AccountAlreadyInUse` against the leftover husk, and its rent stayed
+    /// locked). Only reachable once the stake has unbonded, which only happens
+    /// after the validator has left the active set (`unbonding_amount > 0`
+    /// implies `!is_active`), so an active validator's PDA is never closed out
+    /// from under it.
     pub fn withdraw_unbonded_stake(ctx: Context<WithdrawUnbondedStake>) -> Result<()> {
         let validator_account = &mut ctx.accounts.validator_account;
         let amount = validator_account.unbonding_amount;
@@ -1379,7 +1389,8 @@ pub struct WithdrawUnbondedStake<'info> {
         mut,
         seeds = [b"validator", validator.key().as_ref()],
         bump,
-        has_one = validator
+        has_one = validator,
+        close = validator
     )]
     pub validator_account: Account<'info, ValidatorAccount>,
 

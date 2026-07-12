@@ -4,11 +4,11 @@
 //! staked lamports into an unbonding window (`unbonding_amount` /
 //! `unbonding_slot`) during which the stake is still slashable, and only
 //! `withdraw_unbonded_stake` — after `UNBONDING_SLOTS` have elapsed — releases
-//! the lamports back to the validator wallet. This exercises the full cycle:
-//! register → unregister (no refund, fields set) → early withdraw rejected
-//! (`UnbondingNotElapsed`) → warp past the window → withdraw succeeds (wallet
-//! credited, `unbonding_amount` cleared) → second withdraw rejected
-//! (`NothingUnbonding`).
+//! the lamports back to the validator wallet and closes the PDA (#392). This
+//! exercises the full cycle: register → unregister (no refund, fields set) →
+//! early withdraw rejected (`UnbondingNotElapsed`) → warp past the window →
+//! withdraw succeeds (wallet credited stake + refunded rent, PDA closed) →
+//! the freed address can be registered again.
 //!
 //! Uses `start_with_context()` so the slot can be warped past the unbonding
 //! window without waiting ~216k real slots.
@@ -216,9 +216,8 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     ctx.warp_to_slot(unbonding_slot)
         .expect("warp to unbonding slot");
 
-    // 6. Withdraw succeeds — wallet credited, unbonding cleared.
+    // 6. Withdraw succeeds — wallet credited, PDA closed.
     let wallet_before_withdraw = balance(&mut ctx, validator.pubkey()).await;
-    let pda_before_withdraw = balance(&mut ctx, validator_pda).await;
     send(
         &mut ctx,
         &validator,
@@ -235,43 +234,50 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     .await
     .expect("withdraw after delay");
 
-    let acc = load_validator(&mut ctx, validator_pda).await;
-    assert_eq!(acc.unbonding_amount, 0, "unbonding cleared after withdraw");
-
+    // The wallet was credited the released stake plus the refunded PDA rent.
     let wallet_after_withdraw = balance(&mut ctx, validator.pubkey()).await;
-    let pda_after_withdraw = balance(&mut ctx, validator_pda).await;
-    // The PDA lost exactly the unbonded amount; the wallet gained it (net of the
-    // small tx fee, which is far below one SOL).
-    assert_eq!(
-        pda_before_withdraw - pda_after_withdraw,
-        MIN_VALIDATOR_STAKE,
-        "PDA debited by the unbonded amount"
-    );
     assert!(
         wallet_after_withdraw > wallet_before_withdraw,
-        "wallet credited by the released stake"
+        "wallet credited by the released stake + refunded rent"
+    );
+    // The PDA is closed at end of life (#392): its address is freed and holds no
+    // lamports, so the leftover husk can no longer lock rent or block re-register.
+    let closed = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .expect("rpc");
+    assert!(
+        closed.is_none() || closed.unwrap().lamports == 0,
+        "PDA must be closed after withdraw"
     );
 
-    // 7. A second withdraw has nothing left to release.
-    let err = send(
+    // 7. The freed address can be registered again — the #392 lockout is gone.
+    send(
         &mut ctx,
         &validator,
         Instruction {
             program_id,
-            data: instruction::WithdrawUnbondedStake {}.data(),
-            accounts: accounts::WithdrawUnbondedStake {
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
                 validator_account: validator_pda,
+                validator_registry: registry_pda,
                 validator: validator.pubkey(),
+                system_program: solana_sdk::system_program::ID,
             }
             .to_account_metas(None),
         },
     )
     .await
-    .expect_err("double withdraw must fail");
+    .expect("re-register after close must succeed");
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(acc.is_active, "re-registered validator is active again");
     assert_eq!(
-        custom_code(err),
-        u32::from(BridgeError::NothingUnbonding),
-        "second withdraw must fail with NothingUnbonding"
+        acc.stake_amount, MIN_VALIDATOR_STAKE,
+        "re-registered with a fresh stake"
     );
 }
 
@@ -393,7 +399,6 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         .expect("warp to unbonding slot");
 
     let wallet_before = balance(&mut ctx, validator.pubkey()).await;
-    let pda_before = balance(&mut ctx, validator_pda).await;
     send(
         &mut ctx,
         &validator,
@@ -410,18 +415,20 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     .await
     .expect("deactivated validator must be able to withdraw its unbonded stake");
 
-    let acc = load_validator(&mut ctx, validator_pda).await;
-    assert_eq!(acc.unbonding_amount, 0, "unbonding cleared after withdraw");
-
+    // The wallet got the released stake plus the refunded rent, and the PDA is
+    // closed (#392) — a fully-exited validator leaves no rent-locked husk behind.
     let wallet_after = balance(&mut ctx, validator.pubkey()).await;
-    let pda_after = balance(&mut ctx, validator_pda).await;
-    assert_eq!(
-        pda_before - pda_after,
-        MIN_VALIDATOR_STAKE,
-        "PDA debited by exactly the unbonded stake"
-    );
     assert!(
         wallet_after > wallet_before,
-        "wallet credited by the released stake"
+        "wallet credited by the released stake + refunded rent"
+    );
+    let closed = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .expect("rpc");
+    assert!(
+        closed.is_none() || closed.unwrap().lamports == 0,
+        "PDA must be closed after withdraw"
     );
 }

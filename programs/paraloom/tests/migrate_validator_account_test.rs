@@ -146,8 +146,8 @@ async fn migrate_grows_legacy_validator_account() {
 /// This builds a raw legacy-layout (113-byte) STAKED account (is_active=true,
 /// stake_amount=MIN, lamports = rent(113) + MIN), migrates it, confirms the rent
 /// top-up, then drives the stake through unbonding (deactivate) and asserts the
-/// post-window `withdraw_unbonded_stake` SUCCEEDS leaving the PDA rent-exempt at
-/// the NEW 129-byte floor.
+/// post-window `withdraw_unbonded_stake` SUCCEEDS and closes the PDA (#392),
+/// refunding its lamports to the wallet.
 #[tokio::test]
 async fn migrate_staked_legacy_account_stays_withdrawable() {
     let program_id = paraloom_program::ID;
@@ -325,16 +325,15 @@ async fn migrate_staked_legacy_account_stays_withdrawable() {
     .await
     .expect("withdraw must SUCCEED on a rent-topped-up migrated staked PDA");
 
-    let raw = ctx
-        .banks_client
-        .get_account(validator_pda)
-        .await
-        .unwrap()
-        .expect("PDA still exists (rent-exempt, not reclaimed)");
-    let acc = ValidatorAccount::try_deserialize(&mut raw.data.as_slice()).unwrap();
-    assert_eq!(acc.unbonding_amount, 0, "unbonding cleared after withdraw");
+    // With the end-of-life close (#392), the withdraw reclaims the PDA outright:
+    // the migrated + rent-topped-up account is drained to the wallet and its
+    // address freed. (The pre-close regression concern — the migrate rent top-up
+    // keeping the PDA above the new rent floor after the stake leaves — is what
+    // lets `close` succeed here rather than underflow; the account is then closed
+    // rather than left funded.)
+    let closed = ctx.banks_client.get_account(validator_pda).await.unwrap();
     assert!(
-        raw.lamports >= rent_new,
-        "PDA must remain rent-exempt at the new floor after withdrawing the stake"
+        closed.is_none() || closed.unwrap().lamports == 0,
+        "PDA must be closed after withdraw"
     );
 }
