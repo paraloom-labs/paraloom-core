@@ -216,7 +216,7 @@ impl MerkleTree {
     /// actually adds: the root is not a proof input, so without this check a
     /// settler could advance the published root to an arbitrary (e.g.
     /// fabricated-note) tree and then withdraw against it. Append order matches
-    /// `insert`, so it agrees with the state `apply_transfer` later commits.
+    /// `insert`, so it agrees with the state a later settlement commits.
     pub async fn root_after(&self, commitments: &[Commitment]) -> [u8; 32] {
         let leaves = self.leaves.read().await;
         let mut extended = leaves.clone();

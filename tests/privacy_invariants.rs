@@ -1,11 +1,10 @@
 //! Property-based tests for #71. The existing proptest block in
 //! `src/privacy/types.rs` already pins commitment determinism, the
 //! hiding/binding pair, and `Nullifier::derive` over a varying
-//! spending key. This file fills the three gaps the audit asked us
-//! to lock down: pool-level value conservation across a deposit /
-//! withdraw round-trip, nullifier injectivity in the *commitment*
-//! argument (the symmetric direction), and the insert-then-lookup
-//! contract on the pool's Merkle tree that withdrawals rely on.
+//! spending key. This file fills two of the gaps the audit asked us
+//! to lock down: nullifier injectivity in the *commitment* argument
+//! (the symmetric direction), and the insert-then-lookup contract on
+//! the pool's Merkle tree that settlement relies on.
 
 use paraloom::privacy::{Commitment, Note, Nullifier, ShieldedAddress, ShieldedPool};
 use proptest::prelude::*;
@@ -17,30 +16,6 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 proptest! {
-    /// `deposit(amount)` followed by `withdraw(amount)` returns the
-    /// pool's `total_supply` to zero for arbitrary amounts. Pool fees
-    /// are metadata and supply tracking is independent of them, so
-    /// the invariant must hold over the full positive range.
-    #[test]
-    fn deposit_withdraw_zeroes_supply(
-        amount in 1u64..1_000_000_000,
-        recipient in any::<[u8; 32]>(),
-        randomness in any::<[u8; 32]>(),
-    ) {
-        let result: Result<(), TestCaseError> = rt().block_on(async {
-            let pool = ShieldedPool::new();
-            let note = Note::new_native(ShieldedAddress(recipient), amount, randomness);
-            pool.deposit(note.clone(), amount).await.unwrap();
-            prop_assert_eq!(pool.total_supply().await, amount);
-
-            let nullifier = Nullifier::derive(&note.commitment(), &randomness);
-            pool.withdraw(nullifier, amount, &[0u8; 32]).await.unwrap();
-            prop_assert_eq!(pool.total_supply().await, 0u64);
-            Ok(())
-        });
-        result?;
-    }
-
     /// Distinct commitments under the same spending key must produce
     /// distinct nullifiers. Symmetric to the existing
     /// `nullifier_differs_with_spending_key` — together they pin

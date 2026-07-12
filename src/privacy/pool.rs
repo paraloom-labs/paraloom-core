@@ -121,116 +121,6 @@ impl ShieldedPool {
         Ok(commitment)
     }
 
-    /// Process a shielded transfer
-    /// Spends input commitments (via nullifiers) and creates output commitments
-    pub async fn transfer(
-        &self,
-        input_nullifiers: Vec<Nullifier>,
-        output_notes: Vec<Note>,
-    ) -> Result<Vec<Commitment>> {
-        // Verify all nullifiers are new (not double-spent)
-        if !self.nullifier_set.check_batch(&input_nullifiers).await {
-            return Err(anyhow!("Double-spend detected: nullifier already used"));
-        }
-
-        // Add nullifiers to prevent future double-spending. If
-        // persistence fails the in-memory set is left untouched and
-        // the transfer is aborted — the alternative would be a half-
-        // committed state where in-memory says spent but disk does
-        // not, opening a double-spend window across restarts.
-        self.nullifier_set.insert_batch(input_nullifiers).await?;
-
-        // Create output commitments
-        let mut output_commitments = Vec::new();
-        let mut notes_map = self.notes.write().await;
-
-        for note in output_notes {
-            let commitment = note.commitment();
-            self.commitment_tree.insert(&commitment).await?;
-            notes_map.insert(commitment.clone(), note);
-            output_commitments.push(commitment);
-        }
-
-        Ok(output_commitments)
-    }
-
-    /// Apply a quorum-approved transfer to the local pool from its public
-    /// parts only (#194).
-    ///
-    /// Unlike [`transfer`](Self::transfer), the settling node does not hold the
-    /// private output notes — only their commitments — so it marks the input
-    /// nullifiers spent and appends the raw output commitments to the tree
-    /// without storing any note. Recipients learn and store their own output
-    /// notes out of band (viewing-key discovery, #196). Nullifier insertion is
-    /// persistence-first, matching [`transfer`](Self::transfer)/[`withdraw`](Self::withdraw):
-    /// a storage failure aborts before any in-memory mutation.
-    pub async fn apply_transfer(
-        &self,
-        input_nullifiers: Vec<Nullifier>,
-        output_commitments: Vec<Commitment>,
-    ) -> Result<()> {
-        if !self.nullifier_set.check_batch(&input_nullifiers).await {
-            return Err(anyhow!("Double-spend detected: nullifier already used"));
-        }
-        self.nullifier_set.insert_batch(input_nullifiers).await?;
-
-        for commitment in output_commitments {
-            self.commitment_tree.insert(&commitment).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Withdraw native SOL from the shielded pool.
-    ///
-    /// Convenience wrapper over [`withdraw_asset`](Self::withdraw_asset) with
-    /// [`NATIVE_SOL_ASSET`], preserving the pre-multi-asset signature.
-    pub async fn withdraw(
-        &self,
-        nullifier: Nullifier,
-        amount: u64,
-        recipient: &[u8], // Public address receiving withdrawal
-    ) -> Result<()> {
-        self.withdraw_asset(nullifier, amount, recipient, NATIVE_SOL_ASSET)
-            .await
-    }
-
-    /// Withdraw `amount` of `asset_id` from the shielded pool (#236).
-    /// Burns a commitment (via nullifier) and debits the asset's supply.
-    pub async fn withdraw_asset(
-        &self,
-        nullifier: Nullifier,
-        amount: u64,
-        _recipient: &[u8], // Public address receiving withdrawal
-        asset_id: AssetId,
-    ) -> Result<()> {
-        // Check nullifier hasn't been used
-        if self.nullifier_set.contains(&nullifier).await {
-            return Err(anyhow!("Double-spend: nullifier already used"));
-        }
-
-        // Add nullifier. Persistence-first ordering means a storage
-        // failure aborts the withdraw before any in-memory mutation,
-        // preventing the disk-vs-memory divergence that would let a
-        // restarted node accept a replay of the same withdrawal.
-        self.nullifier_set.insert(nullifier).await?;
-
-        // Decrease this asset's supply
-        let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        if *supply < amount {
-            return Err(anyhow!("Insufficient shielded supply"));
-        }
-        *supply -= amount;
-
-        // Persist the asset's supply to storage if available
-        if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
-        }
-
-        Ok(())
-    }
-
     /// Get the current Merkle root
     pub async fn root(&self) -> [u8; 32] {
         self.commitment_tree.root().await
@@ -388,103 +278,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shielded_pool_transfer() {
-        let pool = ShieldedPool::new();
-
-        // Create input nullifiers
-        let nullifier1 = Nullifier([1u8; 32]);
-        let nullifier2 = Nullifier([2u8; 32]);
-
-        // Create output notes
-        let addr1 = ShieldedAddress([10u8; 32]);
-        let addr2 = ShieldedAddress([20u8; 32]);
-        let note1 = Note::new_native(addr1, 500, [1u8; 32]);
-        let note2 = Note::new_native(addr2, 500, [2u8; 32]);
-
-        // Process transfer
-        let outputs = pool
-            .transfer(vec![nullifier1, nullifier2], vec![note1, note2])
-            .await
-            .unwrap();
-
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(pool.commitment_count().await, 2);
-        assert_eq!(pool.spent_count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn test_shielded_pool_double_spend() {
-        let pool = ShieldedPool::new();
-
-        let nullifier = Nullifier([1u8; 32]);
-        let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new_native(addr, 100, [1u8; 32]);
-
-        // First transfer succeeds
-        pool.transfer(vec![nullifier.clone()], vec![note.clone()])
-            .await
-            .unwrap();
-
-        // Second transfer with same nullifier should fail
-        let result = pool.transfer(vec![nullifier], vec![note]).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_shielded_pool_withdraw() {
-        let pool = ShieldedPool::new();
-
-        // Deposit first
-        let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new_native(addr, 1000, [1u8; 32]);
-        pool.deposit(note, 1000).await.unwrap();
-
-        // Withdraw
-        let nullifier = Nullifier([100u8; 32]);
-        let recipient = [5u8; 32];
-        pool.withdraw(nullifier.clone(), 500, &recipient)
-            .await
-            .unwrap();
-
-        assert_eq!(pool.total_supply().await, 500);
-        assert!(pool.is_spent(&nullifier).await);
-
-        // Double withdraw should fail
-        let result = pool.withdraw(nullifier, 100, &recipient).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_shielded_pool_withdraw_insufficient() {
-        let pool = ShieldedPool::new();
-
-        // Deposit 1000
-        let addr = ShieldedAddress([1u8; 32]);
-        let note = Note::new_native(addr, 1000, [1u8; 32]);
-        pool.deposit(note, 1000).await.unwrap();
-
-        // Try to withdraw more than available
-        let nullifier = Nullifier([1u8; 32]);
-        let recipient = [5u8; 32];
-        let result = pool.withdraw(nullifier, 2000, &recipient).await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_shielded_pool_consistency() {
         let pool = ShieldedPool::new();
 
-        // Add some commitments and nullifiers
+        // Add some commitments; with no spends the nullifier count stays
+        // at zero, which must still satisfy nullifiers <= commitments.
         let addr = ShieldedAddress([1u8; 32]);
         let note1 = Note::new_native(addr.clone(), 100, [1u8; 32]);
         let note2 = Note::new_native(addr, 200, [2u8; 32]);
 
-        pool.deposit(note1.clone(), 100).await.unwrap();
+        pool.deposit(note1, 100).await.unwrap();
         pool.deposit(note2, 200).await.unwrap();
-
-        let nullifier = Nullifier([10u8; 32]);
-        pool.transfer(vec![nullifier], vec![note1]).await.unwrap();
 
         // Should be consistent
         pool.verify_consistency().await.unwrap();
@@ -555,16 +359,10 @@ mod tests {
         assert_eq!(pool.supply_of(usdc).await, 500);
         assert_eq!(pool.supply_of([1u8; 32]).await, 0); // never held
 
-        // Withdrawing one asset leaves the other untouched.
-        pool.withdraw_asset(Nullifier([4u8; 32]), 200, &[0u8; 32], usdc)
-            .await
-            .unwrap();
-        assert_eq!(pool.supply_of(usdc).await, 300);
-        assert_eq!(pool.total_supply().await, 1000);
-
+        // Each asset's supply is snapshotted independently.
         let all = pool.all_supplies().await;
         assert_eq!(all.len(), 2);
         assert_eq!(all[&NATIVE_SOL_ASSET], 1000);
-        assert_eq!(all[&usdc], 300);
+        assert_eq!(all[&usdc], 500);
     }
 }
