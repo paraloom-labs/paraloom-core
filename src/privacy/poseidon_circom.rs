@@ -17,10 +17,15 @@
 //!   output equals the host output by construction.
 //!
 //! Domain separation is by **width** (circomlib convention): a Merkle inner
-//! node is `Poseidon(2)`, a nullifier `Poseidon(3)`, a commitment `Poseidon(4)`
-//! — distinct widths are distinct permutations and cannot collide, so no
-//! absorbed domain tag is needed. The capacity element (`state[0]`) is the
-//! fixed `0` circomlib uses (`new_circom`), which the syscall also assumes.
+//! node is `Poseidon(2)`, a commitment `Poseidon(4)`, and the spend signature
+//! and nullifier are both `Poseidon(3)` — distinct widths are distinct
+//! permutations and cannot collide across the widths, so no absorbed domain tag
+//! is needed. The two width-3 hashes (signature `Poseidon(3)([privkey,
+//! commitment, leaf_index])` and nullifier `Poseidon(3)([commitment,
+//! leaf_index, signature])`) share a width, so they are separated not by width
+//! but by their distinct input tuples (different first element and structure).
+//! The capacity element (`state[0]`) is the fixed `0` circomlib uses
+//! (`new_circom`), which the syscall also assumes.
 //!
 //! The three-way parity — gadget == host == syscall — is what makes the
 //! on-chain-tree architecture safe to adopt. Gadget==host is enforced by the

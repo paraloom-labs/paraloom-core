@@ -1,6 +1,6 @@
 //! On-chain validator quorum for settlement (#260).
 //!
-//! Settlement (`withdraw` / `shielded_transfer`) is authorized by a
+//! Settlement (`transact`) is authorized by a
 //! supermajority of registered, active validators **co-signing the transaction**
 //! — not a single authority key. The Solana runtime verifies the signatures
 //! natively; this module only confirms, for each counted member, that:
@@ -11,7 +11,8 @@
 //! signature verification keeps the on-chain attack surface minimal.
 //!
 //! `quorum_accounts` are `(validator_wallet, validator_pda)` pairs passed via
-//! `remaining_accounts`. Called by `withdraw` and `shielded_transfer`. The
+//! `remaining_accounts`. Called by `transact` (which subsumed the former
+//! `withdraw` / `shielded_transfer` paths). The
 //! node-side co-signing round that produces a real multi-validator quorum is
 //! tracked separately in #260 (this enforces it on-chain).
 
