@@ -947,6 +947,16 @@ pub mod paraloom_program {
             Clock::get()?.slot >= validator_account.unbonding_slot,
             BridgeError::UnbondingNotElapsed
         );
+        // The account is `close`d at the end of this instruction (its rent goes
+        // to the validator), which drops `pending_rewards` along with it. Refuse
+        // to close while rewards are unclaimed so the exit flow cannot silently
+        // forfeit earned settlement fees (#434) — `claim_rewards` is callable
+        // even for an inactive validator, so the exit order is: unregister →
+        // claim_rewards → withdraw_unbonded_stake.
+        require!(
+            validator_account.pending_rewards == 0,
+            BridgeError::PendingRewardsUnclaimed
+        );
         // The staked lamports live in the PDA itself; `unbonding_amount` is
         // always the delta above the account's rent-exempt minimum, so this
         // debit cannot drop the PDA below rent exemption.
@@ -1646,6 +1656,9 @@ pub enum BridgeError {
 
     #[msg("No unbonding stake is pending withdrawal")]
     NothingUnbonding,
+
+    #[msg("Claim pending rewards before withdrawing unbonded stake (the account is closed on withdraw)")]
+    PendingRewardsUnclaimed,
 
     #[msg("Merkle root is not in the on-chain root history")]
     UnknownMerkleRoot,
