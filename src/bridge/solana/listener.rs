@@ -1068,8 +1068,23 @@ mod tests {
             "an earlier fetched-then-discarded signature must not be marked seen"
         );
 
-        // Poll 2: newer's body is now available; because `older` was never
-        // stranded in the seen set, BOTH deposits are re-fetched and indexed.
+        // Poll 2: newer's body is now available. `older` was consumed from the
+        // mock by its successful poll-1 fetch, so re-insert it too; because it
+        // was never stranded in the seen set, BOTH deposits are re-fetched and
+        // indexed. (If the fix regressed, `older` would be filtered as seen and
+        // only `newer` would index — `processed == 1`.)
+        mock.get_transactions.lock().unwrap().insert(
+            older,
+            synth_deposit_tx(
+                older,
+                7,
+                &program_id,
+                &depositor,
+                1_000,
+                [7u8; 32],
+                [13u8; 32],
+            ),
+        );
         mock.get_transactions.lock().unwrap().insert(
             newer,
             synth_deposit_tx(
