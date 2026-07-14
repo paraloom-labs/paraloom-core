@@ -570,6 +570,7 @@ impl EventListener {
         }
 
         let mut events = Vec::new();
+        let mut newly_seen = Vec::with_capacity(to_fetch.len());
         for sig in to_fetch {
             let confirmed = match state.rpc.get_transaction(&sig, LISTENER_TX_ENCODING).await {
                 Ok(tx) => tx,
@@ -599,12 +600,23 @@ impl EventListener {
             let sig_str = sig.to_string();
             let mut decoded = extract_deposit_events(&sig_str, &confirmed, &state.program_id);
             events.append(&mut decoded);
+            newly_seen.push(sig);
+        }
 
+        // Mark signatures seen only after the WHOLE batch was fetched
+        // successfully. Inserting per-signature inside the loop would let a
+        // later `getTransaction` failure — which aborts the poll with `Err` and
+        // discards `events` — leave an already-fetched-but-discarded signature
+        // marked seen; the next poll would then filter it out and advance the
+        // cursor past it, durably losing that deposit (#515).
+        {
             let mut seen = state.seen_signatures.write().await;
-            if seen.len() >= SEEN_SIGNATURE_CAP {
-                seen.clear();
+            for sig in newly_seen {
+                if seen.len() >= SEEN_SIGNATURE_CAP {
+                    seen.clear();
+                }
+                seen.insert(sig);
             }
-            seen.insert(sig);
         }
 
         Ok(events)
@@ -988,6 +1000,93 @@ mod tests {
             processed, 2,
             "both deposits index once the older body is available"
         );
+        assert_eq!(state.pool.commitment_count().await, 2);
+        assert_eq!(*state.last_signature.read().await, Some(newer));
+    }
+
+    /// #515 — the inverse ordering of the test above: an EARLIER signature in
+    /// the batch is fetched successfully, then a LATER one fails. The successful
+    /// fetch must NOT be marked seen until the whole batch succeeds, otherwise
+    /// the aborted poll discards its event while leaving it in the seen set, and
+    /// the retry filters it out — durably losing the older deposit.
+    #[tokio::test]
+    async fn poll_does_not_strand_an_earlier_deposit_when_a_later_sig_fails() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let older = Signature::new_unique();
+        let newer = Signature::new_unique();
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+
+        // Poll 1: RPC lists [newer, older]; fetched oldest-first. `older`
+        // succeeds (present in the map); `newer` then falls to the error, so the
+        // poll aborts. `older` must NOT be left marked seen.
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![status(&newer, 8), status(&older, 7)]));
+        *mock.next_get_transaction.lock().unwrap() = Some(Err(BridgeError::SolanaRpc(
+            "transient getTransaction failure".to_string(),
+        )));
+        mock.get_transactions.lock().unwrap().insert(
+            older,
+            synth_deposit_tx(
+                older,
+                7,
+                &program_id,
+                &depositor,
+                1_000,
+                [7u8; 32],
+                [13u8; 32],
+            ),
+        );
+
+        let poll1 = EventListener::poll_events(&state).await;
+        assert!(
+            poll1.is_err(),
+            "a later getTransaction failure must abort the poll"
+        );
+        assert_eq!(
+            *state.last_signature.read().await,
+            None,
+            "cursor must not advance"
+        );
+        assert_eq!(state.pool.commitment_count().await, 0);
+        assert!(
+            !state.seen_signatures.read().await.contains(&older),
+            "an earlier fetched-then-discarded signature must not be marked seen"
+        );
+
+        // Poll 2: newer's body is now available; because `older` was never
+        // stranded in the seen set, BOTH deposits are re-fetched and indexed.
+        mock.get_transactions.lock().unwrap().insert(
+            newer,
+            synth_deposit_tx(
+                newer,
+                8,
+                &program_id,
+                &depositor,
+                2_000,
+                [9u8; 32],
+                [11u8; 32],
+            ),
+        );
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![status(&newer, 8), status(&older, 7)]));
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 2, "the earlier deposit is not lost");
         assert_eq!(state.pool.commitment_count().await, 2);
         assert_eq!(*state.last_signature.read().await, Some(newer));
     }
