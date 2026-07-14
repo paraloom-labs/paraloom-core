@@ -7,6 +7,7 @@ use crate::bridge::{BridgeError, Result};
 use async_trait::async_trait;
 use solana_client::client_error::ClientError;
 use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::account::Account;
 use solana_sdk::hash::Hash;
@@ -121,8 +122,20 @@ impl BridgeRpc for RealBridgeRpc {
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
         let rpc = Arc::clone(&self.client);
         let sig = *signature;
+        // Request v0 (versioned) transaction support. Without
+        // `max_supported_transaction_version`, a versioned deposit tx makes
+        // `getTransaction` fail, which (since the fetch error now propagates)
+        // aborts the poll and wedges the listener cursor indefinitely.
+        let config = RpcTransactionConfig {
+            encoding: Some(encoding),
+            commitment: None,
+            max_supported_transaction_version: Some(0),
+        };
         blocking("getTransaction", move || {
-            rpc_err("getTransaction", rpc.get_transaction(&sig, encoding))
+            rpc_err(
+                "getTransaction",
+                rpc.get_transaction_with_config(&sig, config),
+            )
         })
         .await
     }
