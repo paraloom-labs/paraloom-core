@@ -288,6 +288,13 @@ impl MerklePath {
     /// gadget. Any divergence between these three paths would break
     /// inclusion proofs.
     pub fn verify(&self, leaf: &[u8; 32], root: &[u8; 32]) -> bool {
+        // A well-formed path carries exactly one direction bit per sibling.
+        // Reject a length mismatch outright rather than letting `zip` silently
+        // verify only `min(len)` levels against the root.
+        if self.path.len() != self.indices.len() {
+            return false;
+        }
+
         let mut current = *leaf;
 
         for (sibling, is_right) in self.path.iter().zip(self.indices.iter()) {
@@ -451,23 +458,21 @@ mod tests {
         assert!(!tampered.verify(&leaf, &root));
     }
 
-    /// Mismatched `path.len()` vs `indices.len()` is a malformed
-    /// input. The current implementation silently zips to the shorter
-    /// of the two — pin that behaviour explicitly so a future change
-    /// to "panic" or "Err" is a deliberate API decision rather than
-    /// an accidental drift.
+    /// Mismatched `path.len()` vs `indices.len()` is a malformed input.
+    /// `verify` rejects it up front instead of letting `zip` silently walk
+    /// only `min(len)` levels — otherwise a short `indices` could clear the
+    /// root while checking fewer siblings than the caller intended.
     #[test]
-    fn merkle_path_mismatched_lengths_truncate_via_zip() {
+    fn merkle_path_mismatched_lengths_are_rejected() {
         let leaf = [0u8; 32];
         let path = MerklePath {
             path: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
             indices: vec![true], // strictly shorter
         };
-        // Build the root the implementation would compute (1 level).
-        let expected_root = root_for(&leaf, &path.path[..1], &path.indices);
-        // Verify against that — the verifier walks only `min(len)`
-        // levels, so the path lengths can disagree without panicking.
-        assert!(path.verify(&leaf, &expected_root));
+        // The root that a truncated (1-level) walk would have produced.
+        let truncated_root = root_for(&leaf, &path.path[..1], &path.indices);
+        // With the length guard, the mismatch fails closed regardless of root.
+        assert!(!path.verify(&leaf, &truncated_root));
     }
 
     /// Random `(path, indices)` pairs of varying shapes must never
