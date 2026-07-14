@@ -686,6 +686,10 @@ pub mod paraloom_program {
             validator_account.unbonding_amount
         };
         let slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
+        // A slash that rounds down to zero (tiny stake × low percentage) would
+        // still bump `times_slashed` and emit an event without moving any
+        // lamports. Reject it so the slash record reflects only real penalties.
+        require!(slash_amount > 0, BridgeError::InvalidAmount);
         validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
         if validator_account.is_active {
