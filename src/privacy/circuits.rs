@@ -1662,12 +1662,30 @@ mod tests {
         #[test]
         fn input_amounts_are_range_constrained() {
             let ins = [
-                InNote { amount: 100, privkey: Fr::from(11u64), blinding: Fr::from(1u64), index: 5 },
-                InNote { amount: 0, privkey: Fr::from(12u64), blinding: Fr::from(2u64), index: 0 },
+                InNote {
+                    amount: 100,
+                    privkey: Fr::from(11u64),
+                    blinding: Fr::from(1u64),
+                    index: 5,
+                },
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(12u64),
+                    blinding: Fr::from(2u64),
+                    index: 0,
+                },
             ];
             let outs = [
-                OutNote { amount: 100, pubkey: v3_pubkey(Fr::from(21u64)), blinding: Fr::from(3u64) },
-                OutNote { amount: 0, pubkey: v3_pubkey(Fr::from(22u64)), blinding: Fr::from(4u64) },
+                OutNote {
+                    amount: 100,
+                    pubkey: v3_pubkey(Fr::from(21u64)),
+                    blinding: Fr::from(3u64),
+                },
+                OutNote {
+                    amount: 0,
+                    pubkey: v3_pubkey(Fr::from(22u64)),
+                    blinding: Fr::from(4u64),
+                },
             ];
             let c = build(ins, outs, asset(), [0xAAu8; 32]);
             let cs = ConstraintSystem::<Fr>::new_ref();
