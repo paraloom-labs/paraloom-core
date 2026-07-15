@@ -65,6 +65,11 @@ pub enum RelayerError {
     #[error("fee_bps {0} exceeds 10000 (100%)")]
     FeeTooHigh(u16),
 
+    /// The swap quote produced an output amount that cannot fit in the `u64`
+    /// amount type used by on-chain instructions.
+    #[error("swap output amount overflows u64: {0}")]
+    AmountOverflow(u128),
+
     /// The configured swap provider failed to route or quote the trade.
     #[error("swap provider failed: {0}")]
     SwapFailed(String),
@@ -164,7 +169,9 @@ impl SwapProvider for MockSwapProvider {
         amount: u64,
         _signer: &Keypair,
     ) -> Result<SwapResult> {
-        let out_amount = (amount as u128 * self.rate_num as u128 / self.rate_den as u128) as u64;
+        let out_amount_u128 = (amount as u128 * self.rate_num as u128) / self.rate_den as u128;
+        let out_amount = u64::try_from(out_amount_u128)
+            .map_err(|_| RelayerError::AmountOverflow(out_amount_u128))?;
         Ok(SwapResult { out_amount })
     }
 }
@@ -628,6 +635,21 @@ mod tests {
         assert_eq!(out.gross_out_amount, (400 - 1) * 2);
         assert_eq!(out.relayer_fee, 0);
         assert_eq!(out.net_out_amount, (400 - 1) * 2);
+    }
+
+    #[tokio::test]
+    async fn mock_swap_rejects_output_amount_overflow() {
+        let provider = MockSwapProvider::with_rate(3, 1);
+        let signer = Keypair::new();
+        let amount = u64::MAX / 2;
+        let expected = amount as u128 * 3u128;
+
+        let err = provider
+            .swap(NATIVE_SOL_ASSET, [4u8; 32], amount, &signer)
+            .await
+            .expect_err("overflowing output must not silently truncate to u64");
+
+        assert!(matches!(err, RelayerError::AmountOverflow(v) if v == expected));
     }
 
     #[tokio::test]
