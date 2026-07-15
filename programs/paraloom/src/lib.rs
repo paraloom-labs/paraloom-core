@@ -1673,6 +1673,7 @@ pub enum BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::error::Error;
 
     #[test]
     fn withdrawal_fee_and_payout_uses_checked_subtraction() {
@@ -1682,6 +1683,15 @@ mod tests {
 
         let err = withdrawal_fee_and_payout(10_000, 10_001)
             .expect_err("fee larger than gross must not underflow payout");
-        assert_eq!(err, BridgeError::InvalidAmount.into());
+        match err {
+            Error::AnchorError(anchor_error) => {
+                assert_eq!(
+                    anchor_error.error_code_number,
+                    u32::from(BridgeError::InvalidAmount)
+                );
+                assert_eq!(anchor_error.error_name, "InvalidAmount");
+            }
+            other => panic!("expected InvalidAmount Anchor error, got {other:?}"),
+        }
     }
 }
