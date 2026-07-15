@@ -125,11 +125,16 @@ impl VerificationAggregator {
         let mut results = self.results.write().await;
         let mut voters = self.voters.write().await;
 
-        // Record vote
-        voters.insert(result.validator.clone(), result.result.clone());
+        // Prevent vote replacement: use entry().or_insert() so a validator
+        // cannot change their vote after the initial submission (#536).
+        voters
+            .entry(result.validator.clone())
+            .or_insert(result.result.clone());
 
-        // Store result
-        results.push(result);
+        // Cap results Vec at total_validators to prevent unbounded growth (#536).
+        if results.len() < self.total_validators {
+            results.push(result);
+        }
 
         Ok(())
     }
