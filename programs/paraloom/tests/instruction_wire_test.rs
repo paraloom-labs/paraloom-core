@@ -29,6 +29,7 @@ fn transact_wire_layout_matches_offchain_builder() {
         root: [0x33; 32],
         ext_amount: -2,
         proof: vec![0xEF; 3],
+        expiration_slot: 0,
     }
     .data();
 

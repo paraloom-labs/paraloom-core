@@ -246,6 +246,7 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
             root: fx::FIXTURE_ROOT,
             ext_amount: fx::FIXTURE_EXT_AMOUNT,
             proof: fixture_proof(),
+            expiration_slot: 0,
         }
         .data(),
         accounts: {

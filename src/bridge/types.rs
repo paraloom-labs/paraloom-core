@@ -62,6 +62,19 @@ pub struct WithdrawalRequest {
     pub proof: Vec<u8>,
 }
 
+impl WithdrawalRequest {
+    /// Returns true if this withdrawal request has expired relative to the
+    /// current slot. A request with `expiration_slot == 0` is treated as
+    /// having no expiry (backward compatibility) and never expires.
+    ///
+    /// Callers should reject requests where `is_expired(current_slot)` returns
+    /// `true` before forwarding them to the consensus or on-chain settlement
+    /// path (#532).
+    pub fn is_expired(&self, current_slot: u64) -> bool {
+        self.expiration_slot != 0 && current_slot > self.expiration_slot
+    }
+}
+
 /// Bridge configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeConfig {

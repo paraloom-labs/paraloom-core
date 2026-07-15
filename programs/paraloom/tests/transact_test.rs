@@ -288,6 +288,7 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
             root: fx::FIXTURE_ROOT,
             ext_amount: fx::FIXTURE_EXT_AMOUNT,
             proof: fixture_proof(),
+            expiration_slot: 0, // no expiry (backward compatible)
         }
         .data(),
         accounts: {

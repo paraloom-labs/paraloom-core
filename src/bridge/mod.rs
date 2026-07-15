@@ -109,6 +109,29 @@ impl Bridge {
         }
     }
 
+    /// Validate that a withdrawal request has not expired (#532).
+    ///
+    /// Returns `Ok(())` if the request is still valid, or an error if the
+    /// current slot exceeds the request's `expiration_slot`. Requests with
+    /// `expiration_slot == 0` are treated as having no expiry.
+    pub async fn validate_withdrawal_expiry(
+        &self,
+        request: &crate::bridge::types::WithdrawalRequest,
+    ) -> Result<()> {
+        if request.expiration_slot == 0 {
+            return Ok(());
+        }
+        let current = self.current_slot().await?;
+        if current > request.expiration_slot {
+            return Err(anyhow::anyhow!(
+                "Withdrawal request expired: current slot {} > expiration_slot {} (#532)",
+                current,
+                request.expiration_slot
+            ));
+        }
+        Ok(())
+    }
+
     /// Submit a pre-assembled, co-signed settlement transaction (#260) — the
     /// multi-sig withdrawal the node gathered from the approving validators.
     pub async fn submit_signed_transaction(

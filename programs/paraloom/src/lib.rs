@@ -250,12 +250,23 @@ pub mod paraloom_program {
         root: [u8; 32],
         ext_amount: i64,
         proof: Vec<u8>,
+        expiration_slot: u64,
     ) -> Result<()> {
         let bridge_state = &mut ctx.accounts.bridge_state;
 
         require!(!bridge_state.paused, BridgeError::BridgePaused);
         require!(!proof.is_empty(), BridgeError::InvalidProof);
         require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
+
+        // Enforce withdrawal expiration slot (#532). A value of 0 means no
+        // expiry (backward compatibility with pre-#532 callers).
+        if expiration_slot != 0 {
+            let current_slot = Clock::get()?.slot;
+            require!(
+                current_slot <= expiration_slot,
+                BridgeError::WithdrawalExpired
+            );
+        }
 
         // Deposits are public and go through `deposit_note`; `transact` only
         // spends existing notes (withdraw or internal transfer).
