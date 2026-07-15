@@ -942,7 +942,15 @@ pub mod paraloom_program {
     pub fn withdraw_unbonded_stake(ctx: Context<WithdrawUnbondedStake>) -> Result<()> {
         let validator_account = &mut ctx.accounts.validator_account;
         let amount = validator_account.unbonding_amount;
-        require!(amount > 0, BridgeError::NothingUnbonding);
+        // Allow amount == 0 when the validator has been fully slashed (e.g., 100%
+        // slash that leaves unbonding_amount == 0 and stake_amount == 0, as
+        // tracked in issue #549). The PDA still holds rent-exempt lamports and
+        // must be closed via the `close = validator` constraint to reclaim them.
+        // The unbonding_slot check below still gates closure behind the delay.
+        require!(
+            amount > 0 || (validator_account.stake_amount == 0 && !validator_account.is_active),
+            BridgeError::NothingUnbonding
+        );
         require!(
             Clock::get()?.slot >= validator_account.unbonding_slot,
             BridgeError::UnbondingNotElapsed
