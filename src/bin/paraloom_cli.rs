@@ -63,6 +63,9 @@ static JOB_EXECUTOR: Lazy<Arc<JobExecutor>> = Lazy::new(|| {
     Arc::new(executor)
 });
 
+#[cfg(feature = "solana-bridge")]
+const LAMPORTS_PER_SOL_EXACT: u64 = LAMPORTS_PER_SOL;
+#[cfg(not(feature = "solana-bridge"))]
 const LAMPORTS_PER_SOL_EXACT: u64 = 1_000_000_000;
 
 fn parse_sol_to_lamports(input: &str) -> Result<u64> {
@@ -104,13 +107,9 @@ fn parse_sol_to_lamports(input: &str) -> Result<u64> {
 
     let mut padded_fraction = fraction.to_string();
     padded_fraction.extend(std::iter::repeat('0').take(9 - padded_fraction.len()));
-    let fraction_lamports = if padded_fraction.is_empty() {
-        0
-    } else {
-        padded_fraction
-            .parse::<u64>()
-            .context("fractional SOL amount is too large")?
-    };
+    let fraction_lamports = padded_fraction
+        .parse::<u64>()
+        .context("fractional SOL amount is too large")?;
 
     whole_lamports
         .checked_add(fraction_lamports)
