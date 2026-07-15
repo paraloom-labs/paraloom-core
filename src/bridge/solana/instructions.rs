@@ -99,15 +99,15 @@ pub struct TransactInstructionData {
 /// Instruction data for `deposit_note` (circuit v3, #350).
 ///
 /// Layout matches the on-chain `deposit_note` function:
-/// `(amount, pubkey, blinding)`. The program computes the note commitment
-/// `Poseidon(amount, pubkey, blinding, asset)` itself and appends it to the
-/// on-chain tree, so the leaf is bound to the lamports actually deposited.
+/// `(amount, pubkey, commitment)`. The blinding factor used to create the
+/// commitment stays off-chain — only the pre-computed commitment is submitted,
+/// preserving note unlinkability.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct DepositNoteInstructionData {
     pub amount: u64,
     pub pubkey: [u8; 32],
-    pub blinding: [u8; 32],
+    pub commitment: [u8; 32],
 }
 
 /// SPL Token program id (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the
@@ -439,8 +439,9 @@ pub fn create_transact_instruction(
 /// Create the `deposit_note` instruction (circuit v3, #350).
 ///
 /// Permissionless: the depositor moves their own lamports into the vault and
-/// the program computes + appends the note commitment on-chain. The account
-/// order must match the `DepositNote` accounts struct in the program.
+/// the program appends the pre-computed note commitment to the on-chain Merkle
+/// tree. The blinding factor is used to compute the commitment off-chain and
+/// is never submitted on-chain, preserving note unlinkability.
 pub fn create_deposit_note_instruction(
     program_id: &Pubkey,
     depositor: &Pubkey,
@@ -452,10 +453,19 @@ pub fn create_deposit_note_instruction(
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
 
+    // Compute commitment off-chain (#534): blinding stays secret, only the
+    // commitment goes on-chain, preventing note-linkability attacks.
+    let commitment = crate::privacy::types::spend_commitment(
+        amount,
+        &pubkey,
+        &blinding,
+        &crate::privacy::types::NATIVE_SOL_ASSET,
+    );
+
     let data = DepositNoteInstructionData {
         amount,
         pubkey,
-        blinding,
+        commitment: commitment.0,
     };
 
     let mut instruction_data = discriminators::DEPOSIT_NOTE.to_vec();

@@ -176,11 +176,16 @@ pub mod paraloom_program {
     /// emitted event carries the leaf index so the wallet learns where its note
     /// landed. Permissionless (the depositor's own funds), no proof or quorum —
     /// a deposit only *adds* value and creates a note the depositor controls.
+    /// Accepts a pre-computed note commitment from the depositor instead of a
+    /// raw blinding factor, so the blinding stays off-chain and note
+    /// unlinkability is preserved. The depositor computes
+    /// `commitment = Poseidon(amount, pubkey, blinding, asset)` off-chain and
+    /// submits only the result.
     pub fn deposit_note(
         ctx: Context<DepositNote>,
         amount: u64,
         pubkey: [u8; 32],
-        blinding: [u8; 32],
+        commitment: [u8; 32],
     ) -> Result<()> {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
         require!(amount > 0, BridgeError::InvalidAmount);
@@ -199,8 +204,6 @@ pub mod paraloom_program {
             ],
         )?;
 
-        let commitment =
-            crate::merkle_tree::commitment(amount, &pubkey, &blinding, &NATIVE_SOL_ASSET)?;
         let mut tree = ctx.accounts.merkle_tree.load_mut()?;
         let leaf_index = tree.next_index;
         tree.append(commitment)?;
