@@ -613,7 +613,12 @@ impl EventListener {
             let mut seen = state.seen_signatures.write().await;
             for sig in newly_seen {
                 if seen.len() >= SEEN_SIGNATURE_CAP {
-                    seen.clear();
+                    // LRU eviction: remove one entry instead of clearing the
+                    // entire set. A full clear() would discard all dedup state
+                    // and allow replay of previously processed signatures (#537).
+                    if let Some(oldest) = seen.iter().next().cloned() {
+                        seen.remove(&oldest);
+                    }
                 }
                 seen.insert(sig);
             }
