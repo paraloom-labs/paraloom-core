@@ -339,7 +339,18 @@ pub mod paraloom_program {
         // `init`ed in `Transact`, so a note already spent on either the
         // `withdraw`, `shielded_transfer` or `transact` path fails here.
         let now = Clock::get()?.unix_timestamp;
-        let settlement_id = bridge_state.withdrawal_count.saturating_add(1);
+        // Derive a non-sequential settlement_id to prevent transaction linking (#538).
+        // Hash the withdrawal_count with the current slot and merkle root so the
+        // result is unpredictable without on-chain context and does not leak ordering.
+        let slot = Clock::get()?.slot;
+        let settlement_hash = anchor_lang::solana_program::hash::hashv(&[
+            &bridge_state.withdrawal_count.to_le_bytes(),
+            &slot.to_le_bytes(),
+            &root,
+        ]);
+        let settlement_id = u64::from_le_bytes(
+            settlement_hash.to_bytes()[..8].try_into().unwrap_or([0u8; 8]),
+        );
         let nf0 = &mut ctx.accounts.nullifier_account_0;
         nf0.nullifier = nullifiers[0];
         nf0.used_at = now;
