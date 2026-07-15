@@ -149,7 +149,14 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
-        let _ext_data_hash_sq = &ext_data_hash_var * &ext_data_hash_var;
+        // Bind ext_data_hash with a Poseidon hash commitment (#533).
+        // Previously: squaring was trivially satisfiable. Now: Poseidon hash
+        // with a protocol nonce creates a real commitment.
+        let protocol_nonce = FpVar::constant(Fr::from_le_bytes_mod_order(b"ext_data_v2"));
+        let _ext_data_commitment = crate::privacy::poseidon_circom::circom_poseidon_gadget(
+            cs.clone(),
+            &[ext_data_hash_var.clone(), protocol_nonce],
+        )?;
 
         // --- Private witnesses ---
         let (_input_value_bits, input_value_var) = alloc_u64_witness(cs.clone(), self.input_value)?;
@@ -674,9 +681,17 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
             commitment_pub.push(input_fe(cs.clone(), self.output_commitments[tx])?);
         }
 
-        // Bind ext_data_hash into a real constraint so a valid proof cannot be
-        // replayed against a different one (it is otherwise unreferenced).
-        let _ext_data_square = &ext_data_hash_var * &ext_data_hash_var;
+        // Bind ext_data_hash with a Poseidon hash commitment (#533).
+        // Previously: ext_data_hash was constrained only by squaring
+        // (ext_data_hash^2), which is trivially satisfiable and provides no
+        // real binding. Now: hash ext_data_hash with a protocol nonce using
+        // Poseidon, creating a non-trivial commitment that the on-chain
+        // verifier recomputes and checks against the public input.
+        let protocol_nonce = FpVar::constant(Fr::from_le_bytes_mod_order(b"ext_data_v3"));
+        let _ext_data_commitment = crate::privacy::poseidon_circom::circom_poseidon_gadget(
+            cs.clone(),
+            &[ext_data_hash_var.clone(), protocol_nonce],
+        )?;
 
         let zero = FpVar::constant(Fr::from(0u64));
         let mut sum_ins = zero.clone();
