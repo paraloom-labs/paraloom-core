@@ -23,8 +23,9 @@ pub const DEFAULT_TREE_DEPTH: usize = 32;
 /// `ROOT_HISTORY_LEN` roots lets independently-advancing validators verify the
 /// same proof without holding byte-identical trees, the way Tornado-style pools
 /// keep a roots ring buffer. Double-spend is still prevented by the nullifier,
-/// independent of which historical root a proof names.
-pub const ROOT_HISTORY_LEN: usize = 256;
+/// independent of which historical root a proof names. Keep this aligned with
+/// the on-chain `ROOT_HISTORY_SIZE` in `programs/paraloom/src/merkle_tree.rs`.
+pub const ROOT_HISTORY_LEN: usize = 64;
 
 pub struct MerkleTree {
     /// Tree depth
@@ -634,5 +635,13 @@ mod tests {
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
         );
+    }
+
+    #[test]
+    fn root_history_matches_on_chain_window() {
+        // Mirrors programs/paraloom/src/merkle_tree.rs::ROOT_HISTORY_SIZE.
+        // Keeping the off-chain path server stricter prevents it from serving
+        // stale roots that the on-chain verifier has already evicted.
+        assert_eq!(ROOT_HISTORY_LEN, 64);
     }
 }
