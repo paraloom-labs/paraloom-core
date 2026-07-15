@@ -65,17 +65,21 @@ pub struct EncryptedNote {
     pub ct: Vec<u8>,
 }
 
-/// Encrypt `note` to `recipient_pub` (an X25519 public key) under a fresh
-/// ephemeral sender key — so two outputs to the same recipient are unlinkable.
-/// The `ct` is `tag(16) || ciphertext`, identical to `tweetnacl.box`.
-pub fn encrypt_note(recipient_pub: &[u8; 32], note: &NotePlaintext) -> EncryptedNote {
+/// Seal arbitrary `plaintext` to `recipient_pub` (an X25519 public key) under a
+/// fresh ephemeral sender key, so two seals to the same recipient are
+/// unlinkable. The `ct` is `tag(16) || ciphertext`, the same NaCl `box` format
+/// as `encrypt_note` and `tweetnacl.box` — only openable with the recipient's
+/// X25519 **secret** key. This is the correct primitive for any recipient-only
+/// payload (e.g. confidential compute input/output), replacing schemes that
+/// encrypt under a public address directly.
+pub fn seal(recipient_pub: &[u8; 32], plaintext: &[u8]) -> EncryptedNote {
     let eph = SecretKey::generate(&mut OsRng);
     let epk = *eph.public_key().as_bytes();
     let salsa = SalsaBox::new(&PublicKey::from(*recipient_pub), &eph);
 
     let nonce = SalsaBox::generate_nonce(&mut OsRng);
     let ct = salsa
-        .encrypt(&nonce, note.to_bytes().as_ref())
+        .encrypt(&nonce, plaintext)
         .expect("XSalsa20-Poly1305 encryption of an in-memory buffer cannot fail");
     // `.into()` avoids naming the (deprecated-in-0.14) GenericArray type.
     let nonce_bytes: [u8; 24] = nonce.into();
@@ -87,14 +91,26 @@ pub fn encrypt_note(recipient_pub: &[u8; 32], note: &NotePlaintext) -> Encrypted
     }
 }
 
+/// Open a `seal`ed box with the recipient's X25519 `secret`, returning the raw
+/// plaintext bytes. `None` on any failure (wrong key or tampered ciphertext).
+pub fn open(secret: &[u8; 32], sealed: &EncryptedNote) -> Option<Vec<u8>> {
+    let salsa = SalsaBox::new(&PublicKey::from(sealed.epk), &SecretKey::from(*secret));
+    // `.into()` builds the nonce without naming the deprecated GenericArray type.
+    salsa.decrypt(&sealed.nonce.into(), sealed.ct.as_ref()).ok()
+}
+
+/// Encrypt `note` to `recipient_pub` (an X25519 public key) under a fresh
+/// ephemeral sender key — so two outputs to the same recipient are unlinkable.
+/// The `ct` is `tag(16) || ciphertext`, identical to `tweetnacl.box`.
+pub fn encrypt_note(recipient_pub: &[u8; 32], note: &NotePlaintext) -> EncryptedNote {
+    seal(recipient_pub, note.to_bytes().as_ref())
+}
+
 /// Try to decrypt `note` with the X25519 `secret`. Returns `None` on any
 /// failure (wrong key, tampered ciphertext, malformed length) — callers
 /// trial-decrypt every delivered note and silently skip the ones not for them.
 pub fn decrypt_note(secret: &[u8; 32], note: &EncryptedNote) -> Option<NotePlaintext> {
-    let salsa = SalsaBox::new(&PublicKey::from(note.epk), &SecretKey::from(*secret));
-    // `.into()` builds the nonce without naming the deprecated GenericArray type.
-    let pt = salsa.decrypt(&note.nonce.into(), note.ct.as_ref()).ok()?;
-    NotePlaintext::from_bytes(&pt)
+    NotePlaintext::from_bytes(&open(secret, note)?)
 }
 
 #[cfg(test)]
@@ -133,6 +149,34 @@ mod tests {
         };
         let enc = encrypt_note(secret.public_key().as_bytes(), &note);
         assert!(decrypt_note(&other.to_bytes(), &enc).is_none());
+    }
+
+    #[test]
+    fn seal_open_round_trips_arbitrary_bytes() {
+        // Unlike the fixed 72-byte note, `seal` takes any payload (e.g. a
+        // confidential compute input/output blob) and can only be opened with
+        // the recipient's SECRET key — the fix for encrypting under a public
+        // address directly (#562).
+        let secret = SecretKey::generate(&mut OsRng);
+        let pubkey = *secret.public_key().as_bytes();
+        let payload = b"confidential compute payload \x00\x01\x02 of arbitrary length".to_vec();
+
+        let sealed = seal(&pubkey, &payload);
+        assert_eq!(open(&secret.to_bytes(), &sealed).expect("open"), payload);
+    }
+
+    #[test]
+    fn open_rejects_wrong_secret_and_tampering() {
+        let secret = SecretKey::generate(&mut OsRng);
+        let other = SecretKey::generate(&mut OsRng);
+        let mut sealed = seal(secret.public_key().as_bytes(), b"secret result");
+
+        // The public key alone (or any other key) cannot open it.
+        assert!(open(&other.to_bytes(), &sealed).is_none());
+
+        // A flipped ciphertext byte fails the Poly1305 tag.
+        sealed.ct[0] ^= 0xff;
+        assert!(open(&secret.to_bytes(), &sealed).is_none());
     }
 
     /// Interop vector produced by the wallet's `tweetnacl.box` (see #196). Core
