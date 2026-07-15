@@ -939,13 +939,20 @@ pub mod paraloom_program {
     /// (#392 — the `init` in `RegisterValidator` would otherwise fail with
     /// `AccountAlreadyInUse` against the leftover husk, and its rent stayed
     /// locked). Only reachable once the stake has unbonded, which only happens
-    /// after the validator has left the active set (`unbonding_amount > 0`
-    /// implies `!is_active`), so an active validator's PDA is never closed out
-    /// from under it.
+    /// after the validator has left the active set. A 100% slash can burn the
+    /// full unbonding balance before withdrawal; in that rent-only exit state,
+    /// the same delayed withdraw path is still allowed so the PDA can close.
     pub fn withdraw_unbonded_stake(ctx: Context<WithdrawUnbondedStake>) -> Result<()> {
         let validator_account = &mut ctx.accounts.validator_account;
         let amount = validator_account.unbonding_amount;
-        require!(amount > 0, BridgeError::NothingUnbonding);
+        let zero_amount_exit_close = amount == 0
+            && !validator_account.is_active
+            && validator_account.stake_amount == 0
+            && validator_account.unbonding_slot > 0;
+        require!(
+            amount > 0 || zero_amount_exit_close,
+            BridgeError::NothingUnbonding
+        );
         require!(
             Clock::get()?.slot >= validator_account.unbonding_slot,
             BridgeError::UnbondingNotElapsed

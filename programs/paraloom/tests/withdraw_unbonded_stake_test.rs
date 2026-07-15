@@ -281,6 +281,183 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     );
 }
 
+/// Regression (#549): a 100% slash on an active validator burns the entire
+/// stake, leaves `unbonding_amount == 0`, and still leaves the PDA holding its
+/// rent reserve. The zero-amount terminal withdraw must be allowed after the
+/// unbonding slot so Anchor's `close = validator` can refund that rent and free
+/// the validator PDA for a future registration.
+#[tokio::test]
+async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let mut ctx = pt.start_with_context().await;
+
+    let validator = ctx.payer.insecure_clone();
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("init registry");
+
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: validator.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("register");
+
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SlashValidator {
+                validator: validator.pubkey(),
+                slash_percentage: 100,
+            }
+            .data(),
+            accounts: accounts::SlashValidator {
+                validator_account: validator_pda,
+                bridge_vault: vault_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("100% slash");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active, "100% slash deactivates the validator");
+    assert_eq!(acc.stake_amount, 0, "all active stake was burnt");
+    assert_eq!(
+        acc.unbonding_amount, 0,
+        "nothing remains to transfer, only rent remains in the PDA"
+    );
+    assert!(
+        acc.unbonding_slot >= UNBONDING_SLOTS,
+        "100% slash still records the delayed exit slot"
+    );
+
+    let pda_after_slash = balance(&mut ctx, validator_pda).await;
+    assert!(
+        pda_after_slash > 0,
+        "the fully slashed PDA still holds rent before withdraw"
+    );
+
+    let err = send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::WithdrawUnbondedStake {}.data(),
+            accounts: accounts::WithdrawUnbondedStake {
+                validator_account: validator_pda,
+                validator: validator.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect_err("rent-only close must still wait for the unbonding slot");
+    assert_eq!(
+        custom_code(err),
+        u32::from(BridgeError::UnbondingNotElapsed),
+        "zero-amount close keeps the same unbonding delay"
+    );
+
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    let wallet_before_withdraw = balance(&mut ctx, validator.pubkey()).await;
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::WithdrawUnbondedStake {}.data(),
+            accounts: accounts::WithdrawUnbondedStake {
+                validator_account: validator_pda,
+                validator: validator.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("rent-only close after delay");
+
+    let wallet_after_withdraw = balance(&mut ctx, validator.pubkey()).await;
+    assert!(
+        wallet_after_withdraw > wallet_before_withdraw,
+        "wallet receives the rent refund even though unbonding_amount is zero"
+    );
+
+    let closed = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .expect("rpc");
+    assert!(
+        closed.is_none() || closed.unwrap().lamports == 0,
+        "rent-only validator PDA must be closed"
+    );
+
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: validator.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("re-register after rent-only close must succeed");
+}
+
 /// Regression (audit fix B1): `deactivate_validator` must no longer strand the
 /// stake. A deactivated validator cannot `unregister` (that path requires
 /// `is_active`), so before the fix its lamports had no exit and were frozen
