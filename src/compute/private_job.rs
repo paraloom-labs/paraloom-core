@@ -127,69 +127,47 @@ impl PrivateComputeJob {
         u64::from_le_bytes(hash[..8].try_into().unwrap())
     }
 
-    /// Encrypt data using AES-GCM-256 authenticated encryption
+    /// Encrypt `data` so only the holder of `address`'s X25519 secret key can
+    /// read it.
     ///
-    /// Format: [12-byte nonce][encrypted data][16-byte auth tag]
-    /// The tag is automatically appended by AES-GCM
+    /// Uses NaCl `crypto_box` (X25519 ECDH + XSalsa20-Poly1305) via
+    /// [`note_crypto::seal`] with a fresh ephemeral sender key per call, the
+    /// same audited, wallet-compatible primitive the shielded-note delivery
+    /// uses. `address` is the recipient's X25519 **public** key; unlike the
+    /// previous scheme it is not itself the key, so a public address alone
+    /// cannot decrypt. Wire format: `epk(32) || nonce(24) || ct`.
     fn encrypt_data(data: &[u8], address: &ShieldedAddress) -> Result<Vec<u8>> {
-        use aes_gcm::{
-            aead::{Aead, KeyInit},
-            Aes256Gcm, Nonce,
-        };
-        use rand::Rng;
-
-        // Use ShieldedAddress as 256-bit encryption key
-        let cipher = Aes256Gcm::new_from_slice(&address.0)
-            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
-
-        // Generate random 96-bit nonce
-        let mut rng = rand::thread_rng();
-        let nonce_bytes: [u8; 12] = rng.gen();
-        let nonce = Nonce::from(nonce_bytes);
-
-        // Encrypt data (automatically appends 128-bit auth tag)
-        let ciphertext = cipher
-            .encrypt(&nonce, data)
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-
-        // Prepend nonce to ciphertext (nonce doesn't need to be secret)
-        let mut result = Vec::with_capacity(12 + ciphertext.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&ciphertext);
-
-        Ok(result)
+        let sealed = crate::privacy::note_crypto::seal(&address.0, data);
+        let mut out = Vec::with_capacity(56 + sealed.ct.len());
+        out.extend_from_slice(&sealed.epk);
+        out.extend_from_slice(&sealed.nonce);
+        out.extend_from_slice(&sealed.ct);
+        Ok(out)
     }
 
-    /// Decrypt data using AES-GCM-256 authenticated encryption
+    /// Decrypt data sealed by [`Self::encrypt_data`], using the owner's X25519
+    /// **secret** key. Only the owner (holder of the secret) can decrypt — the
+    /// public address alone cannot.
     ///
-    /// Expects format: [12-byte nonce][encrypted data][16-byte auth tag]
-    pub fn decrypt_data(encrypted: &[u8], address: &ShieldedAddress) -> Result<Vec<u8>> {
-        use aes_gcm::{
-            aead::{Aead, KeyInit},
-            Aes256Gcm, Nonce,
+    /// Expects `epk(32) || nonce(24) || ct`.
+    pub fn decrypt_data(encrypted: &[u8], owner_secret: &[u8; 32]) -> Result<Vec<u8>> {
+        use crate::privacy::note_crypto::{open, EncryptedNote};
+
+        if encrypted.len() < 56 {
+            return Err(anyhow!("Encrypted data too short (missing epk/nonce)"));
+        }
+        let mut epk = [0u8; 32];
+        epk.copy_from_slice(&encrypted[..32]);
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&encrypted[32..56]);
+        let sealed = EncryptedNote {
+            epk,
+            nonce,
+            ct: encrypted[56..].to_vec(),
         };
 
-        if encrypted.len() < 12 {
-            return Err(anyhow!("Encrypted data too short (missing nonce)"));
-        }
-
-        // Extract nonce from first 12 bytes
-        let (nonce_bytes, ciphertext) = encrypted.split_at(12);
-        let nonce_array: [u8; 12] = nonce_bytes
-            .try_into()
-            .map_err(|_| anyhow!("Invalid nonce length"))?;
-        let nonce = Nonce::from(nonce_array);
-
-        // Use ShieldedAddress as 256-bit decryption key
-        let cipher = Aes256Gcm::new_from_slice(&address.0)
-            .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
-
-        // Decrypt and verify authentication tag
-        let plaintext = cipher
-            .decrypt(&nonce, ciphertext)
-            .map_err(|e| anyhow!("Decryption failed (wrong key or corrupted data): {}", e))?;
-
-        Ok(plaintext)
+        open(owner_secret, &sealed)
+            .ok_or_else(|| anyhow!("Decryption failed (wrong key or corrupted data)"))
     }
 }
 
@@ -260,9 +238,10 @@ impl PrivateJobResult {
         })
     }
 
-    /// Decrypt output data (only job owner can do this)
-    pub fn decrypt_output(&self, owner_address: &ShieldedAddress) -> Result<Vec<u8>> {
-        PrivateComputeJob::decrypt_data(&self.encrypted_output, owner_address)
+    /// Decrypt output data — only the job owner, holding the X25519 secret key
+    /// for the job's `owner_address`, can do this.
+    pub fn decrypt_output(&self, owner_secret: &[u8; 32]) -> Result<Vec<u8>> {
+        PrivateComputeJob::decrypt_data(&self.encrypted_output, owner_secret)
     }
 
     /// Check if compute proving keys exist
@@ -649,16 +628,24 @@ mod tests {
         assert_ne!(job.code_hash, [0u8; 32]);
     }
 
+    /// X25519 keypair for the confidential-compute tests: the public key is the
+    /// owner's ShieldedAddress; the secret key is required to decrypt.
+    fn owner_keypair() -> (ShieldedAddress, [u8; 32]) {
+        use crypto_box::{aead::OsRng, SecretKey};
+        let sk = SecretKey::generate(&mut OsRng);
+        (ShieldedAddress(*sk.public_key().as_bytes()), sk.to_bytes())
+    }
+
     #[test]
     fn test_encryption_decryption() {
         let data = vec![1, 2, 3, 4, 5];
-        let address = ShieldedAddress([42u8; 32]);
+        let (address, secret) = owner_keypair();
 
         let encrypted = PrivateComputeJob::encrypt_data(&data, &address).unwrap();
-        let decrypted = PrivateComputeJob::decrypt_data(&encrypted, &address).unwrap();
+        let decrypted = PrivateComputeJob::decrypt_data(&encrypted, &secret).unwrap();
 
         assert_eq!(data, decrypted);
-        assert_ne!(data, encrypted); // Should be different (includes nonce + tag)
+        assert_ne!(data, encrypted); // seal output includes epk + nonce + tag
     }
 
     #[tokio::test]
@@ -760,7 +747,7 @@ mod tests {
         // Step 1: Create private job
         let wasm_code = vec![0x00, 0x61, 0x73, 0x6d]; // WASM magic
         let input_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let owner_address = ShieldedAddress([99u8; 32]);
+        let (owner_address, owner_secret) = owner_keypair();
         let limits = ResourceLimits::default();
 
         let private_job =
@@ -810,8 +797,8 @@ mod tests {
         let finalized = coordinator.finalize_result(private_result.clone()).await;
         assert!(finalized.is_ok());
 
-        // Step 7: Decrypt output (only owner can do this)
-        let decrypted_output = private_result.decrypt_output(&owner_address).unwrap();
+        // Step 7: Decrypt output (only the owner, holding the secret, can do this)
+        let decrypted_output = private_result.decrypt_output(&owner_secret).unwrap();
         assert_eq!(decrypted_output, mock_output);
     }
 
@@ -1053,8 +1040,8 @@ mod tests {
     async fn test_output_decryption_with_wrong_key() {
         use crate::compute::{JobResult, JobStatus};
 
-        let owner_address = ShieldedAddress([100u8; 32]);
-        let wrong_address = ShieldedAddress([200u8; 32]);
+        let (owner_address, owner_secret) = owner_keypair();
+        let (_wrong_address, wrong_secret) = owner_keypair();
 
         let job_id = "test-wrong-key".to_string();
         let output_data = vec![1, 2, 3, 4, 5];
@@ -1072,12 +1059,12 @@ mod tests {
         let private_result =
             PrivateJobResult::from_job_result(job_id, job_result, &owner_address).unwrap();
 
-        // Decrypt with correct key
-        let decrypted_correct = private_result.decrypt_output(&owner_address).unwrap();
+        // Decrypt with the owner's secret key
+        let decrypted_correct = private_result.decrypt_output(&owner_secret).unwrap();
         assert_eq!(decrypted_correct, output_data);
 
-        // Decrypt with wrong key - should fail authentication (AES-GCM)
-        let decrypted_wrong = private_result.decrypt_output(&wrong_address);
+        // A different secret cannot open it (crypto_box authentication)
+        let decrypted_wrong = private_result.decrypt_output(&wrong_secret);
         assert!(
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"

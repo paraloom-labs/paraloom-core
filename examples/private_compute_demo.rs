@@ -34,7 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Step 2: Creating private compute job");
     let wasm_code = create_sample_wasm();
     let sensitive_input = vec![42, 100, 200, 15, 75]; // Secret data
-    let owner_address = ShieldedAddress([99u8; 32]);
+
+    // owner_address is an X25519 public key; only its secret can decrypt.
+    let (owner_address, owner_secret) = {
+        use crypto_box::{aead::OsRng, SecretKey};
+        let sk = SecretKey::generate(&mut OsRng);
+        (ShieldedAddress(*sk.public_key().as_bytes()), sk.to_bytes())
+    };
     let limits = ResourceLimits::default();
 
     let private_job = PrivateComputeJob::new(
@@ -151,32 +157,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 10: Decrypt output (only job owner can do this)
     println!("Step 10: Decrypting output (owner only)");
-    let decrypted_output = private_result.decrypt_output(&owner_address)?;
+    let decrypted_output = private_result.decrypt_output(&owner_secret)?;
     println!("✓ Original input: {:?}", sensitive_input);
     println!("✓ Decrypted output: {:?}", decrypted_output);
     println!("✓ Computation verified without revealing data\n");
 
     // Step 11: Demonstrate privacy guarantee
-    println!("Step 11: Privacy guarantee demonstration (AES-GCM)");
-    let wrong_address = ShieldedAddress([200u8; 32]);
-    let wrong_decrypt = private_result.decrypt_output(&wrong_address);
+    println!("Step 11: Privacy guarantee demonstration (crypto_box)");
+    let wrong_secret = {
+        use crypto_box::{aead::OsRng, SecretKey};
+        SecretKey::generate(&mut OsRng).to_bytes()
+    };
+    let wrong_decrypt = private_result.decrypt_output(&wrong_secret);
     println!("  Wrong key decryption attempt:");
     match wrong_decrypt {
         Ok(_) => println!("    ✗ Unexpectedly succeeded (security issue!)"),
         Err(e) => println!("    ✓ Failed as expected: {}", e),
     }
-    println!("    ✓ AES-GCM authenticated encryption protects data\n");
+    println!("    ✓ crypto_box (X25519 + XSalsa20-Poly1305) protects data\n");
 
     // Final summary
     println!("=== Summary ===");
     println!("✓ Private job created with input commitment");
-    println!("✓ Input/output encrypted with AES-GCM-256 throughout execution");
+    println!("✓ Input/output sealed to the owner's key (crypto_box) throughout execution");
     println!("✓ Multi-validator consensus (3/3 agreement)");
     println!("✓ zkSNARK proof verified");
     println!("✓ Result decrypted by owner only");
     println!("\nPrivacy guarantees:");
     println!("  • Validators never see input/output data");
-    println!("  • AES-GCM authenticated encryption protects confidentiality");
+    println!("  • crypto_box authenticated encryption protects confidentiality");
     println!("  • zkSNARK proves correct execution");
     println!("  • Multi-validator consensus ensures correctness");
     println!("  • Only owner can decrypt results");
