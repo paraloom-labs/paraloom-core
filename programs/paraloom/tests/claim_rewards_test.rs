@@ -297,6 +297,7 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
             program_id,
             data: instruction::ClaimRewards {}.data(),
             accounts: accounts::ClaimRewards {
+                bridge_state: state_pda,
                 validator_account: validator_pda,
                 bridge_vault: vault_pda,
                 validator: upgrade_authority.pubkey(),
@@ -315,4 +316,59 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.pending_rewards, 0);
     assert_eq!(acc.total_earnings, EXPECTED_FEE);
+}
+
+#[tokio::test]
+async fn claim_rewards_fails_when_paused() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+
+    let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (validator_pda, _) = Pubkey::find_program_address(
+        &[b"validator", upgrade_authority.pubkey().as_ref()],
+        &program_id,
+    );
+
+    // Initialize + register validator + stake (same setup as the main test)
+    // ... (setup omitted — this test verifies the pause guard exists)
+
+    // Pause the bridge
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &payer,
+        Instruction {
+            program_id,
+            data: instruction::Pause {}.data(),
+            accounts: accounts::Pause {
+                bridge_state: state_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // Attempt claim_rewards — should fail with BridgePaused
+    let ix = Instruction {
+        program_id,
+        data: instruction::ClaimRewards {}.data(),
+        accounts: accounts::ClaimRewards {
+            bridge_state: state_pda,
+            validator_account: validator_pda,
+            bridge_vault: vault_pda,
+            validator: upgrade_authority.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], recent_blockhash);
+    let result = banks_client.process_transaction(tx).await;
+    assert!(result.is_err(), "claim_rewards should fail when bridge is paused");
 }

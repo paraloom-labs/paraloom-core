@@ -613,6 +613,9 @@ pub mod paraloom_program {
 
     /// Claim pending rewards
     pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        // Check that the bridge is not paused (#539)
+        require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
+
         let validator_account = &mut ctx.accounts.validator_account;
 
         require!(
@@ -1362,6 +1365,9 @@ pub struct UpdateReputation<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimRewards<'info> {
+    #[account(seeds = [b"bridge_state"], bump)]
+    pub bridge_state: Account<'info, BridgeState>,
+
     #[account(
         mut,
         seeds = [b"validator", validator.key().as_ref()],
