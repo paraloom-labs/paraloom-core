@@ -453,9 +453,10 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if quote.route_plan.is_empty() {
             return Err(RelayerError::NoRoute("empty routePlan".into()));
         }
-        quote.out_amount.parse::<u64>().map_err(|e| {
+        let out_amount_u128 = quote.out_amount.parse::<u128>().map_err(|e| {
             RelayerError::SwapFailed(format!("bad outAmount '{}': {e}", quote.out_amount))
-        })
+        })?;
+        u64::try_from(out_amount_u128).map_err(|_| RelayerError::AmountOverflow(out_amount_u128))
     }
 
     /// Decode Jupiter's base64 `swapTransaction` into a [`VersionedTransaction`].
@@ -640,6 +641,19 @@ mod tests {
             JupiterSwapProvider::<CannedClient, RecordingSubmitter>::parse_quote(&quote).unwrap(),
             12_345_678
         );
+    }
+
+    #[test]
+    fn quote_out_amount_overflow_is_reported_explicitly() {
+        let too_large = u64::MAX as u128 + 1;
+        let quote = serde_json::json!({
+            "outAmount": too_large.to_string(),
+            "routePlan": [ { "swapInfo": { "label": "Orca" }, "percent": 100 } ]
+        });
+
+        let err = JupiterSwapProvider::<CannedClient, RecordingSubmitter>::parse_quote(&quote)
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::AmountOverflow(v) if v == too_large));
     }
 
     #[test]
