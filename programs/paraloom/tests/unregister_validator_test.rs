@@ -1,10 +1,7 @@
 //! Eighth on-chain unit test for #71. Symmetric counterpart to
 //! register_validator: pins that unregister flips `is_active` to
-//! false and decrements `active_validators` while leaving
-//! `total_validators` recorded — the consensus pipeline reads the
-//! active count for quorum and a regression that decremented the
-//! wrong field would silently misbehave for both quorum math and
-//! the long-tail validator-history log.
+//! false and decrements both validator counters so the registry does
+//! not drift after validators leave the active set.
 //!
 //! Registry init runs as the upgrade authority (#204); register +
 //! unregister are validator-signed (auto-payer).
@@ -107,7 +104,7 @@ async fn unregister_clears_active_and_decrements_registry() {
         .unwrap();
     let registry = ValidatorRegistry::try_deserialize(&mut registry_raw.data.as_slice()).unwrap();
     assert_eq!(registry.active_validators, 0);
-    assert_eq!(registry.total_validators, 1);
+    assert_eq!(registry.total_validators, 0);
 
     let acc_raw = banks_client
         .get_account(validator_pda)

@@ -151,6 +151,10 @@ async fn slash_reduces_stake_and_credits_vault() {
         reg.active_validators, 0,
         "deactivating a slashed validator must decrement active_validators"
     );
+    assert_eq!(
+        reg.total_validators, 0,
+        "deactivating a slashed validator must decrement total_validators"
+    );
 
     let vault = banks_client
         .get_account(vault_pda)
@@ -257,6 +261,10 @@ async fn slash_above_minimum_keeps_validator_active() {
     assert_eq!(
         reg.active_validators, 1,
         "a validator still above the minimum must keep counting toward the quorum"
+    );
+    assert_eq!(
+        reg.total_validators, 1,
+        "a validator still above the minimum must stay in the registry total"
     );
 }
 

@@ -389,6 +389,10 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         "deactivate must decrement active_validators"
     );
     assert_eq!(
+        registry.total_validators, 0,
+        "deactivate must decrement total_validators"
+    );
+    assert_eq!(
         registry.total_active_stake, 0,
         "deactivate must remove the stake from the weighted total"
     );

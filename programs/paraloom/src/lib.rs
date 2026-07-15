@@ -567,6 +567,8 @@ pub mod paraloom_program {
 
         validator_registry.active_validators =
             validator_registry.active_validators.saturating_sub(1);
+        validator_registry.total_validators =
+            validator_registry.total_validators.saturating_sub(1);
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_sub(stake_amount);
@@ -698,7 +700,9 @@ pub mod paraloom_program {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
-                registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                registry.total_validators = registry.total_validators.saturating_sub(1);
+                registry.total_active_stake =
+                    registry.total_active_stake.saturating_sub(old_stake);
                 // The unslashed remainder would otherwise be stranded — a
                 // deactivated validator cannot `unregister` — so route it into
                 // unbonding, reclaimable after the delay. The slashed portion
@@ -795,15 +799,18 @@ pub mod paraloom_program {
     /// address is pinned by the seeds constraint and its identity re-checked
     /// against the `ValidatorRegistry` discriminator in the body.
     ///
-    /// PRECONDITION — pass every currently-active validator PDA. An `is_active`
-    /// PDA left out of `remaining_accounts` is NOT deactivated here; it stays
-    /// active on-chain but uncounted, which drives the stake-weighted quorum
-    /// denominator stale-low and, if that orphan later co-signs, trips the
-    /// `counted_stake <= eligible_stake` check (settlement bricks — fail-closed,
-    /// never a theft). Completeness cannot be enforced on-chain (the program
-    /// cannot enumerate all PDAs), so it is the upgrade authority's
-    /// responsibility; reconcile any active-but-excluded PDA with
-    /// [`deactivate_validator`] before relying on the rebuilt denominator.
+    /// PRECONDITION — pass every currently-active validator PDA that should
+    /// remain in the active set. Any active PDA that should be excluded must be
+    /// deactivated BEFORE this reset rebuilds the aggregate counters; the
+    /// `reconcile_validators` tool intentionally runs that sequence and resets
+    /// last. An `is_active` PDA left out of `remaining_accounts` is NOT
+    /// deactivated here; it stays active on-chain but uncounted, which drives
+    /// the stake-weighted quorum denominator stale-low and, if that orphan
+    /// later co-signs, trips the `counted_stake <= eligible_stake` check
+    /// (settlement bricks — fail-closed, never a theft). Completeness cannot be
+    /// enforced on-chain (the program cannot enumerate all PDAs), so it is the
+    /// upgrade authority's responsibility to deactivate excluded PDAs before
+    /// relying on the rebuilt denominator.
     pub fn reset_validator_registry(ctx: Context<ResetValidatorRegistry>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
@@ -894,12 +901,12 @@ pub mod paraloom_program {
     /// Deactivate a single validator so it can no longer be counted toward the
     /// settlement quorum, keeping the registry invariant
     /// `total_active_stake == Σ active-PDA stake` intact. Admin-only (the
-    /// registry authority). This reconciles validators dropped from the active
-    /// set — e.g. `is_active` PDAs left behind by an earlier
-    /// `reset_validator_registry` that rebuilt the counters but did not
-    /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// registry authority). This reconciles validators that must be dropped
+    /// from the active set before the registry is rebuilt (the
+    /// `reconcile_validators` tool deactivates excluded PDAs first, then calls
+    /// `reset_validator_registry` last). It does not move the staked lamports;
+    /// those are returned through `withdraw_unbonded_stake` after the unbonding
+    /// window.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -919,6 +926,7 @@ pub mod paraloom_program {
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
+            registry.total_validators = registry.total_validators.saturating_sub(1);
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
