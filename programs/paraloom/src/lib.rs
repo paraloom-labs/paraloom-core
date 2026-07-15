@@ -220,6 +220,19 @@ pub mod paraloom_program {
             timestamp: Clock::get()?.unix_timestamp,
         });
 
+        // Zero the blinding factor from the instruction's stack frame to
+        // reduce exposure. Note: Solana instruction data is publicly readable
+        // on-chain, so a future version should accept the commitment directly
+        // (or a ZK proof of well-formedness) instead of the raw blinding (#534).
+        // For now, the blinding is not stored in any account or event — it
+        // exists only transiently in the instruction's stack frame.
+        let mut zeroed_blinding = blinding;
+        for byte in zeroed_blinding.iter_mut() {
+            *byte = 0;
+        }
+        // Prevent the compiler from optimizing away the zeroing.
+        std::hint::black_box(zeroed_blinding);
+
         msg!("Deposit note appended at leaf {}", leaf_index);
         Ok(())
     }
