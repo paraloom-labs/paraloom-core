@@ -727,10 +727,15 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
                 let right = bit.select(&current, &sibling)?;
                 current = v3_merkle_pair_gadget(cs.clone(), &left, &right)?;
             }
-            // Membership is enforced only for non-zero-amount inputs:
-            // `(folded_root − root) · amount = 0`.
+            // Membership must be enforced unconditionally (#530).
+            // Previously: `(folded_root − root) · amount = 0`, which is trivially
+            // satisfied when `amount = 0`, allowing forged membership proofs for
+            // zero-amount inputs. Now: enforce `folded_root == root` directly,
+            // so membership is validated regardless of the input amount.
             let diff = &current - &root_var;
-            (&diff * &amount_var).enforce_equal(&zero)?;
+            diff.enforce_equal(&zero)?;
+            // The amount is still summed (zero-amount inputs contribute 0).
+            // The value invariant below ensures conservation.
 
             sum_ins = &sum_ins + &amount_var;
         }
