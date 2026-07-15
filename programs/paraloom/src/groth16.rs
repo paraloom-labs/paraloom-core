@@ -93,13 +93,35 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         .concat();
         let res = alt_bn128_pairing(pairing_input.as_slice())
             .map_err(|_| Groth16Error::ProofVerificationFailed)?;
-        if res[31] != 1 {
+        if !pairing_result_is_identity(&res) {
             return Err(Groth16Error::ProofVerificationFailed);
         }
         Ok(true)
     }
 }
 
+fn pairing_result_is_identity(res: &[u8]) -> bool {
+    res.len() == 32 && res[..31].iter().all(|&b| b == 0) && res[31] == 1
+}
+
 fn is_less_than_bn254_field_size_be(bytes: &[u8; 32]) -> bool {
     BigUint::from_bytes_be(bytes) < Fr::MODULUS.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_result_identity_requires_exact_big_endian_one() {
+        let mut valid = [0u8; 32];
+        valid[31] = 1;
+        assert!(pairing_result_is_identity(&valid));
+
+        let mut nonzero_high_byte = valid;
+        nonzero_high_byte[0] = 1;
+        assert!(!pairing_result_is_identity(&nonzero_high_byte));
+        assert!(!pairing_result_is_identity(&[0u8; 32]));
+        assert!(!pairing_result_is_identity(&valid[..31]));
+    }
 }
