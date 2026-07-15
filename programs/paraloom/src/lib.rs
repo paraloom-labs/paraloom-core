@@ -565,13 +565,18 @@ pub mod paraloom_program {
             .saturating_add(stake_amount);
         validator_account.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
 
-        validator_registry.active_validators =
-            validator_registry.active_validators.saturating_sub(1);
-        validator_registry.total_validators =
-            validator_registry.total_validators.saturating_sub(1);
+        validator_registry.active_validators = validator_registry
+            .active_validators
+            .checked_sub(1)
+            .ok_or(BridgeError::ValidatorRegistryDrift)?;
+        validator_registry.total_validators = validator_registry
+            .total_validators
+            .checked_sub(1)
+            .ok_or(BridgeError::ValidatorRegistryDrift)?;
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
-            .saturating_sub(stake_amount);
+            .checked_sub(stake_amount)
+            .ok_or(BridgeError::ValidatorRegistryDrift)?;
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -699,10 +704,18 @@ pub mod paraloom_program {
             if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
-                registry.active_validators = registry.active_validators.saturating_sub(1);
-                registry.total_validators = registry.total_validators.saturating_sub(1);
-                registry.total_active_stake =
-                    registry.total_active_stake.saturating_sub(old_stake);
+                registry.active_validators = registry
+                    .active_validators
+                    .checked_sub(1)
+                    .ok_or(BridgeError::ValidatorRegistryDrift)?;
+                registry.total_validators = registry
+                    .total_validators
+                    .checked_sub(1)
+                    .ok_or(BridgeError::ValidatorRegistryDrift)?;
+                registry.total_active_stake = registry
+                    .total_active_stake
+                    .checked_sub(old_stake)
+                    .ok_or(BridgeError::ValidatorRegistryDrift)?;
                 // The unslashed remainder would otherwise be stranded — a
                 // deactivated validator cannot `unregister` — so route it into
                 // unbonding, reclaimable after the delay. The slashed portion
@@ -716,8 +729,10 @@ pub mod paraloom_program {
             } else {
                 // Still active: only the slashed portion leaves the total.
                 let registry = &mut ctx.accounts.validator_registry;
-                registry.total_active_stake =
-                    registry.total_active_stake.saturating_sub(slash_amount);
+                registry.total_active_stake = registry
+                    .total_active_stake
+                    .checked_sub(slash_amount)
+                    .ok_or(BridgeError::ValidatorRegistryDrift)?;
             }
         } else {
             // Already unbonding: burn the slashed portion of the withheld stake.
@@ -901,12 +916,17 @@ pub mod paraloom_program {
     /// Deactivate a single validator so it can no longer be counted toward the
     /// settlement quorum, keeping the registry invariant
     /// `total_active_stake == Σ active-PDA stake` intact. Admin-only (the
-    /// registry authority). This reconciles validators that must be dropped
-    /// from the active set before the registry is rebuilt (the
-    /// `reconcile_validators` tool deactivates excluded PDAs first, then calls
-    /// `reset_validator_registry` last). It does not move the staked lamports;
-    /// those are returned through `withdraw_unbonded_stake` after the unbonding
-    /// window.
+    /// registry authority).
+    ///
+    /// PRECONDITION: this instruction is only for validators that are still
+    /// included in the registry counters. During reconciliation, excluded PDAs
+    /// must be deactivated before `reset_validator_registry` rebuilds the
+    /// aggregate counters; the `reconcile_validators` tool runs that sequence
+    /// and resets last. If the counters cannot cover this validator's stake, the
+    /// checked decrements below fail instead of silently drifting lower.
+    ///
+    /// It does not move the staked lamports; those are returned through
+    /// `withdraw_unbonded_stake` after the unbonding window.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -924,9 +944,18 @@ pub mod paraloom_program {
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
-            registry.total_validators = registry.total_validators.saturating_sub(1);
+            registry.total_active_stake = registry
+                .total_active_stake
+                .checked_sub(stake)
+                .ok_or(BridgeError::ValidatorRegistryDrift)?;
+            registry.active_validators = registry
+                .active_validators
+                .checked_sub(1)
+                .ok_or(BridgeError::ValidatorRegistryDrift)?;
+            registry.total_validators = registry
+                .total_validators
+                .checked_sub(1)
+                .ok_or(BridgeError::ValidatorRegistryDrift)?;
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -1670,4 +1699,7 @@ pub enum BridgeError {
 
     #[msg("Merkle root is not in the on-chain root history")]
     UnknownMerkleRoot,
+
+    #[msg("Validator registry counters are inconsistent with the validator account")]
+    ValidatorRegistryDrift,
 }
