@@ -37,6 +37,11 @@ pub const MAX_PROOF_LEN: usize = 256;
 /// pulled out by the earner through `claim_rewards`.
 pub const WITHDRAWAL_FEE_BPS: u64 = 25;
 
+/// Reputation scores are linear leader-selection multipliers. Keep the on-chain
+/// range aligned with the off-chain reputation tracker's documented 0-10000
+/// scale so one admin update cannot create an unbounded permanent leader.
+pub const MAX_REPUTATION_SCORE: u64 = 10_000;
+
 /// Verify a BPFLoaderUpgradeable `ProgramData` account's upgrade authority
 /// matches `expected` (#204). Closes the init front-run race: only the wallet
 /// holding the program's upgrade authority can call the `initialize_*`
@@ -599,6 +604,10 @@ pub mod paraloom_program {
             BridgeError::InvalidValidator
         );
         require!(validator_account.is_active, BridgeError::ValidatorNotActive);
+        require!(
+            new_reputation <= MAX_REPUTATION_SCORE,
+            BridgeError::ReputationOutOfBounds
+        );
 
         validator_account.reputation_score = new_reputation;
         validator_account.last_active = Clock::get()?.unix_timestamp;
@@ -1662,4 +1671,7 @@ pub enum BridgeError {
 
     #[msg("Merkle root is not in the on-chain root history")]
     UnknownMerkleRoot,
+
+    #[msg("Validator reputation exceeds the maximum score")]
+    ReputationOutOfBounds,
 }
