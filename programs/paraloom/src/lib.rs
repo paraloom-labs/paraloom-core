@@ -37,6 +37,15 @@ pub const MAX_PROOF_LEN: usize = 256;
 /// pulled out by the earner through `claim_rewards`.
 pub const WITHDRAWAL_FEE_BPS: u64 = 25;
 
+fn withdrawal_fee_and_payout(gross: u64, fee_bps: u64) -> Result<(u64, u64)> {
+    let fee = gross
+        .checked_mul(fee_bps)
+        .and_then(|v| v.checked_div(10_000))
+        .ok_or(BridgeError::InvalidAmount)?;
+    let payout = gross.checked_sub(fee).ok_or(BridgeError::InvalidAmount)?;
+    Ok((fee, payout))
+}
+
 /// Verify a BPFLoaderUpgradeable `ProgramData` account's upgrade authority
 /// matches `expected` (#204). Closes the init front-run race: only the wallet
 /// holding the program's upgrade authority can call the `initialize_*`
@@ -368,11 +377,8 @@ pub mod paraloom_program {
             let vault_balance = ctx.accounts.bridge_vault.lamports();
             require!(vault_balance >= gross, BridgeError::InsufficientFunds);
 
-            fee = gross
-                .checked_mul(WITHDRAWAL_FEE_BPS)
-                .and_then(|v| v.checked_div(10_000))
-                .ok_or(BridgeError::InvalidAmount)?;
-            let payout = gross - fee;
+            let (withdrawal_fee, payout) = withdrawal_fee_and_payout(gross, WITHDRAWAL_FEE_BPS)?;
+            fee = withdrawal_fee;
 
             let vault_bump = ctx.bumps.bridge_vault;
             let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
@@ -1662,4 +1668,20 @@ pub enum BridgeError {
 
     #[msg("Merkle root is not in the on-chain root history")]
     UnknownMerkleRoot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawal_fee_and_payout_uses_checked_subtraction() {
+        let (fee, payout) = withdrawal_fee_and_payout(10_000, WITHDRAWAL_FEE_BPS).unwrap();
+        assert_eq!(fee, 25);
+        assert_eq!(payout, 9_975);
+
+        let err = withdrawal_fee_and_payout(10_000, 10_001)
+            .expect_err("fee larger than gross must not underflow payout");
+        assert_eq!(err, BridgeError::InvalidAmount.into());
+    }
 }
