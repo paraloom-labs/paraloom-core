@@ -146,7 +146,12 @@ impl MerkleTree {
 
     /// Get the current root of the tree
     pub async fn root(&self) -> [u8; 32] {
-        // Check cache first
+        // Hold the leaves read lock across the cache check and recompute. This
+        // keeps inserts from invalidating the cache in the gap between seeing a
+        // miss and reading the leaf snapshot, while preserving insert()'s
+        // leaves -> cache lock order.
+        let leaves = self.leaves.read().await;
+
         {
             let cached = self.cached_root.read().await;
             if let Some(root) = *cached {
@@ -154,14 +159,12 @@ impl MerkleTree {
             }
         }
 
-        // Compute root
-        let leaves = self.leaves.read().await;
         let root = self.compute_root(&leaves);
 
-        // Cache it
         let mut cached_root = self.cached_root.write().await;
         *cached_root = Some(root);
         drop(cached_root);
+        drop(leaves);
 
         // Record this root in the bounded history so a proof naming it still
         // verifies after later deposits advance the tree (see [`knows_root`] and
@@ -544,6 +547,49 @@ mod tests {
             .expect("in-memory insert");
         let root3 = tree.root().await;
         assert_ne!(root3, root1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_root_reads_do_not_cache_stale_leaf_snapshots() {
+        let tree = MerkleTree::new();
+        tree.insert(&Commitment([1u8; 32]))
+            .await
+            .expect("seed insert");
+
+        let mut handles = Vec::new();
+        for i in 0..64u8 {
+            let reader = tree.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..16 {
+                    let _ = reader.root().await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+
+            let writer = tree.clone();
+            handles.push(tokio::spawn(async move {
+                let mut leaf = [0u8; 32];
+                leaf[0] = i.wrapping_add(2);
+                writer
+                    .insert(&Commitment(leaf))
+                    .await
+                    .expect("concurrent insert");
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task should complete");
+        }
+
+        let leaves = tree.leaves.read().await;
+        let expected = tree.compute_root(&leaves);
+        drop(leaves);
+
+        assert_eq!(
+            tree.root().await,
+            expected,
+            "cached root must match the final committed leaf set"
+        );
     }
 
     #[tokio::test]
