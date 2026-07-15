@@ -63,6 +63,74 @@ static JOB_EXECUTOR: Lazy<Arc<JobExecutor>> = Lazy::new(|| {
     Arc::new(executor)
 });
 
+const LAMPORTS_PER_SOL_EXACT: u64 = 1_000_000_000;
+
+fn parse_sol_to_lamports(input: &str) -> Result<u64> {
+    let input = input.trim();
+    if input.is_empty() {
+        anyhow::bail!("amount must not be empty");
+    }
+    if input.starts_with('-') {
+        anyhow::bail!("amount must not be negative");
+    }
+
+    let (whole, fraction) = match input.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (input, ""),
+    };
+
+    if whole.is_empty() && fraction.is_empty() {
+        anyhow::bail!("amount must contain digits");
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("invalid SOL amount: {input}");
+    }
+    if !fraction.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("invalid SOL amount: {input}");
+    }
+    if fraction.len() > 9 {
+        anyhow::bail!("SOL amount has more than 9 decimal places: {input}");
+    }
+
+    let whole_lamports = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .context("SOL amount is too large")?
+            .checked_mul(LAMPORTS_PER_SOL_EXACT)
+            .context("SOL amount is too large")?
+    };
+
+    let mut padded_fraction = fraction.to_string();
+    padded_fraction.extend(std::iter::repeat('0').take(9 - padded_fraction.len()));
+    let fraction_lamports = if padded_fraction.is_empty() {
+        0
+    } else {
+        padded_fraction
+            .parse::<u64>()
+            .context("fractional SOL amount is too large")?
+    };
+
+    whole_lamports
+        .checked_add(fraction_lamports)
+        .context("SOL amount is too large")
+}
+
+fn format_lamports_as_sol(lamports: u64) -> String {
+    let whole = lamports / LAMPORTS_PER_SOL_EXACT;
+    let fraction = lamports % LAMPORTS_PER_SOL_EXACT;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+
+    let mut fraction_text = format!("{fraction:09}");
+    while fraction_text.ends_with('0') {
+        fraction_text.pop();
+    }
+    format!("{whole}.{fraction_text}")
+}
+
 #[derive(Parser)]
 #[command(name = "paraloom")]
 #[command(author = "Paraloom Team")]
@@ -120,7 +188,7 @@ enum WalletCommands {
     Deposit {
         /// Amount in SOL
         #[arg(short, long)]
-        amount: f64,
+        amount: String,
 
         /// Solana RPC URL (default: devnet)
         #[arg(long)]
@@ -143,7 +211,7 @@ enum WalletCommands {
 
         /// Amount in SOL
         #[arg(short, long)]
-        amount: f64,
+        amount: String,
 
         /// Optional memo (encrypted)
         #[arg(short, long)]
@@ -158,7 +226,7 @@ enum WalletCommands {
 
         /// Amount in SOL
         #[arg(short, long)]
-        amount: f64,
+        amount: String,
 
         /// Solana RPC URL (default: devnet)
         #[arg(long)]
@@ -438,6 +506,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             keypair,
             program_id,
         } => {
+            let deposit_lamports = parse_sol_to_lamports(&amount)?;
             println!("Depositing {} SOL to Paraloom...\n", amount);
 
             #[cfg(feature = "solana-bridge")]
@@ -485,10 +554,9 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     .context("Failed to get balance")?;
                 println!(
                     "Depositor Balance: {} SOL\n",
-                    balance as f64 / LAMPORTS_PER_SOL as f64
+                    format_lamports_as_sol(balance)
                 );
 
-                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
                 if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
                     anyhow::bail!(
                         "Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)",
@@ -582,6 +650,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         }
 
         WalletCommands::Transfer { to, amount, memo } => {
+            let transfer_lamports = parse_sol_to_lamports(&amount)?;
             println!("Initiating private transfer...\n");
             println!("Recipient: {}", to);
             println!("Amount: {} SOL (hidden)", amount);
@@ -622,7 +691,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             // Encode transfer data as input
             let transfer_data = serde_json::json!({
                 "type": "transfer",
-                "amount": amount,
+                "amount_lamports": transfer_lamports,
                 "recipient": hex::encode(recipient_address.as_bytes()),
                 "memo": memo.clone().unwrap_or_default(),
             });
@@ -711,10 +780,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
 
                     println!("\nBridge Vault Balance:");
                     println!("  Address: {}", bridge_vault);
-                    println!(
-                        "  Balance: {} SOL\n",
-                        vault_balance as f64 / LAMPORTS_PER_SOL as f64
-                    );
+                    println!("  Balance: {} SOL\n", format_lamports_as_sol(vault_balance));
                 }
 
                 // Show wallet balance if keypair is provided
@@ -734,7 +800,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     println!("  Address: {}", wallet.pubkey());
                     println!(
                         "  Balance: {} SOL\n",
-                        wallet_balance as f64 / LAMPORTS_PER_SOL as f64
+                        format_lamports_as_sol(wallet_balance)
                     );
                 }
 
@@ -1389,7 +1455,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .context("Failed to get balance")?;
                 println!(
                     "Validator Balance: {} SOL\n",
-                    balance as f64 / LAMPORTS_PER_SOL as f64
+                    format_lamports_as_sol(balance)
                 );
                 if balance < 2 * LAMPORTS_PER_SOL {
                     anyhow::bail!(
@@ -1964,4 +2030,38 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sol_amounts_to_exact_lamports() {
+        assert_eq!(parse_sol_to_lamports("0.1").unwrap(), 100_000_000);
+        assert_eq!(parse_sol_to_lamports("0.000000001").unwrap(), 1);
+        assert_eq!(parse_sol_to_lamports("0.123456789").unwrap(), 123_456_789);
+        assert_eq!(
+            parse_sol_to_lamports("10000.000000001").unwrap(),
+            10_000_000_000_001
+        );
+        assert_eq!(parse_sol_to_lamports("42").unwrap(), 42_000_000_000);
+    }
+
+    #[test]
+    fn rejects_unrepresentable_or_invalid_sol_amounts() {
+        assert!(parse_sol_to_lamports("0.0000000001").is_err());
+        assert!(parse_sol_to_lamports("-1").is_err());
+        assert!(parse_sol_to_lamports("1.two").is_err());
+        assert!(parse_sol_to_lamports("18446744074").is_err());
+    }
+
+    #[test]
+    fn formats_lamports_without_float_rounding() {
+        assert_eq!(format_lamports_as_sol(0), "0");
+        assert_eq!(format_lamports_as_sol(1), "0.000000001");
+        assert_eq!(format_lamports_as_sol(100_000_000), "0.1");
+        assert_eq!(format_lamports_as_sol(1_234_567_890), "1.23456789");
+        assert_eq!(format_lamports_as_sol(42_000_000_000), "42");
+    }
 }
