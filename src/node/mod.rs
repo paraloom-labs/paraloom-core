@@ -14,7 +14,7 @@ use crate::bridge::solana::{
     build_settlement_message, derive_bridge_vault, CoSignPayload, SettlementParams,
 };
 use crate::bridge::Bridge;
-use crate::compute::{JobCoordinator, JobExecutor, JobManager};
+use crate::compute::{ComputeAuthPolicy, JobCoordinator, JobExecutor, JobManager};
 use crate::config::Settings;
 use crate::consensus::transact::TransactVerificationRequest;
 use crate::consensus::{ApprovedTransact, TransactVerificationCoordinator};
@@ -61,6 +61,9 @@ pub struct Node {
     compute_manager: Option<Arc<JobManager>>,
     compute_coordinator: Option<Arc<JobCoordinator>>,
     compute_storage: Option<Arc<ComputeStorage>>,
+    // Authorization policy for inbound compute-job submissions (F3): who may
+    // submit and the per-job resource ceiling. Built from `[compute]` settings.
+    compute_auth: ComputeAuthPolicy,
     // Track coordinator nodes for result reporting
     job_coordinators: Arc<Mutex<std::collections::HashMap<crate::compute::JobId, NodeId>>>,
 
@@ -132,6 +135,41 @@ pub struct Node {
     /// recipient (the recipient is the one every validator saw in the gossiped
     /// request). Bounded by `MAX_VERIFIED_CACHE`; entries are short-lived.
     verified_transacts: Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+}
+
+/// Build the compute-job authorization policy (F3) from `[compute]` settings.
+/// An empty `authorized_submitters` list leaves submission open to any peer
+/// (dev/demo); a non-empty list restricts submission to exactly those NodeIds.
+/// A configured entry that is not valid hex is dropped with a warning — so a
+/// list that parses to nothing is fail-closed, never silently open.
+fn build_compute_auth_policy(cfg: &crate::config::ComputeSettings) -> ComputeAuthPolicy {
+    use crate::compute::auth::{
+        DEFAULT_MAX_INSTRUCTIONS, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
+    };
+    let max_limits = crate::compute::ResourceLimits {
+        max_memory_bytes: cfg.max_memory_bytes.unwrap_or(DEFAULT_MAX_MEMORY_BYTES),
+        max_instructions: cfg.max_instructions.unwrap_or(DEFAULT_MAX_INSTRUCTIONS),
+        timeout_secs: cfg.max_timeout_secs.unwrap_or(DEFAULT_MAX_TIMEOUT_SECS),
+    };
+
+    if cfg.authorized_submitters.is_empty() {
+        return ComputeAuthPolicy::open().with_max_limits(max_limits);
+    }
+
+    let mut allowed = std::collections::HashSet::new();
+    for entry in &cfg.authorized_submitters {
+        match entry.parse::<NodeId>() {
+            Ok(id) => {
+                allowed.insert(id);
+            }
+            Err(e) => log::warn!(
+                "Ignoring invalid compute authorized_submitter '{}': {}",
+                entry,
+                e
+            ),
+        }
+    }
+    ComputeAuthPolicy::restricted(allowed, max_limits)
 }
 
 /// Upper bound on the per-node verified-settlement caches (#260). Entries are
@@ -538,6 +576,24 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         max_instructions,
                         timeout_secs,
                     };
+
+                    // Authorize the submitter and its requested limits BEFORE
+                    // the bytecode reaches the executor (F3): an unauthorized
+                    // or over-sized request is refused without ever being
+                    // compiled, run, or stored.
+                    if let Err(deny) = self.compute_auth.authorize(&source, &limits) {
+                        log::warn!("Rejecting compute job {} from {}: {}", job_id, source, deny);
+                        let response = Message::ComputeJobResponse {
+                            job_id,
+                            accepted: false,
+                            message: format!("Job rejected: {}", deny),
+                        };
+                        if let Err(e) = self.network.send_message(source, response).await {
+                            log::error!("Failed to send compute job response: {}", e);
+                        }
+                        return Ok(());
+                    }
+
                     let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
                     let actual_job_id = job.id.clone();
 
@@ -1054,6 +1110,8 @@ impl Node {
             None
         };
 
+        let compute_auth = build_compute_auth_policy(&settings.compute);
+
         let compute_manager = if node_type == NodeType::Coordinator {
             Some(Arc::new(JobManager::new()))
         } else {
@@ -1150,6 +1208,7 @@ impl Node {
             compute_manager,
             compute_coordinator,
             compute_storage,
+            compute_auth,
             job_coordinators: Arc::new(Mutex::new(std::collections::HashMap::new())),
             ha_broadcast: Arc::new(Mutex::new(None)),
             ha_watchdog: Arc::new(Mutex::new(None)),
@@ -2124,6 +2183,7 @@ impl Clone for Node {
             compute_manager: self.compute_manager.clone(),
             compute_coordinator: self.compute_coordinator.clone(),
             compute_storage: self.compute_storage.clone(),
+            compute_auth: self.compute_auth.clone(),
             job_coordinators: self.job_coordinators.clone(),
             ha_broadcast: self.ha_broadcast.clone(),
             ha_watchdog: self.ha_watchdog.clone(),

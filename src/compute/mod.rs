@@ -257,6 +257,7 @@
 //! - Use memory limits to prevent resource exhaustion
 //! - Verify results through multi-validator consensus
 
+pub mod auth;
 pub mod compute_circuit;
 pub mod distribution;
 pub mod engine;
@@ -267,6 +268,7 @@ pub mod private_job;
 pub mod verification;
 
 // Re-export main types
+pub use auth::{ComputeAuthError, ComputeAuthPolicy};
 pub use compute_circuit::{ComputeCircuit, ComputeProofSystem, MAX_DATA_SIZE};
 pub use distribution::{
     CapacityAnnouncement, CoordinatorStats, JobAssignment, JobCoordinator, ValidatorJobFetcher,
