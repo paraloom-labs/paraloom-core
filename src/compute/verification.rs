@@ -129,6 +129,29 @@ impl VerificationCoordinator {
         validator_id: ValidatorId,
         result: JobResult,
     ) -> Result<()> {
+        // Bind the result to the job's assigned validator set: only a validator
+        // this job was actually assigned to may contribute a result. Without
+        // this, any peer could inject results toward the consensus tally for a
+        // job it was never asked to run (F4). A result for an unknown job — or
+        // from an unassigned validator — is rejected outright.
+        {
+            let requests = self.requests.read().await;
+            let request = requests.get(job_id).ok_or_else(|| {
+                anyhow!(
+                    "No verification request for job {}; result from {} rejected",
+                    job_id,
+                    validator_id
+                )
+            })?;
+            if !request.validators.contains(&validator_id) {
+                return Err(anyhow!(
+                    "Validator {} was not assigned to job {}; result rejected",
+                    validator_id,
+                    job_id
+                ));
+            }
+        }
+
         let validator_result = ValidatorResult::new(validator_id.clone(), result);
 
         let mut results = self.results.write().await;
@@ -489,6 +512,12 @@ mod tests {
     async fn test_duplicate_submission() {
         let coordinator = VerificationCoordinator::new();
         let job_id = "job1".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
 
         let result1 = JobResult::success(job_id.clone(), vec![42], 100, 1024, 50000);
         let result2 = JobResult::success(job_id.clone(), vec![99], 100, 1024, 50000);
@@ -504,5 +533,36 @@ mod tests {
 
         let results = coordinator.get_results(&job_id).await;
         assert_eq!(results.len(), 1); // Should only have 1 result (duplicate ignored)
+    }
+
+    #[tokio::test]
+    async fn test_unassigned_validator_result_is_rejected() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job1".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        // A validator the job was never assigned to cannot contribute a result.
+        let intruder = JobResult::success(job_id.clone(), vec![42], 100, 1024, 50000);
+        let rejected = coordinator
+            .submit_result(&job_id, "attacker".to_string(), intruder)
+            .await;
+        assert!(rejected.is_err());
+        assert!(coordinator.get_results(&job_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_result_for_unknown_job_is_rejected() {
+        let coordinator = VerificationCoordinator::new();
+        // No verification request exists for this job.
+        let result = JobResult::success("ghost".to_string(), vec![42], 100, 1024, 50000);
+        let rejected = coordinator
+            .submit_result(&"ghost".to_string(), "v1".to_string(), result)
+            .await;
+        assert!(rejected.is_err());
     }
 }
