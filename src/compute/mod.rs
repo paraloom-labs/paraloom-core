@@ -271,7 +271,10 @@ pub mod verification;
 // Re-export main types
 pub use auth::{ComputeAuthError, ComputeAuthPolicy};
 pub use compute_circuit::{ComputeCircuit, ComputeProofSystem, MAX_DATA_SIZE};
-pub use confidential_inference::{AttestationVerifier, AttestedChannelKey, EnclaveChannel};
+pub use confidential_inference::{
+    AttestationVerifier, AttestedChannelKey, ConfidentialWorker, EnclaveChannel, InferencePayload,
+    ModelRunner,
+};
 pub use distribution::{
     CapacityAnnouncement, CoordinatorStats, JobAssignment, JobCoordinator, ValidatorJobFetcher,
     DEFAULT_JOB_TIMEOUT_SECS, MAX_JOB_RETRIES,
