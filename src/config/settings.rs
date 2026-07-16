@@ -30,6 +30,13 @@ pub struct Settings {
     /// deposits (#163).
     #[serde(default)]
     pub bridge: BridgeConfig,
+    /// Confidential-compute authorization settings (F3). Optional like
+    /// `[ha]`/`[bridge]`: a config without a `[compute]` section uses
+    /// `ComputeSettings::default()`, which leaves job submission open to any
+    /// peer while still bounding every job by the built-in per-job resource
+    /// ceiling. Set `authorized_submitters` to restrict who may submit.
+    #[serde(default)]
+    pub compute: ComputeSettings,
 }
 
 /// Network settings
@@ -153,6 +160,27 @@ pub struct HaSettings {
     pub watchdog_interval_ms: u64,
 }
 
+/// Confidential-compute authorization settings (F3). Optional like `[ha]`: an
+/// absent `[compute]` section leaves submission open with the built-in ceiling.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ComputeSettings {
+    /// Hex-encoded NodeIds (lowercase, matching `NodeId`'s Display form)
+    /// permitted to submit compute jobs. Empty (the default) leaves submission
+    /// open to any peer; a non-empty list restricts submission to exactly these
+    /// peers. An entry that is not valid hex is ignored at startup.
+    #[serde(default)]
+    pub authorized_submitters: Vec<String>,
+    /// Per-job memory ceiling in bytes. `None` uses the built-in default.
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
+    /// Per-job instruction (fuel) ceiling. `None` uses the built-in default.
+    #[serde(default)]
+    pub max_instructions: Option<u64>,
+    /// Per-job timeout ceiling in seconds. `None` uses the built-in default.
+    #[serde(default)]
+    pub max_timeout_secs: Option<u64>,
+}
+
 /// Default for [`NetworkSettings::enable_relay_server`]. Reads the
 /// `ENABLE_RELAY_SERVER` env var (parsed as bool) so the anchor can
 /// flip relay on without a config edit, falling back to `false`.
@@ -218,6 +246,7 @@ impl Settings {
             },
             ha: HaSettings::default(),
             bridge: BridgeConfig::default(),
+            compute: ComputeSettings::default(),
         }
     }
 }
@@ -260,6 +289,39 @@ mod tests {
         assert!(settings.ha.primary.is_none());
         assert!(settings.ha.standbys.is_empty());
         assert_eq!(settings.ha.stall_threshold_ms, 30_000);
+        // No `[compute]` section → open submission with built-in ceiling.
+        assert!(settings.compute.authorized_submitters.is_empty());
+        assert!(settings.compute.max_memory_bytes.is_none());
+    }
+
+    #[test]
+    fn compute_settings_parse_an_allowlist_and_ceiling_override() {
+        let toml_text = r#"
+            [network]
+            listen_address = "/ip4/127.0.0.1/tcp/0"
+            bootstrap_nodes = []
+            enable_mdns = false
+
+            [node]
+            node_type = "ResourceProvider"
+            max_cpu_usage = 80
+            max_memory_usage = 70
+            max_storage_usage = 1024
+
+            [storage]
+            data_dir = "./data"
+
+            [compute]
+            authorized_submitters = ["aabb", "ccdd"]
+            max_memory_bytes = 134217728
+        "#;
+        let settings: Settings = toml::from_str(toml_text).expect("parses [compute]");
+        assert_eq!(
+            settings.compute.authorized_submitters,
+            vec!["aabb".to_string(), "ccdd".to_string()]
+        );
+        assert_eq!(settings.compute.max_memory_bytes, Some(134_217_728));
+        assert!(settings.compute.max_instructions.is_none());
     }
 
     #[test]
