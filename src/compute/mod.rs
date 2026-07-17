@@ -264,6 +264,7 @@ pub mod distribution;
 pub mod engine;
 pub mod executor;
 pub mod gcp_attestation;
+pub mod granite_model;
 pub mod job;
 pub mod manager;
 pub mod private_job;
@@ -283,6 +284,7 @@ pub use distribution::{
 pub use engine::WasmEngine;
 pub use executor::{ExecutorStats, JobExecutor};
 pub use gcp_attestation::{fetch_google_signing_keys, GcpConfidentialSpaceVerifier};
+pub use granite_model::GraniteModelRunner;
 pub use job::{ComputeJob, JobId, JobResult, JobStatus, ResourceLimits};
 pub use manager::{JobManager, ManagerStats, ValidatorCapacity, ValidatorId};
 pub use private_job::{PrivateComputeJob, PrivateJobCoordinator, PrivateJobResult};
