@@ -49,6 +49,10 @@ name = "benchmark-reqresp"
 path = "src/bin/benchmark_reqresp.rs"
 
 [[bin]]
+name = "confidential-inference-worker"
+path = "src/bin/confidential_inference_worker.rs"
+
+[[bin]]
 name = "bridge-init"
 path = "src/bin/bridge_init.rs"
 
