@@ -103,8 +103,19 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
         body.len()
     );
     stream.write_all(request.as_bytes()).await?;
+
+    // Read until EOF, or a short gap with no further data: the launcher keeps
+    // the socket open after replying, so `read_to_end` alone would block forever.
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut chunk)).await
+        {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => resp.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => return Err(e.into()),
+        }
+    }
 
     let resp = String::from_utf8_lossy(&resp);
     let token = resp
