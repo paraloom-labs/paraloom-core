@@ -1288,7 +1288,10 @@ mod tests {
         // already-succeeded sibling is idempotent in the pool.
         let x = Signature::new_unique();
         let (cursor, failed) = EventListener::contiguous_cursor(&[(x, true), (x, false)]);
-        assert_eq!(cursor, None, "must not advance onto a signature with a failed sibling");
+        assert_eq!(
+            cursor, None,
+            "must not advance onto a signature with a failed sibling"
+        );
         assert_eq!(failed, vec![x]);
 
         // An earlier, fully-successful signature still advances the cursor, but
