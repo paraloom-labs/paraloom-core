@@ -303,6 +303,15 @@ pub mod paraloom_program {
         let ext_data_hash = transact_ext_data_hash(&ctx.accounts.recipient.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
 
+        // Reject an inactive settling validator up front, before any expensive
+        // work (quorum + Groth16 verify + tree appends). A deactivated or
+        // compromised validator would otherwise burn ~250K CU on a settlement
+        // that fails anyway at the later `is_active` gate (#594).
+        require!(
+            ctx.accounts.validator_account.is_active,
+            BridgeError::ValidatorNotActive
+        );
+
         // Supermajority co-sign (#260) — no single key settles.
         quorum::verify_validator_quorum(
             ctx.program_id,
@@ -359,8 +368,9 @@ pub mod paraloom_program {
 
         // Move external funds. `ext_amount < 0` withdraws from the vault; the
         // settling validator earns the same 25 bps fee as `withdraw`.
+        // `is_active` was already checked up front (#594); the settling
+        // validator is guaranteed active here.
         let validator_account = &mut ctx.accounts.validator_account;
-        require!(validator_account.is_active, BridgeError::ValidatorNotActive);
 
         let mut fee = 0u64;
         if ext_amount < 0 {
