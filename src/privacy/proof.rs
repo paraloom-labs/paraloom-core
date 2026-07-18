@@ -70,13 +70,6 @@ impl VerificationResult {
 /// Components that can be verified independently (for distributed verification)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum VerificationChunk {
-    /// Verify input commitments exist in Merkle tree
-    InputCommitments {
-        commitments: Vec<Commitment>,
-        merkle_paths: Vec<MerklePath>,
-        merkle_root: [u8; 32],
-    },
-
     /// Verify output commitments are well-formed
     OutputCommitments { commitments: Vec<Commitment> },
 
@@ -95,34 +88,6 @@ impl VerificationChunk {
     /// Verify this chunk
     pub fn verify(&self) -> VerificationResult {
         match self {
-            VerificationChunk::InputCommitments {
-                commitments: _,
-                merkle_paths,
-                merkle_root,
-            } => {
-                // Placeholder: In production, verify each path
-                if merkle_paths.is_empty() {
-                    return VerificationResult::Invalid {
-                        reason: "No Merkle paths provided".to_string(),
-                    };
-                }
-
-                // Verify each path against root
-                for path in merkle_paths {
-                    // Simplified verification
-                    if path.path.is_empty() {
-                        return VerificationResult::Invalid {
-                            reason: "Empty Merkle path".to_string(),
-                        };
-                    }
-
-                    // In production: path.verify(commitment, merkle_root)
-                    let _ = merkle_root; // Suppress warning
-                }
-
-                VerificationResult::Valid
-            }
-
             VerificationChunk::OutputCommitments { commitments } => {
                 if commitments.is_empty() {
                     return VerificationResult::Invalid {
