@@ -135,6 +135,13 @@ pub struct Node {
     /// recipient (the recipient is the one every validator saw in the gossiped
     /// request). Bounded by `MAX_VERIFIED_CACHE`; entries are short-lived.
     verified_transacts: Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+
+    /// Per-settlement co-sign counter (#593). The co-sign signature is this
+    /// node's Solana fee-payer signature; capping how many times we sign one
+    /// `request_id` bounds how many fee-paying replays a peer can extract from a
+    /// single cached approval, while still leaving headroom for the leader's
+    /// legitimate blockhash-expiry retries.
+    cosign_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 /// Build the compute-job authorization policy (F3) from `[compute]` settings.
@@ -177,6 +184,14 @@ fn build_compute_auth_policy(cfg: &crate::config::ComputeSettings) -> ComputeAut
 /// so this is only a safety ceiling against unbounded growth, never a working
 /// limit in practice.
 const MAX_VERIFIED_CACHE: usize = 1024;
+
+/// Maximum times this node will co-sign one settlement `request_id` (#593).
+/// The co-sign signature is the node's Solana fee-payer signature, so an
+/// unbounded count lets a peer reuse a single cached approval to extract fresh
+/// fee-payer signatures and burn the hot authority's SOL on replays. A small
+/// cap still covers the leader rebuilding with a fresh blockhash when the
+/// previous one expires before the quorum submits.
+const MAX_COSIGNS_PER_SETTLEMENT: u32 = 4;
 
 /// Insert a verified settlement request into a bounded per-node cache (#260).
 /// The bound is a safety ceiling, not a working limit; if the map is somehow at
@@ -850,6 +865,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             self.cosign_keypair.as_ref(),
             &expected_program_id,
             &self.verified_transacts,
+            &self.cosign_counts,
             request,
         )
         .await)
@@ -865,6 +881,7 @@ async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -927,6 +944,20 @@ async fn cosign_settlement(
         Ok(m) => m,
         Err(e) => return declined(&format!("could not build settlement message: {e}")),
     };
+
+    // Bound how many fee-payer signatures a single cached approval can yield
+    // (#593). Only a settlement we approved and could rebuild reaches here, so
+    // the counter is consumed only by genuine signs — a mismatched or
+    // undecodable request is declined earlier and never spends the budget.
+    {
+        let mut counts = cosign_counts.lock().await;
+        let signed = counts.entry(request_id.clone()).or_insert(0);
+        if *signed >= MAX_COSIGNS_PER_SETTLEMENT {
+            return declined("co-sign count limit reached for this settlement");
+        }
+        *signed += 1;
+    }
+
     let signature = keypair.sign_message(&message.serialize());
 
     CoSignResponse {
@@ -1221,6 +1252,7 @@ impl Node {
             delivered_notes: Arc::new(Mutex::new(Vec::new())),
             cosign_keypair,
             verified_transacts: Arc::new(Mutex::new(HashMap::new())),
+            cosign_counts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         Ok(node)
@@ -2197,6 +2229,7 @@ impl Clone for Node {
             delivered_notes: self.delivered_notes.clone(),
             cosign_keypair: self.cosign_keypair.clone(),
             verified_transacts: self.verified_transacts.clone(),
+            cosign_counts: self.cosign_counts.clone(),
         }
     }
 }
@@ -2246,6 +2279,7 @@ mod tests {
             Some(&kp),
             &configured_program(),
             &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("nope", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2260,6 +2294,7 @@ mod tests {
             None,
             &configured_program(),
             &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2270,6 +2305,7 @@ mod tests {
             Some(&kp),
             &Pubkey::new_from_array([2u8; 32]),
             &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2351,6 +2387,7 @@ mod tests {
             Some(&kp),
             &configured_program(),
             &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2364,6 +2401,79 @@ mod tests {
         assert!(
             sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
             "the returned signature must be valid over the rebuilt settlement message"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_caps_repeated_signs_for_one_settlement() {
+        // A peer holding one approved settlement must not be able to replay it
+        // under fresh blockhashes to extract unlimited fee-payer signatures
+        // (#593). The cap still admits the leader's legitimate retries.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+
+        // Up to the cap, each request signs (a legitimate blockhash retry).
+        for i in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &payload),
+            )
+            .await;
+            assert!(resp.signature.is_some(), "sign #{i} within the cap");
+        }
+
+        // One past the cap is declined.
+        let over = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(
+            over.signature, None,
+            "co-signing past the per-settlement cap must be declined"
+        );
+
+        // The cap is per request_id: a distinct settlement is unaffected.
+        tas.lock().await.insert(
+            "t2".to_string(),
+            ta_request("t2", recipient, nullifiers, outputs, root, ext_amount),
+        );
+        let other = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t2", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert!(
+            other.signature.is_some(),
+            "a distinct settlement must not inherit another's cap"
         );
     }
 
@@ -2395,6 +2505,7 @@ mod tests {
             Some(&kp),
             &configured_program(),
             &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &tampered_recipient),
         )
         .await;
@@ -2416,6 +2527,7 @@ mod tests {
             Some(&kp),
             &configured_program(),
             &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &tampered_ext),
         )
         .await;
