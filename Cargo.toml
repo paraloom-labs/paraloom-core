@@ -123,7 +123,10 @@ serde_json = "1.0.93"
 bincode = "1.3.3"
 base64 = "0.22.1" # decode Jupiter's base64 swapTransaction (#239)
 # Verify the RS256 GCP Confidential Space attestation JWT (confidential inference).
-jsonwebtoken = "9"
+# v10 no longer bundles a crypto backend by default (it panics at runtime asking
+# for a CryptoProvider); `rust_crypto` selects the pure-Rust RSA/EC backend — no
+# aws-lc-rs/ring C deps, which also keeps the worker portable to s390x (IBM SE).
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # HTTP client for the Jupiter v6 aggregator API (#239). rustls to match the
 # TLS stack already pulled in by the Solana client deps (avoids OpenSSL).

@@ -43,4 +43,11 @@ ignore = [
     "RUSTSEC-2025-0119", # number_prefix — unmaintained
     "RUSTSEC-2026-0105", # core2 — unmaintained, all versions yanked
     "RUSTSEC-2024-0320", # yaml-rust — unmaintained
+
+    # --- jsonwebtoken v10 rust_crypto backend ---
+    # rsa — Marvin timing side-channel (no fixed release). It affects RSA
+    # private-key operations (decryption/signing); we pull `rsa` only via
+    # jsonwebtoken's rust_crypto backend to VERIFY RS256 attestation JWTs
+    # (public-key op, secret-independent), so the side-channel does not apply.
+    "RUSTSEC-2023-0071",
 ]
