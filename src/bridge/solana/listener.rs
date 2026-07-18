@@ -276,18 +276,35 @@ impl EventListener {
     /// earlier failure). Returns the new cursor (the last contiguous success, if
     /// any) and every failed signature, which the caller un-sees so the next
     /// poll re-fetches and retries them.
+    ///
+    /// A single transaction can emit several deposit events (a batched
+    /// `deposit_note`), all sharing one signature. The `until` boundary is
+    /// per-signature, so the cursor may advance onto a signature only if EVERY
+    /// event under it succeeded: one failed sibling event must freeze the cursor
+    /// *before* that signature even when an earlier event under the same
+    /// signature succeeded, otherwise the boundary would skip the failed
+    /// sibling forever (#604).
     fn contiguous_cursor(outcomes: &[(Signature, bool)]) -> (Option<Signature>, Vec<Signature>) {
+        let failed_sigs: HashSet<Signature> = outcomes
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(sig, _)| *sig)
+            .collect();
         let mut cursor = None;
         let mut frozen = false;
         let mut failed = Vec::new();
         for (sig, ok) in outcomes {
-            if *ok {
-                if !frozen {
-                    cursor = Some(*sig);
-                }
-            } else {
+            // Freeze at the first signature carrying any failure — including one
+            // whose current event succeeded but has a failed sibling (#604).
+            if failed_sigs.contains(sig) {
                 frozen = true;
-                failed.push(*sig);
+            }
+            if frozen {
+                if !*ok {
+                    failed.push(*sig);
+                }
+            } else if *ok {
+                cursor = Some(*sig);
             }
         }
         (cursor, failed)
@@ -1259,6 +1276,28 @@ mod tests {
         let (cursor, failed) = EventListener::contiguous_cursor(&[]);
         assert_eq!(cursor, None);
         assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn contiguous_cursor_freezes_on_a_failed_sibling_event_under_one_signature() {
+        // A batched transaction emits several deposit events under ONE
+        // signature. If the first succeeds and a sibling fails, the cursor must
+        // not advance onto that signature — the per-signature `until` boundary
+        // is exclusive, so advancing would skip the failed sibling forever
+        // (#604). The failed signature is reported for retry; re-processing the
+        // already-succeeded sibling is idempotent in the pool.
+        let x = Signature::new_unique();
+        let (cursor, failed) = EventListener::contiguous_cursor(&[(x, true), (x, false)]);
+        assert_eq!(cursor, None, "must not advance onto a signature with a failed sibling");
+        assert_eq!(failed, vec![x]);
+
+        // An earlier, fully-successful signature still advances the cursor, but
+        // only up to the last signature before the one carrying the failure.
+        let a = Signature::new_unique();
+        let (cursor, failed) =
+            EventListener::contiguous_cursor(&[(a, true), (x, true), (x, false)]);
+        assert_eq!(cursor, Some(a));
+        assert_eq!(failed, vec![x]);
     }
 
     /// A signature already in `state.seen_signatures` must be filtered
