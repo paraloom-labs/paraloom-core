@@ -619,7 +619,8 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     if !executor.has_pending_capacity() {
                         log::warn!(
                             "Rejecting compute job {} from {}: pending queue full",
-                            job_id, source
+                            job_id,
+                            source
                         );
                         let response = Message::ComputeJobResponse {
                             job_id,
