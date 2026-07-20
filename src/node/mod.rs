@@ -820,11 +820,11 @@ impl crate::network::protocol::NetworkEventHandler for Node {
     /// list.
     async fn handle_heartbeat_request(
         &self,
-        _source: NodeId,
+        source: NodeId,
         request: crate::network::HeartbeatRequest,
     ) -> Result<crate::network::HeartbeatResponse> {
         if let Some(coordinator) = &self.coordinator {
-            Ok(coordinator.apply_heartbeat(request).await)
+            Ok(coordinator.apply_heartbeat(&source, request).await)
         } else {
             log::warn!("heartbeat received but this node has no coordinator");
             Ok(crate::network::HeartbeatResponse {
