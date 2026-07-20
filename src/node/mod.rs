@@ -787,7 +787,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
     ) -> Result<ResultResponse> {
         info!("Received result request from {}", source);
         if let Some(coordinator) = &self.coordinator {
-            match coordinator.handle_task_result(&source, request.result).await {
+            match coordinator
+                .handle_task_result(&source, request.result)
+                .await
+            {
                 Ok(_) => {
                     info!("Task result processed successfully");
                     Ok(ResultResponse {
