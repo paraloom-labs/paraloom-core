@@ -17,6 +17,12 @@ use super::job::{ComputeJob, JobId, JobResult, JobStatus};
 const MAX_CONCURRENT_JOBS: usize = 4;
 
 /// Job execution coordinator
+/// Maximum number of jobs that may wait in the pending queue at once (#610).
+/// The executor runs a fixed number concurrently, so without a cap a peer could
+/// enqueue unique jobs faster than they drain and exhaust memory. Generous
+/// enough to absorb a legitimate burst, bounded enough to deny a flood.
+const MAX_PENDING_JOBS: usize = 64;
+
 pub struct JobExecutor {
     /// WASM execution engine
     engine: Arc<WasmEngine>,
@@ -58,6 +64,17 @@ impl JobExecutor {
         info!("Submitting job {} to execution queue", job_id);
 
         let mut pending = self.pending_jobs.lock().unwrap();
+        // Bound the pending queue: a peer whose per-job limits are authorized
+        // could otherwise enqueue unique jobs faster than the (fixed
+        // concurrency) executor drains them, growing memory without bound
+        // (#610). Callers gate on `has_pending_capacity` first; this is the
+        // hard backstop for the check-then-submit race.
+        if pending.len() >= MAX_PENDING_JOBS {
+            return Err(anyhow::anyhow!(
+                "pending job queue is full ({} jobs)",
+                MAX_PENDING_JOBS
+            ));
+        }
         pending.push_back(job);
 
         debug!(
@@ -67,6 +84,13 @@ impl JobExecutor {
         );
 
         Ok(job_id)
+    }
+
+    /// Whether the pending queue has room for another job (#610). Callers check
+    /// this before committing any per-job state so a rejected job leaves no
+    /// residue in the coordinator map or storage.
+    pub fn has_pending_capacity(&self) -> bool {
+        self.pending_jobs.lock().unwrap().len() < MAX_PENDING_JOBS
     }
 
     /// Get job status
@@ -351,5 +375,22 @@ mod tests {
 
         let stats = executor.get_stats();
         assert_eq!(stats.pending_jobs, 5);
+    }
+
+    #[tokio::test]
+    async fn submit_job_rejects_when_the_pending_queue_is_full() {
+        let executor = JobExecutor::new().unwrap();
+        assert!(executor.has_pending_capacity());
+
+        for _ in 0..MAX_PENDING_JOBS {
+            let job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+            assert!(executor.submit_job(job).is_ok());
+        }
+        assert!(!executor.has_pending_capacity());
+
+        // One past the cap is rejected rather than growing the queue without
+        // bound (#610).
+        let overflow = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+        assert!(executor.submit_job(overflow).is_err());
     }
 }

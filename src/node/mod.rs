@@ -612,6 +612,26 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         return Ok(());
                     }
 
+                    // Refuse a new job when the pending queue is full, before
+                    // committing any per-job state (coordinator map, storage),
+                    // so a flood of authorized-but-excess jobs cannot exhaust
+                    // memory or disk and a rejected job leaves no residue (#610).
+                    if !executor.has_pending_capacity() {
+                        log::warn!(
+                            "Rejecting compute job {} from {}: pending queue full",
+                            job_id, source
+                        );
+                        let response = Message::ComputeJobResponse {
+                            job_id,
+                            accepted: false,
+                            message: "Job rejected: pending queue full".to_string(),
+                        };
+                        if let Err(e) = self.network.send_message(source, response).await {
+                            log::error!("Failed to send compute job response: {}", e);
+                        }
+                        return Ok(());
+                    }
+
                     let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
                     let actual_job_id = job.id.clone();
 
