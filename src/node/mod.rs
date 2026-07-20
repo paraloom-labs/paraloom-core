@@ -1235,6 +1235,10 @@ impl Node {
         // withdrawal/transfer coordinators were removed).
         let (transact_coordinator, transact_approval_rx) = if runs_bridge {
             let (mut coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            // This node is the settlement authority it would submit under, so
+            // the off-chain quorum can mirror the on-chain stake-weighted check
+            // and exclude it exactly as the program does (#611).
+            coord = coord.with_local_node_id(node_id.clone());
             // Optional config override of the BFT consensus defaults (7/10/rep200).
             // Unset on mainnet → the secure defaults stand; devnet lowers them in
             // validator.toml to settle with a small live cohort (2/2), otherwise
