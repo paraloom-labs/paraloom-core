@@ -442,18 +442,37 @@ impl Coordinator {
     }
 
     /// Handle task result from validator
-    pub async fn handle_task_result(&self, result: TaskResult) -> Result<()> {
-        info!("Task result received: {}", result.task_id);
+    pub async fn handle_task_result(&self, source: &NodeId, result: TaskResult) -> Result<()> {
+        info!("Task result received: {} from {:?}", result.task_id, source);
+
+        // Validate the result against a task we actually dispatched, before
+        // retaining anything: it must be an active task, reported by the exact
+        // validator it was assigned to, and not already completed. Otherwise any
+        // peer could insert arbitrary task ids to grow the lifetime results map
+        // without bound, or race the assignee with a forged result (#608).
+        {
+            let mut active = self.active_tasks.lock().await;
+            let task = active.get_mut(&result.task_id).ok_or_else(|| {
+                anyhow::anyhow!("result for unknown or inactive task {}", result.task_id)
+            })?;
+            if task.assigned_to.as_deref() != Some(format!("{:?}", source).as_str()) {
+                return Err(anyhow::anyhow!(
+                    "result for {} from a peer it was not assigned to",
+                    result.task_id
+                ));
+            }
+            if matches!(task.status, TaskStatus::Completed) {
+                return Err(anyhow::anyhow!(
+                    "result for {} already recorded",
+                    result.task_id
+                ));
+            }
+            task.status = TaskStatus::Completed;
+        }
 
         // Store result
         let mut results = self.results.lock().await;
         results.insert(result.task_id.clone(), result.clone());
-
-        // Update task status
-        let mut active = self.active_tasks.lock().await;
-        if let Some(task) = active.get_mut(&result.task_id) {
-            task.status = TaskStatus::Completed;
-        }
 
         // Check if all chunks completed
         let parent_tasks = self.parent_tasks.lock().await;
@@ -777,6 +796,65 @@ mod tests {
             .await;
         assert!(!response.accepted);
         assert!(primary_b.is_primary().await);
+    }
+
+    #[tokio::test]
+    async fn task_result_requires_an_active_assigned_task_and_rejects_replays() {
+        // #608: any peer could otherwise insert an arbitrary task id (growing
+        // the lifetime results map) or race the assignee with a forged result.
+        let coordinator = Coordinator::new(make_test_network());
+        let assignee = NodeId(vec![0xAA]);
+
+        let make_result = || TaskResult {
+            task_id: "t1".to_string(),
+            execution_time_ms: 1,
+            data: ResultData::Hashes {
+                hashes: vec![],
+                count: 0,
+            },
+        };
+
+        // A result for a task the coordinator never dispatched is rejected.
+        let orphan = TaskResult {
+            task_id: "ghost".to_string(),
+            ..make_result()
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, orphan)
+            .await
+            .is_err());
+
+        // Register an active task assigned to `assignee`.
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 0,
+            algorithm: "sha256".to_string(),
+        });
+        task.id = "t1".to_string();
+        task.assigned_to = Some(format!("{:?}", assignee));
+        task.status = TaskStatus::Assigned;
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert("t1".to_string(), task);
+
+        // A result from a peer other than the assignee is rejected.
+        let attacker = NodeId(vec![0xEE]);
+        assert!(coordinator
+            .handle_task_result(&attacker, make_result())
+            .await
+            .is_err());
+
+        // The assignee's result is accepted, and a replay is then rejected.
+        assert!(coordinator
+            .handle_task_result(&assignee, make_result())
+            .await
+            .is_ok());
+        assert!(coordinator
+            .handle_task_result(&assignee, make_result())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

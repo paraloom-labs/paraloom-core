@@ -67,7 +67,16 @@ async fn run_benchmark(num_validators: usize) -> Result<()> {
             };
 
             tokio::time::sleep(tokio::time::Duration::from_millis(process_delay_ms)).await;
-            if coordinator_clone.handle_task_result(result).await.is_ok() {
+            // Post-#608 the coordinator validates each result against an active,
+            // assigned task. This bench does not distribute tasks first, so
+            // results are rejected at that gate; the placeholder source keeps it
+            // compiling. Measuring the full processing path would need task setup.
+            let source = paraloom::types::NodeId(vec![i as u8]);
+            if coordinator_clone
+                .handle_task_result(&source, result)
+                .await
+                .is_ok()
+            {
                 let mut count = processed_clone.lock().await;
                 *count += 1;
             }
