@@ -10,6 +10,30 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Compute and HA layers hardened against unauthenticated resource exhaustion
+  and state poisoning** (external bug-bounty reports, billythebotman). Four
+  findings in the alpha compute/task and coordinator-HA subsystems. These are
+  out of Stage 1 bounty scope (which covers the shielded-pool / settlement
+  stack), so they are credited here rather than paid, but each is real and was
+  fixed:
+  - #609 — a peer-supplied `HashCalculation` range (`start=0, end=u64::MAX`)
+    overflowed the item count and looped ~2^64 times, OOM-killing the validator.
+    The range is now bounded and overflow-checked before any work is done.
+  - #607 — an HA standby applied any higher-sequence heartbeat without checking
+    the authenticated sender, so any connected peer could inject an arbitrary
+    coordinator snapshot and suppress failover. Heartbeats are now accepted only
+    from the standby's configured primary; the request's own `primary` field is
+    not trusted.
+  - #608 — the task-result handler retained a `TaskResult` from any peer under
+    any task id before validating it, growing memory without bound and allowing
+    a peer to race the assignee with a forged result. Results are now bound to
+    the assigned validator, required to be for an active task, and not
+    replaceable.
+  - #610 — authorized-but-excess compute jobs were enqueued with no aggregate
+    bound. The pending queue is now capped, and the handler checks capacity
+    before committing any per-job state, so a rejected job leaves no residue.
+  Devnet, pre-mainnet.
+
 - **Deposit listener aborts a poll instead of skipping a signature whose body
   failed to fetch** (external bug-bounty report, gussamkodin). The
   contiguous-cursor barrier that keeps the listener from advancing past an
