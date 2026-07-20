@@ -749,7 +749,9 @@ mod tests {
         );
 
         let req1 = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
-        let resp1 = standby.apply_heartbeat(&NodeId(vec![0x01]), req1.clone()).await;
+        let resp1 = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), req1.clone())
+            .await;
         assert!(resp1.accepted);
         assert_eq!(resp1.last_applied_sequence, 1);
 
@@ -770,7 +772,9 @@ mod tests {
         let primary_b = Coordinator::new(make_test_network());
 
         let request = primary_a.next_heartbeat_request(NodeId(vec![0x01])).await;
-        let response = primary_b.apply_heartbeat(&NodeId(vec![0x01]), request).await;
+        let response = primary_b
+            .apply_heartbeat(&NodeId(vec![0x01]), request)
+            .await;
         assert!(!response.accepted);
         assert!(primary_b.is_primary().await);
     }
