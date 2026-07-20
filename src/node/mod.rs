@@ -136,11 +136,13 @@ pub struct Node {
     /// request). Bounded by `MAX_VERIFIED_CACHE`; entries are short-lived.
     verified_transacts: Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
 
-    /// Per-settlement co-sign counter (#593). The co-sign signature is this
-    /// node's Solana fee-payer signature; capping how many times we sign one
-    /// `request_id` bounds how many fee-paying replays a peer can extract from a
-    /// single cached approval, while still leaving headroom for the leader's
-    /// legitimate blockhash-expiry retries.
+    /// Per-spend co-sign counter (#593/#606), keyed on the input nullifiers.
+    /// The co-sign signature is this node's Solana fee-payer signature; capping
+    /// how many times we sign one spend bounds how many fee-paying replays a
+    /// peer can extract, while still leaving headroom for the leader's
+    /// legitimate blockhash-expiry retries. Keyed on the nullifiers rather than
+    /// the request id, so randomized proofs of the same spend cannot each claim
+    /// a fresh budget.
     cosign_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
@@ -185,7 +187,8 @@ fn build_compute_auth_policy(cfg: &crate::config::ComputeSettings) -> ComputeAut
 /// limit in practice.
 const MAX_VERIFIED_CACHE: usize = 1024;
 
-/// Maximum times this node will co-sign one settlement `request_id` (#593).
+/// Maximum times this node will co-sign one spend, keyed on its input
+/// nullifiers (#593/#606).
 /// The co-sign signature is the node's Solana fee-payer signature, so an
 /// unbounded count lets a peer reuse a single cached approval to extract fresh
 /// fee-payer signatures and burn the hot authority's SOL on replays. A small
@@ -912,8 +915,9 @@ async fn cosign_settlement(
     }
 
     // Match the payload against a settlement we verified Valid, by request id
-    // and binding parameters.
-    let approved = match (request.kind, &payload.params) {
+    // and binding parameters, and take the input nullifiers as the per-nullifier
+    // cap keys (see the cap block below for why the cap is keyed on those).
+    let (approved, cap_nullifiers) = match (request.kind, &payload.params) {
         (
             SettlementKind::Transact,
             SettlementParams::Transact {
@@ -926,13 +930,17 @@ async fn cosign_settlement(
             },
         ) => {
             let cache = verified_transacts.lock().await;
-            cache.get(&request.request_id).is_some_and(|req| {
+            let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
-            })
+            });
+            // Cap keys = the two input nullifiers, each counted independently
+            // (see the cap block for why per-nullifier, not per-pair).
+            let cap_nullifiers = [hex::encode(nullifiers[0]), hex::encode(nullifiers[1])];
+            (approved, cap_nullifiers)
         }
     };
     if !approved {
@@ -945,17 +953,37 @@ async fn cosign_settlement(
         Err(e) => return declined(&format!("could not build settlement message: {e}")),
     };
 
-    // Bound how many fee-payer signatures a single cached approval can yield
-    // (#593). Only a settlement we approved and could rebuild reaches here, so
-    // the counter is consumed only by genuine signs — a mismatched or
+    // Bound how many fee-payer signatures one spend can yield (#593), keyed on
+    // each input nullifier independently — NOT the request id and NOT the
+    // nullifier pair (#606):
+    //
+    // - `request_id` is the canonical hash of the request including the Groth16
+    //   proof bytes, and proving is randomized, so one spend has many valid
+    //   proofs and thus many request ids: keying on it let a peer reset the cap
+    //   with a fresh proof.
+    // - The nullifier *pair* is not invariant either: a 2-input transact can
+    //   carry a zero-amount dummy whose nullifier the requester chooses freely,
+    //   so pairing a fixed real note with different dummies yields fresh pair
+    //   keys.
+    //
+    // A value-spending transact has at least one real input note whose
+    // nullifier is fixed and appears in every equivalent settlement the peer
+    // can build. Counting each nullifier on its own catches that fixed one
+    // however the proof or the dummy input is perturbed. Nullifiers are unique
+    // per note, so this never restricts distinct legitimate spends. Only a
+    // settlement we approved and could rebuild reaches here, so a mismatched or
     // undecodable request is declined earlier and never spends the budget.
     {
         let mut counts = cosign_counts.lock().await;
-        let signed = counts.entry(request_id.clone()).or_insert(0);
-        if *signed >= MAX_COSIGNS_PER_SETTLEMENT {
-            return declined("co-sign count limit reached for this settlement");
+        if cap_nullifiers
+            .iter()
+            .any(|nf| counts.get(nf).copied().unwrap_or(0) >= MAX_COSIGNS_PER_SETTLEMENT)
+        {
+            return declined("co-sign count limit reached for an input nullifier");
         }
-        *signed += 1;
+        for nf in cap_nullifiers {
+            *counts.entry(nf).or_insert(0) += 1;
+        }
     }
 
     let signature = keypair.sign_message(&message.serialize());
@@ -2458,22 +2486,166 @@ mod tests {
             "co-signing past the per-settlement cap must be declined"
         );
 
-        // The cap is per request_id: a distinct settlement is unaffected.
+        // The cap is per spend: a genuinely different spend (different input
+        // nullifiers) has its own budget.
+        let other_nullifiers = [[17u8; 32], [18u8; 32]];
+        let other_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            other_nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
         tas.lock().await.insert(
             "t2".to_string(),
-            ta_request("t2", recipient, nullifiers, outputs, root, ext_amount),
+            ta_request("t2", recipient, other_nullifiers, outputs, root, ext_amount),
         );
         let other = cosign_settlement(
             Some(&kp),
             &configured_program(),
             &tas,
             &counts,
-            cosign_req("t2", SettlementKind::Transact, &payload),
+            cosign_req("t2", SettlementKind::Transact, &other_payload),
         )
         .await;
         assert!(
             other.signature.is_some(),
-            "a distinct settlement must not inherit another's cap"
+            "a distinct spend must not inherit another's cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_cap_follows_nullifiers_across_distinct_request_ids() {
+        // Groth16 proving is randomized: one spend has many valid proofs and so
+        // many canonical request ids. The per-spend cap must key on the input
+        // nullifiers, not the request id, or a peer could pre-generate distinct
+        // proofs of the same spend and get a fresh fee-payer-signature budget
+        // under each, defeating the #593 cap (#606).
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+
+        // Spend the whole budget under one request id (one proof of the spend).
+        tas.lock().await.insert(
+            "proof-a".to_string(),
+            ta_request("proof-a", recipient, nullifiers, outputs, root, ext_amount),
+        );
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("proof-a", SettlementKind::Transact, &payload),
+            )
+            .await;
+            assert!(resp.signature.is_some());
+        }
+
+        // A distinct request id for the SAME spend (same input nullifiers, a
+        // different randomized proof) must not reset the budget.
+        tas.lock().await.insert(
+            "proof-b".to_string(),
+            ta_request("proof-b", recipient, nullifiers, outputs, root, ext_amount),
+        );
+        let bypass = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("proof-b", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(
+            bypass.signature, None,
+            "a fresh request id for the same input nullifiers must not reset the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_cap_follows_the_real_nullifier_across_dummy_variations() {
+        // A transact can pair a real input note with a zero-amount dummy whose
+        // nullifier the requester picks freely. Varying that dummy must NOT
+        // reset the budget: the real note's nullifier is fixed and present in
+        // every variation, and the cap counts each nullifier independently, so
+        // it catches the real one however the dummy is perturbed (#606).
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let real_nf = [7u8; 32]; // the fixed real note's nullifier
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+
+        // Spend the whole budget with the real note plus one dummy.
+        let nullifiers_a = [real_nf, [8u8; 32]];
+        let payload_a = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers_a,
+            outputs,
+            root,
+            ext_amount,
+        );
+        tas.lock().await.insert(
+            "a".to_string(),
+            ta_request("a", recipient, nullifiers_a, outputs, root, ext_amount),
+        );
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("a", SettlementKind::Transact, &payload_a),
+            )
+            .await;
+            assert!(resp.signature.is_some());
+        }
+
+        // Same real note, a DIFFERENT dummy nullifier: still declined, because
+        // the real nullifier is already at the cap.
+        let nullifiers_b = [real_nf, [99u8; 32]];
+        let payload_b = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers_b,
+            outputs,
+            root,
+            ext_amount,
+        );
+        tas.lock().await.insert(
+            "b".to_string(),
+            ta_request("b", recipient, nullifiers_b, outputs, root, ext_amount),
+        );
+        let bypass = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("b", SettlementKind::Transact, &payload_b),
+        )
+        .await;
+        assert_eq!(
+            bypass.signature, None,
+            "varying the dummy nullifier must not reset the cap for the shared real nullifier"
         );
     }
 
