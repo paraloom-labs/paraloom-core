@@ -195,6 +195,13 @@ pub struct TransactVerificationCoordinator {
 
     /// Request IDs already emitted, so a transact is settled at most once.
     emitted: Arc<RwLock<HashSet<String>>>,
+
+    /// This node's own validator id — the settlement authority it would submit
+    /// under. Used to mirror the on-chain stake-weighted quorum off-chain: the
+    /// authority is excluded from both the eligible stake and the counted
+    /// co-signer stake (#611). `None` (unit tests without a registered
+    /// validator set) disables the stake gate, leaving the head-count check.
+    local_node_id: Option<NodeId>,
 }
 
 impl TransactVerificationCoordinator {
@@ -212,7 +219,76 @@ impl TransactVerificationCoordinator {
             total_validators: DEFAULT_TOTAL_VALIDATORS,
             approval_tx: None,
             emitted: Arc::new(RwLock::new(HashSet::new())),
+            local_node_id: None,
         }
+    }
+
+    /// Set this node's own validator id, so the off-chain quorum can exclude the
+    /// settlement authority exactly as the on-chain quorum does (#611).
+    pub fn with_local_node_id(mut self, node_id: NodeId) -> Self {
+        self.local_node_id = Some(node_id);
+        self
+    }
+
+    /// Whether the `Valid`-voting co-signers hold enough stake for the on-chain
+    /// stake-weighted quorum to accept the settlement this node would submit
+    /// (#611). The off-chain consensus is otherwise a head count, which under a
+    /// heterogeneous stake distribution can declare a quorum whose members hold
+    /// less than the on-chain two-thirds threshold — the leader then assembles a
+    /// transaction the program rejects with `QuorumNotMet`, a durable
+    /// settlement-liveness failure. Mirroring the threshold here means any
+    /// quorum we assemble already clears the on-chain gate.
+    ///
+    /// Mirrors `quorum::verify_validator_quorum`: the settlement authority
+    /// (this node) is excluded from both the eligible stake (the denominator)
+    /// and the counted co-signer stake, and the threshold is
+    /// `floor(2 * eligible_stake / 3) + 1`. With no registered stake (unit
+    /// tests) or no configured local id, the gate is a no-op and the head-count
+    /// check stands alone.
+    async fn stake_quorum_met(&self, tally: &VoteTally, active: &HashSet<NodeId>) -> bool {
+        let local = match &self.local_node_id {
+            Some(id) => id,
+            None => return true,
+        };
+        let selector = self.leader_selector.read().await;
+
+        let mut total_active_stake: u64 = 0;
+        for v in active {
+            if let Some(info) = selector.get_validator(v) {
+                total_active_stake = total_active_stake.saturating_add(info.stake_amount);
+            }
+        }
+        if total_active_stake == 0 {
+            return true;
+        }
+
+        let authority_stake = selector
+            .get_validator(local)
+            .map(|i| i.stake_amount)
+            .unwrap_or(0);
+        let eligible_stake = total_active_stake.saturating_sub(authority_stake);
+        let threshold = eligible_stake.saturating_mul(2) / 3 + 1;
+
+        let votes = tally.votes.read().await;
+        let mut counted_stake: u64 = 0;
+        for (voter, vote) in votes.iter() {
+            if voter == local || !active.contains(voter) || !vote.is_valid() {
+                continue;
+            }
+            let reputation = self
+                .reputation_tracker
+                .get_reputation(voter)
+                .await
+                .unwrap_or(0);
+            if reputation < self.min_reputation_for_consensus {
+                continue;
+            }
+            if let Some(info) = selector.get_validator(voter) {
+                counted_stake = counted_stake.saturating_add(info.stake_amount);
+            }
+        }
+
+        counted_stake >= threshold
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -469,6 +545,9 @@ impl TransactVerificationCoordinator {
                         &active,
                     )
                     .await
+                && self
+                    .stake_quorum_met(&consensus.tally, &active)
+                    .await
                 && matches!(
                     consensus
                         .tally
@@ -522,6 +601,16 @@ impl TransactVerificationCoordinator {
                     &active,
                 )
                 .await?;
+            // A `Valid` result may be acted on only if the co-signers hold
+            // enough stake for the on-chain quorum; otherwise keep waiting for
+            // more stake to vote rather than assemble a transaction the program
+            // would reject (#611). An `Invalid` result settles nothing and needs
+            // no stake threshold.
+            if matches!(result, VerificationVote::Valid)
+                && !self.stake_quorum_met(&consensus.tally, &active).await
+            {
+                return Ok(None);
+            }
             Ok(Some(result))
         } else {
             Ok(None)
@@ -797,6 +886,78 @@ mod tests {
         assert!(
             approvals.try_recv().is_err(),
             "a disconnected validator's stale vote must not complete quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_chain_quorum_requires_stake_weighted_supermajority() {
+        // #611: the off-chain head count could declare a quorum whose members
+        // hold less than the on-chain two-thirds of stake, so the leader
+        // assembled a transaction the program rejected with QuorumNotMet. The
+        // off-chain gate now mirrors the on-chain stake-weighted threshold.
+        let self_id = NodeId(vec![0x99]);
+        let (mut coordinator, mut approvals) =
+            TransactVerificationCoordinator::new_with_approvals();
+        coordinator = coordinator.with_local_node_id(self_id);
+        // Head count is deliberately not the blocker (one Valid vote satisfies
+        // it), so the stake gate is what decides.
+        coordinator.set_consensus_thresholds(1, 5);
+
+        let big = NodeId(vec![0x01]);
+        let small1 = NodeId(vec![0x02]);
+        let small2 = NodeId(vec![0x03]);
+        let small3 = NodeId(vec![0x04]);
+        // Stakes: big 70, each small 10 → total 100, self holds none, so
+        // eligible = 100 and threshold = floor(2 * 100 / 3) + 1 = 67. Register
+        // the stake in the leader selector first; the coordinator registration
+        // then preserves it while adding the voter to the active set.
+        for (id, stake) in [(&big, 70u64), (&small1, 10), (&small2, 10), (&small3, 10)] {
+            coordinator
+                .leader_selector
+                .write()
+                .await
+                .register_validator(ValidatorInfo::new(id.clone(), stake, 1000));
+            coordinator.register_validator(id.clone()).await;
+        }
+
+        let mut request = sample_request();
+        request.request_id = request.canonical_id();
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        // The three small validators vote Valid: a head-count majority, but only
+        // 30% of stake — below the 67 threshold.
+        for (i, v) in [&small1, &small2, &small3].iter().enumerate() {
+            coordinator
+                .submit_result(TransactVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: (*v).clone(),
+                    vote: VerificationVote::Valid,
+                    timestamp: i as u64 + 1,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            approvals.try_recv().is_err(),
+            "30% of stake must not reach the stake-weighted quorum"
+        );
+
+        // The big-stake validator votes Valid: now 100% of stake >= 67 → approved.
+        coordinator
+            .submit_result(TransactVerificationResult {
+                request_id: request.request_id.clone(),
+                validator: big,
+                vote: VerificationVote::Valid,
+                timestamp: 4,
+            })
+            .await
+            .unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "a stake-weighted supermajority must reach quorum"
         );
     }
 
