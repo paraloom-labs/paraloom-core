@@ -185,6 +185,16 @@ pub mod paraloom_program {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
         require!(amount > 0, BridgeError::InvalidAmount);
 
+        // The commitment is a Poseidon hash of `pubkey`/`blinding`, and the
+        // syscall reduces any input >= the field modulus mod p. A non-canonical
+        // value would hash to the same leaf as its reduced form, but the wallet
+        // stores the raw bytes and later witnesses them when proving the spend,
+        // so the witness would diverge from the committed leaf and the note
+        // would be unspendable. Reject non-canonical inputs before hashing, at
+        // parity with the checks `transact` already applies to its field inputs.
+        require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
+        require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
+
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
             &ctx.accounts.bridge_vault.key(),
