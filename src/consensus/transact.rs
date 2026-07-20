@@ -545,9 +545,7 @@ impl TransactVerificationCoordinator {
                         &active,
                     )
                     .await
-                && self
-                    .stake_quorum_met(&consensus.tally, &active)
-                    .await
+                && self.stake_quorum_met(&consensus.tally, &active).await
                 && matches!(
                     consensus
                         .tally
