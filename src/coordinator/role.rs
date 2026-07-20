@@ -54,6 +54,16 @@ impl CoordinatorRole {
         matches!(self, CoordinatorRole::Primary)
     }
 
+    /// The configured primary this standby mirrors, or `None` when the role is
+    /// `Primary` (which never applies an inbound heartbeat). Used to reject a
+    /// heartbeat whose authenticated sender is not the configured primary.
+    pub fn primary(&self) -> Option<&NodeId> {
+        match self {
+            CoordinatorRole::Primary => None,
+            CoordinatorRole::Standby { primary, .. } => Some(primary),
+        }
+    }
+
     /// True if this role is `Standby` and the last observed heartbeat
     /// is older than the configured stall threshold relative to `now`.
     pub fn is_stalled(&self, now: Instant) -> bool {

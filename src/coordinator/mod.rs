@@ -109,16 +109,37 @@ impl Coordinator {
     /// stale-or-replayed heartbeat (sequence not strictly greater
     /// than the highest applied) is also rejected so the standby's
     /// view never moves backwards.
-    pub async fn apply_heartbeat(&self, request: HeartbeatRequest) -> HeartbeatResponse {
+    pub async fn apply_heartbeat(
+        &self,
+        source: &NodeId,
+        request: HeartbeatRequest,
+    ) -> HeartbeatResponse {
         let role = self.role.lock().await;
-        if role.is_primary() {
+        // Only a Standby applies heartbeats, and only from its own configured
+        // primary. The authenticated `source` must match, or any connected peer
+        // could inject an arbitrary snapshot, reset the failover watchdog, and
+        // poison the state a later promotion would inherit (#607). Note the
+        // request's own `primary` field is attacker-chosen and is NOT trusted;
+        // only the libp2p-authenticated `source` is.
+        let expected_primary = match role.primary() {
+            Some(primary) => primary.clone(),
+            None => {
+                let last_applied = *self.heartbeat_sequence.lock().await;
+                return HeartbeatResponse {
+                    accepted: false,
+                    last_applied_sequence: last_applied,
+                };
+            }
+        };
+        drop(role);
+        if source != &expected_primary {
+            log::warn!("rejecting heartbeat from a peer that is not the configured primary");
             let last_applied = *self.heartbeat_sequence.lock().await;
             return HeartbeatResponse {
                 accepted: false,
                 last_applied_sequence: last_applied,
             };
         }
-        drop(role);
 
         let mut sequence_slot = self.heartbeat_sequence.lock().await;
         if request.sequence <= *sequence_slot && *sequence_slot != 0 {
@@ -678,7 +699,7 @@ mod tests {
         assert!(!standby.is_primary().await);
 
         let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
-        let response = standby.apply_heartbeat(request).await;
+        let response = standby.apply_heartbeat(&NodeId(vec![0x01]), request).await;
 
         assert!(response.accepted);
         assert_eq!(response.last_applied_sequence, 1);
@@ -687,6 +708,35 @@ mod tests {
         assert_eq!(snapshot.validators.len(), 2);
         assert!(snapshot.validators.contains(&NodeId(vec![0xAA])));
         assert!(snapshot.validators.contains(&NodeId(vec![0xBB])));
+    }
+
+    #[tokio::test]
+    async fn standby_rejects_a_heartbeat_from_a_non_primary_peer() {
+        // #607: any connected peer could otherwise inject an arbitrary snapshot
+        // and suppress failover. A standby accepts heartbeats only from its own
+        // configured primary (the authenticated sender), never from whoever
+        // sets `HeartbeatRequest.primary`.
+        let primary = Coordinator::new(make_test_network());
+        primary.register_validator(NodeId(vec![0xAA])).await;
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+
+        // A well-formed heartbeat (its `primary` field even claims 0x01),
+        // delivered by a different authenticated peer 0xEE.
+        let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = standby.apply_heartbeat(&NodeId(vec![0xEE]), request).await;
+
+        assert!(
+            !response.accepted,
+            "a heartbeat from a peer other than the configured primary must be rejected"
+        );
+        assert!(
+            standby.snapshot().await.validators.is_empty(),
+            "rejected heartbeat must not mirror the primary's state"
+        );
     }
 
     #[tokio::test]
@@ -699,14 +749,16 @@ mod tests {
         );
 
         let req1 = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
-        let resp1 = standby.apply_heartbeat(req1.clone()).await;
+        let resp1 = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), req1.clone())
+            .await;
         assert!(resp1.accepted);
         assert_eq!(resp1.last_applied_sequence, 1);
 
         // Replaying the same heartbeat must be rejected because the
         // sequence is no longer strictly greater than the highest
         // applied. The standby's view never moves backwards.
-        let resp2 = standby.apply_heartbeat(req1).await;
+        let resp2 = standby.apply_heartbeat(&NodeId(vec![0x01]), req1).await;
         assert!(!resp2.accepted);
         assert_eq!(resp2.last_applied_sequence, 1);
     }
@@ -720,7 +772,9 @@ mod tests {
         let primary_b = Coordinator::new(make_test_network());
 
         let request = primary_a.next_heartbeat_request(NodeId(vec![0x01])).await;
-        let response = primary_b.apply_heartbeat(request).await;
+        let response = primary_b
+            .apply_heartbeat(&NodeId(vec![0x01]), request)
+            .await;
         assert!(!response.accepted);
         assert!(primary_b.is_primary().await);
     }
@@ -814,7 +868,7 @@ mod tests {
             Duration::from_millis(100),
         ));
         let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
-        let response = standby.apply_heartbeat(request).await;
+        let response = standby.apply_heartbeat(&NodeId(vec![0x01]), request).await;
         assert!(response.accepted);
 
         let mirrored = standby.snapshot().await;
