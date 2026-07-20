@@ -194,3 +194,62 @@ async fn deposit_note_two_deposits_advance_index() {
     assert_eq!(tree.next_index, 2, "two leaves appended");
     assert!(tree.is_known_root(tree.root));
 }
+
+#[tokio::test]
+async fn deposit_note_rejects_a_non_canonical_field_input() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    // A blinding >= the BN254 scalar modulus is non-canonical: the Poseidon
+    // syscall would silently reduce it mod p, committing a leaf the wallet's
+    // raw-byte witness could never reproduce and bricking the note. All-0xFF is
+    // 2^256 - 1, well above p, so `deposit_note` must reject it before hashing.
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 7;
+    let blinding = [0xFFu8; 32];
+
+    let deposit = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: AMOUNT,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deposit], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    let result = banks.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "a non-canonical blinding must be rejected before hashing"
+    );
+
+    // The transaction reverted: no leaf was appended.
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 0, "no leaf appended on a rejected deposit");
+}
