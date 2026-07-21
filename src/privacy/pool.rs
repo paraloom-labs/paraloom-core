@@ -167,6 +167,20 @@ impl ShieldedPool {
         self.nullifier_set.contains(nullifier).await
     }
 
+    /// Record input nullifiers as spent once their settlement has landed on
+    /// chain, so a later `check_batch` pre-filters replays of that spend before
+    /// they reach consensus (#624). The on-chain nullifier PDAs remain the
+    /// authoritative double-spend gate; this only keeps the off-chain filter in
+    /// step. Best-effort: a set-write error must not fail a settlement that has
+    /// already landed on chain.
+    pub async fn record_spent(&self, nullifiers: [[u8; 32]; 2]) {
+        for n in nullifiers {
+            if let Err(e) = self.nullifier_set.insert(Nullifier(n)).await {
+                log::warn!("failed to record spent nullifier off-chain: {e}");
+            }
+        }
+    }
+
     /// Get the native-SOL shielded supply.
     ///
     /// Back-compat accessor preserved from the single-asset pool; equivalent
@@ -364,5 +378,20 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[&NATIVE_SOL_ASSET], 1000);
         assert_eq!(all[&usdc], 500);
+    }
+
+    #[tokio::test]
+    async fn record_spent_marks_input_nullifiers() {
+        // After a settlement lands, its input nullifiers must read as spent so a
+        // later check_batch pre-filters replays (#624).
+        let pool = ShieldedPool::new();
+        let n0 = [1u8; 32];
+        let n1 = [2u8; 32];
+        assert!(!pool.is_spent(&Nullifier(n0)).await);
+
+        pool.record_spent([n0, n1]).await;
+
+        assert!(pool.is_spent(&Nullifier(n0)).await);
+        assert!(pool.is_spent(&Nullifier(n1)).await);
     }
 }

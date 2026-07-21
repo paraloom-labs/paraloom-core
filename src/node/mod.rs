@@ -2107,7 +2107,17 @@ impl Node {
             .await
             .map_err(|e| BridgeError::Network(format!("transact co-signing round: {e}")))?;
 
-        bridge.lock().await.submit_signed_transaction(&tx).await
+        let result = bridge.lock().await.submit_signed_transaction(&tx).await;
+        if result.is_ok() {
+            // The settlement landed: mark its input nullifiers spent in the
+            // off-chain set so this node's `check_batch` pre-filters replays of
+            // it before consensus, matching the on-chain nullifier PDAs that are
+            // the authoritative double-spend gate (#624).
+            if let Some(pool) = &self.shielded_pool {
+                pool.record_spent(approved.request.nullifiers).await;
+            }
+        }
+        result
     }
 
     // Compute layer API methods
