@@ -62,8 +62,17 @@ impl ProgramInterface {
     }
 
     /// Verify a deposit transaction exists on Solana
-    pub async fn verify_deposit(&self, signature: &str, expected_amount: u64) -> Result<bool> {
-        log::debug!("Verifying deposit signature: {}", signature);
+    /// Confirm a deposit transaction landed on-chain without error.
+    ///
+    /// This is NOT an amount gate. `deposit_note` binds the deposited amount
+    /// into the note commitment on-chain — the commitment is derived from the
+    /// transferred lamports and re-checked when the note is spent — so there is
+    /// no off-chain amount verification here, and this must not be used to gate
+    /// funds. It previously took an `expected_amount` it never read and logged
+    /// it as "verified"; that misleading parameter is removed (#623). Returns
+    /// whether the transaction succeeded.
+    pub async fn verify_deposit(&self, signature: &str) -> Result<bool> {
+        log::debug!("Checking deposit transaction: {}", signature);
 
         let sig = signature
             .parse::<Signature>()
@@ -74,20 +83,16 @@ impl ProgramInterface {
             .get_transaction(&sig, UiTransactionEncoding::Json)
             .await?;
 
-        // Verify transaction succeeded
-        if tx
+        let failed = tx
             .transaction
             .meta
             .as_ref()
             .and_then(|m| m.err.as_ref())
-            .is_some()
-        {
-            log::warn!("Transaction failed on-chain");
-            return Ok(false);
+            .is_some();
+        if failed {
+            log::warn!("Deposit transaction failed on-chain: {}", signature);
         }
-
-        log::info!("Deposit verified: {} lamports", expected_amount);
-        Ok(true)
+        Ok(!failed)
     }
 
     /// Get account balance
