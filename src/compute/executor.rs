@@ -23,6 +23,12 @@ const MAX_CONCURRENT_JOBS: usize = 4;
 /// enough to absorb a legitimate burst, bounded enough to deny a flood.
 const MAX_PENDING_JOBS: usize = 64;
 
+/// Upper bound on retained completed-job results (#610). Results accumulate as
+/// jobs finish and were never evicted, growing memory for the life of the
+/// process; this caps the in-memory map with drop-oldest eviction. A caller
+/// that has not read a result before it ages out simply sees it as unknown.
+const MAX_COMPLETED_RESULTS: usize = 1024;
+
 pub struct JobExecutor {
     /// WASM execution engine
     engine: Arc<WasmEngine>,
@@ -232,6 +238,16 @@ impl JobExecutor {
             debug!("Processing result for job {}", result.job_id);
 
             let mut completed = completed_results.lock().unwrap();
+            // Bound the retained results so they cannot grow without limit as
+            // jobs finish (#610): evict an arbitrary older result before adding
+            // a new job id past the ceiling.
+            if !completed.contains_key(&result.job_id)
+                && completed.len() >= MAX_COMPLETED_RESULTS
+            {
+                if let Some(victim) = completed.keys().next().cloned() {
+                    completed.remove(&victim);
+                }
+            }
             completed.insert(result.job_id.clone(), result);
         }
     }
