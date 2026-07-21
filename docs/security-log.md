@@ -10,6 +10,31 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Off-chain settlement and consensus hygiene** (external bug-bounty reports,
+  Godswork4 and iceiceic3). Correctness findings in the off-chain settlement and
+  consensus layer, fixed:
+  - #626 (Godswork4) — the per-nullifier co-sign counter map (added with the
+    #593/#606 remediation) was never cleared and grew for the life of the
+    process. It is now bounded with an eviction ceiling, like its sibling
+    verified-transact cache. Single-node resource growth (out of bounty scope),
+    credited.
+  - #624 (Godswork4) — the off-chain nullifier set was never updated when a
+    transact settled, so it did not pre-filter replays before consensus. The
+    submitting node now records a settled spend's input nullifiers. The on-chain
+    nullifier PDAs remain the authoritative double-spend gate, so this is a
+    redundant pre-filter kept in step, not a safety change.
+  - #623 (Godswork4) — `ProgramInterface::verify_deposit` took an
+    `expected_amount` it never read and logged it as "verified". The misleading
+    parameter is removed and the helper documented as a transaction-success
+    check only (deposit amounts are bound on-chain by `deposit_note`).
+  - #627 (iceiceic3) — the discovery handler registered any `ResourceProvider`
+    peer as a transact validator without checking its on-chain validator PDA.
+    The on-chain quorum rejects unregistered co-signers, so this is a liveness
+    (doomed-attempt) issue, not a safety one; the authoritative on-chain
+    verification is folded into the validator-set reconciler (#333). Sybil /
+    quorum-liveness (out of scope), credited.
+  Devnet, pre-mainnet.
+
 - **Compute and HA layers hardened against unauthenticated resource exhaustion
   and state poisoning** (external bug-bounty reports, billythebotman). Four
   findings in the alpha compute/task and coordinator-HA subsystems. These are
