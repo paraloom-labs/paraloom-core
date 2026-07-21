@@ -196,6 +196,14 @@ const MAX_VERIFIED_CACHE: usize = 1024;
 /// previous one expires before the quorum submits.
 const MAX_COSIGNS_PER_SETTLEMENT: u32 = 4;
 
+/// Upper bound on the number of per-nullifier co-sign counters retained (#626).
+/// The counter map is never explicitly cleared, so without a ceiling it grows
+/// one entry per settled spend for the life of the process. This is a safety
+/// ceiling, not a working limit: entries are consumed within a co-sign round,
+/// and an evicted entry belongs to an older spend whose nullifiers have almost
+/// certainly settled on chain (a replay of it fails there regardless).
+const MAX_COSIGN_COUNTS: usize = 1024;
+
 /// Insert a verified settlement request into a bounded per-node cache (#260).
 /// The bound is a safety ceiling, not a working limit; if the map is somehow at
 /// capacity for a new key, drop one arbitrary existing entry to make room.
@@ -1006,6 +1014,16 @@ async fn cosign_settlement(
             return declined("co-sign count limit reached for an input nullifier");
         }
         for nf in cap_nullifiers {
+            // Bound the map so it cannot grow without limit as settlements
+            // accumulate (#626): if a new nullifier would exceed the ceiling,
+            // drop an arbitrary existing entry first. An evicted entry belongs
+            // to an older spend whose nullifiers have almost certainly settled
+            // on chain, so resetting its budget is harmless.
+            if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
+                if let Some(victim) = counts.keys().next().cloned() {
+                    counts.remove(&victim);
+                }
+            }
             *counts.entry(nf).or_insert(0) += 1;
         }
     }
@@ -2674,6 +2692,56 @@ mod tests {
         assert_eq!(
             bypass.signature, None,
             "varying the dummy nullifier must not reset the cap for the shared real nullifier"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_counts_map_stays_bounded() {
+        // The counter map is never explicitly cleared, so it must self-bound as
+        // distinct settlements accumulate, or it grows for the life of the
+        // process (#626).
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let recipient = [9u8; 32];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1i64;
+
+        // Co-sign more distinct spends (two fresh nullifiers each) than the
+        // ceiling; the map must never exceed it.
+        for i in 0..(MAX_COSIGN_COUNTS as u64 + 50) {
+            let mut n0 = [0u8; 32];
+            n0[0..8].copy_from_slice(&(2 * i).to_le_bytes());
+            let mut n1 = [0u8; 32];
+            n1[0..8].copy_from_slice(&(2 * i + 1).to_le_bytes());
+            let nullifiers = [n0, n1];
+            let id = format!("s{i}");
+            tas.lock().await.insert(
+                id.clone(),
+                ta_request(&id, recipient, nullifiers, outputs, root, ext_amount),
+            );
+            let payload = ta_payload(
+                kp.pubkey().to_bytes(),
+                recipient,
+                nullifiers,
+                outputs,
+                root,
+                ext_amount,
+            );
+            let _ = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req(&id, SettlementKind::Transact, &payload),
+            )
+            .await;
+        }
+
+        assert!(
+            counts.lock().await.len() <= MAX_COSIGN_COUNTS,
+            "cosign_counts must stay bounded"
         );
     }
 
