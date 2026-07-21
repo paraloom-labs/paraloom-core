@@ -241,9 +241,7 @@ impl JobExecutor {
             // Bound the retained results so they cannot grow without limit as
             // jobs finish (#610): evict an arbitrary older result before adding
             // a new job id past the ceiling.
-            if !completed.contains_key(&result.job_id)
-                && completed.len() >= MAX_COMPLETED_RESULTS
-            {
+            if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
                 if let Some(victim) = completed.keys().next().cloned() {
                     completed.remove(&victim);
                 }
