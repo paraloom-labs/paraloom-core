@@ -293,16 +293,82 @@ mod tests {
         }
     }
 
-    /// Anchor to the canonical circomlib known-answer value for `Poseidon(2)`
-    /// of `[1, 2]`. The Solana `sol_poseidon` syscall implements circomlib, so
-    /// matching this value ties host + gadget to the on-chain hash as well.
+    /// Anchor host **and** gadget to canonical circomlib known-answer values
+    /// across every input width the note construction uses.
+    ///
+    /// Why this matters: `gadget_matches_host_all_widths` only proves our two
+    /// surfaces (arkworks gadget, `light-poseidon` host) agree with *each
+    /// other*. Because the gadget reads its round constants and MDS from the
+    /// same `light-poseidon` parameter tables the host uses, a hypothetical
+    /// non-canonical table would leave both surfaces self-consistent yet be a
+    /// *different hash* from the audited circomlib primitive. These KATs pin the
+    /// tables to circomlib's published outputs, so the commitment/nullifier/
+    /// merkle hashes are the exact audited Poseidon, not an accidental variant.
+    ///
+    /// The values are the iden3 canonical vectors, cross-checked against two
+    /// independent implementations (circomlibjs and go-iden3-crypto — neither
+    /// shares code with `light-poseidon`), so this is a genuine external anchor,
+    /// not a self-comparison. `Poseidon(2)` (`sol_poseidon`) additionally ties
+    /// the on-chain tree hash to circomlib, checked in the program crate too.
+    ///
+    /// Widths anchored by input count: 1 (pubkey, t=2), 2 (merkle, t=3),
+    /// 4 (commitment, t=5), 5 (t=6), 6 (t=7). The one gap is **3 inputs**
+    /// (nullifier/signature, t=4): circomlib's own test tradition anchors t=3
+    /// and t=5, and no published 3-input vector exists in any of the three
+    /// reference sources surveyed. That width is covered transitively — its
+    /// params come from the same `bn254_x5` table generation proven canonical at
+    /// the five surrounding widths, and it is never recomputed by any external
+    /// implementation (on-chain the nullifier is an opaque PDA seed, never
+    /// re-hashed), so host==gadget consistency is the operative property there.
     #[test]
-    fn matches_circomlib_canonical_kat() {
-        let expected = Fr::from_str(
-            "7853200120776062878684798364095072458815029376092732009249414926327459813530",
-        )
-        .unwrap();
-        assert_eq!(circom_poseidon(&[Fr::from(1u64), Fr::from(2u64)]), expected);
-        assert_eq!(gadget_value(&[Fr::from(1u64), Fr::from(2u64)]), expected);
+    fn matches_circomlib_canonical_kats() {
+        let f = |s: &str| Fr::from_str(s).unwrap();
+        let cases: &[(&[u64], &str)] = &[
+            // 1 input, t=2 (pubkey width).
+            (
+                &[1],
+                "18586133768512220936620570745912940619677854269274689475585506675881198879027",
+            ),
+            // 2 inputs, t=3 (merkle node / sol_poseidon width).
+            (
+                &[1, 2],
+                "7853200120776062878684798364095072458815029376092732009249414926327459813530",
+            ),
+            // 4 inputs, t=5 (commitment width).
+            (
+                &[1, 2, 3, 4],
+                "18821383157269793795438455681495246036402687001665670618754263018637548127333",
+            ),
+            // 5 inputs, t=6.
+            (
+                &[1, 2, 0, 0, 0],
+                "1018317224307729531995786483840663576608797660851238720571059489595066344487",
+            ),
+            (
+                &[3, 4, 0, 0, 0],
+                "5811595552068139067952687508729883632420015185677766880877743348592482390548",
+            ),
+            // 6 inputs, t=7.
+            (
+                &[1, 2, 3, 4, 5, 6],
+                "20400040500897583745843009878988256314335038853985262692600694741116813247201",
+            ),
+        ];
+        for (inputs, expected) in cases {
+            let ins: Vec<Fr> = inputs.iter().map(|x| Fr::from(*x)).collect();
+            let want = f(expected);
+            assert_eq!(
+                circom_poseidon(&ins),
+                want,
+                "host != circomlib KAT at {} inputs",
+                ins.len()
+            );
+            assert_eq!(
+                gadget_value(&ins),
+                want,
+                "gadget != circomlib KAT at {} inputs",
+                ins.len()
+            );
+        }
     }
 }
