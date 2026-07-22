@@ -127,6 +127,7 @@ mod tests {
             minimum_stake: 0,
             total_active_stake,
             stake_mint: Pubkey::default(),
+            min_token_stake: 0,
         }
     }
 

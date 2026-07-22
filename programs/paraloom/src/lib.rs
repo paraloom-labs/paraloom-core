@@ -19,14 +19,19 @@ declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
-/// Minimum PARALOOM-token stake a validator must lock, alongside the SOL stake
-/// (dual-stake, tokenomics.mdx). The token is slashable collateral and a demand
-/// sink — a validator slot requires holding and locking it — while the SOL
-/// stake keeps the cost of attacking high even when the token is thin/volatile.
-/// The token is base-unit denominated; the configured `stake_mint` fixes which
-/// token counts (a devnet mock mint in rehearsal, the real mint at mainnet), so
-/// swapping networks is a config change, not a code change. 1e6 base units.
-pub const MIN_TOKEN_STAKE: u64 = 1_000_000;
+/// Recommended PARALOOM-token stake floor for the dual-stake (tokenomics.mdx):
+/// 1,000,000 PARALOOM = 1e12 base units at 6 decimals, roughly at parity with
+/// the 1-SOL floor at launch prices. The token is slashable collateral and a
+/// demand sink — a validator slot requires locking it — while the SOL stake
+/// keeps the attack cost high even when the token is thin/volatile.
+///
+/// This constant is NOT enforced directly. The ENFORCED floor is the config
+/// field [`ValidatorRegistry::min_token_stake`], set by the cold/DAO authority
+/// via `set_min_token_stake` so it can track the token's price without a
+/// redeploy. It defaults to 0 at `initialize`, so a fresh deploy opens the
+/// token gate deliberately (like the deposit cap). This value is what the
+/// deploy runbook and governance should set it to.
+pub const RECOMMENDED_MIN_TOKEN_STAKE: u64 = 1_000_000_000_000;
 
 /// Slots a validator's stake stays locked after it unregisters (or is slashed
 /// below the minimum) before it can be withdrawn. ~1 day at ~2.5 slots/s. The
@@ -560,6 +565,27 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Set the dual-stake token floor (`ValidatorRegistry.min_token_stake`): the
+    /// minimum PARALOOM-token stake `register_validator` requires alongside the
+    /// SOL stake.
+    ///
+    /// Config rather than a compile-time constant so the floor tracks the
+    /// token's (volatile, thin) market price without a redeploy — raise it as
+    /// the token appreciates, lower it if it falls, keeping the real cost of a
+    /// validator slot roughly stable. Starts at 0 (token gate open) at
+    /// `initialize`; the runbook sets it to `RECOMMENDED_MIN_TOKEN_STAKE`.
+    ///
+    /// Gated on the registry authority — the cold key today, a DAO/governance
+    /// PDA once parameter control migrates to token holders.
+    pub fn set_min_token_stake(ctx: Context<SetMinTokenStake>, new_min: u64) -> Result<()> {
+        let registry = &mut ctx.accounts.validator_registry;
+        let previous = registry.min_token_stake;
+        registry.min_token_stake = new_min;
+
+        msg!("Min token stake set: {} -> {}", previous, new_min);
+        Ok(())
+    }
+
     /// Register a validator
     pub fn register_validator(
         ctx: Context<RegisterValidator>,
@@ -571,11 +597,13 @@ pub mod paraloom_program {
             BridgeError::InsufficientStake
         );
         // Dual-stake: a validator slot requires locking the token half too
-        // (tokenomics.mdx). Both minimums must be met — the SOL stake keeps the
-        // attack cost high and stable, the token stake is the slashable
-        // demand-sink collateral.
+        // (tokenomics.mdx). The token floor is the registry's configurable
+        // `min_token_stake` (set by the cold/DAO authority so it tracks the
+        // token price without a redeploy), not a compile-time constant. The SOL
+        // stake keeps the attack cost high and stable; the token stake is the
+        // slashable demand-sink collateral.
         require!(
-            token_stake_amount >= MIN_TOKEN_STAKE,
+            token_stake_amount >= ctx.accounts.validator_registry.min_token_stake,
             BridgeError::InsufficientTokenStake
         );
 
@@ -927,6 +955,10 @@ pub mod paraloom_program {
         // as the token half. The shared `stake_token_vault` is created by the
         // context's `init` constraint under the `stake_vault_authority` PDA.
         registry.stake_mint = ctx.accounts.stake_mint.key();
+        // Token gate opens deliberately: 0 means no token floor until the
+        // cold/DAO authority raises it via `set_min_token_stake` (like the
+        // deposit cap). Set it to `RECOMMENDED_MIN_TOKEN_STAKE` at deploy.
+        registry.min_token_stake = 0;
 
         msg!(
             "Validator registry initialized (stake_mint {})",
@@ -1059,6 +1091,9 @@ pub mod paraloom_program {
             // `stake_token_vault` is created once by `initialize_validator_registry`
             // (or a dedicated vault-init on the redeploy runbook).
             stake_mint,
+            // Reset to the open (0) token gate; the authority re-establishes the
+            // real floor via `set_min_token_stake` after the redeploy.
+            min_token_stake: 0,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1476,6 +1511,21 @@ pub struct SetDepositCap<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetMinTokenStake<'info> {
+    // Gated on the registry authority (the cold key today, a DAO/governance PDA
+    // once parameter control migrates to token holders).
+    #[account(
+        mut,
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeValidatorRegistry<'info> {
     #[account(
         init,
@@ -1870,6 +1920,12 @@ pub struct ValidatorRegistry {
     /// rehearsal, the real PARALOOM mint at mainnet — swapping is a config
     /// change. Appended last to keep the existing field offsets unchanged.
     pub stake_mint: Pubkey,
+    /// The enforced token-stake floor for the dual-stake: `register_validator`
+    /// requires `token_stake_amount >= min_token_stake`. Config (settable by the
+    /// cold/DAO authority via `set_min_token_stake`) so it tracks the token's
+    /// price without a redeploy. Defaults to 0 at `initialize`, so a fresh
+    /// deploy opens the token gate deliberately. See [`RECOMMENDED_MIN_TOKEN_STAKE`].
+    pub min_token_stake: u64,
 }
 
 #[account]
