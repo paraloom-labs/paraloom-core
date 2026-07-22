@@ -165,6 +165,27 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     )
     .await;
 
+    // 3b. open the deposit cap so step 6's `deposit_note` is not rejected by the
+    //     TVL cap (`initialize` leaves it at 0). The vault is pre-funded with
+    //     2 SOL in step 5 before that deposit, so use an unbounded cap here —
+    //     this test exercises settlement, not the cap. Cold-authority signed.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetDepositCap { new_cap: u64::MAX }.data(),
+            accounts: accounts::SetDepositCap {
+                bridge_state: state_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
     // 4. register the settling authority as a validator (stakes 1 SOL).
     send(
         &mut banks_client,
