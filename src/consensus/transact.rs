@@ -374,8 +374,14 @@ impl TransactVerificationCoordinator {
                 }
             }
             None => {
+                // Register with ZERO stake (fail-closed): a freshly-seen peer
+                // carries no quorum weight until the on-chain stake reconciler
+                // (`sync_onchain_stakes`) reads its real, at-risk stake from its
+                // `ValidatorAccount`. The old placeholder gave every connected
+                // peer a fixed stake, collapsing the stake-weighted quorum into
+                // head-count and making it Sybil-forgeable.
                 leader_selector.register_validator(
-                    ValidatorInfo::new(validator, 10_000_000_000, 1000).with_wallet(wallet_pubkey),
+                    ValidatorInfo::new(validator, 0, 1000).with_wallet(wallet_pubkey),
                 );
             }
         }
@@ -405,6 +411,24 @@ impl TransactVerificationCoordinator {
         log::info!(
             "Validator unregistered from active transact consensus set (reputation preserved): {:?}",
             validator
+        );
+    }
+
+    /// Reconcile the consensus set's stakes with on-chain reality: set each
+    /// validator's stake to the value read from its `ValidatorAccount` (keyed by
+    /// co-sign wallet), or 0 if it has no active on-chain registration.
+    ///
+    /// This is what makes the stake-weighted quorum real. Connectivity
+    /// registration (`register_validator_with_wallet`) now seeds 0 stake; this
+    /// pass, driven periodically by the node from
+    /// `ProgramInterface::list_validator_stakes`, fills in the true at-risk
+    /// stake so an unregistered/unstaked peer can never reach a supermajority.
+    pub async fn sync_onchain_stakes(&self, stakes: std::collections::HashMap<String, u64>) {
+        let mut leader_selector = self.leader_selector.write().await;
+        leader_selector.apply_onchain_stakes(&stakes);
+        log::debug!(
+            "Reconciled consensus stakes against on-chain state ({} staked wallets)",
+            stakes.len()
         );
     }
 

@@ -23,8 +23,8 @@ pub use instructions::{
     create_unregister_validator_instruction, create_withdraw_unbonded_stake_instruction,
     derive_asset_vault, derive_asset_vault_authority, derive_associated_token_address,
     derive_bridge_state, derive_bridge_vault, derive_nullifier_account, derive_program_data,
-    derive_validator_account, derive_validator_registry, DepositInstructionData,
-    SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+    derive_stake_token_vault, derive_validator_account, derive_validator_registry,
+    DepositInstructionData, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
 pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;
@@ -102,6 +102,12 @@ impl SolanaBridge {
     /// Current slot, for deriving a settlement's expiration window.
     pub async fn current_slot(&self) -> Result<u64> {
         self.program.get_slot().await
+    }
+
+    /// Active validators' on-chain stakes (wallet → lamports), for the consensus
+    /// stake reconciler.
+    pub async fn list_validator_stakes(&self) -> Result<Vec<(solana_sdk::pubkey::Pubkey, u64)>> {
+        self.program.list_validator_stakes().await
     }
 
     /// Submit a pre-assembled, co-signed settlement transaction (#260).

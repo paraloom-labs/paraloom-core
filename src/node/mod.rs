@@ -1519,6 +1519,39 @@ impl Node {
             info!("Consensus validator-set reconciler spawned (interval 30s)");
         }
 
+        // On-chain stake reconciler (#333/#627/#611). The connectivity
+        // reconciler above registers peers with ZERO stake; this task reads
+        // every validator's real stake from its on-chain `ValidatorAccount`
+        // (one `getProgramAccounts` call) and applies it to the consensus set,
+        // keyed by co-sign wallet. The stake-weighted quorum then reflects real
+        // at-risk capital — an unregistered/unstaked peer carries no weight and
+        // cannot Sybil its way to a supermajority. Fail-closed: any validator
+        // whose wallet has no active on-chain account stays at 0.
+        if let (Some(bridge), Some(transact)) =
+            (self.bridge.clone(), self.transact_coordinator.clone())
+        {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    let stakes = { bridge.lock().await.list_validator_stakes().await };
+                    match stakes {
+                        Ok(list) => {
+                            let map: std::collections::HashMap<String, u64> = list
+                                .into_iter()
+                                .map(|(wallet, stake)| (wallet.to_string(), stake))
+                                .collect();
+                            transact.sync_onchain_stakes(map).await;
+                        }
+                        Err(e) => {
+                            log::debug!("on-chain stake reconcile skipped this tick: {e}")
+                        }
+                    }
+                }
+            });
+            info!("On-chain validator-stake reconciler spawned (interval 60s)");
+        }
+
         // Reserve a relay slot AFTER bootstrap (#226). Order matters: when
         // relay_address points at a node we also bootstrap from (the common
         // case — the anchor is both bootstrap and relay), the bootstrap dial

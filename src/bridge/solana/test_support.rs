@@ -154,6 +154,14 @@ impl BridgeRpc for MockBridgeRpc {
         take(&self.next_get_account, "get_account")
     }
 
+    async fn get_program_accounts(
+        &self,
+        _program_id: &Pubkey,
+        _config: solana_client::rpc_config::RpcProgramAccountsConfig,
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        Ok(Vec::new())
+    }
+
     async fn send_and_confirm_transaction(&self, _tx: &Transaction) -> Result<Signature> {
         take(&self.next_send_and_confirm, "send_and_confirm_transaction")
     }

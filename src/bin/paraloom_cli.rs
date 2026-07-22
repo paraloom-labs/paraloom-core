@@ -1409,24 +1409,36 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Anchor discriminator for `register_validator` + stake (u64 LE).
-                let discriminator: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
-                let mut data = discriminator.to_vec();
-                data.extend_from_slice(&STAKE_LAMPORTS.to_le_bytes());
+                // Dual-stake: read the registry's pinned stake mint and derive
+                // this validator's token account (the token half is transferred
+                // from it). ValidatorRegistry layout after the 8-byte
+                // discriminator: authority[8..40], three u64 counters [40..64],
+                // total_active_stake[64..72], stake_mint[72..104].
+                let registry_data = client
+                    .get_account_data(&validator_registry_pda)
+                    .context("Failed to read validator registry (is it initialized?)")?;
+                anyhow::ensure!(
+                    registry_data.len() >= 104,
+                    "validator registry predates the dual-stake layout (no stake_mint) — redeploy the program first"
+                );
+                let stake_mint = Pubkey::new_from_array(
+                    registry_data[72..104]
+                        .try_into()
+                        .expect("32-byte stake_mint slice"),
+                );
+                let validator_token =
+                    derive_associated_token_address(&validator.pubkey(), &stake_mint);
 
-                let ix = solana_sdk::instruction::Instruction {
-                    program_id,
-                    accounts: vec![
-                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
-                        solana_sdk::instruction::AccountMeta::new_readonly(
-                            solana_sdk::system_program::ID,
-                            false,
-                        ),
-                    ],
-                    data,
-                };
+                // The token half of the dual-stake (== MIN_TOKEN_STAKE).
+                const TOKEN_STAKE: u64 = 1_000_000;
+                let ix = create_register_validator_instruction(
+                    &program_id,
+                    &validator.pubkey(),
+                    &validator_token,
+                    STAKE_LAMPORTS,
+                    TOKEN_STAKE,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
 
                 let blockhash = client
                     .get_latest_blockhash()

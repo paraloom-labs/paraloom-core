@@ -4,6 +4,9 @@
 
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, Result, SolanaAddress};
+use solana_account_decoder::UiAccountEncoding;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction};
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
@@ -59,6 +62,47 @@ impl ProgramInterface {
     /// Get program ID
     pub fn program_id(&self) -> &Pubkey {
         &self.program_id
+    }
+
+    /// Read every on-chain `ValidatorAccount` in one `getProgramAccounts` call
+    /// and return `(validator_wallet, stake_amount)` for the ACTIVE ones. The
+    /// validator-stake reconciler weights the consensus set by this real
+    /// on-chain stake instead of a placeholder, so the stake-weighted quorum
+    /// reflects actual at-risk capital.
+    ///
+    /// Base64 encoding is requested because a current `ValidatorAccount` is 129
+    /// bytes and the RPC rejects base58 above 128. The layout after the 8-byte
+    /// discriminator is `wallet[8..40]`, `stake_amount[40..48]`, and the
+    /// `is_active` flag at byte 88.
+    pub async fn list_validator_stakes(&self) -> Result<Vec<(Pubkey, u64)>> {
+        // sha256("account:ValidatorAccount")[..8].
+        const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
+        let config = RpcProgramAccountsConfig {
+            filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+                0,
+                VALIDATOR_DISC.to_vec(),
+            ))]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let accounts = self
+            .rpc
+            .get_program_accounts(&self.program_id, config)
+            .await?;
+        let mut stakes = Vec::with_capacity(accounts.len());
+        for (_pda, acc) in accounts {
+            let d = &acc.data;
+            if d.len() < 89 || d[0..8] != VALIDATOR_DISC || d[88] == 0 {
+                continue; // wrong account, truncated, or inactive
+            }
+            let wallet = Pubkey::new_from_array(d[8..40].try_into().expect("32-byte wallet"));
+            let stake = u64::from_le_bytes(d[40..48].try_into().expect("8-byte stake"));
+            stakes.push((wallet, stake));
+        }
+        Ok(stakes)
     }
 
     /// Verify a deposit transaction exists on Solana

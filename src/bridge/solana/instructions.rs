@@ -262,18 +262,33 @@ pub fn create_deactivate_validator_instruction(
 
 /// Create a `register_validator` instruction. Permissionless: the validator
 /// signs for itself and stakes `stake_amount` lamports (>= MIN_VALIDATOR_STAKE).
+/// Derive the shared stake-token vault PDA (`[b"stake_token_vault"]`), the
+/// program-owned token account every validator's token stake is locked in.
+pub fn derive_stake_token_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"stake_token_vault"], program_id)
+}
+
+/// Build a dual-stake `register_validator` instruction. `stake_amount` is the
+/// SOL half (lamports, moved into the validator PDA); `token_stake_amount` is
+/// the PARALOOM-token half, transferred from `validator_token_account` into the
+/// shared stake vault. `validator_token_account` must hold the registry's
+/// pinned `stake_mint`. Account order matches the on-chain `RegisterValidator`
+/// context.
+#[allow(clippy::too_many_arguments)]
 pub fn create_register_validator_instruction(
     program_id: &Pubkey,
     validator: &Pubkey,
+    validator_token_account: &Pubkey,
     stake_amount: u64,
+    token_stake_amount: u64,
 ) -> Result<Instruction> {
     let (validator_pda, _) = derive_validator_account(program_id, validator);
     let (registry_pda, _) = derive_validator_registry(program_id);
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
 
     let mut instruction_data = discriminators::REGISTER_VALIDATOR.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&stake_amount).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
+    instruction_data.extend_from_slice(&stake_amount.to_le_bytes());
+    instruction_data.extend_from_slice(&token_stake_amount.to_le_bytes());
 
     Ok(Instruction {
         program_id: *program_id,
@@ -281,6 +296,9 @@ pub fn create_register_validator_instruction(
             AccountMeta::new(validator_pda, false),
             AccountMeta::new(registry_pda, false),
             AccountMeta::new(*validator, true),
+            AccountMeta::new(*validator_token_account, false),
+            AccountMeta::new(stake_token_vault, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data: instruction_data,
