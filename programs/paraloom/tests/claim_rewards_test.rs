@@ -197,6 +197,7 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
             }
             .data(),
             accounts: accounts::RegisterValidator {
+                stake_mint,
                 validator_account: validator_pda,
                 validator_token_account: authority_token,
                 stake_token_vault: Pubkey::find_program_address(
@@ -241,6 +242,7 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
             }
             .data(),
             accounts: accounts::RegisterValidator {
+                stake_mint,
                 validator_account: cosigner_pda,
                 validator_token_account: cosigner_token,
                 stake_token_vault: Pubkey::find_program_address(

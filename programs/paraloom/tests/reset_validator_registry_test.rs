@@ -29,6 +29,7 @@ fn register_ix(
     program_id: Pubkey,
     registry_pda: Pubkey,
     validator: Pubkey,
+    stake_mint: Pubkey,
     validator_token: Pubkey,
 ) -> (Instruction, Pubkey) {
     let (validator_pda, _) =
@@ -44,6 +45,7 @@ fn register_ix(
             validator_account: validator_pda,
             validator_registry: registry_pda,
             validator,
+            stake_mint,
             validator_token_account: validator_token,
             stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
             token_program: spl_token::id(),
@@ -118,12 +120,24 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
     banks.process_transaction(tx).await.unwrap();
 
     // Register validator A (payer) and validator B.
-    let (reg_a, pda_a) = register_ix(program_id, registry_pda, validator_a.pubkey(), token_a);
+    let (reg_a, pda_a) = register_ix(
+        program_id,
+        registry_pda,
+        validator_a.pubkey(),
+        stake_mint,
+        token_a,
+    );
     let mut tx = Transaction::new_with_payer(&[reg_a], Some(&validator_a.pubkey()));
     tx.sign(&[&validator_a], blockhash);
     banks.process_transaction(tx).await.unwrap();
 
-    let (reg_b, _pda_b) = register_ix(program_id, registry_pda, validator_b.pubkey(), token_b);
+    let (reg_b, _pda_b) = register_ix(
+        program_id,
+        registry_pda,
+        validator_b.pubkey(),
+        stake_mint,
+        token_b,
+    );
     let mut tx = Transaction::new_with_payer(&[reg_b], Some(&validator_b.pubkey()));
     tx.sign(&[&validator_b], blockhash);
     banks.process_transaction(tx).await.unwrap();

@@ -66,6 +66,7 @@ async fn register_validator_initializes_account_and_counters() {
         }
         .data(),
         accounts: accounts::RegisterValidator {
+            stake_mint,
             validator_token_account: validator_token,
             stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
             token_program: spl_token::id(),

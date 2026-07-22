@@ -90,6 +90,7 @@ async fn update_reputation_overwrites_score() {
             }
             .data(),
             accounts: accounts::RegisterValidator {
+                stake_mint,
                 validator_token_account: validator_token,
                 stake_token_vault: Pubkey::find_program_address(
                     &[b"stake_token_vault"],

@@ -221,6 +221,7 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
             }
             .data(),
             accounts: accounts::RegisterValidator {
+                stake_mint,
                 validator_account: validator_pda,
                 validator_token_account: authority_token,
                 stake_token_vault: Pubkey::find_program_address(
@@ -266,6 +267,7 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
             }
             .data(),
             accounts: accounts::RegisterValidator {
+                stake_mint,
                 validator_account: cosigner_pda,
                 validator_token_account: cosigner_token,
                 stake_token_vault: Pubkey::find_program_address(

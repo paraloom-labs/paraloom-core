@@ -115,6 +115,7 @@ async fn stake_unbonds_then_withdraws_after_delay() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -186,7 +187,7 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     let err = send(
         &mut ctx,
         &validator,
-        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
     )
     .await
     .expect_err("early withdraw must fail");
@@ -206,7 +207,7 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     send(
         &mut ctx,
         &validator,
-        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
     )
     .await
     .expect("withdraw after delay");
@@ -236,6 +237,7 @@ async fn stake_unbonds_then_withdraws_after_delay() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -288,6 +290,7 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -331,7 +334,7 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     let err = send(
         &mut ctx,
         &validator,
-        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
     )
     .await
     .expect_err("rent-only close must still wait for the unbonding slot");
@@ -348,7 +351,7 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     send(
         &mut ctx,
         &validator,
-        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
     )
     .await
     .expect("rent-only close after delay");
@@ -375,6 +378,7 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -426,6 +430,7 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -491,7 +496,7 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     send(
         &mut ctx,
         &validator,
-        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
     )
     .await
     .expect("deactivated validator must be able to withdraw its unbonded stake");

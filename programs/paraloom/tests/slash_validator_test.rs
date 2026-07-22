@@ -87,6 +87,7 @@ async fn slash_reduces_stake_and_credits_vault() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -181,6 +182,7 @@ async fn slash_above_minimum_keeps_validator_active() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             2 * MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
@@ -269,6 +271,7 @@ async fn slash_inactive_validator_burns_unbonding() {
         register_validator_ix(
             program_id,
             validator.pubkey(),
+            stake_mint,
             validator_token,
             MIN_VALIDATOR_STAKE,
             TOKEN_STAKE,
