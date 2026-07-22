@@ -4,7 +4,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use libp2p::futures::StreamExt;
 use libp2p::{
-    autonat, dcutr,
+    autonat,
+    connection_limits::{self, ConnectionLimits},
+    dcutr,
     gossipsub::{self, Behaviour as Gossipsub, IdentTopic, MessageAuthenticity},
     identify, identity,
     kad::{store::MemoryStore, Behaviour as Kademlia, Event as KadEvent, Mode as KadMode},
@@ -105,6 +107,13 @@ pub struct ParaloomBehaviour {
     /// identify the hole-punch attempt fails immediately with
     /// `NoAddresses`. Also lets peers learn each other's protocol set.
     pub identify: identify::Behaviour,
+    /// Connection caps (#343). Bounds established connections per peer (both
+    /// sides dialing keeps at most a couple) and globally, so a flapping NATed
+    /// peer reconnecting can't grow the socket count without bound. Paired with
+    /// the swarm's idle-connection timeout (set on the builder), which reaps
+    /// connections that go quiet instead of letting dead peers linger as
+    /// ESTABLISHED until OS TCP keepalive notices.
+    pub connection_limits: connection_limits::Behaviour,
 }
 
 /// Network event handler
@@ -372,8 +381,25 @@ impl NetworkManager {
                 relay_client,
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 identify,
+                // Bound sockets per peer and globally (#343). Per-peer headroom
+                // (8) covers legitimate concurrent connections — direct + relay
+                // circuit + a DCUtR hole-punch in flight + a simultaneous open —
+                // while stopping a flapping NATed peer from piling up sockets;
+                // the global cap is a coarse backstop for a busy anchor.
+                connection_limits: connection_limits::Behaviour::new(
+                    ConnectionLimits::default()
+                        .with_max_established_per_peer(Some(8))
+                        .with_max_established(Some(1024)),
+                ),
             })
             .map_err(|e| anyhow!("building swarm behaviour: {}", e))?
+            .with_swarm_config(|c| {
+                // Reap connections that go idle (no active streams) after a
+                // minute, so dead NAT peers don't linger as ESTABLISHED until
+                // OS TCP keepalive notices (#343). A live mesh peer keeps its
+                // connection warm via gossipsub/ping/kad traffic.
+                c.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+            })
             .build();
 
         Ok(NetworkManager {
