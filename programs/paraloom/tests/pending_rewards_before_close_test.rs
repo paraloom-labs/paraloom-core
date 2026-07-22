@@ -106,6 +106,7 @@ async fn withdraw_unbonded_stake_rejects_while_rewards_are_unclaimed() {
         program_id,
         data: instruction::WithdrawUnbondedStake {}.data(),
         accounts: accounts::WithdrawUnbondedStake {
+            stake_mint,
             validator_account: validator_pda,
             validator: validator.pubkey(),
             validator_token_account: validator_token,

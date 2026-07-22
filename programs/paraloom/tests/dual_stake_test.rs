@@ -82,6 +82,7 @@ async fn register_locks_both_stakes_and_slash_burns_the_token() {
         }
         .data(),
         accounts: accounts::RegisterValidator {
+            stake_mint,
             validator_account: validator_pda,
             validator_registry: registry_pda,
             validator: validator.pubkey(),
@@ -206,6 +207,7 @@ async fn register_rejects_token_stake_below_minimum() {
         }
         .data(),
         accounts: accounts::RegisterValidator {
+            stake_mint,
             validator_account: validator_pda,
             validator_registry: registry_pda,
             validator: validator.pubkey(),

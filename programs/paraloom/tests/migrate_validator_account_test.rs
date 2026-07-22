@@ -332,6 +332,7 @@ async fn migrate_staked_legacy_account_stays_withdrawable() {
             program_id,
             data: instruction::WithdrawUnbondedStake {}.data(),
             accounts: accounts::WithdrawUnbondedStake {
+                stake_mint,
                 validator_account: validator_pda,
                 validator: validator.pubkey(),
                 validator_token_account: validator_token,

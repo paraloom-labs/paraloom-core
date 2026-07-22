@@ -4,7 +4,9 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::bpf_loader_upgradeable;
-use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
+use anchor_spl::token_interface::{
+    self, Burn, Mint, TokenAccount, TokenInterface, TransferChecked,
+};
 
 mod groth16;
 pub mod merkle_tree;
@@ -595,16 +597,21 @@ pub mod paraloom_program {
         // Move the token half into the shared vault. The validator signs for its
         // own token account; the mint is pinned to `registry.stake_mint` by the
         // context, so no worthless substitute token can be staked.
-        token::transfer(
+        // `transfer_checked` (with the mint + decimals) is the Token-2022-safe
+        // form and works for classic SPL tokens too — the real PARALOOM mint is
+        // a Token-2022 mint (metadata extension only).
+        token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from: ctx.accounts.validator_token_account.to_account_info(),
+                    mint: ctx.accounts.stake_mint.to_account_info(),
                     to: ctx.accounts.stake_token_vault.to_account_info(),
                     authority: ctx.accounts.validator.to_account_info(),
                 },
             ),
             token_stake_amount,
+            ctx.accounts.stake_mint.decimals,
         )?;
 
         let validator_account = &mut ctx.accounts.validator_account;
@@ -875,7 +882,7 @@ pub mod paraloom_program {
         if token_slash > 0 {
             let auth_bump = ctx.bumps.stake_vault_authority;
             let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
-            token::burn(
+            token_interface::burn(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
                     Burn {
@@ -1159,17 +1166,19 @@ pub mod paraloom_program {
         if token_amount > 0 {
             let auth_bump = ctx.bumps.stake_vault_authority;
             let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
-            token::transfer(
+            token_interface::transfer_checked(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
-                    Transfer {
+                    TransferChecked {
                         from: ctx.accounts.stake_token_vault.to_account_info(),
+                        mint: ctx.accounts.stake_mint.to_account_info(),
                         to: ctx.accounts.validator_token_account.to_account_info(),
                         authority: ctx.accounts.stake_vault_authority.to_account_info(),
                     },
                     signer_seeds,
                 ),
                 token_amount,
+                ctx.accounts.stake_mint.decimals,
             )?;
         }
 
@@ -1483,7 +1492,7 @@ pub struct InitializeValidatorRegistry<'info> {
     /// The SPL mint fixed as the dual-stake token half (recorded in
     /// `registry.stake_mint`). A devnet mock mint in rehearsal, the real
     /// PARALOOM mint at mainnet.
-    pub stake_mint: Account<'info, Mint>,
+    pub stake_mint: InterfaceAccount<'info, Mint>,
 
     /// Shared vault holding every validator's locked token stake, owned by the
     /// `stake_vault_authority` PDA. Created here once; `register_validator`
@@ -1495,8 +1504,9 @@ pub struct InitializeValidatorRegistry<'info> {
         bump,
         token::mint = stake_mint,
         token::authority = stake_vault_authority,
+        token::token_program = token_program,
     )]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
 
     /// PDA that owns `stake_token_vault`; signs token outflows on withdraw/slash.
     ///
@@ -1515,7 +1525,7 @@ pub struct InitializeValidatorRegistry<'info> {
     )]
     pub program_data: UncheckedAccount<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
@@ -1568,6 +1578,11 @@ pub struct RegisterValidator<'info> {
     #[account(mut)]
     pub validator: Signer<'info>,
 
+    /// The dual-stake mint (pinned to the registry's), needed for the
+    /// `transfer_checked` into the vault.
+    #[account(address = validator_registry.stake_mint)]
+    pub stake_mint: InterfaceAccount<'info, Mint>,
+
     /// The validator's token account holding the token stake to lock. Its mint
     /// must be the registry's pinned `stake_mint` and it must be owned by the
     /// registering validator.
@@ -1576,7 +1591,7 @@ pub struct RegisterValidator<'info> {
         token::mint = validator_registry.stake_mint,
         token::authority = validator,
     )]
-    pub validator_token_account: Account<'info, TokenAccount>,
+    pub validator_token_account: InterfaceAccount<'info, TokenAccount>,
 
     /// Shared token-stake vault (destination for the locked token half).
     #[account(
@@ -1584,9 +1599,9 @@ pub struct RegisterValidator<'info> {
         seeds = [b"stake_token_vault"],
         bump,
     )]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1690,6 +1705,11 @@ pub struct WithdrawUnbondedStake<'info> {
     #[account(mut)]
     pub validator: Signer<'info>,
 
+    /// The dual-stake mint (the vault's), needed for the `transfer_checked`
+    /// return.
+    #[account(address = stake_token_vault.mint)]
+    pub stake_mint: InterfaceAccount<'info, Mint>,
+
     /// Destination for the returned token stake — the validator's own token
     /// account, of the same mint the vault holds.
     #[account(
@@ -1697,20 +1717,20 @@ pub struct WithdrawUnbondedStake<'info> {
         constraint = validator_token_account.mint == stake_token_vault.mint,
         token::authority = validator,
     )]
-    pub validator_token_account: Account<'info, TokenAccount>,
+    pub validator_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         seeds = [b"stake_token_vault"],
         bump,
     )]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: PDA that owns the vault; pinned by seeds, signs the token return.
     #[account(seeds = [b"stake_vault_authority"], bump)]
     pub stake_vault_authority: UncheckedAccount<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -1770,20 +1790,20 @@ pub struct SlashValidator<'info> {
         mut,
         address = validator_registry.stake_mint
     )]
-    pub stake_mint: Account<'info, Mint>,
+    pub stake_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
         seeds = [b"stake_token_vault"],
         bump,
     )]
-    pub stake_token_vault: Account<'info, TokenAccount>,
+    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: PDA that owns the vault; pinned by seeds, signs the token burn.
     #[account(seeds = [b"stake_vault_authority"], bump)]
     pub stake_vault_authority: UncheckedAccount<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 
     pub authority: Signer<'info>,
 }

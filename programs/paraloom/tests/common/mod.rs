@@ -241,6 +241,7 @@ pub fn init_validator_registry_ix(
 pub fn register_validator_ix(
     program_id: Pubkey,
     validator: Pubkey,
+    stake_mint: Pubkey,
     validator_token_account: Pubkey,
     sol_stake: u64,
     token_stake: u64,
@@ -260,6 +261,7 @@ pub fn register_validator_ix(
             validator_account: validator_pda,
             validator_registry: registry,
             validator,
+            stake_mint,
             validator_token_account,
             stake_token_vault: vault,
             token_program: spl_token::id(),
@@ -307,6 +309,7 @@ pub fn slash_validator_ix(
 pub fn withdraw_unbonded_ix(
     program_id: Pubkey,
     validator: Pubkey,
+    stake_mint: Pubkey,
     validator_token_account: Pubkey,
 ) -> Instruction {
     let (vault, vault_authority) = stake_vault_pdas(program_id);
@@ -318,6 +321,7 @@ pub fn withdraw_unbonded_ix(
         accounts: paraloom_program::accounts::WithdrawUnbondedStake {
             validator_account: validator_pda,
             validator,
+            stake_mint,
             validator_token_account,
             stake_token_vault: vault,
             stake_vault_authority: vault_authority,
