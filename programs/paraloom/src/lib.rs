@@ -157,6 +157,11 @@ pub mod paraloom_program {
         bridge_state.withdrawal_count = 0;
         bridge_state.paused = false;
         bridge_state.merkle_root = initial_merkle_root;
+        // Fail closed: the pool accepts no deposits until the cold authority
+        // sets a cap via `set_deposit_cap`. A fresh deploy is never silently
+        // uncapped (which would be the exact unbounded-loss risk the cap
+        // exists to remove).
+        bridge_state.deposit_cap = 0;
 
         msg!(
             "Bridge initialized with merkle root, program_version={}",
@@ -194,6 +199,22 @@ pub mod paraloom_program {
         // parity with the checks `transact` already applies to its field inputs.
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
+
+        // TVL cap: refuse any deposit that would push the vault's *current*
+        // balance past `deposit_cap`, bounding total funds-at-risk to the cap.
+        // Checked against the live vault balance (not cumulative deposits) and
+        // before moving funds, so a rejected deposit never touches the vault.
+        // Cap starts at 0 (deposits closed) until the cold authority raises it.
+        let projected_vault_balance = ctx
+            .accounts
+            .bridge_vault
+            .lamports()
+            .checked_add(amount)
+            .ok_or(BridgeError::InvalidAmount)?;
+        require!(
+            projected_vault_balance <= ctx.accounts.bridge_state.deposit_cap,
+            BridgeError::DepositCapExceeded
+        );
 
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
@@ -500,6 +521,30 @@ pub mod paraloom_program {
             previous,
             new_authority
         );
+        Ok(())
+    }
+
+    /// Set the pool deposit cap: the maximum the vault's current balance may
+    /// reach via deposits.
+    ///
+    /// The cap bounds total funds-at-risk — under any bug the pool can lose no
+    /// more than the vault can hold, and the vault can never exceed this value.
+    /// It starts at 0 (deposits closed) at `initialize`, so opening the pool is
+    /// a deliberate act with a chosen ceiling. The operator can raise it as a
+    /// capped beta earns trust, or lower it to throttle new inflows (existing
+    /// notes stay withdrawable; only new deposits are gated). Lowering below the
+    /// current vault balance simply blocks further deposits until withdrawals
+    /// bring the balance back under the cap.
+    ///
+    /// Gated on the COLD registry authority (like `pause`/`set_bridge_authority`,
+    /// not the hot settlement key), so a compromise of the deliberately-hot
+    /// settlement key cannot lift the loss ceiling.
+    pub fn set_deposit_cap(ctx: Context<SetDepositCap>, new_cap: u64) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+        let previous = bridge_state.deposit_cap;
+        bridge_state.deposit_cap = new_cap;
+
+        msg!("Deposit cap set: {} -> {}", previous, new_cap);
         Ok(())
     }
 
@@ -1272,6 +1317,28 @@ pub struct SetBridgeAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetDepositCap<'info> {
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    // Cold-authority gated (see `Pause`): raising the loss ceiling must stay
+    // off the hot settlement host, so a compromised settlement key cannot lift
+    // the cap and enlarge the funds it can reach.
+    #[account(
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeValidatorRegistry<'info> {
     #[account(
         init,
@@ -1529,6 +1596,15 @@ pub struct BridgeState {
     /// `BridgeState` account layout byte-compatible with already-deployed
     /// state; do not reintroduce a reader.
     pub merkle_root: [u8; 32],
+    /// Maximum the vault's **current** lamport balance may reach via deposits
+    /// (the TVL cap). Bounds total funds-at-risk: no bug can lose more than the
+    /// vault can hold, and `deposit_note` refuses any deposit that would push
+    /// the live balance past this. It is the *current* value, not cumulative
+    /// deposits, so withdrawals free headroom and the ceiling tracks live TVL.
+    /// Initialised to `0` (deposits closed) — the cold authority opens the pool
+    /// to a chosen ceiling via `set_deposit_cap`. Appended last to keep the
+    /// fixed `program_version` offset the L2 reads unchanged.
+    pub deposit_cap: u64,
 }
 
 #[account]
@@ -1695,4 +1771,7 @@ pub enum BridgeError {
 
     #[msg("Merkle root is not in the on-chain root history")]
     UnknownMerkleRoot,
+
+    #[msg("Deposit would push the vault balance past the deposit cap")]
+    DepositCapExceeded,
 }

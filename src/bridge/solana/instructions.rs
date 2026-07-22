@@ -40,6 +40,10 @@ pub mod discriminators {
     /// `sha256("global:set_bridge_authority")[..8]`. Rotates the bridge
     /// settlement authority (admin op, current-authority-signed).
     pub const SET_BRIDGE_AUTHORITY: [u8; 8] = [158, 241, 140, 64, 226, 16, 99, 251];
+    /// `sha256("global:set_deposit_cap")[..8]`. Sets the TVL cap (the max the
+    /// vault's current balance may reach via deposits). Cold-authority signed,
+    /// like `pause`; opens/raises/lowers the pool's loss ceiling.
+    pub const SET_DEPOSIT_CAP: [u8; 8] = [30, 43, 219, 90, 254, 4, 85, 236];
     /// `sha256("global:initialize_validator_registry")[..8]`.
     pub const INITIALIZE_VALIDATOR_REGISTRY: [u8; 8] = [168, 49, 128, 236, 25, 7, 168, 85];
     /// `sha256("global:register_validator")[..8]`.
@@ -569,6 +573,36 @@ pub fn create_set_bridge_authority_instruction(
         ],
         data: instruction_data,
     })
+}
+
+/// Create a `set_deposit_cap` instruction (admin: set the TVL cap).
+///
+/// Sets `bridge_state.deposit_cap = new_cap` — the maximum the vault's current
+/// balance may reach via deposits, bounding total funds-at-risk. Cold-authority
+/// signed (same accounts as [`create_pause_instruction`]): the registry
+/// authority, not the hot settlement key, so a compromised settlement key
+/// cannot raise the loss ceiling. The pool starts at cap 0 (deposits closed)
+/// after `initialize`; call this to open it to a chosen ceiling.
+pub fn create_set_deposit_cap_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    new_cap: u64,
+) -> Instruction {
+    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    let mut instruction_data = discriminators::SET_DEPOSIT_CAP.to_vec();
+    instruction_data.extend_from_slice(&new_cap.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: instruction_data,
+    }
 }
 
 /// Derive bridge vault PDA
