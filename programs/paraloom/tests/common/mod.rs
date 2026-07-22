@@ -144,9 +144,154 @@ pub fn add_token_account(pt: &mut ProgramTest, mint: Pubkey, owner: Pubkey, amou
     token_account
 }
 
+/// A validator's baked token balance — generous enough for several
+/// registrations across a test.
+pub const TEST_TOKEN_FUND: u64 = 1_000_000_000;
+
+/// Create a validator keypair funded with SOL and a staking-token balance, both
+/// baked into genesis. Returns the keypair and its token account pubkey. Used
+/// instead of `ctx.payer`/`payer` as the validator, whose token account can't
+/// be pre-baked because its pubkey is only known after `start`.
+pub fn funded_validator(pt: &mut ProgramTest, stake_mint: Pubkey) -> (Keypair, Pubkey) {
+    let validator = Keypair::new();
+    pt.add_account(
+        validator.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let token = add_token_account(pt, stake_mint, validator.pubkey(), TEST_TOKEN_FUND);
+    (validator, token)
+}
+
 /// Derive the shared token-stake vault + its authority PDA for `program_id`.
 pub fn stake_vault_pdas(program_id: Pubkey) -> (Pubkey, Pubkey) {
     let (vault, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);
     let (authority, _) = Pubkey::find_program_address(&[b"stake_vault_authority"], &program_id);
     (vault, authority)
+}
+
+use anchor_lang::{InstructionData, ToAccountMetas};
+use solana_sdk::instruction::Instruction;
+
+/// Build the dual-stake `initialize_validator_registry` instruction (creates the
+/// token vault + pins `stake_mint`).
+pub fn init_validator_registry_ix(
+    program_id: Pubkey,
+    authority: Pubkey,
+    program_data: Pubkey,
+    stake_mint: Pubkey,
+) -> Instruction {
+    let (registry, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (vault, vault_authority) = stake_vault_pdas(program_id);
+    Instruction {
+        program_id,
+        data: paraloom_program::instruction::InitializeValidatorRegistry {}.data(),
+        accounts: paraloom_program::accounts::InitializeValidatorRegistry {
+            validator_registry: registry,
+            authority,
+            stake_mint,
+            stake_token_vault: vault,
+            stake_vault_authority: vault_authority,
+            program_data,
+            token_program: spl_token::id(),
+            system_program: solana_sdk::system_program::ID,
+            rent: solana_sdk::sysvar::rent::ID,
+        }
+        .to_account_metas(None),
+    }
+}
+
+/// Build the dual-stake `register_validator` instruction (`validator` signs).
+pub fn register_validator_ix(
+    program_id: Pubkey,
+    validator: Pubkey,
+    validator_token_account: Pubkey,
+    sol_stake: u64,
+    token_stake: u64,
+) -> Instruction {
+    let (registry, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (vault, _) = stake_vault_pdas(program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.as_ref()], &program_id);
+    Instruction {
+        program_id,
+        data: paraloom_program::instruction::RegisterValidator {
+            stake_amount: sol_stake,
+            token_stake_amount: token_stake,
+        }
+        .data(),
+        accounts: paraloom_program::accounts::RegisterValidator {
+            validator_account: validator_pda,
+            validator_registry: registry,
+            validator,
+            validator_token_account,
+            stake_token_vault: vault,
+            token_program: spl_token::id(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    }
+}
+
+/// Build the dual-stake `slash_validator` instruction (registry `authority` signs).
+pub fn slash_validator_ix(
+    program_id: Pubkey,
+    validator: Pubkey,
+    stake_mint: Pubkey,
+    authority: Pubkey,
+    slash_percentage: u8,
+) -> Instruction {
+    let (registry, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (vault, vault_authority) = stake_vault_pdas(program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.as_ref()], &program_id);
+    let (bridge_vault, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    Instruction {
+        program_id,
+        data: paraloom_program::instruction::SlashValidator {
+            validator,
+            slash_percentage,
+        }
+        .data(),
+        accounts: paraloom_program::accounts::SlashValidator {
+            validator_account: validator_pda,
+            bridge_vault,
+            validator_registry: registry,
+            stake_mint,
+            stake_token_vault: vault,
+            stake_vault_authority: vault_authority,
+            token_program: spl_token::id(),
+            authority,
+        }
+        .to_account_metas(None),
+    }
+}
+
+/// Build the dual-stake `withdraw_unbonded_stake` instruction (`validator` signs).
+pub fn withdraw_unbonded_ix(
+    program_id: Pubkey,
+    validator: Pubkey,
+    validator_token_account: Pubkey,
+) -> Instruction {
+    let (vault, vault_authority) = stake_vault_pdas(program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.as_ref()], &program_id);
+    Instruction {
+        program_id,
+        data: paraloom_program::instruction::WithdrawUnbondedStake {}.data(),
+        accounts: paraloom_program::accounts::WithdrawUnbondedStake {
+            validator_account: validator_pda,
+            validator,
+            validator_token_account,
+            stake_token_vault: vault,
+            stake_vault_authority: vault_authority,
+            token_program: spl_token::id(),
+        }
+        .to_account_metas(None),
+    }
 }

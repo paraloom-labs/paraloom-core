@@ -22,9 +22,13 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{
+    add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
+    register_validator_ix, slash_validator_ix,
+};
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
+const TOKEN_STAKE: u64 = 1_000_000;
 
 async fn send(
     banks_client: &mut solana_program_test::BanksClient,
@@ -55,69 +59,51 @@ async fn slash_reduces_stake_and_credits_vault() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
-    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
-        Pubkey::find_program_address(&[b"validator", payer.pubkey().as_ref()], &program_id);
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
 
     send(
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await;
     send(
         &mut banks_client,
         recent_blockhash,
-        &payer,
-        Instruction {
+        &validator,
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: payer.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await;
     send(
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        slash_validator_ix(
             program_id,
-            data: instruction::SlashValidator {
-                validator: payer.pubkey(),
-                slash_percentage: 50,
-            }
-            .data(),
-            accounts: accounts::SlashValidator {
-                validator_account: validator_pda,
-                bridge_vault: vault_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
     )
     .await;
 
@@ -165,28 +151,25 @@ async fn slash_above_minimum_keeps_validator_active() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
-    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
-        Pubkey::find_program_address(&[b"validator", payer.pubkey().as_ref()], &program_id);
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
 
     send(
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await;
 
@@ -194,21 +177,14 @@ async fn slash_above_minimum_keeps_validator_active() {
     send(
         &mut banks_client,
         recent_blockhash,
-        &payer,
-        Instruction {
+        &validator,
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: 2 * MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: payer.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            2 * MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await;
 
@@ -218,21 +194,13 @@ async fn slash_above_minimum_keeps_validator_active() {
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        slash_validator_ix(
             program_id,
-            data: instruction::SlashValidator {
-                validator: payer.pubkey(),
-                slash_percentage: 25,
-            }
-            .data(),
-            accounts: accounts::SlashValidator {
-                validator_account: validator_pda,
-                bridge_vault: vault_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            25,
+        ),
     )
     .await;
 
@@ -273,48 +241,38 @@ async fn slash_inactive_validator_burns_unbonding() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
-    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
-        Pubkey::find_program_address(&[b"validator", payer.pubkey().as_ref()], &program_id);
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
 
     send(
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await;
     send(
         &mut banks_client,
         recent_blockhash,
-        &payer,
-        Instruction {
+        &validator,
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: payer.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await;
     // Unregister: stake leaves the active set into the unbonding window and the
@@ -322,14 +280,14 @@ async fn slash_inactive_validator_burns_unbonding() {
     send(
         &mut banks_client,
         recent_blockhash,
-        &payer,
+        &validator,
         Instruction {
             program_id,
             data: instruction::UnregisterValidator {}.data(),
             accounts: accounts::UnregisterValidator {
                 validator_account: validator_pda,
                 validator_registry: registry_pda,
-                validator: payer.pubkey(),
+                validator: validator.pubkey(),
             }
             .to_account_metas(None),
         },
@@ -352,21 +310,13 @@ async fn slash_inactive_validator_burns_unbonding() {
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        slash_validator_ix(
             program_id,
-            data: instruction::SlashValidator {
-                validator: payer.pubkey(),
-                slash_percentage: 100,
-            }
-            .data(),
-            accounts: accounts::SlashValidator {
-                validator_account: validator_pda,
-                bridge_vault: vault_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            100,
+        ),
     )
     .await;
 
@@ -404,21 +354,13 @@ async fn slash_inactive_validator_burns_unbonding() {
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        slash_validator_ix(
             program_id,
-            data: instruction::SlashValidator {
-                validator: payer.pubkey(),
-                slash_percentage: 50,
-            }
-            .data(),
-            accounts: accounts::SlashValidator {
-                validator_account: validator_pda,
-                bridge_vault: vault_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
     )
     .await;
     assert!(
@@ -480,23 +422,19 @@ async fn slash_rent_only_ghost_does_not_underflow() {
         },
     );
 
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
     let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     send(
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await;
 
@@ -520,21 +458,13 @@ async fn slash_rent_only_ghost_does_not_underflow() {
         &mut banks_client,
         recent_blockhash,
         &upgrade_authority,
-        Instruction {
+        slash_validator_ix(
             program_id,
-            data: instruction::SlashValidator {
-                validator: ghost_wallet,
-                slash_percentage: 50,
-            }
-            .data(),
-            accounts: accounts::SlashValidator {
-                validator_account: validator_pda,
-                bridge_vault: vault_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+            ghost_wallet,
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
     )
     .await;
     assert!(
