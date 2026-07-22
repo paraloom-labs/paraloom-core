@@ -7,8 +7,8 @@
 //! where G and H are generator points on the BN254 curve.
 
 use crate::privacy::types::Commitment;
-use ark_bn254::{Fr, G1Affine, G1Projective};
-use ark_ec::{AffineRepr, CurveGroup, Group};
+use ark_bn254::{Fq, Fr, G1Affine};
+use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
 use ark_std::UniformRand;
@@ -35,21 +35,27 @@ impl PedersenGenerators {
         PedersenGenerators { g, h }
     }
 
-    /// Hash a message to a curve point (hash-to-curve)
+    /// Hash a message to a curve point via try-and-increment.
+    ///
+    /// The resulting point has no known discrete log relative to `G`: it is
+    /// recovered from a hash-derived x-coordinate, so nobody knows a scalar
+    /// `x` with `H = x·G`. This is what makes the Pedersen commitment binding.
+    /// (Deriving `H` as `x·G` for a known `x` collapses `C = v·G + r·H` to
+    /// `(v + x·r)·G`, which binds only to `v + x·r` and lets anyone re-open
+    /// any commitment to an arbitrary value.)
     fn hash_to_curve(msg: &[u8]) -> G1Affine {
-        // Simple hash-to-curve using try-and-increment
-        // In production, use a proper hash-to-curve like in BLS signatures
-        let mut hasher = Sha256::new();
-        hasher.update(msg);
         let mut counter = 0u64;
 
         loop {
+            // Fresh hash per attempt: H(msg || counter_le).
+            let mut hasher = Sha256::new();
+            hasher.update(msg);
             hasher.update(counter.to_le_bytes());
-            let hash = hasher.finalize_reset();
+            let hash = hasher.finalize();
 
-            // Try to interpret hash as x-coordinate
+            // Try to interpret the digest as a curve x-coordinate.
             if let Some(point) = Self::try_point_from_hash(&hash) {
-                return point.into_affine();
+                return point;
             }
 
             counter += 1;
@@ -59,9 +65,12 @@ impl PedersenGenerators {
         }
     }
 
-    /// Try to construct a curve point from a hash
-    fn try_point_from_hash(hash: &[u8]) -> Option<G1Projective> {
-        // Take first 32 bytes as potential x-coordinate
+    /// Try to construct a curve point from a hash by treating it as an
+    /// x-coordinate (try-and-increment). Returns `None` when no point on the
+    /// curve has this x (roughly half the time), in which case the caller
+    /// increments the counter and retries.
+    fn try_point_from_hash(hash: &[u8]) -> Option<G1Affine> {
+        // Take first 32 bytes as the candidate x-coordinate.
         if hash.len() < 32 {
             return None;
         }
@@ -69,13 +78,13 @@ impl PedersenGenerators {
         let mut x_bytes = [0u8; 32];
         x_bytes.copy_from_slice(&hash[..32]);
 
-        // Try to construct a point
-        // This is simplified; production should use proper hash-to-curve
-        let x = Fr::from_le_bytes_mod_order(&x_bytes);
+        // x-coordinates live in the BASE field Fq, not the scalar field Fr.
+        let x = Fq::from_le_bytes_mod_order(&x_bytes);
 
-        // For simplicity, just use the generator scaled by this value
-        // In production, use a proper hash-to-curve algorithm
-        Some(G1Projective::generator() * x)
+        // Solve for y on the curve; `None` if x is not a valid x-coordinate.
+        // BN254 G1 has cofactor 1, so any on-curve point is already in the
+        // prime-order subgroup — no cofactor clearing required.
+        G1Affine::get_point_from_x_unchecked(x, false)
     }
 }
 
@@ -323,5 +332,48 @@ mod tests {
 
         // They should be equal (homomorphic property)
         assert_eq!(sum_point.into_affine(), c_sum_point.into_affine());
+    }
+
+    #[test]
+    fn test_binding_forgery_is_rejected() {
+        // Regression for the broken-generator bug where H was derived as x·G
+        // for a PUBLIC scalar x = SHA256("PARALOOM_PEDERSEN_H_GENERATOR" || 0).
+        // Under that bug C = v·G + r·H = (v + x·r)·G, so an attacker who knows
+        // x can re-open any commitment to an arbitrary value v' by choosing
+        // r' = r + (v - v')·x⁻¹. With a sound H (unknown dlog) no such x
+        // exists and the forged opening must fail to verify.
+        use ark_ff::Field;
+
+        let pedersen = PedersenCommitment::new();
+        let value = 1000u64;
+        let randomness = [7u8; 32];
+        let commitment = pedersen.commit(value, &randomness);
+
+        // Reconstruct the exact scalar the old exploit used as x.
+        let mut hasher = Sha256::new();
+        hasher.update(b"PARALOOM_PEDERSEN_H_GENERATOR");
+        hasher.update(0u64.to_le_bytes());
+        let digest = hasher.finalize();
+        let x = Fr::from_le_bytes_mod_order(&digest);
+
+        // Forge an opening to a different value using r' = r + (v - v')·x⁻¹.
+        let forged_value = 5_000_000u64;
+        let r = Fr::from_le_bytes_mod_order(&randomness);
+        let v = Fr::from(value);
+        let v_forged = Fr::from(forged_value);
+        let x_inv = x.inverse().expect("x is invertible");
+        let r_forged = r + (v - v_forged) * x_inv;
+
+        let mut r_forged_bytes = [0u8; 32];
+        r_forged
+            .into_bigint()
+            .serialize_compressed(&mut r_forged_bytes[..])
+            .unwrap();
+
+        // The forged opening must NOT verify against the real commitment.
+        assert!(
+            !pedersen.verify(&commitment, forged_value, &r_forged_bytes),
+            "binding broken: commitment re-opened to a forged value"
+        );
     }
 }
