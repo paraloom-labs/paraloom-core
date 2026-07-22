@@ -21,13 +21,20 @@ use paraloom_program::{
 };
 use solana_program_test::{processor, tokio, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
+    account::Account,
     instruction::{Instruction, InstructionError},
     signature::{Keypair, Signer},
     transaction::{Transaction, TransactionError},
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{
+    add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
+    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+};
+
+/// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
+const TOKEN_STAKE: u64 = 1_000_000;
 
 /// Send `ix` signed by `signer` (also the fee payer) on a fresh blockhash and
 /// return the raw result so callers can assert success or a specific error.
@@ -79,11 +86,9 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
     let mut ctx = pt.start_with_context().await;
-
-    // `ctx.payer` doubles as the validator wallet: it self-signs register,
-    // unregister and withdraw. Clone it out so we can hold `&mut ctx` alongside.
-    let validator = ctx.payer.insecure_clone();
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
@@ -93,17 +98,12 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     send(
         &mut ctx,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await
     .expect("init registry");
@@ -112,20 +112,13 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: validator.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await
     .expect("register");
@@ -193,15 +186,7 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     let err = send(
         &mut ctx,
         &validator,
-        Instruction {
-            program_id,
-            data: instruction::WithdrawUnbondedStake {}.data(),
-            accounts: accounts::WithdrawUnbondedStake {
-                validator_account: validator_pda,
-                validator: validator.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
     )
     .await
     .expect_err("early withdraw must fail");
@@ -221,15 +206,7 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
-            program_id,
-            data: instruction::WithdrawUnbondedStake {}.data(),
-            accounts: accounts::WithdrawUnbondedStake {
-                validator_account: validator_pda,
-                validator: validator.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
     )
     .await
     .expect("withdraw after delay");
@@ -256,20 +233,13 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: validator.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await
     .expect("re-register after close must succeed");
@@ -291,29 +261,23 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
     let mut ctx = pt.start_with_context().await;
-
-    let validator = ctx.payer.insecure_clone();
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
-    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
 
     send(
         &mut ctx,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await
     .expect("init registry");
@@ -321,20 +285,13 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: validator.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await
     .expect("register");
@@ -342,21 +299,13 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     send(
         &mut ctx,
         &upgrade_authority,
-        Instruction {
+        slash_validator_ix(
             program_id,
-            data: instruction::SlashValidator {
-                validator: validator.pubkey(),
-                slash_percentage: 100,
-            }
-            .data(),
-            accounts: accounts::SlashValidator {
-                validator_account: validator_pda,
-                bridge_vault: vault_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            100,
+        ),
     )
     .await
     .expect("100% slash");
@@ -382,15 +331,7 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     let err = send(
         &mut ctx,
         &validator,
-        Instruction {
-            program_id,
-            data: instruction::WithdrawUnbondedStake {}.data(),
-            accounts: accounts::WithdrawUnbondedStake {
-                validator_account: validator_pda,
-                validator: validator.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
     )
     .await
     .expect_err("rent-only close must still wait for the unbonding slot");
@@ -407,15 +348,7 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
-            program_id,
-            data: instruction::WithdrawUnbondedStake {}.data(),
-            accounts: accounts::WithdrawUnbondedStake {
-                validator_account: validator_pda,
-                validator: validator.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
     )
     .await
     .expect("rent-only close after delay");
@@ -439,20 +372,13 @@ async fn fully_slashed_validator_can_close_rent_only_pda_after_delay() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: validator.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await
     .expect("re-register after rent-only close must succeed");
@@ -471,11 +397,9 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
     let mut ctx = pt.start_with_context().await;
-
-    // `ctx.payer` doubles as the validator wallet (self-signs register +
-    // withdraw); `upgrade_authority` is the registry authority that deactivates.
-    let validator = ctx.payer.insecure_clone();
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
@@ -485,17 +409,12 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     send(
         &mut ctx,
         &upgrade_authority,
-        Instruction {
+        init_validator_registry_ix(
             program_id,
-            data: instruction::InitializeValidatorRegistry {}.data(),
-            accounts: accounts::InitializeValidatorRegistry {
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
     )
     .await
     .expect("init registry");
@@ -504,20 +423,13 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
+        register_validator_ix(
             program_id,
-            data: instruction::RegisterValidator {
-                stake_amount: MIN_VALIDATOR_STAKE,
-            }
-            .data(),
-            accounts: accounts::RegisterValidator {
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                validator: validator.pubkey(),
-                system_program: solana_sdk::system_program::ID,
-            }
-            .to_account_metas(None),
-        },
+            validator.pubkey(),
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
     )
     .await
     .expect("register");
@@ -579,15 +491,7 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     send(
         &mut ctx,
         &validator,
-        Instruction {
-            program_id,
-            data: instruction::WithdrawUnbondedStake {}.data(),
-            accounts: accounts::WithdrawUnbondedStake {
-                validator_account: validator_pda,
-                validator: validator.pubkey(),
-            }
-            .to_account_metas(None),
-        },
+        withdraw_unbonded_ix(program_id, validator.pubkey(), validator_token),
     )
     .await
     .expect("deactivated validator must be able to withdraw its unbonded stake");

@@ -12,7 +12,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{add_program_data, add_stake_mint, entry};
 
 const AMOUNT: u64 = 1_000_000_000;
 
@@ -22,6 +22,7 @@ async fn init_tree_and_state(
     upgrade_authority: &solana_sdk::signature::Keypair,
     program_data_pda: Pubkey,
     blockhash: solana_sdk::hash::Hash,
+    stake_mint: Pubkey,
     deposit_cap: u64,
 ) {
     // Bridge state (for the paused flag + counters).
@@ -63,6 +64,15 @@ async fn init_tree_and_state(
         program_id,
         data: instruction::InitializeValidatorRegistry {}.data(),
         accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
             validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
             program_data: program_data_pda,
@@ -96,6 +106,7 @@ async fn deposit_note_appends_and_advances_root() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks, payer, blockhash) = pt.start().await;
 
     init_tree_and_state(
@@ -104,6 +115,7 @@ async fn deposit_note_appends_and_advances_root() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         1_000_000_000_000, // 1000 SOL cap — well above the 1–2 SOL these deposit
     )
     .await;
@@ -180,6 +192,7 @@ async fn deposit_note_two_deposits_advance_index() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks, payer, blockhash) = pt.start().await;
 
     init_tree_and_state(
@@ -188,6 +201,7 @@ async fn deposit_note_two_deposits_advance_index() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         1_000_000_000_000, // 1000 SOL cap — well above the 1–2 SOL these deposit
     )
     .await;
@@ -234,6 +248,7 @@ async fn deposit_note_rejects_a_non_canonical_field_input() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks, payer, blockhash) = pt.start().await;
 
     init_tree_and_state(
@@ -242,6 +257,7 @@ async fn deposit_note_rejects_a_non_canonical_field_input() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         1_000_000_000_000, // 1000 SOL cap — well above the 1–2 SOL these deposit
     )
     .await;
@@ -298,6 +314,7 @@ async fn deposit_note_enforces_the_deposit_cap() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks, payer, blockhash) = pt.start().await;
 
     // Cap set to exactly one deposit: the first fills the vault to the cap, the
@@ -308,6 +325,7 @@ async fn deposit_note_enforces_the_deposit_cap() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         AMOUNT,
     )
     .await;
@@ -365,6 +383,7 @@ async fn set_deposit_cap_requires_the_cold_authority() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks, _payer, blockhash) = pt.start().await;
 
     // Registry authority is `upgrade_authority`; the pool opens to AMOUNT.
@@ -374,6 +393,7 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         AMOUNT,
     )
     .await;

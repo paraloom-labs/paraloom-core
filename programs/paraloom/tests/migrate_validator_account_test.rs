@@ -29,7 +29,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{add_program_data, add_stake_mint, add_token_account, entry};
 
 /// Send `ix` signed by `signer` (also the fee payer) on a fresh blockhash.
 async fn send(
@@ -76,6 +76,7 @@ async fn migrate_grows_legacy_validator_account() {
         },
     );
 
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     let migrate_ix = Instruction {
@@ -201,6 +202,8 @@ async fn migrate_staked_legacy_account_stays_withdrawable() {
         },
     );
 
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let validator_token = add_token_account(&mut pt, stake_mint, validator.pubkey(), 1_000_000);
     let mut ctx = pt.start_with_context().await;
 
     // Registry init (needed for deactivate).
@@ -211,6 +214,19 @@ async fn migrate_staked_legacy_account_stays_withdrawable() {
             program_id,
             data: instruction::InitializeValidatorRegistry {}.data(),
             accounts: accounts::InitializeValidatorRegistry {
+                stake_mint,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                stake_vault_authority: Pubkey::find_program_address(
+                    &[b"stake_vault_authority"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
+                rent: solana_sdk::sysvar::rent::ID,
                 validator_registry: registry_pda,
                 authority: upgrade_authority.pubkey(),
                 program_data: program_data_pda,
@@ -318,6 +334,18 @@ async fn migrate_staked_legacy_account_stays_withdrawable() {
             accounts: accounts::WithdrawUnbondedStake {
                 validator_account: validator_pda,
                 validator: validator.pubkey(),
+                validator_token_account: validator_token,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                stake_vault_authority: Pubkey::find_program_address(
+                    &[b"stake_vault_authority"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
             }
             .to_account_metas(None),
         },

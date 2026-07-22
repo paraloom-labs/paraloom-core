@@ -55,6 +55,11 @@ solana-poseidon = "2.3"
 [dev-dependencies]
 solana-program-test = "2.3.13"
 solana-sdk = "2.0"
+# Dual-stake tests bake an SPL mint + validator token accounts and drive the
+# token half of `register_validator`/`slash`. Version-pinned to the spl-token
+# anchor-spl 0.31 pulls so the CPI token program and the test-built accounts
+# share one layout.
+spl-token = "7.0"
 # Used by `tests/common::add_program_data` to bincode-serialize a fake
 # `UpgradeableLoaderState::ProgramData` account so the upgrade-authority init
 # constraint (#204) can be exercised under `solana-program-test`, which loads

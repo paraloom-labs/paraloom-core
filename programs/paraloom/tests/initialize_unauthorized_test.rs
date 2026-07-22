@@ -22,7 +22,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{add_program_data, add_stake_mint, entry};
 
 /// Returns an `(impostor, banks_client, recent_blockhash, program_data_pda)`
 /// where `impostor` is a fresh keypair funded as a signer but **not** the
@@ -32,6 +32,7 @@ async fn setup_with_impostor() -> (
     Keypair,
     solana_program_test::BanksClient,
     anchor_lang::solana_program::hash::Hash,
+    Pubkey,
     Pubkey,
 ) {
     let program_id = paraloom_program::ID;
@@ -50,6 +51,7 @@ async fn setup_with_impostor() -> (
         },
     );
 
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (banks_client, _payer, recent_blockhash) = pt.start().await;
     (
         program_id,
@@ -57,12 +59,13 @@ async fn setup_with_impostor() -> (
         banks_client,
         recent_blockhash,
         program_data_pda,
+        stake_mint,
     )
 }
 
 #[tokio::test]
 async fn initialize_with_non_upgrade_authority_signer_fails() {
-    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda) =
+    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda, stake_mint) =
         setup_with_impostor().await;
 
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
@@ -101,7 +104,7 @@ async fn initialize_with_non_upgrade_authority_signer_fails() {
 
 #[tokio::test]
 async fn initialize_validator_registry_with_non_upgrade_authority_signer_fails() {
-    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda) =
+    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda, stake_mint) =
         setup_with_impostor().await;
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
@@ -110,6 +113,15 @@ async fn initialize_validator_registry_with_non_upgrade_authority_signer_fails()
         program_id,
         data: instruction::InitializeValidatorRegistry {}.data(),
         accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
             validator_registry: registry_pda,
             authority: impostor.pubkey(),
             program_data: program_data_pda,

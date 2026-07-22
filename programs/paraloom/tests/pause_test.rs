@@ -15,13 +15,14 @@ use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
 
 mod common;
-use common::{add_program_data, entry};
+use common::{add_program_data, add_stake_mint, entry};
 
 #[tokio::test]
 async fn pause_flips_flag_and_blocks_deposit() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
@@ -63,6 +64,15 @@ async fn pause_flips_flag_and_blocks_deposit() {
         program_id,
         data: instruction::InitializeValidatorRegistry {}.data(),
         accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
             validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
             program_data: program_data_pda,

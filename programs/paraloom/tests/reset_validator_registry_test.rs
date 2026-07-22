@@ -21,7 +21,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{add_program_data, add_stake_mint, add_token_account, entry};
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 
@@ -29,6 +29,7 @@ fn register_ix(
     program_id: Pubkey,
     registry_pda: Pubkey,
     validator: Pubkey,
+    validator_token: Pubkey,
 ) -> (Instruction, Pubkey) {
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.as_ref()], &program_id);
@@ -36,12 +37,16 @@ fn register_ix(
         program_id,
         data: instruction::RegisterValidator {
             stake_amount: MIN_VALIDATOR_STAKE,
+            token_stake_amount: 1_000_000,
         }
         .data(),
         accounts: accounts::RegisterValidator {
             validator_account: validator_pda,
             validator_registry: registry_pda,
             validator,
+            validator_token_account: validator_token,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            token_program: spl_token::id(),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
@@ -68,7 +73,23 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         },
     );
 
-    let (mut banks, payer, blockhash) = pt.start().await;
+    // Validator A: registered and KEPT through the reset. A funded keypair with
+    // a token balance so it can lock the dual-stake.
+    let validator_a = Keypair::new();
+    pt.add_account(
+        validator_a.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let token_a = add_token_account(&mut pt, stake_mint, validator_a.pubkey(), 1_000_000_000);
+    let token_b = add_token_account(&mut pt, stake_mint, validator_b.pubkey(), 1_000_000_000);
+    let (mut banks, _payer, blockhash) = pt.start().await;
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
     // Init registry.
@@ -76,6 +97,15 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         program_id,
         data: instruction::InitializeValidatorRegistry {}.data(),
         accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
             validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
             program_data: program_data_pda,
@@ -88,12 +118,12 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
     banks.process_transaction(tx).await.unwrap();
 
     // Register validator A (payer) and validator B.
-    let (reg_a, pda_a) = register_ix(program_id, registry_pda, payer.pubkey());
-    let mut tx = Transaction::new_with_payer(&[reg_a], Some(&payer.pubkey()));
-    tx.sign(&[&payer], blockhash);
+    let (reg_a, pda_a) = register_ix(program_id, registry_pda, validator_a.pubkey(), token_a);
+    let mut tx = Transaction::new_with_payer(&[reg_a], Some(&validator_a.pubkey()));
+    tx.sign(&[&validator_a], blockhash);
     banks.process_transaction(tx).await.unwrap();
 
-    let (reg_b, _pda_b) = register_ix(program_id, registry_pda, validator_b.pubkey());
+    let (reg_b, _pda_b) = register_ix(program_id, registry_pda, validator_b.pubkey(), token_b);
     let mut tx = Transaction::new_with_payer(&[reg_b], Some(&validator_b.pubkey()));
     tx.sign(&[&validator_b], blockhash);
     banks.process_transaction(tx).await.unwrap();
@@ -115,7 +145,7 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
     reset_metas.push(AccountMeta::new_readonly(pda_a, false));
     let reset_ix = Instruction {
         program_id,
-        data: instruction::ResetValidatorRegistry {}.data(),
+        data: instruction::ResetValidatorRegistry { stake_mint }.data(),
         accounts: reset_metas,
     };
     let mut tx = Transaction::new_with_payer(&[reset_ix], Some(&upgrade_authority.pubkey()));
@@ -139,6 +169,7 @@ async fn reset_rejects_non_upgrade_authority() {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
     let (mut banks, payer, blockhash) = pt.start().await;
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
@@ -146,6 +177,15 @@ async fn reset_rejects_non_upgrade_authority() {
         program_id,
         data: instruction::InitializeValidatorRegistry {}.data(),
         accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
             validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
             program_data: program_data_pda,
@@ -160,7 +200,7 @@ async fn reset_rejects_non_upgrade_authority() {
     // The payer is NOT the upgrade authority; the reset must be rejected.
     let reset_ix = Instruction {
         program_id,
-        data: instruction::ResetValidatorRegistry {}.data(),
+        data: instruction::ResetValidatorRegistry { stake_mint }.data(),
         accounts: accounts::ResetValidatorRegistry {
             validator_registry: registry_pda,
             authority: payer.pubkey(),
