@@ -7,7 +7,7 @@ use crate::bridge::{BridgeError, Result};
 use async_trait::async_trait;
 use solana_client::client_error::ClientError;
 use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
-use solana_client::rpc_config::RpcTransactionConfig;
+use solana_client::rpc_config::{RpcProgramAccountsConfig, RpcTransactionConfig};
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::account::Account;
 use solana_sdk::hash::Hash;
@@ -41,6 +41,15 @@ pub trait BridgeRpc: Send + Sync {
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta>;
 
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Account>;
+
+    /// Enumerate program-owned accounts matching `config` (a `getProgramAccounts`
+    /// call). Used by the validator-stake reconciler to read every on-chain
+    /// `ValidatorAccount` in one request rather than polling per validator.
+    async fn get_program_accounts(
+        &self,
+        program_id: &Pubkey,
+        config: RpcProgramAccountsConfig,
+    ) -> Result<Vec<(Pubkey, Account)>>;
 
     async fn send_and_confirm_transaction(&self, tx: &Transaction) -> Result<Signature>;
 
@@ -145,6 +154,22 @@ impl BridgeRpc for RealBridgeRpc {
         let key = *pubkey;
         blocking("getAccount", move || {
             rpc_err("getAccount", rpc.get_account(&key))
+        })
+        .await
+    }
+
+    async fn get_program_accounts(
+        &self,
+        program_id: &Pubkey,
+        config: RpcProgramAccountsConfig,
+    ) -> Result<Vec<(Pubkey, Account)>> {
+        let rpc = Arc::clone(&self.client);
+        let pid = *program_id;
+        blocking("getProgramAccounts", move || {
+            rpc_err(
+                "getProgramAccounts",
+                rpc.get_program_accounts_with_config(&pid, config),
+            )
         })
         .await
     }

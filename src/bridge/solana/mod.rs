@@ -104,6 +104,12 @@ impl SolanaBridge {
         self.program.get_slot().await
     }
 
+    /// Active validators' on-chain stakes (wallet → lamports), for the consensus
+    /// stake reconciler.
+    pub async fn list_validator_stakes(&self) -> Result<Vec<(solana_sdk::pubkey::Pubkey, u64)>> {
+        self.program.list_validator_stakes().await
+    }
+
     /// Submit a pre-assembled, co-signed settlement transaction (#260).
     pub async fn submit_signed_transaction(
         &self,

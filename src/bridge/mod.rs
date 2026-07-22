@@ -109,6 +109,19 @@ impl Bridge {
         }
     }
 
+    /// Active validators' on-chain stakes (wallet → lamports), read for the
+    /// consensus stake reconciler so the stake-weighted quorum reflects real
+    /// at-risk capital.
+    pub async fn list_validator_stakes(&self) -> Result<Vec<(solana_sdk::pubkey::Pubkey, u64)>> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.list_validator_stakes().await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
+
     /// Submit a pre-assembled, co-signed settlement transaction (#260) — the
     /// multi-sig withdrawal the node gathered from the approving validators.
     pub async fn submit_signed_transaction(

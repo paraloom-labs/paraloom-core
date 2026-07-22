@@ -109,6 +109,24 @@ impl LeaderSelector {
         self.validators.insert(validator.node_id.clone(), validator);
     }
 
+    /// Set each validator's stake to its real on-chain value, keyed by co-sign
+    /// wallet. A validator whose wallet has no active on-chain `ValidatorAccount`
+    /// (unknown/unadvertised wallet, or unregistered/inactive) is set to 0: it
+    /// keeps its slot for liveness but carries NO stake weight, so the
+    /// stake-weighted quorum counts only real at-risk capital rather than a
+    /// placeholder. This is what makes the quorum Sybil-resistant — an
+    /// unregistered peer cannot vote its way into a supermajority.
+    pub fn apply_onchain_stakes(&mut self, stakes: &HashMap<String, u64>) {
+        for v in self.validators.values_mut() {
+            v.stake_amount = v
+                .wallet_pubkey
+                .as_ref()
+                .and_then(|w| stakes.get(w))
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+
     /// Get number of active validators
     pub fn active_validator_count(&self) -> usize {
         self.validators.values().filter(|v| v.is_active).count()
@@ -237,6 +255,46 @@ impl Default for LeaderSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `apply_onchain_stakes` sets each validator's stake to its real on-chain
+    /// value by wallet, and — fail-closed — zeroes any validator whose wallet is
+    /// not present (unregistered/unstaked), so a peer without at-risk capital
+    /// carries no stake weight in the quorum.
+    #[test]
+    fn apply_onchain_stakes_is_fail_closed_by_wallet() {
+        let mut sel = LeaderSelector::new();
+        // Two peers seeded with a placeholder stake, as connectivity
+        // registration does; one has an on-chain wallet, one does not.
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![2]), 5, 1000).with_wallet(Some("WALLET_B".to_string())),
+        );
+        // A validator with no advertised wallet at all.
+        sel.register_validator(ValidatorInfo::new(NodeId(vec![3]), 5, 1000));
+
+        let mut onchain = HashMap::new();
+        onchain.insert("WALLET_A".to_string(), 7_000_000_000u64);
+        // WALLET_B is not registered on-chain; peer 3 has no wallet.
+        sel.apply_onchain_stakes(&onchain);
+
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+            7_000_000_000,
+            "a wallet with on-chain stake gets its real stake"
+        );
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![2])).unwrap().stake_amount,
+            0,
+            "a wallet absent on-chain is zeroed (fail-closed)"
+        );
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![3])).unwrap().stake_amount,
+            0,
+            "a validator with no wallet carries no stake weight"
+        );
+    }
 
     #[test]
     fn test_validator_weight_calculation() {
