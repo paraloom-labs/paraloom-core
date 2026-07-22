@@ -880,9 +880,30 @@ impl crate::network::protocol::NetworkEventHandler for Node {
     /// ones we approved.)
     async fn handle_cosign_request(
         &self,
-        _source: NodeId,
+        source: NodeId,
         request: CoSignRequest,
     ) -> Result<CoSignResponse> {
+        // Authenticate the requester (#648). The per-nullifier co-sign budget is
+        // a shared, never-decremented counter, so an unregistered mesh peer that
+        // copied a spend's public parameters could send enough co-sign requests
+        // to exhaust it and decline the legitimate leader too — griefing a
+        // targeted settlement. Only a peer in the active validator set may drive
+        // a co-sign round; the libp2p `source` peer id is cryptographically
+        // authenticated by the connection. A node with no transact coordinator
+        // is not a settling validator and declines outright.
+        let is_validator = match &self.transact_coordinator {
+            Some(coordinator) => coordinator.is_registered_validator(&source).await,
+            None => false,
+        };
+        if !is_validator {
+            log::warn!("declining co-sign request from non-validator peer {source:?}");
+            return Ok(CoSignResponse {
+                request_id: request.request_id,
+                wallet_pubkey: String::new(),
+                signature: None,
+            });
+        }
+
         // Pin the program to our own config before the signer sees the request:
         // an unparseable configured id means we cannot bind it, so decline
         // rather than sign against a requester-supplied program.

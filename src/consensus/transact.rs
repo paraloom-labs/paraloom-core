@@ -474,6 +474,15 @@ impl TransactVerificationCoordinator {
         self.validators.read().await.len()
     }
 
+    /// Whether `node_id` is in the active validator set. Used to authenticate
+    /// the source of a co-sign request (#648): only a registered validator may
+    /// drive a co-sign round, so an unregistered mesh peer cannot copy a spend's
+    /// public parameters and exhaust a validator's per-nullifier co-sign budget
+    /// to block the legitimate leader.
+    pub async fn is_registered_validator(&self, node_id: &NodeId) -> bool {
+        self.validators.read().await.iter().any(|v| v == node_id)
+    }
+
     /// Clear the timeout streak after a validator is observed alive.
     async fn reset_timeout_streak(&self, validator: &NodeId) {
         self.timeout_streaks
@@ -704,6 +713,31 @@ mod tests {
         // Unregistering an absent validator is a no-op, not an error.
         coordinator.unregister_validator(&NodeId(vec![9])).await;
         assert_eq!(coordinator.validator_count().await, 1);
+    }
+
+    /// A co-sign request is honoured only from a peer in the active validator
+    /// set (#648): the source-authentication gate rejects an unregistered peer,
+    /// so it can never reach the per-nullifier co-sign budget it would
+    /// otherwise exhaust to grief a settlement.
+    #[tokio::test]
+    async fn is_registered_validator_gates_cosign_by_membership() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator.register_validator(NodeId(vec![1])).await;
+
+        assert!(
+            coordinator.is_registered_validator(&NodeId(vec![1])).await,
+            "a registered validator is authenticated"
+        );
+        assert!(
+            !coordinator.is_registered_validator(&NodeId(vec![2])).await,
+            "an unregistered peer is rejected"
+        );
+
+        coordinator.unregister_validator(&NodeId(vec![1])).await;
+        assert!(
+            !coordinator.is_registered_validator(&NodeId(vec![1])).await,
+            "a dropped validator is no longer authenticated"
+        );
     }
 
     #[tokio::test]
