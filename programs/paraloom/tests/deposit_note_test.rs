@@ -22,6 +22,7 @@ async fn init_tree_and_state(
     upgrade_authority: &solana_sdk::signature::Keypair,
     program_data_pda: Pubkey,
     blockhash: solana_sdk::hash::Hash,
+    stake_mint: Pubkey,
     deposit_cap: u64,
 ) {
     // Bridge state (for the paused flag + counters).
@@ -114,6 +115,7 @@ async fn deposit_note_appends_and_advances_root() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         1_000_000_000_000, // 1000 SOL cap — well above the 1–2 SOL these deposit
     )
     .await;
@@ -199,6 +201,7 @@ async fn deposit_note_two_deposits_advance_index() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         1_000_000_000_000, // 1000 SOL cap — well above the 1–2 SOL these deposit
     )
     .await;
@@ -254,6 +257,7 @@ async fn deposit_note_rejects_a_non_canonical_field_input() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         1_000_000_000_000, // 1000 SOL cap — well above the 1–2 SOL these deposit
     )
     .await;
@@ -321,6 +325,7 @@ async fn deposit_note_enforces_the_deposit_cap() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         AMOUNT,
     )
     .await;
@@ -388,6 +393,7 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         &upgrade_authority,
         program_data_pda,
         blockhash,
+        stake_mint,
         AMOUNT,
     )
     .await;

@@ -17,7 +17,7 @@ use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
 
 mod common;
-use common::{add_program_data, add_stake_mint, entry};
+use common::{add_program_data, add_stake_mint, entry, funded_validator};
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 
@@ -27,11 +27,12 @@ async fn register_validator_initializes_account_and_counters() {
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
     let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
-    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_account_pda, _) =
-        Pubkey::find_program_address(&[b"validator", payer.pubkey().as_ref()], &program_id);
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
 
     let init_ix = Instruction {
         program_id,
@@ -60,19 +61,23 @@ async fn register_validator_initializes_account_and_counters() {
     let register_ix = Instruction {
         program_id,
         data: instruction::RegisterValidator {
+            token_stake_amount: 1_000_000,
             stake_amount: MIN_VALIDATOR_STAKE,
         }
         .data(),
         accounts: accounts::RegisterValidator {
+            validator_token_account: validator_token,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            token_program: spl_token::id(),
             validator_account: validator_account_pda,
             validator_registry: registry_pda,
-            validator: payer.pubkey(),
+            validator: validator.pubkey(),
             system_program: solana_sdk::system_program::ID,
         }
         .to_account_metas(None),
     };
-    let mut tx = Transaction::new_with_payer(&[register_ix], Some(&payer.pubkey()));
-    tx.sign(&[&payer], recent_blockhash);
+    let mut tx = Transaction::new_with_payer(&[register_ix], Some(&validator.pubkey()));
+    tx.sign(&[&validator], recent_blockhash);
     banks_client.process_transaction(tx).await.unwrap();
 
     let registry_raw = banks_client
@@ -91,7 +96,7 @@ async fn register_validator_initializes_account_and_counters() {
         .unwrap()
         .unwrap();
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
-    assert_eq!(acc.validator, payer.pubkey());
+    assert_eq!(acc.validator, validator.pubkey());
     assert_eq!(acc.stake_amount, MIN_VALIDATOR_STAKE);
     assert_eq!(acc.reputation_score, 1000);
     assert!(acc.is_active);

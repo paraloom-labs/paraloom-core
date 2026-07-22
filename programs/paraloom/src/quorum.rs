@@ -126,6 +126,7 @@ mod tests {
             active_validators: active,
             minimum_stake: 0,
             total_active_stake,
+            stake_mint: Pubkey::default(),
         }
     }
 
@@ -148,6 +149,8 @@ mod tests {
             times_slashed: 0,
             unbonding_amount: 0,
             unbonding_slot: 0,
+            token_stake_amount: 0,
+            token_unbonding_amount: 0,
         };
         let mut buf = Vec::new();
         v.try_serialize(&mut buf).unwrap();

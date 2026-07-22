@@ -168,6 +168,37 @@ pub fn funded_validator(pt: &mut ProgramTest, stake_mint: Pubkey) -> (Keypair, P
     (validator, token)
 }
 
+/// Bake the shared stake-token vault (an SPL token account at the
+/// `stake_token_vault` PDA, owned by the `stake_vault_authority` PDA) directly
+/// into genesis, holding `amount`. For tests that exercise withdraw/slash
+/// without running `initialize_validator_registry` (which would otherwise be
+/// the only way the vault gets created).
+pub fn bake_stake_vault(pt: &mut ProgramTest, stake_mint: Pubkey, program_id: Pubkey, amount: u64) {
+    let (vault, vault_authority) = stake_vault_pdas(program_id);
+    let mut data = vec![0u8; spl_token::state::Account::LEN];
+    spl_token::state::Account {
+        mint: stake_mint,
+        owner: vault_authority,
+        amount,
+        delegate: COption::None,
+        state: spl_token::state::AccountState::Initialized,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority: COption::None,
+    }
+    .pack_into_slice(&mut data);
+    pt.add_account(
+        vault,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: spl_token::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+}
+
 /// Derive the shared token-stake vault + its authority PDA for `program_id`.
 pub fn stake_vault_pdas(program_id: Pubkey) -> (Pubkey, Pubkey) {
     let (vault, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);

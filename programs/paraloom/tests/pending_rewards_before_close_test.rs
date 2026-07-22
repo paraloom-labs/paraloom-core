@@ -21,7 +21,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, entry};
+use common::{add_program_data, add_stake_mint, add_token_account, bake_stake_vault, entry};
 
 fn custom_code(err: BanksClientError) -> u32 {
     let tx_err = match err {
@@ -75,6 +75,8 @@ async fn withdraw_unbonded_stake_rejects_while_rewards_are_unclaimed() {
         times_slashed: 0,
         unbonding_amount: 1_000_000_000,
         unbonding_slot: 0,
+        token_stake_amount: 0,
+        token_unbonding_amount: 0,
     };
     let mut data = Vec::new();
     seeded
@@ -93,6 +95,9 @@ async fn withdraw_unbonded_stake_rejects_while_rewards_are_unclaimed() {
         },
     );
 
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let validator_token = add_token_account(&mut pt, stake_mint, validator.pubkey(), 1_000_000);
+    bake_stake_vault(&mut pt, stake_mint, program_id, 1_000_000_000);
     let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     // The unbonding checks pass (amount > 0, slot elapsed), so the reward guard
@@ -103,6 +108,14 @@ async fn withdraw_unbonded_stake_rejects_while_rewards_are_unclaimed() {
         accounts: accounts::WithdrawUnbondedStake {
             validator_account: validator_pda,
             validator: validator.pubkey(),
+            validator_token_account: validator_token,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
         }
         .to_account_metas(None),
     };

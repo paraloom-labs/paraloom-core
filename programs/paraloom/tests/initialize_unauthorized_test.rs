@@ -33,6 +33,7 @@ async fn setup_with_impostor() -> (
     solana_program_test::BanksClient,
     anchor_lang::solana_program::hash::Hash,
     Pubkey,
+    Pubkey,
 ) {
     let program_id = paraloom_program::ID;
     let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
@@ -58,12 +59,13 @@ async fn setup_with_impostor() -> (
         banks_client,
         recent_blockhash,
         program_data_pda,
+        stake_mint,
     )
 }
 
 #[tokio::test]
 async fn initialize_with_non_upgrade_authority_signer_fails() {
-    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda) =
+    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda, stake_mint) =
         setup_with_impostor().await;
 
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
@@ -102,7 +104,7 @@ async fn initialize_with_non_upgrade_authority_signer_fails() {
 
 #[tokio::test]
 async fn initialize_validator_registry_with_non_upgrade_authority_signer_fails() {
-    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda) =
+    let (program_id, impostor, mut banks_client, recent_blockhash, program_data_pda, stake_mint) =
         setup_with_impostor().await;
 
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);

@@ -37,7 +37,7 @@ use solana_sdk::{
 const RECIPIENT_PREFUND: u64 = 1_000_000_000;
 
 mod common;
-use common::{add_program_data, add_stake_mint, entry};
+use common::{add_program_data, add_stake_mint, add_token_account, entry};
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 
@@ -82,7 +82,19 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         },
     );
 
+    // An independent validator that co-signs the quorum. The settling authority
+    // is excluded from its own tally, so a second, unrelated validator is what
+    // actually satisfies the quorum. Created before `start` so its token-stake
+    // account can be baked into genesis alongside the authority's.
+    let cosigner = Keypair::new();
     let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let authority_token = add_token_account(
+        &mut pt,
+        stake_mint,
+        upgrade_authority.pubkey(),
+        1_000_000_000,
+    );
+    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), 1_000_000_000);
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
@@ -93,10 +105,6 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         &[b"validator", upgrade_authority.pubkey().as_ref()],
         &program_id,
     );
-    // An independent validator that co-signs the quorum. The settling authority
-    // is excluded from its own tally, so a second, unrelated validator is what
-    // actually satisfies the quorum.
-    let cosigner = Keypair::new();
     let (cosigner_pda, _) =
         Pubkey::find_program_address(&[b"validator", cosigner.pubkey().as_ref()], &program_id);
     let (nf0_pda, _) =
@@ -208,11 +216,19 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         Instruction {
             program_id,
             data: instruction::RegisterValidator {
+                token_stake_amount: 1_000_000,
                 stake_amount: MIN_VALIDATOR_STAKE,
             }
             .data(),
             accounts: accounts::RegisterValidator {
                 validator_account: validator_pda,
+                validator_token_account: authority_token,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
                 validator_registry: registry_pda,
                 validator: upgrade_authority.pubkey(),
                 system_program: solana_sdk::system_program::ID,
@@ -245,11 +261,19 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         Instruction {
             program_id,
             data: instruction::RegisterValidator {
+                token_stake_amount: 1_000_000,
                 stake_amount: MIN_VALIDATOR_STAKE,
             }
             .data(),
             accounts: accounts::RegisterValidator {
                 validator_account: cosigner_pda,
+                validator_token_account: cosigner_token,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
                 validator_registry: registry_pda,
                 validator: cosigner.pubkey(),
                 system_program: solana_sdk::system_program::ID,
