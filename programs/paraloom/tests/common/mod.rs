@@ -79,3 +79,74 @@ pub fn add_program_data(pt: &mut ProgramTest, program_id: Pubkey) -> (Pubkey, Ke
 
     (program_data_pda, upgrade_authority)
 }
+
+use anchor_lang::solana_program::program_option::COption;
+use anchor_lang::solana_program::program_pack::Pack;
+use solana_sdk::pubkey::Pubkey;
+
+/// Bake an initialized SPL mint into genesis and return its pubkey. Used as the
+/// dual-stake `stake_mint` in tests (a stand-in for the real PARALOOM mint).
+/// `mint_authority` is arbitrary — tests pre-fund token accounts directly
+/// rather than minting through it.
+pub fn add_stake_mint(pt: &mut ProgramTest, mint_authority: Pubkey) -> Pubkey {
+    let mint = Pubkey::new_unique();
+    let mut data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint {
+        mint_authority: COption::Some(mint_authority),
+        // Non-zero so a `slash` burn (which reduces supply) never underflows;
+        // larger than any amount a test funds into token accounts.
+        supply: 1_000_000_000_000_000,
+        decimals: 0,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    }
+    .pack_into_slice(&mut data);
+    pt.add_account(
+        mint,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: spl_token::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    mint
+}
+
+/// Bake an initialized SPL token account for `owner` of `mint` holding
+/// `amount`, into genesis. Returns its pubkey. Lets a test fund a validator's
+/// token balance so `register_validator` can lock the token half.
+pub fn add_token_account(pt: &mut ProgramTest, mint: Pubkey, owner: Pubkey, amount: u64) -> Pubkey {
+    let token_account = Pubkey::new_unique();
+    let mut data = vec![0u8; spl_token::state::Account::LEN];
+    spl_token::state::Account {
+        mint,
+        owner,
+        amount,
+        delegate: COption::None,
+        state: spl_token::state::AccountState::Initialized,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority: COption::None,
+    }
+    .pack_into_slice(&mut data);
+    pt.add_account(
+        token_account,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: spl_token::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    token_account
+}
+
+/// Derive the shared token-stake vault + its authority PDA for `program_id`.
+pub fn stake_vault_pdas(program_id: Pubkey) -> (Pubkey, Pubkey) {
+    let (vault, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);
+    let (authority, _) = Pubkey::find_program_address(&[b"stake_vault_authority"], &program_id);
+    (vault, authority)
+}

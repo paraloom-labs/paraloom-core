@@ -4,6 +4,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::bpf_loader_upgradeable;
+use anchor_spl::token::{self, Burn, Mint, Token, TokenAccount, Transfer};
 
 mod groth16;
 pub mod merkle_tree;
@@ -15,6 +16,15 @@ mod transact_vk_data;
 declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
+
+/// Minimum PARALOOM-token stake a validator must lock, alongside the SOL stake
+/// (dual-stake, tokenomics.mdx). The token is slashable collateral and a demand
+/// sink — a validator slot requires holding and locking it — while the SOL
+/// stake keeps the cost of attacking high even when the token is thin/volatile.
+/// The token is base-unit denominated; the configured `stake_mint` fixes which
+/// token counts (a devnet mock mint in rehearsal, the real mint at mainnet), so
+/// swapping networks is a config change, not a code change. 1e6 base units.
+pub const MIN_TOKEN_STAKE: u64 = 1_000_000;
 
 /// Slots a validator's stake stays locked after it unregisters (or is slashed
 /// below the minimum) before it can be withdrawn. ~1 day at ~2.5 slots/s. The
@@ -549,29 +559,56 @@ pub mod paraloom_program {
     }
 
     /// Register a validator
-    pub fn register_validator(ctx: Context<RegisterValidator>, stake_amount: u64) -> Result<()> {
+    pub fn register_validator(
+        ctx: Context<RegisterValidator>,
+        stake_amount: u64,
+        token_stake_amount: u64,
+    ) -> Result<()> {
         require!(
             stake_amount >= MIN_VALIDATOR_STAKE,
             BridgeError::InsufficientStake
         );
-
-        let validator_account = &mut ctx.accounts.validator_account;
-        let validator_registry = &mut ctx.accounts.validator_registry;
-
-        let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.validator.key(),
-            &validator_account.to_account_info().key(),
-            stake_amount,
+        // Dual-stake: a validator slot requires locking the token half too
+        // (tokenomics.mdx). Both minimums must be met — the SOL stake keeps the
+        // attack cost high and stable, the token stake is the slashable
+        // demand-sink collateral.
+        require!(
+            token_stake_amount >= MIN_TOKEN_STAKE,
+            BridgeError::InsufficientTokenStake
         );
 
+        // Move the SOL half into the validator PDA (holds the lamports directly).
+        let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.validator.key(),
+            &ctx.accounts.validator_account.to_account_info().key(),
+            stake_amount,
+        );
         anchor_lang::solana_program::program::invoke(
             &transfer_ix,
             &[
                 ctx.accounts.validator.to_account_info(),
-                validator_account.to_account_info(),
+                ctx.accounts.validator_account.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
         )?;
+
+        // Move the token half into the shared vault. The validator signs for its
+        // own token account; the mint is pinned to `registry.stake_mint` by the
+        // context, so no worthless substitute token can be staked.
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.validator_token_account.to_account_info(),
+                    to: ctx.accounts.stake_token_vault.to_account_info(),
+                    authority: ctx.accounts.validator.to_account_info(),
+                },
+            ),
+            token_stake_amount,
+        )?;
+
+        let validator_account = &mut ctx.accounts.validator_account;
+        let validator_registry = &mut ctx.accounts.validator_registry;
 
         validator_account.validator = ctx.accounts.validator.key();
         validator_account.stake_amount = stake_amount;
@@ -584,6 +621,8 @@ pub mod paraloom_program {
         validator_account.pending_rewards = 0;
         validator_account.total_earnings = 0;
         validator_account.times_slashed = 0;
+        validator_account.token_stake_amount = token_stake_amount;
+        validator_account.token_unbonding_amount = 0;
 
         validator_registry.total_validators = validator_registry.total_validators.saturating_add(1);
         validator_registry.active_validators =
@@ -599,9 +638,10 @@ pub mod paraloom_program {
         });
 
         msg!(
-            "Validator registered: {} with stake {}",
+            "Validator registered: {} with stake {} + token {}",
             ctx.accounts.validator.key(),
-            stake_amount
+            stake_amount,
+            token_stake_amount
         );
         Ok(())
     }
@@ -629,6 +669,14 @@ pub mod paraloom_program {
             .unbonding_amount
             .saturating_add(stake_amount);
         validator_account.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+        // The token half unbonds in lockstep with the SOL half: it stays in the
+        // vault, slashable through the same window, and is released by
+        // `withdraw_unbonded_stake` when `unbonding_slot` elapses.
+        let token_stake = validator_account.token_stake_amount;
+        validator_account.token_stake_amount = 0;
+        validator_account.token_unbonding_amount = validator_account
+            .token_unbonding_amount
+            .saturating_add(token_stake);
 
         validator_registry.active_validators =
             validator_registry.active_validators.saturating_sub(1);
@@ -748,16 +796,27 @@ pub mod paraloom_program {
         // rent-only PDA cannot be made to debit more lamports than it holds.
         // `old_stake` here is the pre-slash at-risk amount: active stake for a
         // live validator, or the unbonding balance once it has left the set.
-        let old_stake = if validator_account.is_active {
+        let was_active = validator_account.is_active;
+        let old_stake = if was_active {
             validator_account.stake_amount
         } else {
             validator_account.unbonding_amount
         };
         let slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
+        // Slash the token half in the same proportion, off the at-risk token
+        // balance (active stake for a live validator, unbonding balance once it
+        // has left the set).
+        let old_token = if was_active {
+            validator_account.token_stake_amount
+        } else {
+            validator_account.token_unbonding_amount
+        };
+        let token_slash = (old_token as u128 * slash_percentage as u128 / 100) as u64;
         validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
-        if validator_account.is_active {
+        if was_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
+            validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
             // A slash that drops stake below the registry minimum deactivates
             // the validator: registration requires `stake >= minimum_stake`, so
             // a validator below that bar must stop settling and stop counting
@@ -767,16 +826,22 @@ pub mod paraloom_program {
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
                 registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
-                // The unslashed remainder would otherwise be stranded — a
-                // deactivated validator cannot `unregister` — so route it into
-                // unbonding, reclaimable after the delay. The slashed portion
-                // has already gone to the vault below.
+                // The unslashed remainder of BOTH collaterals would otherwise be
+                // stranded — a deactivated validator cannot `unregister` — so
+                // route it into unbonding, reclaimable after the delay. The
+                // slashed SOL has gone to the vault and the slashed token is
+                // burned below.
                 let residual = validator_account.stake_amount;
                 validator_account.unbonding_amount =
                     validator_account.unbonding_amount.saturating_add(residual);
+                validator_account.stake_amount = 0;
+                let token_residual = validator_account.token_stake_amount;
+                validator_account.token_unbonding_amount = validator_account
+                    .token_unbonding_amount
+                    .saturating_add(token_residual);
+                validator_account.token_stake_amount = 0;
                 validator_account.unbonding_slot =
                     Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
-                validator_account.stake_amount = 0;
             } else {
                 // Still active: only the slashed portion leaves the total.
                 let registry = &mut ctx.accounts.validator_registry;
@@ -788,8 +853,12 @@ pub mod paraloom_program {
             validator_account.unbonding_amount = validator_account
                 .unbonding_amount
                 .saturating_sub(slash_amount);
+            validator_account.token_unbonding_amount = validator_account
+                .token_unbonding_amount
+                .saturating_sub(token_slash);
         }
 
+        // Move the slashed SOL to the bridge vault.
         **validator_account
             .to_account_info()
             .try_borrow_mut_lamports()? -= slash_amount;
@@ -798,6 +867,27 @@ pub mod paraloom_program {
             .bridge_vault
             .to_account_info()
             .try_borrow_mut_lamports()? += slash_amount;
+
+        // Burn the slashed token half from the vault, signed by the vault
+        // authority. Burning is the strongest deterrent, needs no destination
+        // account, and works even though the real mint's authority is revoked
+        // (a burn is authorised by the token account's owner, not the mint).
+        if token_slash > 0 {
+            let auth_bump = ctx.bumps.stake_vault_authority;
+            let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
+            token::burn(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Burn {
+                        mint: ctx.accounts.stake_mint.to_account_info(),
+                        from: ctx.accounts.stake_token_vault.to_account_info(),
+                        authority: ctx.accounts.stake_vault_authority.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                token_slash,
+            )?;
+        }
 
         emit!(ValidatorSlashedEvent {
             validator,
@@ -826,8 +916,15 @@ pub mod paraloom_program {
         registry.active_validators = 0;
         registry.minimum_stake = MIN_VALIDATOR_STAKE;
         registry.total_active_stake = 0;
+        // Pin the dual-stake token: `register_validator` only accepts this mint
+        // as the token half. The shared `stake_token_vault` is created by the
+        // context's `init` constraint under the `stake_vault_authority` PDA.
+        registry.stake_mint = ctx.accounts.stake_mint.key();
 
-        msg!("Validator registry initialized");
+        msg!(
+            "Validator registry initialized (stake_mint {})",
+            registry.stake_mint
+        );
         Ok(())
     }
 
@@ -872,7 +969,10 @@ pub mod paraloom_program {
     /// cannot enumerate all PDAs), so it is the upgrade authority's
     /// responsibility; reconcile any active-but-excluded PDA with
     /// [`deactivate_validator`] before relying on the rebuilt denominator.
-    pub fn reset_validator_registry(ctx: Context<ResetValidatorRegistry>) -> Result<()> {
+    pub fn reset_validator_registry(
+        ctx: Context<ResetValidatorRegistry>,
+        stake_mint: Pubkey,
+    ) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
         let registry_ai = ctx.accounts.validator_registry.to_account_info();
@@ -946,6 +1046,12 @@ pub mod paraloom_program {
             active_validators: active,
             minimum_stake: MIN_VALIDATOR_STAKE,
             total_active_stake,
+            // Re-pin the dual-stake mint on the ceremony-redeploy migration. The
+            // pre-migration registry predates this field, so it is supplied
+            // explicitly rather than read from the grown bytes. The shared
+            // `stake_token_vault` is created once by `initialize_validator_registry`
+            // (or a dedicated vault-init on the redeploy runbook).
+            stake_mint,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1044,6 +1150,28 @@ pub mod paraloom_program {
             .to_account_info()
             .try_borrow_mut_lamports()? += amount;
         validator_account.unbonding_amount = 0;
+
+        // Return the token half from the shared vault, signed by the
+        // vault-authority PDA. Released together with the SOL unbonding, once
+        // the same window has elapsed.
+        let token_amount = validator_account.token_unbonding_amount;
+        validator_account.token_unbonding_amount = 0;
+        if token_amount > 0 {
+            let auth_bump = ctx.bumps.stake_vault_authority;
+            let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.stake_token_vault.to_account_info(),
+                        to: ctx.accounts.validator_token_account.to_account_info(),
+                        authority: ctx.accounts.stake_vault_authority.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                token_amount,
+            )?;
+        }
 
         emit!(UnbondedStakeWithdrawnEvent {
             validator: validator_account.validator,
@@ -1352,6 +1480,30 @@ pub struct InitializeValidatorRegistry<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    /// The SPL mint fixed as the dual-stake token half (recorded in
+    /// `registry.stake_mint`). A devnet mock mint in rehearsal, the real
+    /// PARALOOM mint at mainnet.
+    pub stake_mint: Account<'info, Mint>,
+
+    /// Shared vault holding every validator's locked token stake, owned by the
+    /// `stake_vault_authority` PDA. Created here once; `register_validator`
+    /// transfers into it and `withdraw`/`slash` move out under the PDA signer.
+    #[account(
+        init,
+        payer = authority,
+        seeds = [b"stake_token_vault"],
+        bump,
+        token::mint = stake_mint,
+        token::authority = stake_vault_authority,
+    )]
+    pub stake_token_vault: Account<'info, TokenAccount>,
+
+    /// PDA that owns `stake_token_vault`; signs token outflows on withdraw/slash.
+    ///
+    /// CHECK: address pinned by seeds; used only as the vault's token authority.
+    #[account(seeds = [b"stake_vault_authority"], bump)]
+    pub stake_vault_authority: UncheckedAccount<'info>,
+
     /// Same upgrade-authority gate as `Initialize` (#204) — closes the init
     /// front-run race for the validator registry.
     ///
@@ -1363,7 +1515,9 @@ pub struct InitializeValidatorRegistry<'info> {
     )]
     pub program_data: UncheckedAccount<'info>,
 
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -1414,6 +1568,25 @@ pub struct RegisterValidator<'info> {
     #[account(mut)]
     pub validator: Signer<'info>,
 
+    /// The validator's token account holding the token stake to lock. Its mint
+    /// must be the registry's pinned `stake_mint` and it must be owned by the
+    /// registering validator.
+    #[account(
+        mut,
+        token::mint = validator_registry.stake_mint,
+        token::authority = validator,
+    )]
+    pub validator_token_account: Account<'info, TokenAccount>,
+
+    /// Shared token-stake vault (destination for the locked token half).
+    #[account(
+        mut,
+        seeds = [b"stake_token_vault"],
+        bump,
+    )]
+    pub stake_token_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1516,6 +1689,28 @@ pub struct WithdrawUnbondedStake<'info> {
 
     #[account(mut)]
     pub validator: Signer<'info>,
+
+    /// Destination for the returned token stake — the validator's own token
+    /// account, of the same mint the vault holds.
+    #[account(
+        mut,
+        constraint = validator_token_account.mint == stake_token_vault.mint,
+        token::authority = validator,
+    )]
+    pub validator_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"stake_token_vault"],
+        bump,
+    )]
+    pub stake_token_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA that owns the vault; pinned by seeds, signs the token return.
+    #[account(seeds = [b"stake_vault_authority"], bump)]
+    pub stake_vault_authority: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -1568,6 +1763,27 @@ pub struct SlashValidator<'info> {
         has_one = authority
     )]
     pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    /// The dual-stake mint (pinned to the registry's), needed to burn the
+    /// slashed token half from the vault.
+    #[account(
+        mut,
+        address = validator_registry.stake_mint
+    )]
+    pub stake_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"stake_token_vault"],
+        bump,
+    )]
+    pub stake_token_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA that owns the vault; pinned by seeds, signs the token burn.
+    #[account(seeds = [b"stake_vault_authority"], bump)]
+    pub stake_vault_authority: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
 
     pub authority: Signer<'info>,
 }
@@ -1627,6 +1843,13 @@ pub struct ValidatorRegistry {
     /// so a permissionless registry cannot be Sybil-forged with many tiny
     /// validators. Maintained on register / unregister / slash.
     pub total_active_stake: u64,
+    /// The SPL mint that `register_validator` accepts as the token half of the
+    /// dual-stake. Pinned here (set at `initialize_validator_registry`) so a
+    /// validator cannot substitute a worthless token: register validates the
+    /// staked token account's mint against this. A devnet mock mint in
+    /// rehearsal, the real PARALOOM mint at mainnet — swapping is a config
+    /// change. Appended last to keep the existing field offsets unchanged.
+    pub stake_mint: Pubkey,
 }
 
 #[account]
@@ -1648,6 +1871,15 @@ pub struct ValidatorAccount {
     pub unbonding_amount: u64,
     /// Earliest slot at which withheld `unbonding_amount` may be withdrawn.
     pub unbonding_slot: u64,
+    /// The validator's locked PARALOOM-token stake (the dual-stake token half),
+    /// held in the shared `stake_token_vault` and accounted here. Parallels
+    /// `stake_amount`: set on register, moved to `token_unbonding_amount` on
+    /// unregister, slashed (burned from the vault) alongside the SOL stake.
+    pub token_stake_amount: u64,
+    /// Token stake withheld in the vault after unregister/deactivating-slash,
+    /// released to the validator by `withdraw_unbonded_stake` once the same
+    /// `unbonding_slot` elapses. Parallels `unbonding_amount` for the token.
+    pub token_unbonding_amount: u64,
 }
 
 /// Emitted by `deposit_note` (circuit v3): the appended note commitment and its
@@ -1774,4 +2006,7 @@ pub enum BridgeError {
 
     #[msg("Deposit would push the vault balance past the deposit cap")]
     DepositCapExceeded,
+
+    #[msg("Token stake is below the minimum required for the dual-stake")]
+    InsufficientTokenStake,
 }

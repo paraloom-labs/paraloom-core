@@ -3200,6 +3200,7 @@ dependencies = [
  "solana-poseidon",
  "solana-program-test",
  "solana-sdk",
+ "spl-token",
 ]
 
 [[package]]
