@@ -143,6 +143,26 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
         },
     )
     .await;
+    // Open the deposit cap (u64::MAX) so the fixture `deposit_note` below is not
+    // rejected by the TVL cap, which `initialize` leaves at 0. The vault is
+    // pre-funded with 2 SOL before that deposit; this test exercises rewards,
+    // not the cap. Cold-authority signed.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetDepositCap { new_cap: u64::MAX }.data(),
+            accounts: accounts::SetDepositCap {
+                bridge_state: state_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
     send(
         &mut banks_client,
         recent_blockhash,

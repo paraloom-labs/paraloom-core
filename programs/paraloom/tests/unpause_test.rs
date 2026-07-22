@@ -134,6 +134,28 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
     )
     .await;
 
+    // Open the pool: `initialize` leaves the deposit cap at 0 (closed), so set
+    // a cap above the test deposit before it can land. Cold-authority signed.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetDepositCap {
+                new_cap: 1_000_000_000,
+            }
+            .data(),
+            accounts: accounts::SetDepositCap {
+                bridge_state: state_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
     // Deposit is permissionless → stays on the auto-payer.
     send(
         &mut banks_client,
