@@ -198,7 +198,22 @@ async fn register_rejects_token_stake_below_minimum() {
     tx.sign(&[&upgrade_authority], blockhash);
     banks.process_transaction(tx).await.unwrap();
 
-    // SOL stake fine, token stake = 0 (< MIN_TOKEN_STAKE) → must be rejected.
+    // Open the token gate: raise the floor from 0 (default) to 1e6, so a 0 token
+    // stake is now below the minimum. Also exercises `set_min_token_stake`.
+    let set_min = Instruction {
+        program_id,
+        data: instruction::SetMinTokenStake { new_min: 1_000_000 }.data(),
+        accounts: accounts::SetMinTokenStake {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[set_min], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // SOL stake fine, token stake = 0 (< configured min_token_stake) → rejected.
     let register = Instruction {
         program_id,
         data: instruction::RegisterValidator {

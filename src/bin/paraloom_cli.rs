@@ -1418,25 +1418,33 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_account_data(&validator_registry_pda)
                     .context("Failed to read validator registry (is it initialized?)")?;
                 anyhow::ensure!(
-                    registry_data.len() >= 104,
-                    "validator registry predates the dual-stake layout (no stake_mint) — redeploy the program first"
+                    registry_data.len() >= 112,
+                    "validator registry predates the dual-stake layout — redeploy the program first"
                 );
+                // Registry layout after the 8-byte discriminator: authority
+                // [8..40], three u64 counters [40..64], total_active_stake
+                // [64..72], stake_mint [72..104], min_token_stake [104..112].
                 let stake_mint = Pubkey::new_from_array(
                     registry_data[72..104]
                         .try_into()
                         .expect("32-byte stake_mint slice"),
                 );
+                let min_token_stake = u64::from_le_bytes(
+                    registry_data[104..112]
+                        .try_into()
+                        .expect("8-byte min_token_stake slice"),
+                );
                 let validator_token =
                     derive_associated_token_address(&validator.pubkey(), &stake_mint);
 
-                // The token half of the dual-stake (== MIN_TOKEN_STAKE).
-                const TOKEN_STAKE: u64 = 1_000_000;
+                // Stake exactly the registry's current token floor (0 while the
+                // token gate is still closed).
                 let ix = create_register_validator_instruction(
                     &program_id,
                     &validator.pubkey(),
                     &validator_token,
                     STAKE_LAMPORTS,
-                    TOKEN_STAKE,
+                    min_token_stake,
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
 
