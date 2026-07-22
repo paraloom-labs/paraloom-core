@@ -353,4 +353,92 @@ mod tests {
             expected
         );
     }
+
+    /// Deterministic pseudo-random leaves. Values are kept below 2^128 (top
+    /// bytes zero) so every leaf is a canonical BN254 field element the syscall
+    /// hashes without reduction. splitmix64 gives good spread without a `rand`
+    /// dependency in the program crate.
+    fn pseudo_leaves(n: usize, seed: u64) -> Vec<[u8; 32]> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let mut leaf = [0u8; 32];
+            leaf[..8].copy_from_slice(&z.to_le_bytes());
+            leaf[8..16].copy_from_slice(&s.to_le_bytes());
+            out.push(leaf);
+        }
+        out
+    }
+
+    /// Property test: over many random leaf sequences, the incremental
+    /// `append` root equals the independent full recompute after *every* insert.
+    /// This is the load-bearing guarantee that the bespoke incremental tree
+    /// never diverges from a naive from-scratch tree — the only thing that makes
+    /// the program-computed settlement root trustworthy.
+    #[test]
+    fn append_matches_recompute_over_many_leaves() {
+        for seed in [1u64, 42, 7777, 0xDEAD_BEEF] {
+            let mut t = empty();
+            let mut leaves = Vec::new();
+            for leaf in pseudo_leaves(40, seed) {
+                t.append(leaf).unwrap();
+                leaves.push(leaf);
+                assert_eq!(
+                    t.root,
+                    recompute_root(&leaves),
+                    "incremental root diverged from recompute at {} leaves (seed {:#x})",
+                    leaves.len(),
+                    seed
+                );
+            }
+        }
+    }
+
+    /// The root history is a fixed `ROOT_HISTORY_SIZE` window: once more than
+    /// that many leaves are appended, roots older than the window are forgotten
+    /// and only the most recent ones remain known. Settlement relies on this —
+    /// a proof built against a too-stale root must be rejected, not silently
+    /// accepted from a buffer that grew without bound.
+    #[test]
+    fn is_known_root_forgets_beyond_the_history_window() {
+        let mut t = empty();
+        let total = ROOT_HISTORY_SIZE + 5;
+        let mut roots = Vec::with_capacity(total);
+        for leaf in pseudo_leaves(total, 99) {
+            roots.push(t.append(leaf).unwrap());
+        }
+        // The most recent ROOT_HISTORY_SIZE roots stay known.
+        for r in &roots[total - ROOT_HISTORY_SIZE..] {
+            assert!(
+                t.is_known_root(*r),
+                "a root inside the window must be known"
+            );
+        }
+        // Everything older than the window has been evicted.
+        for r in &roots[..total - ROOT_HISTORY_SIZE] {
+            assert!(
+                !t.is_known_root(*r),
+                "a root older than the window must be forgotten"
+            );
+        }
+    }
+
+    /// Appending past the tree's capacity (`2^TREE_DEPTH` leaves) is rejected
+    /// rather than wrapping `next_index` or corrupting the structure.
+    #[test]
+    fn append_rejects_when_the_tree_is_full() {
+        let mut t = empty();
+        t.next_index = 1u64 << TREE_DEPTH; // conceptually full
+        let mut leaf = [0u8; 32];
+        leaf[0] = 1;
+        assert!(
+            t.append(leaf).is_err(),
+            "append past 2^TREE_DEPTH must be rejected"
+        );
+    }
 }
