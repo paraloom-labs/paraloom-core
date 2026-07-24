@@ -59,6 +59,17 @@ issue, email security@paraloom.network.
     before committing any per-job state, so a rejected job leaves no residue.
   Devnet, pre-mainnet.
 
+- **Compute execution-proof verification now fails closed when the verifying key
+  is absent** (external bug-bounty report, Godswork4). `verify_execution_proof`
+  dropped to a length-only check and accepted any 32- or 192-byte buffer as a
+  valid Groth16 proof whenever `keys/compute_verifying.key` was missing; with
+  multi-validator consensus optional by default, that length check was the sole
+  gate, so a forged `PrivateJobResult` with an arbitrary output could pass. It
+  now returns an error when the key is absent, and the permissive placeholder
+  path is compiled only under `cfg(test)`, so release/dev binaries reject the
+  result outright. Alpha compute subsystem, out of Stage 1 bounty scope (credited
+  here, not paid). Devnet, pre-mainnet (#652, PR #654).
+
 - **Deposit listener aborts a poll instead of skipping a signature whose body
   failed to fetch** (external bug-bounty report, gussamkodin). The
   contiguous-cursor barrier that keeps the listener from advancing past an
