@@ -471,22 +471,38 @@ impl PrivateJobResult {
             return Ok(valid);
         }
 
-        // Fallback: Basic format check for placeholder proofs
-        log::warn!("Compute verifying keys not found, using placeholder verification");
-        log::warn!("Run: cargo run --bin setup_compute_ceremony");
-
-        // Accept either:
-        // - Placeholder proofs: SHA256 hashes (32 bytes)
-        // - Real proofs: Groth16 (192 bytes) - but can't verify without keys
-        if proof_bytes.len() != 32 && proof_bytes.len() != 192 {
-            log::warn!(
-                "Invalid proof format (expected 32 or 192 bytes, got {})",
-                proof_bytes.len()
-            );
-            return Ok(false);
+        // No verifying key on disk. Real Groth16 verification is impossible
+        // here, so fail CLOSED: a missing cryptographic artifact must never
+        // silently downgrade "prove correct execution" to a byte-length check
+        // that any 32- or 192-byte buffer would pass (#652). The permissive
+        // placeholder path is compiled ONLY under `cargo test`, where the
+        // compute unit tests exercise the pipeline without a ceremony key;
+        // release/dev binaries reject the result outright.
+        #[cfg(test)]
+        {
+            log::warn!("Compute verifying key not found — TEST-ONLY placeholder verification");
+            if proof_bytes.len() != 32 && proof_bytes.len() != 192 {
+                log::warn!(
+                    "Invalid proof format (expected 32 or 192 bytes, got {})",
+                    proof_bytes.len()
+                );
+                return Ok(false);
+            }
+            Ok(true)
         }
 
-        Ok(true)
+        #[cfg(not(test))]
+        {
+            log::error!(
+                "Compute verifying key not found (keys/compute_verifying.key) — \
+                 refusing to accept execution proof. \
+                 Run: cargo run --bin setup_compute_ceremony"
+            );
+            Err(anyhow!(
+                "compute verifying key unavailable: refusing to verify \
+                 execution proof (fail-closed)"
+            ))
+        }
     }
 }
 
