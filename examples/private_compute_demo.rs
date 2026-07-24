@@ -127,7 +127,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Verifying output commitment...");
     println!("Checking multi-validator consensus (2/3 required)...");
 
-    let verified = coordinator.verify_result(&private_result).await?;
+    let verified = match coordinator.verify_result(&private_result).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Fail-closed (#652): without keys/compute_verifying.key on disk the
+            // coordinator refuses to accept the proof rather than rubber-stamping
+            // it on a byte-length check. Generate the key first, then re-run.
+            println!("Verification unavailable: {e}");
+            println!("Run: cargo run --bin setup_compute_ceremony  (then re-run this demo)\n");
+            return Ok(());
+        }
+    };
     if verified {
         println!("Result verified successfully\n");
     } else {
