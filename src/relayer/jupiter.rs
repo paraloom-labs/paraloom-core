@@ -248,11 +248,11 @@ impl JupiterHttpClient for ReqwestJupiterClient {
     }
 }
 
-/// Production [`SwapSubmitter`] over a Solana [`RpcClient`]. Signs the versioned
+/// Production [`SwapSubmitter`] over a Solana `RpcClient`. Signs the versioned
 /// transaction with the fresh keypair (replacing the unsigned placeholder
 /// signature Jupiter leaves for `userPublicKey`) and confirms it.
 ///
-/// [`RpcClient`] is blocking, so the call is run on a blocking thread to avoid
+/// `RpcClient` is blocking, so the call is run on a blocking thread to avoid
 /// stalling the async runtime.
 pub struct RpcSwapSubmitter {
     rpc_url: String,

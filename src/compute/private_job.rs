@@ -147,7 +147,7 @@ impl PrivateComputeJob {
         Ok(out)
     }
 
-    /// Decrypt data sealed by [`Self::encrypt_data`], using the owner's X25519
+    /// Decrypt data sealed by `encrypt_data`, using the owner's X25519
     /// **secret** key. Only the owner (holder of the secret) can decrypt — the
     /// public address alone cannot.
     ///

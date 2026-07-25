@@ -100,7 +100,7 @@ impl PrivacyStorage {
     /// Insert a commitment into the Merkle tree.
     ///
     /// Durability-critical: synchronous fsync via
-    /// [`durable_write_options`]. A crash after this returns must
+    /// `durable_write_options`. A crash after this returns must
     /// not lose the leaf — the in-memory tree relies on RocksDB as
     /// the source of truth on restart.
     pub fn insert_commitment(&self, index: u64, commitment: &Commitment) -> Result<()> {
@@ -223,7 +223,7 @@ impl PrivacyStorage {
     /// Most safety-critical write in the system: a missed nullifier
     /// on restart re-opens a double-spend window for the
     /// already-spent note. Forced fsync via
-    /// [`durable_write_options`] — the write does not return until
+    /// `durable_write_options` — the write does not return until
     /// the WAL has hit disk.
     pub fn insert_nullifier(&self, nullifier: &Nullifier) -> Result<()> {
         let cf = self

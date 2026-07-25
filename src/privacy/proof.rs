@@ -197,7 +197,7 @@ fn resolve_transact_key_path() -> PathBuf {
 ///
 /// This is the pure, testable core of the loading logic — given a path,
 /// produce either the key or a typed error explaining what went wrong.
-/// The caching wrapper [`ProofVerifier::get_transact_verifying_key`] composes
+/// The caching wrapper `ProofVerifier::get_transact_verifying_key` composes
 /// this with a global `OnceLock`.
 pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadError> {
     let bytes = match std::fs::read(path) {

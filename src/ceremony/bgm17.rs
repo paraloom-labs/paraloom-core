@@ -79,7 +79,7 @@ impl DleqProof {
         out
     }
 
-    /// Inverse of [`to_bytes`]. Errors on truncation, trailing
+    /// Inverse of `to_bytes`. Errors on truncation, trailing
     /// data, or a point that fails compressed-form validation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BgmError> {
         let mut cursor = bytes;

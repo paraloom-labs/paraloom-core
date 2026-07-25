@@ -77,7 +77,7 @@ pub struct HealthServerState {
 impl HealthServerState {
     /// Construct a fresh state with `started_at = now()` and
     /// `peer_count = 0`. The node binary is expected to call
-    /// [`mark_ready`] when start-up completes.
+    /// `mark_ready` when start-up completes.
     pub fn new() -> Self {
         Self {
             started_at: Instant::now(),

@@ -3,9 +3,8 @@
 //! The vote-collection and reputation-gated quorum logic shared by
 //! withdrawal and transfer verification. It tracks votes keyed by validator
 //! for a single request id and computes the quorum without knowing anything
-//! about the payload being verified, so both
-//! [`crate::consensus::withdrawal::WithdrawalConsensus`] and
-//! [`crate::consensus::transfer::TransferConsensus`] embed one and delegate
+//! about the payload being verified, so
+//! [`crate::consensus::transact::TransactConsensus`] embeds one and delegates
 //! to it. Keeping the audit-sensitive counting logic (the reputation gating
 //! from #62) in one place means a fix applies to both paths at once.
 

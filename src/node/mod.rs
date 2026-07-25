@@ -1317,8 +1317,7 @@ impl Node {
         self
     }
 
-    /// Override the transact-consensus quorum thresholds (#350 testing seam),
-    /// the transact twin of [`with_consensus_thresholds`](Self::with_consensus_thresholds).
+    /// Override the transact-consensus quorum thresholds (#350 testing seam).
     /// Must be called right after `new()`, before `run()` clones the node.
     pub fn with_transact_consensus_thresholds(
         mut self,
@@ -1345,8 +1344,7 @@ impl Node {
     }
 
     /// `(valid, invalid)` transact-vote tally for a request this node
-    /// initiated (#350), the transact twin of
-    /// [`transfer_vote_counts`](Self::transfer_vote_counts). `Ok(None)` on a
+    /// initiated (#350). `Ok(None)` on a
     /// node with no transact coordinator.
     pub async fn transact_vote_counts(&self, request_id: &str) -> Result<Option<(usize, usize)>> {
         match &self.transact_coordinator {
