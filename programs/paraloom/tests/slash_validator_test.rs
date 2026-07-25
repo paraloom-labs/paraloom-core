@@ -28,7 +28,7 @@ use common::{
 };
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
-const TOKEN_STAKE: u64 = 1_000_000;
+const TOKEN_STAKE: u64 = paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE;
 
 async fn send(
     banks_client: &mut solana_program_test::BanksClient,

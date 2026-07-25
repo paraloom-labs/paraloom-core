@@ -38,7 +38,7 @@ fn register_ix(
         program_id,
         data: instruction::RegisterValidator {
             stake_amount: MIN_VALIDATOR_STAKE,
-            token_stake_amount: 1_000_000,
+            token_stake_amount: paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
         }
         .data(),
         accounts: accounts::RegisterValidator {
@@ -89,8 +89,8 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         },
     );
     let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
-    let token_a = add_token_account(&mut pt, stake_mint, validator_a.pubkey(), 1_000_000_000);
-    let token_b = add_token_account(&mut pt, stake_mint, validator_b.pubkey(), 1_000_000_000);
+    let token_a = add_token_account(&mut pt, stake_mint, validator_a.pubkey(), common::TEST_TOKEN_FUND);
+    let token_b = add_token_account(&mut pt, stake_mint, validator_b.pubkey(), common::TEST_TOKEN_FUND);
     let (mut banks, _payer, blockhash) = pt.start().await;
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
@@ -176,6 +176,24 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
     assert_eq!(after.total_validators, 1);
     assert_eq!(after.total_active_stake, MIN_VALIDATOR_STAKE);
     assert_eq!(after.minimum_stake, MIN_VALIDATOR_STAKE);
+
+    // The token half of the dual-stake has to come back closed too. A reset
+    // to zero would leave registration open to anyone holding no tokens at
+    // all, for the whole window until someone remembered to set the floor —
+    // and registration is permissionless, so that window is exploitable.
+    assert_ne!(
+        after.min_token_stake, 0,
+        "reset must not reopen the dual-stake token gate"
+    );
+    assert_eq!(
+        after.min_token_stake,
+        paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
+        "reset re-establishes the recommended floor"
+    );
+    assert_eq!(
+        before.min_token_stake, after.min_token_stake,
+        "the floor a fresh registry starts at survives the migration"
+    );
 }
 
 #[tokio::test]

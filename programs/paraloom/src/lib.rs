@@ -955,10 +955,14 @@ pub mod paraloom_program {
         // as the token half. The shared `stake_token_vault` is created by the
         // context's `init` constraint under the `stake_vault_authority` PDA.
         registry.stake_mint = ctx.accounts.stake_mint.key();
-        // Token gate opens deliberately: 0 means no token floor until the
-        // cold/DAO authority raises it via `set_min_token_stake` (like the
-        // deposit cap). Set it to `RECOMMENDED_MIN_TOKEN_STAKE` at deploy.
-        registry.min_token_stake = 0;
+        // Start at the recommended floor rather than at zero. Zero is not the
+        // safe default it looks like: `register_validator` checks
+        // `token_stake_amount >= min_token_stake`, so a floor of zero passes
+        // for everyone and the dual-stake gate is open. That is the opposite
+        // of the deposit cap, where zero refuses every deposit — the two look
+        // alike and fail in opposite directions. The authority lowers or
+        // raises this deliberately via `set_min_token_stake`.
+        registry.min_token_stake = RECOMMENDED_MIN_TOKEN_STAKE;
 
         msg!(
             "Validator registry initialized (stake_mint {})",
@@ -1091,9 +1095,15 @@ pub mod paraloom_program {
             // `stake_token_vault` is created once by `initialize_validator_registry`
             // (or a dedicated vault-init on the redeploy runbook).
             stake_mint,
-            // Reset to the open (0) token gate; the authority re-establishes the
-            // real floor via `set_min_token_stake` after the redeploy.
-            min_token_stake: 0,
+            // Re-establish the recommended floor, not an open gate. The
+            // pre-migration registry predates this field so there is nothing
+            // to carry over, and resetting to zero would leave the dual-stake
+            // gate open for the whole window between the redeploy and whenever
+            // someone remembers `set_min_token_stake` — with registration
+            // permissionless, that window is exploitable. Starting closed
+            // means a forgotten step costs a rejected registration rather
+            // than a validator slot bought with no token stake.
+            min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1923,8 +1933,10 @@ pub struct ValidatorRegistry {
     /// The enforced token-stake floor for the dual-stake: `register_validator`
     /// requires `token_stake_amount >= min_token_stake`. Config (settable by the
     /// cold/DAO authority via `set_min_token_stake`) so it tracks the token's
-    /// price without a redeploy. Defaults to 0 at `initialize`, so a fresh
-    /// deploy opens the token gate deliberately. See [`RECOMMENDED_MIN_TOKEN_STAKE`].
+    /// price without a redeploy. Both `initialize_validator_registry` and
+    /// `reset_validator_registry` start it at [`RECOMMENDED_MIN_TOKEN_STAKE`]:
+    /// zero would mean every registration clears the gate, so the gate opens
+    /// only when the authority lowers it on purpose.
     pub min_token_stake: u64,
 }
 

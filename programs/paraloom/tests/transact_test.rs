@@ -92,9 +92,9 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         &mut pt,
         stake_mint,
         upgrade_authority.pubkey(),
-        1_000_000_000,
+        common::TEST_TOKEN_FUND,
     );
-    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), 1_000_000_000);
+    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), common::TEST_TOKEN_FUND);
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
@@ -216,7 +216,7 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         Instruction {
             program_id,
             data: instruction::RegisterValidator {
-                token_stake_amount: 1_000_000,
+                token_stake_amount: paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
                 stake_amount: MIN_VALIDATOR_STAKE,
             }
             .data(),
@@ -262,7 +262,7 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
         Instruction {
             program_id,
             data: instruction::RegisterValidator {
-                token_stake_amount: 1_000_000,
+                token_stake_amount: paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
                 stake_amount: MIN_VALIDATOR_STAKE,
             }
             .data(),
