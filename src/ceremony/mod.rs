@@ -17,8 +17,22 @@
 //!   BGM17 contribution operation: `delta_after ← delta_before *
 //!   δ_i` and the corresponding update of the `h_query`/`l_query`
 //!   vectors. As long as one contributor in Phase 2 is honest and
-//!   destroys their `δ_i`, the ceremony is sound regardless of
-//!   the Phase 1 trapdoor.
+//!   destroys their `δ_i`, no party knows the final `δ`.
+//!
+//! ## What Phase 2 does not do
+//!
+//! Phase 2 re-randomises `δ` and only `δ`. `α`, `β` and every
+//! element derived from `τ` come out of Phase 1 and are carried
+//! through the chain unchanged — the verifier requires exactly
+//! that. So the contributions do not stand in for a Phase 1
+//! ceremony: whoever produced the initial SRS can still forge
+//! proofs afterwards, however many contributors join.
+//! `phase1_trapdoor` demonstrates this end to end.
+//!
+//! A single-party Phase 1 therefore leaves soundness resting on
+//! that one operator having destroyed their entropy. Removing
+//! that assumption means starting the chain from a public
+//! powers-of-tau transcript instead; see issue #659.
 //!
 //! ## Scope
 //!
@@ -44,6 +58,8 @@
 
 pub mod bgm17;
 pub mod contribute;
+#[cfg(test)]
+mod phase1_trapdoor;
 pub mod policy;
 pub mod transcript;
 pub mod verifier;
