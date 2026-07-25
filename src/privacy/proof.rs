@@ -3,7 +3,6 @@
 //! Implements Groth16 zkSNARK verification for withdrawal proofs using Arkworks.
 
 use crate::privacy::circuits::Groth16ProofSystem;
-use crate::privacy::transaction::TransferTx;
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
 use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
@@ -372,39 +371,11 @@ impl ProofVerifier {
             },
         }
     }
-
-    /// Split verification into chunks for distributed processing.
-    ///
-    /// Range checks for input/output amounts are enforced inside the
-    /// transfer circuit (#60); the host-level chunked verifier no
-    /// longer needs a separate `RangeProof` chunk and so we emit only
-    /// the output-commitment and nullifier-uniqueness chunks here.
-    pub fn create_verification_chunks(tx: &TransferTx) -> Vec<VerificationChunk> {
-        vec![
-            VerificationChunk::OutputCommitments {
-                commitments: tx.output_commitments.clone(),
-            },
-            VerificationChunk::NullifierUniqueness {
-                nullifiers: tx.input_nullifiers.clone(),
-            },
-        ]
-    }
-
-    /// Aggregate chunk verification results
-    pub fn aggregate_results(results: &[VerificationResult]) -> VerificationResult {
-        for result in results {
-            if !result.is_valid() {
-                return result.clone();
-            }
-        }
-        VerificationResult::Valid
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privacy::types::{Note, ShieldedAddress};
 
     /// A canonical encoding is accepted; the same field element re-encoded as
     /// `b + p` (a distinct 32-byte buffer that lifts to the same `Fr`) is
@@ -563,47 +534,6 @@ mod tests {
         let chunk = VerificationChunk::NullifierUniqueness { nullifiers };
 
         assert!(!chunk.verify().is_valid());
-    }
-
-    #[test]
-    fn test_verification_chunks_creation() {
-        let nullifiers = vec![Nullifier([1u8; 32])];
-        let note = Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
-
-        let tx = TransferTx::new(nullifiers, vec![note], [0u8; 32], 10);
-
-        let chunks = ProofVerifier::create_verification_chunks(&tx);
-
-        // Should have: output commitments + nullifier uniqueness.
-        // Range checks moved in-circuit in #60, so the host-level
-        // chunked verifier no longer emits a separate range chunk.
-        assert_eq!(chunks.len(), 2);
-    }
-
-    #[test]
-    fn test_aggregate_results_all_valid() {
-        let results = vec![
-            VerificationResult::Valid,
-            VerificationResult::Valid,
-            VerificationResult::Valid,
-        ];
-
-        let aggregated = ProofVerifier::aggregate_results(&results);
-        assert!(aggregated.is_valid());
-    }
-
-    #[test]
-    fn test_aggregate_results_one_invalid() {
-        let results = vec![
-            VerificationResult::Valid,
-            VerificationResult::Invalid {
-                reason: "Test error".to_string(),
-            },
-            VerificationResult::Valid,
-        ];
-
-        let aggregated = ProofVerifier::aggregate_results(&results);
-        assert!(!aggregated.is_valid());
     }
 
     #[test]
