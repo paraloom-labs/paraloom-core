@@ -20,8 +20,10 @@ mod common;
 use common::{add_program_data, add_stake_mint, add_token_account, entry, stake_vault_pdas};
 
 const SOL_STAKE: u64 = 1_000_000_000; // == MIN_VALIDATOR_STAKE
-const TOKEN_STAKE: u64 = 5_000_000; // 5x MIN_TOKEN_STAKE
-const TOKEN_FUND: u64 = 10_000_000;
+/// Both registries now start at the recommended floor, so a registration
+/// that is meant to succeed has to clear it.
+const TOKEN_STAKE: u64 = paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE;
+const TOKEN_FUND: u64 = TOKEN_STAKE * 2;
 
 #[tokio::test]
 async fn register_locks_both_stakes_and_slash_burns_the_token() {

@@ -34,7 +34,7 @@ use common::{
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
-const TOKEN_STAKE: u64 = 1_000_000;
+const TOKEN_STAKE: u64 = paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE;
 
 /// Send `ix` signed by `signer` (also the fee payer) on a fresh blockhash and
 /// return the raw result so callers can assert success or a specific error.
