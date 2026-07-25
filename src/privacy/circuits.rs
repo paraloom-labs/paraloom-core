@@ -1762,3 +1762,48 @@ mod tests {
         }
     }
 }
+
+/// Locks the constraint shape of the circuit under ceremony.
+///
+/// A phase-2 chain is bound to one R1CS. Change the constraints while a
+/// chain is live and every contribution made so far is void — there is no
+/// partial recovery, the whole chain reruns from a fresh initial key. CI's
+/// circuit-freeze guard blocks PRs that touch the circuit or its Poseidon
+/// gadgets during a ceremony, but it watches file paths; this watches the
+/// thing that actually matters, so a shape change arriving through any
+/// route has to be acknowledged rather than merged quietly.
+///
+/// The numbers also size the ceremony: the evaluation domain is
+/// `num_constraints + num_instance_variables` rounded up to a power of two,
+/// which fixes the smallest powers-of-tau file the chain can start from.
+#[cfg(test)]
+mod r1cs_shape {
+    use super::*;
+    use ark_relations::r1cs::{ConstraintSystem, OptimizationGoal, SynthesisMode};
+
+    #[test]
+    fn transact_v3_shape_is_pinned() {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        cs.set_optimization_goal(OptimizationGoal::Constraints);
+        cs.set_mode(SynthesisMode::Setup);
+        TransactCircuitV3::blank()
+            .generate_constraints(cs.clone())
+            .expect("blank instance synthesises");
+        cs.finalize();
+
+        // Changing any of these invalidates a live ceremony chain. If a
+        // deliberate circuit change lands, update these and treat any
+        // in-flight chain as void.
+        assert_eq!(cs.num_constraints(), 18_477, "constraint count moved");
+        assert_eq!(cs.num_witness_variables(), 18_542, "witness count moved");
+        // 8 public inputs plus the constant-one wire, matching the 9 IC
+        // points the on-chain verifier expects.
+        assert_eq!(cs.num_instance_variables(), 9, "public input count moved");
+
+        // The domain the Groth16 setup builds, and therefore the minimum
+        // powers-of-tau size: 18_486 rounds up to 2^15.
+        let domain_input = cs.num_constraints() + cs.num_instance_variables();
+        assert_eq!(domain_input, 18_486);
+        assert_eq!(domain_input.next_power_of_two(), 32_768);
+    }
+}
