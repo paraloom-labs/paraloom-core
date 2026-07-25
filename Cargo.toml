@@ -143,7 +143,6 @@ anyhow = "1.0.104"
 
 # CLI 
 clap = { version = "4.1.8", features = ["derive"] }
-config = "0.13.3"
 toml = "0.7.3"
 
 # Utilities
