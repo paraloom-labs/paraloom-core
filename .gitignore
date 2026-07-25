@@ -57,3 +57,7 @@ data/
 
 # Archive (old docs backup)
 archive/
+
+# Build artefacts from export_transact_v3_r1cs; regenerate with the binary
+# rather than committing an 18 MB blob (ceremony packages publish their own).
+artifacts/
