@@ -113,9 +113,7 @@ tokio = { version = "1.25.0", features = ["full"] }
 
 # Web server - compatible versions
 axum = "0.6"
-tower = "0.4"
-tower-http = { version = "0.4", features = ["fs", "cors"] }
-hyper = "0.14.32"
+tower-http = { version = "0.4", features = ["cors"] }
 
 # Serialization & Data handling
 serde = { version = "1.0.152", features = ["derive"] }
@@ -156,7 +154,6 @@ wat = "1.240" # For WASM parsing (compute demo)
 sha2 = "0.10"
 hex = "0.4.3"
 bs58 = { version = "0.5.1", optional = true }
-aes-gcm = "0.10.3"
 rand = "0.8"
 # NaCl crypto_box (X25519 + XSalsa20-Poly1305) for encrypted note delivery
 # (#196). Wire-compatible with the wallet's tweetnacl `box`.
@@ -198,16 +195,18 @@ wasmtime = "36.0"
 sysinfo = "0.29.0"
 
 [dev-dependencies]
-tokio-test = "0.4.5"
 tempfile = "3.3.0"
-wat = "1.240" # For WASM testing (Phase 3)
+# `#[tokio::test(start_paused = true)]` in src/node/mod.rs needs tokio's
+# `test-util` feature, which the `full` feature does not include. It used to
+# arrive implicitly via tokio-test; declare it here so it is not load-bearing
+# on an unrelated dependency.
+tokio = { version = "1.25.0", features = ["test-util"] }
 proptest = "1.11.0" # Property-based testing for privacy primitives (#71)
-# Construct a well-formed compressed BN254 proof in the co-sign settlement E2E
-# (#260); the proof only needs to deserialize, not satisfy the circuit.
-ark-bn254 = "0.4"
-ark-groth16 = "0.4"
-ark-ec = "0.4"
-ark-serialize = "0.4"
+# Drive the axum routers directly in the health and ingress test modules:
+# `tower::ServiceExt::oneshot` to call them, `hyper::body::to_bytes` to read
+# the response back.
+hyper = "0.14.32"
+tower = "0.4"
 # Rebuild the evaluation domain a Groth16 setup samples tau from, for the
 # phase-1 trapdoor demonstration in src/ceremony/phase1_trapdoor.rs.
 ark-poly = "0.4"
