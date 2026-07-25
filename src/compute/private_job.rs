@@ -90,7 +90,9 @@ impl PrivateComputeJob {
         let input_commitment =
             crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
 
-        // Encrypt input data with owner's public key using AES-GCM-256
+        // Seal the input to the owner's X25519 public key with crypto_box
+        // (X25519 + XSalsa20-Poly1305, via note_crypto::seal). Only the holder
+        // of the owner's secret key can open it — the address alone cannot.
         let encrypted_input = Self::encrypt_data(&input_data, &owner_address)?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
