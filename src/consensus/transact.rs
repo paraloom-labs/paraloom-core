@@ -1,6 +1,6 @@
 //! Unified-transact verification consensus (#350).
 //!
-//! The circuit-v3 twin of [`crate::consensus::transfer`]. A client submits a
+//! Circuit-v3 settlement consensus. A client submits a
 //! unified transact (two input nullifiers, two output commitments, the
 //! membership root, a signed external flow, and a `TransactCircuitV3` proof);
 //! validators verify the proof and vote, and once a BFT quorum of eligible

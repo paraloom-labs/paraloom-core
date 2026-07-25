@@ -19,7 +19,7 @@ const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 /// Instruction data for deposit (Solana → paraloom L2).
 ///
 /// Layout matches the on-chain Anchor program: the eight-byte
-/// discriminator [`discriminators::DEPOSIT`] is prepended on the wire,
+/// discriminator `discriminators::DEPOSIT` is prepended on the wire,
 /// followed by this struct's borsh encoding.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DepositInstructionData {
@@ -136,7 +136,7 @@ pub const SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID: Pubkey = Pubkey::new_from_arr
 ///
 /// `program_version` is the semver-encoded version the deployed
 /// program should record in `BridgeState` (#69, audit #9). The L2
-/// later reads it back via [`crate::bridge::ProgramInterface::program_version`]
+/// later reads it back via `ProgramInterface::program_version`
 /// and refuses to start if it does not match the binary's
 /// [`crate::bridge::EXPECTED_PROGRAM_VERSION`].
 pub fn create_initialize_instruction(
@@ -401,7 +401,7 @@ fn append_quorum_accounts(
 /// history), both nullifier PDAs are `init`'d, and the program appends both
 /// output commitments itself. The account order must match the `Transact`
 /// accounts struct in the program. Quorum-gated by a supermajority of
-/// registered validators appended via [`append_quorum_accounts`] (#260).
+/// registered validators appended via `append_quorum_accounts` (#260).
 #[allow(clippy::too_many_arguments)]
 pub fn create_transact_instruction(
     program_id: &Pubkey,

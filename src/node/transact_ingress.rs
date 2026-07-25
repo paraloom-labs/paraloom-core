@@ -1,6 +1,6 @@
 //! Transact-verification ingress (#350).
 //!
-//! The v3 unified-transact twin of [`crate::node::transfer_ingress`]. A small
+//! Unified-transact ingress. A small
 //! HTTP endpoint that lets a client (the wallet / CLI) hand a 2-in/2-out
 //! transact — a pure shielded transfer (`ext_amount == 0`) or a withdrawal
 //! (`ext_amount < 0`) — to a running validator, which broadcasts it into the

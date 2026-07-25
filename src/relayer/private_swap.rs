@@ -236,7 +236,7 @@ pub trait Submitter: Send + Sync {
     /// `deposit_spl` require the depositor (the funds' owner) to sign, and that
     /// owner is the fresh address, so the orchestrator threads its keypair
     /// through here. [`MockSubmitter`] ignores it, exactly as
-    /// [`MockSwapProvider`](super::MockSwapProvider) ignores the swap signer.
+    /// [`MockSwapProvider`] ignores the swap signer.
     async fn submit_deposit_from_fresh(
         &self,
         leg: WithdrawLeg,
