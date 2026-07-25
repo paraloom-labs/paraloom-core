@@ -10,6 +10,23 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Dual-stake token gate started open** (external bug-bounty report, kiyeps).
+  #656 — `initialize_validator_registry` and `reset_validator_registry` both
+  hardcoded `min_token_stake: 0`, while preserving the SOL floor. Registration
+  is permissionless and `register_validator` checks
+  `token_stake_amount >= min_token_stake`, so a floor of zero passes for
+  everyone: the token half of the dual-stake was absent until the authority
+  set it. The code defended the default as behaving "like the deposit cap",
+  which inverts — a `deposit_cap` of zero refuses every deposit. Two adjacent
+  settings that look alike and fail in opposite directions, with the safe one
+  cited as precedent for the unsafe one. The runbook step the design leaned on
+  did not exist. Both paths now start at `RECOMMENDED_MIN_TOKEN_STAKE`, so a
+  forgotten step costs a rejected registration rather than a validator slot
+  bought with no token stake (#667). Out of Stage 1 bounty scope — the dual-stake
+  instructions are merged but not on the deployed program, and findings only
+  reproducible off the pinned deployment are out of scope — so credited here
+  rather than paid. Devnet, pre-mainnet.
+
 - **Off-chain settlement and consensus hygiene** (external bug-bounty reports,
   Godswork4 and iceiceic3). Correctness findings in the off-chain settlement and
   consensus layer, fixed:
