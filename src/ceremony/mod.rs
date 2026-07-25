@@ -22,10 +22,16 @@
 //!
 //! ## Scope
 //!
-//! Three privacy circuits are ceremonied for v0.5.0:
-//! `DepositCircuit`, `TransferCircuit`, `WithdrawCircuit`. The
-//! WASM compute layer (`ComputeCircuit`) is out of scope because
-//! its R1CS varies per job; see issue #64 for the rationale.
+//! The v0.5.0 round ceremonied the separate privacy circuits
+//! (`WithdrawCircuit` and `TransferCircuit` chains completed; see
+//! `ceremony/withdraw/` and `ceremony/transfer/`). Circuit v3
+//! (#350) replaced them with the unified `TransactCircuitV3`,
+//! which is the settlement path on chain and therefore the
+//! circuit the mainnet ceremony runs against (#659). A phase-2
+//! chain is bound to one R1CS, so the finished v2 chains do not
+//! carry over. The WASM compute layer (`ComputeCircuit`) stays
+//! out of scope because its R1CS varies per job; see issue #64
+//! for the rationale.
 //!
 //! ## Submodules
 //!

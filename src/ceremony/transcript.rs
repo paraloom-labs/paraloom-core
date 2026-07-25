@@ -69,16 +69,23 @@ mod serde_hash {
 /// Identifier of the circuit a transcript was produced against.
 ///
 /// A Groth16 phase-2 SRS is bound to a specific R1CS, so a single
-/// transcript is meaningful only for one circuit. The label
-/// disambiguates the three privacy circuits paraloom ceremonies
-/// against (`DepositCircuit`, `TransferCircuit`,
-/// `WithdrawCircuit`); other circuits remain explicitly out of
-/// scope for v0.5.0 per issue #64.
+/// transcript is meaningful only for one circuit. `Deposit`,
+/// `Transfer` and `Withdraw` name the v2-era circuits; `Transact`
+/// names the unified `TransactCircuitV3` (#350) that replaced all
+/// three as the settlement path, and is the circuit the mainnet
+/// ceremony runs against (#659).
+///
+/// **New variants must be appended, never inserted.** The wire
+/// format encodes the variant as its positional index, and the
+/// published transcripts of the finished withdraw and transfer
+/// chains pin the current indices; renumbering them would break
+/// re-verification of chains that are already public.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CircuitId {
     Deposit,
     Transfer,
     Withdraw,
+    Transact,
 }
 
 impl CircuitId {
@@ -88,6 +95,7 @@ impl CircuitId {
             CircuitId::Deposit => "deposit",
             CircuitId::Transfer => "transfer",
             CircuitId::Withdraw => "withdraw",
+            CircuitId::Transact => "transact",
         }
     }
 }
@@ -100,8 +108,9 @@ impl std::str::FromStr for CircuitId {
             "deposit" => Ok(CircuitId::Deposit),
             "transfer" => Ok(CircuitId::Transfer),
             "withdraw" => Ok(CircuitId::Withdraw),
+            "transact" => Ok(CircuitId::Transact),
             other => Err(format!(
-                "unknown circuit {:?}; expected deposit | transfer | withdraw",
+                "unknown circuit {:?}; expected deposit | transfer | withdraw | transact",
                 other
             )),
         }
@@ -193,9 +202,16 @@ pub struct Phase2Transcript {
     /// Wire-format version. See `TRANSCRIPT_VERSION`.
     pub version: u32,
 
-    /// Which of the three privacy circuits this transcript
-    /// ceremonies. The verifier cross-checks this against the
-    /// R1CS hash recorded in `initial_srs_hash`.
+    /// Which circuit this transcript ceremonies.
+    ///
+    /// This is a label for operators and logs; nothing derives
+    /// trust from it. What actually binds a transcript to one
+    /// circuit is `initial_srs_hash` — a digest of the initial
+    /// proving key, which the finalize policy matches against the
+    /// initial key on disk — together with the delta chain, which
+    /// anchors on that same key's delta points. A mislabelled
+    /// transcript is therefore still caught, but by those checks
+    /// rather than by this field.
     pub circuit: CircuitId,
 
     /// Hash of the initial single-source SRS (produced by the
@@ -422,16 +438,45 @@ mod tests {
         assert_eq!(CircuitId::Deposit.label(), "deposit");
         assert_eq!(CircuitId::Transfer.label(), "transfer");
         assert_eq!(CircuitId::Withdraw.label(), "withdraw");
+        assert_eq!(CircuitId::Transact.label(), "transact");
     }
 
     #[test]
     fn circuit_id_from_str_round_trips_with_label() {
         use std::str::FromStr;
-        for c in [CircuitId::Deposit, CircuitId::Transfer, CircuitId::Withdraw] {
+        for c in [
+            CircuitId::Deposit,
+            CircuitId::Transfer,
+            CircuitId::Withdraw,
+            CircuitId::Transact,
+        ] {
             let parsed = CircuitId::from_str(c.label()).expect("label round-trips");
             assert_eq!(parsed, c);
         }
         assert!(CircuitId::from_str("unknown").is_err());
+    }
+
+    /// The finished withdraw and transfer transcripts are published for
+    /// public re-verification, and they encode the circuit as its variant
+    /// index. Pin those indices so a future variant can only be appended:
+    /// reordering the enum would silently invalidate transcripts that are
+    /// already in the wild.
+    #[test]
+    fn circuit_id_wire_indices_are_pinned() {
+        for (circuit, index) in [
+            (CircuitId::Deposit, 0u32),
+            (CircuitId::Transfer, 1),
+            (CircuitId::Withdraw, 2),
+            (CircuitId::Transact, 3),
+        ] {
+            let encoded = bincode::serialize(&circuit).expect("serialise");
+            assert_eq!(
+                encoded,
+                index.to_le_bytes().to_vec(),
+                "wire index of {} moved",
+                circuit.label()
+            );
+        }
     }
 
     #[test]
