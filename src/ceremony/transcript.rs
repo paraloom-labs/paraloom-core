@@ -202,9 +202,16 @@ pub struct Phase2Transcript {
     /// Wire-format version. See `TRANSCRIPT_VERSION`.
     pub version: u32,
 
-    /// Which of the three privacy circuits this transcript
-    /// ceremonies. The verifier cross-checks this against the
-    /// R1CS hash recorded in `initial_srs_hash`.
+    /// Which circuit this transcript ceremonies.
+    ///
+    /// This is a label for operators and logs; nothing derives
+    /// trust from it. What actually binds a transcript to one
+    /// circuit is `initial_srs_hash` — a digest of the initial
+    /// proving key, which the finalize policy matches against the
+    /// initial key on disk — together with the delta chain, which
+    /// anchors on that same key's delta points. A mislabelled
+    /// transcript is therefore still caught, but by those checks
+    /// rather than by this field.
     pub circuit: CircuitId,
 
     /// Hash of the initial single-source SRS (produced by the
