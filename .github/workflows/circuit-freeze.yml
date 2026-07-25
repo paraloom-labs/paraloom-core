@@ -14,10 +14,18 @@ name: Circuit Freeze Guard
 # clear diagnostic. After the ceremony completes the operator
 # removes the sentinel and circuit changes are unblocked.
 
+# The R1CS is not confined to circuits.rs: the constraints a circuit
+# emits come just as much from the Poseidon gadgets it calls, so a
+# change there moves the shape without touching the circuit file. Both
+# gadget modules are listed — poseidon_circom.rs carries the v3
+# gadgets, poseidon.rs the v2 ones — because the guard has to hold for
+# whichever circuit is under ceremony.
 on:
   pull_request:
     paths:
       - 'src/privacy/circuits.rs'
+      - 'src/privacy/poseidon_circom.rs'
+      - 'src/privacy/poseidon.rs'
 
 jobs:
   freeze-check:
