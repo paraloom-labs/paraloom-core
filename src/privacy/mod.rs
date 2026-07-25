@@ -15,6 +15,7 @@
 #![deny(clippy::let_underscore_must_use)]
 
 pub mod batch;
+pub mod circom_reduction;
 pub mod circuits;
 
 pub mod commitment;
