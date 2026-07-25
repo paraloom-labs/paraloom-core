@@ -208,3 +208,6 @@ ark-bn254 = "0.4"
 ark-groth16 = "0.4"
 ark-ec = "0.4"
 ark-serialize = "0.4"
+# Rebuild the evaluation domain a Groth16 setup samples tau from, for the
+# phase-1 trapdoor demonstration in src/ceremony/phase1_trapdoor.rs.
+ark-poly = "0.4"

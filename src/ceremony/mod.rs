@@ -38,6 +38,8 @@
 
 pub mod bgm17;
 pub mod contribute;
+#[cfg(test)]
+mod phase1_trapdoor;
 pub mod policy;
 pub mod transcript;
 pub mod verifier;
