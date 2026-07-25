@@ -53,8 +53,11 @@ async fn test_verification_chunking() {
 
     let chunks = ProofVerifier::create_verification_chunks(&tx);
 
-    // Should have: outputs, nullifiers, and range proof
-    assert_eq!(chunks.len(), 3);
+    // Output commitments + nullifier uniqueness. Range checks moved
+    // in-circuit in #60, so the host-level chunked verifier no longer
+    // emits a separate range chunk. Mirrors the in-crate assertion in
+    // src/privacy/proof.rs.
+    assert_eq!(chunks.len(), 2);
 
     // Verify each chunk
     for chunk in &chunks {

@@ -134,8 +134,13 @@ jobs:
         with:
           shared-key: "paraloom-ci"
 
+      # `--tests` covers the lib, the bins and the integration tests under
+      # `tests/`. Those files were previously only compiled by the
+      # `--all-targets` build above and never executed, so their assertions
+      # could drift silently. Costs ~23s locally, nearly all of it in
+      # tests/privacy_invariants.rs.
       - name: Run all tests (quick check)
-        run: cargo test --lib --all-features
+        run: cargo test --tests --all-features
 
   test:
     name: Test (${{ matrix.module }})
