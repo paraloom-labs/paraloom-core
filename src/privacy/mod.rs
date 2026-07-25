@@ -31,6 +31,7 @@ pub mod poseidon;
 pub mod poseidon_circom;
 pub mod proof;
 pub mod proof_codec;
+pub mod r1cs_export;
 pub mod sparse_merkle;
 pub mod transaction;
 pub mod types;
