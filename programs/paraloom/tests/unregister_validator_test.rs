@@ -85,7 +85,7 @@ async fn unregister_clears_active_and_decrements_registry() {
         Instruction {
             program_id,
             data: instruction::RegisterValidator {
-                token_stake_amount: 1_000_000,
+                token_stake_amount: paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
                 stake_amount: MIN_VALIDATOR_STAKE,
             }
             .data(),

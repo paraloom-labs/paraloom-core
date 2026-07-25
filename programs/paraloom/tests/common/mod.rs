@@ -145,8 +145,9 @@ pub fn add_token_account(pt: &mut ProgramTest, mint: Pubkey, owner: Pubkey, amou
 }
 
 /// A validator's baked token balance — generous enough for several
-/// registrations across a test.
-pub const TEST_TOKEN_FUND: u64 = 1_000_000_000;
+/// registrations across a test. Expressed against the floor a fresh registry
+/// starts at, so it keeps clearing the gate if that value is retuned.
+pub const TEST_TOKEN_FUND: u64 = paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE * 4;
 
 /// Create a validator keypair funded with SOL and a staking-token balance, both
 /// baked into genesis. Returns the keypair and its token account pubkey. Used
