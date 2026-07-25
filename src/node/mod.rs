@@ -24,7 +24,6 @@ use crate::network::{
     SettlementKind,
 };
 use crate::privacy::pool::ShieldedPool;
-use crate::privacy::verification::VerificationCoordinator;
 use crate::resource::ResourceMonitor;
 use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
@@ -55,7 +54,6 @@ pub struct Node {
     // Privacy layer
     privacy_storage: Option<Arc<PrivacyStorage>>,
     shielded_pool: Option<Arc<ShieldedPool>>,
-    verification_coordinator: Option<Arc<VerificationCoordinator>>,
     // Compute layer
     compute_executor: Option<Arc<JobExecutor>>,
     compute_manager: Option<Arc<JobManager>>,
@@ -305,67 +303,24 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     transaction.id()
                 );
             }
-            Message::VerificationRequest {
-                task_id,
-                transaction_id,
-                chunk,
-            } => {
-                info!(
-                    "Received verification request: task={}, tx={}",
-                    task_id, transaction_id
+            // Chunked verification is gone: circuit v3 unified settlement into
+            // `transact`, which proves the whole statement at once instead of
+            // splitting it across validators. Nothing has produced either of
+            // these messages since. The variants stay so the wire enum's
+            // discriminants remain stable for deployed nodes — same reason as
+            // `ShieldedTransaction` above — and are dropped at the next
+            // coordinated upgrade.
+            Message::VerificationRequest { task_id, .. } => {
+                log::warn!(
+                    "Ignoring VerificationRequest ({task_id}): chunked verification \
+                     was replaced by the transact settlement path"
                 );
-
-                // Verify chunk and send result
-                let result = chunk.verify();
-
-                let response = Message::VerificationResult {
-                    task_id,
-                    validator_id: self.node_info.id.clone(),
-                    result,
-                };
-
-                // Send result back to source
-                if let Err(e) = self.network.send_message(source.clone(), response).await {
-                    info!("Failed to send verification result: {}", e);
-                }
             }
-            Message::VerificationResult {
-                task_id,
-                validator_id,
-                result,
-            } => {
-                info!(
-                    "Received verification result: task={}, validator={:?}",
-                    task_id, validator_id
+            Message::VerificationResult { task_id, .. } => {
+                log::warn!(
+                    "Ignoring VerificationResult ({task_id}): chunked verification \
+                     was replaced by the transact settlement path"
                 );
-
-                // Only accept a result attributed to the authenticated sender —
-                // a peer must not report a result under another validator's
-                // identity. Parity with the transact vote path's
-                // `result.validator == source` guard. The `verification_coordinator`
-                // is not wired today (always `None`), so this handler is dormant;
-                // the check keeps it safe against impersonation if it is ever wired.
-                if validator_id != source {
-                    log::warn!(
-                        "dropping VerificationResult: claimed validator {:?} != authenticated source {:?}",
-                        validator_id,
-                        source
-                    );
-                } else if let Some(coord) = &self.verification_coordinator {
-                    let task_result = crate::privacy::verification::VerificationTaskResult {
-                        task_id,
-                        validator: validator_id,
-                        result,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    };
-
-                    if let Err(e) = coord.submit_result(task_result).await {
-                        info!("Failed to submit verification result: {}", e);
-                    }
-                }
             }
             Message::PoolStateQuery => {
                 info!("Received pool state query from {}", source);
@@ -1328,7 +1283,6 @@ impl Node {
             validator,
             privacy_storage: None,
             shielded_pool,
-            verification_coordinator: None,
             bridge,
             compute_executor,
             compute_manager,
@@ -2348,7 +2302,6 @@ impl Clone for Node {
             validator: self.validator.clone(),
             privacy_storage: self.privacy_storage.clone(),
             shielded_pool: self.shielded_pool.clone(),
-            verification_coordinator: self.verification_coordinator.clone(),
             compute_executor: self.compute_executor.clone(),
             compute_manager: self.compute_manager.clone(),
             compute_coordinator: self.compute_coordinator.clone(),

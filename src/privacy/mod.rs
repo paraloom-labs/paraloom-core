@@ -36,7 +36,6 @@ pub mod r1cs_export;
 pub mod sparse_merkle;
 pub mod transaction;
 pub mod types;
-pub mod verification;
 
 pub use batch::{AdaptiveBatchVerifier, BatchVerificationResult, BatchVerifier};
 pub use circuits::{Groth16ProofSystem, MAX_INPUTS, MAX_OUTPUTS};
@@ -54,7 +53,3 @@ pub use proof_codec::{
 pub use sparse_merkle::{MemoryStats, SparseMerkleTree, SPARSE_TREE_DEPTH};
 pub use transaction::{DepositTx, ShieldedTransaction, TrackedTransaction, TransferTx, WithdrawTx};
 pub use types::{Commitment, MerklePath, Note, Nullifier, ShieldedAddress, ViewingKey};
-pub use verification::{
-    VerificationAggregator, VerificationCoordinator, VerificationTask, VerificationTaskResult,
-    MIN_VALIDATORS_FOR_CONSENSUS, TOTAL_VALIDATORS,
-};

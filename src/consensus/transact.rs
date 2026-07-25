@@ -157,10 +157,8 @@ impl TransactConsensus {
     }
 }
 
-/// Coordinates transact verification across validators. Mirrors
-/// [`crate::consensus::withdrawal::WithdrawalVerificationCoordinator`]; the
-/// quorum logic is delegated to the embedded [`VoteTally`] of each
-/// [`TransactConsensus`].
+/// Coordinates transact verification across validators. The quorum logic is
+/// delegated to the embedded [`VoteTally`] of each [`TransactConsensus`].
 pub struct TransactVerificationCoordinator {
     /// Active consensus states (request_id -> consensus)
     pending: Arc<RwLock<HashMap<String, TransactConsensus>>>,
