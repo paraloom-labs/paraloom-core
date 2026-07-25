@@ -154,7 +154,7 @@ wat = "1.240" # For WASM parsing (compute demo)
 sha2 = "0.10"
 hex = "0.4.3"
 bs58 = { version = "0.5.1", optional = true }
-rand = "0.8"
+rand = "0.9"
 # NaCl crypto_box (X25519 + XSalsa20-Poly1305) for encrypted note delivery
 # (#196). Wire-compatible with the wallet's tweetnacl `box`.
 crypto_box = { version = "0.9.1", features = ["std"] }
