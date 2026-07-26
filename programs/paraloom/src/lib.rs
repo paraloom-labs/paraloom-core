@@ -28,9 +28,10 @@ pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 /// This constant is NOT enforced directly. The ENFORCED floor is the config
 /// field [`ValidatorRegistry::min_token_stake`], set by the cold/DAO authority
 /// via `set_min_token_stake` so it can track the token's price without a
-/// redeploy. It defaults to 0 at `initialize`, so a fresh deploy opens the
-/// token gate deliberately (like the deposit cap). This value is what the
-/// deploy runbook and governance should set it to.
+/// redeploy. Both `initialize_validator_registry` and
+/// `reset_validator_registry` start that field at this value, so the gate
+/// begins closed and opens only when the authority lowers it on purpose —
+/// unlike the deposit cap, where 0 is the closed state.
 pub const RECOMMENDED_MIN_TOKEN_STAKE: u64 = 1_000_000_000_000;
 
 /// Slots a validator's stake stays locked after it unregisters (or is slashed
@@ -572,8 +573,8 @@ pub mod paraloom_program {
     /// Config rather than a compile-time constant so the floor tracks the
     /// token's (volatile, thin) market price without a redeploy — raise it as
     /// the token appreciates, lower it if it falls, keeping the real cost of a
-    /// validator slot roughly stable. Starts at 0 (token gate open) at
-    /// `initialize`; the runbook sets it to `RECOMMENDED_MIN_TOKEN_STAKE`.
+    /// validator slot roughly stable. Starts at `RECOMMENDED_MIN_TOKEN_STAKE`,
+    /// so the gate is closed until it is deliberately lowered.
     ///
     /// Gated on the registry authority — the cold key today, a DAO/governance
     /// PDA once parameter control migrates to token holders.
