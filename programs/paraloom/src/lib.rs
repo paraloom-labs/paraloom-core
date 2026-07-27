@@ -623,6 +623,8 @@ pub mod paraloom_program {
             ],
         )?;
 
+        let vault_before = ctx.accounts.stake_token_vault.amount;
+
         // Move the token half into the shared vault. The validator signs for its
         // own token account; the mint is pinned to `registry.stake_mint` by the
         // context, so no worthless substitute token can be staked.
@@ -643,6 +645,33 @@ pub mod paraloom_program {
             ctx.accounts.stake_mint.decimals,
         )?;
 
+        // Credit what the vault actually received, not what was asked for.
+        // `transfer_checked` moves `token_stake_amount` out of the validator's
+        // account, but a Token-2022 mint carrying a transfer-fee extension
+        // delivers less than that to the vault. Recording the nominal figure
+        // would then overstate this validator's backing, and since the vault is
+        // shared the error compounds across registrations until it no longer
+        // covers what the ledger says is owed. The mint is pinned and today
+        // carries metadata extensions only, but nothing on chain enforces that
+        // and `reset_validator_registry` can re-pin it, so the invariant is
+        // held here rather than assumed of the mint (#677).
+        ctx.accounts.stake_token_vault.reload()?;
+        let credited_token_stake = ctx
+            .accounts
+            .stake_token_vault
+            .amount
+            .checked_sub(vault_before)
+            .ok_or(BridgeError::InvalidAmount)?;
+
+        // Re-check the floor against the realized amount. The pre-transfer
+        // check above rejects an under-sized request cheaply; this one rejects
+        // an under-sized *arrival*, which is the only figure that matters. The
+        // transfer is undone with the rest of the transaction on failure.
+        require!(
+            credited_token_stake >= ctx.accounts.validator_registry.min_token_stake,
+            BridgeError::InsufficientTokenStake
+        );
+
         let validator_account = &mut ctx.accounts.validator_account;
         let validator_registry = &mut ctx.accounts.validator_registry;
 
@@ -657,7 +686,7 @@ pub mod paraloom_program {
         validator_account.pending_rewards = 0;
         validator_account.total_earnings = 0;
         validator_account.times_slashed = 0;
-        validator_account.token_stake_amount = token_stake_amount;
+        validator_account.token_stake_amount = credited_token_stake;
         validator_account.token_unbonding_amount = 0;
 
         validator_registry.total_validators = validator_registry.total_validators.saturating_add(1);
