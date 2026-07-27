@@ -27,12 +27,12 @@
 
 ## What is Paraloom?
 
-Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded pool, transfers move privately inside that pool, and withdrawals settle back to Solana — all anchored by Groth16 zkSNARKs over BLS12-381. The validator network is intentionally designed for commodity hardware (laptops, home PCs, single-board computers) running a verify-only role; proof generation stays with the user, verification is cheap enough for an off-the-shelf machine to participate in consensus.
+Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded pool, transfers move privately inside that pool, and withdrawals settle back to Solana — all anchored by Groth16 zkSNARKs over BN254 and verified by the Solana program itself. The validator network is intentionally designed for commodity hardware (laptops, home PCs, single-board computers) running a verify-only role; proof generation stays with the user, verification is cheap enough for an off-the-shelf machine to participate in consensus.
 
 **Core Features:**
-- **zkSNARK Privacy** — Poseidon hash, in-circuit u64 range proofs, Groth16 (192-byte proofs, ~10 ms verification)
+- **zkSNARK Privacy** — Poseidon hash, in-circuit u64 range proofs, Groth16 over BN254 (128-byte compressed proofs, verified on-chain via `alt_bn128`)
 - **Solana Bridge** — bidirectional SOL deposits/withdrawals, on-chain replay protection via expiration slots
-- **Byzantine Consensus** — configurable BFT threshold (default 7-of-10), reputation-gated voting, equivocation slashing evidence
+- **Byzantine Consensus** — stake-weighted BFT supermajority (>2/3 of active stake), reputation-gated voting, equivocation slashing evidence
 - **Operations** — `/health`, `/ready`, `/metrics` endpoints, RocksDB-backed crash-consistent storage, Kademlia DHT peer discovery with libp2p ping liveness, active/passive coordinator failover
 - **Private Compute (alpha)** — WASM execution with encrypted I/O, ownership-proof bound; smaller, simpler nodes can opt out
 
@@ -40,12 +40,12 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| zkSNARK privacy layer | ✅ Working | Groth16 + BLS12-381, 192-byte proofs, devnet tested |
+| zkSNARK privacy layer | ✅ Working | Groth16 over BN254, 128-byte compressed proofs, verified on-chain |
 | In-circuit range proofs | ✅ Working | u64 bit-decomposition in deposit / transfer / withdraw (v0.4.0) |
 | Solana bridge (Anchor) | ✅ Working | Deployed on devnet; replay-bound by `expiration_slot` (v0.4.0) |
-| Shielded transfers (private→private) | ✅ Working | 2-in/2-out `TransferCircuit`, client-side proof, BFT-settled, encrypted note delivery + recipient scan (v0.5.0) |
+| Unified transact (deposit / transfer / withdraw) | ✅ Working | One 2-in/2-out `TransactCircuitV3` proof for all three, separated by a signed external amount; change returns as a note; client-side proving, quorum-cosigned settlement (v0.6.0) |
 | Program version handshake | ✅ Working | L2 refuses to talk to wrong on-chain program version |
-| Byzantine consensus | ✅ Working | Configurable BFT threshold; default 7/10; validated on 10-node localnet |
+| Byzantine consensus | ✅ Working | Stake-weighted supermajority, `floor(2·stake/3)+1`, enforced on-chain at settlement |
 | Reputation gating + slashing | ✅ Working | Equivocation + persistent-unavailability evidence (v0.4.0) |
 | Merkle + nullifier set | ✅ Working | Double-spend prevention verified; fsync'd on hot writes |
 | Operational endpoints | ✅ Working | `/health`, `/ready`, `/metrics` (Prometheus) on a separate port |
@@ -54,18 +54,18 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | Poseidon hash | ✅ Working | Domain-separated; native↔circuit equivalence pinned by tests |
 | Coordinator HA | ✅ Working | Active/passive failover with RTO scenario test under 30s |
 | MPC trusted setup tooling | ✅ Working | BGM17 contribution + verifier, transcript chain, contributor / verifier / finalize CLIs |
-| Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending; explicitly out of scope for the v0.5.0 ceremony |
-| MPC ceremony execution | 🟡 In progress | Tooling shipped at rc2; the 20–30 contributor run is the calendar gate to v0.5.0 final |
-| Mainnet launch | 🟡 Pre-release | Devnet stable on `8gPsR…TWrP`; awaiting ceremony completion + external security audit |
+| Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending; out of Stage 1 bounty scope |
+| MPC ceremony execution | 🟡 In progress | Four contributions closed on the unified transact circuit, built on the public Perpetual Powers of Tau; waiting on the closing beacon (#659) |
+| Mainnet launch | 🟡 Pre-release | Devnet on `8gPsR…TWrP`; awaiting the ceremony beacon, the key cutover redeploy, and a wallet republish |
 
 ### Known limitations (devnet, pre-mainnet)
 
 Honest scope for the current devnet milestone. These are tracked and gate mainnet, not the devnet release; none affect fund safety on devnet.
 
-- **ZK proofs are verified by the L2 quorum; on-chain re-verification is deferred.** Every withdrawal and shielded-transfer proof **is** verified — each validator runs the real Groth16 verifier (`verify_withdrawal_parts` / `verify_transfer_parts`) and a transfer/withdrawal settles only after a BFT quorum votes it valid. What is deferred is a *redundant* on-chain re-check: the Solana program records the proof and is gated by the consensus authority, but does not itself re-run Groth16 on-chain (blocked on Solana SIMD-0388, ~Q3'26 — #165). The post-transfer Merkle root is set by the consensus leader and is likewise not re-verified on-chain.
-- **Trusted setup is a dev ceremony.** The MPC tooling is shipped (BGM17 contribution/verifier/transcript, rc2), but the proving/verifying keys in use today come from a single-party dev setup; running the multi-party ceremony is the remaining gate to v0.5.0 final (#64).
-- **Transfer note delivery is L2-served and in-memory.** Encrypted output notes are delivered via a node's `/transfer/scan` endpoint (in-memory, not persisted across restart; the ingress is disabled by default and intended for a loopback/management interface). Recipients scan and trial-decrypt client-side.
-- **Per-transfer pool convergence is partial.** The settling node appends a transfer's output commitments to its shielded pool; recipients rely on that node / the on-chain tree to spend.
+- **The quorum is not yet Sybil-resistant.** Settlement needs a stake-weighted supermajority to co-sign, and the proof is verified on-chain, so no single signature moves funds. But validator registration is permissionless and one key is both the program upgrade authority and the registry admin, with no multisig or timelock — so that key remains the trust anchor, with the quorum as defence in depth. A Sybil-resistant quorum and multisig with timelock are mainnet gates.
+- **The keys in use today are still single-party dev keys.** The multi-party ceremony for the live circuit is running now: four contributions are closed and published, and the chain is waiting on its beacon before the keys are finalized (#659). Two earlier rounds were run against the v2 circuits, and honestly they did not deliver what a ceremony is for — they built on an initial key generated on one machine, and phase 2 re-randomises only `δ`, leaving everything derived from the phase-1 trapdoor intact. `src/ceremony/phase1_trapdoor.rs` demonstrates that rather than asserting it. The current chain starts from the public Perpetual Powers of Tau, which is what makes "one honest contributor is enough" checkable instead of a claim.
+- **Note delivery is L2-served and in-memory.** Encrypted output notes are served from a node's `/transact/scan` endpoint — held in memory, not persisted across a restart, and the ingress is off by default and meant for a loopback or management interface. Recipients poll it and trial-decrypt client-side, so the node learns nothing about which notes are whose.
+- **Pool convergence is partial.** The settling node appends a spend's output commitments to its shielded pool; recipients depend on that node or the on-chain tree to spend them.
 
 These are the work between a pre-mainnet milestone and a mainnet launch, which also awaits an external security audit.
 
