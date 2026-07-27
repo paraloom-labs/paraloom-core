@@ -173,9 +173,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proving_key =
         ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&pk_bytes[..])?;
     let proof = Groth16ProofSystem::prove(&proving_key, circuit, &mut ark_std::rand::thread_rng())?;
-    let mut proof_bytes = Vec::new();
-    proof.serialize_compressed(&mut proof_bytes)?;
-    println!("      proof ready ({} bytes compressed)", proof_bytes.len());
+    let mut proof_body = Vec::new();
+    proof.serialize_compressed(&mut proof_body)?;
+    // What goes on the L2 wire is the tagged envelope, not the bare body.
+    // Wallets and any other prover must emit this form; the node rejects an
+    // untagged blob.
+    let proof_bytes = paraloom::privacy::tag_proof(
+        paraloom::privacy::ProofSuite::Groth16Bn254TransactV3,
+        &proof_body,
+    );
+    println!(
+        "      proof ready ({} bytes compressed, {} tagged)",
+        proof_body.len(),
+        proof_bytes.len()
+    );
 
     // Reproduce the NODE's verification exactly: derive public_amount +
     // ext_data_hash from ext_amount/recipient the same way verify_transact_parts
