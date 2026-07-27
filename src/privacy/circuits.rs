@@ -18,6 +18,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::{CryptoRng, RngCore};
 
+use crate::privacy::circom_reduction::CircomReduction;
 use crate::privacy::poseidon::{
     poseidon_commit_spend_gadget, poseidon_merkle_pair_gadget, poseidon_nullifier_spend_gadget,
     poseidon_pubkey_gadget, poseidon_signature_gadget,
@@ -779,21 +780,37 @@ impl Groth16ProofSystem {
     ///
     /// WARNING: This is a CENTRALIZED trusted setup for testnet only!
     /// Production must use a multi-party computation (MPC) ceremony.
+    ///
+    /// Produced under [`CircomReduction`], so a key from here and a key from
+    /// `snarkjs groth16 setup` are the same convention and either can prove
+    /// against [`prove`](Self::prove). The two differ only in `h_query`; the
+    /// verifying key is identical either way, so which reduction produced a
+    /// key is invisible to a verifier.
     pub fn setup<C: ConstraintSynthesizer<Fr>, R: RngCore + CryptoRng>(
         circuit: C,
         rng: &mut R,
     ) -> Result<(ProvingKey<Bn254>, VerifyingKey<Bn254>), SynthesisError> {
-        ark_groth16::Groth16::<Bn254>::setup(circuit, rng)
+        ark_groth16::Groth16::<Bn254, CircomReduction>::setup(circuit, rng)
             .map_err(|_| SynthesisError::Unsatisfiable)
     }
 
-    /// Create a proof for a circuit
+    /// Create a proof for a circuit.
+    ///
+    /// Uses [`CircomReduction`] because the production key comes out of the
+    /// phase-2 ceremony via snarkjs (#659), which prepares the powers of tau
+    /// in Lagrange basis. arkworks' default reduction computes `H` a different
+    /// way and produces proofs that do not verify against such a key — loudly,
+    /// at the first verification, rather than subtly.
+    ///
+    /// A key and its reduction therefore move together. This is the single
+    /// point every proof in the workspace goes through, `prover-wasm`
+    /// included, which includes this file by path.
     pub fn prove<C: ConstraintSynthesizer<Fr>, R: RngCore + CryptoRng>(
         pk: &ProvingKey<Bn254>,
         circuit: C,
         rng: &mut R,
     ) -> Result<Proof<Bn254>, SynthesisError> {
-        ark_groth16::Groth16::<Bn254>::prove(pk, circuit, rng)
+        ark_groth16::Groth16::<Bn254, CircomReduction>::prove(pk, circuit, rng)
             .map_err(|_| SynthesisError::Unsatisfiable)
     }
 

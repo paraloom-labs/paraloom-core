@@ -131,6 +131,7 @@ impl R1CSToQAP for CircomReduction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::privacy::circuits::Groth16ProofSystem;
     use crate::privacy::circuits::{TransactCircuitV3, TX_LEVELS};
     use crate::privacy::poseidon_circom::{
         v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature,
@@ -265,8 +266,10 @@ mod tests {
             );
         }
 
-        // The real thing.
-        let proof = Groth16::<Bn254, CircomReduction>::prove(&pk, circuit, &mut rng)
+        // The real thing, through the function the node and the wallet call
+        // rather than a hand-picked reduction — so this covers the production
+        // path, not just the capability.
+        let proof = Groth16ProofSystem::prove(&pk, circuit, &mut rng)
             .expect("proving with the ceremony key");
         assert!(
             Groth16::<Bn254, CircomReduction>::verify(&pk.vk, &inputs, &proof)
