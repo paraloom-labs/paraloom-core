@@ -10,7 +10,7 @@ use crate::privacy::nullifier::NullifierSet;
 use crate::privacy::types::{AssetId, Commitment, Note, Nullifier, NATIVE_SOL_ASSET};
 use crate::storage::PrivacyStorage;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -21,6 +21,17 @@ pub struct ShieldedPool {
 
     /// Nullifier set preventing double-spending
     nullifier_set: NullifierSet,
+
+    /// Commitments this pool has already credited, seeded from persisted
+    /// state on every construction.
+    ///
+    /// Deposit idempotency hangs on this rather than on `notes`, which is a
+    /// cache with no persistence behind it: reloading a pool would leave it
+    /// empty and let a replayed deposit through, which is exactly the case
+    /// the guard exists for. `commitment_tree` is the authoritative record and
+    /// this is derived from it, so the two cannot disagree — the tree has a
+    /// single insert site, right beside the one that updates this.
+    deposited: Arc<RwLock<HashSet<Commitment>>>,
 
     /// Note storage (commitment -> encrypted note)
     /// In production, notes would be encrypted
@@ -42,6 +53,7 @@ impl ShieldedPool {
         ShieldedPool {
             commitment_tree: MerkleTree::new(),
             nullifier_set: NullifierSet::new(),
+            deposited: Arc::new(RwLock::new(HashSet::new())),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(HashMap::new())),
             storage: None,
@@ -59,9 +71,15 @@ impl ShieldedPool {
         // Load per-asset supplies from storage (native SOL + any SPL assets)
         let supplies = storage.get_all_asset_supplies()?;
 
+        // Seed the idempotency set from the same persisted record the tree is
+        // rebuilt from, so a deposit credited before a restart is still
+        // recognised after one.
+        let deposited: HashSet<Commitment> = storage.get_all_commitments()?.into_iter().collect();
+
         Ok(ShieldedPool {
             commitment_tree,
             nullifier_set,
+            deposited: Arc::new(RwLock::new(deposited)),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(supplies)),
             storage: Some(storage),
@@ -88,14 +106,17 @@ impl ShieldedPool {
         // Create commitment
         let commitment = note.commitment();
 
-        // Idempotent: a deposit whose commitment is already in the pool must not
-        // be inserted or credited again. The bridge listener re-fetches a
-        // deposit that failed to process on a prior poll, and a restart replays
-        // recent signatures against a pool reloaded from storage — without this
-        // guard either path would append a duplicate leaf and double-credit the
-        // asset's supply. The note carries fresh randomness per deposit, so an
-        // equal commitment means the same deposit, not a distinct one.
-        if self.notes.read().await.contains_key(&commitment) {
+        // Idempotent: a deposit whose commitment is already credited must not
+        // be inserted or credited again. Two paths replay one: the bridge
+        // listener re-fetches a deposit that failed on a prior poll, and — the
+        // case that matters — it also re-fetches deposits that succeeded after
+        // a failed sibling, because the cursor freezes below the failure. If
+        // the process restarts inside that window the replay arrives against a
+        // reloaded pool, so the check has to be backed by persisted state
+        // rather than by anything built fresh at construction. The note carries
+        // fresh randomness per deposit, so an equal commitment means the same
+        // deposit, not a distinct one.
+        if self.deposited.read().await.contains(&commitment) {
             return Ok(commitment);
         }
 
@@ -103,6 +124,10 @@ impl ShieldedPool {
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
         let _index = self.commitment_tree.insert(&commitment).await?;
+
+        // Mark it credited before anything else reads the pool, in the same
+        // place the tree is appended.
+        self.deposited.write().await.insert(commitment.clone());
 
         // Store note
         let mut notes = self.notes.write().await;
@@ -247,6 +272,9 @@ impl Clone for ShieldedPool {
         ShieldedPool {
             commitment_tree: self.commitment_tree.clone(),
             nullifier_set: self.nullifier_set.clone(),
+            // Shared, not copied: a clone that kept its own set would stop
+            // recognising deposits the original had already credited.
+            deposited: Arc::clone(&self.deposited),
             notes: Arc::clone(&self.notes),
             supplies: Arc::clone(&self.supplies),
             storage: self.storage.clone(),
@@ -258,6 +286,54 @@ impl Clone for ShieldedPool {
 mod tests {
     use super::*;
     use crate::privacy::types::ShieldedAddress;
+
+    /// A deposit credited before a restart must still be recognised after one.
+    ///
+    /// The listener freezes its cursor below the first failed signature in a
+    /// batch, so deposits that succeeded after that failure are re-fetched on
+    /// the next poll — and if the process restarted in between, the replay
+    /// lands on a reloaded pool. Guarding on anything built fresh at
+    /// construction misses exactly this case, which is the one the guard was
+    /// written for: the duplicate would append a second leaf for one deposit
+    /// and count its amount twice.
+    #[tokio::test]
+    async fn deposit_stays_idempotent_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("privacy.db");
+        let note = Note::new_native(ShieldedAddress([7u8; 32]), 1_000, [9u8; 32]);
+
+        let commitment = {
+            let storage = Arc::new(PrivacyStorage::open(&db).unwrap());
+            let pool = ShieldedPool::with_storage(storage).await.unwrap();
+            let c = pool.deposit(note.clone(), 1_000).await.unwrap();
+            assert_eq!(pool.total_supply().await, 1_000);
+            c
+        };
+
+        // Reopen from the same database, as a restarted node does.
+        let storage = Arc::new(PrivacyStorage::open(&db).unwrap());
+        let pool = ShieldedPool::with_storage(storage).await.unwrap();
+        assert_eq!(
+            pool.total_supply().await,
+            1_000,
+            "supply should survive the restart"
+        );
+
+        // The listener replays the same deposit.
+        let replayed = pool.deposit(note, 1_000).await.unwrap();
+
+        assert_eq!(replayed, commitment);
+        assert_eq!(
+            pool.total_supply().await,
+            1_000,
+            "a replayed deposit must not be credited twice"
+        );
+        assert_eq!(
+            pool.commitment_tree.len().await,
+            1,
+            "a replayed deposit must not append a second leaf"
+        );
+    }
 
     #[tokio::test]
     async fn test_shielded_pool_deposit() {
