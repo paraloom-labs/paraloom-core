@@ -313,7 +313,21 @@ impl ProofVerifier {
             }
         }
 
-        let proof = match Proof::<Bn254>::deserialize_compressed(zk_proof) {
+        // The blob is `suite_tag(1) || body` (see `proof_codec::ProofSuite`).
+        // Dispatch on the tag rather than on "whatever verifying key this build
+        // embeds": an unrecognised suite is rejected outright, so a node never
+        // verifies a proof under different rules than the prover used.
+        let (suite, body) = match crate::privacy::split_tagged_proof(zk_proof) {
+            Ok(parts) => parts,
+            Err(e) => {
+                log::warn!("Failed to parse transact proof envelope: {}", e);
+                return VerificationResult::Invalid {
+                    reason: format!("Invalid proof envelope: {}", e),
+                };
+            }
+        };
+
+        let proof = match Proof::<Bn254>::deserialize_compressed(body) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to deserialize transact proof: {}", e);
@@ -323,12 +337,19 @@ impl ProofVerifier {
             }
         };
 
-        let verifying_key = match Self::get_transact_verifying_key() {
-            Ok(vk) => vk,
-            Err(e) => {
-                return VerificationResult::Invalid {
-                    reason: format!("transact verifying key unavailable: {}", e),
-                };
+        // The suite names the key that verifies it, so a second suite cannot
+        // silently borrow this one: adding a variant makes this a compile
+        // error rather than a proof checked under the wrong verifying key.
+        let verifying_key = match suite {
+            crate::privacy::ProofSuite::Groth16Bn254TransactV3 => {
+                match Self::get_transact_verifying_key() {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        return VerificationResult::Invalid {
+                            reason: format!("transact verifying key unavailable: {}", e),
+                        };
+                    }
+                }
             }
         };
 
@@ -468,9 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn transact_parts_rejects_garbage_proof_bytes() {
-        // Canonical inputs but an undecodable proof blob: rejected at the
-        // parse step, before the verifying key is ever consulted.
+    fn transact_parts_rejects_an_unparseable_envelope() {
+        // Canonical inputs but a blob that is not a well-formed
+        // `suite_tag(1) || body`: rejected by the envelope, before the body is
+        // ever handed to the deserializer.
         let r = ProofVerifier::verify_transact_parts(
             &[0u8; 32],
             &[3u8; 32],
@@ -479,6 +501,29 @@ mod tests {
             &[[1u8; 32], [2u8; 32]],
             &[[3u8; 32], [4u8; 32]],
             &[0xFFu8; 8],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("Invalid proof envelope"), "{reason}")
+            }
+            _ => panic!("an unparseable proof envelope must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_garbage_proof_bytes() {
+        // A well-formed envelope carrying an undecodable body: rejected at the
+        // parse step, before the verifying key is ever consulted.
+        let mut blob = vec![crate::privacy::ProofSuite::Groth16Bn254TransactV3.tag()];
+        blob.extend_from_slice(&[0xFFu8; crate::privacy::GROTH16_BN254_COMPRESSED_LEN]);
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &blob,
         );
         match r {
             VerificationResult::Invalid { reason } => {

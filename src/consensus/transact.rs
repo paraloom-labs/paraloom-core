@@ -69,7 +69,16 @@ pub struct TransactVerificationRequest {
     /// `deposit_note`).
     pub ext_amount: i64,
 
-    /// zkSNARK proof (arkworks-compressed `TransactCircuitV3` Groth16 proof).
+    /// Settlement proof in the L2 wire encoding `suite_tag(1) || body` — see
+    /// [`crate::privacy::ProofSuite`]. Today the only tag is
+    /// `Groth16Bn254TransactV3`, whose body is an arkworks-compressed Groth16
+    /// proof for `TransactCircuitV3`.
+    ///
+    /// The tag lives inside `proof` rather than in a sibling field so that
+    /// [`Self::canonical_id`], which already hashes these bytes, binds the
+    /// suite to the request id for free: the same proof body presented under
+    /// two suites yields two distinct request ids and can never collide in one
+    /// verification round.
     pub proof: Vec<u8>,
 
     /// Encrypted output notes (#196), one per output commitment, hex-encoded
@@ -1065,5 +1074,29 @@ mod tests {
                 "mutating a settlement field must change the canonical id"
             );
         }
+    }
+
+    /// The proof-suite tag rides inside `proof` rather than in a sibling field
+    /// precisely so that `canonical_id`, which already hashes those bytes,
+    /// binds it for free. Two suites over the same proof body therefore yield
+    /// two distinct request ids and cannot collide in one verification round —
+    /// the property a migration window depends on.
+    #[test]
+    fn canonical_id_binds_the_proof_suite_tag() {
+        use crate::privacy::{tag_proof, ProofSuite, GROTH16_BN254_COMPRESSED_LEN};
+
+        let body = vec![3u8; GROTH16_BN254_COMPRESSED_LEN];
+        let a = TransactVerificationRequest {
+            proof: tag_proof(ProofSuite::Groth16Bn254TransactV3, &body),
+            ..sample_request()
+        };
+        let mut b = a.clone();
+        b.proof[0] = 2; // a hypothetical future suite over the same body
+
+        assert_ne!(
+            a.canonical_id(),
+            b.canonical_id(),
+            "the suite tag must be part of the settlement-defining bytes"
+        );
     }
 }

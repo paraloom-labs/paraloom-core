@@ -48,17 +48,19 @@ fn now_secs() -> u64 {
 /// circuit — voting is stubbed by the accept verifier and co-signers match
 /// parameters, not the proof — but it must deserialize, since the leader
 /// converts it to the on-chain wire form when building the settlement message.
-fn valid_compressed_proof() -> Vec<u8> {
+/// A structurally valid (but not sound) proof in the L2 wire encoding
+/// `suite_tag(1) || compressed_body` — the form the node accepts.
+fn valid_tagged_proof() -> Vec<u8> {
     let proof = ark_groth16::Proof::<ark_bn254::Bn254> {
         a: ark_bn254::G1Affine::generator(),
         b: ark_bn254::G2Affine::generator(),
         c: ark_bn254::G1Affine::generator(),
     };
-    let mut bytes = Vec::new();
+    let mut body = Vec::new();
     proof
-        .serialize_compressed(&mut bytes)
+        .serialize_compressed(&mut body)
         .expect("serialize proof");
-    bytes
+    paraloom::privacy::tag_proof(paraloom::privacy::ProofSuite::Groth16Bn254TransactV3, &body)
 }
 
 /// Bridge-enabled validator settings with a generated settlement keypair, so the
@@ -178,7 +180,7 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
         output_commitments: [[11u8; 32], [12u8; 32]],
         root: [13u8; 32],
         ext_amount: -500,
-        proof: valid_compressed_proof(),
+        proof: valid_tagged_proof(),
         ciphertexts: [String::new(), String::new()],
         timestamp: now_secs(),
     };

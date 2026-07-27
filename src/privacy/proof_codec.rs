@@ -60,6 +60,95 @@ pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
         .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Proof-suite envelope
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Length of an arkworks-compressed BN254 Groth16 proof: G1(32) + G2(64) +
+/// G1(32). The untagged legacy encoding is exactly this long, so a tagged blob
+/// (one byte longer) can never be mistaken for one, or vice versa.
+pub const GROTH16_BN254_COMPRESSED_LEN: usize = 128;
+
+/// Which proof system a settlement proof was produced under.
+///
+/// The L2 carries proofs as opaque `Vec<u8>` through the ingress, the gossip
+/// codec and the consensus round; nothing in that path is self-describing, so
+/// today a proof's system is implied purely by "whatever the single embedded
+/// verifying key happens to be". That is fine while there is exactly one, and
+/// unrecoverable the moment there are two: two suites' blobs are just byte
+/// strings, and a migration window needs both accepted at once and
+/// distinguished without guessing.
+///
+/// Adding the discriminant is only possible before wallets pin the format, so
+/// it is done now even though there is still just one suite. The tag is
+/// deliberately **not** zero-based: an all-zero or truncated buffer must not
+/// parse as a valid suite.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProofSuite {
+    /// Groth16 over BN254 (`alt_bn128`) for `TransactCircuitV3`, proof body in
+    /// arkworks-compressed form. The only suite the on-chain program can
+    /// verify.
+    Groth16Bn254TransactV3 = 1,
+}
+
+impl ProofSuite {
+    /// The on-the-wire tag byte.
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse a tag byte. An unrecognised tag is an error, never a fallback to
+    /// the current suite: a node that cannot verify a suite must reject the
+    /// proof, not verify it under different rules than the prover used.
+    pub fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            1 => Ok(ProofSuite::Groth16Bn254TransactV3),
+            other => Err(crate::privacy::PrivacyError::SerializationError(format!(
+                "unknown proof suite tag {other}"
+            ))),
+        }
+    }
+
+    /// Expected body length for this suite, if it is fixed.
+    pub const fn body_len(self) -> usize {
+        match self {
+            ProofSuite::Groth16Bn254TransactV3 => GROTH16_BN254_COMPRESSED_LEN,
+        }
+    }
+}
+
+/// Prepend the suite tag to a proof body, producing the L2 wire encoding
+/// `tag(1) || body`.
+pub fn tag_proof(suite: ProofSuite, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(suite.tag());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Split an L2 wire proof into its suite and body.
+///
+/// Rejects an empty buffer, an unknown tag, and a body whose length does not
+/// match the suite. The length check is what stops a legacy untagged
+/// 128-byte proof from being read as a tagged one whose first byte happens to
+/// be `0x01`: it would leave a 127-byte body.
+pub fn split_tagged_proof(wire: &[u8]) -> Result<(ProofSuite, &[u8])> {
+    let (tag, body) = wire.split_first().ok_or_else(|| {
+        crate::privacy::PrivacyError::SerializationError("empty proof blob".to_string())
+    })?;
+    let suite = ProofSuite::from_tag(*tag)?;
+    if body.len() != suite.body_len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "proof suite {:?} expects a {}-byte body, got {}",
+            suite,
+            suite.body_len(),
+            body.len()
+        )));
+    }
+    Ok((suite, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +272,79 @@ mod tests {
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    // ── Proof-suite envelope ──────────────────────────────────────────
+
+    #[test]
+    fn tagged_proof_round_trips() {
+        let body = vec![7u8; GROTH16_BN254_COMPRESSED_LEN];
+        let wire = tag_proof(ProofSuite::Groth16Bn254TransactV3, &body);
+        assert_eq!(wire.len(), GROTH16_BN254_COMPRESSED_LEN + 1);
+
+        let (suite, got) = split_tagged_proof(&wire).expect("split");
+        assert_eq!(suite, ProofSuite::Groth16Bn254TransactV3);
+        assert_eq!(got, &body[..]);
+    }
+
+    /// An unknown suite must be an error and never silently fall back to the
+    /// one suite this build knows how to verify. This is the whole point of
+    /// the discriminant: a node that cannot check a proof rejects it.
+    #[test]
+    fn unknown_suite_tag_is_rejected_not_defaulted() {
+        for tag in [0u8, 2, 3, 0x80, 0xff] {
+            let mut wire = vec![tag];
+            wire.extend_from_slice(&[0u8; GROTH16_BN254_COMPRESSED_LEN]);
+            assert!(
+                split_tagged_proof(&wire).is_err(),
+                "tag {tag} must not parse"
+            );
+        }
+    }
+
+    /// A legacy untagged 128-byte proof cannot be misread as a tagged one,
+    /// even when its first byte collides with a valid tag: the remaining body
+    /// is then one byte short.
+    #[test]
+    fn untagged_legacy_proof_cannot_be_misread() {
+        let mut legacy = vec![0u8; GROTH16_BN254_COMPRESSED_LEN];
+        legacy[0] = ProofSuite::Groth16Bn254TransactV3.tag();
+        assert!(split_tagged_proof(&legacy).is_err());
+    }
+
+    #[test]
+    fn empty_and_tag_only_blobs_are_rejected() {
+        assert!(split_tagged_proof(&[]).is_err());
+        assert!(split_tagged_proof(&[ProofSuite::Groth16Bn254TransactV3.tag()]).is_err());
+    }
+
+    /// A body of the wrong length is rejected even under a known tag, so a
+    /// suite whose proofs are a different size can never be settled by a build
+    /// that only knows this one.
+    #[test]
+    fn body_length_is_enforced_under_a_known_tag() {
+        for body_len in [0usize, 1, 127, 129, 256] {
+            let mut wire = vec![0u8; 1 + body_len];
+            wire[0] = ProofSuite::Groth16Bn254TransactV3.tag();
+            assert!(
+                split_tagged_proof(&wire).is_err(),
+                "a {body_len}-byte body must not parse"
+            );
+        }
+    }
+
+    /// Any byte string is either rejected or split into a suite and a body of
+    /// that suite's length — never a panic and never a short read.
+    #[test]
+    fn split_tagged_proof_never_panics_on_random_input() {
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+        for _ in 0..1024 {
+            let len = (rng.next_u32() % 300) as usize;
+            let mut buf = vec![0u8; len];
+            rng.fill_bytes(&mut buf);
+            if let Ok((suite, body)) = split_tagged_proof(&buf) {
+                assert_eq!(body.len(), suite.body_len());
+            }
+        }
     }
 }

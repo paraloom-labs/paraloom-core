@@ -2059,10 +2059,22 @@ impl Node {
         let threshold = quorum_wallets.len();
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
-        // wire form; convert the prover's compressed proof.
-        let onchain_proof =
-            crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(&request.proof)
-                .map_err(|e| anyhow!("transact proof: {e}"))?;
+        // wire form; strip the L2 suite tag and convert the compressed body.
+        //
+        // Settlement is deliberately suite-exhaustive rather than
+        // suite-agnostic: the program embeds one verifying key and its
+        // `MAX_PROOF_LEN` is 256 bytes, so only the BN254 Groth16 suite can
+        // ever be settled by *this* program version. A future suite must not
+        // silently fall through to this conversion — the `match` makes adding
+        // one a compile error here, which is where the decision belongs.
+        let (suite, proof_body) = crate::privacy::split_tagged_proof(&request.proof)
+            .map_err(|e| anyhow!("transact proof envelope: {e}"))?;
+        let onchain_proof = match suite {
+            crate::privacy::ProofSuite::Groth16Bn254TransactV3 => {
+                crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(proof_body)
+                    .map_err(|e| anyhow!("transact proof: {e}"))?
+            }
+        };
         let params = SettlementParams::Transact {
             recipient: request.recipient,
             nullifiers: request.nullifiers,
