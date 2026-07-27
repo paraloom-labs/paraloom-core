@@ -138,6 +138,11 @@ struct DecodedDeposit {
 const SPL_MINT_ACCOUNT_INDEX: usize = 1;
 const SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 5;
 
+/// `deposit_note` account layout: bridge_state(0), bridge_vault(1),
+/// merkle_tree(2), depositor(3), … — the tree account is what pushes the
+/// depositor one further along than the legacy `deposit`.
+const DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX: usize = 3;
+
 /// Try to interpret a single compiled instruction as a Paraloom
 /// deposit. Returns `None` if the instruction targets a different
 /// program, the discriminator does not match, the borsh payload is
@@ -158,11 +163,17 @@ fn decode_compiled_deposit(
         return None;
     }
 
-    // Native `deposit` and `deposit_spl` share the same borsh payload
-    // (amount, recipient, randomness) but differ in discriminator, account
-    // layout, and asset. The SPL deposit's asset id is the mint account; the
-    // native deposit's is NATIVE_SOL.
-    let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT {
+    // All three deposit instructions share one borsh payload — a u64 amount
+    // and two 32-byte fields — and differ in discriminator, account layout and
+    // asset. `deposit_note` is the only one the program still exposes; the two
+    // legacy arms stay so historical deposits made before `8830226` removed
+    // them still decode.
+    let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT_NOTE {
+        (
+            DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
+            crate::privacy::types::NATIVE_SOL_ASSET,
+        )
+    } else if raw_data[..8] == discriminators::DEPOSIT {
         (
             DEPOSITOR_ACCOUNT_INDEX,
             crate::privacy::types::NATIVE_SOL_ASSET,
@@ -220,6 +231,7 @@ fn parse_account_keys(keys: &[String]) -> std::result::Result<Vec<Pubkey>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::solana::instructions::DepositNoteInstructionData;
     use solana_transaction_status::UiCompiledInstruction;
 
     fn encode_deposit_data(amount: u64, recipient: [u8; 32], randomness: [u8; 32]) -> String {
@@ -265,6 +277,50 @@ mod tests {
         assert_eq!(decoded.data.amount, amount);
         assert_eq!(decoded.data.recipient, recipient);
         assert_eq!(decoded.data.randomness, randomness);
+        assert_eq!(decoded.depositor, depositor);
+        assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+    }
+
+    /// `deposit_note` is the only deposit instruction the program still
+    /// exposes — `8830226` removed the other two — so a decoder that cannot
+    /// read it cannot see any deposit at all. It went unread for nineteen
+    /// days; this is the test that would have caught it.
+    #[test]
+    fn decodes_a_deposit_note() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        // deposit_note accounts: bridge_state(0), bridge_vault(1),
+        // merkle_tree(2), depositor(3) — one further along than the legacy
+        // layout, because of the tree account.
+        let account_keys = vec![other, other, other, depositor, program_id];
+
+        let amount = 2_500_000u64;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("deposit_note must decode");
+        assert_eq!(decoded.data.amount, amount);
+        // The payloads share a layout; `pubkey`/`blinding` arrive in the
+        // fields v1 called `recipient`/`randomness`.
+        assert_eq!(decoded.data.recipient, pubkey);
+        assert_eq!(decoded.data.randomness, blinding);
         assert_eq!(decoded.depositor, depositor);
         assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
     }

@@ -103,9 +103,27 @@ impl ShieldedPool {
         amount: u64,
         asset_id: AssetId,
     ) -> Result<Commitment> {
-        // Create commitment
         let commitment = note.commitment();
+        self.credit_commitment(commitment, note, amount, asset_id)
+            .await
+    }
 
+    /// Credit a deposit whose commitment is already known.
+    ///
+    /// The bridge takes this path. Its leaf has to be the one the program
+    /// appended to the on-chain tree, and the program derives that itself
+    /// (`merkle_tree::commitment`) rather than trusting the depositor — so the
+    /// listener recomputes it the same way and passes it in. Deriving it from
+    /// the `Note` instead would use the v2 hash, which is a different
+    /// function: the two trees would diverge one leaf at a time and only
+    /// surface later, at settlement, as a root nobody recognises.
+    pub async fn credit_commitment(
+        &self,
+        commitment: Commitment,
+        note: Note,
+        amount: u64,
+        asset_id: AssetId,
+    ) -> Result<Commitment> {
         // Idempotent: a deposit whose commitment is already credited must not
         // be inserted or credited again. Two paths replay one: the bridge
         // listener re-fetches a deposit that failed on a prior poll, and — the

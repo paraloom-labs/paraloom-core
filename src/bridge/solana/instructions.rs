@@ -66,7 +66,6 @@ pub mod discriminators {
     pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
     /// `sha256("global:deposit_note")[..8]` (#350). v3 deposit that appends the
     /// note commitment to the on-chain tree.
-    #[allow(dead_code)]
     pub const DEPOSIT_NOTE: [u8; 8] = [75, 212, 96, 185, 178, 167, 29, 57];
     /// `sha256("global:initialize_merkle_tree")[..8]` (#350). One-time,
     /// upgrade-authority-gated tree account creation.
@@ -107,7 +106,6 @@ pub struct TransactInstructionData {
 /// `Poseidon(amount, pubkey, blinding, asset)` itself and appends it to the
 /// on-chain tree, so the leaf is bound to the lamports actually deposited.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct DepositNoteInstructionData {
     pub amount: u64,
     pub pubkey: [u8; 32],
