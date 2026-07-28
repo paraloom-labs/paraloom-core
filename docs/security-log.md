@@ -17,9 +17,9 @@ issue, email security@paraloom.network.
   on-chain half of that move shipped.
   - #689 — the bridge decoder still matched the removed discriminators, so from
     2026-07-08 it recognized no deposit at all. The program kept appending
-    leaves; nodes stopped seeing them, so an indexed root drifted from the real
-    one and proofs against it failed as "prover root not recognized", a symptom
-    that points nowhere near its cause. Fixed by adding the `DEPOSIT_NOTE` branch
+    leaves; nodes stopped seeing them, and every deposit in that window is
+    missing from the node's own ledger — per-asset supply, stored notes, and the
+    pool state it gossips to peers. Fixed by adding the `DEPOSIT_NOTE` branch
     and, more to the point, by crediting the commitment the program actually
     computes: `Note::commitment()` is the v2 hash (five inputs, domain tag) while
     the on-chain leaf is four inputs with no tag, so recognizing the instruction
@@ -31,17 +31,32 @@ issue, email security@paraloom.network.
   - #690 — the pool is always constructed in memory, so none of the above is
     persisted and every restart rebuilds from the bridge cursor. Open.
   - #691 — `ReputationTracker` has no persistence, so accumulated validator
-    reputation resets on restart and leader weighting begins flat. Open.
+    reputation resets to `BASE_REPUTATION` on restart. The issue frames this as
+    affecting leader weighting; it does not, because `LeaderSelector` reads its
+    own `ValidatorInfo.reputation`, fixed at registration and never synced from
+    the tracker, so leader weight is stake-only either way. The real effect is on
+    vote eligibility: a validator pushed below the consensus floor by
+    `record_failure` becomes eligible again on any restart of the tallying node.
+    Open.
 
-  None of this reached on-chain state: every deposit was recorded correctly, and
-  no path allowed minting, theft, freezing or a double spend. The damage was
-  confined to a node's view of the chain — but not cheaply, and the first draft
-  of this entry understated it. The scan cursor is passed as `until`, so a node
-  restarted on fixed code only asks for transactions newer than the cursor and
-  never re-requests the twenty days it was blind for. Recovering them takes an
-  explicit cursor reset and a cold start, which is now a step in the cutover
-  runbook rather than something to rediscover on the day. Awarded $100 from the
-  Stage 1 pool as a single root cause. Devnet, pre-mainnet.
+  No user was affected and settlement never depended on any of it, which is
+  worth stating precisely rather than as reassurance. A v3 spend proves
+  membership in the *on-chain* root and the program enforces that with
+  `is_known_root` before the quorum and Groth16 checks, so `verify_transact_proof`
+  deliberately never consults the pool. Wallets build merkle paths from leaves
+  read straight off the chain, not from a node. A blind node was therefore a node
+  with a stale private ledger, not a stalled or divergent protocol: deposits kept
+  landing, funds stayed spendable throughout, and nothing here allowed minting,
+  theft, freezing or a double spend.
+
+  Recovery is the part that is not free. The scan cursor is passed as `until`, so
+  a node restarted on fixed code only asks for transactions newer than the cursor
+  and never re-requests the twenty days it was blind for. Repopulating that ledger
+  takes an explicit cursor reset and a cold start, which is now a step in the
+  cutover runbook rather than something to rediscover on the day.
+
+  Awarded $100 from the Stage 1 pool as a single root cause. Devnet,
+  pre-mainnet.
 
 - **Dual-stake token gate started open** (external bug-bounty report, kiyeps).
   #656 — `initialize_validator_registry` and `reset_validator_registry` both
