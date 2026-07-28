@@ -25,7 +25,7 @@ use paraloom::consensus::transact::TransactVerificationRequest;
 use paraloom::consensus::ApprovedTransact;
 use paraloom::consensus::VerificationVote;
 use paraloom::node::Node;
-use solana_sdk::signature::Keypair;
+use solana_sdk::signature::{Keypair, Signer};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -65,7 +65,11 @@ fn valid_tagged_proof() -> Vec<u8> {
 
 /// Bridge-enabled validator settings with a generated settlement keypair, so the
 /// node advertises a co-signing wallet (#260) and can sign settlement messages.
-fn validator_settings(port: u16, bootstrap: Vec<String>, data_dir: &str) -> Settings {
+fn validator_settings(
+    port: u16,
+    bootstrap: Vec<String>,
+    data_dir: &str,
+) -> (Settings, solana_sdk::pubkey::Pubkey) {
     let mut s = Settings::development();
     s.network.listen_address = format!("/ip4/127.0.0.1/tcp/{port}");
     s.network.bootstrap_nodes = bootstrap;
@@ -78,11 +82,12 @@ fn validator_settings(port: u16, bootstrap: Vec<String>, data_dir: &str) -> Sett
     s.bridge.poll_interval_secs = 3600;
 
     let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
     let path = format!("{data_dir}/validator.json");
     std::fs::write(&path, format!("{:?}", keypair.to_bytes().to_vec()))
         .expect("write keypair file");
     s.bridge.authority_keypair_path = Some(path);
-    s
+    (s, pubkey)
 }
 
 fn accept_verifier() -> paraloom::node::TransactProofVerifier {
@@ -115,22 +120,21 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
     let dir1 = tempfile::tempdir().expect("tempdir1");
     let (port0, port1) = (free_port(), free_port());
 
-    let node0 = Node::new(validator_settings(
-        port0,
-        vec![],
-        dir0.path().to_str().unwrap(),
-    ))
-    .expect("node0")
-    .with_transact_proof_verifier(accept_verifier())
-    .with_transact_consensus_thresholds(1, 2);
-    let node1 = Node::new(validator_settings(
+    let (settings0, wallet0) = validator_settings(port0, vec![], dir0.path().to_str().unwrap());
+    let (settings1, wallet1) = validator_settings(
         port1,
         vec![format!("/ip4/127.0.0.1/tcp/{port0}")],
         dir1.path().to_str().unwrap(),
-    ))
-    .expect("node1")
-    .with_transact_proof_verifier(accept_verifier())
-    .with_transact_consensus_thresholds(1, 2);
+    );
+
+    let node0 = Node::new(settings0)
+        .expect("node0")
+        .with_transact_proof_verifier(accept_verifier())
+        .with_transact_consensus_thresholds(1, 2);
+    let node1 = Node::new(settings1)
+        .expect("node1")
+        .with_transact_proof_verifier(accept_verifier())
+        .with_transact_consensus_thresholds(1, 2);
 
     let n0 = node0.clone();
     let h0 = tokio::spawn(async move { n0.run().await });
@@ -159,6 +163,24 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
     )
     .await;
     assert!(connected, "nodes did not form a gossip mesh within 30s");
+
+    // The stake gate withholds approval until an on-chain snapshot lands
+    // (#698), and this harness has no chain: `solana_rpc_url` points at a dead
+    // port on purpose, so each node's own reconciler never succeeds. Supply the
+    // snapshot it would have produced.
+    //
+    // Before #698 this test reached a quorum without one, which is precisely
+    // the bug: the gate was a no-op whenever no stake was known, so the
+    // stake-weighted half of the quorum it claims to exercise was never
+    // exercised. With stake applied, node1's vote has to carry real weight.
+    //
+    // Applied on every poll rather than once, mirroring the production
+    // reconciler: a peer's stake only sticks once its settlement wallet has
+    // been advertised over the mesh, and that is gossip-timed.
+    let stakes: std::collections::HashMap<String, u64> = std::collections::HashMap::from([
+        (wallet0.to_string(), 1_000_000_000),
+        (wallet1.to_string(), 1_000_000_000),
+    ]);
 
     // A v3 spend: withdraw 500 units to a fixed recipient. Unique nullifiers
     // per run so reruns never collide in the nullifier-keyed caches.
@@ -204,7 +226,11 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
     let quorum = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
         let rid = request_id.clone();
         let probe = node0.clone();
+        let peer = node1.clone();
+        let snapshot = stakes.clone();
         async move {
+            probe.apply_onchain_stakes(snapshot.clone()).await;
+            peer.apply_onchain_stakes(snapshot).await;
             matches!(
                 probe.transact_consensus_status(&rid).await,
                 Ok(Some(VerificationVote::Valid))

@@ -1330,6 +1330,25 @@ impl Node {
         self
     }
 
+    /// Apply an on-chain validator-stake snapshot to the consensus set.
+    ///
+    /// This is the entry point the node's own reconciler uses on every
+    /// successful poll. It is public so a harness running without a chain can
+    /// supply the snapshot the reconciler would have produced: since #698 the
+    /// stake gate withholds approval until one lands, which is what a node with
+    /// a dead RPC should do in production, and leaves an offline test unable to
+    /// reach a quorum whose stake weighting it is not otherwise exercising.
+    ///
+    /// Fail-closed by wallet, like the reconciler: a validator absent from
+    /// `stakes` is zeroed rather than left at its previous value.
+    ///
+    /// No-op on a node with no transact coordinator.
+    pub async fn apply_onchain_stakes(&self, stakes: std::collections::HashMap<String, u64>) {
+        if let Some(coordinator) = &self.transact_coordinator {
+            coordinator.sync_onchain_stakes(stakes).await;
+        }
+    }
+
     /// Quorum status for a transact verification this node initiated (#350).
     /// `Ok(Some(vote))` once a quorum is reached, `Ok(None)` while votes
     /// accumulate or on a node with no transact coordinator.
