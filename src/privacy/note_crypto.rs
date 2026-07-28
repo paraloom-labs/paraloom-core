@@ -477,4 +477,68 @@ mod tests {
         let parsed = EncryptedNote::from_bytes(&sealed.to_bytes()).expect("parse");
         assert_eq!(open(&secret.to_bytes(), &parsed).unwrap(), b"payload");
     }
+
+    /// The checked-in interop vectors (#678), verified against this codec.
+    ///
+    /// The wallet and `paraloom-prover-wasm` implement the same encoding
+    /// separately and are held to this file. Without reading it back here it
+    /// would be an artifact that silently goes stale the first time the codec
+    /// moves, which is worse than having none: the other implementations would
+    /// stay pinned to bytes core no longer produces, and the version tag
+    /// cannot help because both sides would still say v1.
+    ///
+    /// Regenerate with `cargo run --bin emit_note_envelope_vectors`.
+    #[test]
+    fn checked_in_interop_vectors_match_this_codec() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../../vectors/note_envelope_v1.json"))
+                .expect("vectors parse");
+
+        assert_eq!(doc["tags"]["v1"].as_u64().unwrap() as u8, ENVELOPE_TAG_V1);
+        assert_eq!(
+            doc["tags"]["reserved"].as_u64().unwrap() as u8,
+            ENVELOPE_TAG_RESERVED
+        );
+
+        let hex_of = |v: &serde_json::Value| hex::decode(v.as_str().unwrap()).unwrap();
+
+        for case in doc["encode"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let note = EncryptedNote {
+                epk: hex_of(&case["epk"]).try_into().unwrap(),
+                nonce: hex_of(&case["nonce"]).try_into().unwrap(),
+                ct: hex_of(&case["ct"]),
+            };
+            let expected = hex_of(&case["bytes"]);
+            assert_eq!(note.to_bytes(), expected, "encode mismatch: {name}");
+            assert_eq!(
+                EncryptedNote::from_bytes(&expected).expect(name),
+                note,
+                "decode mismatch: {name}"
+            );
+        }
+
+        for case in doc["reject"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let err = EncryptedNote::from_bytes(&hex_of(&case["bytes"]))
+                .expect_err(&format!("must be rejected: {name}"));
+            // Compare the variant, not the payload: the vectors record which
+            // rejection a reader must reach, and `UnknownVersion(2)` and
+            // `UnknownVersion(9)` are the same requirement.
+            assert_eq!(
+                format!("{err:?}").split('(').next().unwrap(),
+                case["error"].as_str().unwrap(),
+                "wrong rejection for {name}"
+            );
+        }
+
+        for case in doc["relay"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            assert_eq!(
+                check_relayable(&hex_of(&case["bytes"])).is_ok(),
+                case["relayable"].as_bool().unwrap(),
+                "relay mismatch: {name}"
+            );
+        }
+    }
 }
