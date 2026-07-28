@@ -1517,7 +1517,11 @@ impl Node {
                             transact.sync_onchain_stakes(map).await;
                         }
                         Err(e) => {
-                            log::debug!("on-chain stake reconcile skipped this tick: {e}")
+                            // Not debug: until a snapshot lands, the off-chain
+                            // stake gate withholds approval (#698), so a
+                            // persistent failure here reads as "this node has
+                            // stopped approving" with no other signal.
+                            log::warn!("on-chain stake reconcile skipped this tick: {e}")
                         }
                     }
                 }
