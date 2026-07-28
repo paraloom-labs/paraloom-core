@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::compute::{ComputeJob, JobId, JobResult, ResourceLimits};
-use crate::privacy::{Commitment, Note, ShieldedAddress, ShieldedPool};
+use crate::privacy::{Commitment, EncryptedNote, Note, ShieldedAddress, ShieldedPool};
 
 /// A private compute job with hidden input/output
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,36 +137,26 @@ impl PrivateComputeJob {
     /// same audited, wallet-compatible primitive the shielded-note delivery
     /// uses. `address` is the recipient's X25519 **public** key; unlike the
     /// previous scheme it is not itself the key, so a public address alone
-    /// cannot decrypt. Wire format: `epk(32) || nonce(24) || ct`.
+    /// cannot decrypt. Wire format is the canonical envelope encoding
+    /// ([`EncryptedNote::to_bytes`]), shared with every other boundary that
+    /// carries a sealed blob.
     fn encrypt_data(data: &[u8], address: &ShieldedAddress) -> Result<Vec<u8>> {
-        let sealed = crate::privacy::note_crypto::seal(&address.0, data);
-        let mut out = Vec::with_capacity(56 + sealed.ct.len());
-        out.extend_from_slice(&sealed.epk);
-        out.extend_from_slice(&sealed.nonce);
-        out.extend_from_slice(&sealed.ct);
-        Ok(out)
+        Ok(crate::privacy::note_crypto::seal(&address.0, data).to_bytes())
     }
 
     /// Decrypt data sealed by `encrypt_data`, using the owner's X25519
     /// **secret** key. Only the owner (holder of the secret) can decrypt — the
     /// public address alone cannot.
     ///
-    /// Expects `epk(32) || nonce(24) || ct`.
+    /// Expects the canonical envelope encoding
+    /// ([`EncryptedNote::from_bytes`]). An unrecognised version is rejected
+    /// rather than fallen back on — this is a consumer of the bytes, not a
+    /// relay.
     pub fn decrypt_data(encrypted: &[u8], owner_secret: &[u8; 32]) -> Result<Vec<u8>> {
-        use crate::privacy::note_crypto::{open, EncryptedNote};
+        use crate::privacy::note_crypto::open;
 
-        if encrypted.len() < 56 {
-            return Err(anyhow!("Encrypted data too short (missing epk/nonce)"));
-        }
-        let mut epk = [0u8; 32];
-        epk.copy_from_slice(&encrypted[..32]);
-        let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&encrypted[32..56]);
-        let sealed = EncryptedNote {
-            epk,
-            nonce,
-            ct: encrypted[56..].to_vec(),
-        };
+        let sealed = EncryptedNote::from_bytes(encrypted)
+            .map_err(|e| anyhow!("Encrypted data is not a valid envelope: {e}"))?;
 
         open(owner_secret, &sealed)
             .ok_or_else(|| anyhow!("Decryption failed (wrong key or corrupted data)"))

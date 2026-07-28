@@ -237,6 +237,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. POST to the public transact ingress ──────────────────────────────
     println!("[4/5] POST {ingress}/transact/submit ...");
+    // The demo delivers no spendable output, but the blobs still have to be
+    // well-formed envelopes: the ingress now rejects the reserved `0` tag, and
+    // the previous `"00"` placeholder is exactly that. Sealing through the codec
+    // also keeps the demo from drifting away from the real format.
+    //
+    // A throwaway X25519 key, not the Solana recipient pubkey: `seal` would
+    // accept any 32 bytes, but an Ed25519 signing key is not an X25519
+    // recipient and reading it as one here would be misleading. Two seals, so
+    // the outputs get distinct ephemeral keys as they would in a real transact.
+    let demo_recipient = *crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng)
+        .public_key()
+        .as_bytes();
+    let placeholder_0 = hex::encode(
+        paraloom::privacy::note_crypto::seal(&demo_recipient, b"demo placeholder 0").to_bytes(),
+    );
+    let placeholder_1 = hex::encode(
+        paraloom::privacy::note_crypto::seal(&demo_recipient, b"demo placeholder 1").to_bytes(),
+    );
     let body = serde_json::json!({
         "recipient": hex::encode(recipient_bytes),
         "nullifiers": [hex::encode(fr_to_le(&nf0)), hex::encode(fr_to_le(&nf1))],
@@ -244,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "root": hex::encode(fr_to_le(&root)),
         "ext_amount": ext_amount,
         "proof": hex::encode(&proof_bytes),
-        "ciphertexts": ["00", "00"],
+        "ciphertexts": [placeholder_0, placeholder_1],
     });
     let resp = reqwest::blocking::Client::new()
         .post(format!("{ingress}/transact/submit"))
