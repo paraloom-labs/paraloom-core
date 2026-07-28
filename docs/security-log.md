@@ -49,11 +49,21 @@ issue, email security@paraloom.network.
   landing, funds stayed spendable throughout, and nothing here allowed minting,
   theft, freezing or a double spend.
 
-  Recovery is the part that is not free. The scan cursor is passed as `until`, so
-  a node restarted on fixed code only asks for transactions newer than the cursor
-  and never re-requests the twenty days it was blind for. Repopulating that ledger
-  takes an explicit cursor reset and a cold start, which is now a step in the
-  cutover runbook rather than something to rediscover on the day.
+  Recovery is the part that is not free, and the first version of this entry got
+  it wrong. The scan cursor is passed as `until`, so a node restarted on fixed
+  code only asks for transactions newer than the cursor and never re-requests the
+  twenty days it was blind for. Deleting the cursor does not fix that either:
+  `listener.rs:543` breaks after the newest page when no cursor is set, so a cold
+  start reads one page and stops. Re-scanning means seeding an older signature
+  into the cursor file so the walk-back has something to page toward.
+
+  The deeper version of the same point, which #690 tracks: the pool is in-memory
+  while the cursor is durable, so a node has always started each run with an
+  empty tree and a cursor claiming the history was already scanned. The twenty
+  days are not a hole in an otherwise complete ledger — the ledger has never held
+  anything older than the last restart. That it went unnoticed for nineteen days
+  is a consequence of the same thing that made it harmless: nothing in production
+  reads this tree.
 
   Awarded $100 from the Stage 1 pool as a single root cause. Devnet,
   pre-mainnet.
