@@ -12,7 +12,7 @@ use crate::privacy::poseidon::{
 /// Serialize an `Fr` to 32 little-endian bytes. BN254 `Fr` is 254-bit,
 /// so the 32-byte buffer always fits and we pad trailing zeros if
 /// arkworks' `to_bytes_le` emits fewer than 32 bytes.
-fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {
+pub(crate) fn fr_to_bytes_32(fr: Fr) -> [u8; 32] {
     let bytes = fr.into_bigint().to_bytes_le();
     let mut out = [0u8; 32];
     let len = bytes.len().min(32);

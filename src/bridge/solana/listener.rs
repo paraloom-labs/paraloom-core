@@ -7,7 +7,11 @@
 use crate::bridge::solana::decoder::{extract_deposit_events, LISTENER_TX_ENCODING};
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, DepositEvent, Result};
+use crate::privacy::poseidon_circom::v3_commit;
+use crate::privacy::types::{fr_to_bytes_32, Commitment};
 use crate::privacy::{DepositTx, ShieldedAddress, ShieldedPool};
+use ark_bn254::Fr;
+use ark_ff::PrimeField;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -669,11 +673,30 @@ impl EventListener {
             ));
         }
 
-        // Process deposit into pool
-        let net_amount = event.amount.saturating_sub(event.fee);
-        pool.deposit_asset(deposit_tx.output_note, net_amount, event.asset_id)
-            .await
-            .map_err(|e| BridgeError::DepositFailed(e.to_string()))?;
+        // Mirror the leaf the program appended, rather than deriving one.
+        // `deposit_note` computes `Poseidon(amount, pubkey, blinding, asset)`
+        // on chain over the lamports it actually received, so recomputing it
+        // the same way is what keeps the two trees the same tree. The `Note`'s
+        // own `commitment()` is the v2 hash — a different function — and using
+        // it here would put a leaf in the pool that the chain never appended.
+        let commitment = Commitment(fr_to_bytes_32(v3_commit(
+            Fr::from(event.amount),
+            Fr::from_le_bytes_mod_order(&event.recipient),
+            Fr::from_le_bytes_mod_order(&event.randomness),
+            Fr::from_le_bytes_mod_order(&event.asset_id),
+        )));
+
+        // Credit the deposited amount, not a net of it: the on-chain leaf
+        // commits to the full amount, so a fee netted here would credit a
+        // supply that does not match the tree.
+        pool.credit_commitment(
+            commitment,
+            deposit_tx.output_note,
+            event.amount,
+            event.asset_id,
+        )
+        .await
+        .map_err(|e| BridgeError::DepositFailed(e.to_string()))?;
 
         log::info!(target: "paraloom::bridge::solana", "deposit processed successfully");
         Ok(())
@@ -684,6 +707,49 @@ impl EventListener {
 mod tests {
     use super::*;
     use crate::privacy::pedersen;
+
+    /// The pool's leaf has to be the leaf the program appended, or the two
+    /// trees drift apart and the first anyone hears of it is a settlement
+    /// rejecting a root nobody recognises.
+    ///
+    /// The program computes it as `hashv(Bn254X5, LittleEndian, [amount_le,
+    /// pubkey, blinding, asset])` (`merkle_tree::commitment`). This recomputes
+    /// that byte-for-byte with the same primitive the syscall wraps, and
+    /// checks the listener's path lands on the same 32 bytes. It fails if
+    /// either side moves — including if anyone routes the deposit back through
+    /// `Note::commitment()`, which is the v2 hash and a different function.
+    #[test]
+    fn deposit_commitment_matches_the_on_chain_leaf() {
+        use ark_bn254::Fr;
+        use ark_ff::PrimeField;
+        use light_poseidon::{Poseidon, PoseidonBytesHasher};
+
+        let amount: u64 = 2_500_000;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let asset = crate::privacy::types::NATIVE_SOL_ASSET;
+
+        // What the listener credits.
+        let ours =
+            crate::privacy::types::fr_to_bytes_32(crate::privacy::poseidon_circom::v3_commit(
+                Fr::from(amount),
+                Fr::from_le_bytes_mod_order(&pubkey),
+                Fr::from_le_bytes_mod_order(&blinding),
+                Fr::from_le_bytes_mod_order(&asset),
+            ));
+
+        // What the program appends, spelled out rather than imported: the
+        // program is a separate crate, so copying the formula is the only way
+        // to notice if it changes.
+        let mut amount_le = [0u8; 32];
+        amount_le[..8].copy_from_slice(&amount.to_le_bytes());
+        let theirs = Poseidon::<Fr>::new_circom(4)
+            .unwrap()
+            .hash_bytes_le(&[&amount_le, &pubkey, &blinding, &asset])
+            .unwrap();
+
+        assert_eq!(ours, theirs, "off-chain leaf must equal the on-chain leaf");
+    }
 
     #[test]
     fn test_listener_creation() {
@@ -1378,7 +1444,13 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify deposit was added to pool
-        assert_eq!(pool.total_supply().await, 990); // 1000 - 10 fee
+        // The full amount, not a net of the fee. `deposit_note` moves
+        // `amount` lamports and commits to `amount`, so a note worth 1000 is
+        // what lands in the tree — netting a fee here would leave the supply
+        // disagreeing with the notes backing it. Nothing produces a non-zero
+        // fee today (the decoder hardcodes 0), which is why the old netting
+        // never surfaced.
+        assert_eq!(pool.total_supply().await, 1000);
         assert_eq!(pool.commitment_count().await, 1);
     }
 
@@ -1406,7 +1478,7 @@ mod tests {
         EventListener::process_deposit(&pool, event).await.unwrap();
 
         // Credited to the mint, not to native SOL.
-        assert_eq!(pool.supply_of(mint).await, 990);
+        assert_eq!(pool.supply_of(mint).await, 1000);
         assert_eq!(
             pool.supply_of(crate::privacy::types::NATIVE_SOL_ASSET)
                 .await,
