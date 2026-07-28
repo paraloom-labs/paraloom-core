@@ -10,6 +10,34 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **The v3 deposit path was never finished off chain** (external bug-bounty
+  reports, Godswork4). Four issues with one root cause. `deposit_note` landed on
+  2026-07-06 and the legacy `deposit` / `deposit_spl` instructions came out two
+  days later, moving every deposit onto the new instruction — but only the
+  on-chain half of that move shipped.
+  - #689 — the bridge decoder still matched the removed discriminators, so from
+    2026-07-08 it recognized no deposit at all. The program kept appending
+    leaves; nodes stopped seeing them, so an indexed root drifted from the real
+    one and proofs against it failed as "prover root not recognized", a symptom
+    that points nowhere near its cause. Fixed by adding the `DEPOSIT_NOTE` branch
+    and, more to the point, by crediting the commitment the program actually
+    computes: `Note::commitment()` is the v2 hash (five inputs, domain tag) while
+    the on-chain leaf is four inputs with no tag, so recognizing the instruction
+    alone would have traded a blind node for a confidently wrong one (PR #693).
+  - #680 — the pool's deposit idempotency guard was restored only in a
+    constructor with no production caller, so on a real node it never came back
+    and a re-indexed leaf could be appended twice. Guard fixed (PR #685); it does
+    not yet run, for the reason #690 gives.
+  - #690 — the pool is always constructed in memory, so none of the above is
+    persisted and every restart rebuilds from the bridge cursor. Open.
+  - #691 — `ReputationTracker` has no persistence, so accumulated validator
+    reputation resets on restart and leader weighting begins flat. Open.
+
+  None of this reached on-chain state: every deposit was recorded correctly, and
+  no path allowed minting, theft, freezing or a double spend. The damage was
+  confined to a node's view of the chain, which a reindex repairs. Awarded $100
+  from the Stage 1 pool as a single root cause. Devnet, pre-mainnet.
+
 - **Dual-stake token gate started open** (external bug-bounty report, kiyeps).
   #656 — `initialize_validator_registry` and `reset_validator_registry` both
   hardcoded `min_token_stake: 0`, while preserving the SOL floor. Registration
