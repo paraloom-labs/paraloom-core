@@ -16,7 +16,6 @@ use crypto_box::{
     aead::{Aead, AeadCore, OsRng},
     PublicKey, SalsaBox, SecretKey,
 };
-use serde::{Deserialize, Serialize};
 
 /// The spend capability delivered to a recipient. Encoded as
 /// `amount(8, LE) || randomness(32) || recipient(32)` = 72 bytes.
@@ -58,11 +57,164 @@ impl NotePlaintext {
 
 /// An encrypted note: ephemeral X25519 public key, 24-byte nonce, and the NaCl
 /// ciphertext (`tag(16) || ct`). Delivered opaquely through the transfer flow.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Deliberately **not** `Serialize`/`Deserialize`. The canonical encoding is
+/// [`EncryptedNote::to_bytes`] / [`EncryptedNote::from_bytes`], and a derived
+/// serde impl would be a second wire representation of the same envelope —
+/// exactly the drift this codec exists to remove. A boundary that needs to
+/// carry one in JSON carries the canonical bytes as a hex string.
+///
+/// `ct` always carries at least its 16-byte Poly1305 tag, because `crypto_box`
+/// emits one even for an empty plaintext. Every constructor in this crate
+/// upholds that ([`seal`] and [`EncryptedNote::from_bytes`]), but the fields
+/// are public, so a hand-built value can violate it — and `to_bytes` would
+/// then emit bytes that `from_bytes` rejects. See the PR discussion.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedNote {
     pub epk: [u8; 32],
     pub nonce: [u8; 24],
     pub ct: Vec<u8>,
+}
+
+/// Permanently reserved envelope tag. Never allocated to a version, so that an
+/// all-zero or truncated buffer cannot read as a valid envelope.
+pub const ENVELOPE_TAG_RESERVED: u8 = 0;
+
+/// v1: `crypto_box` (X25519 + XSalsa20-Poly1305). The remainder is
+/// `epk(32) || nonce(24) || ct`, byte-identical to the pre-tag encoding.
+pub const ENVELOPE_TAG_V1: u8 = 1;
+
+/// Smallest well-formed v1 remainder: `epk(32) || nonce(24)`, plus the 16-byte
+/// Poly1305 tag that every `crypto_box` output carries even when the sealed
+/// plaintext is empty (see the `ct` field: `tag(16) || ct`).
+const V1_MIN_REMAINDER: usize = 32 + 24 + 16;
+
+/// Why an envelope could not be parsed.
+///
+/// The distinction between [`EnvelopeError::UnknownVersion`] and the other
+/// variants is load-bearing rather than cosmetic: a component that only
+/// *relays* envelopes has to tell "I cannot parse this" apart from "this is
+/// not a valid envelope". See [`check_relayable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopeError {
+    /// No bytes at all, so not even a tag.
+    Empty,
+    /// The reserved `0` tag: invalid in every version, now and in future.
+    ReservedTag,
+    /// A tag this build does not implement. Carries no claim about whether the
+    /// remainder is well-formed — this build has no way to judge that.
+    UnknownVersion(u8),
+    /// A recognised tag whose remainder does not match that version's layout.
+    Malformed(u8),
+}
+
+impl std::fmt::Display for EnvelopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty envelope (no version tag)"),
+            Self::ReservedTag => write!(f, "reserved envelope tag 0"),
+            Self::UnknownVersion(v) => write!(f, "unimplemented envelope version {v}"),
+            Self::Malformed(v) => write!(f, "malformed v{v} envelope"),
+        }
+    }
+}
+
+impl std::error::Error for EnvelopeError {}
+
+impl EncryptedNote {
+    /// Canonical wire encoding: `tag(1) || <version-defined remainder>`.
+    ///
+    /// The tag selects a *parser* rather than sitting inside a fixed layout:
+    /// the bytes after it are defined entirely by the version, with no
+    /// structure shared across versions beyond the tag. A later hybrid or
+    /// post-quantum suite has an encapsulation far larger than 32 bytes
+    /// (X-Wing's is 1120), so a fixed `epk` slot at offset 1 would be the same
+    /// wall one byte further in.
+    ///
+    /// The tag covers the *envelope* — key agreement, symmetric construction,
+    /// framing — and not the schema of whatever is sealed inside: [`seal`]
+    /// takes an arbitrary `&[u8]`, so the envelope is the only domain the note
+    /// path and the compute path actually share. Versioning `NotePlaintext`
+    /// needs its own discriminator, on the transact path only.
+    ///
+    /// The in-memory struct is the v1 shape, so this always writes
+    /// [`ENVELOPE_TAG_V1`]. Every boundary that puts an envelope on a wire
+    /// goes through this and [`EncryptedNote::from_bytes`], so no two of them
+    /// can drift apart independently.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 32 + 24 + self.ct.len());
+        out.push(ENVELOPE_TAG_V1);
+        out.extend_from_slice(&self.epk);
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.ct);
+        out
+    }
+
+    /// Parse a canonical encoding.
+    ///
+    /// An unrecognised tag is rejected rather than fallen back on: a reader
+    /// that cannot parse a version must not try the one it knows. That is also
+    /// what makes the tag safe outside the AEAD — `crypto_box` has no AAD, so
+    /// the tag is unauthenticated, and with no fallback the only thing
+    /// flipping it achieves is a rejection the recipient would have reached
+    /// anyway.
+    pub fn from_bytes(b: &[u8]) -> Result<Self, EnvelopeError> {
+        let (&tag, rest) = b.split_first().ok_or(EnvelopeError::Empty)?;
+        match tag {
+            ENVELOPE_TAG_RESERVED => Err(EnvelopeError::ReservedTag),
+            ENVELOPE_TAG_V1 => {
+                if rest.len() < V1_MIN_REMAINDER {
+                    return Err(EnvelopeError::Malformed(ENVELOPE_TAG_V1));
+                }
+                let mut epk = [0u8; 32];
+                epk.copy_from_slice(&rest[..32]);
+                let mut nonce = [0u8; 24];
+                nonce.copy_from_slice(&rest[32..56]);
+                Ok(Self {
+                    epk,
+                    nonce,
+                    ct: rest[56..].to_vec(),
+                })
+            }
+            other => Err(EnvelopeError::UnknownVersion(other)),
+        }
+    }
+}
+
+/// Whether a relay may forward this blob.
+///
+/// The settlement path does not open envelopes: `canonical_id` excludes the
+/// ciphertexts and nothing downstream in core depends on their content, so a
+/// validator here is a *carrier*, not a consumer. It therefore rejects only
+/// what is invalid under every version — an empty blob and the reserved tag —
+/// plus a v1 blob that fails the v1 parser, and relays every other tag
+/// untouched.
+///
+/// **The catch-all arm is deliberate and must stay a catch-all.** Making this
+/// fail closed on a compiled-in set of known versions would put a core release
+/// on the upgrade critical path for every future format: a wallet could not
+/// submit a v2 note through existing nodes until every relay had shipped v2
+/// support, even though core still would not care what is inside. It would
+/// also make acceptance depend on which relay a note lands on during a rollout,
+/// which is a worse failure mode than a consistent accept or reject. This is
+/// the opposite of the exhaustive `match` at the settlement seam (#679), and
+/// for the opposite reason: there core is the consumer, here it is the carrier.
+///
+/// Note also that an old build cannot do better than this on an unknown tag.
+/// Any structural check it could apply would be a v1 check under a general
+/// name: a minimum length would forbid a legitimately shorter future format,
+/// and a maximum would not survive a 1120-byte encapsulation.
+///
+/// Rejecting here is hygiene, not safety. The ciphertext is not
+/// settlement-bound — nullifier PDAs, quorum and the proof gate the funds, and
+/// none of them touch these bytes.
+pub fn check_relayable(blob: &[u8]) -> Result<(), EnvelopeError> {
+    match blob.first() {
+        None => Err(EnvelopeError::Empty),
+        Some(&ENVELOPE_TAG_RESERVED) => Err(EnvelopeError::ReservedTag),
+        Some(&ENVELOPE_TAG_V1) => EncryptedNote::from_bytes(blob).map(|_| ()),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Seal arbitrary `plaintext` to `recipient_pub` (an X25519 public key) under a
@@ -201,5 +353,128 @@ mod tests {
         assert_eq!(got.amount, 1_000_000);
         assert_eq!(got.randomness, [0x11; 32]);
         assert_eq!(got.recipient, [0x22; 32]);
+    }
+
+    /// A v1 envelope built from known filler, so the byte layout is pinned
+    /// independently of any key material. The codec is pure framing and never
+    /// inspects the sealed bytes, so filler is the right input here; real
+    /// crypto stays with the tweetnacl vector above.
+    fn v1_fixture(ct_len: usize) -> EncryptedNote {
+        let epk: [u8; 32] = std::array::from_fn(|i| 0xA0 + i as u8);
+        let nonce: [u8; 24] = std::array::from_fn(|i| 0xC0 + i as u8);
+        EncryptedNote {
+            epk,
+            nonce,
+            ct: (0..ct_len).map(|i| i as u8).collect(),
+        }
+    }
+
+    #[test]
+    fn envelope_round_trips_and_pins_the_layout() {
+        // 72-byte NotePlaintext + 16-byte tag is the transact-path shape.
+        let note = v1_fixture(88);
+        let bytes = note.to_bytes();
+
+        assert_eq!(bytes.len(), 145, "1 + 32 + 24 + 88");
+        assert_eq!(bytes[0], ENVELOPE_TAG_V1);
+        // v1's remainder is byte-identical to the pre-tag encoding.
+        assert_eq!(&bytes[1..33], &note.epk);
+        assert_eq!(&bytes[33..57], &note.nonce);
+        assert_eq!(&bytes[57..], &note.ct[..]);
+        assert_eq!(EncryptedNote::from_bytes(&bytes).unwrap(), note);
+    }
+
+    #[test]
+    fn envelope_does_not_hardcode_the_note_ciphertext_length() {
+        // `seal` takes an arbitrary payload, so the compute path produces
+        // envelopes on either side of the 88-byte note shape.
+        for ct_len in [16, 160, 1024] {
+            let note = v1_fixture(ct_len);
+            assert_eq!(
+                EncryptedNote::from_bytes(&note.to_bytes()).unwrap(),
+                note,
+                "ct_len {ct_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_rejects_reserved_unknown_and_malformed() {
+        let good = v1_fixture(88).to_bytes();
+
+        let mut reserved = good.clone();
+        reserved[0] = ENVELOPE_TAG_RESERVED;
+        assert_eq!(
+            EncryptedNote::from_bytes(&reserved),
+            Err(EnvelopeError::ReservedTag)
+        );
+
+        let mut unknown = good.clone();
+        unknown[0] = 2;
+        assert_eq!(
+            EncryptedNote::from_bytes(&unknown),
+            Err(EnvelopeError::UnknownVersion(2))
+        );
+
+        assert_eq!(EncryptedNote::from_bytes(&[]), Err(EnvelopeError::Empty));
+        assert_eq!(
+            EncryptedNote::from_bytes(&[ENVELOPE_TAG_V1]),
+            Err(EnvelopeError::Malformed(1))
+        );
+        // 57 bytes: well-formed epk and nonce, but an empty sealed body. A
+        // `crypto_box` ciphertext always carries its 16-byte tag, so this
+        // cannot be real output.
+        assert_eq!(
+            EncryptedNote::from_bytes(&good[..57]),
+            Err(EnvelopeError::Malformed(1))
+        );
+    }
+
+    /// The carrier rule. Core relays on the settlement path, so an unknown
+    /// version passes ingress even though the codec cannot parse it — see
+    /// `check_relayable` for why this must not become fail-closed.
+    #[test]
+    fn relay_forwards_unknown_versions_but_not_the_reserved_tag() {
+        let good = v1_fixture(88).to_bytes();
+        assert!(check_relayable(&good).is_ok());
+
+        for tag in [2u8, 0x7f, 0xff] {
+            let mut unknown = good.clone();
+            unknown[0] = tag;
+            assert!(
+                check_relayable(&unknown).is_ok(),
+                "tag {tag} must relay opaquely"
+            );
+        }
+
+        // A one-byte unknown version. This is the case that forbids a shared
+        // minimum length in front of the version dispatch: a future format may
+        // legitimately be shorter than v1, and a carrier has no standing to
+        // assume otherwise. A `blob.len() < V1_MIN_REMAINDER` guard added
+        // before the match would pass every other test in this module and fail
+        // only these two.
+        assert!(
+            check_relayable(&[2]).is_ok(),
+            "an unknown version must not inherit v1's minimum length"
+        );
+        assert!(check_relayable(&[0xff]).is_ok());
+
+        let mut reserved = good.clone();
+        reserved[0] = ENVELOPE_TAG_RESERVED;
+        assert_eq!(check_relayable(&reserved), Err(EnvelopeError::ReservedTag));
+        assert_eq!(check_relayable(&[]), Err(EnvelopeError::Empty));
+        // A v1 tag is held to the v1 parser even on the relay path.
+        assert_eq!(
+            check_relayable(&good[..57]),
+            Err(EnvelopeError::Malformed(1))
+        );
+    }
+
+    #[test]
+    fn sealed_output_round_trips_through_the_canonical_encoding() {
+        let secret = SecretKey::generate(&mut OsRng);
+        let sealed = seal(secret.public_key().as_bytes(), b"payload");
+        let parsed = EncryptedNote::from_bytes(&sealed.to_bytes()).expect("parse");
+        assert_eq!(open(&secret.to_bytes(), &parsed).unwrap(), b"payload");
     }
 }

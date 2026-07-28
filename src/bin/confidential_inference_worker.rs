@@ -7,9 +7,12 @@
 //! - `GET  /attested-key` — the channel public key plus the attestation token
 //!   vouching for it, so a client can verify (`GcpConfidentialSpaceVerifier`)
 //!   before sealing anything.
-//! - `POST /infer` — a sealed request (`EncryptedNote`); the worker opens it
-//!   inside the enclave, runs the model, and returns the result sealed to the
-//!   requester. The plaintext prompt and result never leave the enclave.
+//! - `POST /infer` — a JSON string holding the hex-encoded canonical
+//!   `EncryptedNote` envelope. The worker opens it inside the enclave, runs the
+//!   model, and returns the result sealed to the requester in the same
+//!   representation. The plaintext prompt and result never leave the enclave.
+//!   (Previously a three-field JSON object; moving to the canonical encoding is
+//!   a breaking wire change, made at the ceremony cutover.)
 //!
 //! The model is served by a local `llama-server` (see `GraniteModelRunner`).
 //!
@@ -56,10 +59,18 @@ async fn get_attested_key(State(state): State<Arc<AppState>>) -> Json<AttestedKe
 }
 
 /// Open a sealed request inside the enclave, run the model, seal the result.
+/// The body is the canonical envelope encoding as one opaque hex string, not a
+/// three-field JSON object: the enclave and its client then agree on a single
+/// encoding — the same one every other boundary uses — rather than on a JSON
+/// shape that can drift a field at a time.
 async fn infer(
     State(state): State<Arc<AppState>>,
-    Json(sealed): Json<EncryptedNote>,
-) -> Result<Json<EncryptedNote>, (StatusCode, String)> {
+    Json(sealed_hex): Json<String>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let bytes = hex::decode(sealed_hex.strip_prefix("0x").unwrap_or(&sealed_hex))
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("sealed request: {e}")))?;
+    let sealed = EncryptedNote::from_bytes(&bytes)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("sealed request: {e}")))?;
     let worker = state.worker.clone();
     // The model call blocks; run it off the async runtime.
     let handled = tokio::task::spawn_blocking(move || worker.handle(&sealed))
@@ -72,7 +83,7 @@ async fn infer(
         })?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("inference: {e}")))?;
     match handled {
-        Some(result) => Ok(Json(result)),
+        Some(result) => Ok(Json(hex::encode(result.to_bytes()))),
         None => Err((
             StatusCode::BAD_REQUEST,
             "request could not be opened by this enclave".to_string(),

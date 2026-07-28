@@ -153,8 +153,10 @@ async fn submit_handler(
         ));
     }
 
-    // The ciphertexts are opaque to the node — validate only that there are
-    // two non-empty hex blobs (the recipient decrypts them).
+    // The ciphertexts stay opaque to the node: it relays them and never opens
+    // them. Validation is limited to what is invalid under every envelope
+    // version — see `note_crypto::check_relayable`, which documents why an
+    // unknown version is forwarded rather than rejected here.
     if req.ciphertexts.len() != 2 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -163,12 +165,14 @@ async fn submit_handler(
     }
     for (i, c) in req.ciphertexts.iter().enumerate() {
         let trimmed = c.strip_prefix("0x").unwrap_or(c);
-        if hex::decode(trimmed).map(|b| b.is_empty()).unwrap_or(true) {
-            return Err((
+        let bytes = hex::decode(trimmed).map_err(|_| {
+            (
                 StatusCode::BAD_REQUEST,
                 format!("ciphertexts[{i}] must be non-empty hex"),
-            ));
-        }
+            )
+        })?;
+        crate::privacy::note_crypto::check_relayable(&bytes)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("ciphertexts[{i}]: {e}")))?;
     }
     let ciphertexts = [req.ciphertexts[0].clone(), req.ciphertexts[1].clone()];
 
@@ -302,6 +306,18 @@ mod tests {
             .unwrap()
     }
 
+    /// A structurally valid v1 envelope. The ingress only checks framing, so
+    /// filler bytes are enough — but the fill must be a real v1 blob, or the
+    /// happy-path tests below exercise only the unknown-version arm of
+    /// `check_relayable` and never the v1 parser.
+    fn v1_ciphertext_hex(fill: u8) -> String {
+        let mut bytes = vec![crate::privacy::note_crypto::ENVELOPE_TAG_V1];
+        bytes.extend_from_slice(&[fill; 32]); // epk
+        bytes.extend_from_slice(&[fill; 24]); // nonce
+        bytes.extend_from_slice(&[fill; 16]); // smallest authenticated ct
+        hex::encode(bytes)
+    }
+
     fn body_with_ext_amount(ext_amount: i64) -> String {
         format!(
             r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":{},"proof":"{}","ciphertexts":["{}","{}"]}}"#,
@@ -313,8 +329,8 @@ mod tests {
             "55".repeat(32),
             ext_amount,
             "01".repeat(192),
-            "ab".repeat(88),
-            "cd".repeat(88)
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
         )
     }
 
@@ -382,8 +398,8 @@ mod tests {
             "44".repeat(32),
             "55".repeat(32),
             "01".repeat(192),
-            "ab".repeat(88),
-            "cd".repeat(88)
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -476,5 +492,33 @@ mod tests {
         let notes: Vec<DeliveredNote> = serde_json::from_slice(&body).unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].output_commitment, "33".repeat(32));
+    }
+
+    /// The carrier rule at the HTTP layer: core relays a version it cannot
+    /// parse. A single byte is deliberate — a future format may be shorter than
+    /// v1, so the ingress must not impose v1's minimum on an unknown tag.
+    #[tokio::test]
+    async fn unknown_envelope_version_is_relayed() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "02");
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A v1 tag is held to the v1 parser even on the relay path.
+    #[tokio::test]
+    async fn malformed_v1_envelope_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "01");
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reserved_envelope_tag_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
