@@ -35,8 +35,13 @@ issue, email security@paraloom.network.
 
   None of this reached on-chain state: every deposit was recorded correctly, and
   no path allowed minting, theft, freezing or a double spend. The damage was
-  confined to a node's view of the chain, which a reindex repairs. Awarded $100
-  from the Stage 1 pool as a single root cause. Devnet, pre-mainnet.
+  confined to a node's view of the chain — but not cheaply, and the first draft
+  of this entry understated it. The scan cursor is passed as `until`, so a node
+  restarted on fixed code only asks for transactions newer than the cursor and
+  never re-requests the twenty days it was blind for. Recovering them takes an
+  explicit cursor reset and a cold start, which is now a step in the cutover
+  runbook rather than something to rediscover on the day. Awarded $100 from the
+  Stage 1 pool as a single root cause. Devnet, pre-mainnet.
 
 - **Dual-stake token gate started open** (external bug-bounty report, kiyeps).
   #656 — `initialize_validator_registry` and `reset_validator_registry` both
