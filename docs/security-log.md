@@ -30,14 +30,22 @@ issue, email security@paraloom.network.
     not yet run, for the reason #690 gives.
   - #690 — the pool is always constructed in memory, so none of the above is
     persisted and every restart rebuilds from the bridge cursor. Open.
-  - #691 — `ReputationTracker` has no persistence, so accumulated validator
-    reputation resets to `BASE_REPUTATION` on restart. The issue frames this as
-    affecting leader weighting; it does not, because `LeaderSelector` reads its
-    own `ValidatorInfo.reputation`, fixed at registration and never synced from
-    the tracker, so leader weight is stake-only either way. The real effect is on
-    vote eligibility: a validator pushed below the consensus floor by
-    `record_failure` becomes eligible again on any restart of the tallying node.
-    Open.
+  #691 was reported in the same batch and is **not** part of this root cause,
+  though the first version of this entry filed it here. `ReputationTracker` has
+  no persistence, so accumulated validator reputation resets to
+  `BASE_REPUTATION` on restart. That is the consensus layer, with no causal link
+  to the deposit path; the shared trait is only that neither survives a restart,
+  which is a symptom rather than a cause. Filing it under the deposit-path
+  heading was a stretch, and it happened to be the direction that suited us.
+
+  Its impact is also not what the issue claims. Leader weighting is unaffected,
+  because `LeaderSelector` reads its own `ValidatorInfo.reputation`, fixed at
+  registration and never synced from the tracker, so leader weight is stake-only
+  either way. The real exposure is vote eligibility: a validator pushed below the
+  consensus floor by `record_failure` is eligible again after any restart of the
+  tallying node, which is a penalty-evasion path. Low today only because the
+  quorum is not yet economically Sybil-resistant, so reputation is not
+  load-bearing; it joins the mainnet gate list alongside that. Open.
 
   No user was affected and settlement never depended on any of it, which is
   worth stating precisely rather than as reassurance. A v3 spend proves
@@ -65,8 +73,8 @@ issue, email security@paraloom.network.
   is a consequence of the same thing that made it harmless: nothing in production
   reads this tree.
 
-  Awarded $100 from the Stage 1 pool as a single root cause. Devnet,
-  pre-mainnet.
+  Paid $150 from the Stage 1 pool: $100 for the deposit-path cluster as a single
+  root cause, $50 for #691 as a separate Low. Devnet, pre-mainnet.
 
 - **Dual-stake token gate started open** (external bug-bounty report, kiyeps).
   #656 — `initialize_validator_registry` and `reset_validator_registry` both
