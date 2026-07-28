@@ -249,9 +249,22 @@ impl TransactVerificationCoordinator {
     /// Mirrors `quorum::verify_validator_quorum`: the settlement authority
     /// (this node) is excluded from both the eligible stake (the denominator)
     /// and the counted co-signer stake, and the threshold is
-    /// `floor(2 * eligible_stake / 3) + 1`. With no registered stake (unit
-    /// tests) or no configured local id, the gate is a no-op and the head-count
-    /// check stands alone.
+    /// `floor(2 * eligible_stake / 3) + 1`.
+    ///
+    /// With no configured local id the gate is a no-op and the head-count check
+    /// stands alone: that is the unit-test and unconfigured case, where there is
+    /// no settlement authority to exclude and nothing is submitted anyway.
+    ///
+    /// A configured node that sees zero active stake withholds instead (#698).
+    /// Reaching that state means the on-chain reconciler has not yet landed a
+    /// snapshot — connectivity registration seeds 0 stake, and a failing
+    /// `list_validator_stakes` leaves it that way for as long as the RPC stays
+    /// down. Approving there would have been the gate's own failure mode: it
+    /// exists so this node never assembles a settlement the program will reject
+    /// with `QuorumNotMet`, and with no stake data there is no basis to believe
+    /// it would clear. A quorum whose co-signers hold no stake cannot clear the
+    /// on-chain threshold regardless, so withholding costs nothing a real
+    /// snapshot would have bought.
     async fn stake_quorum_met(&self, tally: &VoteTally, active: &HashSet<NodeId>) -> bool {
         let local = match &self.local_node_id {
             Some(id) => id,
@@ -266,7 +279,13 @@ impl TransactVerificationCoordinator {
             }
         }
         if total_active_stake == 0 {
-            return true;
+            log::warn!(
+                target: "paraloom::consensus::transact",
+                "withholding approval: no on-chain stake snapshot for {} active validator(s) \
+                 (reconciler has not landed one yet)",
+                active.len()
+            );
+            return false;
         }
 
         let authority_stake = selector
@@ -1021,6 +1040,81 @@ mod tests {
         assert!(
             approvals.try_recv().is_ok(),
             "a stake-weighted supermajority must reach quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn stake_gate_withholds_until_a_stake_snapshot_lands() {
+        // #698: the gate used to return true when it saw no stake at all, so a
+        // node between startup and its first successful on-chain reconcile
+        // approved on head count alone — with the stake weighting the gate
+        // exists to apply silently switched off. Connectivity registration
+        // seeds 0 stake, so this is the ordinary state of a node that has just
+        // started or whose `list_validator_stakes` RPC is failing.
+        let self_id = NodeId(vec![0x99]);
+        let (mut coordinator, mut approvals) =
+            TransactVerificationCoordinator::new_with_approvals();
+        coordinator = coordinator.with_local_node_id(self_id);
+        // One Valid vote satisfies the head count, so the stake gate decides.
+        coordinator.set_consensus_thresholds(1, 5);
+
+        // Registered as voters, but with no stake applied: exactly what
+        // connectivity registration leaves behind before the reconciler runs.
+        let a = NodeId(vec![0x01]);
+        let b = NodeId(vec![0x02]);
+        let c = NodeId(vec![0x03]);
+        for id in [&a, &b, &c] {
+            coordinator.register_validator(id.clone()).await;
+        }
+
+        let mut request = sample_request();
+        request.request_id = request.canonical_id();
+        coordinator
+            .start_verification(request.clone())
+            .await
+            .unwrap();
+
+        for (i, v) in [&a, &b].iter().enumerate() {
+            coordinator
+                .submit_result(TransactVerificationResult {
+                    request_id: request.request_id.clone(),
+                    validator: (*v).clone(),
+                    vote: VerificationVote::Valid,
+                    timestamp: i as u64 + 1,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            approvals.try_recv().is_err(),
+            "with no stake snapshot the gate must withhold, not wave the head count through"
+        );
+
+        // The reconciler lands a snapshot. Stakes: 50 each over three voters →
+        // total 150, self holds none, so eligible = 150 and the threshold is
+        // floor(2 * 150 / 3) + 1 = 101.
+        for id in [&a, &b, &c] {
+            coordinator
+                .leader_selector
+                .write()
+                .await
+                .register_validator(ValidatorInfo::new(id.clone(), 50, 1000));
+        }
+
+        // The third vote re-evaluates the same request, now with weight behind
+        // all three: 150 >= 101 → approved.
+        coordinator
+            .submit_result(TransactVerificationResult {
+                request_id: request.request_id.clone(),
+                validator: c,
+                vote: VerificationVote::Valid,
+                timestamp: 3,
+            })
+            .await
+            .unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "once stake is known, a stake-weighted supermajority must approve"
         );
     }
 
