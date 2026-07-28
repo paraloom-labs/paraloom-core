@@ -10,6 +10,39 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **The off-chain stake gate failed open with no stake snapshot** (external
+  bug-bounty report, Godswork4). #698 — `stake_quorum_met` returned `true` when
+  it saw zero total active stake, documented as covering unit tests and nodes
+  with no configured local id. A configured production node reached it too:
+  connectivity registration seeds 0 stake, so between startup and the first
+  successful `list_validator_stakes`, and for as long as that RPC kept failing,
+  the gate applied no stake weighting at all and approval fell back to head
+  count and reputation alone.
+
+  That inverts what the gate is for. It exists so a node never assembles a
+  settlement the program rejects with `QuorumNotMet`, and with no stake data
+  there is no basis to believe one would clear. It now withholds, and the
+  reconciler's failure log moved from `debug` to `warn`, since a persistent
+  failure means the node has quietly stopped approving (PR #700). One correction
+  to the report: `tokio::time::interval` completes its first tick immediately,
+  so the startup window is one RPC round trip rather than 60 seconds. The
+  unbounded RPC-failure window is the real one.
+
+  Worth recording what fixing it exposed. `transact_cosign_e2e` — whose subject
+  is stake-weighted co-signing — began failing, because its nodes point
+  `solana_rpc_url` at a dead port, so no snapshot ever landed and the gate had
+  always been a no-op there. The test had never exercised the stake weighting it
+  is named for. A single fail-open branch both opened the production window and
+  disabled the test that should have caught it; the test now supplies the
+  snapshot its reconciler cannot fetch.
+
+  On-chain settlement was never affected: `quorum::verify_validator_quorum` is
+  the safety gate and is independent. Out of Stage 1 bounty scope on the #627
+  precedent — an off-chain quorum gate being too permissive is quorum-liveness
+  rather than safety, and out-of-scope item 3 covers both dimensions of a
+  quorum that is not yet economically Sybil-resistant — so credited here rather
+  than paid. Devnet, pre-mainnet.
+
 - **The v3 deposit path was never finished off chain** (external bug-bounty
   reports, Godswork4). Four issues with one root cause. `deposit_note` landed on
   2026-07-06 and the legacy `deposit` / `deposit_spl` instructions came out two
