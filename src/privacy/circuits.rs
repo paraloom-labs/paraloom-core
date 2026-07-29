@@ -1708,13 +1708,64 @@ mod tests {
             let cs = ConstraintSystem::<Fr>::new_ref();
             c.generate_constraints(cs.clone()).expect("generate");
             assert!(cs.is_satisfied().expect("satisfied"));
-            // alloc_u64_witness adds 64 boolean constraints per input (2 inputs = 128).
-            // With the fix, these constraints exist; verify the CS has them.
-            let num_constraints = cs.num_constraints();
-            assert!(
-                num_constraints > 0,
-                "constraint system must contain constraints"
+            // Pinned, not `> 0`. The original assertion here was
+            // `num_constraints > 0`, which is true of any non-empty circuit
+            // and stayed green with the fix reverted, so the regression guard
+            // for a paid finding guarded nothing.
+            //
+            // This count is the same one `r1cs_shape::transact_v3_shape_is_pinned`
+            // freezes for the ceremony. Deliberately duplicated here so a
+            // circuit edit that legitimately moves the shape has to look at
+            // *this* test too, and at the property named above it, rather than
+            // only at a ceremony freeze that says nothing about range bounds.
+            //
+            // The property itself is pinned at the gadget in
+            // `alloc_u64_witness_costs_exactly_64_boolean_constraints`, which
+            // survives a shape change.
+            assert_eq!(
+                cs.num_constraints(),
+                18_477,
+                "constraint count moved: if this is a deliberate circuit change, \
+                 confirm input amounts still go through alloc_u64_witness before \
+                 updating the number"
             );
+        }
+
+        /// The range bound behind #389, pinned where it actually lives.
+        ///
+        /// `alloc_u64_witness` is what gives every value witness its hard
+        /// `[0, 2^64)` bound; without it a prover can assign a near-field-prime
+        /// amount and forge a withdrawal exceeding deposited supply. A count on
+        /// the whole circuit cannot isolate that, and the circuit's own
+        /// `in_amounts: Vec<Option<u64>>` makes the adversarial witness
+        /// unrepresentable from Rust — so the guard belongs here, on the gadget,
+        /// where the 64 boolean constraints are the whole observable.
+        #[test]
+        fn alloc_u64_witness_costs_exactly_64_boolean_constraints() {
+            use ark_r1cs_std::R1CSVar;
+
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            let before = cs.num_constraints();
+            let (uint, fp) = alloc_u64_witness(cs.clone(), Some(u64::MAX)).expect("alloc");
+            let after = cs.num_constraints();
+
+            assert_eq!(
+                after - before,
+                64,
+                "a u64 witness must cost 64 boolean constraints; fewer means the \
+                 bits are not being enforced and the range bound is gone"
+            );
+
+            // The FpVar view must be the free linear combination of those bits,
+            // not a second independent allocation: an unconstrained FpVar
+            // alongside a constrained UInt64 would reinstate the forgery.
+            assert_eq!(
+                fp.value().expect("fp value"),
+                Fr::from(u64::MAX),
+                "the field view must equal the allocated integer"
+            );
+            assert_eq!(uint.value().expect("uint value"), u64::MAX);
+            assert!(cs.is_satisfied().expect("satisfied"));
         }
 
         /// Full Groth16 setup → prove → verify with the public-input vector in
