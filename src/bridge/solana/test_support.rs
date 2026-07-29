@@ -19,10 +19,11 @@ use solana_sdk::message::MessageHeader;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
+use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
     EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage, UiRawMessage,
-    UiTransaction, UiTransactionEncoding,
+    UiTransaction, UiTransactionEncoding, UiTransactionStatusMeta,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -124,6 +125,39 @@ pub fn synth_deposit_tx(
         },
         block_time: None,
     }
+}
+
+/// Attach a status meta carrying `err` to a synthesised transaction.
+///
+/// `synth_deposit_tx` leaves `meta: None`, which is what the decoder path
+/// wants. `verify_deposit` reads `meta.err`, so testing its failure branch
+/// needs a meta that exists and carries an error — otherwise the branch is
+/// simply unreachable and a test claiming to cover it does not.
+///
+/// The struct has no `Default`, so every field is spelled out here rather than
+/// at each call site: the list churns between Solana releases, and one place to
+/// fix it is better than several.
+pub fn with_tx_error(
+    mut tx: EncodedConfirmedTransactionWithStatusMeta,
+    err: solana_sdk::transaction::TransactionError,
+) -> EncodedConfirmedTransactionWithStatusMeta {
+    tx.transaction.meta = Some(UiTransactionStatusMeta {
+        status: Err(err.clone()),
+        err: Some(err),
+        fee: 0,
+        pre_balances: vec![],
+        post_balances: vec![],
+        inner_instructions: OptionSerializer::None,
+        log_messages: OptionSerializer::None,
+        pre_token_balances: OptionSerializer::None,
+        post_token_balances: OptionSerializer::None,
+        rewards: OptionSerializer::None,
+        loaded_addresses: OptionSerializer::None,
+        return_data: OptionSerializer::None,
+        compute_units_consumed: OptionSerializer::None,
+        cost_units: OptionSerializer::None,
+    });
+    tx
 }
 
 #[async_trait]
