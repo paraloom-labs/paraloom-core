@@ -1013,15 +1013,20 @@ async fn cosign_settlement(
     }
 }
 
-/// Whether a submit error means the withdrawal was already settled (its
+/// Whether a submit error means the settlement is already on chain (its
 /// nullifier is spent), as opposed to a real failure (#164). A replay is
 /// expected — e.g. two nodes reach quorum and both try to submit — so the
-/// submitter task skips it quietly instead of logging a warning.
+/// submitter task skips it quietly instead of retrying and warning.
+///
+/// Structural, not a string match. The previous version looked for
+/// `"already spent"` inside `InvalidTransaction`, which nothing in the program
+/// or the bridge ever produces: the real failure comes from Anchor's `init` on
+/// an existing account and carries the runtime's own wording. Only the unit
+/// test built an error that matched, so the check passed CI while never firing
+/// in production (#703). `settle_transact_via_cosign` now asks the chain
+/// whether the nullifier landed and reports `AlreadySettled`.
 fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
-    matches!(
-        e,
-        crate::bridge::BridgeError::InvalidTransaction(msg) if msg.contains("already spent")
-    )
+    matches!(e, crate::bridge::BridgeError::AlreadySettled)
 }
 
 /// Drain the transact coordinator's approval channel and settle each approved
@@ -2149,16 +2154,46 @@ impl Node {
             .map_err(|e| BridgeError::Network(format!("transact co-signing round: {e}")))?;
 
         let result = bridge.lock().await.submit_signed_transaction(&tx).await;
-        if result.is_ok() {
-            // The settlement landed: mark its input nullifiers spent in the
-            // off-chain set so this node's `check_batch` pre-filters replays of
-            // it before consensus, matching the on-chain nullifier PDAs that are
-            // the authoritative double-spend gate (#624).
+
+        // Landing it ourselves and losing the race to a peer are the same fact
+        // about the chain, so they get the same local bookkeeping: the spend is
+        // recorded either way. Previously only the winner recorded it, so a
+        // losing node's off-chain nullifier set drifted from the chain it is
+        // meant to pre-filter against (#703).
+        let settled = match &result {
+            Ok(_) => true,
+            // Only ask the chain on failure, and only about the first
+            // nullifier: the pair is spent atomically in one instruction, so
+            // either both PDAs exist or neither does.
+            Err(_) => {
+                bridge
+                    .lock()
+                    .await
+                    .is_nullifier_spent(&approved.request.nullifiers[0])
+                    .await
+            }
+        };
+
+        if settled {
+            // Mark the input nullifiers spent in the off-chain set so this
+            // node's `check_batch` pre-filters replays before consensus,
+            // matching the on-chain nullifier PDAs that are the authoritative
+            // double-spend gate (#624).
             if let Some(pool) = &self.shielded_pool {
                 pool.record_spent(approved.request.nullifiers).await;
             }
         }
-        result
+
+        match result {
+            Ok(sig) => Ok(sig),
+            // Report a lost race as what it is. Classifying it by the submit
+            // error's text is what #703 was: the message comes from Anchor's
+            // `init` on an existing account, so it is not ours to predict, and
+            // the old `contains("already spent")` check matched nothing outside
+            // its own test.
+            Err(_) if settled => Err(crate::bridge::BridgeError::AlreadySettled),
+            Err(e) => Err(e),
+        }
     }
 
     // Compute layer API methods
@@ -2911,9 +2946,12 @@ mod tests {
             async move {
                 let n = counter.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    Err(crate::bridge::BridgeError::InvalidTransaction(
-                        "nullifier already spent".to_string(),
-                    ))
+                    // The variant `settle_transact_via_cosign` returns after
+                    // the chain confirms the nullifier landed. The old test
+                    // built `InvalidTransaction("nullifier already spent")`,
+                    // a string production never emits, so it exercised a
+                    // classification that could not fire in a real node (#703).
+                    Err(crate::bridge::BridgeError::AlreadySettled)
                 } else {
                     Ok("signature".to_string())
                 }

@@ -10,6 +10,19 @@ pub enum BridgeError {
     #[error("Invalid transaction: {0}")]
     InvalidTransaction(String),
 
+    /// The settlement this node tried to submit is already on chain: its
+    /// nullifier PDA exists. Expected whenever two nodes reach quorum on the
+    /// same request and both submit (#164), so callers skip it quietly rather
+    /// than retrying a transaction that can never succeed.
+    ///
+    /// Deliberately a variant rather than a string match on the submit error.
+    /// The previous check looked for "already spent", which nothing in the
+    /// program or the bridge ever produces — the real failure comes from
+    /// Anchor's `init` on an existing account, whose text is not ours to
+    /// predict, and only the test constructed a matching error (#703).
+    #[error("already settled on chain (nullifier spent)")]
+    AlreadySettled,
+
     #[error("Deposit failed: {0}")]
     DepositFailed(String),
 

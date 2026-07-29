@@ -104,6 +104,11 @@ impl SolanaBridge {
         self.program.get_slot().await
     }
 
+    /// Whether a nullifier's PDA already exists on chain (#703).
+    pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
+        self.program.is_nullifier_spent(nullifier).await
+    }
+
     /// Active validators' on-chain stakes (wallet → lamports), for the consensus
     /// stake reconciler.
     pub async fn list_validator_stakes(&self) -> Result<Vec<(solana_sdk::pubkey::Pubkey, u64)>> {

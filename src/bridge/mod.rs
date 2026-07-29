@@ -87,6 +87,16 @@ impl Bridge {
         self.stats.read().await.clone()
     }
 
+    /// Whether a nullifier's PDA already exists on chain (#703). `false` when
+    /// no Solana bridge is configured, or when the RPC cannot answer — both
+    /// mean "no evidence this landed", and the caller retries on that.
+    pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
+        match self.solana_bridge {
+            Some(ref bridge) => bridge.is_nullifier_spent(nullifier).await,
+            None => false,
+        }
+    }
+
     /// Latest blockhash for a node-assembled co-signed settlement tx (#260).
     pub async fn latest_blockhash(&self) -> Result<[u8; 32]> {
         if let Some(ref bridge) = self.solana_bridge {

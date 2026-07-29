@@ -158,6 +158,26 @@ impl ProgramInterface {
         }
     }
 
+    /// Whether a nullifier has already been spent on chain, i.e. whether its
+    /// PDA exists (#703).
+    ///
+    /// This is how a losing submitter learns that the settlement it raced for
+    /// actually landed. Asking the chain is the only reliable way: the submit
+    /// failure surfaces from Anchor's `init` on an existing account, and its
+    /// text belongs to the runtime rather than to this program, so classifying
+    /// it by message means guessing at a string somebody else owns.
+    ///
+    /// A `get_account` failure is reported as "not spent" rather than as an
+    /// error: the caller uses this to decide whether a retry is pointless, and
+    /// an unreachable RPC is exactly when a retry is worth attempting.
+    pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
+        let (pda, _) = Pubkey::find_program_address(&[b"nullifier", nullifier], &self.program_id);
+        match self.rpc.get_account(&pda).await {
+            Ok(account) => account.owner == self.program_id,
+            Err(_) => false,
+        }
+    }
+
     /// Get current slot (block number equivalent)
     pub async fn get_slot(&self) -> Result<u64> {
         self.rpc.get_slot().await
