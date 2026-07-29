@@ -299,21 +299,23 @@ mod tests {
         );
 
         // The same transaction carrying an on-chain error must not.
+        // `synth_deposit_tx` leaves `meta: None`, so the error has to be
+        // attached deliberately — the first version of this test mutated a meta
+        // that was never there and panicked, which is how it should fail, but it
+        // meant the branch went unexercised until this landed.
         let mock = Arc::new(MockBridgeRpc::new());
-        let mut failed = synth_deposit_tx(
-            sig,
-            7,
-            &program_id,
-            &depositor,
-            1_000,
-            [9u8; 32],
-            [11u8; 32],
+        let failed = crate::bridge::solana::test_support::with_tx_error(
+            synth_deposit_tx(
+                sig,
+                7,
+                &program_id,
+                &depositor,
+                1_000,
+                [9u8; 32],
+                [11u8; 32],
+            ),
+            solana_sdk::transaction::TransactionError::AccountNotFound,
         );
-        if let Some(meta) = failed.transaction.meta.as_mut() {
-            meta.err = Some(solana_sdk::transaction::TransactionError::AccountNotFound);
-        } else {
-            panic!("synth_deposit_tx must carry meta for this test to mean anything");
-        }
         *mock.next_get_transaction.lock().unwrap() = Some(Ok(failed));
         assert!(
             !program_with_mock(mock)
