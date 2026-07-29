@@ -10,9 +10,13 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
-use paraloom_program::{accounts, instruction, BridgeState};
-use solana_program_test::{processor, tokio, ProgramTest};
-use solana_sdk::{instruction::Instruction, signature::Signer, transaction::Transaction};
+use paraloom_program::{accounts, instruction, BridgeError, BridgeState};
+use solana_program_test::{processor, tokio, BanksClientError, ProgramTest};
+use solana_sdk::{
+    instruction::{Instruction, InstructionError},
+    signature::Signer,
+    transaction::{Transaction, TransactionError},
+};
 
 mod common;
 use common::{add_program_data, add_stake_mint, entry};
@@ -109,6 +113,28 @@ async fn pause_flips_flag_and_blocks_deposit() {
     let state = BridgeState::try_deserialize(&mut raw.data.as_slice()).unwrap();
     assert!(state.paused);
 
+    // Open the pool before testing the pause guard. `initialize` leaves
+    // `deposit_cap` at 0 (fail-closed), so without this the deposit below is
+    // refused by the cap and never reaches `require!(!paused, BridgePaused)` —
+    // the exact line this test exists to pin. Cold-authority signed, mirroring
+    // `unpause_test`.
+    let cap_ix = Instruction {
+        program_id,
+        data: instruction::SetDepositCap {
+            new_cap: 1_000_000_000,
+        }
+        .data(),
+        accounts: accounts::SetDepositCap {
+            bridge_state: bridge_state_pda,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[cap_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    banks_client.process_transaction(tx).await.unwrap();
+
     let deposit_ix = Instruction {
         program_id,
         data: instruction::DepositNote {
@@ -129,5 +155,24 @@ async fn pause_flips_flag_and_blocks_deposit() {
     let mut tx = Transaction::new_with_payer(&[deposit_ix], Some(&payer.pubkey()));
     tx.sign(&[&payer], recent_blockhash);
     let result = banks_client.process_transaction(tx).await;
-    assert!(result.is_err(), "deposit must fail when paused");
+
+    // Assert the error, not just that there was one. `initialize` leaves
+    // `deposit_cap` at 0, so before the `set_deposit_cap` above this deposit was
+    // refused by the cap gate and never reached the pause check: deleting the
+    // `require!(!paused, BridgePaused)` line left this test green, which is the
+    // opposite of what its module doc promises.
+    let code = match result.expect_err("deposit must fail when paused") {
+        BanksClientError::TransactionError(e) => e,
+        BanksClientError::SimulationError { err, .. } => err,
+        other => panic!("expected a transaction error, got {other:?}"),
+    };
+    let code = match code {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => code,
+        other => panic!("expected a custom instruction error, got {other:?}"),
+    };
+    assert_eq!(
+        code,
+        BridgeError::BridgePaused as u32 + anchor_lang::error::ERROR_CODE_OFFSET,
+        "deposit must be refused by the pause guard, not by some other gate"
+    );
 }

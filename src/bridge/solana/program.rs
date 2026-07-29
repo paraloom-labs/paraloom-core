@@ -257,21 +257,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_program_interface_creation() {
-        let config = BridgeConfig::default();
-        let result = ProgramInterface::new(config, dummy_rpc());
-        assert!(result.is_err() || result.is_ok());
+    // `test_program_interface_creation` used to sit here asserting
+    // `result.is_err() || result.is_ok()`, which is a logical constant. Its
+    // real property — construction succeeds for a well-formed program id — is
+    // exercised by every test below through `program_with_mock`, which
+    // `unwrap`s it.
+
+    /// `verify_deposit` reports whether the transaction succeeded on chain.
+    ///
+    /// Both arms, because the previous test with this name never called it: it
+    /// constructed a `ProgramInterface` and asserted that construction worked,
+    /// leaving `verify_deposit` at zero executed lines behind a green test
+    /// bearing its name. That matters here more than most — this is the helper
+    /// whose own doc records #623, where it took an `expected_amount` it never
+    /// read and logged it as "verified".
+    #[tokio::test]
+    async fn verify_deposit_distinguishes_a_succeeded_from_a_failed_transaction() {
+        use crate::bridge::solana::test_support::synth_deposit_tx;
+
+        let sig = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+
+        // A transaction with no `meta.err` is a landed deposit.
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(synth_deposit_tx(
+            sig,
+            7,
+            &program_id,
+            &depositor,
+            1_000,
+            [9u8; 32],
+            [11u8; 32],
+        )));
+        assert!(
+            program_with_mock(mock)
+                .verify_deposit(&sig.to_string())
+                .await
+                .expect("rpc ok"),
+            "a transaction without meta.err must verify"
+        );
+
+        // The same transaction carrying an on-chain error must not.
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut failed = synth_deposit_tx(
+            sig,
+            7,
+            &program_id,
+            &depositor,
+            1_000,
+            [9u8; 32],
+            [11u8; 32],
+        );
+        if let Some(meta) = failed.transaction.meta.as_mut() {
+            meta.err = Some(solana_sdk::transaction::TransactionError::AccountNotFound);
+        } else {
+            panic!("synth_deposit_tx must carry meta for this test to mean anything");
+        }
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(failed));
+        assert!(
+            !program_with_mock(mock)
+                .verify_deposit(&sig.to_string())
+                .await
+                .expect("rpc ok"),
+            "a transaction whose meta carries an error must not verify"
+        );
     }
 
+    /// An unparsable signature is rejected before any RPC call.
     #[tokio::test]
-    async fn test_verify_deposit_with_valid_config() {
-        let config = BridgeConfig {
-            program_id: "11111111111111111111111111111111".to_string(),
-            ..Default::default()
-        };
-        let program = ProgramInterface::new(config, dummy_rpc());
-        assert!(program.is_ok());
+    async fn verify_deposit_rejects_a_malformed_signature() {
+        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
+        assert!(matches!(
+            program.verify_deposit("not-a-signature").await,
+            Err(BridgeError::InvalidTransaction(_))
+        ));
     }
 
     fn program_with_mock(mock: Arc<MockBridgeRpc>) -> ProgramInterface {
