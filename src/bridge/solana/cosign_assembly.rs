@@ -126,6 +126,12 @@ fn signature_is_valid(wallet: &Pubkey, sig_bytes: &[u8], message_bytes: &[u8]) -
 mod tests {
     use super::*;
     use solana_sdk::signature::{Keypair, Signer};
+    // Deprecated in favour of the `solana-system-interface` crate. Kept here
+    // because the transfer is only a convenient way to build a 2-signer
+    // message; migrating means a new dependency for test scaffolding, and the
+    // remaining call sites live in `programs/paraloom`, which is a separate
+    // build. Same shape as `relayer::jupiter`'s test helper.
+    #[allow(deprecated)]
     use solana_sdk::system_instruction;
 
     /// A simple 2-signer message: a transfer requiring both `a` (payer) and a
@@ -134,6 +140,7 @@ mod tests {
     fn two_signer_message(a: &Pubkey, b: &Pubkey) -> Message {
         // An instruction that marks both accounts as signers.
         let ix = system_instruction::transfer(a, b, 1);
+        #[allow(deprecated)]
         let mut msg = Message::new(&[ix], Some(a));
         // `transfer` marks the recipient writable-non-signer; force b to be a
         // required signer so we get a genuine 2-of-2.
