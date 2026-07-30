@@ -234,16 +234,8 @@ impl ProgramInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::solana::rpc::RealBridgeRpc;
     use crate::bridge::solana::test_support::MockBridgeRpc;
-    use solana_client::rpc_client::RpcClient;
     use solana_sdk::account::Account;
-
-    fn dummy_rpc() -> Arc<dyn BridgeRpc> {
-        Arc::new(RealBridgeRpc::new(Arc::new(RpcClient::new(
-            "http://localhost:8899".to_string(),
-        ))))
-    }
 
     fn bridge_state_account(program_version: u32) -> Account {
         let mut data = vec![0xAAu8; 8];
