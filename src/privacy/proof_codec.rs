@@ -220,6 +220,14 @@ mod tests {
                 // Err — only that it does not panic. (Random bytes
                 // *can* in principle decode to a valid \`Proof\`
                 // structure; if they do, that's fine.)
+                //
+                // The discard is the assertion, so the module-root
+                // `deny(let_underscore_must_use)` (the #59 guard) is
+                // allowed here deliberately. Binding the result and
+                // asserting `matches!(r, Ok(_) | Err(_))` would satisfy
+                // the lint with a tautology, which is the shape #707
+                // exists to remove.
+                #[allow(clippy::let_underscore_must_use)]
                 let _ = deserialize_proof(&buf);
             }
         }
@@ -245,6 +253,10 @@ mod tests {
             for _ in 0..64 {
                 let mut buf = vec![0u8; size];
                 rng.fill_bytes(&mut buf);
+                // Deliberate discard, as in
+                // `deserialize_proof_random_bytes_never_panic` above:
+                // not panicking is the property under test.
+                #[allow(clippy::let_underscore_must_use)]
                 let _ = deserialize_vk(&buf);
             }
         }
