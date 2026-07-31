@@ -38,7 +38,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy warnings
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       # Nothing was checking the doc links. Circuit v3 deleted the withdrawal
       # and transfer consensus modules and left five references to them behind
