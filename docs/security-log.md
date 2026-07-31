@@ -10,6 +10,34 @@ issue, email security@paraloom.network.
 
 ## 2026-07
 
+- **Wallet connection-approval was bypassable from the page** (external
+  bug-bounty report, Godswork4). #711 — the wallet's content-script relay
+  forwarded any message type to the background, and the background gated the
+  connection-approval branches on type alone without checking the sender. A
+  script on any injected `*.paraloom.io` origin could send
+  `GET_PENDING_CONNECTION` to read the id of a connection awaiting approval,
+  then `APPROVE_CONNECTION` to resolve it — approving its own connection and
+  reading the visitor's shielded address and balance with no popup and no
+  interaction. For a shielded pool that is deanonymisation, linking a page
+  visitor to a shielded amount, rather than a mere info leak.
+
+  Fixed in two layers in `paraloom-wallet` (PR #1): the background now refuses
+  the six popup-only message types when they carry a `sender.tab` — a popup
+  message comes from the extension's own context and has none, a content-script
+  message always has one — and the relay forwards only the eight message types
+  the page provider actually sends, so the approval types cannot reach the
+  background from a page at all.
+
+  Out of Stage 1 bounty scope, credited not paid, on the #656/#677 precedent:
+  the relay and this whole message path landed on 2026-07-28 (`f84e96d`), while
+  the Chrome Web Store build is 1.3.0 from 2026-06-22, which contains neither.
+  Confirmed empirically — against the shipped 1.3.0 the self-approval script
+  hangs with no relay to answer — so the finding is reproducible only off the
+  deployed extension, which the scope puts out of bounds. Had it been reachable
+  on the shipped build the severity would have risen rather than fallen; it was
+  not reachable by any user. Ships fixed in the wallet rebuild that first
+  exposes the surface, alongside the ceremony redeploy. Devnet, pre-mainnet.
+
 - **The off-chain stake gate failed open with no stake snapshot** (external
   bug-bounty report, Godswork4). #698 — `stake_quorum_met` returned `true` when
   it saw zero total active stake, documented as covering unit tests and nodes
