@@ -1,0 +1,27 @@
+Transact v3 phase-2 trusted-setup ceremony — IN PROGRESS
+
+circuit        TransactCircuitV3
+constraints    18,477 (pinned by r1cs_shape::transact_v3_shape_is_pinned)
+r1cs sha256    c468ebf1d15a82aeb7c00ece6cf714dc742b1660b8b04634b096e548a8fbe6d7
+phase 1        powersOfTau28_hez_final_16.ptau (Perpetual Powers of Tau)
+               1c401abb57c9ce531370f3015c3e75c0892e0f32b8b1e94ace0f6682d9695922
+contributions  4, verified (LoomOG, NodeSafe, WakiyamaP, LuckyStar)
+beacon         Bitcoin block 960500 — pending
+transcript     ceremony/transact/README.md
+
+The four contributions on the chain are bound to the r1cs digest above. A
+change to the constraint shape invalidates every one of them, so
+src/privacy/circuits.rs, poseidon_circom.rs and poseidon.rs are frozen while
+this file is present (.github/workflows/circuit-freeze.yml).
+
+Armed 2026-07-31, later than it should have been: the guard has existed since
+the #64 ceremony plan but the sentinel was never committed, so it passed every
+circuit-touching PR throughout the contribution window. No harm done — the r1cs
+digest still matches the published transcript, and the three commits that
+touched circuits.rs in that window were test and QAP-reduction changes that do
+not move the constraint system. That was luck rather than process, which is the
+reason this file exists now rather than at the next ceremony.
+
+Remove after the verifying key is cut into the program and deployed, not at the
+beacon: the window closes when the on-chain verifier is bound to this circuit,
+not when the chain stops accepting contributions.
