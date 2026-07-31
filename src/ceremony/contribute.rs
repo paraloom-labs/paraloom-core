@@ -106,6 +106,52 @@ pub fn contribute<R: RngCore + CryptoRng>(
     Ok((prior_pk, transcript))
 }
 
+/// Read a `ProvingKey<Bn254>` from a compressed-arkworks file.
+pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
+    let bytes = fs::read(path)?;
+    ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
+        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
+}
+
+/// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
+pub fn write_pk(pk: &ProvingKey<Bn254>, path: &Path) -> Result<(), ContributeError> {
+    write_compressed(pk, path)
+}
+
+/// Generic write of any `CanonicalSerialize` value as a
+/// compressed-arkworks file. Used for both proving keys and the
+/// verifying key the ceremony finalize binary extracts. Any
+/// caller wanting a different on-disk format should not use this
+/// helper — bincode-shaped artefacts go through
+/// `write_transcript` instead.
+pub fn write_compressed<T>(value: &T, path: &Path) -> Result<(), ContributeError>
+where
+    T: ark_serialize::CanonicalSerialize,
+{
+    let mut bytes = Vec::new();
+    value
+        .serialize_compressed(&mut bytes)
+        .map_err(|e| ContributeError::Serialize(format!("{:?}: {}", path, e)))?;
+    fs::write(path, &bytes)?;
+    Ok(())
+}
+
+/// Read a `Phase2Transcript` from a bincode file.
+pub fn read_transcript(path: &Path) -> Result<Phase2Transcript, ContributeError> {
+    let bytes = fs::read(path)?;
+    bincode::deserialize::<Phase2Transcript>(&bytes)
+        .map_err(|e| ContributeError::Deserialize(format!("Phase2Transcript at {:?}: {}", path, e)))
+}
+
+/// Write a `Phase2Transcript` to a bincode file.
+pub fn write_transcript(transcript: &Phase2Transcript, path: &Path) -> Result<(), ContributeError> {
+    let bytes = bincode::serialize(transcript).map_err(|e| {
+        ContributeError::Serialize(format!("Phase2Transcript to {:?}: {}", path, e))
+    })?;
+    fs::write(path, &bytes)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,50 +241,4 @@ mod tests {
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
     }
-}
-
-/// Read a `ProvingKey<Bn254>` from a compressed-arkworks file.
-pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
-    let bytes = fs::read(path)?;
-    ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
-        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
-}
-
-/// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
-pub fn write_pk(pk: &ProvingKey<Bn254>, path: &Path) -> Result<(), ContributeError> {
-    write_compressed(pk, path)
-}
-
-/// Generic write of any `CanonicalSerialize` value as a
-/// compressed-arkworks file. Used for both proving keys and the
-/// verifying key the ceremony finalize binary extracts. Any
-/// caller wanting a different on-disk format should not use this
-/// helper — bincode-shaped artefacts go through
-/// `write_transcript` instead.
-pub fn write_compressed<T>(value: &T, path: &Path) -> Result<(), ContributeError>
-where
-    T: ark_serialize::CanonicalSerialize,
-{
-    let mut bytes = Vec::new();
-    value
-        .serialize_compressed(&mut bytes)
-        .map_err(|e| ContributeError::Serialize(format!("{:?}: {}", path, e)))?;
-    fs::write(path, &bytes)?;
-    Ok(())
-}
-
-/// Read a `Phase2Transcript` from a bincode file.
-pub fn read_transcript(path: &Path) -> Result<Phase2Transcript, ContributeError> {
-    let bytes = fs::read(path)?;
-    bincode::deserialize::<Phase2Transcript>(&bytes)
-        .map_err(|e| ContributeError::Deserialize(format!("Phase2Transcript at {:?}: {}", path, e)))
-}
-
-/// Write a `Phase2Transcript` to a bincode file.
-pub fn write_transcript(transcript: &Phase2Transcript, path: &Path) -> Result<(), ContributeError> {
-    let bytes = bincode::serialize(transcript).map_err(|e| {
-        ContributeError::Serialize(format!("Phase2Transcript to {:?}: {}", path, e))
-    })?;
-    fs::write(path, &bytes)?;
-    Ok(())
 }
