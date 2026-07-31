@@ -282,7 +282,7 @@ mod tests {
         // is from the same rand_core version that ark_groth16 binds
         // against; ark_std exposes a newer rand_core that the
         // groth16 setup signature does not accept.
-        StdRng::seed_from_u64(0xC0FFEE_BAADu64)
+        StdRng::seed_from_u64(0xC0_FFEE_BAADu64)
     }
 
     /// Trivial circuit so we can call `circuit_specific_setup` and
