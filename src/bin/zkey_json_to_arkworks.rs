@@ -135,7 +135,13 @@ fn main() -> Res<()> {
         .ok_or("usage: zkey_json_to_arkworks <zkey.json> <out.key>")?;
     let output = args
         .next()
-        .ok_or("usage: zkey_json_to_arkworks <zkey.json> <out.key>")?;
+        .ok_or("usage: zkey_json_to_arkworks <zkey.json> <out.key> [<vk.key>]")?;
+    // Optional third arg: also write the verifying key. The VK is embedded in
+    // the proving key we build (`pk.vk`), but `emit_transact_v3_fixture` reads
+    // it from a separate file. Without this the ceremony produces a proving key
+    // and no arkworks VK, and the runbook's cut-the-VK step has no input —
+    // exactly the gap hit at the transact v3 cutover.
+    let vk_output = args.next();
 
     println!("Reading {}...", input);
     let zkey: ZkeyJson =
@@ -225,6 +231,19 @@ fn main() -> Res<()> {
     let mut bytes = Vec::new();
     pk.serialize_compressed(&mut bytes)?;
     std::fs::write(&output, &bytes)?;
+
+    if let Some(vk_path) = vk_output {
+        // The same VK the on-chain program embeds. Serialized from `pk.vk`, so
+        // it cannot disagree with the proving key it was extracted from.
+        let mut vk_bytes = Vec::new();
+        pk.vk.serialize_compressed(&mut vk_bytes)?;
+        std::fs::write(&vk_path, &vk_bytes)?;
+        println!(
+            "Wrote {} ({} bytes, verifying key)",
+            vk_path,
+            vk_bytes.len()
+        );
+    }
 
     println!("\nWrote {} ({} bytes)", output, bytes.len());
     println!("  a_query   {}", pk.a_query.len());

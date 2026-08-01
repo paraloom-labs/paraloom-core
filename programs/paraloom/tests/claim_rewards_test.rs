@@ -78,7 +78,12 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
         upgrade_authority.pubkey(),
         common::TEST_TOKEN_FUND,
     );
-    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), common::TEST_TOKEN_FUND);
+    let cosigner_token = add_token_account(
+        &mut pt,
+        stake_mint,
+        cosigner.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
