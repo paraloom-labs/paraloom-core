@@ -238,7 +238,11 @@ fn main() -> Res<()> {
         let mut vk_bytes = Vec::new();
         pk.vk.serialize_compressed(&mut vk_bytes)?;
         std::fs::write(&vk_path, &vk_bytes)?;
-        println!("Wrote {} ({} bytes, verifying key)", vk_path, vk_bytes.len());
+        println!(
+            "Wrote {} ({} bytes, verifying key)",
+            vk_path,
+            vk_bytes.len()
+        );
     }
 
     println!("\nWrote {} ({} bytes)", output, bytes.len());

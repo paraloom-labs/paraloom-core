@@ -89,8 +89,18 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         },
     );
     let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
-    let token_a = add_token_account(&mut pt, stake_mint, validator_a.pubkey(), common::TEST_TOKEN_FUND);
-    let token_b = add_token_account(&mut pt, stake_mint, validator_b.pubkey(), common::TEST_TOKEN_FUND);
+    let token_a = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator_a.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
+    let token_b = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator_b.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
     let (mut banks, _payer, blockhash) = pt.start().await;
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
 
