@@ -1001,6 +1001,31 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Create the shared dual-stake token vault for a registry that predates the
+    /// dual-stake fields.
+    ///
+    /// `initialize_validator_registry` creates `stake_token_vault` inline, but a
+    /// registry initialized by the pre-dual-stake program has no vault and its
+    /// PDA already exists, so `initialize_validator_registry` can never run again
+    /// to create one. Without the vault, `register_validator` cannot lock the
+    /// token half and every dual-stake registration fails. This is the migration
+    /// counterpart, gated to the upgrade authority like the other `initialize_*`:
+    /// it creates the vault once, under the same `stake_vault_authority` PDA and
+    /// `stake_token_vault` seeds `register_validator`/`slash`/`withdraw` expect.
+    ///
+    /// `stake_mint` must be the same mint `reset_validator_registry` pins into the
+    /// registry — `register_validator` transfers the token half into this vault
+    /// with `transfer_checked`, which requires the vault, the validator's token
+    /// account, and the registry's pinned mint to all agree.
+    pub fn init_stake_token_vault(ctx: Context<InitStakeTokenVault>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        msg!(
+            "Stake token vault initialized (mint {})",
+            ctx.accounts.stake_mint.key()
+        );
+        Ok(())
+    }
+
     /// Initialize the on-chain commitment Merkle tree (circuit v3, #350).
     ///
     /// Creates the program-owned tree account and seeds it with the empty-tree
@@ -1606,6 +1631,54 @@ pub struct InitializeValidatorRegistry<'info> {
 
     /// Same upgrade-authority gate as `Initialize` (#204) — closes the init
     /// front-run race for the validator registry.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`init_stake_token_vault`] — the dual-stake vault migration for a
+/// registry that predates the vault. Mirrors the vault-creation half of
+/// [`InitializeValidatorRegistry`] (same seeds, same authority PDA, same
+/// interface token program) but takes no `validator_registry`, so it runs
+/// against a registry whose PDA already exists.
+#[derive(Accounts)]
+pub struct InitStakeTokenVault<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The dual-stake mint the vault holds. Must match the mint
+    /// `reset_validator_registry` pins into the registry.
+    pub stake_mint: InterfaceAccount<'info, Mint>,
+
+    /// Shared vault holding every validator's locked token stake, owned by the
+    /// `stake_vault_authority` PDA. Same seeds `register_validator` derives.
+    #[account(
+        init,
+        payer = authority,
+        seeds = [b"stake_token_vault"],
+        bump,
+        token::mint = stake_mint,
+        token::authority = stake_vault_authority,
+        token::token_program = token_program,
+    )]
+    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
+
+    /// PDA that owns `stake_token_vault`; signs token outflows on withdraw/slash.
+    ///
+    /// CHECK: address pinned by seeds; used only as the vault's token authority.
+    #[account(seeds = [b"stake_vault_authority"], bump)]
+    pub stake_vault_authority: UncheckedAccount<'info>,
+
+    /// Upgrade-authority gate (#204), same as the other `initialize_*`.
     ///
     /// CHECK: validated by seeds + `check_upgrade_authority` body call.
     #[account(
