@@ -93,6 +93,11 @@ pub mod discriminators {
     /// registry initialized before the dual-stake fields (its PDA already exists,
     /// so `initialize_validator_registry` can never run again to create one).
     pub const INIT_STAKE_TOKEN_VAULT: [u8; 8] = [15, 138, 162, 97, 120, 60, 125, 127];
+    /// `sha256("global:migrate_bridge_state")[..8]`. Upgrade-authority-gated grow
+    /// of a `BridgeState` created before the `deposit_cap` field (#642): every
+    /// instruction that deserializes `BridgeState` (transact/deposit_note/pause/
+    /// set_deposit_cap) aborts on the short account until it is grown.
+    pub const MIGRATE_BRIDGE_STATE: [u8; 8] = [196, 193, 143, 108, 71, 132, 75, 181];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -372,6 +377,29 @@ pub fn create_init_stake_token_vault_instruction(
             AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
         ],
         data: discriminators::INIT_STAKE_TOKEN_VAULT.to_vec(),
+    })
+}
+
+/// Build a `migrate_bridge_state` instruction — grow a `BridgeState` created
+/// before the `deposit_cap` field to the current layout. Upgrade-authority-
+/// signed. Account order matches the on-chain `MigrateBridgeState` context:
+/// bridge_state, authority, program_data, system_program.
+pub fn create_migrate_bridge_state_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+) -> Result<Instruction> {
+    let (bridge_state, _) = derive_bridge_state(program_id);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: discriminators::MIGRATE_BRIDGE_STATE.to_vec(),
     })
 }
 
