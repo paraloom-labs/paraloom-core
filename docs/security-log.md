@@ -8,6 +8,42 @@ can verify it.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-08
+
+- **The live circuit's proving/verifying keys are now from a multi-party trusted
+  setup, not a single-party dev key** (ceremony finalization, #659 / #64). Until
+  now the deployed transact v3 circuit verified against a Groth16 key generated on
+  one machine, so whoever ran that setup held the toxic waste and could in
+  principle forge a proof for any statement, including a withdrawal with no
+  matching deposit. That was a documented pre-ceremony limitation, listed out of
+  bounty scope in `docs/bug-bounty.md`.
+
+  The multi-party ceremony is now finalized and cut into the program. It starts
+  from the public Perpetual Powers of Tau (phase 1), takes four independent
+  phase-2 contributions, and closes on a public Bitcoin-block beacon, so the keys
+  are sound as long as any one contributor discarded their secret. The full
+  transcript, the initial and final keys, and their `SHA256SUMS` are published
+  under `ceremony/transact/` for independent verification, following what
+  `ceremony/transfer/` and `ceremony/withdraw/` already ship. The redeployed
+  program verifies every settlement against the ceremony key; the old
+  single-party key no longer exists on chain. Verified end to end on devnet: a
+  wallet-generated proof settled through the live validator quorum against the
+  ceremony key. Devnet, pre-mainnet.
+
+- **Dual-stake vault and BridgeState migrations for a pre-existing pool**
+  (hardening, ceremony redeploy). The dual-stake token half locks into a shared
+  `stake_token_vault`, and the TVL cap (#642) added `deposit_cap` to
+  `BridgeState`, but both fields are created inline at first-time initialization,
+  which a pool deployed before them can never re-run. After the ceremony redeploy,
+  `BridgeState` was one field short of the layout the program expected, so every
+  `transact` / `deposit_note` / `pause` / `set_deposit_cap` aborted
+  `AccountDidNotDeserialize`, and no `stake_token_vault` existed for dual-stake
+  registration. Added upgrade-authority-gated `init_stake_token_vault` and
+  `migrate_bridge_state` instructions that grow the accounts in place (rent topped
+  up, new bytes zero-filled so `deposit_cap` starts closed), mirroring
+  `reset_validator_registry`. An availability gap on a devnet pool, not a
+  fund-loss path; no real funds were at risk. Devnet, pre-mainnet.
+
 ## 2026-07
 
 - **Wallet connection-approval was bypassable from the page** (external
