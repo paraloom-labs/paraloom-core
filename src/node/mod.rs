@@ -981,9 +981,23 @@ async fn cosign_settlement(
                     && req.root == *root
                     && req.ext_amount == *ext_amount
             });
-            // Cap keys = the two input nullifiers, each counted independently
-            // (see the cap block for why per-nullifier, not per-pair).
-            let cap_nullifiers = [hex::encode(nullifiers[0]), hex::encode(nullifiers[1])];
+            // Cap keys = each input nullifier paired with the payload authority
+            // (#723). The approval match above binds the settlement's public
+            // params but NOT `payload.authority`, and those params are all
+            // observable over gossip, so a registered peer could copy a real
+            // spend's params under its own authority and drain the shared
+            // per-nullifier budget until the legitimate leader's request is
+            // declined. Only the settlement whose authority is the on-chain
+            // bridge authority can ever land (its `has_one`), so keying the cap
+            // on (nullifier, authority) isolates each authority's budget: a
+            // forged-authority request can no longer starve the real leader,
+            // while the cap still bounds the usable signatures one spend yields
+            // (they all share the one on-chain authority).
+            let auth = hex::encode(payload.authority);
+            let cap_nullifiers = [
+                format!("{}:{auth}", hex::encode(nullifiers[0])),
+                format!("{}:{auth}", hex::encode(nullifiers[1])),
+            ];
             (approved, cap_nullifiers)
         }
     };
@@ -2679,6 +2693,78 @@ mod tests {
         assert!(
             other.signature.is_some(),
             "a distinct spend must not inherit another's cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_cap_is_per_authority_so_a_forged_authority_cannot_starve_the_leader() {
+        // #723: the approval match binds the settlement's public params but not
+        // `payload.authority`, and those params are all observable over gossip.
+        // A registered peer that copies a real spend's params under its OWN
+        // authority must not drain the budget the legitimate leader needs. The
+        // cap is keyed on (nullifier, authority), so the two budgets are
+        // isolated — and only the leader's authority (the on-chain bridge
+        // authority) ever yields a usable settlement anyway.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let leader_authority = [1u8; 32];
+        let forger_authority = [99u8; 32];
+
+        // The forger floods well past the cap under its own authority, reusing
+        // the real spend's params.
+        let forged = ta_payload(
+            forger_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
+            let _ = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &forged),
+            )
+            .await;
+        }
+
+        // The legitimate leader, under a different authority, still gets signed:
+        // its (nullifier, authority) budget was never touched. Before #723 the
+        // cap was keyed on the nullifier alone, so this request was declined.
+        let legit = ta_payload(
+            leader_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &legit),
+        )
+        .await;
+        assert!(
+            resp.signature.is_some(),
+            "a forged-authority flood must not exhaust the legitimate leader's budget"
         );
     }
 
