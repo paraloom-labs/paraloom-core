@@ -5,10 +5,15 @@ Multi-party BGM17 phase-2 ceremony over the BN254 unified transact circuit
 contributors, strictly sequential, each contribution verified before the chain
 moved on.
 
-**Status: awaiting the final beacon.** The four contributions below are complete
-and verify. The chain closes with a `zkey beacon` against Bitcoin block 960500,
-after which this directory gains the finalized keys and `SHA256SUMS`. Until then
-the ceremony is not finished and its output is not the production key.
+**Status: finalized and deployed.** The four contributions below are complete and
+verify, and the chain was closed with a `zkey beacon` against Bitcoin block
+960500 (hash
+`00000000000000000000d121b0b62b54a09cda3246ad80b699c1ce9d43a467e4`). The final
+key (`paraloom_final.zkey`, SHA-256
+`5d89e9fb89f4927a2abf0108cc2e67345fb4896d5b5513d82be2044f0e2fe571`) is the
+production key: its verifying key is cut into the deployed program, and a
+wallet-generated proof has settled end to end through the live validator quorum
+against it on devnet.
 
 ## Why this ceremony exists, when two already ran
 
@@ -36,6 +41,11 @@ is not ours to have compromised.
 | `paraloom_final.zkey` | the finalized production proving key (after the beacon) |
 | `verification_key.json` | the finalized verifying key the on-chain program embeds |
 | `SHA256SUMS` | digests of the files above |
+
+`verification_key.json` and `SHA256SUMS` are committed here. The two ~28 MB zkeys
+(`paraloom_0000.zkey`, `paraloom_final.zkey`) are attached to the `v0.6.0` release
+rather than committed, so the repository stays light; the digests in `SHA256SUMS`
+pin them wherever they are fetched from.
 
 The circuit's `transact_v3.r1cs` is not committed — it is an 18 MB build output.
 Regenerate it deterministically and check the digest below:
@@ -79,6 +89,8 @@ ptau above, as long as the phase-1 chain was not wholly compromised either.
   `1c401abb57c9ce531370f3015c3e75c0892e0f32b8b1e94ace0f6682d9695922`
 - `paraloom_0000.zkey` (SHA-256):
   `b44d657cf69dd512391887b393c5d52455f6b566708c3869729ed6b4032d7ebd`
+- `paraloom_final.zkey` (SHA-256):
+  `5d89e9fb89f4927a2abf0108cc2e67345fb4896d5b5513d82be2044f0e2fe571`
 - `transact_v3.r1cs` (SHA-256):
   `c468ebf1d15a82aeb7c00ece6cf714dc742b1660b8b04634b096e548a8fbe6d7`
 
