@@ -8,6 +8,16 @@ exclude = [
 ]
 resolver = "2"
 
+# Panic on arithmetic overflow in release, not silently wrap. The on-chain
+# programs/paraloom crate already sets this; the off-chain node built with a plain
+# `cargo build --release` otherwise used the default profile (overflow-checks off),
+# so a future raw `+`/`-`/`*` that slipped past a checked_/saturating_ call would
+# wrap in production instead of aborting. Defense-in-depth (#731). Tests already
+# run with overflow-checks on (the dev-profile default), so nothing relies on
+# wrapping.
+[profile.release]
+overflow-checks = true
+
 [package]
 name = "paraloom"
 version = "0.6.0"
