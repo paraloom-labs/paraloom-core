@@ -310,7 +310,12 @@ impl SwapSubmitter for RpcSwapSubmitter {
         use solana_sdk::commitment_config::CommitmentConfig;
 
         let rpc_url = self.rpc_url.clone();
-        let ata = crate::bridge::solana::derive_associated_token_address(owner, mint);
+        // Jupiter's swap output tokens are classic SPL Token accounts.
+        let ata = crate::bridge::solana::derive_associated_token_address(
+            owner,
+            mint,
+            &crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
+        );
         tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
             // A missing/unreadable ATA yields None, not an error: the caller then

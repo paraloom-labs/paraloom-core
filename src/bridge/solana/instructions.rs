@@ -16,6 +16,14 @@ use solana_sdk::{
 /// at runtime.
 const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 
+/// Rent sysvar id (`SysvarRent111111111111111111111111111111111`). Defined as a
+/// `const` here so account builders that pass the rent sysvar (e.g. token-account
+/// `init`) need no `solana-sdk` sysvar import at each call site.
+const RENT_SYSVAR_ID: Pubkey = Pubkey::new_from_array([
+    6, 167, 213, 23, 25, 44, 92, 81, 33, 140, 201, 76, 61, 74, 241, 127, 88, 218, 238, 8, 155, 161,
+    253, 68, 227, 219, 217, 138, 0, 0, 0, 0,
+]);
+
 /// Instruction data for deposit (Solana → paraloom L2).
 ///
 /// Layout matches the on-chain Anchor program: the eight-byte
@@ -80,6 +88,11 @@ pub mod discriminators {
     /// `sha256("global:migrate_validator_account")[..8]`. Upgrade-authority-gated
     /// one-time grow of a legacy `ValidatorAccount` PDA to the unbonding layout.
     pub const MIGRATE_VALIDATOR_ACCOUNT: [u8; 8] = [141, 49, 52, 5, 175, 161, 182, 154];
+    /// `sha256("global:init_stake_token_vault")[..8]`. Upgrade-authority-gated
+    /// dual-stake vault migration: creates the shared `stake_token_vault` for a
+    /// registry initialized before the dual-stake fields (its PDA already exists,
+    /// so `initialize_validator_registry` can never run again to create one).
+    pub const INIT_STAKE_TOKEN_VAULT: [u8; 8] = [15, 138, 162, 97, 120, 60, 125, 127];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -119,6 +132,16 @@ pub struct DepositNoteInstructionData {
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
     95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+]);
+
+/// SPL Token-2022 program id (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`).
+/// The on-chain program is token-program-agnostic (`Interface<TokenInterface>`),
+/// so the dual-stake mint may live under either token program; the off-chain
+/// builders must pass whichever program actually owns the token accounts, since
+/// the ATA derivation and the `transfer_checked` CPI both key off it.
+pub const SPL_TOKEN_2022_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218, 182, 26, 252, 77,
+    131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252,
 ]);
 
 /// Associated Token Account program id
@@ -211,6 +234,7 @@ pub fn create_reset_validator_registry_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
     co_signers: &[Pubkey],
+    stake_mint: &Pubkey,
 ) -> Result<Instruction> {
     let (registry_pda, _) = derive_validator_registry(program_id);
     let (program_data_pda, _) = derive_program_data(program_id);
@@ -227,10 +251,17 @@ pub fn create_reset_validator_registry_instruction(
         accounts.push(AccountMeta::new_readonly(validator_pda, false));
     }
 
+    // `reset_validator_registry(stake_mint: Pubkey)` takes the dual-stake mint as
+    // an argument (the pre-migration registry predates the field, so it is
+    // supplied explicitly rather than read from the grown bytes). Anchor arg
+    // encoding is disc(8) || Borsh(Pubkey) == disc(8) || 32 raw mint bytes.
+    let mut data = discriminators::RESET_VALIDATOR_REGISTRY.to_vec();
+    data.extend_from_slice(stake_mint.as_ref());
+
     Ok(Instruction {
         program_id: *program_id,
         accounts,
-        data: discriminators::RESET_VALIDATOR_REGISTRY.to_vec(),
+        data,
     })
 }
 
@@ -276,7 +307,9 @@ pub fn derive_stake_token_vault(program_id: &Pubkey) -> (Pubkey, u8) {
 pub fn create_register_validator_instruction(
     program_id: &Pubkey,
     validator: &Pubkey,
+    stake_mint: &Pubkey,
     validator_token_account: &Pubkey,
+    token_program: &Pubkey,
     stake_amount: u64,
     token_stake_amount: u64,
 ) -> Result<Instruction> {
@@ -288,18 +321,57 @@ pub fn create_register_validator_instruction(
     instruction_data.extend_from_slice(&stake_amount.to_le_bytes());
     instruction_data.extend_from_slice(&token_stake_amount.to_le_bytes());
 
+    // Account order matches the on-chain `RegisterValidator` context exactly:
+    // validator_account, validator_registry, validator, stake_mint,
+    // validator_token_account, stake_token_vault, token_program, system_program.
+    // `stake_mint` and `token_program` are passed by the caller (not hardcoded)
+    // because the dual-stake mint may live under classic SPL Token or Token-2022.
     Ok(Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(validator_pda, false),
             AccountMeta::new(registry_pda, false),
             AccountMeta::new(*validator, true),
+            AccountMeta::new_readonly(*stake_mint, false),
             AccountMeta::new(*validator_token_account, false),
             AccountMeta::new(stake_token_vault, false),
-            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data: instruction_data,
+    })
+}
+
+/// Build an `init_stake_token_vault` instruction — the dual-stake vault migration
+/// for a registry that predates the vault. Upgrade-authority-signed. Account
+/// order matches the on-chain `InitStakeTokenVault` context: authority,
+/// stake_mint, stake_token_vault, stake_vault_authority, program_data,
+/// token_program, system_program, rent. `token_program` must be the program that
+/// owns `stake_mint` (classic SPL Token or Token-2022).
+pub fn create_init_stake_token_vault_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    stake_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<Instruction> {
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
+    let (stake_vault_authority, _) =
+        Pubkey::find_program_address(&[b"stake_vault_authority"], program_id);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(*stake_mint, false),
+            AccountMeta::new(stake_token_vault, false),
+            AccountMeta::new_readonly(stake_vault_authority, false),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
+        ],
+        data: discriminators::INIT_STAKE_TOKEN_VAULT.to_vec(),
     })
 }
 
@@ -678,9 +750,16 @@ pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
 /// mirroring `spl_associated_token_account::get_associated_token_address`
 /// without the dependency: it is the PDA of
 /// `[owner, SPL_TOKEN_PROGRAM_ID, mint]` under the ATA program.
-pub fn derive_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub fn derive_associated_token_address(
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Pubkey {
+    // The ATA seeds include the token program that owns the mint, so a Token-2022
+    // mint resolves to a different ATA than a classic-SPL mint. Callers must pass
+    // whichever program owns `mint`, or they derive an address no account lives at.
     Pubkey::find_program_address(
-        &[owner.as_ref(), SPL_TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
         &SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
     )
     .0
@@ -725,13 +804,19 @@ mod tests {
     fn test_associated_token_address_is_deterministic() {
         let owner = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let a = derive_associated_token_address(&owner, &mint);
-        let b = derive_associated_token_address(&owner, &mint);
+        let a = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_PROGRAM_ID);
+        let b = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_PROGRAM_ID);
         assert_eq!(a, b);
         // Different owners yield different ATAs.
         assert_ne!(
             a,
-            derive_associated_token_address(&Pubkey::new_unique(), &mint)
+            derive_associated_token_address(&Pubkey::new_unique(), &mint, &SPL_TOKEN_PROGRAM_ID)
+        );
+        // The token program is part of the ATA seeds: the same owner+mint under
+        // Token-2022 resolves to a different address than under classic SPL.
+        assert_ne!(
+            a,
+            derive_associated_token_address(&owner, &mint, &SPL_TOKEN_2022_PROGRAM_ID)
         );
     }
 
