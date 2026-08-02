@@ -4,7 +4,8 @@
 //! the on-chain validator set into agreement with the new program WITHOUT
 //! bricking it, in the load-bearing order the mainnet de-risk audit requires:
 //!
-//!   1. **Migrate** EVERY `ValidatorAccount` PDA 113 -> 129 bytes. Every
+//!   1. **Migrate** EVERY `ValidatorAccount` PDA up to 145 bytes (8 + INIT_SPACE
+//!      after dual-stake; live PDAs are 129, pre-dual-stake). Every
 //!      validator-touching instruction typed-loads `ValidatorAccount` and aborts
 //!      on the old 113-byte layout, so this MUST run before anything else. The
 //!      on-chain `migrate_validator_account` also tops up the incremental rent
@@ -45,7 +46,7 @@ use std::str::FromStr;
 
 /// `getProgramAccounts` config for enumerating `ValidatorAccount` PDAs.
 ///
-/// MUST request Base64: after migration every PDA is 129 bytes and the RPC
+/// MUST request Base64: after migration every PDA is 145 bytes and the RPC
 /// rejects base58 encoding above 128 bytes (`-32600 "Encoded binary (base 58)
 /// data should be less than 128 bytes"`). The default (base58) works today at
 /// 113 bytes but breaks the post-migrate verify and any idempotent re-run.
@@ -67,7 +68,14 @@ fn validator_accounts_config() -> RpcProgramAccountsConfig {
 const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
 /// Current on-chain `ValidatorAccount` size = 8 (disc) + INIT_SPACE (121) after
 /// the #375 unbonding fields. Anything smaller (113 = pre-#375) needs migration.
-const NEW_LEN: usize = 129;
+// 8 (disc) + ValidatorAccount::INIT_SPACE. INIT_SPACE is now 137 after
+// dual-stake added token_stake_amount + token_unbonding_amount (2 x u64 = +16)
+// on top of the post-#375 unbonding fields, so the target is 145, not the 129
+// this tool was first written for. The live PDAs are 129 (pre-dual-stake), so
+// the migrate filter (data_len < NEW_LEN) must use 145 or it would treat every
+// 129-byte PDA as already-migrated and skip it, then deactivate/reset would
+// abort typed-loading a 129-byte account against the 145-byte layout.
+const NEW_LEN: usize = 145;
 
 struct ValidatorRow {
     wallet: Pubkey,
@@ -150,6 +158,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // require it explicitly and refuse to run unless it is in the keep-set.
     let settler = Pubkey::from_str(&std::env::var("RECONCILE_SETTLER").map_err(|_| {
         "RECONCILE_SETTLER is required (the settlement authority's validator wallet, e.g. Hky4Zx2…) — it must never be deactivated"
+    })?)?;
+
+    // The dual-stake mint the reset re-pins into the registry. `reset` grows the
+    // pre-dual-stake registry to the current layout, and its `stake_mint` field
+    // predates that layout, so it must be supplied explicitly. Getting this wrong
+    // pins the wrong mint and every future dual-stake `register_validator` fails.
+    let stake_mint = Pubkey::from_str(&std::env::var("RECONCILE_STAKE_MINT").map_err(|_| {
+        "RECONCILE_STAKE_MINT is required (the dual-stake token mint to pin into the registry, e.g. the mock PARALOOM mint)"
     })?)?;
 
     if keep.is_empty() {
@@ -285,6 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &program_id,
             &authority.pubkey(),
             &keep_wallets,
+            &stake_mint,
         )?,
     )?;
 

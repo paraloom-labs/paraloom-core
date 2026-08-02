@@ -102,6 +102,18 @@ path = "src/bin/register_validator.rs"
 name = "reconcile-validators"
 path = "src/bin/reconcile_validators.rs"
 
+[[bin]]
+name = "init-stake-token-vault"
+path = "src/bin/init_stake_token_vault.rs"
+
+[[bin]]
+name = "migrate-bridge-state"
+path = "src/bin/migrate_bridge_state.rs"
+
+[[bin]]
+name = "set-bridge-authority"
+path = "src/bin/set_bridge_authority.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "solana-account-decoder", "borsh", "bs58"]

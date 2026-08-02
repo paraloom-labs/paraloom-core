@@ -1001,6 +1001,93 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Create the shared dual-stake token vault for a registry that predates the
+    /// dual-stake fields.
+    ///
+    /// `initialize_validator_registry` creates `stake_token_vault` inline, but a
+    /// registry initialized by the pre-dual-stake program has no vault and its
+    /// PDA already exists, so `initialize_validator_registry` can never run again
+    /// to create one. Without the vault, `register_validator` cannot lock the
+    /// token half and every dual-stake registration fails. This is the migration
+    /// counterpart, gated to the upgrade authority like the other `initialize_*`:
+    /// it creates the vault once, under the same `stake_vault_authority` PDA and
+    /// `stake_token_vault` seeds `register_validator`/`slash`/`withdraw` expect.
+    ///
+    /// `stake_mint` must be the same mint `reset_validator_registry` pins into the
+    /// registry — `register_validator` transfers the token half into this vault
+    /// with `transfer_checked`, which requires the vault, the validator's token
+    /// account, and the registry's pinned mint to all agree.
+    pub fn init_stake_token_vault(ctx: Context<InitStakeTokenVault>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        msg!(
+            "Stake token vault initialized (mint {})",
+            ctx.accounts.stake_mint.key()
+        );
+        Ok(())
+    }
+
+    /// Grow a `BridgeState` account created before the `deposit_cap` field to the
+    /// current layout.
+    ///
+    /// The TVL cap (#642) appended `deposit_cap` to `BridgeState`, but a bridge
+    /// initialized by an earlier program has the shorter account, and Anchor
+    /// `Account<BridgeState>` deserialization now needs the full length — so
+    /// after this redeploy every `transact`/`deposit_note`/`pause`/
+    /// `set_deposit_cap` (all of which deserialize `BridgeState`) aborts
+    /// `AccountDidNotDeserialize` until the account is grown. `set_deposit_cap`
+    /// itself can't do the grow (it takes `Account<BridgeState>`, which fails to
+    /// deserialize the short account first), so this is a dedicated
+    /// upgrade-authority-gated migration, mirroring `reset_validator_registry`.
+    ///
+    /// The extra bytes are zero-filled, so `deposit_cap` starts at 0 — the
+    /// closed, safe default (every deposit refused) that `initialize` also uses.
+    /// Open it deliberately afterward with `set_deposit_cap`.
+    pub fn migrate_bridge_state(ctx: Context<MigrateBridgeState>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let bridge_ai = ctx.accounts.bridge_state.to_account_info();
+
+        // Confirm the pinned PDA really is a BridgeState before reshaping it.
+        {
+            let data = bridge_ai.try_borrow_data()?;
+            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(
+                data[0..8] == *BridgeState::DISCRIMINATOR,
+                BridgeError::UnauthorizedInit
+            );
+        }
+
+        let new_len = 8 + BridgeState::INIT_SPACE;
+        if bridge_ai.data_len() < new_len {
+            let rent = Rent::get()?;
+            let min_balance = rent.minimum_balance(new_len);
+            let current = bridge_ai.lamports();
+            if min_balance > current {
+                let delta = min_balance - current;
+                let ix = anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &bridge_ai.key(),
+                    delta,
+                );
+                anchor_lang::solana_program::program::invoke(
+                    &ix,
+                    &[
+                        ctx.accounts.authority.to_account_info(),
+                        bridge_ai.clone(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                )?;
+            }
+            bridge_ai.resize(new_len)?;
+        }
+
+        msg!(
+            "BridgeState migrated to {} bytes (deposit_cap starts 0)",
+            new_len
+        );
+        Ok(())
+    }
+
     /// Initialize the on-chain commitment Merkle tree (circuit v3, #350).
     ///
     /// Creates the program-owned tree account and seeds it with the empty-tree
@@ -1618,6 +1705,82 @@ pub struct InitializeValidatorRegistry<'info> {
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`init_stake_token_vault`] — the dual-stake vault migration for a
+/// registry that predates the vault. Mirrors the vault-creation half of
+/// [`InitializeValidatorRegistry`] (same seeds, same authority PDA, same
+/// interface token program) but takes no `validator_registry`, so it runs
+/// against a registry whose PDA already exists.
+#[derive(Accounts)]
+pub struct InitStakeTokenVault<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The dual-stake mint the vault holds. Must match the mint
+    /// `reset_validator_registry` pins into the registry.
+    pub stake_mint: InterfaceAccount<'info, Mint>,
+
+    /// Shared vault holding every validator's locked token stake, owned by the
+    /// `stake_vault_authority` PDA. Same seeds `register_validator` derives.
+    #[account(
+        init,
+        payer = authority,
+        seeds = [b"stake_token_vault"],
+        bump,
+        token::mint = stake_mint,
+        token::authority = stake_vault_authority,
+        token::token_program = token_program,
+    )]
+    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
+
+    /// PDA that owns `stake_token_vault`; signs token outflows on withdraw/slash.
+    ///
+    /// CHECK: address pinned by seeds; used only as the vault's token authority.
+    #[account(seeds = [b"stake_vault_authority"], bump)]
+    pub stake_vault_authority: UncheckedAccount<'info>,
+
+    /// Upgrade-authority gate (#204), same as the other `initialize_*`.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`migrate_bridge_state`] — grow a pre-`deposit_cap` BridgeState.
+/// Uses `UncheckedAccount` (not `Account<BridgeState>`) because the whole point
+/// is that the short account no longer deserializes; the handler checks the
+/// discriminator by hand before resizing, like `reset_validator_registry`.
+#[derive(Accounts)]
+pub struct MigrateBridgeState<'info> {
+    /// CHECK: discriminator-checked and resized in the handler; cannot be
+    /// `Account<BridgeState>` because the pre-migration account is too short to
+    /// deserialize.
+    #[account(mut, seeds = [b"bridge_state"], bump)]
+    pub bridge_state: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204), same as the other migrations.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]

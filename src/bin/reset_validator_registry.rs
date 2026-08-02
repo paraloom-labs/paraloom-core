@@ -33,6 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program_id = Pubkey::from_str(&std::env::var("SOLANA_PROGRAM_ID")?)?;
     let authority_keypair_path = std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?;
     let co_signers_raw = std::env::var("RESET_CO_SIGNERS")?;
+    // The dual-stake mint re-pinned into the registry on reset (predates the grown
+    // layout, so supplied explicitly). Wrong value bricks dual-stake registration.
+    let stake_mint = Pubkey::from_str(&std::env::var("RESET_STAKE_MINT").map_err(|_| {
+        "RESET_STAKE_MINT is required (the dual-stake token mint to pin into the registry)"
+    })?)?;
 
     let co_signers: Vec<Pubkey> = co_signers_raw
         .split(',')
@@ -66,8 +71,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    let ix =
-        create_reset_validator_registry_instruction(&program_id, &authority.pubkey(), &co_signers)?;
+    let ix = create_reset_validator_registry_instruction(
+        &program_id,
+        &authority.pubkey(),
+        &co_signers,
+        &stake_mint,
+    )?;
     let blockhash = client.get_latest_blockhash()?;
     let tx = Transaction::new_signed_with_payer(
         &[ix],

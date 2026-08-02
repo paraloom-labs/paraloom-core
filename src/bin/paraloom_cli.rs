@@ -1434,15 +1434,28 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                         .try_into()
                         .expect("8-byte min_token_stake slice"),
                 );
-                let validator_token =
-                    derive_associated_token_address(&validator.pubkey(), &stake_mint);
+                // The dual-stake mint may live under classic SPL Token or
+                // Token-2022; the ATA derivation and the on-chain
+                // `transfer_checked` both key off whichever program owns the
+                // mint, so read it rather than assume classic SPL.
+                let token_program = client
+                    .get_account(&stake_mint)
+                    .context("Failed to read stake mint account")?
+                    .owner;
+                let validator_token = derive_associated_token_address(
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
 
                 // Stake exactly the registry's current token floor (0 while the
                 // token gate is still closed).
                 let ix = create_register_validator_instruction(
                     &program_id,
                     &validator.pubkey(),
+                    &stake_mint,
                     &validator_token,
+                    &token_program,
                     STAKE_LAMPORTS,
                     min_token_stake,
                 )
