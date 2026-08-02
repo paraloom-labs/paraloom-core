@@ -55,19 +55,18 @@ Paraloom is a **privacy-focused Layer 2 on Solana**: SOL bridges into a shielded
 | Coordinator HA | ✅ Working | Active/passive failover with RTO scenario test under 30s |
 | MPC trusted setup tooling | ✅ Working | BGM17 contribution + verifier, transcript chain, contributor / verifier / finalize CLIs |
 | Private compute (WASM) | 🚧 Alpha | Engine + ownership proof in place; output-note plumbing pending; out of Stage 1 bounty scope |
-| MPC ceremony execution | 🟡 In progress | Four contributions closed on the unified transact circuit, built on the public Perpetual Powers of Tau; waiting on the closing beacon (#659) |
-| Mainnet launch | 🟡 Pre-release | Devnet on `8gPsR…TWrP`; awaiting the ceremony beacon, the key cutover redeploy, and a wallet republish |
+| MPC ceremony execution | ✅ Done | Four independent contributions plus a Bitcoin-block beacon on the unified transact circuit, built on the public Perpetual Powers of Tau. The final key is cut into the deployed program; transcript and keys in `ceremony/transact/` (#659) |
+| Mainnet launch | 🟡 Pre-release | Devnet on `8gPsR…TWrP`; the ceremony key cutover is deployed and a dual-stake validator quorum settles end to end. The matching wallet is in Chrome Web Store review. Remaining mainnet gates below |
 
 ### Known limitations (devnet, pre-mainnet)
 
 Honest scope for the current devnet milestone. These are tracked and gate mainnet, not the devnet release; none affect fund safety on devnet.
 
 - **The quorum is not yet Sybil-resistant.** Settlement needs a stake-weighted supermajority to co-sign, and the proof is verified on-chain, so no single signature moves funds. But validator registration is permissionless and one key is both the program upgrade authority and the registry admin, with no multisig or timelock — so that key remains the trust anchor, with the quorum as defence in depth. A Sybil-resistant quorum and multisig with timelock are mainnet gates.
-- **The keys in use today are still single-party dev keys.** The multi-party ceremony for the live circuit is running now: four contributions are closed and published, and the chain is waiting on its beacon before the keys are finalized (#659). Two earlier rounds were run against the v2 circuits, and honestly they did not deliver what a ceremony is for — they built on an initial key generated on one machine, and phase 2 re-randomises only `δ`, leaving everything derived from the phase-1 trapdoor intact. `src/ceremony/phase1_trapdoor.rs` demonstrates that rather than asserting it. The current chain starts from the public Perpetual Powers of Tau, which is what makes "one honest contributor is enough" checkable instead of a claim.
 - **Note delivery is L2-served and in-memory.** Encrypted output notes are served from a node's `/transact/scan` endpoint — held in memory, not persisted across a restart, and the ingress is off by default and meant for a loopback or management interface. Recipients poll it and trial-decrypt client-side, so the node learns nothing about which notes are whose.
 - **Pool convergence is partial.** The settling node appends a spend's output commitments to its shielded pool; recipients depend on that node or the on-chain tree to spend them.
 
-These are the work between a pre-mainnet milestone and a mainnet launch, which also awaits an external security audit.
+These are the work between a pre-mainnet milestone and a mainnet launch. The review model is a public bug bounty (see [`docs/bug-bounty.md`](docs/bug-bounty.md)), where any test-proven finding is paid.
 
 ## Economic Model
 

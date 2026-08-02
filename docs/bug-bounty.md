@@ -68,11 +68,13 @@ offline, so don't depend on it for reproduction.
 
 These are already known and documented; reports of them are **not eligible**.
 
-1. **Trusted-setup toxic waste.** `transact` currently verifies against a
-   pre-ceremony (single-party dev) Groth16 verifying key; the production MPC
-   trusted-setup ceremony is a pre-mainnet gate. Assume an **honest setup** —
-   a forgery that requires the setup secret is known and out of scope; a forgery
-   that does **not** (a real circuit under-constraint) is in scope and Critical.
+1. **Trusted-setup toxic waste.** `transact` now verifies against the
+   multi-party ceremony Groth16 key (four independent contributions plus a
+   Bitcoin-block beacon on the public Perpetual Powers of Tau; transcript and
+   keys published under `ceremony/transact/`). Assume an **honest setup**, which
+   holds as long as any one contributor discarded their secret: a forgery that
+   requires the setup secret is out of scope; a forgery that does **not** (a real
+   circuit under-constraint) is in scope and Critical.
 2. **Single upgrade/registry authority key.** One key is both the program
    upgrade authority and the registry admin (slash/deactivate/reset/etc.); no
    multisig/timelock yet. Attacks that assume this key is compromised or misused
