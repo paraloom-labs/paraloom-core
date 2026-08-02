@@ -397,10 +397,40 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     return Ok(());
                 }
 
+                // Authenticate the requester before any expensive work (#726).
+                // Groth16 verification is the most expensive handler in the node;
+                // run with no gate, any mesh peer could flood un-cached proof
+                // verifications. Only a peer in the active validator set may drive
+                // a verification round, mirroring `handle_cosign_request`; the
+                // libp2p `source` is cryptographically authenticated by the
+                // connection, and a node with no transact coordinator is not a
+                // settling validator and drops outright.
+                let is_validator = match &self.transact_coordinator {
+                    Some(coordinator) => coordinator.is_registered_validator(&source).await,
+                    None => false,
+                };
+                if !is_validator {
+                    log::warn!(
+                        "dropping transact verification request from non-validator peer {source:?}"
+                    );
+                    return Ok(());
+                }
+
                 info!(
                     "Received transact verification request: {}",
                     request.request_id
                 );
+
+                // Short-circuit a request we have already verified `Valid` rather
+                // than re-running the proof (#726). `verified_transacts` only holds
+                // `Valid` results, so a cache hit is a proven-valid repeat; reusing
+                // it stops a valid transact re-broadcast from re-triggering the
+                // full Groth16 verification on every honest validator.
+                let already_verified = self
+                    .verified_transacts
+                    .lock()
+                    .await
+                    .contains_key(&request.request_id);
 
                 // Verify the transact zkSNARK proof, mirroring the transfer
                 // path (#350). Unlike a transfer, the v3 proof binds
@@ -408,7 +438,13 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // carried in the request), so verification needs no pool
                 // state; the pool gate below only keeps non-bridge nodes from
                 // voting on settlements they do not participate in.
-                let vote = if self.shielded_pool.is_some() {
+                let vote = if already_verified {
+                    info!(
+                        "Transact {} already verified Valid; reusing cached result",
+                        request.request_id
+                    );
+                    crate::consensus::vote_tally::VerificationVote::Valid
+                } else if self.shielded_pool.is_some() {
                     match self.verify_transact_proof(&request).await {
                         Ok(true) => {
                             info!(
