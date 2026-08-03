@@ -237,6 +237,14 @@ impl TransactVerificationCoordinator {
         self
     }
 
+    /// Back the reputation tracker with a file so accumulated scores survive a
+    /// node restart (#691), instead of resetting every validator to the base and
+    /// re-admitting a previously-penalised one at full weight.
+    pub fn with_reputation_persistence(mut self, path: std::path::PathBuf) -> Self {
+        self.reputation_tracker = Arc::new(ReputationTracker::with_persistence(path));
+        self
+    }
+
     /// Whether the `Valid`-voting co-signers hold enough stake for the on-chain
     /// stake-weighted quorum to accept the settlement this node would submit
     /// (#611). The off-chain consensus is otherwise a head count, which under a

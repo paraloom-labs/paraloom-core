@@ -1312,6 +1312,11 @@ impl Node {
             // the off-chain quorum can mirror the on-chain stake-weighted check
             // and exclude it exactly as the program does (#611).
             coord = coord.with_local_node_id(node_id.clone());
+            // Persist reputation so a restart does not reset every validator to
+            // the base and silently re-admit a previously-penalised one (#691).
+            coord = coord.with_reputation_persistence(
+                format!("{}/reputation.json", settings.storage.data_dir).into(),
+            );
             // Optional config override of the BFT consensus defaults (7/10/rep200).
             // Unset on mainnet → the secure defaults stand; devnet lowers them in
             // validator.toml to settle with a small live cohort (2/2), otherwise
