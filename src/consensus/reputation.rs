@@ -8,7 +8,9 @@
 
 use crate::types::NodeId;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -40,7 +42,7 @@ pub const REPUTATION_DECAY_PER_DAY: u64 = 10; // 0.1% per day
 const SECONDS_PER_DAY: u64 = 86400;
 
 /// Validator performance metrics
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorMetrics {
     /// Node ID
     pub node_id: NodeId,
@@ -133,13 +135,65 @@ impl ValidatorMetrics {
 pub struct ReputationTracker {
     /// Validator metrics (node_id -> metrics)
     metrics: Arc<RwLock<HashMap<NodeId, ValidatorMetrics>>>,
+    /// When set, reputation is written here after every mutation and loaded from
+    /// it at construction, so accumulated scores survive a node restart (#691).
+    /// Without it, a restart resets every validator to `BASE_REPUTATION`, which
+    /// silently re-admits a previously-penalised validator at full weight — the
+    /// reputation-gated-voting defence degrading to a no-op on every restart.
+    persist_path: Option<PathBuf>,
 }
 
 impl ReputationTracker {
-    /// Create new reputation tracker
+    /// Create a new, in-memory-only reputation tracker (no persistence).
     pub fn new() -> Self {
         Self {
             metrics: Arc::new(RwLock::new(HashMap::new())),
+            persist_path: None,
+        }
+    }
+
+    /// Create a tracker backed by `path`: load any prior snapshot at
+    /// construction and rewrite it after every mutation (#691). A missing or
+    /// unreadable file starts empty rather than failing — reputation is
+    /// defence-in-depth, so a lost snapshot must not stop the node from starting.
+    pub fn with_persistence(path: PathBuf) -> Self {
+        let metrics = Self::load_snapshot(&path).unwrap_or_default();
+        if !metrics.is_empty() {
+            log::info!(
+                "Loaded reputation for {} validators from {}",
+                metrics.len(),
+                path.display()
+            );
+        }
+        Self {
+            metrics: Arc::new(RwLock::new(metrics)),
+            persist_path: Some(path),
+        }
+    }
+
+    fn load_snapshot(path: &Path) -> Option<HashMap<NodeId, ValidatorMetrics>> {
+        let bytes = std::fs::read(path).ok()?;
+        let list: Vec<ValidatorMetrics> = serde_json::from_slice(&bytes).ok()?;
+        Some(list.into_iter().map(|m| (m.node_id.clone(), m)).collect())
+    }
+
+    /// Write the current metrics to `persist_path` (best-effort). Called while
+    /// the caller holds the metrics write lock so the snapshot is consistent.
+    /// The map is small (one entry per validator) and writes are event-driven,
+    /// so a synchronous write is cheap; a failure is logged, not propagated,
+    /// because losing a snapshot must never abort a verification.
+    fn persist_locked(&self, metrics: &HashMap<NodeId, ValidatorMetrics>) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let list: Vec<&ValidatorMetrics> = metrics.values().collect();
+        match serde_json::to_vec(&list) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, &bytes) {
+                    log::warn!("failed to persist reputation to {}: {e}", path.display());
+                }
+            }
+            Err(e) => log::warn!("failed to serialize reputation snapshot: {e}"),
         }
     }
 
@@ -155,12 +209,14 @@ impl ReputationTracker {
             );
             validator_metrics
         });
+        self.persist_locked(&metrics);
     }
 
     /// Unregister a validator
     pub async fn unregister_validator(&self, node_id: &NodeId) {
         let mut metrics = self.metrics.write().await;
         metrics.remove(node_id);
+        self.persist_locked(&metrics);
         log::info!(
             "Unregistered validator from reputation tracking: {:?}",
             node_id
@@ -192,7 +248,9 @@ impl ReputationTracker {
             validator.success_rate() * 100.0
         );
 
-        Ok(validator.reputation)
+        let reputation = validator.reputation;
+        self.persist_locked(&metrics);
+        Ok(reputation)
     }
 
     /// Record failed verification (disagreed with consensus)
@@ -221,7 +279,9 @@ impl ReputationTracker {
             validator.success_rate() * 100.0
         );
 
-        Ok(validator.reputation)
+        let reputation = validator.reputation;
+        self.persist_locked(&metrics);
+        Ok(reputation)
     }
 
     /// Record timeout (validator didn't respond)
@@ -248,7 +308,9 @@ impl ReputationTracker {
             validator.reputation
         );
 
-        Ok(validator.reputation)
+        let reputation = validator.reputation;
+        self.persist_locked(&metrics);
+        Ok(reputation)
     }
 
     /// Apply decay to all validators based on inactivity
@@ -317,6 +379,36 @@ impl Default for ReputationTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reputation_survives_a_restart() {
+        // #691: a penalised validator's reputation must persist across a node
+        // restart, or the reputation-gated-voting defence resets to a no-op and
+        // silently re-admits the validator at full weight on every restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation.json");
+        let node = NodeId(vec![1, 2, 3]);
+
+        let penalised = {
+            let tracker = ReputationTracker::with_persistence(path.clone());
+            tracker.register_validator(node.clone()).await;
+            tracker.record_failure(&node).await.unwrap()
+        };
+        assert!(
+            penalised < BASE_REPUTATION,
+            "a failure must drop reputation"
+        );
+
+        // A fresh tracker (the restart) loading the same file sees the penalised
+        // score, not BASE_REPUTATION. Without persistence it would be empty and
+        // this returns None.
+        let reloaded = ReputationTracker::with_persistence(path);
+        assert_eq!(
+            reloaded.get_reputation(&node).await,
+            Some(penalised),
+            "penalised reputation must survive a restart (#691)"
+        );
+    }
 
     #[test]
     fn test_validator_metrics_creation() {
