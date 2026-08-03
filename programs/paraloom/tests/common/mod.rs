@@ -284,7 +284,8 @@ pub fn slash_validator_ix(
     let (vault, vault_authority) = stake_vault_pdas(program_id);
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.as_ref()], &program_id);
-    let (bridge_vault, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (slashed_funds_vault, _) =
+        Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
     Instruction {
         program_id,
         data: paraloom_program::instruction::SlashValidator {
@@ -294,7 +295,7 @@ pub fn slash_validator_ix(
         .data(),
         accounts: paraloom_program::accounts::SlashValidator {
             validator_account: validator_pda,
-            bridge_vault,
+            slashed_funds_vault,
             validator_registry: registry,
             stake_mint,
             stake_token_vault: vault,

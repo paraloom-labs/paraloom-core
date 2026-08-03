@@ -52,7 +52,8 @@ async fn register_locks_both_stakes_and_slash_burns_the_token() {
     let (vault, vault_authority) = stake_vault_pdas(program_id);
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
-    let (bridge_vault, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (slashed_funds_vault, _) =
+        Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
 
     // 1. Initialize the registry — pins `stake_mint` and creates the vault.
     let init_registry = Instruction {
@@ -127,7 +128,7 @@ async fn register_locks_both_stakes_and_slash_burns_the_token() {
         .data(),
         accounts: accounts::SlashValidator {
             validator_account: validator_pda,
-            bridge_vault,
+            slashed_funds_vault,
             validator_registry: registry_pda,
             stake_mint,
             stake_token_vault: vault,

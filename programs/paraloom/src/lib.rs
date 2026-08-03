@@ -923,13 +923,17 @@ pub mod paraloom_program {
                 .saturating_sub(token_slash);
         }
 
-        // Move the slashed SOL to the bridge vault.
+        // Move the slashed SOL to the dead-end slashed-funds vault, NOT the
+        // bridge vault (#728): the deposit cap is measured against the bridge
+        // vault's live balance, so routing forfeited SOL there would permanently
+        // eat deposit headroom with no way back out. The slashed token half is
+        // burned just below; this is the SOL parallel to that.
         **validator_account
             .to_account_info()
             .try_borrow_mut_lamports()? -= slash_amount;
         **ctx
             .accounts
-            .bridge_vault
+            .slashed_funds_vault
             .to_account_info()
             .try_borrow_mut_lamports()? += slash_amount;
 
@@ -2022,12 +2026,18 @@ pub struct SlashValidator<'info> {
     )]
     pub validator_account: Account<'info, ValidatorAccount>,
 
-    #[account(
-        mut,
-        seeds = [b"bridge_vault"],
-        bump
-    )]
-    pub bridge_vault: SystemAccount<'info>,
+    /// Dead-end vault for slashed SOL, kept OUT of `bridge_vault` so it never
+    /// counts against the deposit cap (#728). The cap is measured against the
+    /// live `bridge_vault` balance, and slashed SOL routed there would sit
+    /// forever with no withdrawal path, permanently eroding the deposit headroom
+    /// meant for real user liabilities. Slashed SOL is forfeited by design (the
+    /// token half is burned), so this is a holding PDA parallel to that burn; a
+    /// later governed sweep to a treasury can spend it without ever touching the
+    /// deposit/withdrawal-critical `bridge_vault`.
+    ///
+    /// CHECK: lamport sink pinned by seeds; only credited here.
+    #[account(mut, seeds = [b"slashed_funds_vault"], bump)]
+    pub slashed_funds_vault: UncheckedAccount<'info>,
 
     #[account(
         mut,
