@@ -4,7 +4,7 @@
 //! reduces a misbehaving validator's stake. Pins three contracts
 //! the consensus pipeline relies on: stake_amount drops by the
 //! percentage, times_slashed increments, slashed lamports land in
-//! bridge_vault.
+//! the slashed-funds vault (#728).
 //!
 //! Registry init and `slash_validator` run as the upgrade authority
 //! (#204 + `has_one = authority`); register stays validator-signed.
@@ -66,7 +66,9 @@ async fn slash_reduces_stake_and_credits_vault() {
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
-    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    // #728: slashed SOL now lands in the dead-end slashed-funds vault, not the
+    // deposit-cap-measured bridge vault.
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
 
     send(
         &mut banks_client,
@@ -143,7 +145,7 @@ async fn slash_reduces_stake_and_credits_vault() {
         .get_account(vault_pda)
         .await
         .unwrap()
-        .expect("bridge_vault must exist after slash");
+        .expect("slashed_funds_vault must exist after slash");
     assert_eq!(vault.lamports, MIN_VALIDATOR_STAKE / 2);
 }
 
@@ -159,7 +161,9 @@ async fn slash_above_minimum_keeps_validator_active() {
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
-    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    // #728: slashed SOL now lands in the dead-end slashed-funds vault, not the
+    // deposit-cap-measured bridge vault.
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
 
     send(
         &mut banks_client,
@@ -250,7 +254,9 @@ async fn slash_inactive_validator_burns_unbonding() {
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
-    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    // #728: slashed SOL now lands in the dead-end slashed-funds vault, not the
+    // deposit-cap-measured bridge vault.
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
 
     send(
         &mut banks_client,
@@ -343,7 +349,7 @@ async fn slash_inactive_validator_burns_unbonding() {
         .get_account(vault_pda)
         .await
         .unwrap()
-        .expect("bridge_vault must exist after the slash");
+        .expect("slashed_funds_vault must exist after the slash");
     assert_eq!(
         vault.lamports, MIN_VALIDATOR_STAKE,
         "the slashed unbonding stake must land in the bridge vault"
@@ -399,7 +405,9 @@ async fn slash_rent_only_ghost_does_not_underflow() {
     let (validator_pda, _) =
         Pubkey::find_program_address(&[b"validator", ghost_wallet.as_ref()], &program_id);
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
-    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    // #728: slashed SOL now lands in the dead-end slashed-funds vault, not the
+    // deposit-cap-measured bridge vault.
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
 
     // Seed a raw current-layout (129-byte) ghost: correct discriminator,
     // is_active = false, a PHANTOM stake_amount = MIN, unbonding_amount = 0, and
