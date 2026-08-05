@@ -69,18 +69,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            mold \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
+          sudo apt-get install -y mold
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -120,18 +109,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            mold \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
+          sudo apt-get install -y mold
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -181,18 +159,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            mold \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
+          sudo apt-get install -y mold
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -228,18 +195,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            mold \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
+          sudo apt-get install -y mold
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -278,18 +234,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            mold \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
+          sudo apt-get install -y mold
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -347,18 +292,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            mold \
-            protobuf-compiler \
-            clang \
-            libclang-dev \
-            cmake \
-            libsnappy-dev \
-            liblz4-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            libbz2-dev
+          sudo apt-get install -y mold
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
