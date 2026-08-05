@@ -85,9 +85,28 @@ impl CoSignPayload {
 
     /// Deserialize a payload received in a `CoSignRequest`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes).map_err(|e| BridgeError::Serialization(e.to_string()))
+        let payload: Self =
+            bincode::deserialize(bytes).map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        // A BN254 Groth16 proof in alt_bn128 wire form is exactly 256 bytes.
+        // Reject an oversized `proof` field so a co-sign request cannot carry
+        // megabytes of padding to every co-signer (#757); the on-chain
+        // `MAX_PROOF_LEN` only binds at submission, after each node has already
+        // decoded the payload.
+        let SettlementParams::Transact { proof, .. } = &payload.params;
+        if proof.len() > MAX_PROOF_BYTES {
+            return Err(BridgeError::Serialization(format!(
+                "co-sign proof field is {} bytes, exceeds {MAX_PROOF_BYTES}",
+                proof.len()
+            )));
+        }
+        Ok(payload)
     }
 }
+
+/// The exact byte length of a BN254 Groth16 proof in alt_bn128 wire form (two G1
+/// points + one G2 point). The `proof` field of a decoded co-sign payload must
+/// not exceed this (#757).
+pub const MAX_PROOF_BYTES: usize = 256;
 
 /// Upper bound on co-signers in a single settlement transaction.
 ///

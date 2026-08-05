@@ -1979,7 +1979,7 @@ impl Node {
         // twins do the same. Without it a 2-node cohort only ever collects the
         // remote vote and never reaches the quorum. Still one vote toward the
         // BFT threshold, not a bypass of it.
-        {
+        let locally_valid = {
             let self_id = self.node_info.id.clone();
             let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
             coordinator
@@ -2021,6 +2021,8 @@ impl Node {
                     reason: format!("self-verify error: {e}"),
                 },
             };
+            let locally_valid =
+                matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid);
             let result = crate::consensus::TransactVerificationResult {
                 request_id: request_id.clone(),
                 validator: self_id,
@@ -2033,14 +2035,23 @@ impl Node {
             if let Err(e) = coordinator.submit_result(result).await {
                 log::debug!("self-vote submit_result dropped for {request_id}: {e}");
             }
-        }
+            locally_valid
+        };
 
-        self.network
-            .send_message(
-                NodeId(vec![]),
-                Message::TransactVerificationRequest { request },
-            )
-            .await?;
+        // Only broadcast a proof we ourselves verified as Valid. An invalid
+        // submission to the ingress is already recorded as a local Invalid vote
+        // and can never reach quorum, so broadcasting it would only let a flood
+        // of bad proofs make every mesh validator run a Groth16 verification
+        // (#755). A valid proof broadcasts exactly as before, so settlement is
+        // unaffected; only the amplification of invalid work is removed.
+        if locally_valid {
+            self.network
+                .send_message(
+                    NodeId(vec![]),
+                    Message::TransactVerificationRequest { request },
+                )
+                .await?;
+        }
         info!("initiated transact verification: {}", request_id);
         Ok(request_id)
     }
