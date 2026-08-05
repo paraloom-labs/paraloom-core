@@ -240,6 +240,10 @@ pub fn create_reset_validator_registry_instruction(
     authority: &Pubkey,
     co_signers: &[Pubkey],
     stake_mint: &Pubkey,
+    // The active-validator count the caller asserts it is resetting to; the
+    // on-chain guard fails the reset if the rebuilt count differs (#739/#741).
+    // Source it independently of `co_signers` for the check to mean anything.
+    expected_active_validators: u64,
 ) -> Result<Instruction> {
     let (registry_pda, _) = derive_validator_registry(program_id);
     let (program_data_pda, _) = derive_program_data(program_id);
@@ -256,12 +260,13 @@ pub fn create_reset_validator_registry_instruction(
         accounts.push(AccountMeta::new_readonly(validator_pda, false));
     }
 
-    // `reset_validator_registry(stake_mint: Pubkey)` takes the dual-stake mint as
-    // an argument (the pre-migration registry predates the field, so it is
-    // supplied explicitly rather than read from the grown bytes). Anchor arg
-    // encoding is disc(8) || Borsh(Pubkey) == disc(8) || 32 raw mint bytes.
+    // `reset_validator_registry(stake_mint: Pubkey, expected_active_validators:
+    // u64)`. The mint is supplied explicitly (the pre-migration registry
+    // predates the field). Anchor arg encoding is disc(8) || Borsh(Pubkey) ||
+    // Borsh(u64) == disc(8) || 32 raw mint bytes || 8 LE count bytes.
     let mut data = discriminators::RESET_VALIDATOR_REGISTRY.to_vec();
     data.extend_from_slice(stake_mint.as_ref());
+    data.extend_from_slice(&expected_active_validators.to_le_bytes());
 
     Ok(Instruction {
         program_id: *program_id,
