@@ -14,6 +14,10 @@
 //!   BRIDGE_AUTHORITY_KEYPAIR_PATH  the program upgrade-authority keypair
 //!   RESET_CO_SIGNERS            comma-separated validator wallet pubkeys
 //!                               (each must already be registered + active)
+//!   RESET_EXPECTED_ACTIVE_VALIDATORS  optional: the active-validator count the
+//!                               on-chain guard checks the rebuild against.
+//!                               Source it independently of RESET_CO_SIGNERS
+//!                               (defaults to the co-signer count with a warning)
 
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
@@ -49,6 +53,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("RESET_CO_SIGNERS is empty — refusing to reset to zero validators".into());
     }
 
+    // The count the on-chain guard checks the rebuilt registry against. Set
+    // RESET_EXPECTED_ACTIVE_VALIDATORS from an INDEPENDENT source (your own
+    // roster / monitoring), not by counting RESET_CO_SIGNERS — the guard only
+    // catches a dropped co-signer if the expected count did not drop with it.
+    // Defaulting to the co-signer count keeps the tool working but makes the
+    // check tautological, so warn loudly.
+    let expected_active_validators: u64 = match std::env::var("RESET_EXPECTED_ACTIVE_VALIDATORS") {
+        Ok(s) => s.trim().parse()?,
+        Err(_) => {
+            println!(
+                "⚠ RESET_EXPECTED_ACTIVE_VALIDATORS not set — defaulting to the {} \
+                 co-signers listed. The omission guard is only meaningful when this \
+                 count comes from an independent source.\n",
+                co_signers.len()
+            );
+            co_signers.len() as u64
+        }
+    };
+
     let authority = load_keypair_from_file(&authority_keypair_path)?;
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
@@ -76,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &authority.pubkey(),
         &co_signers,
         &stake_mint,
+        expected_active_validators,
     )?;
     let blockhash = client.get_latest_blockhash()?;
     let tx = Transaction::new_signed_with_payer(
@@ -91,11 +115,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Registry reset ===");
     println!("Signature: {}", signature);
     println!("Verify:    solana confirm -v {}", signature);
+
+    // Auto-verify the on-chain registry rather than only printing what to expect
+    // (#742). Registry layout after the 8-byte discriminator: authority[8..40],
+    // total_validators[40..48], active_validators[48..56], minimum_stake[56..64],
+    // total_active_stake[64..72].
+    let data = client.get_account_data(&registry_pda)?;
+    if data.len() < 72 {
+        return Err(format!(
+            "registry account is unexpectedly short ({} bytes)",
+            data.len()
+        )
+        .into());
+    }
+    let active_validators = u64::from_le_bytes(data[48..56].try_into().unwrap());
+    let total_active_stake = u64::from_le_bytes(data[64..72].try_into().unwrap());
     println!(
-        "Expect active_validators = {} and total_active_stake = {} lamports.",
-        co_signers.len(),
-        co_signers.len() as u64 * 1_000_000_000
+        "On-chain: active_validators = {active_validators}, total_active_stake = {total_active_stake} lamports."
     );
+    if active_validators != expected_active_validators {
+        return Err(format!(
+            "post-reset mismatch: on-chain active_validators = {active_validators} but expected \
+             {expected_active_validators}. The quorum denominator may be wrong — investigate before \
+             relying on settlement."
+        )
+        .into());
+    }
+    println!("✓ active_validators matches the expected count.");
 
     Ok(())
 }
