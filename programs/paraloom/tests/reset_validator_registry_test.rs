@@ -1,10 +1,12 @@
 //! On-chain test for `reset_validator_registry`, the registry migration used at
-//! the ceremony-key redeploy. Registers two validators, then resets the
-//! registry passing only ONE of them in `remaining_accounts`, and asserts the
-//! rebuilt registry counts exactly that one — the property that lets the
+//! the ceremony-key redeploy. Registers two validators, then exercises the
+//! expected-count guard (#739/#741): a reset passing only ONE PDA but declaring
+//! two active validators must revert (and leave the registry untouched), while a
+//! reset that passes one and declares one succeeds — the property that lets the
 //! redeploy drop stale registrations so the stake-weighted quorum denominator
-//! reflects only the real co-signer set. Also asserts the upgrade-authority
-//! gate rejects a non-authority caller.
+//! reflects only the real co-signer set, without a short list silently
+//! understating it. Also asserts the upgrade-authority gate rejects a
+//! non-authority caller.
 //!
 //! (The realloc-from-the-shorter-legacy-layout path cannot be exercised here —
 //! ProgramTest always creates the registry at the current size — so this test
@@ -158,7 +160,44 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
     assert_eq!(before.active_validators, 2);
     assert_eq!(before.total_active_stake, 2 * MIN_VALIDATOR_STAKE);
 
-    // Reset, passing ONLY validator A's PDA in remaining_accounts.
+    // The omission guard fires on a short list: pass ONLY validator A's PDA but
+    // DECLARE two active validators. The rebuild sees one, the declaration says
+    // two, so the reset must revert rather than silently understate the quorum
+    // denominator (#739/#741).
+    let mut short_metas = accounts::ResetValidatorRegistry {
+        validator_registry: registry_pda,
+        authority: upgrade_authority.pubkey(),
+        program_data: program_data_pda,
+        system_program: system_program::ID,
+    }
+    .to_account_metas(None);
+    short_metas.push(AccountMeta::new_readonly(pda_a, false));
+    let short_ix = Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 2,
+        }
+        .data(),
+        accounts: short_metas,
+    };
+    let mut tx = Transaction::new_with_payer(&[short_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "a short remaining_accounts list must fail the expected-count guard"
+    );
+    // The rejected reset left the registry untouched: still two active.
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let unchanged = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        unchanged.active_validators, 2,
+        "a rejected reset must not mutate the registry"
+    );
+
+    // A deliberately-declared subset still works: dropping a stale registration
+    // is legitimate, the reset just has to declare the count it resets to. Pass
+    // ONLY validator A and declare one.
     let mut reset_metas = accounts::ResetValidatorRegistry {
         validator_registry: registry_pda,
         authority: upgrade_authority.pubkey(),
@@ -169,7 +208,11 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
     reset_metas.push(AccountMeta::new_readonly(pda_a, false));
     let reset_ix = Instruction {
         program_id,
-        data: instruction::ResetValidatorRegistry { stake_mint }.data(),
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 1,
+        }
+        .data(),
         accounts: reset_metas,
     };
     let mut tx = Transaction::new_with_payer(&[reset_ix], Some(&upgrade_authority.pubkey()));
@@ -242,7 +285,12 @@ async fn reset_rejects_non_upgrade_authority() {
     // The payer is NOT the upgrade authority; the reset must be rejected.
     let reset_ix = Instruction {
         program_id,
-        data: instruction::ResetValidatorRegistry { stake_mint }.data(),
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            // Rejected on the upgrade-authority gate before the guard runs.
+            expected_active_validators: 1,
+        }
+        .data(),
         accounts: accounts::ResetValidatorRegistry {
             validator_registry: registry_pda,
             authority: payer.pubkey(),

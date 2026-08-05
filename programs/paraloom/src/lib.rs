@@ -1136,6 +1136,16 @@ pub mod paraloom_program {
     pub fn reset_validator_registry(
         ctx: Context<ResetValidatorRegistry>,
         stake_mint: Pubkey,
+        // The number of active validators the caller asserts it is resetting to.
+        // Solana cannot enumerate every `[b"validator", *]` PDA on-chain, so the
+        // program cannot prove the `remaining_accounts` list is complete
+        // (#739/#741). This turns a silently-short list into a hard failure: the
+        // rebuilt active count must equal what the caller declared. It is a real
+        // check only when this number is sourced independently of the account
+        // list (e.g. the operator's own roster / an off-chain enumeration), not
+        // derived from the same list — otherwise a bug that drops accounts from
+        // both cancels out.
+        expected_active_validators: u64,
     ) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
@@ -1203,6 +1213,16 @@ pub mod paraloom_program {
             active = active.saturating_add(1);
         }
 
+        // Fail loudly on a short list rather than silently understating the
+        // quorum denominator. `active` counts exactly the PDAs that passed the
+        // per-account checks above (a non-active or non-canonical PDA reverts,
+        // it is never skipped), so this rejects a `remaining_accounts` list that
+        // carries fewer validators than the caller declared.
+        require!(
+            active == expected_active_validators,
+            BridgeError::RegistryResetCountMismatch
+        );
+
         // Write the rebuilt registry.
         let registry = ValidatorRegistry {
             authority: ctx.accounts.authority.key(),
@@ -1235,6 +1255,14 @@ pub mod paraloom_program {
             active,
             total_active_stake
         );
+        // Structured event so off-chain monitors can alert on an unexpected
+        // change to the quorum denominator (#743).
+        emit!(RegistryResetEvent {
+            authority: ctx.accounts.authority.key(),
+            active_validators: active,
+            total_active_stake,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
         Ok(())
     }
 
@@ -2220,6 +2248,14 @@ pub struct UnbondedStakeWithdrawnEvent {
 }
 
 #[event]
+pub struct RegistryResetEvent {
+    pub authority: Pubkey,
+    pub active_validators: u64,
+    pub total_active_stake: u64,
+    pub timestamp: i64,
+}
+
+#[event]
 pub struct ValidatorSlashedEvent {
     pub validator: Pubkey,
     pub slash_amount: u64,
@@ -2300,4 +2336,7 @@ pub enum BridgeError {
 
     #[msg("Token stake is below the minimum required for the dual-stake")]
     InsufficientTokenStake,
+
+    #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
+    RegistryResetCountMismatch,
 }

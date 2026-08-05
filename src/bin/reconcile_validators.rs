@@ -302,6 +302,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &authority.pubkey(),
             &keep_wallets,
             &stake_mint,
+            // keep_wallets is the authoritative active set enumerated from
+            // getProgramAccounts above, so its length is the expected count.
+            keep_wallets.len() as u64,
         )?,
     )?;
 
