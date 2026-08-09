@@ -23,5 +23,5 @@ pub use jupiter::{
 pub use onchain::OnChainSubmitter;
 pub use private_swap::{
     MockSubmitter, MockSwapProvider, PrivateSwapRelayer, PrivateSwapRequest, PrivateSwapResult,
-    RelayerError, SubmittedLeg, Submitter, SwapProvider, SwapResult, WithdrawLeg,
+    RelayerError, SubmittedLeg, Submitter, SwapOutResult, SwapProvider, SwapResult, WithdrawLeg,
 };
