@@ -85,6 +85,25 @@ pub fn asset_to_mint(asset: AssetId) -> String {
     }
 }
 
+/// Convert a base58 mint string into an [`AssetId`] — the inverse of
+/// [`asset_to_mint`].
+///
+/// [`WRAPPED_SOL_MINT`] (and the literal `"SOL"`) map to [`NATIVE_SOL_ASSET`],
+/// so a caller asking for wrapped SOL routes through the native leg; every other
+/// mint decodes to its 32 raw bytes. Returns an error string on a malformed or
+/// wrong-length mint.
+pub fn mint_to_asset(mint: &str) -> std::result::Result<AssetId, String> {
+    if mint == WRAPPED_SOL_MINT || mint.eq_ignore_ascii_case("SOL") {
+        return Ok(NATIVE_SOL_ASSET);
+    }
+    let bytes = bs58::decode(mint)
+        .into_vec()
+        .map_err(|e| format!("invalid mint '{mint}': {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("mint '{mint}' is not 32 bytes"))
+}
+
 /// The fields we read out of a Jupiter v6 quote. Jupiter returns more, but the
 /// whole object is round-tripped back into the swap request as `quoteResponse`,
 /// so we keep the raw value too.
@@ -510,6 +529,80 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         bincode::deserialize::<VersionedTransaction>(&bytes)
             .map_err(|e| RelayerError::SwapFailed(format!("tx deserialize failed: {e}")))
     }
+
+    /// Shared quote-then-build step: fetch a `/quote`, then ask Jupiter to build
+    /// the `/swap` transaction for `user` (the address that will sign and pay),
+    /// with the relayer's `platformFeeBps` routed to `fee_account`. Returns the
+    /// quoted output amount and the raw swap-response JSON (which carries the
+    /// base64 `swapTransaction`). Both [`swap`](SwapProvider::swap) (which then
+    /// signs + submits) and [`build_swap`](Self::build_swap) (which hands the
+    /// unsigned tx back to a non-custodial caller) build on this, so the routing
+    /// and fee wiring live in exactly one place.
+    async fn quote_and_swap_raw(
+        &self,
+        asset_in: AssetId,
+        asset_out: AssetId,
+        amount: u64,
+        user: &Pubkey,
+    ) -> Result<(u64, serde_json::Value)> {
+        if amount == 0 {
+            return Err(RelayerError::InvalidAmount(0));
+        }
+        let input_mint = asset_to_mint(asset_in);
+        let output_mint = asset_to_mint(asset_out);
+
+        let query = self.quote_query(&input_mint, &output_mint, amount);
+        let quote_raw = self.http.get_quote(&query).await?;
+        let out_amount = Self::parse_quote(&quote_raw)?;
+
+        let body = SwapRequestBody {
+            quote_response: &quote_raw,
+            user_public_key: user.to_string(),
+            fee_account: self.fee_account.clone(),
+            wrap_and_unwrap_sol: true,
+            as_legacy_transaction: self.legacy_transaction,
+            prioritization_fee_lamports: "auto",
+            dynamic_compute_unit_limit: true,
+        };
+        let body_value = serde_json::to_value(&body)
+            .map_err(|e| RelayerError::SwapFailed(format!("encode swap body: {e}")))?;
+        let swap_raw = self.http.post_swap(&body_value).await?;
+        Ok((out_amount, swap_raw))
+    }
+
+    /// Build a swap for `user` **without** signing or submitting it — the
+    /// non-custodial service path. The server never holds `user`'s key: it
+    /// returns the quoted output plus the unsigned base64 `swapTransaction`, and
+    /// the client (which holds the fresh key) signs and submits it. The route
+    /// still carries the configured slippage, DEX allow-list, and platform fee.
+    pub async fn build_swap(
+        &self,
+        asset_in: AssetId,
+        asset_out: AssetId,
+        amount: u64,
+        user: &Pubkey,
+    ) -> Result<SwapQuote> {
+        let (out_amount, swap_raw) = self
+            .quote_and_swap_raw(asset_in, asset_out, amount, user)
+            .await?;
+        let resp: SwapTxResponse = serde_json::from_value(swap_raw)
+            .map_err(|e| RelayerError::SwapFailed(format!("malformed swap response: {e}")))?;
+        Ok(SwapQuote {
+            out_amount,
+            swap_transaction: resp.swap_transaction,
+        })
+    }
+}
+
+/// A built-but-unsigned swap, returned by
+/// [`JupiterSwapProvider::build_swap`] for the non-custodial service path.
+#[derive(Debug, Clone)]
+pub struct SwapQuote {
+    /// Jupiter's quoted output amount, in the out mint's base units.
+    pub out_amount: u64,
+    /// Base64 versioned `swapTransaction`, ready for the fresh address to sign
+    /// and submit. Carries the platform fee and priority-fee settings.
+    pub swap_transaction: String,
 }
 
 #[async_trait::async_trait]
@@ -521,31 +614,13 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         amount: u64,
         signer: &Keypair,
     ) -> Result<SwapResult> {
-        if amount == 0 {
-            return Err(RelayerError::InvalidAmount(0));
-        }
-        let input_mint = asset_to_mint(asset_in);
+        // 1-2. Quote, then ask Jupiter to build the transaction for the fresh
+        //      address, routing the platform fee to the relayer's fee account
+        //      (shared with the non-custodial `build_swap` path).
         let output_mint = asset_to_mint(asset_out);
-
-        // 1. Quote.
-        let query = self.quote_query(&input_mint, &output_mint, amount);
-        let quote_raw = self.http.get_quote(&query).await?;
-        let out_amount = Self::parse_quote(&quote_raw)?;
-
-        // 2. Swap: ask Jupiter to build the transaction for the fresh address,
-        //    routing the platform fee to the relayer's fee account.
-        let body = SwapRequestBody {
-            quote_response: &quote_raw,
-            user_public_key: signer.pubkey().to_string(),
-            fee_account: self.fee_account.clone(),
-            wrap_and_unwrap_sol: true,
-            as_legacy_transaction: self.legacy_transaction,
-            prioritization_fee_lamports: "auto",
-            dynamic_compute_unit_limit: true,
-        };
-        let body_value = serde_json::to_value(&body)
-            .map_err(|e| RelayerError::SwapFailed(format!("encode swap body: {e}")))?;
-        let swap_raw = self.http.post_swap(&body_value).await?;
+        let (out_amount, swap_raw) = self
+            .quote_and_swap_raw(asset_in, asset_out, amount, &signer.pubkey())
+            .await?;
         let transaction = Self::decode_swap_tx(&swap_raw)?;
 
         // 3. Execute: sign with the fresh keypair and submit.
