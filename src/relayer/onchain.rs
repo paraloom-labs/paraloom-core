@@ -1,94 +1,201 @@
-//! Production [`Submitter`] for the private-swap relayer (#240).
+//! Production [`Submitter`] for the private-swap relayer, settling over the v3
+//! `transact` (withdraw-to-fresh) + `deposit_note` (re-shield) flow.
 //!
-//! # Status: pending v3 rework
-//!
-//! This submitter previously settled the withdraw-to-fresh and
-//! re-deposit-from-fresh legs through the legacy off-chain-root `withdraw` /
-//! `withdraw_spl` / `deposit_spl` instructions. Those instructions were removed
-//! with the off-chain-root shielded path — all shielded settlement now goes
-//! through the program-owned-tree `transact` instruction (which requires a v3
-//! Groth16 proof and a validator co-sign quorum), and SPL support was dropped
-//! for now (native-only). Re-expressing the relayer's two legs over `transact`
-//! and `deposit_note` is a follow-up; until then this submitter's on-chain legs
-//! return a clear error rather than building instructions that no longer exist
-//! on-chain. The struct and constructor are retained so the mock-tested
-//! orchestration layer keeps compiling.
+//! The withdraw leg is a v3 `transact` with `ext_amount < 0` and
+//! `recipient = fresh_address`: it is proved with the transact proving key,
+//! POSTed to the public transact ingress, and settled by the 2-of-2 validator
+//! co-sign quorum (see [`crate::relayer::transact_submit`]). The re-shield leg
+//! is a permissionless `deposit_note` signed by the fresh ephemeral key. SPL
+//! re-shielding is unavailable on the native-only v3 program.
 
-use crate::privacy::types::{Nullifier, ShieldedAddress};
-use crate::relayer::private_swap::{RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg};
+use ark_bn254::Bn254;
+use ark_bn254::Fr;
+use ark_ff::PrimeField;
+use ark_serialize::CanonicalDeserialize;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    transaction::Transaction,
 };
 use std::sync::Arc;
 
-/// Settles the relayer's on-chain legs against a live Solana RPC.
-///
-/// Holds the program id, the bridge authority keypair (signs the withdraw
-/// legs), the RPC URL, and the withdrawal expiration window. Cloneable handles
-/// to the authority are shared into the blocking tasks.
+use crate::bridge::solana::{create_deposit_note_instruction, derive_bridge_vault};
+use crate::privacy::poseidon_circom::v3_commit;
+use crate::privacy::types::ShieldedAddress;
+use crate::relayer::private_swap::{RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg};
+use crate::relayer::transact_submit;
+
+/// Default settlement poll timeout (matches the demo's 120s window).
+const SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Settles the relayer's on-chain legs against a live Solana RPC + transact
+/// ingress. Cloneable config is moved into the blocking tasks that run the
+/// (blocking) `transact_submit` helpers.
 pub struct OnChainSubmitter {
     program_id: Pubkey,
-    authority: Arc<Keypair>,
     rpc_url: String,
-    /// Slots added to the current slot to bound each withdrawal's validity.
-    expiration_window_slots: u64,
+    ingress_url: String,
+    proving_key: Arc<ark_groth16::ProvingKey<Bn254>>,
 }
 
 impl OnChainSubmitter {
-    /// Build a submitter over `rpc_url`, the deployed `program_id`, and the
-    /// bridge `authority` (which must be a registered validator). The
-    /// `expiration_window_slots` bounds each withdrawal's on-chain validity
-    /// (`current_slot + window`).
+    /// Build a submitter over `rpc_url`, the deployed `program_id`, the transact
+    /// `ingress_url`, and the v3 transact proving key at `proving_key_path`
+    /// (e.g. `keys/transact_v3_proving.key`).
     pub fn new(
         rpc_url: impl Into<String>,
         program_id: Pubkey,
-        authority: Keypair,
-        expiration_window_slots: u64,
-    ) -> Self {
-        Self {
+        ingress_url: impl Into<String>,
+        proving_key_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let bytes = std::fs::read(proving_key_path.as_ref())
+            .map_err(|e| RelayerError::SubmissionFailed(format!("read proving key: {e}")))?;
+        let pk = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
+            .map_err(|e| RelayerError::SubmissionFailed(format!("decode proving key: {e}")))?;
+        Ok(Self {
             program_id,
-            authority: Arc::new(authority),
             rpc_url: rpc_url.into(),
-            expiration_window_slots,
-        }
+            ingress_url: ingress_url.into(),
+            proving_key: Arc::new(pk),
+        })
     }
 
-    /// Error returned by both on-chain legs while the relayer awaits its v3
-    /// rework. References the retained config so the fields are not dead.
-    fn pending_v3(&self) -> RelayerError {
-        RelayerError::SubmissionFailed(format!(
-            "on-chain relayer legs were removed with the off-chain-root shielded path \
-             (program {}, rpc {}, expiration window {} slots); the private-swap relayer \
-             must be re-expressed over the v3 transact + deposit_note flow before it can \
-             settle on-chain",
-            self.program_id, self.rpc_url, self.expiration_window_slots
-        ))
+    fn client(&self) -> RpcClient {
+        RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::confirmed())
     }
 }
 
 #[async_trait::async_trait]
 impl Submitter for OnChainSubmitter {
+    #[allow(clippy::too_many_arguments)]
     async fn submit_withdraw_to_fresh(
         &self,
-        _leg: WithdrawLeg,
-        _nullifier: Nullifier,
-        _amount: u64,
-        _fresh_address: [u8; 32],
-        _proof: Vec<u8>,
+        leg: WithdrawLeg,
+        amount: u64,
+        sk: [u8; 32],
+        blinding: [u8; 32],
+        note_pubkey: [u8; 32],
+        leaf_index: u64,
+        fresh_address: [u8; 32],
     ) -> Result<SubmittedLeg> {
-        let _ = self.authority.pubkey();
-        Err(self.pending_v3())
+        if !matches!(leg, WithdrawLeg::Native) {
+            return Err(RelayerError::SubmissionFailed(
+                "SPL withdraw is unavailable on the native-only v3 program".to_string(),
+            ));
+        }
+        let program_id = self.program_id;
+        let rpc_url = self.rpc_url.clone();
+        let ingress = self.ingress_url.clone();
+        let pk = self.proving_key.clone();
+
+        // The transact_submit helpers are blocking (blocking RpcClient + reqwest).
+        let result = tokio::task::spawn_blocking(move || -> transact_submit::Result<String> {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            if !transact_submit::quorum_available(&client, &program_id) {
+                return Err(transact_submit::TransactSubmitError::IngressRejected {
+                    status: 503,
+                    body: "no validator quorum (need >= 2 active validators)".to_string(),
+                });
+            }
+            let sk_fr = Fr::from_le_bytes_mod_order(&sk);
+            let blinding_fr = Fr::from_le_bytes_mod_order(&blinding);
+            let note_pk_fr = Fr::from_le_bytes_mod_order(&note_pubkey);
+            let commitment = v3_commit(Fr::from(amount), note_pk_fr, blinding_fr, Fr::from(0u64));
+            let membership =
+                transact_submit::read_membership(&client, &program_id, leaf_index, commitment)?;
+            let w = transact_submit::prove_withdraw_to_fresh(
+                &pk,
+                sk_fr,
+                blinding_fr,
+                note_pk_fr,
+                amount,
+                &membership,
+                &fresh_address,
+            )?;
+            // Two well-formed placeholder envelopes: the withdraw's output notes
+            // are zero-value, but the ingress still requires valid ciphertexts.
+            let demo_recipient = *crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng)
+                .public_key()
+                .as_bytes();
+            let ct0 =
+                crate::privacy::note_crypto::seal(&demo_recipient, b"withdraw out 0").to_bytes();
+            let ct1 =
+                crate::privacy::note_crypto::seal(&demo_recipient, b"withdraw out 1").to_bytes();
+            transact_submit::post_transact(&ingress, &fresh_address, &w, [ct0, ct1])?;
+
+            let recipient_pk = Pubkey::new_from_array(fresh_address);
+            transact_submit::wait_for_settlement(
+                &client,
+                &program_id,
+                &recipient_pk,
+                &w.nullifiers[0],
+                SETTLEMENT_TIMEOUT,
+            )?;
+            // Settlement lands via the quorum, not a single tx we hold — return
+            // the fresh address as the leg's on-chain reference.
+            Ok(recipient_pk.to_string())
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("withdraw task join: {e}")))?
+        .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
+
+        Ok(SubmittedLeg {
+            leg,
+            amount,
+            fresh_address,
+            signature: result,
+        })
     }
 
     async fn submit_deposit_from_fresh(
         &self,
-        _leg: WithdrawLeg,
-        _amount: u64,
-        _signer: &Keypair,
-        _recipient: ShieldedAddress,
-        _randomness: [u8; 32],
+        leg: WithdrawLeg,
+        amount: u64,
+        signer: &Keypair,
+        recipient: ShieldedAddress,
+        randomness: [u8; 32],
     ) -> Result<SubmittedLeg> {
-        Err(self.pending_v3())
+        if !matches!(leg, WithdrawLeg::Native) {
+            return Err(RelayerError::SubmissionFailed(
+                "SPL re-shield is unavailable on the native-only v3 program (needs a redeploy)"
+                    .to_string(),
+            ));
+        }
+        let program_id = self.program_id;
+        let fresh_address = signer.pubkey().to_bytes();
+        let signer = signer.insecure_clone();
+        let client = self.client();
+
+        let sig = tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
+            let (vault, _) = derive_bridge_vault(&program_id);
+            let ix = create_deposit_note_instruction(
+                &program_id,
+                &signer.pubkey(),
+                &vault,
+                amount,
+                recipient.0,
+                randomness,
+            )
+            .map_err(|e| e.to_string())?;
+            let bh = client.get_latest_blockhash().map_err(|e| e.to_string())?;
+            let tx =
+                Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[&signer], bh);
+            client
+                .send_and_confirm_transaction(&tx)
+                .map(|s| s.to_string())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("deposit task join: {e}")))?
+        .map_err(RelayerError::SubmissionFailed)?;
+
+        Ok(SubmittedLeg {
+            leg,
+            amount,
+            fresh_address,
+            signature: sig,
+        })
     }
 }
