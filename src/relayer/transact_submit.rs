@@ -28,7 +28,7 @@ use crate::privacy::circuits::{Groth16ProofSystem, TransactCircuitV3, TX_LEVELS}
 use crate::privacy::poseidon_circom::{
     v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature,
 };
-use crate::privacy::{tag_proof, ProofSuite};
+use crate::privacy::{tag_proof, ProofSuite, ProofVerifier};
 
 /// Errors from the shared v3 settlement helpers.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +39,8 @@ pub enum TransactSubmitError {
     RootMismatch { leaf_index: u64 },
     #[error("proving failed: {0}")]
     Prove(String),
+    #[error("proof self-verification failed (proving/verifying key mismatch?): {0}")]
+    SelfVerify(String),
     #[error("ingress rejected the transact: {status} {body}")]
     IngressRejected { status: u16, body: String },
     #[error("http error talking to the ingress: {0}")]
@@ -217,6 +219,25 @@ pub fn prove_withdraw_to_fresh(
         .serialize_compressed(&mut body)
         .map_err(|e| TransactSubmitError::Prove(e.to_string()))?;
     let proof = tag_proof(ProofSuite::Groth16Bn254TransactV3, &body);
+
+    // Self-verify against the node's verifying key *before* returning, so a
+    // proving/verifying-key mismatch (e.g. a stale dev proving key against the
+    // ceremony VK) or a witness bug fails here — locally, for free — instead of
+    // after the deposit is spent and the withdraw silently times out at the
+    // quorum. This reproduces the node's `verify_transact_parts` exactly (same
+    // VK path, same public-input derivation from `recipient`/`ext_amount`).
+    let verdict = ProofVerifier::verify_transact_parts(
+        &membership.root,
+        recipient,
+        ext_amount,
+        &[0u8; 32],
+        &[fr_to_le(&nf0), fr_to_le(&nf1)],
+        &[fr_to_le(&oc0), fr_to_le(&oc1)],
+        &proof,
+    );
+    if !verdict.is_valid() {
+        return Err(TransactSubmitError::SelfVerify(format!("{verdict:?}")));
+    }
 
     Ok(WithdrawToFresh {
         proof,
