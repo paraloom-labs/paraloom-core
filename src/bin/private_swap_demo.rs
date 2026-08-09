@@ -170,29 +170,87 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── Step 1: deposit a native-SOL v3 note ────────────────────────────────
-    header("Step 1: shielded deposit (native SOL, deposit_note v3)");
-    let sk = rand_fr();
-    let blinding = rand_fr();
-    let pk_note = v3_pubkey(sk);
-    let ix = create_deposit_note_instruction(
-        &program_id,
-        &payer.pubkey(),
-        &vault_pda,
-        swap_amount,
-        fr_to_le(&pk_note),
-        fr_to_le(&blinding),
-    )?;
-    let bh = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh);
-    let deposit_sig = client.send_and_confirm_transaction(&tx)?;
-    println!("deposit tx:        {deposit_sig}");
+    // ── Step 1: deposit a native-SOL v3 note (or resume a persisted one) ─────
+    // The note's spend witness (sk, blinding, pubkey, leaf, amount) is persisted
+    // to a file the instant the deposit confirms — BEFORE the withdraw is
+    // attempted — so a failed/incomplete run never strands the deposited SOL:
+    // re-run with RESUME_NOTE=<file> to retry the withdraw against the same note
+    // instead of depositing again.
+    let (in_sk_le, in_blinding_le, in_note_pubkey_le, leaf_index, note_amount): (
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+        u64,
+        u64,
+    ) = if let Ok(resume_path) = std::env::var("RESUME_NOTE") {
+        header("Step 1: resume persisted note (skip deposit)");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&resume_path)?)?;
+        let hex32 = |k: &str| -> anyhow::Result<[u8; 32]> {
+            let s = v[k]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("note file missing {k}"))?;
+            hex::decode(s)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("{k} not 32 bytes"))
+        };
+        let li = v["leaf_index"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("note file missing leaf_index"))?;
+        let amt = v["amount"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("note file missing amount"))?;
+        println!(
+            "resumed note:      {resume_path} (leaf {li}, {} SOL)",
+            amt as f64 / 1e9
+        );
+        (
+            hex32("in_sk")?,
+            hex32("in_blinding")?,
+            hex32("in_note_pubkey")?,
+            li,
+            amt,
+        )
+    } else {
+        header("Step 1: shielded deposit (native SOL, deposit_note v3)");
+        let sk = rand_fr();
+        let blinding = rand_fr();
+        let pk_note = v3_pubkey(sk);
+        let ix = create_deposit_note_instruction(
+            &program_id,
+            &payer.pubkey(),
+            &vault_pda,
+            swap_amount,
+            fr_to_le(&pk_note),
+            fr_to_le(&blinding),
+        )?;
+        let bh = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh);
+        let deposit_sig = client.send_and_confirm_transaction(&tx)?;
+        println!("deposit tx:        {deposit_sig}");
 
-    // Read the just-appended leaf index from the on-chain tree.
-    let raw = client.get_account_data(&tree_pda)?;
-    let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-    let leaf_index = next_index - 1;
-    println!("leaf index:        {leaf_index}");
+        // Read the just-appended leaf index from the on-chain tree.
+        let raw = client.get_account_data(&tree_pda)?;
+        let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
+        let leaf_index = next_index - 1;
+        println!("leaf index:        {leaf_index}");
+
+        // Persist the note secret NOW, before the withdraw, so the deposit is
+        // always recoverable if the rest of the run fails.
+        let sk_le = fr_to_le(&sk);
+        let blinding_le = fr_to_le(&blinding);
+        let pk_le = fr_to_le(&pk_note);
+        let note_path = format!("private_swap_note_leaf{leaf_index}.json");
+        let note = serde_json::json!({
+            "in_sk": hex::encode(sk_le),
+            "in_blinding": hex::encode(blinding_le),
+            "in_note_pubkey": hex::encode(pk_le),
+            "leaf_index": leaf_index,
+            "amount": swap_amount,
+        });
+        std::fs::write(&note_path, serde_json::to_string_pretty(&note)?)?;
+        println!("note saved:        {note_path}  (retry withdraw with RESUME_NOTE={note_path})");
+        (sk_le, blinding_le, pk_le, leaf_index, swap_amount)
+    };
 
     // ── Step 2: build the fresh (user-controlled) output wallet ─────────────
     header("Step 2: fresh output wallet");
@@ -236,11 +294,11 @@ async fn main() -> anyhow::Result<()> {
         .with_native_swap_overhead(LAMPORTS_PER_SOL / 100);
 
     let request = PrivateSwapRequest {
-        amount_in: swap_amount,
+        amount_in: note_amount,
         asset_in: NATIVE_SOL_ASSET,
-        in_sk: fr_to_le(&sk),
-        in_blinding: fr_to_le(&blinding),
-        in_note_pubkey: fr_to_le(&pk_note),
+        in_sk: in_sk_le,
+        in_blinding: in_blinding_le,
+        in_note_pubkey: in_note_pubkey_le,
         in_leaf_index: leaf_index,
         asset_out: usdc_asset,
         // Unused on the swap-out path (no re-shield), but the request carries
@@ -282,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("Jupiter liquidity is mainnet-only. Run against the localnet mainnet-fork");
             println!("(scripts/localnet/private_swap_fork.sh) or real mainnet.");
-            println!("The deposit above DID land on-chain (tx {deposit_sig}).");
+            println!("The note (leaf {leaf_index}) is intact and recoverable via its saved file.");
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!("private swap-out failed: {e}")),
