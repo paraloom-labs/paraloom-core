@@ -109,6 +109,10 @@ name = "private-swap-demo"
 path = "src/bin/private_swap_demo.rs"
 
 [[bin]]
+name = "swap-router"
+path = "src/bin/swap_router.rs"
+
+[[bin]]
 name = "register-validator"
 path = "src/bin/register_validator.rs"
 

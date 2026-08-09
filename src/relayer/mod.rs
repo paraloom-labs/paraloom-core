@@ -14,14 +14,16 @@
 pub mod jupiter;
 pub mod onchain;
 pub mod private_swap;
+pub mod swap_router;
 pub mod transact_submit;
 
 pub use jupiter::{
-    asset_to_mint, JupiterHttpClient, JupiterSwapProvider, ReqwestJupiterClient, RpcSwapSubmitter,
-    SwapSubmitter, DEFAULT_JUPITER_BASE_URL, WRAPPED_SOL_MINT,
+    asset_to_mint, mint_to_asset, JupiterHttpClient, JupiterSwapProvider, ReqwestJupiterClient,
+    RpcSwapSubmitter, SwapQuote, SwapSubmitter, DEFAULT_JUPITER_BASE_URL, WRAPPED_SOL_MINT,
 };
 pub use onchain::OnChainSubmitter;
 pub use private_swap::{
     MockSubmitter, MockSwapProvider, PrivateSwapRelayer, PrivateSwapRequest, PrivateSwapResult,
     RelayerError, SubmittedLeg, Submitter, SwapOutResult, SwapProvider, SwapResult, WithdrawLeg,
 };
+pub use swap_router::SwapQuoter;
