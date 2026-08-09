@@ -105,6 +105,10 @@ name = "demo-transact-v3"
 path = "src/bin/demo_transact_v3.rs"
 
 [[bin]]
+name = "private-swap-demo"
+path = "src/bin/private_swap_demo.rs"
+
+[[bin]]
 name = "register-validator"
 path = "src/bin/register_validator.rs"
 

@@ -304,6 +304,25 @@ pub struct PrivateSwapResult {
     pub output_note: Note,
 }
 
+/// The outcome of a swap-out-only private swap (no re-shield).
+///
+/// Produced by [`PrivateSwapRelayer::execute_swap_out`]. The swapped
+/// `asset_out` sits at `fresh_address` — an address unlinkable to the note's
+/// depositor, whose key the caller (the user) holds.
+#[derive(Debug, Clone)]
+pub struct SwapOutResult {
+    /// The withdraw-to-fresh-address leg that funded the swap.
+    pub withdraw_leg: SubmittedLeg,
+    /// Gross swap output delivered to `fresh_address`, in `asset_out`'s smallest
+    /// unit. Already net of any fee the provider realized inside the route.
+    pub gross_out_amount: u64,
+    /// The fresh ephemeral address holding the swap output. Shares no signer
+    /// with the note's depositor.
+    pub fresh_address: [u8; 32],
+    /// The asset now held at `fresh_address` (mint, or [`NATIVE_SOL_ASSET`]).
+    pub asset_out: AssetId,
+}
+
 /// Orchestrates a single private swap by composing a [`SwapProvider`] and a
 /// [`Submitter`]. Generic over both so the same logic runs against the mocks in
 /// tests and the real Jupiter router + on-chain submitter in production.
@@ -337,13 +356,20 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         self
     }
 
-    /// Execute one private swap end to end.
+    /// Shared first half of every private swap: withdraw the spent note to
+    /// `ephemeral` via a v3 transact, then swap the realized (post-fee, post-
+    /// overhead) amount on the provider from that same fresh address. Returns
+    /// the settled withdraw leg and the gross swap output. Both [`execute`] (the
+    /// full round-trip) and [`execute_swap_out`] (the swap-out-only flow) build
+    /// on this, so the fee/overhead accounting lives in exactly one place.
     ///
-    /// Composes: derive nullifier -> withdraw to a fresh ephemeral keypair ->
-    /// swap on the provider -> take the relayer fee -> re-deposit the net to the
-    /// user's shielded recipient. Returns a [`PrivateSwapResult`] describing
-    /// every leg.
-    pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
+    /// [`execute`]: Self::execute
+    /// [`execute_swap_out`]: Self::execute_swap_out
+    async fn withdraw_then_swap(
+        &self,
+        request: &PrivateSwapRequest,
+        ephemeral: &Keypair,
+    ) -> Result<(SubmittedLeg, u64)> {
         let amount_in = request.amount_in;
         if amount_in == 0 {
             return Err(RelayerError::InvalidAmount(0));
@@ -355,12 +381,6 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let asset_in = request.asset_in;
         let asset_out = request.asset_out;
         let in_leg = WithdrawLeg::for_asset(asset_in);
-        let out_leg = WithdrawLeg::for_asset(asset_out);
-
-        // A brand-new keypair per swap — nothing on-chain links it to the user.
-        // This is the relayer-layer expression of the link-severing property
-        // that the withdrawal nullifier enforces on-chain.
-        let ephemeral = Keypair::new();
         let fresh_address = ephemeral.pubkey().to_bytes();
 
         // Step 1: withdraw the spent note to the fresh address via a v3
@@ -413,9 +433,37 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         };
         let swap = self
             .swap_provider
-            .swap(asset_in, asset_out, swap_amount, &ephemeral)
+            .swap(asset_in, asset_out, swap_amount, ephemeral)
             .await?;
-        let gross_out_amount = swap.out_amount;
+        Ok((withdraw_leg, swap.out_amount))
+    }
+
+    /// Execute one private swap end to end.
+    ///
+    /// Composes: derive nullifier -> withdraw to a fresh ephemeral keypair ->
+    /// swap on the provider -> take the relayer fee -> re-deposit the net to the
+    /// user's shielded recipient. Returns a [`PrivateSwapResult`] describing
+    /// every leg.
+    ///
+    /// # Availability
+    ///
+    /// The re-deposit leg re-shields `asset_out`. On the native-only v3 program
+    /// the submitter only accepts a native-SOL re-deposit, so a non-native
+    /// `asset_out` (e.g. USDC) fails at the deposit leg — re-shielding a token
+    /// needs the SPL redeploy. Until then, [`execute_swap_out`] delivers the
+    /// swapped token to the unlinkable fresh address without re-shielding it.
+    ///
+    /// [`execute_swap_out`]: Self::execute_swap_out
+    pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
+        // A brand-new keypair per swap — nothing on-chain links it to the user.
+        // This is the relayer-layer expression of the link-severing property
+        // that the withdrawal nullifier enforces on-chain.
+        let ephemeral = Keypair::new();
+        let fresh_address = ephemeral.pubkey().to_bytes();
+        let out_leg = WithdrawLeg::for_asset(request.asset_out);
+
+        let (withdraw_leg, gross_out_amount) =
+            self.withdraw_then_swap(&request, &ephemeral).await?;
 
         // Step 3: the swap output is ALREADY net of the relayer's fee — it is
         // realized inside the route by the swap provider (Jupiter's
@@ -443,7 +491,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             request.reshield_recipient,
             net_out_amount,
             request.reshield_randomness,
-            asset_out,
+            request.asset_out,
         );
 
         Ok(PrivateSwapResult {
@@ -454,6 +502,38 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             net_out_amount,
             fresh_address,
             output_note,
+        })
+    }
+
+    /// Execute the swap-out half of a private swap: withdraw the spent note to a
+    /// caller-supplied fresh address and swap it there, **without** re-shielding
+    /// the output. The swapped `asset_out` is left at `fresh`, an address that
+    /// shares no signer with the note's depositor — a private buy whose output
+    /// the user controls but the chain cannot link to their shielded deposit.
+    ///
+    /// This is the capability the native-only v3 program supports today for a
+    /// token `asset_out`: [`execute`]'s re-deposit leg cannot re-shield an SPL
+    /// token until the SPL redeploy, but the swap output itself is real and
+    /// unlinkable. Re-shielding it into a fresh note is the round-trip
+    /// [`execute`] provides once a native `asset_out` (or the SPL redeploy)
+    /// applies.
+    ///
+    /// `fresh` is supplied by the caller (not generated here) so the party who
+    /// will spend the output — the user, not the relayer — holds its key. The
+    /// withdraw leg funds `fresh`; the swap is signed and submitted from it.
+    ///
+    /// [`execute`]: Self::execute
+    pub async fn execute_swap_out(
+        &self,
+        request: PrivateSwapRequest,
+        fresh: &Keypair,
+    ) -> Result<SwapOutResult> {
+        let (withdraw_leg, gross_out_amount) = self.withdraw_then_swap(&request, fresh).await?;
+        Ok(SwapOutResult {
+            withdraw_leg,
+            gross_out_amount,
+            fresh_address: fresh.pubkey().to_bytes(),
+            asset_out: request.asset_out,
         })
     }
 }
@@ -740,6 +820,58 @@ mod tests {
             .await
             .expect_err("fee > 100% must error");
         assert!(matches!(err, RelayerError::FeeTooHigh(10_001)));
+    }
+
+    #[tokio::test]
+    async fn swap_out_withdraws_and_swaps_without_redeposit() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let fresh = Keypair::new();
+        let usdc: AssetId = [0x55u8; 32];
+        // Re-shielding a token is impossible on the native-only v3 program, so
+        // the swap-out flow delivers USDC to the fresh address and stops.
+        let out = relayer
+            .execute_swap_out(request(native_note(1_000_000), usdc, 0), &fresh)
+            .await
+            .expect("swap-out executes");
+        // 25bps withdraw fee: 997_500 reaches the fresh address, swapped 1:1.
+        assert_eq!(out.gross_out_amount, 1_000_000 - 2_500);
+        assert_eq!(out.asset_out, usdc);
+        assert_eq!(out.fresh_address, fresh.pubkey().to_bytes());
+        // Only the withdraw leg is submitted — there is no re-deposit leg.
+        let legs = relayer.submitter.recorded();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].leg, WithdrawLeg::Native);
+        assert_eq!(legs[0].fresh_address, fresh.pubkey().to_bytes());
+    }
+
+    #[tokio::test]
+    async fn swap_out_honors_the_native_overhead_reserve() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(5_000);
+        let out = relayer
+            .execute_swap_out(
+                request(native_note(1_000_000), NATIVE_SOL_ASSET, 0),
+                &Keypair::new(),
+            )
+            .await
+            .expect("swap-out executes");
+        // The whole note is withdrawn, but the swap trades realized minus
+        // overhead: 1_000_000 - 2_500 (fee) - 5_000 (overhead).
+        assert_eq!(out.withdraw_leg.amount, 1_000_000);
+        assert_eq!(out.gross_out_amount, 1_000_000 - 2_500 - 5_000);
+    }
+
+    #[tokio::test]
+    async fn swap_out_rejects_zero_amount() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let err = relayer
+            .execute_swap_out(
+                request(native_note(0), NATIVE_SOL_ASSET, 0),
+                &Keypair::new(),
+            )
+            .await
+            .expect_err("zero amount must error");
+        assert!(matches!(err, RelayerError::InvalidAmount(0)));
     }
 
     #[test]

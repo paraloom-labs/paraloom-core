@@ -13,11 +13,11 @@
 //!
 //! # The Jupiter v6 call sequence
 //!
-//! 1. **Quote** — `GET /v6/quote?inputMint&outputMint&amount&slippageBps&platformFeeBps`.
+//! 1. **Quote** — `GET /quote (v1)?inputMint&outputMint&amount&slippageBps&platformFeeBps`.
 //!    Returns the best `routePlan` and the expected `outAmount`. No liquidity
 //!    path for the pair/amount yields an empty/`error` response, surfaced as
 //!    [`RelayerError::NoRoute`].
-//! 2. **Swap** — `POST /v6/swap` with `{ quoteResponse, userPublicKey, feeAccount }`.
+//! 2. **Swap** — `POST /swap (v1)` with `{ quoteResponse, userPublicKey, feeAccount }`.
 //!    Returns a base64-encoded, ready-to-sign `swapTransaction` (a versioned
 //!    transaction) routed through the platform-fee account.
 //! 3. **Execute** — sign that transaction with the fresh ephemeral keypair and
@@ -101,10 +101,10 @@ struct QuoteResponse {
     error: Option<String>,
 }
 
-/// Body of the `POST /v6/swap` request.
+/// Body of the `POST /swap (v1)` request.
 #[derive(Debug, Serialize)]
 struct SwapRequestBody<'a> {
-    /// The exact quote object returned by `/v6/quote`, echoed back verbatim.
+    /// The exact quote object returned by `/quote (v1)`, echoed back verbatim.
     #[serde(rename = "quoteResponse")]
     quote_response: &'a serde_json::Value,
     /// The fresh ephemeral address that signs and pays for the swap.
@@ -121,6 +121,15 @@ struct SwapRequestBody<'a> {
     /// from the body when false so mainnet keeps the default versioned tx.
     #[serde(rename = "asLegacyTransaction", skip_serializing_if = "is_false")]
     as_legacy_transaction: bool,
+    /// Let Jupiter estimate and attach a priority fee so the swap lands on a
+    /// congested mainnet. Without it the versioned tx frequently fails to land
+    /// and `send_and_confirm` times out. `"auto"` lets Jupiter size it.
+    #[serde(rename = "prioritizationFeeLamports")]
+    prioritization_fee_lamports: &'static str,
+    /// Let Jupiter size the compute-unit limit to the actual route rather than
+    /// the 200k default, so a multi-hop route is not under-budgeted.
+    #[serde(rename = "dynamicComputeUnitLimit")]
+    dynamic_compute_unit_limit: bool,
 }
 
 /// serde helper: omit a `bool` field when it is `false`.
@@ -128,7 +137,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// The `/v6/swap` response: a base64 versioned transaction, ready to sign.
+/// The `/swap (v1)` response: a base64 versioned transaction, ready to sign.
 #[derive(Debug, Clone, Deserialize)]
 struct SwapTxResponse {
     #[serde(rename = "swapTransaction")]
@@ -142,9 +151,9 @@ struct SwapTxResponse {
 /// is the production impl; tests use an in-memory canned client.
 #[async_trait::async_trait]
 pub trait JupiterHttpClient: Send + Sync {
-    /// `GET /v6/quote?<query>` — returns the raw JSON body.
+    /// `GET /quote (v1)?<query>` — returns the raw JSON body.
     async fn get_quote(&self, query: &str) -> Result<serde_json::Value>;
-    /// `POST /v6/swap` with `body` — returns the raw JSON body.
+    /// `POST /swap (v1)` with `body` — returns the raw JSON body.
     async fn post_swap(&self, body: &serde_json::Value) -> Result<serde_json::Value>;
 }
 
@@ -197,11 +206,64 @@ pub struct ReqwestJupiterClient {
 }
 
 impl ReqwestJupiterClient {
-    /// Build a client against `base_url` (e.g. [`DEFAULT_JUPITER_BASE_URL`]).
+    /// Build a client against `base_url` (e.g. [`DEFAULT_JUPITER_BASE_URL`]) with
+    /// a request timeout so a hung Jupiter call cannot stall a swap forever.
     pub fn new(base_url: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into(),
+        }
+    }
+
+    /// Send with a small retry on 429 / 5xx / transport timeouts, and surface the
+    /// response body on a non-retryable error — a "no route" body maps to
+    /// [`RelayerError::NoRoute`] rather than an opaque transport failure, and any
+    /// other error carries the status + body instead of just the code. `build` is
+    /// called fresh per attempt so each retry gets a new request.
+    async fn send_with_retry<F>(&self, build: F) -> Result<String>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match build().send().await {
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r
+                        .text()
+                        .await
+                        .map_err(|e| RelayerError::HttpError(e.to_string()))?;
+                    if status.is_success() {
+                        return Ok(text);
+                    }
+                    if (status.as_u16() == 429 || status.is_server_error())
+                        && attempt < MAX_ATTEMPTS
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    let low = text.to_lowercase();
+                    if low.contains("no route") || low.contains("could not find any route") {
+                        return Err(RelayerError::NoRoute(text));
+                    }
+                    return Err(RelayerError::HttpError(format!("HTTP {status}: {text}")));
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS && (e.is_timeout() || e.is_connect()) {
+                        tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    return Err(RelayerError::HttpError(e.to_string()));
+                }
+            }
         }
     }
 }
@@ -210,41 +272,16 @@ impl ReqwestJupiterClient {
 impl JupiterHttpClient for ReqwestJupiterClient {
     async fn get_quote(&self, query: &str) -> Result<serde_json::Value> {
         let url = format!("{}/quote?{}", self.base_url, query);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| RelayerError::HttpError(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(RelayerError::HttpError(format!(
-                "quote returned HTTP {}",
-                resp.status()
-            )));
-        }
-        resp.json()
-            .await
-            .map_err(|e| RelayerError::HttpError(e.to_string()))
+        let text = self.send_with_retry(|| self.http.get(&url)).await?;
+        serde_json::from_str(&text).map_err(|e| RelayerError::HttpError(e.to_string()))
     }
 
     async fn post_swap(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}/swap", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| RelayerError::HttpError(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(RelayerError::HttpError(format!(
-                "swap returned HTTP {}",
-                resp.status()
-            )));
-        }
-        resp.json()
-            .await
-            .map_err(|e| RelayerError::HttpError(e.to_string()))
+        let text = self
+            .send_with_retry(|| self.http.post(&url).json(body))
+            .await?;
+        serde_json::from_str(&text).map_err(|e| RelayerError::HttpError(e.to_string()))
     }
 }
 
@@ -428,7 +465,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         self
     }
 
-    /// Build the `/v6/quote` query string for the given pair/amount, folding in
+    /// Build the `/quote (v1)` query string for the given pair/amount, folding in
     /// the configured slippage and platform fee.
     fn quote_query(&self, input_mint: &str, output_mint: &str, amount: u64) -> String {
         let mut q = format!(
@@ -447,7 +484,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         q
     }
 
-    /// Parse a `/v6/quote` body into the realized gross output, treating an
+    /// Parse a `/quote (v1)` body into the realized gross output, treating an
     /// `error` field or an empty `routePlan` as [`RelayerError::NoRoute`].
     fn parse_quote(raw: &serde_json::Value) -> Result<u64> {
         let quote: QuoteResponse = serde_json::from_value(raw.clone())
@@ -503,6 +540,8 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             fee_account: self.fee_account.clone(),
             wrap_and_unwrap_sol: true,
             as_legacy_transaction: self.legacy_transaction,
+            prioritization_fee_lamports: "auto",
+            dynamic_compute_unit_limit: true,
         };
         let body_value = serde_json::to_value(&body)
             .map_err(|e| RelayerError::SwapFailed(format!("encode swap body: {e}")))?;
@@ -610,7 +649,7 @@ mod tests {
         }
     }
 
-    /// A recorded `/v6/swap` body whose `swapTransaction` is a real base64
+    /// A recorded `/swap (v1)` body whose `swapTransaction` is a real base64
     /// versioned transaction (a transfer), so `decode_swap_tx` succeeds.
     fn sample_swap_tx_json() -> serde_json::Value {
         use solana_sdk::message::{Message, VersionedMessage};
@@ -720,6 +759,8 @@ mod tests {
             fee_account: None,
             wrap_and_unwrap_sol: true,
             as_legacy_transaction: false,
+            prioritization_fee_lamports: "auto",
+            dynamic_compute_unit_limit: true,
         };
         let v = serde_json::to_value(&plain).unwrap();
         assert!(v.get("asLegacyTransaction").is_none(), "default omits flag");
