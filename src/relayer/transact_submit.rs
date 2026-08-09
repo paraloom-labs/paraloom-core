@@ -82,7 +82,7 @@ pub struct Membership {
 /// stale/wrong read fails here rather than at proving.
 ///
 /// Tree account layout: disc(8) | next_index(8) | root_index(8) | root(32) |
-/// filled_subtrees[TX_LEVELS][32] (from offset 56).
+/// `filled_subtrees[TX_LEVELS][32]` (from offset 56).
 pub fn read_membership(
     client: &RpcClient,
     program_id: &Pubkey,
