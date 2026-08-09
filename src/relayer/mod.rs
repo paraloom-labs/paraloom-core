@@ -14,6 +14,7 @@
 pub mod jupiter;
 pub mod onchain;
 pub mod private_swap;
+pub mod transact_submit;
 
 pub use jupiter::{
     asset_to_mint, JupiterHttpClient, JupiterSwapProvider, ReqwestJupiterClient, RpcSwapSubmitter,
