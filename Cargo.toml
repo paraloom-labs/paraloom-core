@@ -210,7 +210,7 @@ ark-crypto-primitives = { version = "0.4", features = ["r1cs", "sponge"] }
 # (circuit v3, #350). Host hash + constant source for the in-circuit gadget.
 light-poseidon = "0.2.0"
 # On-chain Groth16 verification path (BN254 / alt_bn128). #249/#165.
-solana-bn254 = "2.2"
+solana-bn254 = "2.2.2"
 num-bigint = "0.4"
 
 # Solana dependencies (optional, enabled with solana-bridge feature)
