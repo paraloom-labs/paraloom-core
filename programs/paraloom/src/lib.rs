@@ -424,14 +424,25 @@ pub mod paraloom_program {
         let mut fee = 0u64;
         if ext_amount < 0 {
             let gross = ext_amount.unsigned_abs();
-            let vault_balance = ctx.accounts.bridge_vault.lamports();
-            require!(vault_balance >= gross, BridgeError::InsufficientFunds);
-
             fee = gross
                 .checked_mul(WITHDRAWAL_FEE_BPS)
                 .and_then(|v| v.checked_div(10_000))
                 .ok_or(BridgeError::InvalidAmount)?;
             let payout = gross - fee;
+
+            // The vault is a system account and must stay rent-exempt after the
+            // payout. Guard on `payout + rent_floor`, not `gross`: only `payout`
+            // leaves (the fee stays), so a `gross`-only guard let the balance
+            // drop to `fee` — below the rent floor — and the runtime then
+            // rejected the whole transaction. Guarding on the retained balance
+            // turns that spurious liveness failure into a clean InsufficientFunds
+            // (paraloom-core#761).
+            let vault_balance = ctx.accounts.bridge_vault.lamports();
+            let rent_floor = Rent::get()?.minimum_balance(0);
+            require!(
+                vault_balance >= payout.saturating_add(rent_floor),
+                BridgeError::InsufficientFunds
+            );
 
             let vault_bump = ctx.bumps.bridge_vault;
             let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
@@ -745,6 +756,8 @@ pub mod paraloom_program {
 
         validator_registry.active_validators =
             validator_registry.active_validators.saturating_sub(1);
+        validator_registry.total_validators =
+            validator_registry.total_validators.saturating_sub(1);
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_sub(stake_amount);
