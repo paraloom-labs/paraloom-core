@@ -12,6 +12,7 @@ mod groth16;
 pub mod merkle_tree;
 mod quorum;
 pub mod transact_fixture_data;
+pub mod transact_spl_fixture_data;
 mod transact_verifier;
 mod transact_vk_data;
 
