@@ -131,7 +131,9 @@ async fn unregister_clears_active_and_decrements_registry() {
         .unwrap();
     let registry = ValidatorRegistry::try_deserialize(&mut registry_raw.data.as_slice()).unwrap();
     assert_eq!(registry.active_validators, 0);
-    assert_eq!(registry.total_validators, 1);
+    // total_validators is decremented on unregister too (#760); the sole
+    // registered validator leaving brings it back to 0.
+    assert_eq!(registry.total_validators, 0);
 
     let acc_raw = banks_client
         .get_account(validator_pda)
