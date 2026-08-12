@@ -77,10 +77,15 @@ fn main() {
     const OUT1: u64 = 100;
     const EXT_AMOUNT: i64 = -500;
 
-    // The asset field element: the mint bytes reduced mod the BN254 order,
-    // matching what the on-chain verifier derives from the same bytes and what
-    // Poseidon reduces the deposit commitment's asset input to.
-    let asset = Fr::from_le_bytes_mod_order(&MINT);
+    // The asset field element: Poseidon(2) over the mint's two 16-byte
+    // little-endian halves, matching the on-chain `merkle_tree::mint_to_asset`.
+    // A raw mint pubkey is usually non-canonical (>= p) and Poseidon rejects it,
+    // so we hash two independently-canonical halves into a canonical, collision-
+    // resistant asset id. `v3_merkle_pair` is the circuit's Poseidon(2), proven
+    // bit-identical to the on-chain `poseidon2`.
+    let mint_lo = Fr::from_le_bytes_mod_order(&MINT[..16]);
+    let mint_hi = Fr::from_le_bytes_mod_order(&MINT[16..]);
+    let asset = v3_merkle_pair(mint_lo, mint_hi);
     let ext_data_hash = transact_ext_data_hash(&RECIPIENT_TOKEN_ACCOUNT, EXT_AMOUNT);
 
     // Real input note.

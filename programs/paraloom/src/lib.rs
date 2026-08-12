@@ -570,7 +570,7 @@ pub mod paraloom_program {
             ext_amount,
         );
         let public_amount = public_amount_bytes(ext_amount);
-        let asset = ctx.accounts.mint.key().to_bytes();
+        let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
         require!(
             ctx.accounts.validator_account.is_active,
@@ -1356,7 +1356,7 @@ pub mod paraloom_program {
             .ok_or(BridgeError::InvalidAmount)?;
         require!(realized == amount, BridgeError::InvalidAmount);
 
-        let asset = ctx.accounts.mint.key().to_bytes();
+        let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
         let commitment = crate::merkle_tree::commitment(amount, &pubkey, &blinding, &asset)?;
         let mut tree = ctx.accounts.merkle_tree.load_mut()?;
         let leaf_index = tree.next_index;
