@@ -1045,14 +1045,141 @@ pub mod paraloom_program {
     ///
     /// Creates the program-owned `TokenAccount` PDA (`seeds = [b"asset_vault",
     /// mint]`), owned by the shared `asset_vault_authority` PDA that signs token
-    /// outflows on an SPL `transact` withdraw. `deposit_note_spl` funds it.
+    /// outflows on an SPL `transact` withdraw, plus the `AssetConfig` PDA that
+    /// holds this mint's fail-closed deposit cap and accounting.
+    /// `deposit_note_spl` funds the vault.
+    ///
     /// Upgrade-authority-gated: the operator enables a mint for shielding by
     /// creating its vault (a curated start; it can be opened permissionless
-    /// later). Purely additive — native SOL is untouched and keeps using
+    /// later). The cap starts at 0 — closed — so no SPL can be deposited until
+    /// `set_asset_deposit_cap` opens it, mirroring the native `deposit_cap`
+    /// default. Purely additive — native SOL is untouched and keeps using
     /// `bridge_vault`.
     pub fn init_asset_vault(ctx: Context<InitAssetVault>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let config = &mut ctx.accounts.asset_config;
+        config.mint = ctx.accounts.mint.key();
+        config.deposit_cap = 0;
+        config.total_deposited = 0;
+        config.deposit_count = 0;
+        config.bump = ctx.bumps.asset_config;
+
         msg!("Asset vault initialized (mint {})", ctx.accounts.mint.key());
+        Ok(())
+    }
+
+    /// Raise (or lower) the per-asset SPL deposit cap for `mint` (#779).
+    ///
+    /// The SPL analogue of `set_deposit_cap`: bounds funds-at-risk for one
+    /// shielded token to a chosen ceiling on the vault's live token balance.
+    /// Upgrade-authority-gated and starts at 0, so a mint is inert until the
+    /// cold authority deliberately opens it.
+    pub fn set_asset_deposit_cap(ctx: Context<SetAssetDepositCap>, new_cap: u64) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        let config = &mut ctx.accounts.asset_config;
+        let previous = config.deposit_cap;
+        config.deposit_cap = new_cap;
+        msg!(
+            "Asset deposit cap for mint {} set {} -> {}",
+            config.mint,
+            previous,
+            new_cap
+        );
+        Ok(())
+    }
+
+    /// Shield an SPL token into a note (#779): the asset-aware analogue of
+    /// [`deposit_note`]. Moves `amount` of `mint` from the depositor into that
+    /// mint's `asset_vault` and appends a commitment whose `asset` field is the
+    /// mint bytes (not the all-zero native asset), so the note is spendable by
+    /// the same asset-aware `transact` circuit.
+    ///
+    /// Fail-closed like the native path: refuses when the bridge is paused and
+    /// when the deposit would push the vault's live token balance past this
+    /// mint's `deposit_cap` (which starts at 0). Fee-on-transfer mints are
+    /// rejected — the realized received amount must equal `amount`, or the
+    /// committed note would out-value the vault and the wallet's client-side
+    /// commitment (which hashes `amount`) would not match the leaf.
+    pub fn deposit_note_spl(
+        ctx: Context<DepositNoteSpl>,
+        amount: u64,
+        pubkey: [u8; 32],
+        blinding: [u8; 32],
+    ) -> Result<()> {
+        require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
+        require!(amount > 0, BridgeError::InvalidAmount);
+        require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
+        require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
+
+        // Per-asset TVL cap, checked against the vault's *live* token balance
+        // before moving funds, exactly like the native path checks lamports.
+        let projected_vault_balance = ctx
+            .accounts
+            .asset_vault
+            .amount
+            .checked_add(amount)
+            .ok_or(BridgeError::InvalidAmount)?;
+        require!(
+            projected_vault_balance <= ctx.accounts.asset_config.deposit_cap,
+            BridgeError::DepositCapExceeded
+        );
+
+        // Move the tokens in. `transfer_checked` is the Token-2022-safe form.
+        let balance_before = ctx.accounts.asset_vault.amount;
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.depositor_token_account.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.asset_vault.to_account_info(),
+                    authority: ctx.accounts.depositor.to_account_info(),
+                },
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        // Reject fee-on-transfer mints: the vault must have received exactly
+        // `amount`, or the note (which commits `amount`) would over-value the
+        // vault. Reload to read the realized post-transfer balance.
+        ctx.accounts.asset_vault.reload()?;
+        let realized = ctx
+            .accounts
+            .asset_vault
+            .amount
+            .checked_sub(balance_before)
+            .ok_or(BridgeError::InvalidAmount)?;
+        require!(realized == amount, BridgeError::InvalidAmount);
+
+        let asset = ctx.accounts.mint.key().to_bytes();
+        let commitment = crate::merkle_tree::commitment(amount, &pubkey, &blinding, &asset)?;
+        let mut tree = ctx.accounts.merkle_tree.load_mut()?;
+        let leaf_index = tree.next_index;
+        tree.append(commitment)?;
+
+        let config = &mut ctx.accounts.asset_config;
+        config.total_deposited = config
+            .total_deposited
+            .checked_add(amount)
+            .ok_or(BridgeError::InvalidAmount)?;
+        config.deposit_count = config.deposit_count.saturating_add(1);
+
+        emit!(DepositNoteSplEvent {
+            depositor: ctx.accounts.depositor.key(),
+            mint: ctx.accounts.mint.key(),
+            amount,
+            commitment,
+            leaf_index,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        msg!(
+            "SPL deposit note appended at leaf {} (mint {})",
+            leaf_index,
+            ctx.accounts.mint.key()
+        );
         Ok(())
     }
 
@@ -1844,6 +1971,16 @@ pub struct InitAssetVault<'info> {
     #[account(seeds = [b"asset_vault_authority"], bump)]
     pub asset_vault_authority: UncheckedAccount<'info>,
 
+    /// Per-asset config: fail-closed deposit cap (starts 0) plus accounting.
+    #[account(
+        init,
+        payer = authority,
+        space = AssetConfig::SPACE,
+        seeds = [b"asset_config", mint.key().as_ref()],
+        bump,
+    )]
+    pub asset_config: Account<'info, AssetConfig>,
+
     /// Upgrade-authority gate (#204), same as the other `initialize_*`.
     ///
     /// CHECK: validated by seeds + `check_upgrade_authority` body call.
@@ -1857,6 +1994,63 @@ pub struct InitAssetVault<'info> {
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`set_asset_deposit_cap`] — open/adjust one mint's SPL cap.
+#[derive(Accounts)]
+pub struct SetAssetDepositCap<'info> {
+    #[account(mut, seeds = [b"asset_config", asset_config.mint.as_ref()], bump = asset_config.bump)]
+    pub asset_config: Account<'info, AssetConfig>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204).
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+}
+
+/// Accounts for [`deposit_note_spl`] — shield an SPL token into a note (#779).
+#[derive(Accounts)]
+pub struct DepositNoteSpl<'info> {
+    /// Read only for the global `paused` flag; SPL accounting lives in
+    /// `asset_config`, so `BridgeState` is never mutated here.
+    #[account(seeds = [b"bridge_state"], bump)]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    #[account(mut, seeds = [b"asset_config", mint.key().as_ref()], bump = asset_config.bump)]
+    pub asset_config: Account<'info, AssetConfig>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump,
+        token::mint = mint,
+    )]
+    pub asset_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = depositor,
+    )]
+    pub depositor_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, seeds = [b"merkle_tree"], bump)]
+    pub merkle_tree: AccountLoader<'info, crate::merkle_tree::IncrementalMerkleTree>,
+
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 /// Accounts for [`migrate_bridge_state`] — grow a pre-`deposit_cap` BridgeState.
@@ -2206,6 +2400,28 @@ pub struct BridgeState {
     pub deposit_cap: u64,
 }
 
+/// Per-asset SPL shielding config (#779): one PDA per enabled mint, holding a
+/// fail-closed deposit cap plus accounting. The SPL parallel to `BridgeState`'s
+/// native `deposit_cap`/`total_deposited`/`deposit_count`, kept separate so the
+/// native lamport path's byte layout and semantics are untouched.
+#[account]
+pub struct AssetConfig {
+    /// The mint this config governs (redundant with the PDA seed; stored so
+    /// `SetAssetDepositCap` can re-derive the seed without a mint account).
+    pub mint: Pubkey,
+    /// Ceiling on the vault's **current** token balance; deposits closed at 0.
+    pub deposit_cap: u64,
+    /// Cumulative shielded into this asset (informational, like the native one).
+    pub total_deposited: u64,
+    pub deposit_count: u64,
+    pub bump: u8,
+}
+
+impl AssetConfig {
+    /// 8 discriminator + 32 mint + 8 cap + 8 total + 8 count + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 1;
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct NullifierAccount {
@@ -2278,6 +2494,16 @@ pub struct ValidatorAccount {
 #[event]
 pub struct DepositNoteEvent {
     pub depositor: Pubkey,
+    pub amount: u64,
+    pub commitment: [u8; 32],
+    pub leaf_index: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct DepositNoteSplEvent {
+    pub depositor: Pubkey,
+    pub mint: Pubkey,
     pub amount: u64,
     pub commitment: [u8; 32],
     pub leaf_index: u64,
