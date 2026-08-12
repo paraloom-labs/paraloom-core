@@ -99,12 +99,21 @@ async fn init_spl_pool(
         }
         .to_account_metas(None),
     };
+    // init the vault in one transaction, then open the cap in a SEPARATE one.
+    // set_asset_deposit_cap mutates the asset_config the init just created, and
+    // a later instruction in the same transaction does not observe that create
+    // reliably under solana-program-test; on mainnet these are separate
+    // cold-authority operations anyway.
     let mut tx = Transaction::new_with_payer(
-        &[init_state, init_tree, init_vault, set_cap],
+        &[init_state, init_tree, init_vault],
         Some(&upgrade_authority.pubkey()),
     );
     tx.sign(&[upgrade_authority], blockhash);
     banks.process_transaction(tx).await.unwrap();
+
+    let mut cap_tx = Transaction::new_with_payer(&[set_cap], Some(&upgrade_authority.pubkey()));
+    cap_tx.sign(&[upgrade_authority], blockhash);
+    banks.process_transaction(cap_tx).await.unwrap();
 }
 
 fn deposit_spl_ix(
