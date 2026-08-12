@@ -1041,6 +1041,21 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Initialize a per-asset shielded-token vault for `mint` (#779).
+    ///
+    /// Creates the program-owned `TokenAccount` PDA (`seeds = [b"asset_vault",
+    /// mint]`), owned by the shared `asset_vault_authority` PDA that signs token
+    /// outflows on an SPL `transact` withdraw. `deposit_note_spl` funds it.
+    /// Upgrade-authority-gated: the operator enables a mint for shielding by
+    /// creating its vault (a curated start; it can be opened permissionless
+    /// later). Purely additive — native SOL is untouched and keeps using
+    /// `bridge_vault`.
+    pub fn init_asset_vault(ctx: Context<InitAssetVault>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        msg!("Asset vault initialized (mint {})", ctx.accounts.mint.key());
+        Ok(())
+    }
+
     /// Grow a `BridgeState` account created before the `deposit_cap` field to the
     /// current layout.
     ///
@@ -1782,6 +1797,52 @@ pub struct InitStakeTokenVault<'info> {
     /// CHECK: address pinned by seeds; used only as the vault's token authority.
     #[account(seeds = [b"stake_vault_authority"], bump)]
     pub stake_vault_authority: UncheckedAccount<'info>,
+
+    /// Upgrade-authority gate (#204), same as the other `initialize_*`.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`init_asset_vault`] — a per-asset shielded-token vault (#779).
+/// Mirrors [`InitStakeTokenVault`] but keyed by `mint`, so there is one vault
+/// per shielded SPL asset.
+#[derive(Accounts)]
+pub struct InitAssetVault<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The SPL mint this vault holds shielded balances of.
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    /// Per-asset vault: one program-owned `TokenAccount` PDA per mint, owned by
+    /// the shared `asset_vault_authority`. `deposit_note_spl` funds it; an SPL
+    /// `transact` withdraw pays out of it.
+    #[account(
+        init,
+        payer = authority,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump,
+        token::mint = mint,
+        token::authority = asset_vault_authority,
+        token::token_program = token_program,
+    )]
+    pub asset_vault: InterfaceAccount<'info, TokenAccount>,
+
+    /// PDA that owns every asset vault; signs token outflows on an SPL withdraw.
+    ///
+    /// CHECK: address pinned by seeds; used only as the vaults' token authority.
+    #[account(seeds = [b"asset_vault_authority"], bump)]
+    pub asset_vault_authority: UncheckedAccount<'info>,
 
     /// Upgrade-authority gate (#204), same as the other `initialize_*`.
     ///
