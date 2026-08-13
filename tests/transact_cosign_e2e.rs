@@ -198,6 +198,7 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
     let mut request = TransactVerificationRequest {
         request_id: String::new(),
         recipient: [7u8; 32],
+        mint: None,
         nullifiers: [nf0, nf1],
         output_commitments: [[11u8; 32], [12u8; 32]],
         root: [13u8; 32],
