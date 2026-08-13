@@ -2003,20 +2003,30 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
-        let request_id = coordinator.start_verification(request.clone()).await?;
-
-        // The initiator does not receive its own gossip broadcast, so it must
-        // self-verify and submit its own vote (registering self into the
-        // validator set first so it is non-empty) — the withdrawal/transfer
-        // twins do the same. Without it a 2-node cohort only ever collects the
-        // remote vote and never reaches the quorum. Still one vote toward the
-        // BFT threshold, not a bypass of it.
-        let locally_valid = {
-            let self_id = self.node_info.id.clone();
+        // Register self into the validator set BEFORE start_verification, which
+        // rejects an empty set with "No validators available". The initiator
+        // never receives its own gossip broadcast, so on a single-node cohort (a
+        // bootstrap validator) or a freshly restarted one the set would otherwise
+        // be empty and the request would be refused before this node ever votes —
+        // the pool could take deposits but never settle a spend. Idempotent, so a
+        // multi-node cohort is unaffected. `self_id` is reused below as this
+        // node's vote source, so it lives at the function scope.
+        let self_id = self.node_info.id.clone();
+        {
             let wallet = self.cosign_keypair.as_ref().map(|k| k.pubkey().to_string());
             coordinator
                 .register_validator_with_wallet(self_id.clone(), wallet)
                 .await;
+        }
+
+        let request_id = coordinator.start_verification(request.clone()).await?;
+
+        // The initiator does not receive its own gossip broadcast, so it must
+        // self-verify and submit its own vote — the withdrawal/transfer twins do
+        // the same. Without it a 2-node cohort only ever collects the remote vote
+        // and never reaches the quorum. Still one vote toward the BFT threshold,
+        // not a bypass of it.
+        let locally_valid = {
             let vote = match self.verify_transact_proof(&request).await {
                 Ok(true) => {
                     // Record the encrypted notes (#196) only AFTER the proof
