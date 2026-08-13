@@ -222,16 +222,14 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         }
     };
 
-    // A transact settlement verifies its proof on-chain and needs the raised
-    // compute-unit ceiling prepended; every co-signer builds the same message,
-    // so the extra instruction stays part of what they all sign over.
-    let mut instructions = Vec::with_capacity(2);
     // Both settlement paths verify a Groth16 proof on-chain and need the raised
-    // compute-unit ceiling; SPL additionally does two token CPIs.
-    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-        TRANSACT_COMPUTE_UNIT_LIMIT,
-    ));
-    instructions.push(instruction);
+    // compute-unit ceiling prepended (SPL additionally does two token CPIs);
+    // every co-signer builds the same message, so the extra instruction stays
+    // part of what they all sign over.
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(TRANSACT_COMPUTE_UNIT_LIMIT),
+        instruction,
+    ];
 
     let blockhash = Hash::new_from_array(payload.blockhash);
     Ok(Message::new_with_blockhash(
