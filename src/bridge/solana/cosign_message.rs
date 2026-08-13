@@ -51,6 +51,20 @@ pub enum SettlementParams {
         /// 256-byte alt_bn128 wire proof.
         proof: Vec<u8>,
     },
+    /// An SPL-token `transact_spl` settlement (#779): the same 2-in/2-out spend
+    /// but the payout leaves `mint`'s per-asset vault and `recipient` is the
+    /// recipient **token account**. The settling validator's fee token account
+    /// is derived from the payload `authority` + `mint` (its ATA), so every
+    /// co-signer builds the same instruction without an extra field.
+    TransactSpl {
+        recipient_token_account: [u8; 32],
+        mint: [u8; 32],
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        root: [u8; 32],
+        ext_amount: i64,
+        proof: Vec<u8>,
+    },
 }
 
 /// Everything needed to rebuild the settlement transaction message a co-signer
@@ -92,7 +106,10 @@ impl CoSignPayload {
         // megabytes of padding to every co-signer (#757); the on-chain
         // `MAX_PROOF_LEN` only binds at submission, after each node has already
         // decoded the payload.
-        let SettlementParams::Transact { proof, .. } = &payload.params;
+        let proof = match &payload.params {
+            SettlementParams::Transact { proof, .. } => proof,
+            SettlementParams::TransactSpl { proof, .. } => proof,
+        };
         if proof.len() > MAX_PROOF_BYTES {
             return Err(BridgeError::Serialization(format!(
                 "co-sign proof field is {} bytes, exceeds {MAX_PROOF_BYTES}",
@@ -170,18 +187,49 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &quorum,
             )?
         }
+        SettlementParams::TransactSpl {
+            recipient_token_account,
+            mint,
+            nullifiers,
+            output_commitments,
+            root,
+            ext_amount,
+            proof,
+        } => {
+            let mint_pk = Pubkey::new_from_array(*mint);
+            let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            // The settling validator's fee lands in its own ATA for the mint,
+            // derived deterministically so every co-signer builds the same ix.
+            let fee_ta = super::instructions::derive_associated_token_address(
+                &authority,
+                &mint_pk,
+                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+            );
+            super::instructions::create_transact_spl_instruction(
+                &program_id,
+                &authority,
+                &mint_pk,
+                &recipient_ta,
+                &fee_ta,
+                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                *nullifiers,
+                *output_commitments,
+                *root,
+                *ext_amount,
+                proof.clone(),
+                &quorum,
+            )?
+        }
     };
 
-    // A transact settlement verifies its proof on-chain and needs the raised
-    // compute-unit ceiling prepended; every co-signer builds the same message,
-    // so the extra instruction stays part of what they all sign over.
-    let mut instructions = Vec::with_capacity(2);
-    if matches!(payload.params, SettlementParams::Transact { .. }) {
-        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-            TRANSACT_COMPUTE_UNIT_LIMIT,
-        ));
-    }
-    instructions.push(instruction);
+    // Both settlement paths verify a Groth16 proof on-chain and need the raised
+    // compute-unit ceiling prepended (SPL additionally does two token CPIs);
+    // every co-signer builds the same message, so the extra instruction stays
+    // part of what they all sign over.
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(TRANSACT_COMPUTE_UNIT_LIMIT),
+        instruction,
+    ];
 
     let blockhash = Hash::new_from_array(payload.blockhash);
     Ok(Message::new_with_blockhash(
@@ -234,10 +282,12 @@ mod tests {
         // The security property: a validator that rebuilds from verified
         // parameters never signs a substituted transact recipient.
         let mut tampered = sample_transact_payload();
-        let SettlementParams::Transact {
+        if let SettlementParams::Transact {
             ref mut recipient, ..
-        } = tampered.params;
-        *recipient = [99u8; 32];
+        } = tampered.params
+        {
+            *recipient = [99u8; 32];
+        }
         let original = build_settlement_message(&sample_transact_payload()).expect("build");
         let changed = build_settlement_message(&tampered).expect("build tampered");
         assert_ne!(original.serialize(), changed.serialize());

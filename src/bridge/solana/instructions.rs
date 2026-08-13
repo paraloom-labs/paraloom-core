@@ -72,6 +72,9 @@ pub mod discriminators {
     /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
     /// the on-chain incremental tree.
     pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
+    /// `sha256("global:transact_spl")[..8]` (#779). The SPL-token settlement
+    /// path: pays a token withdraw from the per-mint asset vault.
+    pub const TRANSACT_SPL: [u8; 8] = [154, 66, 244, 204, 78, 225, 163, 151];
     /// `sha256("global:deposit_note")[..8]` (#350). v3 deposit that appends the
     /// note commitment to the on-chain tree.
     pub const DEPOSIT_NOTE: [u8; 8] = [75, 212, 96, 185, 178, 167, 29, 57];
@@ -561,6 +564,80 @@ pub fn create_transact_instruction(
     })
 }
 
+/// Create the `transact_spl` instruction (#779): the SPL analogue of
+/// [`create_transact_instruction`]. Pays a token withdraw out of `mint`'s
+/// per-asset vault (PDA-signed) instead of lamports out of `bridge_vault`, and
+/// pays the settling validator's fee in the same token to `fee_token_account`.
+///
+/// Account order must match the on-chain `TransactSpl` accounts struct exactly:
+/// bridge_state, merkle_tree, mint, asset_vault, asset_vault_authority,
+/// recipient_token_account, fee_token_account, nullifier_0, nullifier_1,
+/// validator_account, validator_registry, authority, token_program,
+/// system_program, then the quorum `(wallet, PDA)` pairs.
+#[allow(clippy::too_many_arguments)]
+pub fn create_transact_spl_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    recipient_token_account: &Pubkey,
+    fee_token_account: &Pubkey,
+    token_program: &Pubkey,
+    nullifiers: [[u8; 32]; 2],
+    output_commitments: [[u8; 32]; 2],
+    root: [u8; 32],
+    ext_amount: i64,
+    proof: Vec<u8>,
+    quorum_validators: &[Pubkey],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+    let (validator_registry_pda, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], program_id);
+    let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
+    let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
+    let (validator_pda, _) = derive_validator_account(program_id, authority);
+    let (asset_vault_pda, _) =
+        Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id);
+    let (asset_vault_authority_pda, _) =
+        Pubkey::find_program_address(&[b"asset_vault_authority"], program_id);
+
+    let data = TransactInstructionData {
+        nullifiers,
+        output_commitments,
+        root,
+        ext_amount,
+        proof,
+    };
+    let mut instruction_data = discriminators::TRANSACT_SPL.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    let mut accounts = vec![
+        AccountMeta::new(bridge_state_pda, false),
+        AccountMeta::new(merkle_tree_pda, false),
+        AccountMeta::new_readonly(*mint, false),
+        AccountMeta::new(asset_vault_pda, false),
+        AccountMeta::new_readonly(asset_vault_authority_pda, false),
+        AccountMeta::new(*recipient_token_account, false),
+        AccountMeta::new(*fee_token_account, false),
+        AccountMeta::new(nullifier_pda_0, false),
+        AccountMeta::new(nullifier_pda_1, false),
+        AccountMeta::new(validator_pda, false),
+        AccountMeta::new_readonly(validator_registry_pda, false),
+        AccountMeta::new(*authority, true),
+        AccountMeta::new_readonly(*token_program, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts,
+        data: instruction_data,
+    })
+}
+
 /// Create the `deposit_note` instruction (circuit v3, #350).
 ///
 /// Permissionless: the depositor moves their own lamports into the vault and
@@ -905,6 +982,73 @@ mod tests {
         assert!(!ix.accounts[13].is_signer);
 
         assert_eq!(&ix.data[..8], &discriminators::TRANSACT);
+    }
+
+    #[test]
+    fn test_create_transact_spl_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let recipient_token = Pubkey::new_unique();
+        let fee_token = Pubkey::new_unique();
+        let cosigner = Pubkey::new_unique();
+
+        let ix = create_transact_spl_instruction(
+            &program_id,
+            &authority,
+            &mint,
+            &recipient_token,
+            &fee_token,
+            &SPL_TOKEN_PROGRAM_ID,
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -500,
+            vec![0u8; 256],
+            &[authority, cosigner],
+        )
+        .expect("build transact_spl instruction");
+
+        assert_eq!(ix.program_id, program_id);
+        // 14 base accounts (see the account-order doc) + 2 quorum (wallet, PDA) pairs.
+        assert_eq!(ix.accounts.len(), 14 + 4);
+        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
+        assert_eq!(ix.accounts[1].pubkey, derive_merkle_tree(&program_id).0);
+        assert_eq!(ix.accounts[2].pubkey, mint);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], &program_id).0
+        );
+        assert!(ix.accounts[3].is_writable);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            Pubkey::find_program_address(&[b"asset_vault_authority"], &program_id).0
+        );
+        assert_eq!(ix.accounts[5].pubkey, recipient_token);
+        assert_eq!(ix.accounts[6].pubkey, fee_token);
+        assert_eq!(
+            ix.accounts[7].pubkey,
+            derive_nullifier_account(&program_id, &[1u8; 32]).0
+        );
+        assert_eq!(
+            ix.accounts[8].pubkey,
+            derive_nullifier_account(&program_id, &[2u8; 32]).0
+        );
+        assert_eq!(
+            ix.accounts[9].pubkey,
+            derive_validator_account(&program_id, &authority).0
+        );
+        assert_eq!(ix.accounts[11].pubkey, authority);
+        assert!(ix.accounts[11].is_signer);
+        assert_eq!(ix.accounts[12].pubkey, SPL_TOKEN_PROGRAM_ID);
+        // Quorum pairs after the 14 base accounts: each wallet signs, PDA does not.
+        assert_eq!(ix.accounts[14].pubkey, authority);
+        assert!(ix.accounts[14].is_signer);
+        assert_eq!(ix.accounts[16].pubkey, cosigner);
+        assert!(ix.accounts[16].is_signer);
+        assert!(!ix.accounts[17].is_signer);
+
+        assert_eq!(&ix.data[..8], &discriminators::TRANSACT_SPL);
     }
 
     /// Field ordering is observable on the wire — Anchor decodes borsh fields

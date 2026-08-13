@@ -150,6 +150,24 @@ pub fn v3_merkle_pair(left: Fr, right: Fr) -> Fr {
     circom_poseidon(&[left, right])
 }
 
+/// The shielded-asset field element for an SPL `mint` (#779): `Poseidon(2)` over
+/// the mint's two 16-byte little-endian halves, as 32 little-endian bytes.
+///
+/// Bit-identical to the on-chain `merkle_tree::mint_to_asset` and the wallet's
+/// `mint_to_asset` — a raw mint pubkey is usually non-canonical (>= p), so
+/// hashing two canonical halves yields a canonical, collision-resistant asset
+/// id. Native SOL keeps the all-zero asset and never calls this.
+pub fn mint_to_asset(mint: &[u8; 32]) -> [u8; 32] {
+    use ark_ff::{BigInteger, PrimeField};
+    let lo = Fr::from_le_bytes_mod_order(&mint[..16]);
+    let hi = Fr::from_le_bytes_mod_order(&mint[16..]);
+    let asset = v3_merkle_pair(lo, hi);
+    let mut out = [0u8; 32];
+    let le = asset.into_bigint().to_bytes_le();
+    out[..le.len().min(32)].copy_from_slice(&le[..le.len().min(32)]);
+    out
+}
+
 /// In-circuit: `Poseidon(1)([privkey])`.
 pub fn v3_pubkey_gadget(
     cs: ConstraintSystemRef<Fr>,

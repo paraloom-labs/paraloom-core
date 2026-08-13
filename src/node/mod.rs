@@ -1000,6 +1000,38 @@ async fn cosign_settlement(
             ];
             (approved, cap_nullifiers)
         }
+        // SPL settlement (#779): the same binding check, but the payload's
+        // recipient is the recipient token account and the asset is bound by
+        // `mint`, so a co-signer only signs an SPL spend it verified Valid for
+        // exactly this mint.
+        (
+            SettlementKind::Transact,
+            SettlementParams::TransactSpl {
+                recipient_token_account,
+                mint,
+                nullifiers,
+                output_commitments,
+                root,
+                ext_amount,
+                ..
+            },
+        ) => {
+            let cache = verified_transacts.lock().await;
+            let approved = cache.get(&request.request_id).is_some_and(|req| {
+                req.recipient == *recipient_token_account
+                    && req.mint == Some(*mint)
+                    && req.nullifiers == *nullifiers
+                    && req.output_commitments == *output_commitments
+                    && req.root == *root
+                    && req.ext_amount == *ext_amount
+            });
+            let auth = hex::encode(payload.authority);
+            let cap_nullifiers = [
+                format!("{}:{auth}", hex::encode(nullifiers[0])),
+                format!("{}:{auth}", hex::encode(nullifiers[1])),
+            ];
+            (approved, cap_nullifiers)
+        }
     };
     if !approved {
         return declined("parameters do not match a settlement we verified");
@@ -2169,13 +2201,26 @@ impl Node {
                     .map_err(|e| anyhow!("transact proof: {e}"))?
             }
         };
-        let params = SettlementParams::Transact {
-            recipient: request.recipient,
-            nullifiers: request.nullifiers,
-            output_commitments: request.output_commitments,
-            root: request.root,
-            ext_amount: request.ext_amount,
-            proof: onchain_proof.to_vec(),
+        // SPL settlement (#779) takes the transact_spl path; `recipient` is the
+        // recipient token account and the vault is the mint's asset vault.
+        let params = match request.mint {
+            Some(mint) => SettlementParams::TransactSpl {
+                recipient_token_account: request.recipient,
+                mint,
+                nullifiers: request.nullifiers,
+                output_commitments: request.output_commitments,
+                root: request.root,
+                ext_amount: request.ext_amount,
+                proof: onchain_proof.to_vec(),
+            },
+            None => SettlementParams::Transact {
+                recipient: request.recipient,
+                nullifiers: request.nullifiers,
+                output_commitments: request.output_commitments,
+                root: request.root,
+                ext_amount: request.ext_amount,
+                proof: onchain_proof.to_vec(),
+            },
         };
 
         let network = self.network.clone();
@@ -2402,12 +2447,18 @@ impl Node {
             return Ok(verifier(request));
         }
 
-        // Asset is native SOL (the all-zero asset id) for now.
+        // Asset id: all-zero for native SOL, or `mint_to_asset(mint)` for an SPL
+        // settlement (#779), so validators verify the proof against the exact
+        // asset that settles.
+        let asset_id = request
+            .mint
+            .map(|m| crate::privacy::poseidon_circom::mint_to_asset(&m))
+            .unwrap_or([0u8; 32]);
         let result = crate::privacy::ProofVerifier::verify_transact_parts(
             &request.root,
             &request.recipient,
             request.ext_amount,
-            &[0u8; 32],
+            &asset_id,
             &request.nullifiers,
             &request.output_commitments,
             &request.proof,
@@ -2550,6 +2601,7 @@ mod tests {
         TransactVerificationRequest {
             request_id: id.to_string(),
             recipient,
+            mint: None,
             nullifiers,
             output_commitments,
             root,
