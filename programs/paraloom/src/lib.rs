@@ -12,6 +12,7 @@ mod groth16;
 pub mod merkle_tree;
 mod quorum;
 pub mod transact_fixture_data;
+pub mod transact_spl_fixture_data;
 mod transact_verifier;
 mod transact_vk_data;
 
@@ -503,6 +504,208 @@ pub mod paraloom_program {
             ext_amount,
             fee,
             validator_account.validator
+        );
+        Ok(())
+    }
+
+    /// SPL analogue of [`transact`] (#779): spend two shielded-token notes and,
+    /// on a withdraw (`ext_amount < 0`), pay `mint` out of that mint's
+    /// `asset_vault` instead of lamports out of `bridge_vault`.
+    ///
+    /// Kept as a separate instruction rather than a branch inside `transact` so
+    /// the live native money path is byte-for-byte unchanged. Everything that
+    /// makes settlement safe is identical: the same on-chain tree + known-root
+    /// ring buffer, the same nullifier PDAs (shared `b"nullifier"` namespace, so
+    /// a note cannot be double-spent across the native and SPL paths), the same
+    /// supermajority quorum, and the same v3 Groth16 verifier — only the `asset`
+    /// public input changes from the all-zero native asset to the mint bytes.
+    /// The proof is therefore bound to this exact mint, and `asset_vault` is
+    /// derived from the same `mint`, so a note can only be paid from the vault
+    /// of the asset it was shielded into.
+    pub fn transact_spl(
+        ctx: Context<TransactSpl>,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        root: [u8; 32],
+        ext_amount: i64,
+        proof: Vec<u8>,
+    ) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+
+        require!(!bridge_state.paused, BridgeError::BridgePaused);
+        require!(!proof.is_empty(), BridgeError::InvalidProof);
+        require!(proof.len() <= MAX_PROOF_LEN, BridgeError::ProofTooLarge);
+
+        // Deposits are public and go through `deposit_note_spl`; `transact_spl`
+        // only spends existing notes (withdraw or internal transfer).
+        require!(ext_amount <= 0, BridgeError::InvalidAmount);
+
+        require_canonical_nullifier(&nullifiers[0])?;
+        require_canonical_nullifier(&nullifiers[1])?;
+        require!(
+            nullifiers[0] != nullifiers[1],
+            BridgeError::DuplicateNullifier
+        );
+        require_canonical_field(
+            &output_commitments[0],
+            BridgeError::NonCanonicalFieldElement,
+        )?;
+        require_canonical_field(
+            &output_commitments[1],
+            BridgeError::NonCanonicalFieldElement,
+        )?;
+        require_canonical_field(&root, BridgeError::NonCanonicalFieldElement)?;
+
+        require!(
+            ctx.accounts.merkle_tree.load()?.is_known_root(root),
+            BridgeError::UnknownMerkleRoot
+        );
+
+        // Bind the settlement to the recipient token account + signed amount.
+        // The asset is bound separately via the `asset` public input below, and
+        // the recipient token account address is mint-specific, so a proof for
+        // one asset cannot redirect another's vault.
+        let ext_data_hash = transact_ext_data_hash(
+            &ctx.accounts.recipient_token_account.key(),
+            ext_amount,
+        );
+        let public_amount = public_amount_bytes(ext_amount);
+        let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
+
+        require!(
+            ctx.accounts.validator_account.is_active,
+            BridgeError::ValidatorNotActive
+        );
+
+        quorum::verify_validator_quorum(
+            ctx.program_id,
+            &ctx.accounts.validator_registry,
+            &ctx.accounts.authority.key(),
+            if ctx.accounts.validator_account.is_active {
+                ctx.accounts.validator_account.stake_amount
+            } else {
+                0
+            },
+            ctx.remaining_accounts,
+        )?;
+
+        require!(
+            transact_verifier::verify_transact(
+                &root,
+                &public_amount,
+                &ext_data_hash,
+                &asset,
+                &nullifiers[0],
+                &nullifiers[1],
+                &output_commitments[0],
+                &output_commitments[1],
+                &proof,
+            ),
+            BridgeError::InvalidProof
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        let settlement_id = bridge_state.withdrawal_count.saturating_add(1);
+        let nf0 = &mut ctx.accounts.nullifier_account_0;
+        nf0.nullifier = nullifiers[0];
+        nf0.used_at = now;
+        nf0.withdrawal_id = settlement_id;
+        let nf1 = &mut ctx.accounts.nullifier_account_1;
+        nf1.nullifier = nullifiers[1];
+        nf1.used_at = now;
+        nf1.withdrawal_id = settlement_id;
+
+        let mut tree = ctx.accounts.merkle_tree.load_mut()?;
+        tree.append(output_commitments[0])?;
+        let new_root = tree.append(output_commitments[1])?;
+        drop(tree);
+
+        let validator_account = &mut ctx.accounts.validator_account;
+
+        let mut fee = 0u64;
+        if ext_amount < 0 {
+            let gross = ext_amount.unsigned_abs();
+            fee = gross
+                .checked_mul(WITHDRAWAL_FEE_BPS)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(BridgeError::InvalidAmount)?;
+            let payout = gross - fee;
+
+            // Token accounts are independently rent-exempt, so unlike the native
+            // vault there is no rent floor to reserve; the vault just needs the
+            // gross balance.
+            require!(
+                ctx.accounts.asset_vault.amount >= gross,
+                BridgeError::InsufficientFunds
+            );
+
+            let vault_authority_bump = ctx.bumps.asset_vault_authority;
+            let seeds = &[b"asset_vault_authority".as_ref(), &[vault_authority_bump]];
+            let signer_seeds = &[&seeds[..]];
+
+            // Payout to the recipient token account (bound into the proof).
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    TransferChecked {
+                        from: ctx.accounts.asset_vault.to_account_info(),
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: ctx.accounts.recipient_token_account.to_account_info(),
+                        authority: ctx.accounts.asset_vault_authority.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                payout,
+                ctx.accounts.mint.decimals,
+            )?;
+
+            // Settling-validator fee, paid in the withdrawn asset to the
+            // validator's own token account (constrained to `authority` in the
+            // accounts struct). The native path credits lamport `pending_rewards`
+            // for a later claim; here the token fee is paid inline.
+            if fee > 0 {
+                token_interface::transfer_checked(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.asset_vault.to_account_info(),
+                            mint: ctx.accounts.mint.to_account_info(),
+                            to: ctx.accounts.fee_token_account.to_account_info(),
+                            authority: ctx.accounts.asset_vault_authority.to_account_info(),
+                        },
+                        signer_seeds,
+                    ),
+                    fee,
+                    ctx.accounts.mint.decimals,
+                )?;
+            }
+        }
+
+        validator_account.total_tasks_verified =
+            validator_account.total_tasks_verified.saturating_add(1);
+        validator_account.successful_verifications =
+            validator_account.successful_verifications.saturating_add(1);
+        validator_account.last_active = now;
+        bridge_state.withdrawal_count = settlement_id;
+
+        emit!(TransactEvent {
+            nullifier0: nullifiers[0],
+            nullifier1: nullifiers[1],
+            out_commitment0: output_commitments[0],
+            out_commitment1: output_commitments[1],
+            new_root,
+            ext_amount,
+            fee,
+            recipient: ctx.accounts.recipient_token_account.key(),
+            timestamp: now,
+            settlement_id,
+        });
+
+        msg!(
+            "Transact SPL settled: mint {}, ext_amount {}, fee {}",
+            ctx.accounts.mint.key(),
+            ext_amount,
+            fee
         );
         Ok(())
     }
@@ -1041,6 +1244,148 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Initialize a per-asset shielded-token vault for `mint` (#779).
+    ///
+    /// Creates the program-owned `TokenAccount` PDA (`seeds = [b"asset_vault",
+    /// mint]`), owned by the shared `asset_vault_authority` PDA that signs token
+    /// outflows on an SPL `transact` withdraw, plus the `AssetConfig` PDA that
+    /// holds this mint's fail-closed deposit cap and accounting.
+    /// `deposit_note_spl` funds the vault.
+    ///
+    /// Upgrade-authority-gated: the operator enables a mint for shielding by
+    /// creating its vault (a curated start; it can be opened permissionless
+    /// later). The cap starts at 0 — closed — so no SPL can be deposited until
+    /// `set_asset_deposit_cap` opens it, mirroring the native `deposit_cap`
+    /// default. Purely additive — native SOL is untouched and keeps using
+    /// `bridge_vault`.
+    pub fn init_asset_vault(ctx: Context<InitAssetVault>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let config = &mut ctx.accounts.asset_config;
+        config.mint = ctx.accounts.mint.key();
+        config.deposit_cap = 0;
+        config.total_deposited = 0;
+        config.deposit_count = 0;
+        config.bump = ctx.bumps.asset_config;
+
+        msg!("Asset vault initialized (mint {})", ctx.accounts.mint.key());
+        Ok(())
+    }
+
+    /// Raise (or lower) the per-asset SPL deposit cap for `mint` (#779).
+    ///
+    /// The SPL analogue of `set_deposit_cap`: bounds funds-at-risk for one
+    /// shielded token to a chosen ceiling on the vault's live token balance.
+    /// Upgrade-authority-gated and starts at 0, so a mint is inert until the
+    /// cold authority deliberately opens it.
+    pub fn set_asset_deposit_cap(ctx: Context<SetAssetDepositCap>, new_cap: u64) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        let config = &mut ctx.accounts.asset_config;
+        let previous = config.deposit_cap;
+        config.deposit_cap = new_cap;
+        msg!(
+            "Asset deposit cap for mint {} set {} -> {}",
+            config.mint,
+            previous,
+            new_cap
+        );
+        Ok(())
+    }
+
+    /// Shield an SPL token into a note (#779): the asset-aware analogue of
+    /// [`deposit_note`]. Moves `amount` of `mint` from the depositor into that
+    /// mint's `asset_vault` and appends a commitment whose `asset` field is the
+    /// mint bytes (not the all-zero native asset), so the note is spendable by
+    /// the same asset-aware `transact` circuit.
+    ///
+    /// Fail-closed like the native path: refuses when the bridge is paused and
+    /// when the deposit would push the vault's live token balance past this
+    /// mint's `deposit_cap` (which starts at 0). Fee-on-transfer mints are
+    /// rejected — the realized received amount must equal `amount`, or the
+    /// committed note would out-value the vault and the wallet's client-side
+    /// commitment (which hashes `amount`) would not match the leaf.
+    pub fn deposit_note_spl(
+        ctx: Context<DepositNoteSpl>,
+        amount: u64,
+        pubkey: [u8; 32],
+        blinding: [u8; 32],
+    ) -> Result<()> {
+        require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
+        require!(amount > 0, BridgeError::InvalidAmount);
+        require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
+        require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
+
+        // Per-asset TVL cap, checked against the vault's *live* token balance
+        // before moving funds, exactly like the native path checks lamports.
+        let projected_vault_balance = ctx
+            .accounts
+            .asset_vault
+            .amount
+            .checked_add(amount)
+            .ok_or(BridgeError::InvalidAmount)?;
+        require!(
+            projected_vault_balance <= ctx.accounts.asset_config.deposit_cap,
+            BridgeError::DepositCapExceeded
+        );
+
+        // Move the tokens in. `transfer_checked` is the Token-2022-safe form.
+        let balance_before = ctx.accounts.asset_vault.amount;
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.depositor_token_account.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.asset_vault.to_account_info(),
+                    authority: ctx.accounts.depositor.to_account_info(),
+                },
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        // Reject fee-on-transfer mints: the vault must have received exactly
+        // `amount`, or the note (which commits `amount`) would over-value the
+        // vault. Reload to read the realized post-transfer balance.
+        ctx.accounts.asset_vault.reload()?;
+        let realized = ctx
+            .accounts
+            .asset_vault
+            .amount
+            .checked_sub(balance_before)
+            .ok_or(BridgeError::InvalidAmount)?;
+        require!(realized == amount, BridgeError::InvalidAmount);
+
+        let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
+        let commitment = crate::merkle_tree::commitment(amount, &pubkey, &blinding, &asset)?;
+        let mut tree = ctx.accounts.merkle_tree.load_mut()?;
+        let leaf_index = tree.next_index;
+        tree.append(commitment)?;
+
+        let config = &mut ctx.accounts.asset_config;
+        config.total_deposited = config
+            .total_deposited
+            .checked_add(amount)
+            .ok_or(BridgeError::InvalidAmount)?;
+        config.deposit_count = config.deposit_count.saturating_add(1);
+
+        emit!(DepositNoteSplEvent {
+            depositor: ctx.accounts.depositor.key(),
+            mint: ctx.accounts.mint.key(),
+            amount,
+            commitment,
+            leaf_index,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        msg!(
+            "SPL deposit note appended at leaf {} (mint {})",
+            leaf_index,
+            ctx.accounts.mint.key()
+        );
+        Ok(())
+    }
+
     /// Grow a `BridgeState` account created before the `deposit_cap` field to the
     /// current layout.
     ///
@@ -1532,6 +1877,77 @@ pub struct ResetValidatorRegistry<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Accounts for [`transact_spl`] — the SPL-token settlement path (#779). Mirrors
+/// [`Transact`] but pays a token withdraw out of the per-mint `asset_vault`
+/// instead of lamports out of `bridge_vault`.
+#[derive(Accounts)]
+#[instruction(nullifiers: [[u8; 32]; 2])]
+pub struct TransactSpl<'info> {
+    #[account(mut, seeds = [b"bridge_state"], bump, has_one = authority)]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    #[account(mut, seeds = [b"merkle_tree"], bump)]
+    pub merkle_tree: AccountLoader<'info, merkle_tree::IncrementalMerkleTree>,
+
+    /// The mint being withdrawn; its bytes are the proof's `asset` public input.
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    /// Per-mint token vault the payout leaves from.
+    #[account(
+        mut,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump,
+        token::mint = mint,
+    )]
+    pub asset_vault: InterfaceAccount<'info, TokenAccount>,
+
+    /// PDA authority that signs the vault outflow.
+    ///
+    /// CHECK: address pinned by seeds; only used as the vault's token authority.
+    #[account(seeds = [b"asset_vault_authority"], bump)]
+    pub asset_vault_authority: UncheckedAccount<'info>,
+
+    /// Payout destination, bound into the proof via `ext_data_hash` so the
+    /// settling validator cannot redirect it.
+    #[account(mut, token::mint = mint)]
+    pub recipient_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// The settling validator's token account for `mint`, where the fee is
+    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
+    #[account(mut, token::mint = mint, token::authority = authority)]
+    pub fee_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifiers[0].as_ref()],
+        bump
+    )]
+    pub nullifier_account_0: Account<'info, NullifierAccount>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + NullifierAccount::INIT_SPACE,
+        seeds = [b"nullifier", nullifiers[1].as_ref()],
+        bump
+    )]
+    pub nullifier_account_1: Account<'info, NullifierAccount>,
+
+    #[account(mut, seeds = [b"validator", authority.key().as_ref()], bump)]
+    pub validator_account: Account<'info, ValidatorAccount>,
+
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
 #[derive(Accounts)]
 #[instruction(nullifiers: [[u8; 32]; 2])]
 pub struct Transact<'info> {
@@ -1796,6 +2212,119 @@ pub struct InitStakeTokenVault<'info> {
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`init_asset_vault`] — a per-asset shielded-token vault (#779).
+/// Mirrors [`InitStakeTokenVault`] but keyed by `mint`, so there is one vault
+/// per shielded SPL asset.
+#[derive(Accounts)]
+pub struct InitAssetVault<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The SPL mint this vault holds shielded balances of.
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    /// Per-asset vault: one program-owned `TokenAccount` PDA per mint, owned by
+    /// the shared `asset_vault_authority`. `deposit_note_spl` funds it; an SPL
+    /// `transact` withdraw pays out of it.
+    #[account(
+        init,
+        payer = authority,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump,
+        token::mint = mint,
+        token::authority = asset_vault_authority,
+        token::token_program = token_program,
+    )]
+    pub asset_vault: InterfaceAccount<'info, TokenAccount>,
+
+    /// PDA that owns every asset vault; signs token outflows on an SPL withdraw.
+    ///
+    /// CHECK: address pinned by seeds; used only as the vaults' token authority.
+    #[account(seeds = [b"asset_vault_authority"], bump)]
+    pub asset_vault_authority: UncheckedAccount<'info>,
+
+    /// Per-asset config: fail-closed deposit cap (starts 0) plus accounting.
+    #[account(
+        init,
+        payer = authority,
+        space = AssetConfig::SPACE,
+        seeds = [b"asset_config", mint.key().as_ref()],
+        bump,
+    )]
+    pub asset_config: Account<'info, AssetConfig>,
+
+    /// Upgrade-authority gate (#204), same as the other `initialize_*`.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+/// Accounts for [`set_asset_deposit_cap`] — open/adjust one mint's SPL cap.
+#[derive(Accounts)]
+pub struct SetAssetDepositCap<'info> {
+    #[account(mut, seeds = [b"asset_config", asset_config.mint.as_ref()], bump = asset_config.bump)]
+    pub asset_config: Account<'info, AssetConfig>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204).
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+}
+
+/// Accounts for [`deposit_note_spl`] — shield an SPL token into a note (#779).
+#[derive(Accounts)]
+pub struct DepositNoteSpl<'info> {
+    /// Read only for the global `paused` flag; SPL accounting lives in
+    /// `asset_config`, so `BridgeState` is never mutated here.
+    #[account(seeds = [b"bridge_state"], bump)]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    #[account(mut, seeds = [b"asset_config", mint.key().as_ref()], bump = asset_config.bump)]
+    pub asset_config: Account<'info, AssetConfig>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"asset_vault", mint.key().as_ref()],
+        bump,
+        token::mint = mint,
+    )]
+    pub asset_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = depositor,
+    )]
+    pub depositor_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, seeds = [b"merkle_tree"], bump)]
+    pub merkle_tree: AccountLoader<'info, crate::merkle_tree::IncrementalMerkleTree>,
+
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 /// Accounts for [`migrate_bridge_state`] — grow a pre-`deposit_cap` BridgeState.
@@ -2145,6 +2674,28 @@ pub struct BridgeState {
     pub deposit_cap: u64,
 }
 
+/// Per-asset SPL shielding config (#779): one PDA per enabled mint, holding a
+/// fail-closed deposit cap plus accounting. The SPL parallel to `BridgeState`'s
+/// native `deposit_cap`/`total_deposited`/`deposit_count`, kept separate so the
+/// native lamport path's byte layout and semantics are untouched.
+#[account]
+pub struct AssetConfig {
+    /// The mint this config governs (redundant with the PDA seed; stored so
+    /// `SetAssetDepositCap` can re-derive the seed without a mint account).
+    pub mint: Pubkey,
+    /// Ceiling on the vault's **current** token balance; deposits closed at 0.
+    pub deposit_cap: u64,
+    /// Cumulative shielded into this asset (informational, like the native one).
+    pub total_deposited: u64,
+    pub deposit_count: u64,
+    pub bump: u8,
+}
+
+impl AssetConfig {
+    /// 8 discriminator + 32 mint + 8 cap + 8 total + 8 count + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 1;
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct NullifierAccount {
@@ -2217,6 +2768,16 @@ pub struct ValidatorAccount {
 #[event]
 pub struct DepositNoteEvent {
     pub depositor: Pubkey,
+    pub amount: u64,
+    pub commitment: [u8; 32],
+    pub leaf_index: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct DepositNoteSplEvent {
+    pub depositor: Pubkey,
+    pub mint: Pubkey,
     pub amount: u64,
     pub commitment: [u8; 32],
     pub leaf_index: u64,

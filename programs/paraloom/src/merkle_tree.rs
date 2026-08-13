@@ -72,6 +72,28 @@ pub fn commitment(
     Ok(h.to_bytes())
 }
 
+/// The asset field element for an SPL `mint` (#779): `Poseidon(2)` over the
+/// mint's two 16-byte little-endian halves.
+///
+/// A raw 32-byte mint pubkey is usually **not** a canonical BN254 scalar (it
+/// often exceeds the field modulus), and the Poseidon syscall rejects a
+/// non-canonical input rather than reducing it — so the mint bytes cannot be
+/// fed to `commitment` directly. Hashing two independently-canonical halves
+/// (each < 2^128 < p) yields a canonical output with no lossy masking, so the
+/// derivation is collision-resistant over the *full* 256-bit mint identity: an
+/// attacker cannot grind a second mint that shares USDC's asset id and drain
+/// its vault. Native SOL keeps the all-zero asset and never calls this.
+///
+/// Must match the off-chain derivation the wallet prover and the fixture use.
+pub fn mint_to_asset(mint: &Pubkey) -> Result<[u8; 32]> {
+    let b = mint.to_bytes();
+    let mut lo = [0u8; 32];
+    lo[..16].copy_from_slice(&b[..16]);
+    let mut hi = [0u8; 32];
+    hi[..16].copy_from_slice(&b[16..]);
+    poseidon2(&lo, &hi)
+}
+
 /// Empty-subtree hashes: `ZERO_HASHES[0]` is the empty leaf (`0`) and
 /// `ZERO_HASHES[k+1] = Poseidon(ZERO_HASHES[k], ZERO_HASHES[k])`, the root of a
 /// fully empty subtree of height `k` — the sibling for never-filled positions.
