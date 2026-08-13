@@ -51,8 +51,16 @@ pub struct TransactVerificationRequest {
     pub request_id: String,
 
     /// Withdrawal destination (`ext_amount < 0`); all-zero for a pure
-    /// shielded transfer (`ext_amount == 0`).
+    /// shielded transfer (`ext_amount == 0`). For an SPL settlement (`mint`
+    /// set) this is the recipient **token account**, not a system address.
     pub recipient: [u8; 32],
+
+    /// The SPL mint being spent (#779), or `None` for a native-SOL settlement.
+    /// When set, the settlement takes the `transact_spl` path: the proof's
+    /// asset id is `mint_to_asset(mint)` and the payout leaves the mint's asset
+    /// vault. Defaulted so older native requests (no field) decode as `None`.
+    #[serde(default)]
+    pub mint: Option<[u8; 32]>,
 
     /// Input note nullifiers (one may be a random dummy for a 1-real-input spend)
     pub nullifiers: [[u8; 32]; 2],
@@ -113,6 +121,13 @@ impl TransactVerificationRequest {
         h.update(self.output_commitments[1]);
         h.update((self.proof.len() as u64).to_le_bytes());
         h.update(&self.proof);
+        // Bind the asset so an SPL settlement can never collide with a native
+        // one on the same proof/nullifiers, and the mint is settlement-bound.
+        // Only hashed when present, so native request ids are unchanged (#779).
+        if let Some(mint) = self.mint {
+            h.update(b"spl");
+            h.update(mint);
+        }
         format!("transact-{}", hex::encode(h.finalize()))
     }
 }
@@ -1130,6 +1145,7 @@ mod tests {
         TransactVerificationRequest {
             request_id: "attacker-chosen".to_string(),
             recipient: [1u8; 32],
+            mint: None,
             nullifiers: [[2u8; 32], [3u8; 32]],
             output_commitments: [[4u8; 32], [5u8; 32]],
             root: [6u8; 32],

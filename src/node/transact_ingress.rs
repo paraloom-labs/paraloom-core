@@ -82,6 +82,11 @@ struct SubmitRequest {
     ext_amount: i64,
     proof: String,
     ciphertexts: Vec<String>,
+    /// SPL mint being spent (#779), 32-byte hex. Omitted for a native-SOL
+    /// settlement; when present the settlement takes the `transact_spl` path
+    /// and `recipient` is the recipient token account.
+    #[serde(default)]
+    mint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -139,6 +144,11 @@ async fn submit_handler(
     }
 
     let recipient = parse_hex32("recipient", &req.recipient)?;
+    let mint = req
+        .mint
+        .as_ref()
+        .map(|m| parse_hex32("mint", m))
+        .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
@@ -186,6 +196,7 @@ async fn submit_handler(
     let mut request = TransactVerificationRequest {
         request_id: String::new(),
         recipient,
+        mint,
         nullifiers,
         output_commitments,
         root,
