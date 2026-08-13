@@ -223,15 +223,27 @@ async fn leader_assembles_a_co_signed_transact_transaction() {
     };
 
     // node1 verifies (accept), votes Valid over the mesh, and caches the
-    // request in verified_transacts; node0 reaches a Valid quorum at 1-of-2.
+    // request in verified_transacts; node0 reaches the stake-weighted quorum
+    // once node1's vote lands (both validators now carry real weight, #698).
     let quorum = wait_until(Duration::from_secs(30), Duration::from_millis(500), || {
         let rid = request_id.clone();
         let probe = node0.clone();
         let peer = node1.clone();
         let snapshot = stakes.clone();
+        let req = request.clone();
         async move {
             probe.apply_onchain_stakes(snapshot.clone()).await;
             peer.apply_onchain_stakes(snapshot).await;
+            // Re-broadcast each poll until node1 actually receives the request.
+            // The gossip topic mesh forms a beat after the TCP connection, and
+            // `send_message` only logs a NoPeersSubscribedToTopic publish rather
+            // than propagating it, so the first initiate can return Ok without
+            // reaching node1. Re-initiate is idempotent (start_verification dedups
+            // and preserves votes), so this simply redelivers once the mesh is
+            // ready — then node1 votes and the 2-of-2 stake quorum is met. Before,
+            // the test passed on the initiator's self-vote alone, which never
+            // exercised node1's weight.
+            let _ = probe.initiate_transact_verification(req).await;
             matches!(
                 probe.transact_consensus_status(&rid).await,
                 Ok(Some(VerificationVote::Valid))
