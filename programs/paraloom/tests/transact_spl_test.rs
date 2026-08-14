@@ -17,7 +17,7 @@ use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::transact_spl_fixture_data as fx;
 use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
-use solana_program_test::{processor, tokio, ProgramTest};
+use solana_program_test::{tokio, ProgramTest};
 use solana_sdk::{
     account::Account,
     instruction::{AccountMeta, Instruction},
@@ -27,7 +27,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, add_stake_mint, add_token_account, entry, TEST_TOKEN_FUND};
+use common::{add_program_data, add_stake_mint, add_token_account, program_test, TEST_TOKEN_FUND};
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
 
@@ -101,7 +101,7 @@ fn token_amount(account: &Account) -> u64 {
 #[tokio::test]
 async fn transact_spl_settles_a_token_withdrawal() {
     let program_id = paraloom_program::ID;
-    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let mut pt = program_test(program_id);
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
 
     // Staking mint for the registry/quorum (independent of the shielded asset).
@@ -416,8 +416,16 @@ async fn transact_spl_settles_a_token_withdrawal() {
             metas
         },
     };
+    // Raise the compute-unit ceiling, exactly as the on-chain settlement path
+    // prepends it (cosign_message): the Groth16 verify plus the two token CPIs
+    // exceed the 200k default, which only bites under the BPF VM (native tests
+    // enforce no CU limit). Without it the BPF run fails "Computational budget
+    // exceeded" even though the instruction is correct.
     let transact_tx = Transaction::new_signed_with_payer(
-        &[transact_ix],
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            transact_ix,
+        ],
         Some(&upgrade_authority.pubkey()),
         &[&upgrade_authority, &cosigner],
         blockhash,
