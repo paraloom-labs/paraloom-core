@@ -1890,7 +1890,12 @@ pub struct TransactSpl<'info> {
     pub merkle_tree: AccountLoader<'info, merkle_tree::IncrementalMerkleTree>,
 
     /// The mint being withdrawn; its bytes are the proof's `asset` public input.
-    pub mint: InterfaceAccount<'info, Mint>,
+    ///
+    /// Boxed (like the token accounts below) to keep the `TransactSpl` context
+    /// off the BPF stack: unboxed, the four extra InterfaceAccounts push the
+    /// generated `try_accounts` frame past the 4 KB limit and settlement fails
+    /// on-chain with a stack access violation (#779).
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// Per-mint token vault the payout leaves from.
     #[account(
@@ -1899,7 +1904,7 @@ pub struct TransactSpl<'info> {
         bump,
         token::mint = mint,
     )]
-    pub asset_vault: InterfaceAccount<'info, TokenAccount>,
+    pub asset_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// PDA authority that signs the vault outflow.
     ///
@@ -1910,12 +1915,12 @@ pub struct TransactSpl<'info> {
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
     #[account(mut, token::mint = mint)]
-    pub recipient_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// The settling validator's token account for `mint`, where the fee is
     /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
     #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         init,
