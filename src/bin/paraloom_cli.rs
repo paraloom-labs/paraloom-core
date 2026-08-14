@@ -1292,19 +1292,33 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
     }
 }
 
-/// Decode an on-chain `ValidatorAccount` (after the 8-byte Anchor
-/// discriminator) into (validator pubkey, stake in SOL, reputation, is_active).
-/// Returns None if the buffer isn't a ValidatorAccount (113 bytes).
+/// `sha256("account:ValidatorAccount")[..8]` — the Anchor discriminator every
+/// on-chain `ValidatorAccount` carries in its first 8 bytes.
 #[cfg(feature = "solana-bridge")]
-fn decode_validator_account(data: &[u8]) -> Option<(Pubkey, f64, u64, bool)> {
-    if data.len() < 113 {
+const VALIDATOR_ACCOUNT_DISCRIMINATOR: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
+
+/// Decode an on-chain `ValidatorAccount` into
+/// (validator, SOL stake, PARALOOM token stake base units, reputation, is_active).
+///
+/// Matched by its 8-byte Anchor discriminator, NOT by size. `get_program_accounts`
+/// returns every account the program owns (BridgeState, the validator registry,
+/// nullifier PDAs, per-asset configs, the merkle tree); decoding any of those at
+/// the validator field offsets is what produced the astronomical stake and
+/// quintillion-reputation "validators" in `validator list` — a CLI display bug,
+/// never on-chain corruption. Requiring the discriminator (and the current
+/// dual-stake layout length) rejects them cleanly.
+#[cfg(feature = "solana-bridge")]
+fn decode_validator_account(data: &[u8]) -> Option<(Pubkey, f64, u64, u64, bool)> {
+    if data.len() < 145 || data[0..8] != VALIDATOR_ACCOUNT_DISCRIMINATOR {
         return None;
     }
     let validator = Pubkey::new_from_array(<[u8; 32]>::try_from(&data[8..40]).ok()?);
     let stake = u64::from_le_bytes(data[40..48].try_into().ok()?) as f64 / LAMPORTS_PER_SOL as f64;
     let reputation = u64::from_le_bytes(data[48..56].try_into().ok()?);
     let is_active = data[88] == 1;
-    Some((validator, stake, reputation, is_active))
+    // Dual-stake token half (base units), at the end of the current layout.
+    let token_stake = u64::from_le_bytes(data[129..137].try_into().ok()?);
+    Some((validator, stake, token_stake, reputation, is_active))
 }
 
 async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
@@ -1745,10 +1759,11 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     println!("Account PDA: {}", pda);
                     match client.get_account_data(&pda) {
                         Ok(data) => match decode_validator_account(&data) {
-                            Some((_, stake, reputation, is_active)) => println!(
-                                "On-chain:    {} | stake {} SOL | reputation {}",
+                            Some((_, stake, token_stake, reputation, is_active)) => println!(
+                                "On-chain:    {} | stake {} SOL + {} token | reputation {}",
                                 if is_active { "ACTIVE" } else { "INACTIVE" },
                                 stake,
+                                token_stake,
                                 reputation
                             ),
                             None => {
@@ -1818,7 +1833,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_program_accounts(&program_id)
                     .context("Failed to fetch program accounts")?;
 
-                let mut validators: Vec<(Pubkey, f64, u64, bool)> = accounts
+                let mut validators: Vec<(Pubkey, f64, u64, u64, bool)> = accounts
                     .iter()
                     .filter_map(|(_, acc)| decode_validator_account(&acc.data))
                     .collect();
@@ -1829,21 +1844,24 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     println!("No validators registered yet on this RPC.");
                 } else {
                     let total_stake: f64 = validators.iter().map(|v| v.1).sum();
-                    let active = validators.iter().filter(|v| v.3).count();
-                    for (pubkey, stake, reputation, is_active) in &validators {
+                    let total_token: u128 = validators.iter().map(|v| v.2 as u128).sum();
+                    let active = validators.iter().filter(|v| v.4).count();
+                    for (pubkey, stake, token_stake, reputation, is_active) in &validators {
                         println!(
-                            "  {}  {:>7.3} SOL  rep {:>5}  {}",
+                            "  {}  {:>7.3} SOL + {:>13} token  rep {:>5}  {}",
                             pubkey,
                             stake,
+                            token_stake,
                             reputation,
                             if *is_active { "active" } else { "inactive" }
                         );
                     }
                     println!(
-                        "\n{} validators ({} active) · {} SOL staked",
+                        "\n{} validators ({} active) · {} SOL + {} token staked",
                         validators.len(),
                         active,
-                        total_stake
+                        total_stake,
+                        total_token
                     );
                 }
             }
