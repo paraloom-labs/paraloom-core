@@ -33,3 +33,45 @@ jobs:
 
       - name: Run tests
         run: cargo test --manifest-path programs/paraloom/Cargo.toml
+
+  test-bpf:
+    name: Test programs/paraloom (BPF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: programs/paraloom
+          shared-key: paraloom-programs-bpf
+
+      - name: Cache solana
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana/install
+          key: solana-stable-${{ runner.os }}
+
+      - name: Install solana (for cargo build-sbf)
+        run: |
+          if ! [ -x "$HOME/.local/share/solana/install/active_release/bin/cargo-build-sbf" ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Build the BPF program
+        run: cargo build-sbf --manifest-path programs/paraloom/Cargo.toml
+
+      # Run the SPL instruction tests against the compiled BPF .so, not just the
+      # native processor. BPF enforces the real 4 KB per-frame stack and the
+      # compute-unit ceiling, so this catches the class of bug that let #779's
+      # transact_spl pass every native test yet abort on-chain with a stack
+      # access violation. `program_test()` switches to BPF mode on this env.
+      - name: Run SPL tests in BPF mode
+        env:
+          PARALOOM_TEST_BPF: "1"
+          BPF_OUT_DIR: ${{ github.workspace }}/programs/paraloom/target/deploy
+        run: cargo test --manifest-path programs/paraloom/Cargo.toml --test transact_spl_test --test deposit_note_spl_test

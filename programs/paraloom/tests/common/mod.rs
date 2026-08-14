@@ -10,7 +10,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::entrypoint::ProgramResult;
-use solana_program_test::ProgramTest;
+use solana_program_test::{processor, ProgramTest};
 use solana_sdk::{
     account::Account,
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
@@ -28,6 +28,24 @@ pub fn entry<'a, 'b, 'c, 'd>(
         unsafe { std::mem::transmute::<&'b [AccountInfo<'c>], &'b [AccountInfo<'b>]>(accounts) },
         data,
     )
+}
+
+/// Build a `ProgramTest` for the paraloom program: native by default, or the
+/// compiled BPF `.so` when `PARALOOM_TEST_BPF` is set.
+///
+/// The native processor has no stack limit, so it silently runs code that
+/// overflows BPF's 4 KB per-frame ceiling on-chain — exactly how #779's
+/// `TransactSpl` context (four extra InterfaceAccounts) passed every native test
+/// yet aborted the deployed program with a stack access violation. Running the
+/// same tests in BPF mode catches that class before deploy. BPF mode loads
+/// `paraloom_program.so` from the BPF search path, so CI sets `BPF_OUT_DIR` to
+/// `programs/paraloom/target/deploy` after `cargo build-sbf`.
+pub fn program_test(program_id: Pubkey) -> ProgramTest {
+    if std::env::var("PARALOOM_TEST_BPF").is_ok() {
+        ProgramTest::new("paraloom_program", program_id, None)
+    } else {
+        ProgramTest::new("paraloom_program", program_id, processor!(entry))
+    }
 }
 
 /// Derive the BPFLoaderUpgradeable `ProgramData` PDA for a deployed program.

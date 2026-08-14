@@ -8,7 +8,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::{accounts, instruction, AssetConfig};
-use solana_program_test::{processor, tokio, ProgramTest};
+use solana_program_test::{tokio, ProgramTest};
 use solana_sdk::{
     account::Account,
     instruction::Instruction,
@@ -18,7 +18,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, add_stake_mint, add_token_account, entry};
+use common::{add_program_data, add_stake_mint, add_token_account, program_test};
 
 const DEPOSIT: u64 = 1_000_000;
 const DEPOSITOR_FUND: u64 = 10_000_000;
@@ -160,7 +160,7 @@ fn token_balance(account: &Account) -> u64 {
 #[tokio::test]
 async fn deposit_note_spl_appends_and_moves_tokens() {
     let program_id = paraloom_program::ID;
-    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let mut pt = program_test(program_id);
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
     let mint = add_stake_mint(&mut pt, Pubkey::new_unique());
 
@@ -225,7 +225,7 @@ async fn deposit_note_spl_appends_and_moves_tokens() {
 #[tokio::test]
 async fn deposit_note_spl_enforces_cap() {
     let program_id = paraloom_program::ID;
-    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let mut pt = program_test(program_id);
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
     let mint = add_stake_mint(&mut pt, Pubkey::new_unique());
 
@@ -276,7 +276,7 @@ async fn deposit_note_spl_closed_until_cap_opened() {
     // A freshly created asset vault has cap 0 (deposits closed) until
     // `set_asset_deposit_cap` opens it — the fail-closed default.
     let program_id = paraloom_program::ID;
-    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let mut pt = program_test(program_id);
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
     let mint = add_stake_mint(&mut pt, Pubkey::new_unique());
 
