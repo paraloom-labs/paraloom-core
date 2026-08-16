@@ -90,6 +90,15 @@ pub struct NetworkSettings {
     /// any `/p2p/<peerid>` reference others rely on.
     #[serde(default)]
     pub identity_path: Option<String>,
+    /// Full multiaddrs (each with `/p2p/<peer_id>`) of the OTHER swap
+    /// co-validator(s) this node forms the settlement quorum with. A background
+    /// keep-alive re-dials any that are not currently connected, so a dropped
+    /// same-box co-sign link is re-established within one interval instead of
+    /// waiting for the 300s Kademlia refresh. Empty (default) preserves prior
+    /// behavior — the link relies on bootstrap + kad only. Typically the
+    /// loopback address, e.g. `/ip4/127.0.0.1/tcp/9310/p2p/<peer_id>`.
+    #[serde(default)]
+    pub co_validators: Vec<String>,
 }
 
 /// Node settings
@@ -234,6 +243,7 @@ impl Settings {
                 external_address: None,
                 relay_address: None,
                 identity_path: None,
+                co_validators: vec![],
             },
             node: NodeSettings {
                 node_type: "ResourceProvider".to_string(),

@@ -472,6 +472,49 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// Keep-alive for the swap co-validator link: re-dial any of `addrs` (full
+    /// multiaddrs with `/p2p/<peer_id>`) that are NOT currently connected.
+    ///
+    /// The 2-of-2 co-sign quorum settles only while val1<->val2 are connected.
+    /// There is otherwise no production redial after startup (the reconnect
+    /// state machine is unused), so a dropped same-box link stayed down until
+    /// the 300s Kademlia refresh — a multi-minute settlement outage. Called on a
+    /// short timer, this re-establishes it within one interval. Already-connected
+    /// peers are skipped, so it adds no dial churn or log noise in steady state.
+    pub async fn redial_disconnected_co_validators(&self, addrs: &[String]) {
+        if addrs.is_empty() {
+            return;
+        }
+        let connected: std::collections::HashSet<Vec<u8>> = {
+            self.connected_peers
+                .lock()
+                .await
+                .iter()
+                .map(|p| p.to_bytes())
+                .collect()
+        };
+        let mut swarm = self.swarm.lock().await;
+        for addr_str in addrs {
+            let addr = match addr_str.parse::<Multiaddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!("Invalid co_validator address {}: {}", addr_str, e);
+                    continue;
+                }
+            };
+            if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                if connected.contains(&pid.to_bytes()) {
+                    continue; // already connected — nothing to do
+                }
+                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+            }
+            match swarm.dial(addr.clone()) {
+                Ok(()) => log::info!("co-validator keep-alive: re-dialing {}", addr),
+                Err(e) => log::debug!("co-validator redial to {} failed (will retry): {}", addr, e),
+            }
+        }
+    }
+
     /// Declare a publicly-reachable address for this node (#226).
     ///
     /// Calls `Swarm::add_external_address`, which marks the address

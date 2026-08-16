@@ -224,6 +224,14 @@ pub struct TransactVerificationCoordinator {
     /// co-signer stake (#611). `None` (unit tests without a registered
     /// validator set) disables the stake gate, leaving the head-count check.
     local_node_id: Option<NodeId>,
+
+    /// On-chain swap-validator co-sign wallets (the ValidatorRegistry set),
+    /// refreshed every reconcile tick from `list_validator_stakes`. Registration
+    /// into the swap consensus is gated to these wallets so compute
+    /// ResourceProviders and wallet-less connectivity entries never enter the
+    /// quorum. Empty = uninitialized (pre-first-snapshot / tests): the gate
+    /// fails open, and the stake gate still withholds on 0 total stake.
+    onchain_wallets: Arc<RwLock<HashSet<String>>>,
 }
 
 impl TransactVerificationCoordinator {
@@ -242,6 +250,7 @@ impl TransactVerificationCoordinator {
             approval_tx: None,
             emitted: Arc::new(RwLock::new(HashSet::new())),
             local_node_id: None,
+            onchain_wallets: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -337,7 +346,37 @@ impl TransactVerificationCoordinator {
             }
         }
 
-        counted_stake >= threshold
+        let met = counted_stake >= threshold;
+        if !met {
+            // Previously silent: with the authority (this node) staked,
+            // total_active_stake != 0 skips the warn above, so a co-signer that
+            // voted but carries 0 counted stake withheld the settlement with no
+            // log at all. Make it observable — this is exactly the state a
+            // flapped/zero-stake co-signer produces.
+            let per_validator: Vec<(String, u64)> = active
+                .iter()
+                .map(|v| {
+                    (
+                        format!("{:?}", v),
+                        selector
+                            .get_validator(v)
+                            .map(|i| i.stake_amount)
+                            .unwrap_or(0),
+                    )
+                })
+                .collect();
+            log::warn!(
+                target: "paraloom::consensus::transact",
+                "withholding approval: counted co-signer stake {} < threshold {} \
+                 (eligible {}, authority {}); active stakes = {:?}",
+                counted_stake,
+                threshold,
+                eligible_stake,
+                authority_stake,
+                per_validator
+            );
+        }
+        met
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -396,6 +435,32 @@ impl TransactVerificationCoordinator {
         validator: NodeId,
         wallet_pubkey: Option<String>,
     ) {
+        // Gate: only on-chain swap validators (the ValidatorRegistry set) may
+        // enter the settlement quorum. Compute ResourceProviders share the same
+        // p2p network but must never carry co-sign weight, and a wallet-less
+        // connectivity entry (`None`) must never re-seed a real validator at 0
+        // stake. Fail open while the allowlist is empty (pre-first-snapshot /
+        // tests) — the stake gate still withholds on 0 total stake, so a
+        // transiently-admitted peer is inert.
+        {
+            let allow = self.onchain_wallets.read().await;
+            if !allow.is_empty() {
+                let admitted = wallet_pubkey
+                    .as_ref()
+                    .map(|w| allow.contains(w))
+                    .unwrap_or(false);
+                if !admitted {
+                    log::debug!(
+                        "transact registration rejected (not an on-chain swap validator): \
+                         {:?} wallet={:?}",
+                        validator,
+                        wallet_pubkey
+                    );
+                    return;
+                }
+            }
+        }
+
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
             log::info!(
@@ -421,6 +486,10 @@ impl TransactVerificationCoordinator {
                 if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
                     leader_selector.update_validator(existing.with_wallet(wallet_pubkey));
                 }
+                // A reconnect re-activates a preserved (deactivated) entry;
+                // its stake/wallet/reputation are kept intact (see
+                // `unregister_validator` -> `deactivate_validator`).
+                leader_selector.activate_validator(&validator);
             }
             None => {
                 // Register with ZERO stake (fail-closed): a freshly-seen peer
@@ -454,11 +523,18 @@ impl TransactVerificationCoordinator {
         let mut validators = self.validators.write().await;
         validators.retain(|v| v != validator);
 
+        // Deactivate (do NOT delete) the leader-selector entry: preserve its
+        // on-chain stake + co-sign wallet + reputation across a connectivity
+        // flap. Deleting them re-seeded a reconnecting validator at stake 0 /
+        // wallet None, which the wallet-keyed on-chain reconciler could never
+        // repair, silently withholding every settlement. A genuinely
+        // deregistered (off-chain) validator is dropped by the on-chain prune,
+        // not by a transient disconnect.
         let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.unregister_validator(validator);
+        leader_selector.deactivate_validator(validator);
 
         log::info!(
-            "Validator unregistered from active transact consensus set (reputation preserved): {:?}",
+            "Validator deactivated in transact consensus (stake + wallet + reputation preserved): {:?}",
             validator
         );
     }
@@ -473,6 +549,16 @@ impl TransactVerificationCoordinator {
     /// `ProgramInterface::list_validator_stakes`, fills in the true at-risk
     /// stake so an unregistered/unstaked peer can never reach a supermajority.
     pub async fn sync_onchain_stakes(&self, stakes: std::collections::HashMap<String, u64>) {
+        // Refresh the registration allowlist to exactly the on-chain
+        // swap-validator wallets. These map keys ARE the ValidatorRegistry set;
+        // compute ResourceProviders have no ValidatorAccount so are absent,
+        // which is what keeps them out of the swap quorum going forward.
+        // An empty snapshot (RPC returned nothing) is NOT trusted to clear the
+        // allowlist — that would fail-open the gate; keep the previous set.
+        if !stakes.is_empty() {
+            *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
+        }
+
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.apply_onchain_stakes(&stakes);
         log::debug!(
@@ -1216,5 +1302,105 @@ mod tests {
             b.canonical_id(),
             "the suite tag must be part of the settlement-defining bytes"
         );
+    }
+
+    /// The swap consensus must admit ONLY on-chain swap validators. Compute
+    /// ResourceProviders share the p2p network and a wallet-less connectivity
+    /// entry must never carry co-sign weight (the latter is what re-seeded a
+    /// flapped validator at 0 stake and silently withheld every settlement).
+    /// Arm-the-guard: removing the gate re-admits the compute wallet and this
+    /// test fails.
+    #[tokio::test]
+    async fn registration_is_gated_to_onchain_swap_validators() {
+        let coordinator = TransactVerificationCoordinator::new();
+        // Seed the allowlist to the two on-chain swap validators.
+        let mut stakes = std::collections::HashMap::new();
+        stakes.insert("VAL1wallet".to_string(), 1_000_000_000u64);
+        stakes.insert("VAL2wallet".to_string(), 1_000_000_000u64);
+        coordinator.sync_onchain_stakes(stakes).await;
+
+        // A compute ResourceProvider (wallet not in the registry) is rejected.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![0xC0]), Some("COMPUTEwallet".to_string()))
+            .await;
+        assert!(
+            !coordinator
+                .is_registered_validator(&NodeId(vec![0xC0]))
+                .await,
+            "a non-on-chain (compute) wallet must never enter the swap consensus"
+        );
+
+        // A wallet-less connectivity entry is rejected.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![0xC1]), None)
+            .await;
+        assert!(
+            !coordinator
+                .is_registered_validator(&NodeId(vec![0xC1]))
+                .await,
+            "a wallet-less (None) registration must never enter the swap consensus"
+        );
+
+        // A real on-chain swap validator IS admitted.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![0x01]), Some("VAL2wallet".to_string()))
+            .await;
+        assert!(
+            coordinator
+                .is_registered_validator(&NodeId(vec![0x01]))
+                .await,
+            "an on-chain swap validator must be admitted"
+        );
+    }
+
+    /// A connectivity flap must PRESERVE a validator's on-chain stake + co-sign
+    /// wallet (deactivate, not delete), so a reconnect never opens a 0-stake
+    /// window that silently withholds settlement. Arm-the-guard: restoring the
+    /// old `remove`-on-unregister makes `get_validator` return None and this
+    /// test fails.
+    #[tokio::test]
+    async fn flap_preserves_validator_stake_and_wallet() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2wallet".to_string()))
+            .await;
+        let mut stakes = std::collections::HashMap::new();
+        stakes.insert("VAL2wallet".to_string(), 1_000_000_000u64);
+        coordinator.sync_onchain_stakes(stakes).await;
+
+        // Connectivity flap: unregister deactivates (must not delete).
+        coordinator.unregister_validator(&NodeId(vec![2])).await;
+        {
+            let sel = coordinator.leader_selector.read().await;
+            let info = sel
+                .get_validator(&NodeId(vec![2]))
+                .expect("entry must survive a connectivity flap (deactivated, not deleted)");
+            assert_eq!(
+                info.stake_amount, 1_000_000_000,
+                "stake must be preserved across a flap"
+            );
+            assert_eq!(info.wallet_pubkey.as_deref(), Some("VAL2wallet"));
+            assert!(
+                !info.is_active,
+                "a flapped validator is inactive until it reconnects"
+            );
+        }
+
+        // Reconnect (wallet-bearing Discovery) re-activates; stake intact.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2wallet".to_string()))
+            .await;
+        {
+            let sel = coordinator.leader_selector.read().await;
+            let info = sel.get_validator(&NodeId(vec![2])).unwrap();
+            assert!(
+                info.is_active,
+                "reconnect must re-activate the preserved entry"
+            );
+            assert_eq!(
+                info.stake_amount, 1_000_000_000,
+                "stake stays after reconnect (no 0-stake window)"
+            );
+        }
     }
 }
