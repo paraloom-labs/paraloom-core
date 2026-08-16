@@ -406,7 +406,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // connection, and a node with no transact coordinator is not a
                 // settling validator and drops outright.
                 let is_validator = match &self.transact_coordinator {
-                    Some(coordinator) => coordinator.is_registered_validator(&source).await,
+                    Some(coordinator) => coordinator.source_is_onchain_validator(&source).await,
                     None => false,
                 };
                 if !is_validator {
@@ -512,14 +512,15 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     .await;
                 }
 
-                let result = crate::consensus::transact::TransactVerificationResult {
-                    request_id: request.request_id,
-                    validator: self.node_info.id.clone(),
-                    vote,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                let result = match self.signed_vote(request.request_id.clone(), vote) {
+                    Some(r) => r,
+                    None => {
+                        log::warn!(
+                            "no co-sign keypair; cannot sign transact vote for {}",
+                            request.request_id
+                        );
+                        return Ok(());
+                    }
                 };
 
                 let response = Message::TransactVerificationResult { result };
@@ -541,6 +542,19 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         result.request_id,
                         result.validator,
                         source
+                    );
+                    return Ok(());
+                }
+                // Verify the vote's ed25519 signature over the canonical preimage
+                // BEFORE it reaches the tally: a relayed/forged/unsigned vote (or
+                // one whose wallet/validity/request-id/voter-NodeId do not match
+                // the signature) is dropped here, so counting can trust the
+                // attributed wallet.
+                if !self.verify_vote_signature(&result) {
+                    log::warn!(
+                        "dropping transact vote for {}: signature invalid for wallet {} (forged/unsigned/relayed)",
+                        result.request_id,
+                        result.wallet_pubkey
                     );
                     return Ok(());
                 }
@@ -883,7 +897,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         // authenticated by the connection. A node with no transact coordinator
         // is not a settling validator and declines outright.
         let is_validator = match &self.transact_coordinator {
-            Some(coordinator) => coordinator.is_registered_validator(&source).await,
+            Some(coordinator) => coordinator.source_is_onchain_validator(&source).await,
             None => false,
         };
         if !is_validator {
@@ -1119,6 +1133,7 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
 async fn settle_approved_transacts<F, Fut>(
     mut rx: mpsc::UnboundedReceiver<ApprovedTransact>,
     mut submit: F,
+    coordinator: Option<Arc<TransactVerificationCoordinator>>,
 ) where
     F: FnMut(ApprovedTransact) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
@@ -1158,18 +1173,88 @@ async fn settle_approved_transacts<F, Fut>(
                     );
                     tokio::time::sleep(SETTLE_RETRY_BACKOFF).await;
                 }
-                Err(e) => log::warn!(
-                    "transact {} submit failed after {} attempts: {}",
-                    request_id,
-                    MAX_SETTLE_ATTEMPTS,
-                    e
-                ),
+                Err(e) => {
+                    log::warn!(
+                        "transact {} submit failed after {} attempts: {}",
+                        request_id,
+                        MAX_SETTLE_ATTEMPTS,
+                        e
+                    );
+                    // Un-emit so the client can re-prove the identical canonical
+                    // id and have it approved again, instead of it being wedged
+                    // (approved-once, never settled) until a restart.
+                    if let Some(coord) = &coordinator {
+                        coord.clear_emitted(&request_id).await;
+                    }
+                }
             }
         }
     }
 }
 
 impl Node {
+    /// The cluster tag mixed into transact-vote signature domain separation.
+    /// Byte-identical on every validator in a cohort (config), so a signed vote
+    /// from one cluster never verifies on another.
+    fn cluster_tag(&self) -> &str {
+        &self.settings.bridge.cluster_tag
+    }
+
+    /// Build a signed transact vote for `request_id`, or `None` if this node has
+    /// no co-sign keypair (it could not co-sign settlement anyway). The vote is
+    /// ed25519-signed by the co-sign key over the canonical preimage.
+    fn signed_vote(
+        &self,
+        request_id: String,
+        vote: crate::consensus::vote_tally::VerificationVote,
+    ) -> Option<crate::consensus::transact::TransactVerificationResult> {
+        let kp = self.cosign_keypair.as_ref()?;
+        let wallet = kp.pubkey().to_string();
+        let bytes = crate::consensus::transact::transact_vote_signing_bytes(
+            &self.settings.bridge.program_id,
+            self.cluster_tag(),
+            &request_id,
+            &self.node_info.id,
+            &vote,
+            &wallet,
+        );
+        let signature = kp.sign_message(&bytes).as_ref().to_vec();
+        Some(crate::consensus::transact::TransactVerificationResult {
+            request_id,
+            validator: self.node_info.id.clone(),
+            vote,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            wallet_pubkey: wallet,
+            signature,
+        })
+    }
+
+    /// Verify an incoming vote's ed25519 signature over the canonical preimage,
+    /// using the exact in-repo verify primitive. Rejects a vote whose
+    /// wallet/validity/request-id/voter-NodeId do not match its signature.
+    fn verify_vote_signature(
+        &self,
+        result: &crate::consensus::transact::TransactVerificationResult,
+    ) -> bool {
+        use std::str::FromStr;
+        let pk = match Pubkey::from_str(&result.wallet_pubkey) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let bytes = crate::consensus::transact::transact_vote_signing_bytes(
+            &self.settings.bridge.program_id,
+            self.cluster_tag(),
+            &result.request_id,
+            &result.validator,
+            &result.vote,
+            &result.wallet_pubkey,
+        );
+        crate::bridge::solana::cosign_assembly::signature_is_valid(&pk, &result.signature, &bytes)
+    }
+
     /// Create a new node
     pub fn new(settings: Settings) -> Result<Self> {
         let network = NetworkManager::new(&settings)?;
@@ -1344,6 +1429,16 @@ impl Node {
             // the off-chain quorum can mirror the on-chain stake-weighted check
             // and exclude it exactly as the program does (#611).
             coord = coord.with_local_node_id(node_id.clone());
+            // The wallet-keyed stake quorum excludes this node's own co-sign
+            // wallet from both sides, exactly as the on-chain authority is
+            // excluded. Without a co-sign keypair the stake gate stays disabled
+            // (this node cannot settle anyway).
+            match &cosign_keypair {
+                Some(kp) => coord = coord.with_local_wallet(kp.pubkey().to_string()),
+                None => log::warn!(
+                    "no co-sign keypair: local_wallet unset, transact stake gate disabled"
+                ),
+            }
             // Persist reputation so a restart does not reset every validator to
             // the base and silently re-admit a previously-penalised one (#691).
             coord = coord.with_reputation_persistence(
@@ -1437,7 +1532,15 @@ impl Node {
     /// No-op on a node with no transact coordinator.
     pub async fn apply_onchain_stakes(&self, stakes: std::collections::HashMap<String, u64>) {
         if let Some(coordinator) = &self.transact_coordinator {
-            coordinator.sync_onchain_stakes(stakes).await;
+            // Harness entry point without a real ValidatorRegistry account: use the
+            // sum of the supplied stakes as the denominator, matching the previous
+            // head/stake behaviour. The production reconciler instead reads
+            // `registry_total_active_stake` and calls `sync_onchain_stakes`
+            // directly, so a lagging PDA scan can never lower the threshold.
+            let registry_total: u64 = stakes.values().copied().sum();
+            coordinator
+                .sync_onchain_stakes(stakes, registry_total)
+                .await;
         }
     }
 
@@ -1582,17 +1685,25 @@ impl Node {
         if let (Some(bridge), Some(transact)) =
             (self.bridge.clone(), self.transact_coordinator.clone())
         {
-            match bridge.lock().await.list_validator_stakes().await {
-                Ok(list) => {
+            let guard = bridge.lock().await;
+            let seed = async {
+                let list = guard.list_validator_stakes().await?;
+                let total = guard.registry_total_active_stake().await?;
+                Ok::<_, crate::bridge::BridgeError>((list, total))
+            }
+            .await;
+            drop(guard);
+            match seed {
+                Ok((list, registry_total)) => {
                     let map: std::collections::HashMap<String, u64> = list
                         .into_iter()
                         .map(|(wallet, stake)| (wallet.to_string(), stake))
                         .collect();
-                    transact.sync_onchain_stakes(map).await;
-                    info!("Seeded on-chain validator allowlist for the transact registration gate");
+                    transact.sync_onchain_stakes(map, registry_total).await;
+                    info!("Seeded on-chain validator allowlist + registry stake total for the transact gate");
                 }
                 Err(e) => log::warn!(
-                    "could not seed validator allowlist at startup \
+                    "could not seed validator allowlist/registry total at startup \
                      (gate fails open until the first reconcile lands): {e}"
                 ),
             }
@@ -1643,14 +1754,28 @@ impl Node {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     ticker.tick().await;
-                    let stakes = { bridge.lock().await.list_validator_stakes().await };
-                    match stakes {
-                        Ok(list) => {
+                    // Read the stake map AND the registry total together; the
+                    // gate mirrors the on-chain denominator, so both must move as
+                    // one. On either failure, skip the tick (keep the previous
+                    // snapshot) rather than zeroing one side.
+                    let snapshot = {
+                        let guard = bridge.lock().await;
+                        let r = async {
+                            let list = guard.list_validator_stakes().await?;
+                            let total = guard.registry_total_active_stake().await?;
+                            Ok::<_, crate::bridge::BridgeError>((list, total))
+                        }
+                        .await;
+                        drop(guard);
+                        r
+                    };
+                    match snapshot {
+                        Ok((list, registry_total)) => {
                             let map: std::collections::HashMap<String, u64> = list
                                 .into_iter()
                                 .map(|(wallet, stake)| (wallet.to_string(), stake))
                                 .collect();
-                            transact.sync_onchain_stakes(map).await;
+                            transact.sync_onchain_stakes(map, registry_total).await;
                         }
                         Err(e) => {
                             // Not debug: until a snapshot lands, the off-chain
@@ -1949,16 +2074,20 @@ impl Node {
         // instruction settles exclusively through the #260 co-signing quorum
         // (no single-key fallback), so a node without a settlement keypair logs
         // each approval's failure rather than settling it single-key.
-        if let (Some(_bridge), Some(_coordinator), Some(rx)) = (
+        if let (Some(_bridge), Some(coordinator), Some(rx)) = (
             self.bridge.clone(),
             self.transact_coordinator.clone(),
             self.transact_approval_rx.lock().await.take(),
         ) {
             let node = self.clone();
-            let handle = tokio::spawn(settle_approved_transacts(rx, move |approved| {
-                let node = node.clone();
-                async move { node.settle_transact_via_cosign(approved).await }
-            }));
+            let handle = tokio::spawn(settle_approved_transacts(
+                rx,
+                move |approved| {
+                    let node = node.clone();
+                    async move { node.settle_transact_via_cosign(approved).await }
+                },
+                Some(coordinator),
+            ));
             *self.transact_submitter_task.lock().await = Some(handle);
             info!("transact submitter task started (co-signing)");
         }
@@ -2112,17 +2241,16 @@ impl Node {
             };
             let locally_valid =
                 matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid);
-            let result = crate::consensus::TransactVerificationResult {
-                request_id: request_id.clone(),
-                validator: self_id,
-                vote,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            };
-            if let Err(e) = coordinator.submit_result(result).await {
-                log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+            // Sign the self-vote with the co-sign key so it passes submit_result's
+            // structural backstop and counts under this node's own wallet. Without
+            // a co-sign keypair this node cannot settle anyway, so skip.
+            match self.signed_vote(request_id.clone(), vote) {
+                Some(result) => {
+                    if let Err(e) = coordinator.submit_result(result).await {
+                        log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+                    }
+                }
+                None => log::warn!("no co-sign keypair; skipping self-vote for {request_id}"),
             }
             locally_valid
         };
@@ -3165,13 +3293,17 @@ mod tests {
 
         let submitted = Arc::new(AtomicUsize::new(0));
         let counter = submitted.clone();
-        settle_approved_transacts(rx, move |_approved| {
-            let counter = counter.clone();
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok("signature".to_string())
-            }
-        })
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok("signature".to_string())
+                }
+            },
+            None,
+        )
         .await;
 
         assert_eq!(submitted.load(Ordering::SeqCst), 3);
@@ -3188,22 +3320,26 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        settle_approved_transacts(rx, move |_approved| {
-            let counter = counter.clone();
-            async move {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    // The variant `settle_transact_via_cosign` returns after
-                    // the chain confirms the nullifier landed. The old test
-                    // built `InvalidTransaction("nullifier already spent")`,
-                    // a string production never emits, so it exercised a
-                    // classification that could not fire in a real node (#703).
-                    Err(crate::bridge::BridgeError::AlreadySettled)
-                } else {
-                    Ok("signature".to_string())
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // The variant `settle_transact_via_cosign` returns after
+                        // the chain confirms the nullifier landed. The old test
+                        // built `InvalidTransaction("nullifier already spent")`,
+                        // a string production never emits, so it exercised a
+                        // classification that could not fire in a real node (#703).
+                        Err(crate::bridge::BridgeError::AlreadySettled)
+                    } else {
+                        Ok("signature".to_string())
+                    }
                 }
-            }
-        })
+            },
+            None,
+        )
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -3221,19 +3357,23 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        settle_approved_transacts(rx, move |_approved| {
-            let counter = counter.clone();
-            async move {
-                let n = counter.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    Err(crate::bridge::BridgeError::InvalidTransaction(
-                        "blockhash not found".to_string(),
-                    ))
-                } else {
-                    Ok("signature".to_string())
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(crate::bridge::BridgeError::InvalidTransaction(
+                            "blockhash not found".to_string(),
+                        ))
+                    } else {
+                        Ok("signature".to_string())
+                    }
                 }
-            }
-        })
+            },
+            None,
+        )
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -3249,15 +3389,19 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        settle_approved_transacts(rx, move |_approved| {
-            let counter = counter.clone();
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                Err::<String, _>(crate::bridge::BridgeError::InvalidTransaction(
-                    "still failing".to_string(),
-                ))
-            }
-        })
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err::<String, _>(crate::bridge::BridgeError::InvalidTransaction(
+                        "still failing".to_string(),
+                    ))
+                }
+            },
+            None,
+        )
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);

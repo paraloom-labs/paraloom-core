@@ -132,6 +132,19 @@ impl Bridge {
         }
     }
 
+    /// The on-chain `ValidatorRegistry.total_active_stake` — the denominator the
+    /// stake-weighted quorum mirrors off-chain (read from the registry account,
+    /// not summed from `list_validator_stakes`).
+    pub async fn registry_total_active_stake(&self) -> Result<u64> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.registry_total_active_stake().await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
+
     /// Submit a pre-assembled, co-signed settlement transaction (#260) — the
     /// multi-sig withdrawal the node gathered from the approving validators.
     pub async fn submit_signed_transaction(
