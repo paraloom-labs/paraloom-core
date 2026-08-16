@@ -1665,6 +1665,28 @@ impl Node {
             info!("On-chain validator-stake reconciler spawned (interval 60s)");
         }
 
+        // Co-validator link keep-alive. The 2-of-2 quorum settles only while the
+        // co-validators are connected, and there is no other production redial
+        // after startup, so a dropped same-box link stayed down until the 300s
+        // Kademlia refresh — a multi-minute settlement outage each flap. Re-dial
+        // any configured co_validator that is not currently connected, on a
+        // short timer; already-connected peers are skipped (no churn).
+        if !self.settings.network.co_validators.is_empty() {
+            let network = Arc::clone(&self.network);
+            let co_validators = self.settings.network.co_validators.clone();
+            let n = co_validators.len();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    ticker.tick().await;
+                    network
+                        .redial_disconnected_co_validators(&co_validators)
+                        .await;
+                }
+            });
+            info!("Co-validator link keep-alive spawned ({n} peer(s), interval 15s)");
+        }
+
         // Reserve a relay slot AFTER bootstrap (#226). Order matters: when
         // relay_address points at a node we also bootstrap from (the common
         // case — the anchor is both bootstrap and relay), the bootstrap dial
