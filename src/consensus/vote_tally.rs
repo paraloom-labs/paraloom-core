@@ -1,14 +1,20 @@
 //! Payload-independent BFT vote tally (#194).
 //!
-//! The vote-collection and reputation-gated quorum logic shared by
-//! withdrawal and transfer verification. It tracks votes keyed by validator
-//! for a single request id and computes the quorum without knowing anything
-//! about the payload being verified, so
-//! [`crate::consensus::transact::TransactConsensus`] embeds one and delegates
-//! to it. Keeping the audit-sensitive counting logic (the reputation gating
-//! from #62) in one place means a fix applies to both paths at once.
+//! The vote-collection and quorum logic shared by withdrawal and transact
+//! verification. It tracks votes keyed by the voter's on-chain **co-sign
+//! wallet** — the stable, stake-bearing identity — for a single request id and
+//! computes the quorum without knowing anything about the payload being
+//! verified, so [`crate::consensus::transact::TransactConsensus`] embeds one
+//! and delegates to it.
+//!
+//! Wallet-keying (not libp2p NodeId) is the fix for the intermittent quorum
+//! failure: a co-signer that flaps/reconnects keeps a stable wallet identity,
+//! so its vote is always counted as long as the wallet is a staked on-chain
+//! validator — eligibility no longer depends on a flap-prone `active` NodeId
+//! set. The authenticated transport `node_id` is retained inside each record
+//! for co-sign routing, and the ed25519 `signature` for non-repudiable
+//! equivocation evidence.
 
-use crate::consensus::reputation::ReputationTracker;
 use crate::consensus::slashing::SlashingEvidence;
 use crate::types::NodeId;
 use anyhow::{anyhow, Result};
@@ -34,16 +40,30 @@ impl VerificationVote {
     }
 }
 
+/// One validator's recorded vote, keyed in the tally by its co-sign wallet.
+/// `node_id` is the authenticated libp2p identity the signed vote arrived under
+/// (retained for co-sign routing so the co-sign quorum equals the counted
+/// quorum); `signature` is the ed25519 vote signature (retained so an
+/// equivocation flip can be surfaced as non-repudiable evidence carrying both
+/// conflicting signatures).
+#[derive(Clone, Debug)]
+pub struct VoteRecord {
+    pub vote: VerificationVote,
+    pub node_id: NodeId,
+    pub signature: Vec<u8>,
+}
+
 /// Payload-independent vote tally and quorum state for one verification
-/// request. Owns the validator votes plus the BFT thresholds and deadline;
-/// the consensus-specific wrapper adds the request payload alongside.
+/// request. Owns the validator votes (keyed by wallet) plus the BFT thresholds
+/// and deadline; the consensus-specific wrapper adds the request payload
+/// alongside.
 #[derive(Clone, Debug)]
 pub struct VoteTally {
     /// Request ID
     pub request_id: String,
 
-    /// Validators who voted
-    pub votes: Arc<RwLock<HashMap<NodeId, VerificationVote>>>,
+    /// Votes, keyed by the voter's on-chain co-sign wallet (base58).
+    pub votes: Arc<RwLock<HashMap<String, VoteRecord>>>,
 
     /// When consensus started
     pub started_at: u64,
@@ -52,16 +72,11 @@ pub struct VoteTally {
     pub deadline: u64,
 
     /// Minimum eligible-vote count required for this consensus to be
-    /// considered reached. Configurable so different validator-set
-    /// sizes can use different BFT thresholds (e.g. 5-of-7 on a small
-    /// devnet, 14-of-20 on a larger network) without recompiling.
+    /// considered reached.
     pub min_validators_for_consensus: usize,
 
     /// Total validator-set size used as the divisor in
-    /// [`completion_percentage`](Self::completion_percentage). Must agree
-    /// with the actual size of the validator pool the coordinator drew
-    /// from; mismatch only affects the reported percentage, not consensus
-    /// correctness.
+    /// [`completion_percentage`](Self::completion_percentage).
     pub total_validators: usize,
 }
 
@@ -84,58 +99,56 @@ impl VoteTally {
         }
     }
 
-    /// Submit a vote.
+    /// Submit a vote, keyed by the voter's co-sign `wallet`.
     ///
-    /// Returns `Ok(None)` for the normal case (first vote, or a
-    /// repeated identical vote which we treat as idempotent). Returns
-    /// `Ok(Some(SlashingEvidence::Equivocation { .. }))` if the
-    /// validator has previously submitted a vote on this request and
-    /// the new vote disagrees — this is provable misbehavior and is
-    /// surfaced to the caller for recording in the
-    /// [`crate::consensus::SlashingTracker`]. The new vote is **not**
-    /// installed in that case; the original stands.
+    /// Returns `Ok(None)` for the normal case (first vote, or a repeated
+    /// identical vote which we treat as idempotent). Returns
+    /// `Ok(Some(SlashingEvidence::Equivocation { .. }))` if the wallet has
+    /// previously submitted a vote on this request and the new vote disagrees —
+    /// provable misbehaviour surfaced for recording. The new vote is **not**
+    /// installed in that case; the original stands. On the idempotent path the
+    /// stored `node_id`/`signature` are deliberately NOT overwritten (both are
+    /// signature-bound, so the first authenticated record is authoritative).
     pub async fn submit_vote(
         &self,
-        validator: NodeId,
+        wallet: String,
+        node_id: NodeId,
         vote: VerificationVote,
+        signature: Vec<u8>,
     ) -> Result<Option<SlashingEvidence>> {
         let mut votes = self.votes.write().await;
-        if let Some(previous) = votes.get(&validator) {
-            if previous.is_valid() == vote.is_valid() {
+        if let Some(previous) = votes.get(&wallet) {
+            if previous.vote.is_valid() == vote.is_valid() {
                 // Same decision — idempotent. Equivocation is a *flip* between
                 // Valid and Invalid, not two Invalid votes whose free-text
-                // `reason` differs; comparing the whole vote would let a
-                // validator's own two differently-worded Invalid votes read as
-                // equivocation and self-penalise its reputation.
+                // `reason` differs.
                 return Ok(None);
             }
             let evidence = SlashingEvidence::Equivocation {
                 request_id: self.request_id.clone(),
-                previous_vote: previous.clone(),
+                wallet_pubkey: wallet.clone(),
+                previous_vote: previous.vote.clone(),
                 new_vote: vote,
+                previous_signature: previous.signature.clone(),
+                new_signature: signature,
             };
             return Ok(Some(evidence));
         }
-        votes.insert(validator, vote);
+        votes.insert(
+            wallet,
+            VoteRecord {
+                vote,
+                node_id,
+                signature,
+            },
+        );
         Ok(None)
     }
 
-    /// Check whether consensus has been reached among the eligible
-    /// validators — those whose reputation is at or above
-    /// `min_reputation`. A validator below the threshold is silently
-    /// excluded from the count; their vote may still be in `votes`
-    /// (the network cannot prevent the bytes from arriving) but it
-    /// does not contribute to the quorum.
-    pub async fn has_consensus(
-        &self,
-        reputation_tracker: &ReputationTracker,
-        min_reputation: u64,
-        active: &HashSet<NodeId>,
-    ) -> bool {
-        let eligible = self
-            .count_eligible_votes(reputation_tracker, min_reputation, active)
-            .await;
-        eligible >= self.min_validators_for_consensus
+    /// Whether consensus has been reached among the eligible wallets — those in
+    /// `eligible_wallets` (the staked on-chain co-sign set minus equivocators).
+    pub async fn has_consensus(&self, eligible_wallets: &HashSet<String>) -> bool {
+        self.count_eligible_votes(eligible_wallets).await >= self.min_validators_for_consensus
     }
 
     /// Check if consensus deadline has passed
@@ -144,92 +157,42 @@ impl VoteTally {
         now > self.deadline
     }
 
-    /// Number of submitted votes whose validators currently sit at or
-    /// above `min_reputation`. Helper for [`has_consensus`](Self::has_consensus)
-    /// and [`consensus_result`](Self::consensus_result) so they share a
-    /// single eligibility view.
-    async fn count_eligible_votes(
-        &self,
-        reputation_tracker: &ReputationTracker,
-        min_reputation: u64,
-        active: &HashSet<NodeId>,
-    ) -> usize {
+    /// Number of submitted votes whose wallet is in `eligible_wallets`.
+    async fn count_eligible_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
         let votes = self.votes.read().await;
-        let mut count = 0;
-        for validator in votes.keys() {
-            // A vote only counts if the validator is BOTH currently in the
-            // active set and at/above the reputation floor. Reputation is
-            // durable across a disconnect (#394), so without the active-set
-            // intersection a departed validator's stale vote would keep
-            // counting (#408).
-            if !active.contains(validator) {
-                continue;
-            }
-            let reputation = reputation_tracker
-                .get_reputation(validator)
-                .await
-                .unwrap_or(0);
-            if reputation >= min_reputation {
-                count += 1;
-            }
-        }
-        count
+        votes
+            .keys()
+            .filter(|wallet| eligible_wallets.contains(*wallet))
+            .count()
     }
 
-    /// Compute consensus result, filtering out votes from validators
-    /// whose reputation has dropped below `min_reputation`.
-    ///
-    /// The audit (#62) flagged that the previous version aggregated
-    /// every submitted vote regardless of the voter's standing, so a
-    /// validator whose reputation had bottomed out from repeated
-    /// dishonest votes still got to influence the quorum. This version
-    /// snapshots reputation at result-time and counts only votes from
-    /// validators currently in good standing.
+    /// Compute the consensus result, counting only votes whose wallet is in
+    /// `eligible_wallets`. A wallet absent from the on-chain staked set (or
+    /// banned for equivocation) does not contribute — this replaces the old
+    /// reputation-floor + active-NodeId-set gating, which made counting depend
+    /// on the flap-prone registration state.
     pub async fn consensus_result(
         &self,
-        reputation_tracker: &ReputationTracker,
-        min_reputation: u64,
-        active: &HashSet<NodeId>,
+        eligible_wallets: &HashSet<String>,
     ) -> Result<VerificationVote> {
         let votes = self.votes.read().await;
 
-        // Collect (validator, vote) pairs from validators that are BOTH in the
-        // current active set and at/above the reputation threshold. The
-        // active-set intersection stops a disconnected validator's stale but
-        // still-reputable vote from counting (#408).
         let mut eligible: Vec<&VerificationVote> = Vec::with_capacity(votes.len());
         let mut excluded = 0usize;
-        for (validator, vote) in votes.iter() {
-            if !active.contains(validator) {
-                excluded += 1;
-                continue;
-            }
-            let reputation = reputation_tracker
-                .get_reputation(validator)
-                .await
-                .unwrap_or(0);
-            if reputation >= min_reputation {
-                eligible.push(vote);
+        for (wallet, rec) in votes.iter() {
+            if eligible_wallets.contains(wallet) {
+                eligible.push(&rec.vote);
             } else {
                 excluded += 1;
-                log::warn!(
-                    target: "paraloom::consensus",
-                    "vote from low-reputation validator {:?} (rep {}, threshold {}) excluded from consensus on {}",
-                    validator,
-                    reputation,
-                    min_reputation,
-                    self.request_id
-                );
             }
         }
 
         if eligible.len() < self.min_validators_for_consensus {
             return Err(anyhow!(
-                "Not enough eligible votes: {} < {} (excluded {} below reputation {})",
+                "Not enough eligible votes: {} < {} (excluded {} not in the staked set)",
                 eligible.len(),
                 self.min_validators_for_consensus,
-                excluded,
-                min_reputation
+                excluded
             ));
         }
 
@@ -257,41 +220,22 @@ impl VoteTally {
     /// Get vote counts
     pub async fn vote_counts(&self) -> (usize, usize) {
         let votes = self.votes.read().await;
-        let valid = votes.values().filter(|v| v.is_valid()).count();
+        let valid = votes.values().filter(|r| r.vote.is_valid()).count();
         let invalid = votes.len() - valid;
         (valid, invalid)
     }
 
-    /// The validators that voted `Valid` (#260) **and** currently sit at or
-    /// above `min_reputation` — the eligible co-signers the round leader
-    /// collects settlement signatures from. Gating this on the same
-    /// reputation view [`has_consensus`](Self::has_consensus) and
-    /// [`consensus_result`](Self::consensus_result) use (audit #17) keeps the
-    /// co-sign set consistent with the set that actually formed the quorum: a
-    /// vote that was excluded from the count must not then be asked to
-    /// co-sign, or the leader gathers signatures from validators the quorum
-    /// never counted.
-    pub async fn valid_voters(
-        &self,
-        reputation_tracker: &ReputationTracker,
-        min_reputation: u64,
-        active: &HashSet<NodeId>,
-    ) -> Vec<NodeId> {
+    /// The NodeIds of the wallets that voted `Valid` **and** are in
+    /// `eligible_wallets` — the co-signers the round leader collects settlement
+    /// signatures from. Returning the record's authenticated `node_id` keeps the
+    /// co-sign set equal to the counted set: a wallet that was counted is dialed
+    /// under exactly the NodeId its signed vote arrived on.
+    pub async fn valid_voters(&self, eligible_wallets: &HashSet<String>) -> Vec<NodeId> {
         let votes = self.votes.read().await;
         let mut out = Vec::new();
-        for (node, vote) in votes.iter() {
-            if !vote.is_valid() {
-                continue;
-            }
-            // Only currently-active validators can be co-signers — a departed
-            // validator can no longer be mapped to a wallet or asked to sign,
-            // so its stale Valid vote must not enter the co-sign set (#408).
-            if !active.contains(node) {
-                continue;
-            }
-            let reputation = reputation_tracker.get_reputation(node).await.unwrap_or(0);
-            if reputation >= min_reputation {
-                out.push(node.clone());
+        for (wallet, rec) in votes.iter() {
+            if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
+                out.push(rec.node_id.clone());
             }
         }
         out
@@ -302,64 +246,116 @@ impl VoteTally {
 mod tests {
     use super::*;
 
+    fn wallets(ws: &[&str]) -> HashSet<String> {
+        ws.iter().map(|w| w.to_string()).collect()
+    }
+
     #[tokio::test]
     async fn valid_voters_lists_only_eligible_valid_votes() {
         let tally = VoteTally::new("req-1".to_string(), 2, 3);
         tally
-            .submit_vote(NodeId(vec![1]), VerificationVote::Valid)
-            .await
-            .unwrap();
-        tally
             .submit_vote(
-                NodeId(vec![2]),
-                VerificationVote::Invalid {
-                    reason: "bad proof".to_string(),
-                },
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
             )
             .await
             .unwrap();
         tally
-            .submit_vote(NodeId(vec![3]), VerificationVote::Valid)
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "bad proof".to_string(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W3".into(),
+                NodeId(vec![3]),
+                VerificationVote::Valid,
+                vec![3],
+            )
             .await
             .unwrap();
 
-        let reputation = ReputationTracker::new();
-        for id in [1u8, 2, 3] {
-            reputation.register_validator(NodeId(vec![id])).await;
-        }
-
-        // Both Valid voters are in good standing → both are eligible co-signers.
-        let active: HashSet<NodeId> = [NodeId(vec![1]), NodeId(vec![2]), NodeId(vec![3])]
-            .into_iter()
-            .collect();
-        let mut voters = tally.valid_voters(&reputation, 200, &active).await;
+        let eligible = wallets(&["W1", "W2", "W3"]);
+        let mut voters = tally.valid_voters(&eligible).await;
         voters.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(voters, vec![NodeId(vec![1]), NodeId(vec![3])]);
     }
 
     #[tokio::test]
-    async fn valid_voters_excludes_below_reputation_valid_votes() {
+    async fn valid_voters_excludes_wallets_not_in_eligible_set() {
         let tally = VoteTally::new("req-1".to_string(), 1, 3);
         tally
-            .submit_vote(NodeId(vec![1]), VerificationVote::Valid)
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
+            )
             .await
             .unwrap();
         tally
-            .submit_vote(NodeId(vec![3]), VerificationVote::Valid)
+            .submit_vote(
+                "W3".into(),
+                NodeId(vec![3]),
+                VerificationVote::Valid,
+                vec![3],
+            )
             .await
             .unwrap();
 
-        let reputation = ReputationTracker::new();
-        reputation.register_validator(NodeId(vec![1])).await;
-        reputation.register_validator(NodeId(vec![3])).await;
-        // Drop validator 3 below the threshold; its Valid vote must not make it
-        // an eligible co-signer even though it voted Valid.
-        for _ in 0..50 {
-            let _ = reputation.record_failure(&NodeId(vec![3])).await;
-        }
-
-        let active: HashSet<NodeId> = [NodeId(vec![1]), NodeId(vec![3])].into_iter().collect();
-        let voters = tally.valid_voters(&reputation, 200, &active).await;
+        // Only W1 is in the staked set; W3's Valid vote must not make it a
+        // co-signer even though it voted Valid.
+        let eligible = wallets(&["W1"]);
+        let voters = tally.valid_voters(&eligible).await;
         assert_eq!(voters, vec![NodeId(vec![1])]);
+    }
+
+    #[tokio::test]
+    async fn equivocation_is_wallet_keyed_and_carries_both_signatures() {
+        let tally = VoteTally::new("req-1".to_string(), 1, 2);
+        // Same wallet, two different NodeIds, Valid then Invalid -> equivocation
+        // attributed to the wallet, undodgeable by rotating NodeId.
+        assert!(tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![9, 9]
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let evidence = tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "flip".into(),
+                },
+                vec![8, 8],
+            )
+            .await
+            .unwrap();
+        match evidence {
+            Some(SlashingEvidence::Equivocation {
+                wallet_pubkey,
+                previous_signature,
+                new_signature,
+                ..
+            }) => {
+                assert_eq!(wallet_pubkey, "W1");
+                assert_eq!(previous_signature, vec![9, 9]);
+                assert_eq!(new_signature, vec![8, 8]);
+            }
+            _ => panic!("expected wallet-keyed equivocation evidence"),
+        }
     }
 }

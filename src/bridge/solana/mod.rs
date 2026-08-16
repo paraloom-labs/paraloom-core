@@ -1,6 +1,6 @@
 //! Solana bridge implementation
 
-mod cosign_assembly;
+pub(crate) mod cosign_assembly;
 mod cosign_message;
 mod decoder;
 mod instructions;
@@ -115,6 +115,10 @@ impl SolanaBridge {
     /// stake reconciler.
     pub async fn list_validator_stakes(&self) -> Result<Vec<(solana_sdk::pubkey::Pubkey, u64)>> {
         self.program.list_validator_stakes().await
+    }
+
+    pub async fn registry_total_active_stake(&self) -> Result<u64> {
+        self.program.registry_total_active_stake().await
     }
 
     /// Submit a pre-assembled, co-signed settlement transaction (#260).

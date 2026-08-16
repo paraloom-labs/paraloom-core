@@ -115,7 +115,9 @@ pub fn assemble_transaction(
 }
 
 /// Whether `sig_bytes` is a valid signature by `wallet` over `message_bytes`.
-fn signature_is_valid(wallet: &Pubkey, sig_bytes: &[u8], message_bytes: &[u8]) -> bool {
+/// Reused by the node layer to verify transact vote signatures against the same
+/// in-repo ed25519 primitive (no separate verify path).
+pub(crate) fn signature_is_valid(wallet: &Pubkey, sig_bytes: &[u8], message_bytes: &[u8]) -> bool {
     match Signature::try_from(sig_bytes) {
         Ok(sig) => sig.verify(wallet.as_ref(), message_bytes),
         Err(_) => false,

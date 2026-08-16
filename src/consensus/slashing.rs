@@ -36,11 +36,17 @@ use tokio::sync::RwLock;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SlashingEvidence {
     /// Validator submitted two votes that disagree on the same request.
-    /// `previous_vote` was already recorded when `new_vote` arrived.
+    /// `previous_vote` was already recorded when `new_vote` arrived. Attributed
+    /// to the stable co-sign `wallet_pubkey` (undodgeable by rotating NodeId),
+    /// and non-repudiable: the two conflicting ed25519 vote signatures ARE the
+    /// proof.
     Equivocation {
         request_id: String,
+        wallet_pubkey: String,
         previous_vote: VerificationVote,
         new_vote: VerificationVote,
+        previous_signature: Vec<u8>,
+        new_signature: Vec<u8>,
     },
 
     /// Validator missed `streak_length` consecutive verification rounds.
@@ -143,10 +149,13 @@ mod tests {
                 alice.clone(),
                 SlashingEvidence::Equivocation {
                     request_id: "r1".to_string(),
+                    wallet_pubkey: "W1".to_string(),
                     previous_vote: VerificationVote::Valid,
                     new_vote: VerificationVote::Invalid {
                         reason: "test".to_string(),
                     },
+                    previous_signature: vec![1],
+                    new_signature: vec![2],
                 },
             )
             .await;

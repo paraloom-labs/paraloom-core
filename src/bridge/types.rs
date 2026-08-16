@@ -188,6 +188,19 @@ pub struct BridgeConfig {
     /// (the default, and what tests use) keeps the cursor in memory only.
     #[serde(skip)]
     pub cursor_path: Option<std::path::PathBuf>,
+
+    /// Cluster label mixed into the transact-vote signature domain so a signed
+    /// vote from one cluster can never verify on another (the program id is the
+    /// same on devnet and mainnet, so it alone does not separate them). MUST be
+    /// byte-identical on every validator in a cohort, or their signed preimages
+    /// diverge and cross-node votes are dropped. Defaults to "mainnet-beta".
+    #[serde(default = "default_cluster_tag")]
+    pub cluster_tag: String,
+}
+
+/// Default cluster tag ([`BridgeConfig::cluster_tag`]).
+fn default_cluster_tag() -> String {
+    "mainnet-beta".to_string()
 }
 
 impl Default for BridgeConfig {
@@ -233,6 +246,8 @@ impl Default for BridgeConfig {
             consensus_total_validators: None,
             consensus_min_reputation: None,
             cursor_path: None,
+            cluster_tag: std::env::var("BRIDGE_CLUSTER_TAG")
+                .unwrap_or_else(|_| default_cluster_tag()),
         }
     }
 }

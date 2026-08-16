@@ -133,19 +133,86 @@ impl TransactVerificationRequest {
 }
 
 /// Verification result from a validator for a transact request.
+///
+/// Rides inside `Message::TransactVerificationResult`, which is bincode-encoded
+/// (positional, NOT self-describing): adding the two trailing fields is a
+/// BREAKING wire change for that one variant, so both validators must run the
+/// identical binary and be restarted together (a mixed pair drops each other's
+/// votes on decode error and cannot settle).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactVerificationResult {
     /// Request ID
     pub request_id: String,
 
-    /// Validator who performed verification
+    /// Voter's authenticated libp2p identity. DEMOTED from the counting/
+    /// eligibility identity to routing + liveness only: the ingress checks
+    /// `validator == source`, the signed preimage binds it (so a relayed copy
+    /// cannot re-attribute the vote), and the tally retains it for co-sign
+    /// routing. Counting is by `wallet_pubkey`.
     pub validator: NodeId,
 
     /// Verification vote
     pub vote: VerificationVote,
 
-    /// Timestamp when verified
+    /// Timestamp when verified. NOT signed (excluded from the preimage): dedup
+    /// is wallet-keyed in the tally, so the timestamp is advisory only.
     pub timestamp: u64,
+
+    /// The voter's on-chain co-sign wallet (base58) — the counting/attribution
+    /// identity and the ed25519 verifying key for `signature`.
+    pub wallet_pubkey: String,
+
+    /// ed25519 signature by the co-sign key over
+    /// [`transact_vote_signing_bytes`]. A vote with an empty or invalid
+    /// signature is dropped at ingress (structural backstop in `submit_result`).
+    pub signature: Vec<u8>,
+}
+
+/// Build the exact canonical preimage a transact vote signature covers. PURE and
+/// crypto-agnostic (no solana dependency) so this module still compiles under
+/// `--no-default-features`; the node layer signs/verifies these bytes with the
+/// co-sign ed25519 key.
+///
+/// Every variable-length field is u64-little-endian length-prefixed so no field
+/// boundary can be slid. The layout binds, in order:
+/// domain tag, program id, cluster tag, request id (== canonical settlement id),
+/// the VOTER NodeId (defeats relay/rewrap re-attribution), a single validity
+/// bit (matches the equivocation model; `Invalid.reason` free text stays
+/// unsigned), and the wallet pubkey (defeats ed25519 key-substitution).
+pub fn transact_vote_signing_bytes(
+    program_id: &str,
+    cluster_tag: &str,
+    request_id: &str,
+    validator: &NodeId,
+    vote: &VerificationVote,
+    wallet_pubkey: &str,
+) -> Vec<u8> {
+    // 25-byte fixed domain tag, disjoint from the settlement co-sign input (a
+    // raw Solana Message beginning with a small u8), so a vote signature can
+    // never double as a settlement signature.
+    const DOMAIN: &[u8] = b"paraloom:transact-vote:v1";
+    let mut buf = Vec::with_capacity(
+        DOMAIN.len()
+            + 8 * 4
+            + program_id.len()
+            + cluster_tag.len()
+            + request_id.len()
+            + validator.0.len()
+            + wallet_pubkey.len()
+            + 1,
+    );
+    buf.extend_from_slice(DOMAIN);
+    let put = |bytes: &[u8], buf: &mut Vec<u8>| {
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    };
+    put(program_id.as_bytes(), &mut buf);
+    put(cluster_tag.as_bytes(), &mut buf);
+    put(request_id.as_bytes(), &mut buf);
+    put(&validator.0, &mut buf);
+    buf.push(if vote.is_valid() { 1u8 } else { 0u8 });
+    put(wallet_pubkey.as_bytes(), &mut buf);
+    buf
 }
 
 /// A transact the validator quorum has approved (#350). Emitted on the
@@ -202,9 +269,6 @@ pub struct TransactVerificationCoordinator {
     /// Per-validator timeout streaks
     timeout_streaks: Arc<RwLock<HashMap<NodeId, u64>>>,
 
-    /// Reputation floor for consensus participation
-    min_reputation_for_consensus: u64,
-
     /// Minimum eligible-vote count for the BFT quorum
     min_validators_for_consensus: usize,
 
@@ -232,6 +296,32 @@ pub struct TransactVerificationCoordinator {
     /// quorum. Empty = uninitialized (pre-first-snapshot / tests): the gate
     /// fails open, and the stake gate still withholds on 0 total stake.
     onchain_wallets: Arc<RwLock<HashSet<String>>>,
+
+    /// On-chain co-sign stake, keyed by wallet (base58). The numerator source
+    /// for the stake gate: votes are counted by wallet and each Valid voter's
+    /// weight is read here. Refreshed atomically with `onchain_wallets` (its
+    /// key set) each reconcile tick. Empty = uninitialized.
+    onchain_stakes: Arc<RwLock<HashMap<String, u64>>>,
+
+    /// The on-chain `ValidatorRegistry.total_active_stake` — the DENOMINATOR for
+    /// the stake threshold, read from the registry account (NOT reconstructed by
+    /// summing `onchain_stakes`), so a lagging `getProgramAccounts` sum can never
+    /// lower the threshold below what the on-chain quorum enforces. 0 =
+    /// uninitialized (withholds, like 0 eligible stake).
+    onchain_registry_total: Arc<RwLock<u64>>,
+
+    /// This node's own co-sign wallet (base58), excluded from both sides of the
+    /// stake quorum exactly as the on-chain authority is. `None` disables the
+    /// stake gate (unit/unconfigured case). Set via [`Self::with_local_wallet`].
+    local_wallet: Option<String>,
+
+    /// Wallets banned for equivocation (persisted). A banned wallet's standing
+    /// vote is excluded from counting, undodgeable by NodeId rotation.
+    equivocators: Arc<RwLock<HashSet<String>>>,
+
+    /// Where the equivocator ban set is persisted (sibling of reputation.json).
+    /// `None` = in-memory only (unit/unconfigured case).
+    equivocators_path: Option<std::path::PathBuf>,
 }
 
 impl TransactVerificationCoordinator {
@@ -244,13 +334,17 @@ impl TransactVerificationCoordinator {
             reputation_tracker: Arc::new(ReputationTracker::new()),
             slashing_tracker: Arc::new(SlashingTracker::new()),
             timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
-            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
             min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
             total_validators: DEFAULT_TOTAL_VALIDATORS,
             approval_tx: None,
             emitted: Arc::new(RwLock::new(HashSet::new())),
             local_node_id: None,
             onchain_wallets: Arc::new(RwLock::new(HashSet::new())),
+            onchain_stakes: Arc::new(RwLock::new(HashMap::new())),
+            onchain_registry_total: Arc::new(RwLock::new(0)),
+            local_wallet: None,
+            equivocators: Arc::new(RwLock::new(HashSet::new())),
+            equivocators_path: None,
         }
     }
 
@@ -261,12 +355,54 @@ impl TransactVerificationCoordinator {
         self
     }
 
+    /// Set this node's own co-sign wallet (base58), so the wallet-keyed stake
+    /// quorum can exclude the settlement authority from both sides exactly as
+    /// the on-chain quorum does. Mirrors [`Self::with_local_node_id`] but on the
+    /// stable stake identity used for counting.
+    pub fn with_local_wallet(mut self, wallet: String) -> Self {
+        self.local_wallet = Some(wallet);
+        self
+    }
+
     /// Back the reputation tracker with a file so accumulated scores survive a
     /// node restart (#691), instead of resetting every validator to the base and
     /// re-admitting a previously-penalised one at full weight.
     pub fn with_reputation_persistence(mut self, path: std::path::PathBuf) -> Self {
+        // Persist the equivocator ban set alongside reputation.json so a banned
+        // wallet stays banned across a restart (a NodeId-rotation re-entry must
+        // not silently restore its counting weight).
+        let eq_path = path.with_file_name("equivocators.json");
+        if let Ok(bytes) = std::fs::read(&eq_path) {
+            if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&bytes) {
+                self.equivocators = Arc::new(RwLock::new(set));
+            }
+        }
+        self.equivocators_path = Some(eq_path);
         self.reputation_tracker = Arc::new(ReputationTracker::with_persistence(path));
         self
+    }
+
+    /// Best-effort persist of the equivocator ban set. Called while holding the
+    /// write lock so the on-disk set never lags the in-memory one.
+    async fn persist_equivocators(&self, set: &HashSet<String>) {
+        if let Some(path) = &self.equivocators_path {
+            match serde_json::to_vec(set) {
+                Ok(bytes) => {
+                    if let Err(e) = std::fs::write(path, bytes) {
+                        log::warn!("could not persist equivocators to {:?}: {}", path, e);
+                    }
+                }
+                Err(e) => log::warn!("could not serialize equivocators: {}", e),
+            }
+        }
+    }
+
+    /// Remove `request_id` from the emitted set so a re-proved identical
+    /// canonical id can be approved again — called on final settlement failure
+    /// and on timeout sweep, so a content-bound id is never permanently
+    /// un-approvable (a wedged-until-restart hazard otherwise).
+    pub async fn clear_emitted(&self, request_id: &str) {
+        self.emitted.write().await.remove(request_id);
     }
 
     /// Whether the `Valid`-voting co-signers hold enough stake for the on-chain
@@ -297,86 +433,97 @@ impl TransactVerificationCoordinator {
     /// it would clear. A quorum whose co-signers hold no stake cannot clear the
     /// on-chain threshold regardless, so withholding costs nothing a real
     /// snapshot would have bought.
-    async fn stake_quorum_met(&self, tally: &VoteTally, active: &HashSet<NodeId>) -> bool {
-        let local = match &self.local_node_id {
-            Some(id) => id,
-            None => return true,
-        };
-        let selector = self.leader_selector.read().await;
-
-        let mut total_active_stake: u64 = 0;
-        for v in active {
-            if let Some(info) = selector.get_validator(v) {
-                total_active_stake = total_active_stake.saturating_add(info.stake_amount);
+    async fn stake_quorum_met(&self, tally: &VoteTally) -> bool {
+        // Wallet-keyed, NO NodeId lookup and NO active-set filter (the flap-prone
+        // path). Eligibility + stake come from the on-chain snapshot keyed by
+        // wallet, so a reconnected co-signer whose wallet is staked always
+        // counts.
+        let local = match &self.local_wallet {
+            Some(w) => w,
+            None => {
+                log::warn!(
+                    target: "paraloom::consensus::transact",
+                    "local_wallet unset; stake gate disabled (unit/unconfigured)"
+                );
+                return true;
             }
-        }
-        if total_active_stake == 0 {
+        };
+
+        let onchain_stakes = self.onchain_stakes.read().await;
+        // DENOMINATOR = on-chain ValidatorRegistry.total_active_stake, NOT a
+        // getProgramAccounts sum, so a lagging PDA scan can never lower the
+        // threshold below what the on-chain quorum enforces (mirrors
+        // programs/paraloom/src/quorum.rs).
+        let registry_total = *self.onchain_registry_total.read().await;
+        let authority_stake = onchain_stakes.get(local).copied().unwrap_or(0);
+        let eligible_stake = registry_total.saturating_sub(authority_stake);
+
+        if eligible_stake == 0 {
             log::warn!(
                 target: "paraloom::consensus::transact",
-                "withholding approval: no on-chain stake snapshot for {} active validator(s) \
-                 (reconciler has not landed one yet)",
-                active.len()
+                "withholding approval: zero eligible on-chain stake \
+                 (registry_total={registry_total}, authority_stake={authority_stake}; \
+                 reconciler snapshot not landed yet)"
+            );
+            return false;
+        }
+        let threshold = eligible_stake.saturating_mul(2) / 3 + 1;
+
+        let equivocators = self.equivocators.read().await;
+        let votes = tally.votes.read().await;
+        let mut counted_stake: u64 = 0;
+        for (wallet, rec) in votes.iter() {
+            if wallet == local
+                || !rec.vote.is_valid()
+                || equivocators.contains(wallet)
+                || !onchain_stakes.contains_key(wallet)
+            {
+                continue;
+            }
+            counted_stake =
+                counted_stake.saturating_add(onchain_stakes.get(wallet).copied().unwrap_or(0));
+        }
+
+        // counted must never exceed eligible: an orphaned/duplicate is_active PDA
+        // inflating the getProgramAccounts numerator above the registry
+        // denominator would otherwise clear a set the chain rejects
+        // (mirrors quorum.rs QuorumNotMet on counted>eligible). Withhold, fail safe.
+        if counted_stake > eligible_stake {
+            log::warn!(
+                target: "paraloom::consensus::transact",
+                "withholding approval: counted stake {counted_stake} > eligible {eligible_stake} \
+                 (getProgramAccounts/registry divergence); reconcile validators"
             );
             return false;
         }
 
-        let authority_stake = selector
-            .get_validator(local)
-            .map(|i| i.stake_amount)
-            .unwrap_or(0);
-        let eligible_stake = total_active_stake.saturating_sub(authority_stake);
-        let threshold = eligible_stake.saturating_mul(2) / 3 + 1;
-
-        let votes = tally.votes.read().await;
-        let mut counted_stake: u64 = 0;
-        for (voter, vote) in votes.iter() {
-            if voter == local || !active.contains(voter) || !vote.is_valid() {
-                continue;
-            }
-            let reputation = self
-                .reputation_tracker
-                .get_reputation(voter)
-                .await
-                .unwrap_or(0);
-            if reputation < self.min_reputation_for_consensus {
-                continue;
-            }
-            if let Some(info) = selector.get_validator(voter) {
-                counted_stake = counted_stake.saturating_add(info.stake_amount);
-            }
-        }
-
         let met = counted_stake >= threshold;
         if !met {
-            // Previously silent: with the authority (this node) staked,
-            // total_active_stake != 0 skips the warn above, so a co-signer that
-            // voted but carries 0 counted stake withheld the settlement with no
-            // log at all. Make it observable — this is exactly the state a
-            // flapped/zero-stake co-signer produces.
-            let per_validator: Vec<(String, u64)> = active
+            let per_wallet: Vec<(String, u64)> = onchain_stakes
                 .iter()
-                .map(|v| {
-                    (
-                        format!("{:?}", v),
-                        selector
-                            .get_validator(v)
-                            .map(|i| i.stake_amount)
-                            .unwrap_or(0),
-                    )
-                })
+                .map(|(w, s)| (w.clone(), *s))
                 .collect();
             log::warn!(
                 target: "paraloom::consensus::transact",
                 "withholding approval: counted co-signer stake {} < threshold {} \
-                 (eligible {}, authority {}); active stakes = {:?}",
+                 (eligible {}, authority {}); on-chain stakes = {:?}",
                 counted_stake,
                 threshold,
                 eligible_stake,
                 authority_stake,
-                per_validator
+                per_wallet
             );
         }
         met
+    }
+
+    /// The eligibility basis for counting: the staked on-chain co-sign wallets
+    /// minus any banned for equivocation. Replaces the flap-prone
+    /// `active_snapshot()` NodeId set at every tally call site.
+    async fn eligible_wallets(&self) -> HashSet<String> {
+        let onchain = self.onchain_wallets.read().await;
+        let equivocators = self.equivocators.read().await;
+        onchain.difference(&equivocators).cloned().collect()
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -548,22 +695,31 @@ impl TransactVerificationCoordinator {
     /// pass, driven periodically by the node from
     /// `ProgramInterface::list_validator_stakes`, fills in the true at-risk
     /// stake so an unregistered/unstaked peer can never reach a supermajority.
-    pub async fn sync_onchain_stakes(&self, stakes: std::collections::HashMap<String, u64>) {
-        // Refresh the registration allowlist to exactly the on-chain
-        // swap-validator wallets. These map keys ARE the ValidatorRegistry set;
-        // compute ResourceProviders have no ValidatorAccount so are absent,
-        // which is what keeps them out of the swap quorum going forward.
+    pub async fn sync_onchain_stakes(
+        &self,
+        stakes: std::collections::HashMap<String, u64>,
+        registry_total_active_stake: u64,
+    ) {
+        // Refresh the registration allowlist + the wallet-keyed stake numerator
+        // to exactly the on-chain swap-validator wallets. These map keys ARE the
+        // ValidatorRegistry set; compute ResourceProviders have no
+        // ValidatorAccount so are absent, which keeps them out of the quorum.
         // An empty snapshot (RPC returned nothing) is NOT trusted to clear the
-        // allowlist — that would fail-open the gate; keep the previous set.
+        // allowlist/stakes — that would fail-open the gate; keep the previous
+        // set (and the previous registry total, updated only alongside a
+        // non-empty snapshot so numerator and denominator move together).
         if !stakes.is_empty() {
             *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
+            *self.onchain_registry_total.write().await = registry_total_active_stake;
+            *self.onchain_stakes.write().await = stakes.clone();
         }
 
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.apply_onchain_stakes(&stakes);
         log::debug!(
-            "Reconciled consensus stakes against on-chain state ({} staked wallets)",
-            stakes.len()
+            "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
+            stakes.len(),
+            registry_total_active_stake
         );
     }
 
@@ -582,26 +738,28 @@ impl TransactVerificationCoordinator {
         let pending = self.pending.read().await;
         match pending.get(request_id) {
             Some(consensus) => {
-                let active = self.active_snapshot().await;
-                consensus
-                    .tally
-                    .valid_voters(
-                        &self.reputation_tracker,
-                        self.min_reputation_for_consensus,
-                        &active,
-                    )
-                    .await
+                let eligible = self.eligible_wallets().await;
+                consensus.tally.valid_voters(&eligible).await
             }
             None => Vec::new(),
         }
     }
 
-    /// Snapshot of the validators currently in the active set. Vote eligibility
-    /// and co-signer selection are intersected with this so a validator that has
-    /// left the active set (e.g. disconnected) stops counting, even though its
-    /// durable reputation is preserved across the disconnect (#394/#408).
-    async fn active_snapshot(&self) -> HashSet<NodeId> {
-        self.validators.read().await.iter().cloned().collect()
+    /// Whether `node_id` maps to a wallet in the on-chain staked set — the
+    /// flap-surviving driver-auth check (replaces `is_registered_validator`,
+    /// which used the flap-prone `self.validators`). The leader_selector entry
+    /// is preserved across a flap (deactivate-not-delete), so a reconnected
+    /// co-signer still authenticates. Fail-open only while the on-chain set is
+    /// empty (pre-first-snapshot), matching the registration gate.
+    pub async fn source_is_onchain_validator(&self, node_id: &NodeId) -> bool {
+        let onchain = self.onchain_wallets.read().await;
+        if onchain.is_empty() {
+            return true;
+        }
+        match self.validator_wallet(node_id).await {
+            Some(wallet) => onchain.contains(&wallet),
+            None => false,
+        }
     }
 
     /// Number of registered validators
@@ -629,6 +787,16 @@ impl TransactVerificationCoordinator {
     /// Start verification for a transact request. Errors if there are not
     /// enough registered validators to reach the configured quorum.
     pub async fn start_verification(&self, request: TransactVerificationRequest) -> Result<String> {
+        // The pending map (and every vote's counting id) is keyed by the
+        // content-bound canonical id; refuse a request whose id is not its own
+        // canonical id so a mis-keyed round can never collect uncountable votes.
+        if request.request_id != request.canonical_id() {
+            return Err(anyhow!(
+                "request_id {} is not the canonical id of its settlement",
+                request.request_id
+            ));
+        }
+
         let validators = self.validators.read().await;
 
         if validators.is_empty() {
@@ -674,9 +842,48 @@ impl TransactVerificationCoordinator {
             .get(&result.request_id)
             .ok_or_else(|| anyhow!("Request not found: {}", result.request_id))?;
 
+        // REPLAY invariant on the counting path: the id we count under must be
+        // the content-bound canonical id of the settlement in flight. (Signed
+        // bytes also bind request_id, so this is belt-and-suspenders.)
+        if result.request_id != consensus.request.canonical_id() {
+            log::warn!(
+                "dropping vote: request_id {} != canonical id of pending settlement",
+                result.request_id
+            );
+            return Ok(());
+        }
+
+        // Structural backstop behind the ingress signature check: a vote with no
+        // wallet or no signature can never be counted (the self-vote is signed
+        // too, so this is safe for the initiator).
+        if result.wallet_pubkey.is_empty() || result.signature.is_empty() {
+            log::warn!(
+                "dropping unsigned/wallet-less vote for {} from {:?}",
+                result.request_id,
+                result.validator
+            );
+            return Ok(());
+        }
+
+        // Eligibility: while the on-chain wallet set is known, only a staked
+        // co-sign wallet may be counted (fail-open only while it is empty, as
+        // the registration gate does).
+        {
+            let onchain = self.onchain_wallets.read().await;
+            if !onchain.is_empty() && !onchain.contains(&result.wallet_pubkey) {
+                log::warn!(
+                    "dropping vote from non-staked wallet {} for {}",
+                    result.wallet_pubkey,
+                    result.request_id
+                );
+                return Ok(());
+            }
+        }
+
         log::debug!(
-            "Transact vote submitted for {}: {:?}",
+            "Transact vote submitted for {}: wallet={} node={:?}",
             result.request_id,
+            result.wallet_pubkey,
             result.validator
         );
 
@@ -685,44 +892,39 @@ impl TransactVerificationCoordinator {
 
         if let Some(evidence) = consensus
             .tally
-            .submit_vote(validator.clone(), result.vote)
+            .submit_vote(
+                result.wallet_pubkey.clone(),
+                validator.clone(),
+                result.vote.clone(),
+                result.signature.clone(),
+            )
             .await?
         {
-            // Equivocation: record the evidence; the original vote stands. Also
-            // penalise the equivocator's reputation (audit) so the misbehaviour
-            // costs it standing and gates it out of future quorums, mirroring
-            // the withdrawal path.
+            // Equivocation: ban the WALLET (undodgeable by NodeId rotation) so
+            // its standing vote's stake stops counting; persist the ban; keep the
+            // NodeId reputation penalty for forensics.
+            {
+                let mut eq = self.equivocators.write().await;
+                eq.insert(result.wallet_pubkey.clone());
+                self.persist_equivocators(&eq).await;
+            }
             if let Err(e) = self.reputation_tracker.record_failure(&validator).await {
                 log::warn!("could not penalise equivocator {:?}: {}", validator, e);
             }
             self.slashing_tracker.record(validator, evidence).await;
         }
 
-        // Emit the approval the first time this vote completes a `Valid`
-        // quorum. Computed from the borrowed `consensus` directly, guarded by
-        // the `emitted` set against later votes re-triggering it.
+        // Emit the approval the first time this vote completes a `Valid` quorum.
+        // Counting is by the on-chain staked wallet set (minus equivocators), NOT
+        // the flap-prone active NodeId set.
         if let Some(tx) = &self.approval_tx {
-            let active = self.active_snapshot().await;
+            let eligible = self.eligible_wallets().await;
             let mut emitted = self.emitted.write().await;
             if !emitted.contains(&result.request_id)
-                && consensus
-                    .tally
-                    .has_consensus(
-                        &self.reputation_tracker,
-                        self.min_reputation_for_consensus,
-                        &active,
-                    )
-                    .await
-                && self.stake_quorum_met(&consensus.tally, &active).await
+                && consensus.tally.has_consensus(&eligible).await
+                && self.stake_quorum_met(&consensus.tally).await
                 && matches!(
-                    consensus
-                        .tally
-                        .consensus_result(
-                            &self.reputation_tracker,
-                            self.min_reputation_for_consensus,
-                            &active,
-                        )
-                        .await,
+                    consensus.tally.consensus_result(&eligible).await,
                     Ok(VerificationVote::Valid)
                 )
             {
@@ -749,31 +951,16 @@ impl TransactVerificationCoordinator {
             return Err(anyhow!("Verification timed out"));
         }
 
-        let active = self.active_snapshot().await;
-        if consensus
-            .tally
-            .has_consensus(
-                &self.reputation_tracker,
-                self.min_reputation_for_consensus,
-                &active,
-            )
-            .await
-        {
-            let result = consensus
-                .tally
-                .consensus_result(
-                    &self.reputation_tracker,
-                    self.min_reputation_for_consensus,
-                    &active,
-                )
-                .await?;
+        let eligible = self.eligible_wallets().await;
+        if consensus.tally.has_consensus(&eligible).await {
+            let result = consensus.tally.consensus_result(&eligible).await?;
             // A `Valid` result may be acted on only if the co-signers hold
             // enough stake for the on-chain quorum; otherwise keep waiting for
             // more stake to vote rather than assemble a transaction the program
             // would reject (#611). An `Invalid` result settles nothing and needs
             // no stake threshold.
             if matches!(result, VerificationVote::Valid)
-                && !self.stake_quorum_met(&consensus.tally, &active).await
+                && !self.stake_quorum_met(&consensus.tally).await
             {
                 return Ok(None);
             }
@@ -814,6 +1001,9 @@ impl TransactVerificationCoordinator {
         let count = timed_out.len();
         for id in timed_out {
             pending.remove(&id);
+            // A content-bound canonical id that timed out must be re-approvable
+            // if the client re-proves it, so drop any stale emitted mark too.
+            self.emitted.write().await.remove(&id);
             log::warn!("Cleaned up timed out transact verification: {}", id);
         }
         Ok(count)
@@ -829,403 +1019,7 @@ impl Default for TransactVerificationCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The validator-set reconciler (#333) registers currently-connected peers
-    /// and drops those that disconnect. `unregister_validator` is the removal
-    /// half; it must shrink the transact-consensus set so a stale peer stops
-    /// counting toward (and being selected for) transact settlement.
-    #[tokio::test]
-    async fn register_then_unregister_tracks_the_validator_set() {
-        let coordinator = TransactVerificationCoordinator::new();
-
-        coordinator.register_validator(NodeId(vec![1])).await;
-        coordinator.register_validator(NodeId(vec![2])).await;
-        assert_eq!(coordinator.validator_count().await, 2);
-
-        coordinator.unregister_validator(&NodeId(vec![1])).await;
-        assert_eq!(coordinator.validator_count().await, 1);
-
-        // Unregistering an absent validator is a no-op, not an error.
-        coordinator.unregister_validator(&NodeId(vec![9])).await;
-        assert_eq!(coordinator.validator_count().await, 1);
-    }
-
-    /// A co-sign request is honoured only from a peer in the active validator
-    /// set (#648): the source-authentication gate rejects an unregistered peer,
-    /// so it can never reach the per-nullifier co-sign budget it would
-    /// otherwise exhaust to grief a settlement.
-    #[tokio::test]
-    async fn is_registered_validator_gates_cosign_by_membership() {
-        let coordinator = TransactVerificationCoordinator::new();
-        coordinator.register_validator(NodeId(vec![1])).await;
-
-        assert!(
-            coordinator.is_registered_validator(&NodeId(vec![1])).await,
-            "a registered validator is authenticated"
-        );
-        assert!(
-            !coordinator.is_registered_validator(&NodeId(vec![2])).await,
-            "an unregistered peer is rejected"
-        );
-
-        coordinator.unregister_validator(&NodeId(vec![1])).await;
-        assert!(
-            !coordinator.is_registered_validator(&NodeId(vec![1])).await,
-            "a dropped validator is no longer authenticated"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciler_reregister_preserves_the_advertised_wallet() {
-        // Same #260 wallet-preservation guarantee as the withdrawal coordinator:
-        // a wallet-less reconciler re-register must not clobber a wallet learned
-        // via Discovery.
-        let coordinator = TransactVerificationCoordinator::new();
-        coordinator
-            .register_validator_with_wallet(NodeId(vec![1]), Some("WaLLet1111".to_string()))
-            .await;
-        coordinator
-            .register_validator_with_wallet(NodeId(vec![1]), None)
-            .await;
-        assert_eq!(
-            coordinator.validator_wallet(&NodeId(vec![1])).await,
-            Some("WaLLet1111".to_string()),
-            "a wallet-less re-register must not clobber the advertised wallet"
-        );
-    }
-
-    /// A validator penalized below the consensus-eligibility floor must not be
-    /// able to wipe that history by disconnecting and reconnecting. The
-    /// reconciler's `unregister_validator` drops the peer from the active set
-    /// but preserves its reputation, so a re-registration cannot reset it to
-    /// `BASE_REPUTATION` and make a previously-excluded vote count (#394).
-    #[tokio::test]
-    async fn reconnect_preserves_reputation_and_keeps_excluded_vote_excluded() {
-        let (mut coordinator, mut approvals) =
-            TransactVerificationCoordinator::new_with_approvals();
-        coordinator.set_consensus_thresholds(1, 1);
-        let validator = NodeId(vec![0x44]);
-        coordinator.register_validator(validator.clone()).await;
-
-        // Drive the validator below the eligibility floor (17 * 50 penalty).
-        for _ in 0..17 {
-            coordinator
-                .reputation_tracker
-                .record_failure(&validator)
-                .await
-                .unwrap();
-        }
-        let penalized = coordinator
-            .reputation_tracker
-            .get_reputation(&validator)
-            .await
-            .unwrap();
-        assert!(
-            penalized < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
-            "precondition: validator must be below the consensus floor"
-        );
-
-        // A below-floor vote must not reach quorum.
-        let mut request = sample_request();
-        request.request_id = request.canonical_id();
-        coordinator
-            .start_verification(request.clone())
-            .await
-            .unwrap();
-        let vote = TransactVerificationResult {
-            request_id: request.request_id.clone(),
-            validator: validator.clone(),
-            vote: VerificationVote::Valid,
-            timestamp: 1,
-        };
-        coordinator.submit_result(vote.clone()).await.unwrap();
-        assert!(
-            approvals.try_recv().is_err(),
-            "a below-floor validator's vote must not reach quorum"
-        );
-
-        // Simulate a disconnect/reconnect across a reconciler tick.
-        coordinator.unregister_validator(&validator).await;
-        coordinator.register_validator(validator.clone()).await;
-
-        // Reputation must survive the round-trip, NOT reset to BASE_REPUTATION.
-        let after = coordinator
-            .reputation_tracker
-            .get_reputation(&validator)
-            .await
-            .unwrap();
-        assert_eq!(
-            after, penalized,
-            "disconnect/reconnect must preserve reputation, not reset it to BASE"
-        );
-        assert!(after < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS);
-
-        // The same vote must still be excluded after the reconnect.
-        coordinator.submit_result(vote).await.unwrap();
-        assert!(
-            approvals.try_recv().is_err(),
-            "disconnect/reconnect must not make a previously-excluded vote quorum-eligible"
-        );
-    }
-
-    /// A duplicate `start_verification` for an in-flight canonical id must not
-    /// reset the vote tally — the first vote must survive so the quorum can
-    /// still complete (insert-if-absent).
-    #[tokio::test]
-    async fn restarting_an_in_flight_verification_preserves_collected_votes() {
-        let (mut coordinator, mut approvals) =
-            TransactVerificationCoordinator::new_with_approvals();
-        coordinator.set_consensus_thresholds(2, 2);
-        let v1 = NodeId(vec![1]);
-        let v2 = NodeId(vec![2]);
-        coordinator.register_validator(v1.clone()).await;
-        coordinator.register_validator(v2.clone()).await;
-
-        let mut request = sample_request();
-        request.request_id = request.canonical_id();
-        let id = request.request_id.clone();
-        coordinator
-            .start_verification(request.clone())
-            .await
-            .unwrap();
-
-        coordinator
-            .submit_result(TransactVerificationResult {
-                request_id: id.clone(),
-                validator: v1.clone(),
-                vote: VerificationVote::Valid,
-                timestamp: 1,
-            })
-            .await
-            .unwrap();
-        assert!(
-            approvals.try_recv().is_err(),
-            "one of two votes must not reach quorum yet"
-        );
-
-        // Duplicate start for the same in-flight id — must be a no-op, not a reset.
-        coordinator.start_verification(request).await.unwrap();
-
-        coordinator
-            .submit_result(TransactVerificationResult {
-                request_id: id.clone(),
-                validator: v2.clone(),
-                vote: VerificationVote::Valid,
-                timestamp: 2,
-            })
-            .await
-            .unwrap();
-        assert!(
-            approvals.try_recv().is_ok(),
-            "re-starting an in-flight verification must preserve the first vote so the quorum completes"
-        );
-    }
-
-    /// A vote from a validator that has left the active set must stop counting
-    /// toward every in-flight round. Durable reputation survives a disconnect
-    /// (#394), but active-membership eligibility must not — otherwise a validator
-    /// can vote, disconnect, and let a later honest vote complete a quorum whose
-    /// co-sign set is missing the departed signer (#408). Regression from
-    /// billythebotman.
-    #[tokio::test]
-    async fn disconnected_validators_stale_votes_must_not_complete_quorum() {
-        let (mut coordinator, mut approvals) =
-            TransactVerificationCoordinator::new_with_approvals();
-        coordinator.set_consensus_thresholds(3, 3);
-
-        let leader = NodeId(vec![0x10]);
-        let attacker = NodeId(vec![0x20]);
-        let honest = NodeId(vec![0x30]);
-        coordinator.register_validator(leader.clone()).await;
-        coordinator.register_validator(attacker.clone()).await;
-        coordinator.register_validator(honest.clone()).await;
-
-        let mut request = sample_request();
-        request.request_id = request.canonical_id();
-        coordinator
-            .start_verification(request.clone())
-            .await
-            .unwrap();
-
-        for (validator, timestamp) in [(leader, 1), (attacker.clone(), 2)] {
-            coordinator
-                .submit_result(TransactVerificationResult {
-                    request_id: request.request_id.clone(),
-                    validator,
-                    vote: VerificationVote::Valid,
-                    timestamp,
-                })
-                .await
-                .unwrap();
-        }
-        assert!(approvals.try_recv().is_err(), "two of three is not quorum");
-
-        // Attacker disconnects — removed from the active set, reputation kept.
-        coordinator.unregister_validator(&attacker).await;
-        assert_eq!(coordinator.validator_count().await, 2);
-
-        coordinator
-            .submit_result(TransactVerificationResult {
-                request_id: request.request_id.clone(),
-                validator: honest,
-                vote: VerificationVote::Valid,
-                timestamp: 3,
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            approvals.try_recv().is_err(),
-            "a disconnected validator's stale vote must not complete quorum"
-        );
-    }
-
-    #[tokio::test]
-    async fn off_chain_quorum_requires_stake_weighted_supermajority() {
-        // #611: the off-chain head count could declare a quorum whose members
-        // hold less than the on-chain two-thirds of stake, so the leader
-        // assembled a transaction the program rejected with QuorumNotMet. The
-        // off-chain gate now mirrors the on-chain stake-weighted threshold.
-        let self_id = NodeId(vec![0x99]);
-        let (mut coordinator, mut approvals) =
-            TransactVerificationCoordinator::new_with_approvals();
-        coordinator = coordinator.with_local_node_id(self_id);
-        // Head count is deliberately not the blocker (one Valid vote satisfies
-        // it), so the stake gate is what decides.
-        coordinator.set_consensus_thresholds(1, 5);
-
-        let big = NodeId(vec![0x01]);
-        let small1 = NodeId(vec![0x02]);
-        let small2 = NodeId(vec![0x03]);
-        let small3 = NodeId(vec![0x04]);
-        // Stakes: big 70, each small 10 → total 100, self holds none, so
-        // eligible = 100 and threshold = floor(2 * 100 / 3) + 1 = 67. Register
-        // the stake in the leader selector first; the coordinator registration
-        // then preserves it while adding the voter to the active set.
-        for (id, stake) in [(&big, 70u64), (&small1, 10), (&small2, 10), (&small3, 10)] {
-            coordinator
-                .leader_selector
-                .write()
-                .await
-                .register_validator(ValidatorInfo::new(id.clone(), stake, 1000));
-            coordinator.register_validator(id.clone()).await;
-        }
-
-        let mut request = sample_request();
-        request.request_id = request.canonical_id();
-        coordinator
-            .start_verification(request.clone())
-            .await
-            .unwrap();
-
-        // The three small validators vote Valid: a head-count majority, but only
-        // 30% of stake — below the 67 threshold.
-        for (i, v) in [&small1, &small2, &small3].iter().enumerate() {
-            coordinator
-                .submit_result(TransactVerificationResult {
-                    request_id: request.request_id.clone(),
-                    validator: (*v).clone(),
-                    vote: VerificationVote::Valid,
-                    timestamp: i as u64 + 1,
-                })
-                .await
-                .unwrap();
-        }
-        assert!(
-            approvals.try_recv().is_err(),
-            "30% of stake must not reach the stake-weighted quorum"
-        );
-
-        // The big-stake validator votes Valid: now 100% of stake >= 67 → approved.
-        coordinator
-            .submit_result(TransactVerificationResult {
-                request_id: request.request_id.clone(),
-                validator: big,
-                vote: VerificationVote::Valid,
-                timestamp: 4,
-            })
-            .await
-            .unwrap();
-        assert!(
-            approvals.try_recv().is_ok(),
-            "a stake-weighted supermajority must reach quorum"
-        );
-    }
-
-    #[tokio::test]
-    async fn stake_gate_withholds_until_a_stake_snapshot_lands() {
-        // #698: the gate used to return true when it saw no stake at all, so a
-        // node between startup and its first successful on-chain reconcile
-        // approved on head count alone — with the stake weighting the gate
-        // exists to apply silently switched off. Connectivity registration
-        // seeds 0 stake, so this is the ordinary state of a node that has just
-        // started or whose `list_validator_stakes` RPC is failing.
-        let self_id = NodeId(vec![0x99]);
-        let (mut coordinator, mut approvals) =
-            TransactVerificationCoordinator::new_with_approvals();
-        coordinator = coordinator.with_local_node_id(self_id);
-        // One Valid vote satisfies the head count, so the stake gate decides.
-        coordinator.set_consensus_thresholds(1, 5);
-
-        // Registered as voters, but with no stake applied: exactly what
-        // connectivity registration leaves behind before the reconciler runs.
-        let a = NodeId(vec![0x01]);
-        let b = NodeId(vec![0x02]);
-        let c = NodeId(vec![0x03]);
-        for id in [&a, &b, &c] {
-            coordinator.register_validator(id.clone()).await;
-        }
-
-        let mut request = sample_request();
-        request.request_id = request.canonical_id();
-        coordinator
-            .start_verification(request.clone())
-            .await
-            .unwrap();
-
-        for (i, v) in [&a, &b].iter().enumerate() {
-            coordinator
-                .submit_result(TransactVerificationResult {
-                    request_id: request.request_id.clone(),
-                    validator: (*v).clone(),
-                    vote: VerificationVote::Valid,
-                    timestamp: i as u64 + 1,
-                })
-                .await
-                .unwrap();
-        }
-        assert!(
-            approvals.try_recv().is_err(),
-            "with no stake snapshot the gate must withhold, not wave the head count through"
-        );
-
-        // The reconciler lands a snapshot. Stakes: 50 each over three voters →
-        // total 150, self holds none, so eligible = 150 and the threshold is
-        // floor(2 * 150 / 3) + 1 = 101.
-        for id in [&a, &b, &c] {
-            coordinator
-                .leader_selector
-                .write()
-                .await
-                .register_validator(ValidatorInfo::new(id.clone(), 50, 1000));
-        }
-
-        // The third vote re-evaluates the same request, now with weight behind
-        // all three: 150 >= 101 → approved.
-        coordinator
-            .submit_result(TransactVerificationResult {
-                request_id: request.request_id.clone(),
-                validator: c,
-                vote: VerificationVote::Valid,
-                timestamp: 3,
-            })
-            .await
-            .unwrap();
-        assert!(
-            approvals.try_recv().is_ok(),
-            "once stake is known, a stake-weighted supermajority must approve"
-        );
-    }
+    use std::collections::HashMap;
 
     fn sample_request() -> TransactVerificationRequest {
         TransactVerificationRequest {
@@ -1242,11 +1036,431 @@ mod tests {
         }
     }
 
+    /// A canonical-id request ready to start verification.
+    fn canonical_request() -> TransactVerificationRequest {
+        let mut r = sample_request();
+        r.request_id = r.canonical_id();
+        r
+    }
+
+    /// Build a vote result. The coordinator only checks the signature is
+    /// NON-EMPTY (the ed25519 verify lives at the node ingress, not here), so a
+    /// dummy non-empty signature exercises the coordinator's counting logic.
+    fn vote(request_id: &str, node: u8, wallet: &str, valid: bool) -> TransactVerificationResult {
+        TransactVerificationResult {
+            request_id: request_id.to_string(),
+            validator: NodeId(vec![node]),
+            vote: if valid {
+                VerificationVote::Valid
+            } else {
+                VerificationVote::Invalid {
+                    reason: "bad".to_string(),
+                }
+            },
+            timestamp: 1,
+            wallet_pubkey: wallet.to_string(),
+            signature: vec![1],
+        }
+    }
+
+    fn stakes(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs.iter().map(|(w, s)| (w.to_string(), *s)).collect()
+    }
+
+    /// A 2-of-2 coordinator: authority W0 (val0) + co-signer W1 (val1), each
+    /// staked 1 SOL, registry total 2 SOL. Both registered and stake-synced.
+    async fn coord_2of2() -> (
+        TransactVerificationCoordinator,
+        mpsc::UnboundedReceiver<ApprovedTransact>,
+    ) {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W0", 1_000_000_000), ("W1", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+        (c, rx)
+    }
+
+    #[tokio::test]
+    async fn register_then_unregister_tracks_the_validator_set() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator.register_validator(NodeId(vec![1])).await;
+        coordinator.register_validator(NodeId(vec![2])).await;
+        assert_eq!(coordinator.validator_count().await, 2);
+        coordinator.unregister_validator(&NodeId(vec![1])).await;
+        assert_eq!(coordinator.validator_count().await, 1);
+        coordinator.unregister_validator(&NodeId(vec![9])).await;
+        assert_eq!(coordinator.validator_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn reconciler_reregister_preserves_the_advertised_wallet() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("WaLLet1111".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), None)
+            .await;
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![1])).await,
+            Some("WaLLet1111".to_string()),
+            "a wallet-less re-register must not clobber the advertised wallet"
+        );
+    }
+
+    // ---- signing-bytes (pure) ----
+
+    #[test]
+    fn signing_bytes_are_deterministic_and_bind_every_field() {
+        let base = transact_vote_signing_bytes(
+            "PROG",
+            "mainnet-beta",
+            "req-1",
+            &NodeId(vec![1, 2, 3]),
+            &VerificationVote::Valid,
+            "W1",
+        );
+        // Deterministic for identical inputs.
+        assert_eq!(
+            base,
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![1, 2, 3]),
+                &VerificationVote::Valid,
+                "W1"
+            )
+        );
+        // Every field is bound: changing any one changes the bytes.
+        let mutations = [
+            transact_vote_signing_bytes(
+                "PROG2",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![1, 2, 3]),
+                &VerificationVote::Valid,
+                "W1",
+            ),
+            transact_vote_signing_bytes(
+                "PROG",
+                "devnet",
+                "req-1",
+                &NodeId(vec![1, 2, 3]),
+                &VerificationVote::Valid,
+                "W1",
+            ),
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-2",
+                &NodeId(vec![1, 2, 3]),
+                &VerificationVote::Valid,
+                "W1",
+            ),
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![9, 9, 9]),
+                &VerificationVote::Valid,
+                "W1",
+            ),
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![1, 2, 3]),
+                &VerificationVote::Invalid { reason: "x".into() },
+                "W1",
+            ),
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![1, 2, 3]),
+                &VerificationVote::Valid,
+                "W2",
+            ),
+        ];
+        for m in mutations {
+            assert_ne!(base, m, "each field must be bound into the preimage");
+        }
+        // The Invalid reason free-text is NOT signed (only the validity bit).
+        assert_eq!(
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![1]),
+                &VerificationVote::Invalid { reason: "a".into() },
+                "W1"
+            ),
+            transact_vote_signing_bytes(
+                "PROG",
+                "mainnet-beta",
+                "req-1",
+                &NodeId(vec![1]),
+                &VerificationVote::Invalid { reason: "b".into() },
+                "W1"
+            ),
+        );
+    }
+
+    // ---- wallet-keyed counting / stake gate ----
+
+    #[tokio::test]
+    async fn two_of_two_wallet_quorum_settles() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        assert!(approvals.try_recv().is_err(), "one vote is not a quorum");
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "authority + co-signer wallet quorum must settle"
+        );
+    }
+
+    /// CORE FIX: a co-signer removed from the active NodeId set (flap) still has
+    /// its signed vote counted, because counting is keyed by the on-chain wallet.
+    /// Arm-the-guard: revert counting to intersect the active NodeId set and
+    /// val1 (unregistered) is filtered, quorum never forms, this fails.
+    #[tokio::test]
+    async fn flapped_wallet_vote_still_counts_and_settles() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+
+        // val1 flaps: dropped from the active NodeId set (but W1 stays on-chain).
+        coord.unregister_validator(&NodeId(vec![1])).await;
+        assert!(!coord.is_registered_validator(&NodeId(vec![1])).await);
+
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "a flapped co-signer's signed vote must still count by wallet"
+        );
+    }
+
+    /// The authority's own wallet is excluded from both sides of the stake
+    /// quorum: its lone self-vote cannot self-approve.
+    /// Arm-the-guard: stop excluding local and W0's stake self-clears.
+    #[tokio::test]
+    async fn authority_wallet_excluded_from_quorum() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(1, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W0", 1_000_000_000), ("W1", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "the authority's own vote must not settle its own quorum"
+        );
+    }
+
+    /// The stake denominator is the registry total, not the getProgramAccounts
+    /// sum: a co-signer holding less than 2/3 of the registry total is withheld
+    /// even though it is 100% of the scanned stake map.
+    /// Arm-the-guard: use sum(onchain_stakes) as the denominator and it approves.
+    #[tokio::test]
+    async fn off_chain_denominator_uses_registry_total() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(1, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        // Only W1 is in the scanned map, but the registry counts 3 SOL active.
+        c.sync_onchain_stakes(stakes(&[("W1", 1_000_000_000)]), 3_000_000_000)
+            .await;
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "1 SOL < 2/3 of the 3-SOL registry total must withhold"
+        );
+    }
+
+    /// counted_stake must never exceed eligible_stake (an orphaned/duplicate
+    /// is_active PDA inflating the scan above the registry total): withhold.
+    /// Arm-the-guard: drop the counted<=eligible guard and it approves.
+    #[tokio::test]
+    async fn counted_exceeds_eligible_withholds() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        // Scan sums to 2 SOL but the registry only records 1 SOL active.
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            1_000_000_000,
+        )
+        .await;
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 2, "W2", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "counted (2 SOL) > eligible (1 SOL) must fail safe"
+        );
+    }
+
+    /// A wallet that equivocates (Valid then Invalid, from two NodeIds) is
+    /// banned and its standing vote stops counting.
+    /// Arm-the-guard: remove the equivocator ban/filter and the standing Valid
+    /// vote keeps its weight.
+    #[tokio::test]
+    async fn equivocation_bans_wallet_and_stops_counting() {
+        // Two co-signers are needed for the quorum; W1 equivocates and is banned,
+        // so W2 alone can no longer complete it.
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        // W1 votes Valid (node 1), then flips to Invalid (node 9) — equivocation.
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 9, "W1", false)).await.unwrap();
+        // W2 votes Valid, but with W1 banned the quorum cannot form.
+        c.submit_result(vote(&id, 2, "W2", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "an equivocating wallet's standing vote must stop counting"
+        );
+        assert!(
+            c.slashing_tracker().total_count().await > 0,
+            "equivocation must be recorded"
+        );
+    }
+
+    /// A vote from a wallet absent from the on-chain staked set is dropped
+    /// (re-expression of #408 + Sybil): only staked wallets count.
+    /// Arm-the-guard: count regardless of onchain_wallets membership.
+    #[tokio::test]
+    async fn non_staked_wallet_vote_not_counted() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        // W9 is not in the staked set — dropped, so no quorum forms.
+        coord.submit_result(vote(&id, 9, "W9", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "a non-staked wallet's vote must not count toward the quorum"
+        );
+    }
+
+    /// After an approval is emitted but settlement fails, clear_emitted lets the
+    /// same canonical id be approved again.
+    /// Arm-the-guard: never clear `emitted` and the re-trigger is swallowed.
+    #[tokio::test]
+    async fn clear_emitted_allows_reapproval() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok(), "first approval fires");
+
+        // Simulate a settlement failure freeing the id, then a re-trigger.
+        coord.clear_emitted(&id).await;
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "after clear_emitted the same canonical id can be re-approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_verification_rejects_non_canonical_id() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator.register_validator(NodeId(vec![1])).await;
+        coordinator.register_validator(NodeId(vec![2])).await;
+        let req = sample_request(); // request_id = "attacker-chosen" != canonical
+        assert!(
+            coordinator.start_verification(req).await.is_err(),
+            "a request whose id is not its canonical id must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_an_in_flight_verification_preserves_collected_votes() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req.clone()).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "one of two votes is not a quorum"
+        );
+        // Duplicate start for the same in-flight id — must NOT reset the tally.
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "the first vote must survive the duplicate start"
+        );
+    }
+
+    // ---- canonical id (pure, unchanged) ----
+
     #[test]
     fn canonical_id_binds_only_settlement_fields() {
-        // The caller-chosen id, the ciphertexts, and the timestamp must not
-        // change the canonical id (#383/#382): an exact settlement replay is
-        // idempotent regardless of those non-bound fields.
         let base = sample_request().canonical_id();
         let mut r = sample_request();
         r.request_id = "different".to_string();
@@ -1272,54 +1486,34 @@ mod tests {
         ] {
             let mut r = sample_request();
             mutate(&mut r);
-            assert_ne!(
-                r.canonical_id(),
-                base,
-                "mutating a settlement field must change the canonical id"
-            );
+            assert_ne!(r.canonical_id(), base);
         }
     }
 
-    /// The proof-suite tag rides inside `proof` rather than in a sibling field
-    /// precisely so that `canonical_id`, which already hashes those bytes,
-    /// binds it for free. Two suites over the same proof body therefore yield
-    /// two distinct request ids and cannot collide in one verification round —
-    /// the property a migration window depends on.
     #[test]
     fn canonical_id_binds_the_proof_suite_tag() {
         use crate::privacy::{tag_proof, ProofSuite, GROTH16_BN254_COMPRESSED_LEN};
-
         let body = vec![3u8; GROTH16_BN254_COMPRESSED_LEN];
         let a = TransactVerificationRequest {
             proof: tag_proof(ProofSuite::Groth16Bn254TransactV3, &body),
             ..sample_request()
         };
         let mut b = a.clone();
-        b.proof[0] = 2; // a hypothetical future suite over the same body
-
-        assert_ne!(
-            a.canonical_id(),
-            b.canonical_id(),
-            "the suite tag must be part of the settlement-defining bytes"
-        );
+        b.proof[0] = 2;
+        assert_ne!(a.canonical_id(), b.canonical_id());
     }
 
-    /// The swap consensus must admit ONLY on-chain swap validators. Compute
-    /// ResourceProviders share the p2p network and a wallet-less connectivity
-    /// entry must never carry co-sign weight (the latter is what re-seeded a
-    /// flapped validator at 0 stake and silently withheld every settlement).
-    /// Arm-the-guard: removing the gate re-admits the compute wallet and this
-    /// test fails.
+    // ---- registration gating / flap preservation ----
+
     #[tokio::test]
     async fn registration_is_gated_to_onchain_swap_validators() {
         let coordinator = TransactVerificationCoordinator::new();
-        // Seed the allowlist to the two on-chain swap validators.
-        let mut stakes = std::collections::HashMap::new();
-        stakes.insert("VAL1wallet".to_string(), 1_000_000_000u64);
-        stakes.insert("VAL2wallet".to_string(), 1_000_000_000u64);
-        coordinator.sync_onchain_stakes(stakes).await;
-
-        // A compute ResourceProvider (wallet not in the registry) is rejected.
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1wallet", 1_000_000_000), ("VAL2wallet", 1_000_000_000)]),
+                2_000_000_000,
+            )
+            .await;
         coordinator
             .register_validator_with_wallet(NodeId(vec![0xC0]), Some("COMPUTEwallet".to_string()))
             .await;
@@ -1329,8 +1523,6 @@ mod tests {
                 .await,
             "a non-on-chain (compute) wallet must never enter the swap consensus"
         );
-
-        // A wallet-less connectivity entry is rejected.
         coordinator
             .register_validator_with_wallet(NodeId(vec![0xC1]), None)
             .await;
@@ -1338,10 +1530,8 @@ mod tests {
             !coordinator
                 .is_registered_validator(&NodeId(vec![0xC1]))
                 .await,
-            "a wallet-less (None) registration must never enter the swap consensus"
+            "a wallet-less registration must never enter the swap consensus"
         );
-
-        // A real on-chain swap validator IS admitted.
         coordinator
             .register_validator_with_wallet(NodeId(vec![0x01]), Some("VAL2wallet".to_string()))
             .await;
@@ -1353,54 +1543,33 @@ mod tests {
         );
     }
 
-    /// A connectivity flap must PRESERVE a validator's on-chain stake + co-sign
-    /// wallet (deactivate, not delete), so a reconnect never opens a 0-stake
-    /// window that silently withholds settlement. Arm-the-guard: restoring the
-    /// old `remove`-on-unregister makes `get_validator` return None and this
-    /// test fails.
     #[tokio::test]
     async fn flap_preserves_validator_stake_and_wallet() {
         let coordinator = TransactVerificationCoordinator::new();
         coordinator
             .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2wallet".to_string()))
             .await;
-        let mut stakes = std::collections::HashMap::new();
-        stakes.insert("VAL2wallet".to_string(), 1_000_000_000u64);
-        coordinator.sync_onchain_stakes(stakes).await;
-
-        // Connectivity flap: unregister deactivates (must not delete).
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL2wallet", 1_000_000_000)]), 1_000_000_000)
+            .await;
         coordinator.unregister_validator(&NodeId(vec![2])).await;
         {
             let sel = coordinator.leader_selector.read().await;
             let info = sel
                 .get_validator(&NodeId(vec![2]))
                 .expect("entry must survive a connectivity flap (deactivated, not deleted)");
-            assert_eq!(
-                info.stake_amount, 1_000_000_000,
-                "stake must be preserved across a flap"
-            );
+            assert_eq!(info.stake_amount, 1_000_000_000);
             assert_eq!(info.wallet_pubkey.as_deref(), Some("VAL2wallet"));
-            assert!(
-                !info.is_active,
-                "a flapped validator is inactive until it reconnects"
-            );
+            assert!(!info.is_active);
         }
-
-        // Reconnect (wallet-bearing Discovery) re-activates; stake intact.
         coordinator
             .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2wallet".to_string()))
             .await;
         {
             let sel = coordinator.leader_selector.read().await;
             let info = sel.get_validator(&NodeId(vec![2])).unwrap();
-            assert!(
-                info.is_active,
-                "reconnect must re-activate the preserved entry"
-            );
-            assert_eq!(
-                info.stake_amount, 1_000_000_000,
-                "stake stays after reconnect (no 0-stake window)"
-            );
+            assert!(info.is_active);
+            assert_eq!(info.stake_amount, 1_000_000_000);
         }
     }
 }

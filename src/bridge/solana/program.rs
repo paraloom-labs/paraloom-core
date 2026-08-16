@@ -105,6 +105,31 @@ impl ProgramInterface {
         Ok(stakes)
     }
 
+    /// Read `ValidatorRegistry.total_active_stake` — the DENOMINATOR the on-chain
+    /// stake-weighted quorum uses (`programs/paraloom/src/quorum.rs`). The
+    /// off-chain gate mirrors this exact value instead of summing
+    /// `list_validator_stakes`, so a lagging `getProgramAccounts` scan can never
+    /// lower the threshold below what the program enforces.
+    ///
+    /// Layout after the 8-byte Anchor discriminator: `authority[8..40]`,
+    /// `total_validators[40..48]`, `active_validators[48..56]`,
+    /// `minimum_stake[56..64]`, `total_active_stake[64..72]`.
+    pub async fn registry_total_active_stake(&self) -> Result<u64> {
+        let (registry_pda, _) =
+            Pubkey::find_program_address(&[b"validator_registry"], &self.program_id);
+        let account = self.rpc.get_account(&registry_pda).await?;
+        let d = &account.data;
+        if d.len() < 72 {
+            return Err(BridgeError::Serialization(format!(
+                "ValidatorRegistry account too short: {} bytes (need >= 72)",
+                d.len()
+            )));
+        }
+        Ok(u64::from_le_bytes(
+            d[64..72].try_into().expect("8-byte total_active_stake"),
+        ))
+    }
+
     /// Verify a deposit transaction exists on Solana
     /// Confirm a deposit transaction landed on-chain without error.
     ///
