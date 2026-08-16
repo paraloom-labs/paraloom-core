@@ -1576,6 +1576,28 @@ impl Node {
         // dropped, so the set tracks real connectivity independent of gossip
         // timing. A wallet learned via Discovery is preserved — registration is
         // wallet-preserving — and is what the #260 co-sign step uses.
+        // Seed the on-chain validator allowlist ONCE, synchronously, before the
+        // reconcilers spawn — so the registration gate is armed from t=0 and no
+        // peer slips in during an empty-allowlist fail-open window.
+        if let (Some(bridge), Some(transact)) =
+            (self.bridge.clone(), self.transact_coordinator.clone())
+        {
+            match bridge.lock().await.list_validator_stakes().await {
+                Ok(list) => {
+                    let map: std::collections::HashMap<String, u64> = list
+                        .into_iter()
+                        .map(|(wallet, stake)| (wallet.to_string(), stake))
+                        .collect();
+                    transact.sync_onchain_stakes(map).await;
+                    info!("Seeded on-chain validator allowlist for the transact registration gate");
+                }
+                Err(e) => log::warn!(
+                    "could not seed validator allowlist at startup \
+                     (gate fails open until the first reconcile lands): {e}"
+                ),
+            }
+        }
+
         if self.transact_coordinator.is_some() {
             let network = Arc::clone(&self.network);
             let transact = self.transact_coordinator.clone();
@@ -1587,11 +1609,14 @@ impl Node {
                     ticker.tick().await;
                     let connected: std::collections::HashSet<NodeId> =
                         network.connected_peers().await.into_iter().collect();
-                    for peer in connected.difference(&registered) {
-                        if let Some(t) = &transact {
-                            t.register_validator_with_wallet(peer.clone(), None).await;
-                        }
-                    }
+                    // Registration is Discovery-driven ONLY (wallet-bearing and
+                    // gated to on-chain validators). The old wallet=None
+                    // registration here re-seeded a flapped validator at stake 0
+                    // / wallet None, which the wallet-keyed reconciler could not
+                    // repair — silently withholding settlement. The reconciler
+                    // now only reacts to DISCONNECTS, deactivating a dropped peer
+                    // (its stake + wallet are preserved; a no-op for peers never
+                    // admitted, e.g. compute ResourceProviders).
                     for peer in registered.difference(&connected) {
                         if let Some(t) = &transact {
                             t.unregister_validator(peer).await;

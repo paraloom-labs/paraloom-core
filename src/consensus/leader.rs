@@ -104,6 +104,33 @@ impl LeaderSelector {
         );
     }
 
+    /// Mark a validator inactive WITHOUT dropping its entry, so its on-chain
+    /// stake and co-sign wallet survive a mere connectivity flap. A hard
+    /// `remove` on disconnect discarded both; on reconnect the peer was
+    /// re-seeded at stake 0 / wallet None, and the wallet-keyed on-chain
+    /// reconciler could never re-attach its real stake — silently withholding
+    /// every settlement until a full rediscovery. Deactivation keeps the entry
+    /// (inert for leader selection via the `is_active` filter, and still
+    /// refreshed by `apply_onchain_stakes`) so a reconnect restores full weight
+    /// immediately. Genuine removal (a validator deregistered on-chain) is done
+    /// by the on-chain prune, not by a connectivity blip.
+    pub fn deactivate_validator(&mut self, node_id: &NodeId) {
+        if let Some(v) = self.validators.get_mut(node_id) {
+            v.is_active = false;
+            log::info!(
+                "Deactivated validator (entry + stake preserved): {:?}",
+                node_id
+            );
+        }
+    }
+
+    /// Re-activate a preserved entry on reconnect (stake/wallet/reputation kept).
+    pub fn activate_validator(&mut self, node_id: &NodeId) {
+        if let Some(v) = self.validators.get_mut(node_id) {
+            v.is_active = true;
+        }
+    }
+
     /// Update validator info
     pub fn update_validator(&mut self, validator: ValidatorInfo) {
         self.validators.insert(validator.node_id.clone(), validator);
