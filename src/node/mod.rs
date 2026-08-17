@@ -1125,6 +1125,49 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
     matches!(e, crate::bridge::BridgeError::AlreadySettled)
 }
 
+/// Decide which admitted validators to deactivate on one connectivity-reconcile
+/// tick, applying HYSTERESIS: a validator is deactivated only after it has been
+/// absent from `connected` for `threshold` CONSECUTIVE ticks.
+///
+/// Without this, a single-tick gap in `connected_peers()` — a transient reading
+/// blip while the mesh never actually dropped (gossip keeps flowing, no
+/// connection-closed event) — instantly deactivated a still-present co-signer,
+/// dropping the 2-of-2 quorum below threshold and stalling ALL settlement until
+/// it flapped back. Deactivate-not-delete (preserving stake) made that recover
+/// cleanly on reconnect, but the reconciler still FOUGHT Discovery-driven
+/// re-activation every tick; hysteresis stops the spurious deactivation itself.
+///
+/// `known` (admitted peers) and `misses` (per-peer consecutive-absent streaks)
+/// are updated in place. A present peer clears its streak; a peer that reaches
+/// `threshold` misses is returned for deactivation and dropped from tracking
+/// (re-admitted when it reconnects). A genuinely gone peer is still deactivated
+/// after `threshold` ticks.
+fn reconcile_deactivations(
+    known: &mut std::collections::HashSet<NodeId>,
+    misses: &mut HashMap<NodeId, u32>,
+    connected: &std::collections::HashSet<NodeId>,
+    threshold: u32,
+) -> Vec<NodeId> {
+    // Present this tick: (re-)admit and clear any absent streak.
+    for peer in connected {
+        known.insert(peer.clone());
+        misses.remove(peer);
+    }
+    // Admitted but absent this tick: bump the streak; deactivate at the threshold.
+    let mut deactivate = Vec::new();
+    let absent: Vec<NodeId> = known.difference(connected).cloned().collect();
+    for peer in absent {
+        let streak = misses.entry(peer.clone()).or_insert(0);
+        *streak += 1;
+        if *streak >= threshold {
+            deactivate.push(peer.clone());
+            misses.remove(&peer);
+            known.remove(&peer);
+        }
+    }
+    deactivate
+}
+
 /// Drain the transact coordinator's approval channel and settle each approved
 /// unified transact on-chain (#350). The approval channel is local to the
 /// coordinator that reached quorum, so exactly one node settles.
@@ -1714,8 +1757,13 @@ impl Node {
             let transact = self.transact_coordinator.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
-                let mut registered: std::collections::HashSet<NodeId> =
-                    std::collections::HashSet::new();
+                // Deactivate a co-signer only after it has been absent for this
+                // many consecutive ticks (3 * 30s = 90s), so a transient
+                // connected_peers() blip cannot flap a still-present validator
+                // out of the 2-of-2 quorum. See reconcile_deactivations.
+                const MISS_THRESHOLD: u32 = 3;
+                let mut known: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+                let mut misses: HashMap<NodeId, u32> = HashMap::new();
                 loop {
                     ticker.tick().await;
                     let connected: std::collections::HashSet<NodeId> =
@@ -1725,18 +1773,23 @@ impl Node {
                     // registration here re-seeded a flapped validator at stake 0
                     // / wallet None, which the wallet-keyed reconciler could not
                     // repair — silently withholding settlement. The reconciler
-                    // now only reacts to DISCONNECTS, deactivating a dropped peer
-                    // (its stake + wallet are preserved; a no-op for peers never
-                    // admitted, e.g. compute ResourceProviders).
-                    for peer in registered.difference(&connected) {
+                    // now only reacts to sustained DISCONNECTS, deactivating a
+                    // dropped peer (its stake + wallet are preserved; a no-op for
+                    // peers never admitted, e.g. compute ResourceProviders).
+                    let drop_list = reconcile_deactivations(
+                        &mut known,
+                        &mut misses,
+                        &connected,
+                        MISS_THRESHOLD,
+                    );
+                    for peer in &drop_list {
                         if let Some(t) = &transact {
                             t.unregister_validator(peer).await;
                         }
                     }
-                    registered = connected;
                 }
             });
-            info!("Consensus validator-set reconciler spawned (interval 30s)");
+            info!("Consensus validator-set reconciler spawned (interval 30s, deactivate after 3 missed ticks)");
         }
 
         // On-chain stake reconciler (#333/#627/#611). The connectivity
@@ -2700,6 +2753,60 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- connectivity reconciler hysteresis (reconcile_deactivations) ---
+
+    fn node_id(b: u8) -> NodeId {
+        NodeId(vec![b])
+    }
+
+    fn set(ids: &[u8]) -> std::collections::HashSet<NodeId> {
+        ids.iter().map(|b| node_id(*b)).collect()
+    }
+
+    // A validator absent for fewer than `threshold` consecutive ticks is NEVER
+    // deactivated — the bug that dropped the 2-of-2 quorum on a single-tick
+    // connected_peers() blip.
+    #[test]
+    fn transient_absence_does_not_deactivate() {
+        let mut known = std::collections::HashSet::new();
+        let mut misses = HashMap::new();
+        // Admit peer 2 while connected to 1 and 2.
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1, 2]), 3).is_empty());
+        // Peer 2 vanishes for one tick, then two — still under the threshold.
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+        // It reappears: the streak must reset, so it survives indefinitely.
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1, 2]), 3).is_empty());
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+    }
+
+    // A validator genuinely gone (absent `threshold` ticks in a row) IS
+    // deactivated — exactly once — so a real disconnect is still handled.
+    #[test]
+    fn sustained_absence_deactivates_once() {
+        let mut known = std::collections::HashSet::new();
+        let mut misses = HashMap::new();
+        reconcile_deactivations(&mut known, &mut misses, &set(&[1, 2]), 3);
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+        // Third consecutive miss crosses the threshold.
+        let dropped = reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3);
+        assert_eq!(dropped, vec![node_id(2)]);
+        // Already deactivated + dropped from tracking: no repeat.
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 3).is_empty());
+    }
+
+    // A peer never seen connected is never deactivated (no-op for compute peers).
+    #[test]
+    fn unknown_peer_is_never_deactivated() {
+        let mut known = std::collections::HashSet::new();
+        let mut misses = HashMap::new();
+        // Only peer 1 ever connects; peer 9 is never admitted.
+        reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 1);
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 1).is_empty());
+    }
 
     // --- #260/#350 co-sign handler (cosign_settlement), v3 transact ---
 
