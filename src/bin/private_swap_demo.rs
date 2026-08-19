@@ -306,6 +306,10 @@ async fn main() -> anyhow::Result<()> {
         reshield_recipient: ShieldedAddress::from_bytes(fr_to_le(&rand_fr())),
         reshield_randomness: fr_to_le(&rand_fr()),
         fee_bps: 0,
+        // No orchestration-layer floor for the demo — the Jupiter provider's
+        // slippage bound governs the on-chain trade. A production caller would
+        // pass Some(min) derived from a fresh quote to abort a bad fill.
+        min_out_amount: None,
     };
 
     match relayer.execute_swap_out(request, &fresh).await {
