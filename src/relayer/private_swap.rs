@@ -83,6 +83,16 @@ pub enum RelayerError {
     /// Submitting one of the on-chain legs (withdraw or deposit) failed.
     #[error("on-chain submission failed: {0}")]
     SubmissionFailed(String),
+
+    /// The swap's realized output fell below the caller's stated minimum
+    /// (`min_out_amount`). Checked the instant the swap leg returns, before any
+    /// fee accounting or re-deposit/delivery, so a bad fill aborts the swap
+    /// instead of silently re-shielding (or handing over) less than the caller
+    /// was willing to accept. The provider's own slippage bound is the on-chain
+    /// first line of defense; this is the orchestration layer's independent
+    /// check, which the provider setting alone did not give a single request.
+    #[error("swap output {out_amount} is below the caller minimum {min_out}")]
+    SlippageExceeded { out_amount: u64, min_out: u64 },
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -279,6 +289,14 @@ pub struct PrivateSwapRequest {
     pub reshield_randomness: [u8; 32],
     /// Relayer fee in basis points, applied to the gross swap output.
     pub fee_bps: u16,
+    /// Minimum acceptable swap output for THIS trade, in `asset_out`'s smallest
+    /// unit. `Some(min)` fails the swap (`SlippageExceeded`) if the realized
+    /// output is below `min`, before any fee or re-deposit; `None` applies no
+    /// orchestration-layer floor (the provider's slippage bound still governs the
+    /// on-chain trade). This lets an individual request express "abort rather
+    /// than accept less than X" — the tunable the provider-wide `slippage_bps`
+    /// could not give one order.
+    pub min_out_amount: Option<u64>,
 }
 
 /// The outcome of a completed private swap.
@@ -435,6 +453,22 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
             .await?;
+
+        // Independent slippage floor. The provider enforces its own slippage
+        // bound on-chain, but that is a single value fixed when the relayer is
+        // wired up — a request could not say "fail this trade rather than accept
+        // less than X." Verify the realized output against the caller's minimum
+        // here, before the fee accounting and re-deposit/delivery downstream act
+        // on it, so a bad fill aborts rather than being re-shielded or handed
+        // over unchecked.
+        if let Some(min_out) = request.min_out_amount {
+            if swap.out_amount < min_out {
+                return Err(RelayerError::SlippageExceeded {
+                    out_amount: swap.out_amount,
+                    min_out,
+                });
+            }
+        }
         Ok((withdraw_leg, swap.out_amount))
     }
 
@@ -636,6 +670,7 @@ mod tests {
             reshield_recipient: ShieldedAddress::from_bytes([9u8; 32]),
             reshield_randomness: [5u8; 32],
             fee_bps,
+            min_out_amount: None,
         }
     }
 
@@ -800,6 +835,66 @@ mod tests {
         let legs = relayer.submitter.recorded();
         assert_eq!(legs[0].leg, WithdrawLeg::Spl(mint_in));
         assert_eq!(legs[1].leg, WithdrawLeg::Native);
+    }
+
+    #[tokio::test]
+    async fn swap_below_min_out_is_rejected_before_redeposit() {
+        // 1:1 swap of 1_000_000: 997_500 reaches the fresh address after the
+        // 25bps withdraw fee and is swapped 1:1, so the realized output is
+        // 997_500. A caller minimum of 1_000_000 is above that, so the swap must
+        // abort rather than re-shield the shortfall.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let req = PrivateSwapRequest {
+            min_out_amount: Some(1_000_000),
+            ..request(native_note(1_000_000), NATIVE_SOL_ASSET, 0)
+        };
+        let err = relayer
+            .execute(req)
+            .await
+            .expect_err("below-min fill must error");
+        assert!(matches!(
+            err,
+            RelayerError::SlippageExceeded {
+                out_amount: 997_500,
+                min_out: 1_000_000
+            }
+        ));
+        // The withdraw leg settled, but the check fires before the re-deposit —
+        // so no deposit leg was ever submitted.
+        let legs = relayer.submitter.recorded();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].leg, WithdrawLeg::Native);
+    }
+
+    #[tokio::test]
+    async fn swap_meeting_min_out_succeeds() {
+        // Same trade, but the minimum exactly equals the realized output, so it
+        // passes and both legs settle.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let req = PrivateSwapRequest {
+            min_out_amount: Some(997_500),
+            ..request(native_note(1_000_000), NATIVE_SOL_ASSET, 0)
+        };
+        let out = relayer.execute(req).await.expect("at-min fill succeeds");
+        assert_eq!(out.net_out_amount, 997_500);
+        assert_eq!(relayer.submitter.recorded().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn swap_out_honors_min_out() {
+        // The swap-out flow shares withdraw_then_swap, so the floor guards it too:
+        // a private buy left at the fresh address must also refuse a bad fill.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let usdc: AssetId = [0x55u8; 32];
+        let req = PrivateSwapRequest {
+            min_out_amount: Some(1_000_000),
+            ..request(native_note(1_000_000), usdc, 0)
+        };
+        let err = relayer
+            .execute_swap_out(req, &Keypair::new())
+            .await
+            .expect_err("below-min swap-out must error");
+        assert!(matches!(err, RelayerError::SlippageExceeded { .. }));
     }
 
     #[tokio::test]
