@@ -1,9 +1,10 @@
 # Security log
 
 A public record of security-relevant findings and the fixes that closed them.
-Everything here was found and fixed **pre-mainnet, on devnet — no real funds
-were ever at risk**. Newest first. Each entry links the public issue so anyone
-can verify it.
+Newest first. Each entry links the public issue so anyone can verify it, and
+states its own exposure: everything dated before the mainnet-beta go-live on
+**2026-08-04** was found and fixed pre-mainnet, on devnet, with no real funds at
+risk, and entries after it say plainly what was and was not exposed.
 
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
@@ -40,7 +41,7 @@ issue, email security@paraloom.network.
   the deployed program does not yet carry the #779 instructions and filed it for
   the record rather than as a scope claim, which is the right read — the gap
   becomes live on the first redeploy that ships #779, and is now closed ahead of
-  it. Devnet, pre-mainnet.
+  it. No user funds were exposed at any point.
 
 - **The live circuit's proving/verifying keys are now from a multi-party trusted
   setup, not a single-party dev key** (ceremony finalization, #659 / #64). Until
