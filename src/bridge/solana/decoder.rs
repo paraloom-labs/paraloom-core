@@ -130,7 +130,9 @@ pub fn extract_deposit_events(
 struct DecodedDeposit {
     data: DepositInstructionData,
     depositor: Pubkey,
-    /// The deposited asset (#237): the SPL mint's bytes, or `NATIVE_SOL_ASSET`.
+    /// The deposited asset: `NATIVE_SOL_ASSET`, `mint_to_asset(mint)` for a
+    /// `deposit_note_spl` (#779), or the legacy `deposit_spl`'s raw mint bytes
+    /// (#237). The v3 arms must use whatever the program hashed into the leaf.
     asset_id: [u8; 32],
 }
 
@@ -142,6 +144,14 @@ const SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 5;
 /// merkle_tree(2), depositor(3), … — the tree account is what pushes the
 /// depositor one further along than the legacy `deposit`.
 const DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX: usize = 3;
+
+/// `deposit_note_spl` account layout: bridge_state(0), asset_config(1),
+/// mint(2), asset_vault(3), depositor_token_account(4), merkle_tree(5),
+/// depositor(6), token_program(7). Both the per-asset config and the vault sit
+/// ahead of the mint, so neither the legacy `deposit_spl` positions nor the
+/// native `deposit_note` ones carry over.
+const DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX: usize = 2;
+const DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 6;
 
 /// Try to interpret a single compiled instruction as a Paraloom
 /// deposit. Returns `None` if the instruction targets a different
@@ -163,15 +173,28 @@ fn decode_compiled_deposit(
         return None;
     }
 
-    // All three deposit instructions share one borsh payload — a u64 amount
-    // and two 32-byte fields — and differ in discriminator, account layout and
-    // asset. `deposit_note` is the only one the program still exposes; the two
-    // legacy arms stay so historical deposits made before `8830226` removed
-    // them still decode.
+    // All four deposit instructions share one borsh payload — a u64 amount and
+    // two 32-byte fields — and differ in discriminator, account layout and
+    // asset. `deposit_note` and `deposit_note_spl` are the two the program
+    // still exposes; the two legacy arms stay so historical deposits made
+    // before `8830226` removed them still decode.
     let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT_NOTE {
         (
             DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
             crate::privacy::types::NATIVE_SOL_ASSET,
+        )
+    } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
+        let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
+        let mint = account_keys.get(mint_index)?;
+        // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
+        // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
+        // the leaf, and `process_deposit` reduces this field into the same
+        // `v3_commit` the program computed. Feeding it raw bytes would credit a
+        // commitment the chain never appended — blind is recoverable, a wrong
+        // leaf in the pool is not.
+        (
+            DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
+            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
         )
     } else if raw_data[..8] == discriminators::DEPOSIT {
         (
@@ -323,6 +346,64 @@ mod tests {
         assert_eq!(decoded.data.randomness, blinding);
         assert_eq!(decoded.depositor, depositor);
         assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+    }
+
+    /// `deposit_note_spl` is the SPL half of the v3 deposit surface, and it
+    /// went unread the same way `deposit_note` did (#689): the discriminator
+    /// simply had no arm, so every SPL deposit fell out of
+    /// `extract_deposit_events` and the pool never saw the leaf.
+    ///
+    /// The assert that matters is the last one. The legacy `deposit_spl` arm
+    /// keys the asset as the raw mint bytes, and reusing that here would decode
+    /// fine, credit a commitment, and be wrong — so this pins the asset to
+    /// `mint_to_asset` *and* to not being the raw bytes.
+    #[test]
+    fn decodes_a_deposit_note_spl() {
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        // deposit_note_spl accounts: bridge_state(0), asset_config(1), mint(2),
+        // asset_vault(3), depositor_token_account(4), merkle_tree(5),
+        // depositor(6), token_program(7).
+        let account_keys = vec![
+            other, other, mint, other, other, other, depositor, other, program_id,
+        ];
+
+        let amount = 5_000_000u64;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 8,
+            accounts: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("deposit_note_spl must decode");
+        assert_eq!(decoded.data.amount, amount);
+        assert_eq!(decoded.data.recipient, pubkey);
+        assert_eq!(decoded.data.randomness, blinding);
+        assert_eq!(decoded.depositor, depositor);
+        assert_eq!(
+            decoded.asset_id,
+            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes())
+        );
+        assert_ne!(
+            decoded.asset_id,
+            mint.to_bytes(),
+            "the v3 SPL arm must not reuse the legacy raw-mint asset"
+        );
     }
 
     #[test]
