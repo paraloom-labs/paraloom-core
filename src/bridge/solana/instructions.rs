@@ -78,6 +78,10 @@ pub mod discriminators {
     /// `sha256("global:deposit_note")[..8]` (#350). v3 deposit that appends the
     /// note commitment to the on-chain tree.
     pub const DEPOSIT_NOTE: [u8; 8] = [75, 212, 96, 185, 178, 167, 29, 57];
+    /// `sha256("global:deposit_note_spl")[..8]` (#779). The SPL twin of
+    /// `deposit_note`: shields a token into a note whose leaf commits the
+    /// asset as `mint_to_asset(mint)`, not the raw mint bytes.
+    pub const DEPOSIT_NOTE_SPL: [u8; 8] = [244, 219, 167, 106, 7, 120, 254, 253];
     /// `sha256("global:initialize_merkle_tree")[..8]` (#350). One-time,
     /// upgrade-authority-gated tree account creation.
     #[allow(dead_code)]
