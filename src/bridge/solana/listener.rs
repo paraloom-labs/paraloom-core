@@ -751,6 +751,66 @@ mod tests {
         assert_eq!(ours, theirs, "off-chain leaf must equal the on-chain leaf");
     }
 
+    /// The SPL twin of the test above, and the one that decides whether the
+    /// `deposit_note_spl` decoder arm is right (#795). The decoder's asset
+    /// choice only shows up here: `process_deposit` reduces `event.asset_id`
+    /// into the fourth `v3_commit` input, so a decoder that handed over the raw
+    /// mint bytes would still decode, still credit, and still produce a leaf
+    /// the chain never appended.
+    ///
+    /// So this walks the whole path a real SPL deposit takes — mint bytes to
+    /// asset to leaf — and compares it against the program's own formula,
+    /// spelled out rather than imported.
+    #[test]
+    fn spl_deposit_commitment_matches_the_on_chain_leaf() {
+        use ark_bn254::Fr;
+        use ark_ff::PrimeField;
+        use light_poseidon::{Poseidon, PoseidonBytesHasher};
+
+        let amount: u64 = 5_000_000;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let mint = Pubkey::new_unique().to_bytes();
+
+        // What the listener credits, starting from what the decoder emits.
+        let asset = crate::privacy::poseidon_circom::mint_to_asset(&mint);
+        let ours =
+            crate::privacy::types::fr_to_bytes_32(crate::privacy::poseidon_circom::v3_commit(
+                Fr::from(amount),
+                Fr::from_le_bytes_mod_order(&pubkey),
+                Fr::from_le_bytes_mod_order(&blinding),
+                Fr::from_le_bytes_mod_order(&asset),
+            ));
+
+        // What `deposit_note_spl` appends: `merkle_tree::mint_to_asset` is
+        // Poseidon(2) over the mint's two 16-byte halves, each zero-extended to
+        // a 32-byte little-endian field element, and the leaf is the same
+        // Poseidon(4) the native path uses.
+        let mut lo = [0u8; 32];
+        lo[..16].copy_from_slice(&mint[..16]);
+        let mut hi = [0u8; 32];
+        hi[..16].copy_from_slice(&mint[16..]);
+        let their_asset = Poseidon::<Fr>::new_circom(2)
+            .unwrap()
+            .hash_bytes_le(&[&lo, &hi])
+            .unwrap();
+        let mut amount_le = [0u8; 32];
+        amount_le[..8].copy_from_slice(&amount.to_le_bytes());
+        let theirs = Poseidon::<Fr>::new_circom(4)
+            .unwrap()
+            .hash_bytes_le(&[&amount_le, &pubkey, &blinding, &their_asset])
+            .unwrap();
+
+        assert_eq!(
+            ours, theirs,
+            "off-chain SPL leaf must equal the on-chain SPL leaf"
+        );
+        assert_ne!(
+            asset, mint,
+            "the asset is Poseidon over the mint's halves, never the mint itself"
+        );
+    }
+
     #[test]
     fn test_listener_creation() {
         use crate::bridge::solana::rpc::RealBridgeRpc;
