@@ -35,13 +35,37 @@ issue, email security@paraloom.network.
   listener test walks mint to asset to leaf and compares it against the program's
   own formula, spelled out rather than imported so either side moving is caught.
 
-  Impact is off-chain index correctness only, with no fund, spend, or settlement
-  path affected: settlement verifies against the on-chain tree and `is_known_root`,
-  and wallets build Merkle paths from chain events. The reporter also confirmed
-  the deployed program does not yet carry the #779 instructions and filed it for
-  the record rather than as a scope claim, which is the right read — the gap
-  becomes live on the first redeploy that ships #779, and is now closed ahead of
-  it. No user funds were exposed at any point.
+  **Corrected 2026-08-23.** The first version of this entry said the deployed
+  program did not yet carry the #779 instructions, so the gap "becomes live on
+  the first redeploy that ships #779, and is now closed ahead of it". That was
+  wrong, and it was wrong because the claim was repeated from the report rather
+  than checked. The reporter probed the pinned *devnet* program, which genuinely
+  lacks the instructions; mainnet-beta runs the same program id from a newer
+  binary that has carried `deposit_note_spl` since 2026-08-14. He raised the
+  correction himself once he re-checked both clusters.
+
+  So the gap was live on mainnet-beta for roughly eight days, from 2026-08-14
+  until the fix merged in `39b4c55`, and four real USDC deposits landed inside
+  that window: leaves 29 and 30 on 08-14, leaves 56 and 57 on 08-16, totalling
+  2.597771 USDC against a 5 USDC cap. No node indexed any of them, because no
+  build had the decoder arm until the fix. Verified by decoding the instruction
+  discriminator of every transaction in the program's mainnet history (88 at the
+  time of writing) against two independent RPCs: 4 `deposit_note_spl`, 24
+  `deposit_note`, 30 `transact`, 8 `transact_spl`, the rest registration and
+  config. `AssetConfig.deposit_count` independently reads 4, and only
+  `deposit_note_spl` increments it.
+
+  What that did and did not cost. No fund, spend, or settlement path is affected:
+  settlement verifies against the on-chain tree and `is_known_root`, and wallets
+  build Merkle paths from chain events, so the four deposits are spendable and
+  their funds were never at risk. What was wrong is the node's own view of those
+  four leaves — per-asset supply, its stored note set, and the pool state it
+  gossips. That view is also bounded by something separate and worth stating
+  plainly: the shielded pool is built in memory and does not survive a restart,
+  while the deposit cursor does, so a restarted node never re-scans the history
+  it missed. Those four leaves would therefore not be in the current pool even
+  had the decoder been correct, and closing that larger gap is tracked separately
+  from this fix.
 
 - **The live circuit's proving/verifying keys are now from a multi-party trusted
   setup, not a single-party dev key** (ceremony finalization, #659 / #64). Until
