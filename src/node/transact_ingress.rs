@@ -45,6 +45,31 @@ use crate::node::ingress_auth::{check_bearer, IngressToken};
 pub struct DeliveredNote {
     pub output_commitment: String,
     pub ciphertext: String,
+    /// The SPL mint this note is denominated in, hex, or `None` for native
+    /// SOL (#23, paraloom-wallet). The sealed plaintext carries `asset_id`,
+    /// which is `mint_to_asset(mint)` and therefore one-way, so without this a
+    /// recipient can decrypt an SPL note and still not know what it is worth,
+    /// nor build the spend, which needs the mint. Dropping such a note is safe
+    /// but leaves it undiscoverable; storing it without the mint would count a
+    /// token balance as native SOL, which is a wrong number the user acts on.
+    ///
+    /// Hex, not base58: it is the spelling `output_commitment` above already
+    /// uses, the one `/transact/submit` accepts for this same field name
+    /// (`parse_hex32`), and the one `mint_to_asset` takes on the wallet side.
+    ///
+    /// This reveals nothing the chain does not: `transact_spl` takes the same
+    /// `output_commitments` as an argument and the `mint` as an account in one
+    /// transaction, so the pairing is already public for every SPL settlement.
+    ///
+    /// A scanning wallet must still treat it as untrusted, exactly as it treats
+    /// `output_commitment`: check `mint_to_asset(mint) == asset_id` from the
+    /// decrypted plaintext and drop the note on a mismatch. The commitment
+    /// binds `asset_id`, so that check is what binds this field to the leaf.
+    ///
+    /// `serde(default)` so a wallet built before this field still parses the
+    /// feed, and a node built before it still parses a newer one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mint: Option<String>,
 }
 
 /// The capabilities the ingress needs: hand a transact to the consensus mesh,
@@ -485,6 +510,7 @@ mod tests {
             vec![DeliveredNote {
                 output_commitment: "33".repeat(32),
                 ciphertext: "ab".repeat(88),
+                mint: None,
             }]
         }
     }
