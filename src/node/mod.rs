@@ -469,6 +469,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                                 self.record_delivered_notes(
                                     &request.output_commitments,
                                     &request.ciphertexts,
+                                    request.mint,
                                 )
                                 .await;
                             }
@@ -2274,6 +2275,7 @@ impl Node {
                         self.record_delivered_notes(
                             &request.output_commitments,
                             &request.ciphertexts,
+                            request.mint,
                         )
                         .await;
                     }
@@ -2333,17 +2335,28 @@ impl Node {
         &self,
         output_commitments: &[[u8; 32]; 2],
         ciphertexts: &[String; 2],
+        mint: Option<[u8; 32]>,
     ) {
         // Bound the in-memory scan buffer so a high volume of transfers cannot
         // grow it without limit (this records only proof-verified transfers, so
         // it is not cheaply floodable, but the bound is defence in depth).
         const MAX_DELIVERED_NOTES: usize = 50_000;
 
+        // Hex, matching `output_commitment` in the same struct and the `mint`
+        // that `/transact/submit` accepts (`parse_hex32`), so one field name has
+        // one spelling across the ingress. Base58 is how a wallet spells a mint
+        // in its own storage, not how this surface spells one, and a scanning
+        // wallet feeds this straight to `mint_to_asset`, which takes 32-byte
+        // hex. `None` for a native settlement, so an unchanged native feed stays
+        // byte-identical (the field is skipped when absent).
+        let mint = mint.map(hex::encode);
+
         let mut store = self.delivered_notes.lock().await;
         for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
             let note = transact_ingress::DeliveredNote {
                 output_commitment: hex::encode(commitment),
                 ciphertext: ciphertext.clone(),
+                mint: mint.clone(),
             };
             if store.iter().any(|d| {
                 d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
@@ -3538,6 +3551,75 @@ mod tests {
         assert!(node.shielded_pool.is_some());
         assert!(node.bridge.is_some());
         assert!(node.transact_coordinator.is_some());
+    }
+
+    // --- delivered-note mint (#23, paraloom-wallet) ---
+
+    // `delivered_notes()` is the trait method `/transact/scan` serves, so the
+    // tests below read the feed the way the endpoint does.
+    use crate::node::transact_ingress::TransactIngress;
+
+    // An SPL settlement puts the mint on every note it delivers, spelled the
+    // way the rest of this surface spells one: 32-byte lowercase hex. The
+    // spelling is the assertion, not an incidental detail. A scanning wallet
+    // feeds this field straight to `mint_to_asset`, which takes hex and throws
+    // on anything else, so shipping base58 here would abort the scan rather
+    // than fail a comparison — and every note delivered after the offending one
+    // would be unreachable, native notes included.
+    #[tokio::test]
+    async fn spl_settlement_delivers_the_mint_as_hex() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        // USDC, the mint the wallet's own tests use.
+        let mint = bs58::decode("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+            .into_vec()
+            .expect("decode mint");
+        let mint: [u8; 32] = mint.try_into().expect("32-byte mint");
+
+        node.record_delivered_notes(
+            &[[7u8; 32], [8u8; 32]],
+            &["aa".repeat(88), "bb".repeat(88)],
+            Some(mint),
+        )
+        .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        for note in &delivered {
+            let spelled = note.mint.as_deref().expect("SPL note carries its mint");
+            assert_eq!(spelled, hex::encode(mint));
+            assert_eq!(spelled.len(), 64, "32-byte hex, not base58");
+            assert_eq!(spelled, spelled.to_lowercase());
+            // The spelling `mint_to_asset` rejects, pinned so a well-meaning
+            // switch to it fails here rather than in a wallet's scan loop.
+            assert_ne!(spelled, bs58::encode(mint).into_string());
+            // Round-trips to the bytes the caller passed.
+            assert_eq!(hex::decode(spelled).expect("hex"), mint.to_vec());
+        }
+    }
+
+    // A native settlement leaves the field `None`, which `skip_serializing_if`
+    // then omits, so the native feed stays byte-identical to a pre-#23 node's.
+    #[tokio::test]
+    async fn native_settlement_delivers_no_mint() {
+        let node = Node::new(Settings::development()).expect("construct node");
+
+        node.record_delivered_notes(
+            &[[1u8; 32], [2u8; 32]],
+            &["cc".repeat(88), "dd".repeat(88)],
+            None,
+        )
+        .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        for note in &delivered {
+            assert!(note.mint.is_none());
+        }
+        let json = serde_json::to_string(&delivered[0]).expect("serialize");
+        assert!(
+            !json.contains("mint"),
+            "absent mint must not appear: {json}"
+        );
     }
 
     // A coordinator node does not index deposits even with the bridge
