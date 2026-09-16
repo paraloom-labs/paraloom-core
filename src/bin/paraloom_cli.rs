@@ -1650,8 +1650,38 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-                let ix =
-                    create_withdraw_unbonded_stake_instruction(&program_id, &validator.pubkey());
+                // Read registry to discover the pinned stake mint and derive the token account
+                let (validator_registry_pda, _) =
+                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+                let registry_data = client
+                    .get_account_data(&validator_registry_pda)
+                    .context("Failed to read validator registry (is it initialized?)")?;
+                anyhow::ensure!(
+                    registry_data.len() >= 104,
+                    "validator registry predates the dual-stake layout"
+                );
+                let stake_mint = Pubkey::new_from_array(
+                    registry_data[72..104]
+                        .try_into()
+                        .expect("32-byte stake_mint slice"),
+                );
+                let token_program = client
+                    .get_account(&stake_mint)
+                    .context("Failed to read stake mint account")?
+                    .owner;
+                let validator_token = derive_associated_token_address(
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
+                let ix = create_withdraw_unbonded_stake_instruction(
+                    &program_id,
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &validator_token,
+                    &token_program,
+                );
 
                 let blockhash = client
                     .get_latest_blockhash()
