@@ -1096,11 +1096,14 @@ pub mod paraloom_program {
         if was_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
             validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
-            // A slash that drops stake below the registry minimum deactivates
-            // the validator: registration requires `stake >= minimum_stake`, so
-            // a validator below that bar must stop settling and stop counting
+            // A slash that drops either SOL or token stake below the registry
+            // minimum deactivates the validator: registration requires
+            // `stake >= minimum_stake` and `token_stake >= min_token_stake`, so
+            // a validator below either bar must stop settling and stop counting
             // toward the BFT quorum.
-            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
+                || validator_account.token_stake_amount < ctx.accounts.validator_registry.min_token_stake
+            {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
