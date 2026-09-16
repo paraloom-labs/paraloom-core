@@ -836,12 +836,33 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             }
 
             let filename = if let Some(label_text) = &label {
+                // Validate that label contains no directory separators or traversal components (#817)
+                let p = std::path::Path::new(label_text);
+                if p.is_absolute()
+                    || p.components().count() != 1
+                    || label_text.contains('/')
+                    || label_text.contains('\\')
+                    || label_text.contains("..")
+                {
+                    anyhow::bail!(
+                        "Invalid key label {:?}: labels must be single filenames and cannot contain path separators or parent directory references",
+                        label_text
+                    );
+                }
                 format!("{}.key", label_text.replace(" ", "_"))
             } else {
                 format!("key_{}.key", hex::encode(&public_key[..4]))
             };
 
             let key_path = keys_dir.join(&filename);
+
+            // Prevent silent overwriting and destruction of existing keypairs (#816)
+            if key_path.exists() {
+                anyhow::bail!(
+                    "Keypair file already exists at {}. Refusing to overwrite existing keys to prevent loss of funds.",
+                    key_path.display()
+                );
+            }
 
             // Save in JSON format for easy parsing
             let key_data = serde_json::json!({
@@ -865,16 +886,24 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 use std::os::unix::fs::OpenOptionsExt;
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .mode(0o600)
                     .open(&key_path)
-                    .context("Failed to create key file")?;
+                    .context("Failed to create key file (file may already exist)")?;
                 f.write_all(key_json.as_bytes())
                     .context("Failed to save keypair")?;
             }
             #[cfg(not(unix))]
-            std::fs::write(&key_path, key_json).context("Failed to save keypair")?;
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&key_path)
+                    .context("Failed to create key file (file may already exist)")?;
+                f.write_all(key_json.as_bytes())
+                    .context("Failed to save keypair")?;
+            }
 
             println!("\nKeypair saved to: {}", key_path.display());
             println!("\n[WARNING] Keep your private key safe! Anyone with access to this file can spend your funds.");
