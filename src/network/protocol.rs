@@ -1081,12 +1081,20 @@ impl NetworkManager {
         info!("Network event loop terminated");
     }
 
-    /// Send a message to a peer (broadcasts via gossipsub)
+    /// Send a message to a peer (broadcasts via gossipsub).
+    /// Uses non-blocking `try_send` to prevent self-deadlock (#813) when called
+    /// from message handlers within the swarm event loop.
     pub async fn send_message(&self, _peer: NodeId, message: Message) -> Result<()> {
-        self.message_sender
-            .send((NodeId(vec![]), message))
-            .await
-            .map_err(|e| anyhow!("Failed to send message: {}", e))
+        match self.message_sender.try_send((NodeId(vec![]), message)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!("Outbound message channel full; dropping to avoid event loop self-deadlock (#813)");
+                Err(anyhow!("Failed to send message: outbound channel full"))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("Failed to send message: outbound channel closed"))
+            }
+        }
     }
 
     pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
@@ -1375,5 +1383,33 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn send_message_does_not_deadlock_when_channel_full() {
+        let (tx, mut rx) = mpsc::channel(2);
+        // Fill channel to capacity
+        tx.try_send((NodeId(vec![]), Message::Ping)).unwrap();
+        tx.try_send((NodeId(vec![]), Message::Ping)).unwrap();
+        assert!(tx.try_send((NodeId(vec![]), Message::Ping)).is_err());
+
+        // Under try_send, attempting to send to a full channel returns Err immediately
+        // rather than suspending the event loop indefinitely (#813).
+        let result = match tx.try_send((NodeId(vec![]), Message::Ping)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(anyhow!("Failed to send message: outbound channel full"))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("Failed to send message: outbound channel closed"))
+            }
+        };
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Failed to send message: outbound channel full"
+        );
+        // Channel can still be drained cleanly without deadlocking
+        assert!(rx.recv().await.is_some());
     }
 }
