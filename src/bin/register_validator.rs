@@ -41,11 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Insufficient balance. Need at least 2 SOL".into());
     }
 
-    let (validator_account_pda, _bump) =
-        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
-
-    let (validator_registry_pda, _registry_bump) =
-        Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_account_pda, _bump) = derive_validator_account(&program_id, &validator.pubkey());
+    let (validator_registry_pda, _registry_bump) = derive_validator_registry(&program_id);
 
     println!("Validator Account PDA: {}", validator_account_pda);
     println!("Validator Registry PDA: {}\n", validator_registry_pda);
@@ -53,23 +50,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stake_amount = LAMPORTS_PER_SOL;
     println!("Stake Amount: {} SOL\n", stake_amount as f64 / 1e9);
 
-    let discriminator: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
+    // Dual-stake: read registry to discover pinned stake_mint and token floor
+    let registry_data = client.get_account_data(&validator_registry_pda)?;
+    if registry_data.len() < 112 {
+        return Err("validator registry predates the dual-stake layout".into());
+    }
+    let stake_mint = Pubkey::new_from_array(
+        registry_data[72..104]
+            .try_into()
+            .map_err(|_| "invalid stake_mint slice")?,
+    );
+    let min_token_stake = u64::from_le_bytes(
+        registry_data[104..112]
+            .try_into()
+            .map_err(|_| "invalid min_token_stake slice")?,
+    );
+    let token_program = client.get_account(&stake_mint)?.owner;
+    let validator_token = derive_associated_token_address(
+        &validator.pubkey(),
+        &stake_mint,
+        &token_program,
+    );
 
-    let mut instruction_data = discriminator.to_vec();
-    instruction_data.extend_from_slice(&stake_amount.to_le_bytes());
-
-    let system_program_id = Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap();
-
-    let ix = Instruction {
-        program_id,
-        accounts: vec![
-            AccountMeta::new(validator_account_pda, false),
-            AccountMeta::new(validator_registry_pda, false),
-            AccountMeta::new(validator.pubkey(), true),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
-        data: instruction_data,
-    };
+    let ix = create_register_validator_instruction(
+        &program_id,
+        &validator.pubkey(),
+        &stake_mint,
+        &validator_token,
+        &token_program,
+        stake_amount,
+        min_token_stake,
+    )?;
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;

@@ -332,6 +332,21 @@ enum ValidatorCommands {
         program_id: Option<String>,
     },
 
+    /// Claim pending settlement rewards for this validator
+    ClaimRewards {
+        /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Stop running validator
     Stop {
         /// Force stop (SIGKILL)
@@ -1321,6 +1336,15 @@ fn decode_validator_account(data: &[u8]) -> Option<(Pubkey, f64, u64, u64, bool)
     Some((validator, stake, token_stake, reputation, is_active))
 }
 
+/// Decode pending settlement rewards (in lamports) from an on-chain `ValidatorAccount`.
+#[cfg(feature = "solana-bridge")]
+fn decode_validator_pending_rewards(data: &[u8]) -> Option<u64> {
+    if data.len() < 97 || data[0..8] != VALIDATOR_ACCOUNT_DISCRIMINATOR {
+        return None;
+    }
+    Some(u64::from_le_bytes(data[89..97].try_into().ok()?))
+}
+
 async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
     match command {
         ValidatorCommands::Start { config, daemon } => {
@@ -1685,6 +1709,108 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             Ok(())
         }
 
+        ValidatorCommands::ClaimRewards {
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
+            #[cfg(feature = "solana-bridge")]
+            {
+                use paraloom::bridge::solana::*;
+                use solana_client::rpc_client::RpcClient;
+                use solana_sdk::{
+                    commitment_config::CommitmentConfig,
+                    signature::Signer,
+                    transaction::Transaction,
+                };
+                use std::str::FromStr;
+
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("VALIDATOR_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Validator Keypair: {}\n", keypair_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let validator =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Validator Address: {}\n", validator.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let (validator_pda, _) = derive_validator_account(&program_id, &validator.pubkey());
+                let account_data = client
+                    .get_account_data(&validator_pda)
+                    .context("Failed to read validator account (is validator registered?)")?;
+
+                let pending_rewards = decode_validator_pending_rewards(&account_data).unwrap_or(0);
+                if pending_rewards == 0 {
+                    println!("No pending rewards to claim for this validator (pending_rewards = 0).");
+                    return Ok(());
+                }
+
+                println!(
+                    "Claiming {} SOL ({} lamports) pending settlement rewards...",
+                    pending_rewards as f64 / LAMPORTS_PER_SOL as f64,
+                    pending_rewards
+                );
+
+                let ix = create_claim_rewards_instruction(&program_id, &validator.pubkey());
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    blockhash,
+                );
+
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Rewards claimed successfully!");
+                println!("Signature: {}", signature);
+                println!("Validator: {}", validator.pubkey());
+                println!(
+                    "Claimed:   {} SOL",
+                    pending_rewards as f64 / LAMPORTS_PER_SOL as f64
+                );
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                let _ = (&keypair, &rpc_url, &program_id);
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
+
+            Ok(())
+        }
+
         ValidatorCommands::Stop { force } => {
             println!("Stopping validator...\n");
 
@@ -1758,18 +1884,30 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     println!("Validator:   {}", validator.pubkey());
                     println!("Account PDA: {}", pda);
                     match client.get_account_data(&pda) {
-                        Ok(data) => match decode_validator_account(&data) {
-                            Some((_, stake, token_stake, reputation, is_active)) => println!(
-                                "On-chain:    {} | stake {} SOL + {} token | reputation {}",
-                                if is_active { "ACTIVE" } else { "INACTIVE" },
-                                stake,
-                                token_stake,
-                                reputation
-                            ),
-                            None => {
-                                println!("On-chain:    account exists but isn't a ValidatorAccount")
+                        Ok(data) => {
+                            let pending = decode_validator_pending_rewards(&data).unwrap_or(0);
+                            match decode_validator_account(&data) {
+                                Some((_, stake, token_stake, reputation, is_active)) => {
+                                    println!(
+                                        "On-chain:    {} | stake {} SOL + {} token | pending rewards: {} SOL | reputation {}",
+                                        if is_active { "ACTIVE" } else { "INACTIVE" },
+                                        stake,
+                                        token_stake,
+                                        pending as f64 / LAMPORTS_PER_SOL as f64,
+                                        reputation
+                                    );
+                                    if pending > 0 {
+                                        println!(
+                                            "Note:        {} SOL pending rewards available. Claim with `paraloom validator claim-rewards`.",
+                                            pending as f64 / LAMPORTS_PER_SOL as f64
+                                        );
+                                    }
+                                }
+                                None => {
+                                    println!("On-chain:    account exists but isn't a ValidatorAccount")
+                                }
                             }
-                        },
+                        }
                         Err(_) => println!(
                             "On-chain:    not registered. Run `paraloom validator register`."
                         ),
