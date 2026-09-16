@@ -2431,6 +2431,13 @@ impl Node {
                 }
             }
         }
+        // Fail closed if the verification round was swept or yielded no valid voters,
+        // preventing assembly of a leader-only transaction that cannot satisfy on-chain quorum (#815).
+        let voters = coordinator.valid_voters(&request.request_id).await;
+        if voters.is_empty() {
+            return Err(anyhow!("verification round for {} was swept or has no valid voters; aborting settlement", request.request_id));
+        }
+
         let mut quorum_wallets = vec![leader.pubkey()];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
         let threshold = quorum_wallets.len();
