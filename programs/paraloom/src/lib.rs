@@ -1017,6 +1017,16 @@ pub mod paraloom_program {
 
         let reward_amount = validator_account.pending_rewards;
 
+        // The bridge vault is a system account and must remain rent-exempt after
+        // payout. Guard on `reward_amount + rent_floor`, matching the `transact`
+        // withdrawal check (paraloom-core#761).
+        let vault_balance = ctx.accounts.bridge_vault.lamports();
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        require!(
+            vault_balance >= reward_amount.saturating_add(rent_floor),
+            BridgeError::InsufficientFunds
+        );
+
         let vault_bump = ctx.bumps.bridge_vault;
         let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
