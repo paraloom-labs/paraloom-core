@@ -320,7 +320,6 @@ pub fn derive_stake_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"stake_vault_authority"], program_id)
 }
 
-
 /// Build a dual-stake `register_validator` instruction. `stake_amount` is the
 /// SOL half (lamports, moved into the validator PDA); `token_stake_amount` is
 /// the PARALOOM-token half, transferred from `validator_token_account` into the
