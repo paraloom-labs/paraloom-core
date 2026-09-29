@@ -8,7 +8,6 @@
 //!   SOLANA_PROGRAM_ID              the deployed bridge program id
 //!   VALIDATOR_KEYPAIR_PATH         path to the validator keypair json
 //!   STAKE_AMOUNT                   (optional: SOL stake in lamports, default: registry minimum_stake)
-//!   STAKE_MINT                     (optional: override stake mint pubkey, default: read from registry)
 //!   TOKEN_STAKE_AMOUNT             (optional: token stake amount, default: registry min_token_stake)
 //!   VALIDATOR_TOKEN_ACCOUNT        (optional: override validator ATA, default: derived ATA)
 
@@ -73,7 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .try_into()
             .map_err(|_| "invalid minimum_stake slice")?,
     );
-    let reg_stake_mint = Pubkey::new_from_array(
+    // The program pins `stake_mint` to the registry's, so there is no override.
+    let stake_mint = Pubkey::new_from_array(
         registry_data[72..104]
             .try_into()
             .map_err(|_| "invalid stake_mint slice")?,
@@ -83,11 +83,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .try_into()
             .map_err(|_| "invalid min_token_stake slice")?,
     );
-
-    let stake_mint = match std::env::var("STAKE_MINT") {
-        Ok(val) => Pubkey::from_str(&val)?,
-        Err(_) => reg_stake_mint,
-    };
 
     let stake_amount = match std::env::var("STAKE_AMOUNT") {
         Ok(val) => val.parse::<u64>()?,
