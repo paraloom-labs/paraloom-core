@@ -1,0 +1,6 @@
+```rust
+// src/privacy/circuits.rs:731-734
+let diff = &current - &root_var;
+amount_var.enforce_equal(&zero)?;
+current.enforce_equal(&root_var)?;
+```
