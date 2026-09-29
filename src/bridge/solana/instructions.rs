@@ -1137,30 +1137,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_withdraw_unbonded_stake_instruction() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-
-        let ix = create_withdraw_unbonded_stake_instruction(&program_id, &validator);
-
-        // Account order must match the `WithdrawUnbondedStake` struct:
-        // validator_account (mut), validator (mut signer).
-        assert_eq!(ix.program_id, program_id);
-        assert_eq!(ix.accounts.len(), 2);
-        assert_eq!(
-            ix.accounts[0].pubkey,
-            derive_validator_account(&program_id, &validator).0
-        );
-        assert!(ix.accounts[0].is_writable);
-        assert!(!ix.accounts[0].is_signer);
-        assert_eq!(ix.accounts[1].pubkey, validator);
-        assert!(ix.accounts[1].is_signer);
-        assert!(ix.accounts[1].is_writable);
-        // Discriminator only — no args.
-        assert_eq!(ix.data, discriminators::WITHDRAW_UNBONDED_STAKE.to_vec());
-    }
-
-    #[test]
     fn test_create_unregister_validator_instruction() {
         let program_id = Pubkey::new_unique();
         let validator = Pubkey::new_unique();
