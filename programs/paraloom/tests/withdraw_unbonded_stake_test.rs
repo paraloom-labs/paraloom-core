@@ -30,7 +30,7 @@ use solana_sdk::{
 mod common;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix, TEST_TOKEN_FUND,
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
@@ -69,6 +69,18 @@ async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
         .get_balance(key)
         .await
         .expect("get balance")
+}
+
+async fn token_balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
+    use anchor_lang::solana_program::program_pack::Pack;
+    let raw = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .expect("rpc")
+        .expect("token account exists");
+    let state = spl_token::state::Account::unpack(&raw.data).expect("unpack token account");
+    state.amount
 }
 
 async fn load_validator(ctx: &mut ProgramTestContext, pda: Pubkey) -> ValidatorAccount {
@@ -465,6 +477,14 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         acc.unbonding_amount, MIN_VALIDATOR_STAKE,
         "the full stake must be routed into unbonding, not stranded"
     );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "the token stake must be routed into unbonding, not stranded"
+    );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake zeroed on deactivate"
+    );
     assert!(
         acc.unbonding_slot >= UNBONDING_SLOTS,
         "unbonding_slot = deactivation-era slot + UNBONDING_SLOTS"
@@ -507,6 +527,12 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     assert!(
         wallet_after > wallet_before,
         "wallet credited by the released stake + refunded rent"
+    );
+    // The validator's token balance was refunded from the shared stake vault.
+    assert_eq!(
+        token_balance(&mut ctx, validator_token).await,
+        TEST_TOKEN_FUND,
+        "token stake refunded to validator token account after deactivate + unbonded withdraw"
     );
     let closed = ctx
         .banks_client
