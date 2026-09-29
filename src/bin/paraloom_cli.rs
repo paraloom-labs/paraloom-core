@@ -1746,15 +1746,6 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
         } => {
             #[cfg(feature = "solana-bridge")]
             {
-                use paraloom::bridge::solana::*;
-                use solana_client::rpc_client::RpcClient;
-                use solana_sdk::{
-                    commitment_config::CommitmentConfig,
-                    signature::Signer,
-                    transaction::Transaction,
-                };
-                use std::str::FromStr;
-
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
 
                 let rpc_url = rpc_url
