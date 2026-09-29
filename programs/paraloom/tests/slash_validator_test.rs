@@ -178,7 +178,7 @@ async fn slash_above_minimum_keeps_validator_active() {
     )
     .await;
 
-    // Register with twice the minimum stake so a moderate slash stays above it.
+    // Register with twice the minimum stake for both collaterals so a moderate slash stays above it.
     send(
         &mut banks_client,
         recent_blockhash,
@@ -189,12 +189,12 @@ async fn slash_above_minimum_keeps_validator_active() {
             stake_mint,
             validator_token,
             2 * MIN_VALIDATOR_STAKE,
-            TOKEN_STAKE,
+            2 * TOKEN_STAKE,
         ),
     )
     .await;
 
-    // 25% slash: 2*MIN -> 1.5*MIN, still >= the minimum, so the validator stays
+    // 25% slash: 2*MIN -> 1.5*MIN, still >= the minimum for both, so the validator stays
     // active and keeps counting toward the quorum.
     send(
         &mut banks_client,
@@ -217,9 +217,10 @@ async fn slash_above_minimum_keeps_validator_active() {
         .unwrap();
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.stake_amount, 2 * MIN_VALIDATOR_STAKE * 75 / 100);
+    assert_eq!(acc.token_stake_amount, 2 * TOKEN_STAKE * 75 / 100);
     assert!(
         acc.is_active,
-        "a slash that leaves stake above the minimum must keep the validator active"
+        "a slash that leaves both collaterals above the minimum must keep the validator active"
     );
 
     let reg_raw = banks_client
@@ -231,6 +232,94 @@ async fn slash_above_minimum_keeps_validator_active() {
     assert_eq!(
         reg.active_validators, 1,
         "a validator still above the minimum must keep counting toward the quorum"
+    );
+}
+
+/// Dual-stake regression: a slash that leaves SOL >= MIN_VALIDATOR_STAKE but drops
+/// token collateral below `min_token_stake` must deactivate the validator.
+#[tokio::test]
+async fn slash_dropping_token_stake_below_minimum_deactivates_validator() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+
+    // Register with twice the SOL minimum, but exactly the token minimum floor.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            2 * MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await;
+
+    // A 25% slash drops token_stake to 75% of min_token_stake, while SOL stake
+    // is 1.5 * MIN_VALIDATOR_STAKE (still >= MIN). Dual-stake requires both;
+    // dropping below min_token_stake must deactivate the validator.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            25,
+        ),
+    )
+    .await;
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert!(
+        !acc.is_active,
+        "a slash dropping token stake below min_token_stake must deactivate the validator"
+    );
+    assert_eq!(acc.stake_amount, 0);
+    assert_eq!(acc.token_stake_amount, 0);
+    assert_eq!(acc.unbonding_amount, 2 * MIN_VALIDATOR_STAKE * 75 / 100);
+    assert_eq!(acc.token_unbonding_amount, TOKEN_STAKE * 75 / 100);
+
+    let reg_raw = banks_client
+        .get_account(registry_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let reg = ValidatorRegistry::try_deserialize(&mut reg_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        reg.active_validators, 0,
+        "deactivated validator must decrement active_validators"
     );
 }
 
