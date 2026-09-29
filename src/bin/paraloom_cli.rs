@@ -1786,7 +1786,9 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 let pending_rewards = decode_validator_pending_rewards(&account_data).unwrap_or(0);
                 if pending_rewards == 0 {
-                    println!("No pending rewards to claim for this validator (pending_rewards = 0).");
+                    println!(
+                        "No pending rewards to claim for this validator (pending_rewards = 0)."
+                    );
                     return Ok(());
                 }
 
@@ -1925,7 +1927,9 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                                     }
                                 }
                                 None => {
-                                    println!("On-chain:    account exists but isn't a ValidatorAccount")
+                                    println!(
+                                        "On-chain:    account exists but isn't a ValidatorAccount"
+                                    )
                                 }
                             }
                         }

@@ -489,10 +489,7 @@ pub fn create_withdraw_unbonded_stake_instruction(
 /// Account order matches the `ClaimRewards` struct:
 /// bridge_state, validator_account (mut), bridge_vault (mut), validator (mut signer),
 /// system_program. Data is the discriminator only (no args).
-pub fn create_claim_rewards_instruction(
-    program_id: &Pubkey,
-    validator: &Pubkey,
-) -> Instruction {
+pub fn create_claim_rewards_instruction(program_id: &Pubkey, validator: &Pubkey) -> Instruction {
     let (bridge_state, _) = derive_bridge_state(program_id);
     let (validator_pda, _) = derive_validator_account(program_id, validator);
     let (bridge_vault, _) = derive_bridge_vault(program_id);
@@ -1315,4 +1312,3 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
     }
 }
-
