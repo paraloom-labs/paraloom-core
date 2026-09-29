@@ -14,11 +14,8 @@
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    native_token::LAMPORTS_PER_SOL,
-    pubkey::Pubkey,
-    signature::Signer,
-    transaction::Transaction,
+    commitment_config::CommitmentConfig, native_token::LAMPORTS_PER_SOL, pubkey::Pubkey,
+    signature::Signer, transaction::Transaction,
 };
 use std::str::FromStr;
 
@@ -56,7 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read registry state to extract minimum_stake, stake_mint, and min_token_stake.
     let registry_data = client.get_account_data(&validator_registry_pda)?;
     if registry_data.len() < 112 {
-        return Err("Validator registry data too short (< 112 bytes); predates dual-stake layout".into());
+        return Err(
+            "Validator registry data too short (< 112 bytes); predates dual-stake layout".into(),
+        );
     }
 
     // Registry layout after the 8-byte discriminator:
@@ -95,7 +94,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("Stake Mint: {}", stake_mint);
-    println!("SOL Stake Amount: {} SOL ({} lamports)", stake_amount as f64 / 1e9, stake_amount);
+    println!(
+        "SOL Stake Amount: {} SOL ({} lamports)",
+        stake_amount as f64 / 1e9,
+        stake_amount
+    );
     println!("Token Stake Amount: {}\n", token_stake_amount);
 
     if balance < stake_amount.saturating_add(LAMPORTS_PER_SOL / 100) {
