@@ -105,6 +105,9 @@ pub mod discriminators {
     /// instruction that deserializes `BridgeState` (transact/deposit_note/pause/
     /// set_deposit_cap) aborts on the short account until it is grown.
     pub const MIGRATE_BRIDGE_STATE: [u8; 8] = [196, 193, 143, 108, 71, 132, 75, 181];
+    /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
+    /// pending settlement fees from `bridge_vault`.
+    pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -474,6 +477,33 @@ pub fn create_withdraw_unbonded_stake_instruction(
             AccountMeta::new_readonly(*token_program, false),
         ],
         data: discriminators::WITHDRAW_UNBONDED_STAKE.to_vec(),
+    }
+}
+
+/// Create a `claim_rewards` instruction.
+///
+/// Drains accumulated settlement fees (`pending_rewards`) from `bridge_vault`
+/// to the validator wallet and resets `pending_rewards = 0`.
+/// Required before `withdraw_unbonded_stake` can succeed if the validator
+/// ever settled transactions and earned fees (#434, #438).
+/// Account order matches the `ClaimRewards` struct:
+/// bridge_state, validator_account (mut), bridge_vault (mut), validator (mut signer),
+/// system_program. Data is the discriminator only (no args).
+pub fn create_claim_rewards_instruction(program_id: &Pubkey, validator: &Pubkey) -> Instruction {
+    let (bridge_state, _) = derive_bridge_state(program_id);
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (bridge_vault, _) = derive_bridge_vault(program_id);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(bridge_state, false),
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(bridge_vault, false),
+            AccountMeta::new(*validator, true),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: discriminators::CLAIM_REWARDS.to_vec(),
     }
 }
 
@@ -1200,6 +1230,41 @@ mod tests {
         assert!(ix.accounts[1].is_signer);
         assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
         assert_eq!(ix.data, discriminators::INITIALIZE_MERKLE_TREE.to_vec());
+    }
+
+    #[test]
+    fn test_create_claim_rewards_instruction() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let ix = create_claim_rewards_instruction(&program_id, &validator);
+
+        // bridge_state, validator_account (mut), bridge_vault (mut), validator (signer), system_program
+        assert_eq!(ix.accounts.len(), 5);
+        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
+        assert!(!ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(ix.accounts[2].pubkey, derive_bridge_vault(&program_id).0);
+        assert!(ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+
+        assert_eq!(ix.accounts[3].pubkey, validator);
+        assert!(ix.accounts[3].is_writable);
+        assert!(ix.accounts[3].is_signer);
+
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        assert_eq!(ix.data, discriminators::CLAIM_REWARDS.to_vec());
     }
 
     #[test]
