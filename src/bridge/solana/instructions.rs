@@ -314,6 +314,12 @@ pub fn derive_stake_token_vault(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"stake_token_vault"], program_id)
 }
 
+/// Derive the stake-vault authority PDA (`[b"stake_vault_authority"]`), which
+/// signs dual-stake token returns and burns.
+pub fn derive_stake_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"stake_vault_authority"], program_id)
+}
+
 /// Build a dual-stake `register_validator` instruction. `stake_amount` is the
 /// SOL half (lamports, moved into the validator PDA); `token_stake_amount` is
 /// the PARALOOM-token half, transferred from `validator_token_account` into the
@@ -439,21 +445,33 @@ pub fn create_unregister_validator_instruction(
 }
 
 /// Create a `withdraw_unbonded_stake` instruction. Self-signed: releases the
-/// validator's unbonded stake back to its wallet once `unbonding_slot` has
-/// passed. Account order matches the `WithdrawUnbondedStake` struct:
-/// validator_account (mut), validator (mut signer). Data is the discriminator
-/// only (no args).
+/// validator's unbonded SOL stake and token stake once `unbonding_slot` has
+/// passed and closes the PDA. Account order matches the on-chain
+/// `WithdrawUnbondedStake` context exactly: validator_account (mut),
+/// validator (mut signer), stake_mint (readonly), validator_token_account (mut),
+/// stake_token_vault (mut), stake_vault_authority (readonly), token_program (readonly).
+/// Data is the discriminator only (no args).
 pub fn create_withdraw_unbonded_stake_instruction(
     program_id: &Pubkey,
     validator: &Pubkey,
+    stake_mint: &Pubkey,
+    validator_token_account: &Pubkey,
+    token_program: &Pubkey,
 ) -> Instruction {
     let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
+    let (stake_vault_authority, _) = derive_stake_vault_authority(program_id);
 
     Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(validator_pda, false),
             AccountMeta::new(*validator, true),
+            AccountMeta::new_readonly(*stake_mint, false),
+            AccountMeta::new(*validator_token_account, false),
+            AccountMeta::new(stake_token_vault, false),
+            AccountMeta::new_readonly(stake_vault_authority, false),
+            AccountMeta::new_readonly(*token_program, false),
         ],
         data: discriminators::WITHDRAW_UNBONDED_STAKE.to_vec(),
     }
@@ -1118,30 +1136,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_withdraw_unbonded_stake_instruction() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-
-        let ix = create_withdraw_unbonded_stake_instruction(&program_id, &validator);
-
-        // Account order must match the `WithdrawUnbondedStake` struct:
-        // validator_account (mut), validator (mut signer).
-        assert_eq!(ix.program_id, program_id);
-        assert_eq!(ix.accounts.len(), 2);
-        assert_eq!(
-            ix.accounts[0].pubkey,
-            derive_validator_account(&program_id, &validator).0
-        );
-        assert!(ix.accounts[0].is_writable);
-        assert!(!ix.accounts[0].is_signer);
-        assert_eq!(ix.accounts[1].pubkey, validator);
-        assert!(ix.accounts[1].is_signer);
-        assert!(ix.accounts[1].is_writable);
-        // Discriminator only — no args.
-        assert_eq!(ix.data, discriminators::WITHDRAW_UNBONDED_STAKE.to_vec());
-    }
-
-    #[test]
     fn test_create_unregister_validator_instruction() {
         let program_id = Pubkey::new_unique();
         let validator = Pubkey::new_unique();
@@ -1206,5 +1200,50 @@ mod tests {
         assert!(ix.accounts[1].is_signer);
         assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
         assert_eq!(ix.data, discriminators::INITIALIZE_MERKLE_TREE.to_vec());
+    }
+
+    #[test]
+    fn test_create_withdraw_unbonded_stake_instruction() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let validator_token = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_withdraw_unbonded_stake_instruction(
+            &program_id,
+            &validator,
+            &stake_mint,
+            &validator_token,
+            &token_program,
+        );
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 7);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, validator);
+        assert!(ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, stake_mint);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, validator_token);
+        assert!(ix.accounts[3].is_writable);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[4].is_writable);
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert!(!ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert!(!ix.accounts[6].is_writable);
+        assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
     }
 }
