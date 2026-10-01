@@ -218,7 +218,7 @@ num-bigint = "0.4"
 solana-client = { version = "2.0", optional = true }
 solana-sdk = { version = "2.0", optional = true }
 solana-transaction-status = { version = "2.0", optional = true }
-solana-account-decoder = { version = "2.0", optional = true }
+solana-account-decoder = { version = "2.3.13", optional = true }
 borsh = { version = "1.5", optional = true }
 
 # WASM Runtime (Phase 3: Compute Layer)
