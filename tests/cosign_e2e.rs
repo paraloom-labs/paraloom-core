@@ -125,6 +125,7 @@ async fn cosign_request_round_trips_to_a_peer() {
         request_id: "e2e-round-1".to_string(),
         kind: SettlementKind::Transact,
         message: vec![0xA1, 0xB2, 0xC3, 0xD4],
+        authority_signature: None,
     };
     let response = mgr_a
         .send_cosign_request(b_node_id, request)

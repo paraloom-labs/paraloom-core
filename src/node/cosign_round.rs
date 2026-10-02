@@ -74,6 +74,7 @@ where
         request_id: request_id.to_string(),
         kind,
         message: payload.to_bytes()?,
+        authority_signature: Some(own_sig.clone()),
     };
 
     let collected = gather_signatures(
