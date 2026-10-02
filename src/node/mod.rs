@@ -1731,8 +1731,21 @@ impl Node {
         {
             let guard = bridge.lock().await;
             let seed = async {
+                let total_before = guard.registry_total_active_stake().await?;
                 let list = guard.list_validator_stakes().await?;
-                let total = guard.registry_total_active_stake().await?;
+                let total_after = guard.registry_total_active_stake().await?;
+                // Eliminate latency skew between the heavy getProgramAccounts scan and
+                // the fast registry PDA read (#799).
+                let total = if total_before == total_after {
+                    total_after
+                } else {
+                    let list_sum: u64 = list.iter().map(|(_, s)| *s).sum();
+                    if list_sum == total_after {
+                        total_after
+                    } else {
+                        total_before
+                    }
+                };
                 Ok::<_, crate::bridge::BridgeError>((list, total))
             }
             .await;
@@ -1815,8 +1828,21 @@ impl Node {
                     let snapshot = {
                         let guard = bridge.lock().await;
                         let r = async {
+                            let total_before = guard.registry_total_active_stake().await?;
                             let list = guard.list_validator_stakes().await?;
-                            let total = guard.registry_total_active_stake().await?;
+                            let total_after = guard.registry_total_active_stake().await?;
+                            // Eliminate latency skew between the heavy getProgramAccounts scan and
+                            // the fast registry PDA read (#799).
+                            let total = if total_before == total_after {
+                                total_after
+                            } else {
+                                let list_sum: u64 = list.iter().map(|(_, s)| *s).sum();
+                                if list_sum == total_after {
+                                    total_after
+                                } else {
+                                    total_before
+                                }
+                            };
                             Ok::<_, crate::bridge::BridgeError>((list, total))
                         }
                         .await;

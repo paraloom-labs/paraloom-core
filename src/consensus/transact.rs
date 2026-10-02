@@ -709,8 +709,29 @@ impl TransactVerificationCoordinator {
         // set (and the previous registry total, updated only alongside a
         // non-empty snapshot so numerator and denominator move together).
         if !stakes.is_empty() {
+            let scan_sum: u64 = stakes.values().copied().sum();
+            // Invariant: registry.total_active_stake == sum(active_pda.stake_amount).
+            // When list_validator_stakes and registry_total_active_stake are read
+            // across an on-chain registration or top-up (latency asymmetry, #799),
+            // registry_total can reflect a newer total while stakes has not yet
+            // captured the new validator account. If registry_total > scan_sum,
+            // the missing wallet cannot vote, which would inflate the quorum
+            // threshold beyond the reachable stake and stall settlement liveness.
+            // Reconcile to scan_sum so the threshold remains achievable by the
+            // currently known validators.
+            let effective_total = if registry_total_active_stake > scan_sum {
+                log::warn!(
+                    target: "paraloom::consensus::transact",
+                    "registry total ({}) exceeds sum of scanned stakes ({}); reconciling to scan_sum to prevent quorum freeze (#799)",
+                    registry_total_active_stake,
+                    scan_sum
+                );
+                scan_sum
+            } else {
+                registry_total_active_stake
+            };
             *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
-            *self.onchain_registry_total.write().await = registry_total_active_stake;
+            *self.onchain_registry_total.write().await = effective_total;
             *self.onchain_stakes.write().await = stakes.clone();
         }
 
@@ -1341,6 +1362,43 @@ mod tests {
         assert!(
             approvals.try_recv().is_err(),
             "counted (2 SOL) > eligible (1 SOL) must fail safe"
+        );
+    }
+
+    /// Regression (#799): when the RPC scan latency skew causes `registry_total`
+    /// to reflect a newly-onboarded validator before `list_validator_stakes`
+    /// includes its account (scan sums to 2 SOL, but registry_total is 4 SOL),
+    /// `sync_onchain_stakes` reconciles `registry_total` to the available scan sum
+    /// so the quorum threshold is not inflated beyond the reachable stake,
+    /// preventing a consensus settlement halt.
+    #[tokio::test]
+    async fn sync_onchain_stakes_reconciles_skewed_registry_total_to_prevent_halt() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        // Skewed input: scan returned 2 SOL across W1 and W2, but registry_total
+        // was read later and already advanced to 4 SOL due to a racing registration.
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            4_000_000_000,
+        )
+        .await;
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        // Both available validators vote Valid (2 SOL out of 2 SOL scanned).
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 2, "W2", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "available validators (2 SOL) must reach quorum even when registry_total was skewed"
         );
     }
 
