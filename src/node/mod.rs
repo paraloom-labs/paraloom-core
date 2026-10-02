@@ -250,10 +250,40 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // compute Coordinator.
                 if let Some(transact) = &self.transact_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
+                        let mut admitted_wallet = node_info.wallet_pubkey.clone();
+                        // Validate proof of control for claimed on-chain wallet (#838).
+                        // If the on-chain validator set is active and a wallet is advertised,
+                        // require a valid cryptographic attestation signature by the wallet key
+                        // over this node's identity and cluster tag.
+                        if let Some(ref wallet_str) = admitted_wallet {
+                            let allow = transact.onchain_wallets.read().await;
+                            if !allow.is_empty() {
+                                let valid_sig = node_info.wallet_signature.as_ref().map_or(false, |sig| {
+                                    if let Ok(pk) = wallet_str.parse::<Pubkey>() {
+                                        let bytes = crate::consensus::transact::wallet_attestation_bytes(
+                                            self.cluster_tag(),
+                                            &source,
+                                            wallet_str,
+                                        );
+                                        crate::bridge::solana::cosign_assembly::signature_is_valid(&pk, sig, &bytes)
+                                    } else {
+                                        false
+                                    }
+                                });
+                                if !valid_sig {
+                                    log::warn!(
+                                        "rejecting unauthenticated wallet claim in discovery: peer {:?} claimed wallet {:?} without valid proof of control",
+                                        source, wallet_str
+                                    );
+                                    admitted_wallet = None;
+                                }
+                            }
+                        }
+
                         transact
                             .register_validator_with_wallet(
                                 source.clone(),
-                                node_info.wallet_pubkey.clone(),
+                                admitted_wallet,
                             )
                             .await;
                     }
@@ -923,12 +953,49 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 });
             }
         };
-        Ok(cosign_settlement(
+
+        // Authenticate that the requesting peer owns the authority named in the payload (#838).
+        // A peer cannot drive settlement co-signing using another validator's authority, which
+        // would burn the victim's co-sign budget and starve legitimate settlement.
+        let payload = match CoSignPayload::from_bytes(&request.message) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("declining co-sign request with undecodable payload: {e}");
+                return Ok(CoSignResponse {
+                    request_id: request.request_id,
+                    wallet_pubkey: String::new(),
+                    signature: None,
+                });
+            }
+        };
+
+        let source_wallet = match &self.transact_coordinator {
+            Some(coordinator) => coordinator.validator_wallet(&source).await,
+            None => None,
+        };
+        let expected_authority = Pubkey::new_from_array(payload.authority).to_string();
+        if source_wallet.as_deref() != Some(&expected_authority) {
+            log::warn!(
+                "declining co-sign request for {}: peer {:?} registered wallet {:?} does not match payload authority {}",
+                request.request_id,
+                source,
+                source_wallet,
+                expected_authority
+            );
+            return Ok(CoSignResponse {
+                request_id: request.request_id,
+                wallet_pubkey: String::new(),
+                signature: None,
+            });
+        }
+
+        Ok(cosign_settlement_with_driver(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
             &self.verified_transacts,
             &self.cosign_counts,
             request,
+            Some(&payload.authority),
         )
         .await)
     }
@@ -945,6 +1012,29 @@ async fn cosign_settlement(
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
     request: CoSignRequest,
+) -> CoSignResponse {
+    cosign_settlement_with_driver(
+        cosign_keypair,
+        expected_program_id,
+        verified_transacts,
+        cosign_counts,
+        request,
+        None,
+    )
+    .await
+}
+
+/// Produce a co-sign response for `request` with optional driver authority validation (#838).
+/// When `driver_authority` is provided, enforces that the driver is the authority named
+/// in the payload, and keys the per-settlement cap on the authenticated driver rather
+/// than unauthenticated payload fields.
+async fn cosign_settlement_with_driver(
+    cosign_keypair: Option<&Arc<Keypair>>,
+    expected_program_id: &Pubkey,
+    verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    request: CoSignRequest,
+    driver_authority: Option<&[u8; 32]>,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
     let declined = |reason: &str| {
@@ -965,6 +1055,13 @@ async fn cosign_settlement(
         Ok(p) => p,
         Err(e) => return declined(&format!("undecodable payload: {e}")),
     };
+
+    // The driver authority must match the payload authority (#838).
+    if let Some(driver) = driver_authority {
+        if driver != &payload.authority {
+            return declined("driver authority does not match payload authority");
+        }
+    }
 
     // Pin the program to our own configuration: never sign a settlement message
     // that invokes a program the requester chose, which would turn the validator
@@ -996,19 +1093,10 @@ async fn cosign_settlement(
                     && req.root == *root
                     && req.ext_amount == *ext_amount
             });
-            // Cap keys = each input nullifier paired with the payload authority
-            // (#723). The approval match above binds the settlement's public
-            // params but NOT `payload.authority`, and those params are all
-            // observable over gossip, so a registered peer could copy a real
-            // spend's params under its own authority and drain the shared
-            // per-nullifier budget until the legitimate leader's request is
-            // declined. Only the settlement whose authority is the on-chain
-            // bridge authority can ever land (its `has_one`), so keying the cap
-            // on (nullifier, authority) isolates each authority's budget: a
-            // forged-authority request can no longer starve the real leader,
-            // while the cap still bounds the usable signatures one spend yields
-            // (they all share the one on-chain authority).
-            let auth = hex::encode(payload.authority);
+            // Cap keys = each input nullifier paired with the driver authority
+            // (#723, #838). Keying on the authenticated driver isolates each
+            // authority's budget: a third party cannot starve the real leader.
+            let auth = hex::encode(driver_authority.unwrap_or(&payload.authority));
             let cap_nullifiers = [
                 format!("{}:{auth}", hex::encode(nullifiers[0])),
                 format!("{}:{auth}", hex::encode(nullifiers[1])),
@@ -1040,7 +1128,7 @@ async fn cosign_settlement(
                     && req.root == *root
                     && req.ext_amount == *ext_amount
             });
-            let auth = hex::encode(payload.authority);
+            let auth = hex::encode(driver_authority.unwrap_or(&payload.authority));
             let cap_nullifiers = [
                 format!("{}:{auth}", hex::encode(nullifiers[0])),
                 format!("{}:{auth}", hex::encode(nullifiers[1])),
@@ -1333,14 +1421,6 @@ impl Node {
             .as_deref()
             .and_then(|p| crate::bridge::solana::pubkey_from_file(p).ok());
 
-        let node_info = NodeInfo {
-            id: node_id.clone(),
-            node_type: node_type.clone(),
-            resources,
-            address: settings.network.listen_address.clone(),
-            wallet_pubkey,
-        };
-
         // Load the full settlement keypair for co-signing (#260) — the same key
         // whose pubkey is advertised above. A node without it declines co-sign
         // requests rather than failing to start.
@@ -1355,6 +1435,27 @@ impl Node {
                     None
                 }
             });
+
+        // Produce a cryptographic attestation of wallet ownership for discovery (#838).
+        let wallet_signature = if let (Some(kp), Some(ref wallet)) = (&cosign_keypair, &wallet_pubkey) {
+            let bytes = crate::consensus::transact::wallet_attestation_bytes(
+                &settings.bridge.cluster_tag,
+                &node_id,
+                wallet,
+            );
+            Some(kp.sign_message(&bytes).as_ref().to_vec())
+        } else {
+            None
+        };
+
+        let node_info = NodeInfo {
+            id: node_id.clone(),
+            node_type: node_type.clone(),
+            resources,
+            address: settings.network.listen_address.clone(),
+            wallet_pubkey,
+            wallet_signature,
+        };
 
         let network_arc = Arc::new(network);
 
@@ -3633,5 +3734,132 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // --- #838: driver authority gate & wallet attestation ---
+
+    #[tokio::test]
+    async fn third_party_cannot_burn_the_leaders_cosign_budget() {
+        let kp = Arc::new(Keypair::new()); // this node's co-sign keypair
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let leader_authority: [u8; 32] = [42u8; 32];
+        let attacker_authority: [u8; 32] = [99u8; 32];
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let mk_payload = |authority: [u8; 32], blockhash: [u8; 32]| CoSignPayload {
+            program_id: [1u8; 32],
+            authority,
+            bridge_vault: [3u8; 32],
+            blockhash,
+            quorum_validators: vec![authority],
+            params: SettlementParams::Transact {
+                recipient,
+                nullifiers,
+                output_commitments,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let program = configured_program();
+
+        // 1. Attacker attempts to co-sign naming leader_authority as payload authority,
+        // but driver_authority is attacker_authority. Must be declined outright (#838).
+        let spoofed_payload = mk_payload(leader_authority, [0xAA; 32]);
+        let spoofed_req = cosign_req("t1", SettlementKind::Transact, &spoofed_payload);
+        let resp = cosign_settlement_with_driver(
+            Some(&kp),
+            &program,
+            &tas,
+            &counts,
+            spoofed_req,
+            Some(&attacker_authority),
+        )
+        .await;
+        assert!(
+            resp.signature.is_none(),
+            "co-sign request where driver != payload.authority must be declined"
+        );
+
+        // 2. Attacker exhausts its own co-sign budget under its own authority.
+        let attacker_own_payload = mk_payload(attacker_authority, [0xAA; 32]);
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement_with_driver(
+                Some(&kp),
+                &program,
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &attacker_own_payload),
+                Some(&attacker_authority),
+            )
+            .await;
+            assert!(resp.signature.is_some(), "attacker's own request is signed");
+        }
+
+        // Attacker is now capped out.
+        let capped_resp = cosign_settlement_with_driver(
+            Some(&kp),
+            &program,
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &attacker_own_payload),
+            Some(&attacker_authority),
+        )
+        .await;
+        assert!(capped_resp.signature.is_none(), "attacker reached budget cap");
+
+        // 3. The legitimate leader's request under leader_authority is unaffected and gets signed!
+        let leader_payload = mk_payload(leader_authority, [0x42; 32]);
+        let leader_resp = cosign_settlement_with_driver(
+            Some(&kp),
+            &program,
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &leader_payload),
+            Some(&leader_authority),
+        )
+        .await;
+        assert!(
+            leader_resp.signature.is_some(),
+            "the leader's genuine request must be signed: budget is isolated per driver"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_attestation_signature_verification() {
+        let kp = Keypair::new();
+        let wallet = kp.pubkey().to_string();
+        let peer_id = NodeId(vec![1, 2, 3, 4]);
+        let cluster = "paraloom-testnet";
+
+        let bytes = crate::consensus::transact::wallet_attestation_bytes(cluster, &peer_id, &wallet);
+        let valid_sig = kp.sign_message(&bytes).as_ref().to_vec();
+
+        // Valid signature verifies over the matching peer_id and cluster
+        assert!(crate::bridge::solana::cosign_assembly::signature_is_valid(
+            &kp.pubkey(),
+            &valid_sig,
+            &bytes
+        ));
+
+        // Different peer_id produces different bytes and fails to verify
+        let wrong_peer = NodeId(vec![9, 9, 9, 9]);
+        let wrong_bytes = crate::consensus::transact::wallet_attestation_bytes(cluster, &wrong_peer, &wallet);
+        assert!(!crate::bridge::solana::cosign_assembly::signature_is_valid(
+            &kp.pubkey(),
+            &valid_sig,
+            &wrong_bytes
+        ));
     }
 }

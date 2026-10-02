@@ -118,6 +118,7 @@ fn test_discovery_message() {
             bandwidth_kbps: 1000,
         },
         wallet_pubkey: None,
+        wallet_signature: None,
     };
 
     let message = Message::Discovery {

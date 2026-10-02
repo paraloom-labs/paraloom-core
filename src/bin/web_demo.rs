@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         address: "remote".to_string(),
                         wallet_pubkey: None,
+                        wallet_signature: None,
                     };
                     dashboard_clone.add_node(&peer_info);
                 }
