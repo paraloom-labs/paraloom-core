@@ -61,6 +61,10 @@ pub struct CoSignRequest {
     pub kind: SettlementKind,
     /// Serialized Solana transaction message to be signed.
     pub message: Vec<u8>,
+    /// Optional authority signature over the transaction message, proving the
+    /// requester holds the authority key for the settlement (#811).
+    #[serde(default)]
+    pub authority_signature: Option<Vec<u8>>,
 }
 
 /// Validator → leader: the signature over the request's `message`.
@@ -208,12 +212,14 @@ mod tests {
             request_id: "round-42".to_string(),
             kind: SettlementKind::Transact,
             message: vec![0x01, 0x02, 0x03, 0x04],
+            authority_signature: Some(vec![0xAA; 64]),
         };
         let encoded = bincode::serialize(&request).expect("serialize");
         let decoded: CoSignRequest = bincode::deserialize(&encoded).expect("deserialize");
         assert_eq!(decoded.request_id, request.request_id);
         assert_eq!(decoded.kind, request.kind);
         assert_eq!(decoded.message, request.message);
+        assert_eq!(decoded.authority_signature, request.authority_signature);
     }
 
     #[test]

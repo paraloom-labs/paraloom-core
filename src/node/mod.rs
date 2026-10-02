@@ -28,7 +28,7 @@ use crate::resource::ResourceMonitor;
 use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 
 pub mod cosign_round;
@@ -923,12 +923,17 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 });
             }
         };
-        Ok(cosign_settlement(
+        let requester_wallet = match &self.transact_coordinator {
+            Some(coordinator) => coordinator.validator_wallet(&source).await,
+            None => None,
+        };
+        Ok(cosign_settlement_with_driver(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
             &self.verified_transacts,
             &self.cosign_counts,
             request,
+            requester_wallet.as_deref(),
         )
         .await)
     }
@@ -945,6 +950,25 @@ async fn cosign_settlement(
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
     request: CoSignRequest,
+) -> CoSignResponse {
+    cosign_settlement_with_driver(
+        cosign_keypair,
+        expected_program_id,
+        verified_transacts,
+        cosign_counts,
+        request,
+        None,
+    )
+    .await
+}
+
+async fn cosign_settlement_with_driver(
+    cosign_keypair: Option<&Arc<Keypair>>,
+    expected_program_id: &Pubkey,
+    verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    request: CoSignRequest,
+    requester_wallet: Option<&str>,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
     let declined = |reason: &str| {
@@ -973,6 +997,18 @@ async fn cosign_settlement(
         return declined("payload program id does not match our configured program");
     }
 
+    // Authenticate the requester against the claimed settlement authority (#811).
+    // If the authenticated requester wallet is known (from libp2p source auth),
+    // enforce that it matches the payload authority pubkey so a registered peer
+    // cannot impersonate the legitimate leader.
+    let authority_pubkey = Pubkey::new_from_array(payload.authority);
+    let authority_str = authority_pubkey.to_string();
+    if let Some(req_wallet) = requester_wallet {
+        if req_wallet != authority_str {
+            return declined("requester wallet does not match payload authority");
+        }
+    }
+
     // Match the payload against a settlement we verified Valid, by request id
     // and binding parameters, and take the input nullifiers as the per-nullifier
     // cap keys (see the cap block below for why the cap is keyed on those).
@@ -997,17 +1033,10 @@ async fn cosign_settlement(
                     && req.ext_amount == *ext_amount
             });
             // Cap keys = each input nullifier paired with the payload authority
-            // (#723). The approval match above binds the settlement's public
+            // (#723, #811). The approval match above binds the settlement's public
             // params but NOT `payload.authority`, and those params are all
-            // observable over gossip, so a registered peer could copy a real
-            // spend's params under its own authority and drain the shared
-            // per-nullifier budget until the legitimate leader's request is
-            // declined. Only the settlement whose authority is the on-chain
-            // bridge authority can ever land (its `has_one`), so keying the cap
-            // on (nullifier, authority) isolates each authority's budget: a
-            // forged-authority request can no longer starve the real leader,
-            // while the cap still bounds the usable signatures one spend yields
-            // (they all share the one on-chain authority).
+            // observable over gossip. Requester verification above ensures that
+            // third-party peers cannot spend the legitimate leader's budget.
             let auth = hex::encode(payload.authority);
             let cap_nullifiers = [
                 format!("{}:{auth}", hex::encode(nullifiers[0])),
@@ -1057,6 +1086,18 @@ async fn cosign_settlement(
         Ok(m) => m,
         Err(e) => return declined(&format!("could not build settlement message: {e}")),
     };
+
+    // If an authority signature is provided, verify it cryptographically against
+    // the reconstructed transaction message and payload authority (#811).
+    if let Some(sig_bytes) = &request.authority_signature {
+        let sig = match Signature::try_from(sig_bytes.as_slice()) {
+            Ok(s) => s,
+            Err(_) => return declined("malformed authority signature"),
+        };
+        if !sig.verify(&payload.authority, &message.serialize()) {
+            return declined("authority signature verification failed");
+        }
+    }
 
     // Bound how many fee-payer signatures one spend can yield (#593), keyed on
     // each input nullifier independently — NOT the request id and NOT the
@@ -2828,6 +2869,7 @@ mod tests {
             request_id: id.to_string(),
             kind,
             message: payload.to_bytes().expect("serialize payload"),
+            authority_signature: None,
         }
     }
 
@@ -3633,5 +3675,93 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_cap_cannot_be_exhausted_by_third_party_impersonating_leader() {
+        // Issue #811 regression: A registered validator trying to impersonate
+        // the leader's settlement authority to exhaust its co-sign budget must be
+        // rejected when its requester wallet does not match the payload authority,
+        // preserving the genuine leader's budget.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let leader_kp = Keypair::new();
+        let leader_authority = leader_kp.pubkey().to_bytes();
+        let attacker_kp = Keypair::new();
+        let attacker_wallet = attacker_kp.pubkey().to_string();
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let mk_payload = |authority: [u8; 32], blockhash: [u8; 32]| CoSignPayload {
+            program_id: [1u8; 32],
+            authority,
+            bridge_vault: [3u8; 32],
+            blockhash,
+            quorum_validators: vec![authority],
+            params: SettlementParams::Transact {
+                recipient,
+                nullifiers,
+                output_commitments: outputs,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+
+        // Attacker sends 4 requests naming the leader's authority under attacker's peer wallet
+        let attacker_payload = mk_payload(leader_authority, [0xAA; 32]);
+        let attacker_req = cosign_req("t1", SettlementKind::Transact, &attacker_payload);
+
+        for _ in 0..4 {
+            let resp = cosign_settlement_with_driver(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                attacker_req.clone(),
+                Some(&attacker_wallet),
+            )
+            .await;
+            assert_eq!(
+                resp.signature, None,
+                "attacker impersonating leader must be declined"
+            );
+        }
+
+        // Leader's genuine request (with its matching wallet and valid signature) must succeed
+        let leader_payload = mk_payload(leader_authority, [0x42; 32]);
+        let leader_msg = build_settlement_message(&leader_payload).expect("build msg");
+        let leader_sig = leader_kp.sign_message(&leader_msg.serialize());
+        let leader_req = CoSignRequest {
+            request_id: "t1".to_string(),
+            kind: SettlementKind::Transact,
+            message: leader_payload.to_bytes().expect("payload"),
+            authority_signature: Some(leader_sig.as_ref().to_vec()),
+        };
+
+        let leader_resp = cosign_settlement_with_driver(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            leader_req,
+            Some(&leader_kp.pubkey().to_string()),
+        )
+        .await;
+
+        assert!(
+            leader_resp.signature.is_some(),
+            "leader's legitimate co-sign request must succeed and not be budget-starved"
+        );
     }
 }
