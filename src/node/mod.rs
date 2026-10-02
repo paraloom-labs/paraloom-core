@@ -932,6 +932,24 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         )
         .await)
     }
+
+    /// Unban a wallet from the consensus equivocators set (admin recovery path, #794).
+    pub async fn unban_equivocator(&self, wallet: &str) -> bool {
+        if let Some(coordinator) = &self.transact_coordinator {
+            coordinator.unban_equivocator(wallet).await
+        } else {
+            false
+        }
+    }
+
+    /// List all currently banned equivocators (#794).
+    pub async fn list_banned_equivocators(&self) -> std::collections::HashSet<String> {
+        if let Some(coordinator) = &self.transact_coordinator {
+            coordinator.list_banned_equivocators().await
+        } else {
+            std::collections::HashSet::new()
+        }
+    }
 }
 
 /// Produce a co-sign response for `request` (#260): sign the rebuilt settlement

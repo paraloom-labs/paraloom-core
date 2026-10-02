@@ -397,6 +397,47 @@ impl TransactVerificationCoordinator {
         }
     }
 
+    /// Unban an equivocating wallet from the blacklist (admin recovery/dispute path, #794).
+    ///
+    /// The automated equivocation detection permanently excludes a wallet from consensus
+    /// when disagreeing votes are observed. In multi-node/HA deployments or transient timing
+    /// races, this would permanently strand an honest validator's stake and ability to earn.
+    /// This provides the administrative unban / recovery mechanism.
+    pub async fn unban_equivocator(&self, wallet: &str) -> bool {
+        let mut eq = self.equivocators.write().await;
+        let removed = eq.remove(wallet);
+        if removed {
+            self.persist_equivocators(&eq).await;
+            log::info!(
+                target: "paraloom::consensus::transact",
+                "Unbanned wallet {} from equivocators; consensus voting restored (#794)",
+                wallet
+            );
+        }
+        removed
+    }
+
+    /// Check if a wallet is currently banned for equivocation (#794).
+    pub async fn is_equivocator_banned(&self, wallet: &str) -> bool {
+        self.equivocators.read().await.contains(wallet)
+    }
+
+    /// List all currently banned equivocator wallets (#794).
+    pub async fn list_banned_equivocators(&self) -> HashSet<String> {
+        self.equivocators.read().await.clone()
+    }
+
+    /// Clear all equivocator bans (administrative reset, #794).
+    pub async fn clear_all_equivocators(&self) {
+        let mut eq = self.equivocators.write().await;
+        eq.clear();
+        self.persist_equivocators(&eq).await;
+        log::info!(
+            target: "paraloom::consensus::transact",
+            "Cleared all equivocator bans (#794)"
+        );
+    }
+
     /// Remove `request_id` from the emitted set so a re-proved identical
     /// canonical id can be approved again — called on final settlement failure
     /// and on timeout sweep, so a content-bound id is never permanently
@@ -1382,6 +1423,55 @@ mod tests {
         assert!(
             c.slashing_tracker().total_count().await > 0,
             "equivocation must be recorded"
+        );
+    }
+
+    /// Regression (#794): an equivocating wallet that was banned can be unbanned
+    /// via the recovery path (`unban_equivocator`), restoring its consensus voting
+    /// eligibility and allowing an operator / HA failover setup to recover without
+    /// permanently stranding validator stake.
+    #[tokio::test]
+    async fn unban_equivocator_restores_voting_eligibility() {
+        let (c, mut approvals) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        // W1 equivocates across two nodes and is banned
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 9, "W1", false)).await.unwrap();
+        assert!(c.is_equivocator_banned("W1").await);
+
+        // Admin unbans W1 via recovery path (#794)
+        assert!(c.unban_equivocator("W1").await);
+        assert!(!c.is_equivocator_banned("W1").await);
+
+        // In a fresh verification round, W1 and W2 both vote Valid.
+        // W1's unbanned vote now counts, successfully reaching quorum.
+        let mut req2 = sample_request();
+        req2.timestamp = 100;
+        let id2 = req2.canonical_request_id().unwrap();
+        req2.request_id = id2.clone();
+        c.start_verification(req2).await.unwrap();
+        c.submit_result(vote(&id2, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id2, 2, "W2", true)).await.unwrap();
+
+        assert!(
+            approvals.try_recv().is_ok(),
+            "unbanned wallet's vote must count toward quorum"
         );
     }
 
