@@ -225,11 +225,7 @@ pub fn wallet_attestation_bytes(
 ) -> Vec<u8> {
     const DOMAIN: &[u8] = b"paraloom:discovery-wallet:v1";
     let mut buf = Vec::with_capacity(
-        DOMAIN.len()
-            + 8 * 3
-            + cluster_tag.len()
-            + node_id.0.len()
-            + wallet_pubkey.len(),
+        DOMAIN.len() + 8 * 3 + cluster_tag.len() + node_id.0.len() + wallet_pubkey.len(),
     );
     buf.extend_from_slice(DOMAIN);
     let put = |bytes: &[u8], buf: &mut Vec<u8>| {
@@ -1626,9 +1622,7 @@ mod tests {
             .register_validator_with_wallet(NodeId(vec![1]), Some("SHARED_WALLET".to_string()))
             .await;
         assert!(
-            coordinator
-                .is_registered_validator(&NodeId(vec![1]))
-                .await,
+            coordinator.is_registered_validator(&NodeId(vec![1])).await,
             "first registrant must be admitted"
         );
 
@@ -1637,9 +1631,7 @@ mod tests {
             .register_validator_with_wallet(NodeId(vec![2]), Some("SHARED_WALLET".to_string()))
             .await;
         assert!(
-            !coordinator
-                .is_registered_validator(&NodeId(vec![2]))
-                .await,
+            !coordinator.is_registered_validator(&NodeId(vec![2])).await,
             "second peer attempting to usurp an active wallet must be rejected"
         );
     }

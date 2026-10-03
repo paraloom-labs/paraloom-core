@@ -281,10 +281,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         }
 
                         transact
-                            .register_validator_with_wallet(
-                                source.clone(),
-                                admitted_wallet,
-                            )
+                            .register_validator_with_wallet(source.clone(), admitted_wallet)
                             .await;
                     }
                 }
@@ -1437,16 +1434,17 @@ impl Node {
             });
 
         // Produce a cryptographic attestation of wallet ownership for discovery (#838).
-        let wallet_signature = if let (Some(kp), Some(ref wallet)) = (&cosign_keypair, &wallet_pubkey) {
-            let bytes = crate::consensus::transact::wallet_attestation_bytes(
-                &settings.bridge.cluster_tag,
-                &node_id,
-                wallet,
-            );
-            Some(kp.sign_message(&bytes).as_ref().to_vec())
-        } else {
-            None
-        };
+        let wallet_signature =
+            if let (Some(kp), Some(ref wallet)) = (&cosign_keypair, &wallet_pubkey) {
+                let bytes = crate::consensus::transact::wallet_attestation_bytes(
+                    &settings.bridge.cluster_tag,
+                    &node_id,
+                    wallet,
+                );
+                Some(kp.sign_message(&bytes).as_ref().to_vec())
+            } else {
+                None
+            };
 
         let node_info = NodeInfo {
             id: node_id.clone(),
@@ -3817,7 +3815,10 @@ mod tests {
             Some(&attacker_authority),
         )
         .await;
-        assert!(capped_resp.signature.is_none(), "attacker reached budget cap");
+        assert!(
+            capped_resp.signature.is_none(),
+            "attacker reached budget cap"
+        );
 
         // 3. The legitimate leader's request under leader_authority is unaffected and gets signed!
         let leader_payload = mk_payload(leader_authority, [0x42; 32]);
@@ -3843,7 +3844,8 @@ mod tests {
         let peer_id = NodeId(vec![1, 2, 3, 4]);
         let cluster = "paraloom-testnet";
 
-        let bytes = crate::consensus::transact::wallet_attestation_bytes(cluster, &peer_id, &wallet);
+        let bytes =
+            crate::consensus::transact::wallet_attestation_bytes(cluster, &peer_id, &wallet);
         let valid_sig = kp.sign_message(&bytes).as_ref().to_vec();
 
         // Valid signature verifies over the matching peer_id and cluster
@@ -3855,7 +3857,8 @@ mod tests {
 
         // Different peer_id produces different bytes and fails to verify
         let wrong_peer = NodeId(vec![9, 9, 9, 9]);
-        let wrong_bytes = crate::consensus::transact::wallet_attestation_bytes(cluster, &wrong_peer, &wallet);
+        let wrong_bytes =
+            crate::consensus::transact::wallet_attestation_bytes(cluster, &wrong_peer, &wallet);
         assert!(!crate::bridge::solana::cosign_assembly::signature_is_valid(
             &kp.pubkey(),
             &valid_sig,
