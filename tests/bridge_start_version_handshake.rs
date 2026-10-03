@@ -18,7 +18,10 @@ async fn bridge_start_verifies_program_version() {
 
     let pool = Arc::new(ShieldedPool::new());
     let mut bridge = Bridge::new(config);
-    bridge.init(pool).await.expect("bridge init builds RPC clients only");
+    bridge
+        .init(pool)
+        .await
+        .expect("bridge init builds RPC clients only");
 
     let started = bridge.start().await;
     assert!(
