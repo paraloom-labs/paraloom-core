@@ -38,6 +38,26 @@ impl VerificationVote {
     pub fn is_valid(&self) -> bool {
         matches!(self, VerificationVote::Valid)
     }
+
+    /// Check if an invalid vote was caused by an operational/transient error
+    /// (e.g. verifying key unavailable, pool unavailable, IO error) rather than
+    /// an evaluated proof verification failure (#812).
+    pub fn is_transient_error(&self) -> bool {
+        match self {
+            VerificationVote::Invalid { reason } => {
+                let r = reason.to_lowercase();
+                r.contains("verifying key unavailable")
+                    || r.contains("pool not available")
+                    || r.contains("verification error")
+                    || r.contains("transient")
+                    || r.contains("temporar")
+                    || r.contains("unavailable")
+                    || r.contains("self-verify error")
+                    || r.contains("io error")
+            }
+            VerificationVote::Valid => false,
+        }
+    }
 }
 
 /// One validator's recorded vote, keyed in the tally by its co-sign wallet.
@@ -124,6 +144,26 @@ impl VoteTally {
                 // `reason` differs.
                 return Ok(None);
             }
+
+            // Distinguish operational/transient errors from Byzantine flips (#812).
+            // An honest validator encountering a temporary failure (e.g. verifying
+            // key temporarily unavailable from disk, pool unready) should not be flagged as an
+            // equivocator when it subsequently recovers and votes Valid.
+            if previous.vote.is_transient_error() || vote.is_transient_error() {
+                if vote.is_valid() {
+                    // Recovered to Valid: update the stored vote so quorum can form.
+                    votes.insert(
+                        wallet,
+                        VoteRecord {
+                            vote,
+                            node_id,
+                            signature,
+                        },
+                    );
+                }
+                return Ok(None);
+            }
+
             let evidence = SlashingEvidence::Equivocation {
                 request_id: self.request_id.clone(),
                 wallet_pubkey: wallet.clone(),
@@ -357,5 +397,72 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+    }
+
+    #[tokio::test]
+    async fn transient_invalid_then_valid_does_not_equivocate_and_updates_vote() {
+        let tally = VoteTally::new("req-transient-1".to_string(), 1, 2);
+        // Honest validator had temporary key read issue -> Invalid with key unavailable
+        let first = tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "transact verifying key unavailable: file not found".into(),
+                },
+                vec![1, 1],
+            )
+            .await
+            .unwrap();
+        assert!(first.is_none());
+
+        // Validator recovers and votes Valid -> NOT treated as equivocation
+        let recovered = tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![2, 2],
+            )
+            .await
+            .unwrap();
+        assert!(
+            recovered.is_none(),
+            "transient error recovery must not produce equivocation evidence"
+        );
+
+        // The Valid vote must now be counted
+        let eligible = wallets(&["W1"]);
+        assert!(tally.has_consensus(&eligible).await);
+        assert_eq!(tally.valid_voters(&eligible).await, vec![NodeId(vec![1])]);
+    }
+
+    #[tokio::test]
+    async fn definitive_invalid_then_valid_still_equivocates() {
+        let tally = VoteTally::new("req-definitive-1".to_string(), 1, 2);
+        let first = tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "proof verification failed: pairing mismatch".into(),
+                },
+                vec![1, 1],
+            )
+            .await
+            .unwrap();
+        assert!(first.is_none());
+
+        // A flip on a non-transient, definitive verification outcome MUST equivocate
+        let flip = tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![2, 2],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(flip, Some(SlashingEvidence::Equivocation { .. })));
     }
 }
