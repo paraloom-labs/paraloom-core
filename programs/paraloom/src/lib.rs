@@ -575,10 +575,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
