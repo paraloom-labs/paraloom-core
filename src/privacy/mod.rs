@@ -41,7 +41,9 @@ pub use circuits::{Groth16ProofSystem, MAX_INPUTS, MAX_OUTPUTS};
 pub use commitment::{CommitmentBuilder, CommitmentGenerator};
 pub use error::{PrivacyError, Result};
 pub use merkle::MerkleTree;
-pub use note_crypto::{decrypt_note, encrypt_note, EncryptedNote, NotePlaintext};
+pub use note_crypto::{
+    decrypt_note, encrypt_note, is_low_order_point, EncryptedNote, NotePlaintext,
+};
 pub use nullifier::NullifierSet;
 pub use pool::ShieldedPool;
 pub use proof::{ProofVerifier, VerificationChunk, VerificationResult};
