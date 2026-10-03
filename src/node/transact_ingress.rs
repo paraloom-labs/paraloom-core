@@ -112,6 +112,10 @@ struct SubmitRequest {
     /// and `recipient` is the recipient token account.
     #[serde(default)]
     mint: Option<String>,
+    /// Token program that owns `mint` (#803), 32-byte hex. Omitted for classic
+    /// SPL Token.
+    #[serde(default)]
+    token_program: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +178,11 @@ async fn submit_handler(
         .as_ref()
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
+    let token_program = req
+        .token_program
+        .as_ref()
+        .map(|tp| parse_hex32("token_program", tp))
+        .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
@@ -222,6 +231,7 @@ async fn submit_handler(
         request_id: String::new(),
         recipient,
         mint,
+        token_program,
         nullifiers,
         output_commitments,
         root,

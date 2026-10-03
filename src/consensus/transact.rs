@@ -62,6 +62,14 @@ pub struct TransactVerificationRequest {
     #[serde(default)]
     pub mint: Option<[u8; 32]>,
 
+    /// The token program that owns `mint` and the recipient/fee ATAs (#803).
+    /// Required when `mint` is set so the off-chain co-sign payload binds the
+    /// correct program id for ATA derivation and `transfer_checked`; defaults
+    /// to the classic SPL Token program for backwards compatibility with
+    /// pre-#803 requests.
+    #[serde(default)]
+    pub token_program: Option<[u8; 32]>,
+
     /// Input note nullifiers (one may be a random dummy for a 1-real-input spend)
     pub nullifiers: [[u8; 32]; 2],
 
@@ -127,6 +135,9 @@ impl TransactVerificationRequest {
         if let Some(mint) = self.mint {
             h.update(b"spl");
             h.update(mint);
+            if let Some(tp) = self.token_program {
+                h.update(tp);
+            }
         }
         format!("transact-{}", hex::encode(h.finalize()))
     }
@@ -1026,6 +1037,7 @@ mod tests {
             request_id: "attacker-chosen".to_string(),
             recipient: [1u8; 32],
             mint: None,
+            token_program: None,
             nullifiers: [[2u8; 32], [3u8; 32]],
             output_commitments: [[4u8; 32], [5u8; 32]],
             root: [6u8; 32],
