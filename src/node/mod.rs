@@ -1024,6 +1024,7 @@ async fn cosign_settlement(
             SettlementParams::TransactSpl {
                 recipient_token_account,
                 mint,
+                token_program,
                 nullifiers,
                 output_commitments,
                 root,
@@ -1033,8 +1034,17 @@ async fn cosign_settlement(
         ) => {
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
+                let expected_tp = req.token_program.unwrap_or_else(|| {
+                    crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes()
+                });
+                let actual_tp = if *token_program == [0u8; 32] {
+                    crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes()
+                } else {
+                    *token_program
+                };
                 req.recipient == *recipient_token_account
                     && req.mint == Some(*mint)
+                    && actual_tp == expected_tp
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -2458,6 +2468,9 @@ impl Node {
             Some(mint) => SettlementParams::TransactSpl {
                 recipient_token_account: request.recipient,
                 mint,
+                token_program: request.token_program.unwrap_or_else(|| {
+                    crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes()
+                }),
                 nullifiers: request.nullifiers,
                 output_commitments: request.output_commitments,
                 root: request.root,
@@ -2907,6 +2920,7 @@ mod tests {
             request_id: id.to_string(),
             recipient,
             mint: None,
+            token_program: None,
             nullifiers,
             output_commitments,
             root,
