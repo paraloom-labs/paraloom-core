@@ -63,6 +63,24 @@ impl MerkleTree {
         let commitments = storage.get_all_commitments()?;
         let leaves: Vec<[u8; 32]> = commitments.iter().map(|c| *c.as_bytes()).collect();
 
+        // Validate that the stored commitment count does not exceed the configured
+        // tree capacity. A mismatch indicates storage corruption or a depth
+        // misconfiguration and must be caught here before the tree is used:
+        // insert() would silently accept overflow leaves whose Merkle paths
+        // cannot verify against the fixed-depth root.
+        let capacity = 1usize
+            .checked_shl(DEFAULT_TREE_DEPTH as u32)
+            .unwrap_or(usize::MAX);
+        if leaves.len() > capacity {
+            anyhow::bail!(
+                "storage contains {} commitments but depth {} supports at most {} leaves — \
+                 refusing to load a tree that would already be past capacity",
+                leaves.len(),
+                DEFAULT_TREE_DEPTH,
+                capacity
+            );
+        }
+
         // Load cached root if available
         let cached_root = storage.get_merkle_root()?;
 
@@ -81,15 +99,31 @@ impl MerkleTree {
         })
     }
 
+    /// Returns the maximum number of leaves this tree can hold (`2^depth`).
+    pub fn capacity(&self) -> usize {
+        1usize.checked_shl(self.depth as u32).unwrap_or(usize::MAX)
+    }
+
     /// Insert a commitment as a leaf, returning the index it was placed
-    /// at. When persistent storage is configured, the on-disk write is
-    /// performed *before* the in-memory mutation, so a storage failure
-    /// is observable and leaves the tree's in-memory state unchanged.
-    /// This preserves crash-consistency: a leaf either reaches both
-    /// memory and disk, or neither.
+    /// at. Returns an error if the tree has already reached its fixed-depth
+    /// capacity (`2^depth` leaves). When persistent storage is configured,
+    /// the on-disk write is performed *before* the in-memory mutation, so a
+    /// storage failure is observable and leaves the tree's in-memory state
+    /// unchanged. This preserves crash-consistency: a leaf either reaches
+    /// both memory and disk, or neither.
     pub async fn insert(&self, commitment: &Commitment) -> Result<usize, anyhow::Error> {
         let mut leaves = self.leaves.write().await;
         let index = leaves.len();
+
+        let capacity = self.capacity();
+        if index >= capacity {
+            anyhow::bail!(
+                "merkle tree at capacity: depth {} supports at most {} leaves (currently {})",
+                self.depth,
+                capacity,
+                index
+            );
+        }
 
         if let Some(storage) = &self.storage {
             storage.insert_commitment(index as u64, commitment).map_err(|e| {
@@ -112,14 +146,29 @@ impl MerkleTree {
 
     /// Batch insert multiple commitments. Same crash-consistency
     /// contract as [`MerkleTree::insert`]: persist first, mutate
-    /// memory only if persistence succeeded.
+    /// memory only if persistence succeeded. Returns an error if the
+    /// batch would exceed the fixed-depth capacity (`2^depth` leaves).
     pub async fn insert_batch(
         &self,
         commitments: &[Commitment],
     ) -> Result<Vec<usize>, anyhow::Error> {
         let mut leaves = self.leaves.write().await;
         let start_index = leaves.len();
-        let indices: Vec<usize> = (start_index..start_index + commitments.len()).collect();
+
+        let capacity = self.capacity();
+        let end_index = start_index.checked_add(commitments.len()).unwrap_or(usize::MAX);
+        if end_index > capacity {
+            anyhow::bail!(
+                "merkle tree batch would exceed capacity: depth {} supports at most {} leaves \
+                 (currently {}, batch size {})",
+                self.depth,
+                capacity,
+                start_index,
+                commitments.len()
+            );
+        }
+
+        let indices: Vec<usize> = (start_index..end_index).collect();
 
         if let Some(storage) = &self.storage {
             storage
