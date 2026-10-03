@@ -1611,15 +1611,18 @@ mod tests {
             .with_local_wallet("W0".to_string())
             .with_reputation_persistence(rep_path.clone());
         c.set_consensus_thresholds(2, 2);
-        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string())).await;
-        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string())).await;
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
         c.sync_onchain_stakes(
             std::collections::HashMap::from([
                 ("W0".to_string(), 1_000_000_000u64),
                 ("W1".to_string(), 1_000_000_000u64),
             ]),
             2_000_000_000,
-        ).await;
+        )
+        .await;
         let mut approvals = rx;
 
         let req = test_transact_request();
@@ -1636,7 +1639,9 @@ mod tests {
             timestamp: 1,
             wallet_pubkey: "W1".to_string(),
             signature: vec![1, 2],
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // Key restored; the canonical request is retried/resubmitted; W1 recovers and votes Valid
         c.submit_result(TransactVerificationResult {
@@ -1646,7 +1651,9 @@ mod tests {
             timestamp: 2,
             wallet_pubkey: "W1".to_string(),
             signature: vec![1, 3],
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // Node 0 also votes Valid
         c.submit_result(TransactVerificationResult {
@@ -1656,7 +1663,9 @@ mod tests {
             timestamp: 3,
             wallet_pubkey: "W0".to_string(),
             signature: vec![0, 1],
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // With fix #812, W1 is NOT banned: the 2-of-2 quorum forms successfully
         assert!(

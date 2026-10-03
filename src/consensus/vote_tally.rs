@@ -426,7 +426,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(recovered.is_none(), "transient error recovery must not produce equivocation evidence");
+        assert!(
+            recovered.is_none(),
+            "transient error recovery must not produce equivocation evidence"
+        );
 
         // The Valid vote must now be counted
         let eligible = wallets(&["W1"]);
