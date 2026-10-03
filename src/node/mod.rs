@@ -1429,24 +1429,45 @@ impl Node {
                 None
             };
 
-        // Privacy layer + Solana bridge (#163). A validator- or
-        // bridge-class node with the bridge enabled owns a ShieldedPool
-        // that the Bridge manager's deposit EventListener keeps in sync
-        // with on-chain deposits (started in run()). Compute-only
-        // providers and nodes with the bridge disabled skip it.
+        // Privacy layer + Solana bridge (#163, #798). A validator- or
+        // bridge-class node with the bridge enabled owns a storage-backed
+        // ShieldedPool that the Bridge manager's deposit EventListener keeps in sync
+        // with on-chain deposits (started in run()).
         //
-        // The pool is in-memory (ShieldedPool::new) rather than
-        // storage-backed on purpose: the deposit listener does not yet
-        // persist its scan cursor, so a persistent tree would
-        // double-index on restart. Rebuilding from chain on each run
-        // keeps the cursor and the tree consistent; persistent indexing
-        // is a follow-up once the cursor is durable.
+        // The deposit listener persists its cursor under `bridge_cursor`.
+        // To prevent missing historical deposits on restart (#798), the shielded pool
+        // is backed by persistent PrivacyStorage under `<data_dir>/privacy`.
+        // Re-scanning/idempotency is handled on deposit insertion via the
+        // persisted `deposited` commitment set.
         let runs_bridge = settings.bridge.enabled
             && matches!(node_type, NodeType::ResourceProvider | NodeType::Bridge);
-        let shielded_pool = if runs_bridge {
-            Some(Arc::new(ShieldedPool::new()))
+        let (privacy_storage, shielded_pool) = if runs_bridge {
+            let storage_path = format!("{}/privacy", settings.storage.data_dir);
+            match PrivacyStorage::open(&storage_path) {
+                Ok(storage) => {
+                    info!("Privacy storage initialized at {}", storage_path);
+                    let storage_arc = Arc::new(storage);
+                    let pool = futures::executor::block_on(ShieldedPool::with_storage(storage_arc.clone()))
+                        .map(Arc::new)
+                        .unwrap_or_else(|e| {
+                            log::warn!(
+                                "Failed to restore storage-backed shielded pool: {}, falling back to in-memory",
+                                e
+                            );
+                            Arc::new(ShieldedPool::new())
+                        });
+                    (Some(storage_arc), Some(pool))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to open privacy storage at {}: {}, falling back to in-memory",
+                        storage_path, e
+                    );
+                    (None, Some(Arc::new(ShieldedPool::new())))
+                }
+            }
         } else {
-            None
+            (None, None)
         };
         let bridge = if runs_bridge {
             // Persist the deposit listener's scan cursor under the node's data
@@ -1512,7 +1533,7 @@ impl Node {
             resource_monitor: Arc::new(resource_monitor),
             coordinator,
             validator,
-            privacy_storage: None,
+            privacy_storage,
             shielded_pool,
             bridge,
             compute_executor,
@@ -3549,8 +3570,52 @@ mod tests {
         settings.bridge.enabled = true;
         let node = Node::new(settings).expect("construct node");
         assert!(node.shielded_pool.is_some());
+        assert!(node.privacy_storage.is_some());
         assert!(node.bridge.is_some());
         assert!(node.transact_coordinator.is_some());
+    }
+
+    // Issue #798: Shielded pool must be backed by persistent storage when the
+    // bridge is enabled, so deposits survive a node restart instead of being lost
+    // while the cursor advances.
+    #[tokio::test]
+    async fn shielded_pool_state_survives_node_restart() {
+        use crate::privacy::types::{Note, ShieldedAddress};
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        settings.storage.data_dir = dir.path().to_str().unwrap().to_string();
+
+        let note = Note::new_native(ShieldedAddress([5u8; 32]), 2_500, [6u8; 32]);
+        let commitment = {
+            let node = Node::new(settings.clone()).expect("start initial node");
+            assert!(node.privacy_storage.is_some());
+            let pool = node.shielded_pool.as_ref().expect("pool present");
+            let c = pool.deposit(note.clone(), 2_500).await.expect("deposit");
+            assert_eq!(pool.total_supply().await, 2_500);
+            assert_eq!(pool.commitment_count().await, 1);
+            c
+        };
+
+        // Restart node with same settings and data directory
+        let restarted = Node::new(settings).expect("restart node");
+        let pool = restarted.shielded_pool.as_ref().expect("restarted pool present");
+        assert_eq!(
+            pool.total_supply().await,
+            2_500,
+            "shielded pool supply must survive restart (#798)"
+        );
+        assert_eq!(
+            pool.commitment_count().await,
+            1,
+            "shielded pool commitments must survive restart (#798)"
+        );
+
+        // Subsequent replay of the same deposit is idempotent
+        let replayed = pool.deposit(note, 2_500).await.expect("replay deposit");
+        assert_eq!(replayed, commitment);
+        assert_eq!(pool.total_supply().await, 2_500);
+        assert_eq!(pool.commitment_count().await, 1);
     }
 
     // --- delivered-note mint (#23, paraloom-wallet) ---
