@@ -299,10 +299,10 @@ pub fn is_low_order_point(point: &[u8; 32]) -> bool {
 
     let mut matched = false;
     for low in &LOW_ORDER_MASKED_POINTS {
-        let mut diff = 0u8;
-        for i in 0..32 {
-            diff |= masked[i] ^ low[i];
-        }
+        let diff = masked
+            .iter()
+            .zip(low.iter())
+            .fold(0u8, |acc, (m, l)| acc | (m ^ l));
         if diff == 0 {
             matched = true;
         }
