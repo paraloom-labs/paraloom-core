@@ -14,7 +14,10 @@ struct CaptureIngress {
 
 #[async_trait]
 impl TransactIngress for CaptureIngress {
-    async fn submit_transact(&self, request: TransactVerificationRequest) -> anyhow::Result<String> {
+    async fn submit_transact(
+        &self,
+        request: TransactVerificationRequest,
+    ) -> anyhow::Result<String> {
         let id = request.request_id.clone();
         *self.seen.lock().await = Some(request);
         Ok(id)

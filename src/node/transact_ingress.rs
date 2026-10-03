@@ -358,10 +358,8 @@ mod tests {
 
     fn valid_proof_hex() -> String {
         let body = vec![1u8; crate::privacy::GROTH16_BN254_COMPRESSED_LEN];
-        let wire = crate::privacy::tag_proof(
-            crate::privacy::ProofSuite::Groth16Bn254TransactV3,
-            &body,
-        );
+        let wire =
+            crate::privacy::tag_proof(crate::privacy::ProofSuite::Groth16Bn254TransactV3, &body);
         hex::encode(wire)
     }
 
