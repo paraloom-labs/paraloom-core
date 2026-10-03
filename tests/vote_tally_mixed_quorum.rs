@@ -52,7 +52,9 @@ async fn mixed_votes_at_response_quorum_remain_pending_until_outcome_quorum() {
             .await;
         stakes.insert(format!("W{i}"), 1_000_000_000);
     }
-    coordinator.sync_onchain_stakes(stakes, 10_000_000_000).await;
+    coordinator
+        .sync_onchain_stakes(stakes, 10_000_000_000)
+        .await;
 
     let request = canonical_request();
     let request_id = request.request_id.clone();
@@ -76,7 +78,11 @@ async fn mixed_votes_at_response_quorum_remain_pending_until_outcome_quorum() {
     // Because 6 Valid < 7 and 1 Invalid < 7, consensus is not yet reached;
     // check_consensus must return None (pending) rather than premature Invalid (#801).
     assert!(
-        coordinator.check_consensus(&request_id).await.unwrap().is_none(),
+        coordinator
+            .check_consensus(&request_id)
+            .await
+            .unwrap()
+            .is_none(),
         "mixed split 6-valid/1-invalid must remain pending, not prematurely reject"
     );
 
@@ -108,7 +114,9 @@ async fn explicit_invalid_quorum_finalizes_as_invalid() {
             .await;
         stakes.insert(format!("W{i}"), 1_000_000_000);
     }
-    coordinator.sync_onchain_stakes(stakes, 10_000_000_000).await;
+    coordinator
+        .sync_onchain_stakes(stakes, 10_000_000_000)
+        .await;
 
     let request = canonical_request();
     let request_id = request.request_id.clone();
