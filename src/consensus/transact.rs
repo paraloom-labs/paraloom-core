@@ -215,6 +215,29 @@ pub fn transact_vote_signing_bytes(
     buf
 }
 
+/// Build the canonical signing bytes for proving wallet ownership during discovery (#838).
+/// Binds the domain tag, cluster tag, node ID, and claimed wallet pubkey so a signature
+/// cannot be relayed or re-used across different node identities or clusters.
+pub fn wallet_attestation_bytes(
+    cluster_tag: &str,
+    node_id: &NodeId,
+    wallet_pubkey: &str,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"paraloom:discovery-wallet:v1";
+    let mut buf = Vec::with_capacity(
+        DOMAIN.len() + 8 * 3 + cluster_tag.len() + node_id.0.len() + wallet_pubkey.len(),
+    );
+    buf.extend_from_slice(DOMAIN);
+    let put = |bytes: &[u8], buf: &mut Vec<u8>| {
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    };
+    put(cluster_tag.as_bytes(), &mut buf);
+    put(&node_id.0, &mut buf);
+    put(wallet_pubkey.as_bytes(), &mut buf);
+    buf
+}
+
 /// A transact the validator quorum has approved (#350). Emitted on the
 /// approval channel the moment a `Valid` quorum is first reached, carrying
 /// the full request — everything needed to build the on-chain `transact`
@@ -602,6 +625,25 @@ impl TransactVerificationCoordinator {
                          {:?} wallet={:?}",
                         validator,
                         wallet_pubkey
+                    );
+                    return;
+                }
+            }
+        }
+
+        // If this wallet is already registered to a DIFFERENT active validator node,
+        // reject the registration (#838). A single on-chain validator wallet belongs
+        // to a unique mesh node identity and cannot be usurped by another peer claiming
+        // the same public key in Discovery.
+        if let Some(ref w) = wallet_pubkey {
+            let leader_selector = self.leader_selector.read().await;
+            if let Some(existing) = leader_selector.get_validator_by_wallet(w) {
+                if existing.node_id != validator && existing.is_active {
+                    log::warn!(
+                        "transact registration rejected: wallet {:?} already bound to active peer {:?}, rejecting usurpation by {:?}",
+                        w,
+                        existing.node_id,
+                        validator
                     );
                     return;
                 }
@@ -1571,5 +1613,26 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_active_wallet_claim_rejected() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("SHARED_WALLET".to_string()))
+            .await;
+        assert!(
+            coordinator.is_registered_validator(&NodeId(vec![1])).await,
+            "first registrant must be admitted"
+        );
+
+        // A second distinct peer attempting to register the same active wallet is rejected (#838)
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("SHARED_WALLET".to_string()))
+            .await;
+        assert!(
+            !coordinator.is_registered_validator(&NodeId(vec![2])).await,
+            "second peer attempting to usurp an active wallet must be rejected"
+        );
     }
 }

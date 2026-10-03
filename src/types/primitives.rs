@@ -69,6 +69,10 @@ pub struct NodeInfo {
     /// do not participate in on-chain settlement.
     #[serde(default)]
     pub wallet_pubkey: Option<String>,
+    /// ed25519 signature by `wallet_pubkey` over this node's `id` (#838),
+    /// proving that the node controls the advertised settlement wallet.
+    #[serde(default)]
+    pub wallet_signature: Option<Vec<u8>>,
 }
 
 /// Status of a node
