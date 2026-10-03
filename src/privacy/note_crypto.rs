@@ -243,9 +243,90 @@ pub fn seal(recipient_pub: &[u8; 32], plaintext: &[u8]) -> EncryptedNote {
     }
 }
 
+/// Returns `true` if `point` is a known small-order (non-contributory) X25519
+/// public key encoding that collapses the Diffie-Hellman shared secret to the
+/// identity element for all recipient scalars (RFC 7748 / Wycheproof / #814).
+pub fn is_low_order_point(point: &[u8; 32]) -> bool {
+    let mut masked = *point;
+    masked[31] &= 0x7f;
+
+    // The 7 canonical roots of order dividing 8 (order 1, 2, 4 on curve/twist,
+    // plus non-canonical modular equivalents) that yield an all-zero shared secret:
+    const LOW_ORDER_MASKED_POINTS: [[u8; 32]; 7] = [
+        // 0: order 2 (point at infinity)
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        // 1: order 4 on curve
+        [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ],
+        // 8-torsion point on curve
+        [
+            0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24,
+            0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
+            0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86,
+            0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57,
+        ],
+        // 8-torsion point on curve
+        [
+            0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae,
+            0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
+            0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd,
+            0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00,
+        ],
+        // 2^255 - 20 (p - 1): order 4 on twist
+        [
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+        ],
+        // 2^255 - 19 (p): non-canonical 0 mod p
+        [
+            0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+        ],
+        // 2^255 - 18 (p + 1): non-canonical 1 mod p
+        [
+            0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+        ],
+    ];
+
+    let mut matched = false;
+    for low in &LOW_ORDER_MASKED_POINTS {
+        let mut diff = 0u8;
+        for i in 0..32 {
+            diff |= masked[i] ^ low[i];
+        }
+        if diff == 0 {
+            matched = true;
+        }
+    }
+    matched
+}
+
 /// Open a `seal`ed box with the recipient's X25519 `secret`, returning the raw
-/// plaintext bytes. `None` on any failure (wrong key or tampered ciphertext).
+/// plaintext bytes. `None` on any failure (wrong key, low-order non-contributory
+/// ephemeral key, or tampered ciphertext).
 pub fn open(secret: &[u8; 32], sealed: &EncryptedNote) -> Option<Vec<u8>> {
+    // Reject non-contributory key agreement (RFC 7748 / libsodium crypto_box_beforenm / #814).
+    // An attacker sending a low-order EPK forces the shared secret to the identity,
+    // causing every recipient key to derive the same public constant AEAD key.
+    if is_low_order_point(&sealed.epk) {
+        return None;
+    }
     let salsa = SalsaBox::new(&PublicKey::from(sealed.epk), &SecretKey::from(*secret));
     // `.into()` builds the nonce without naming the deprecated GenericArray type.
     salsa.decrypt(&sealed.nonce.into(), sealed.ct.as_ref()).ok()
@@ -540,5 +621,82 @@ mod tests {
                 "relay mismatch: {name}"
             );
         }
+    }
+
+    /// Regression test for #814: low-order ephemeral public keys must be rejected
+    /// by `open()` and `decrypt_note()`, preventing universal MAC forgery of delivered notes.
+    #[test]
+    fn low_order_epk_is_rejected_in_open_and_decrypt() {
+        let attacker_note = NotePlaintext {
+            amount: 9_000_000_000,
+            randomness: [0xA1; 32],
+            recipient: [0xB2; 32],
+        };
+        let attacker_scalar: [u8; 32] = [9u8; 32];
+        let nonce: [u8; 24] = [5u8; 24];
+
+        // All 14 known small-order X25519 encodings (canonical and non-canonical)
+        // that produce all-zero shared secrets in RFC 7748 / Wycheproof:
+        let low_order_points = [
+            hex32("0000000000000000000000000000000000000000000000000000000000000000"),
+            hex32("0000000000000000000000000000000000000000000000000000000000000080"),
+            hex32("0100000000000000000000000000000000000000000000000000000000000000"),
+            hex32("0100000000000000000000000000000000000000000000000000000000000080"),
+            hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+            hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7"),
+            hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+            hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880"),
+            hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        ];
+
+        let victim_a: [u8; 32] = [1u8; 32];
+        let victim_b: [u8; 32] = [2u8; 32];
+
+        for epk in low_order_points {
+            assert!(
+                is_low_order_point(&epk),
+                "is_low_order_point must identify low-order point {epk:?}"
+            );
+
+            // Craft ciphertext under attacker scalar and the low-order epk
+            let salsa = SalsaBox::new(&PublicKey::from(epk), &SecretKey::from(attacker_scalar));
+            let ct = salsa
+                .encrypt(&nonce.into(), attacker_note.to_bytes().as_ref())
+                .expect("seal under zero shared secret");
+            let forged = EncryptedNote { epk, nonce, ct };
+
+            // Both open() and decrypt_note() must reject the forged note for any victim
+            assert!(
+                open(&victim_a, &forged).is_none(),
+                "open() must reject low-order epk {epk:?}"
+            );
+            assert!(
+                decrypt_note(&victim_a, &forged).is_none(),
+                "decrypt_note() must reject low-order epk {epk:?}"
+            );
+            assert!(
+                open(&victim_b, &forged).is_none(),
+                "open() must reject low-order epk {epk:?} for victim B"
+            );
+            assert!(
+                decrypt_note(&victim_b, &forged).is_none(),
+                "decrypt_note() must reject low-order epk {epk:?} for victim B"
+            );
+        }
+
+        // Control: an honest note encrypts and decrypts correctly
+        let honest_secret = SecretKey::generate(&mut OsRng);
+        let honest_pubkey = *honest_secret.public_key().as_bytes();
+        let valid_enc = encrypt_note(&honest_pubkey, &attacker_note);
+        assert!(!is_low_order_point(&valid_enc.epk));
+        let recovered = decrypt_note(&honest_secret.to_bytes(), &valid_enc)
+            .expect("honest note must decrypt for intended recipient");
+        assert_eq!(recovered, attacker_note);
+        assert!(decrypt_note(&victim_a, &valid_enc).is_none());
     }
 }
