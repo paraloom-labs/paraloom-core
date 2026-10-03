@@ -187,6 +187,8 @@ async fn submit_handler(
             "proof must not be empty".to_string(),
         ));
     }
+    crate::privacy::split_tagged_proof(&proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("proof: {e}")))?;
 
     // The ciphertexts stay opaque to the node: it relays them and never opens
     // them. Validation is limited to what is invalid under every envelope
@@ -354,6 +356,15 @@ mod tests {
         hex::encode(bytes)
     }
 
+    fn valid_proof_hex() -> String {
+        let body = vec![1u8; crate::privacy::GROTH16_BN254_COMPRESSED_LEN];
+        let wire = crate::privacy::tag_proof(
+            crate::privacy::ProofSuite::Groth16Bn254TransactV3,
+            &body,
+        );
+        hex::encode(wire)
+    }
+
     fn body_with_ext_amount(ext_amount: i64) -> String {
         format!(
             r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":{},"proof":"{}","ciphertexts":["{}","{}"]}}"#,
@@ -364,7 +375,7 @@ mod tests {
             "44".repeat(32),
             "55".repeat(32),
             ext_amount,
-            "01".repeat(192),
+            valid_proof_hex(),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
         )
@@ -398,7 +409,8 @@ mod tests {
         assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);
         assert_eq!(seen.root, [0x55u8; 32]);
         assert_eq!(seen.ext_amount, 0);
-        assert_eq!(seen.proof, vec![0x01u8; 192]);
+        let expected_proof = hex::decode(valid_proof_hex()).unwrap();
+        assert_eq!(seen.proof, expected_proof);
     }
 
     #[tokio::test]
@@ -433,7 +445,7 @@ mod tests {
             "33".repeat(32),
             "44".repeat(32),
             "55".repeat(32),
-            "01".repeat(192),
+            valid_proof_hex(),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
         );
@@ -455,6 +467,39 @@ mod tests {
             "ab".repeat(88),
             "cd".repeat(88)
         );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_tagged_proof_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // Valid tag, but 129 bytes body instead of 128 (130 bytes total wire).
+        let mut malformed = vec![crate::privacy::ProofSuite::Groth16Bn254TransactV3.tag()];
+        malformed.extend_from_slice(&[0x01u8; crate::privacy::GROTH16_BN254_COMPRESSED_LEN + 1]);
+        let body = well_formed_body().replace(&valid_proof_hex(), &hex::encode(&malformed));
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn undersized_tagged_proof_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // Valid tag, but 127 bytes body instead of 128 (128 bytes total wire).
+        let mut malformed = vec![crate::privacy::ProofSuite::Groth16Bn254TransactV3.tag()];
+        malformed.extend_from_slice(&[0x01u8; crate::privacy::GROTH16_BN254_COMPRESSED_LEN - 1]);
+        let body = well_formed_body().replace(&valid_proof_hex(), &hex::encode(&malformed));
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unknown_suite_tag_proof_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // Unknown suite tag 0x02.
+        let mut malformed = vec![0x02u8];
+        malformed.extend_from_slice(&[0x01u8; crate::privacy::GROTH16_BN254_COMPRESSED_LEN]);
+        let body = well_formed_body().replace(&valid_proof_hex(), &hex::encode(&malformed));
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
