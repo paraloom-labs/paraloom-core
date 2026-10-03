@@ -361,6 +361,16 @@ pub mod paraloom_program {
             ctx.accounts.validator_account.is_active,
             BridgeError::ValidatorNotActive
         );
+        require!(
+            ctx.accounts.validator_account.stake_amount
+                >= ctx.accounts.validator_registry.minimum_stake,
+            BridgeError::InsufficientStake
+        );
+        require!(
+            ctx.accounts.validator_account.token_stake_amount
+                >= ctx.accounts.validator_registry.min_token_stake,
+            BridgeError::InsufficientTokenStake
+        );
 
         // Supermajority co-sign (#260) — no single key settles.
         quorum::verify_validator_quorum(
@@ -575,6 +585,16 @@ pub mod paraloom_program {
         require!(
             ctx.accounts.validator_account.is_active,
             BridgeError::ValidatorNotActive
+        );
+        require!(
+            ctx.accounts.validator_account.stake_amount
+                >= ctx.accounts.validator_registry.minimum_stake,
+            BridgeError::InsufficientStake
+        );
+        require!(
+            ctx.accounts.validator_account.token_stake_amount
+                >= ctx.accounts.validator_registry.min_token_stake,
+            BridgeError::InsufficientTokenStake
         );
 
         quorum::verify_validator_quorum(
