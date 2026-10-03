@@ -232,11 +232,33 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
     ];
 
     let blockhash = Hash::new_from_array(payload.blockhash);
-    Ok(Message::new_with_blockhash(
+    let message = Message::new_with_blockhash(
         &instructions,
         Some(&authority),
         &blockhash,
-    ))
+    );
+
+    // Validate that the serialized transaction will not exceed the 1232-byte packet
+    // limit on Solana (solana_sdk::packet::PACKET_DATA_SIZE) (#806).
+    // An oversized transaction fails RPC submission, so catching this during
+    // message assembly prevents collecting signatures for a transaction that cannot land.
+    let num_signatures = message.header.num_required_signatures as usize;
+    let dummy_tx = solana_sdk::transaction::Transaction {
+        signatures: vec![solana_sdk::signature::Signature::default(); num_signatures],
+        message: message.clone(),
+    };
+    let serialized_size = bincode::serialized_size(&dummy_tx)
+        .map_err(|e| BridgeError::Serialization(format!("failed to compute transaction size: {e}")))?;
+    if serialized_size > solana_sdk::packet::PACKET_DATA_SIZE as u64 {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "settlement transaction serialized size ({} bytes) exceeds the {}-byte packet limit with {} co-signers",
+            serialized_size,
+            solana_sdk::packet::PACKET_DATA_SIZE,
+            payload.quorum_validators.len()
+        )));
+    }
+
+    Ok(message)
 }
 
 #[cfg(test)]
@@ -322,8 +344,67 @@ mod tests {
             build_settlement_message(&payload).expect_err("an oversized quorum must be rejected");
         assert!(matches!(err, BridgeError::InvalidTransaction(_)));
 
-        // A quorum exactly at the cap still builds (the bound is inclusive).
-        payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
-        build_settlement_message(&payload).expect("a quorum at the cap still builds");
+        // A quorum within the packet limit builds successfully.
+        payload.quorum_validators = vec![[7u8; 32]; 2];
+        build_settlement_message(&payload).expect("a quorum within packet limits builds");
+    }
+
+    #[test]
+    fn settlement_tx_rejects_exceeding_packet_limit_at_three_cosigners() {
+        // Issue #806: 3 distinct co-signers pushes native transact settlement past 1232 bytes
+        let mut p = sample_transact_payload();
+        let mut w0 = [9u8; 32];
+        let mut w1 = [10u8; 32];
+        let mut w2 = [11u8; 32];
+        w0[0] = 1;
+        w1[0] = 2;
+        w2[0] = 3;
+        p.quorum_validators = vec![w0, w1, w2];
+
+        let err = build_settlement_message(&p)
+            .expect_err("3 distinct co-signers must be rejected as exceeding packet limit");
+        match err {
+            BridgeError::InvalidTransaction(msg) => {
+                assert!(msg.contains("exceeds the 1232-byte packet limit"), "error message: {msg}");
+            }
+            other => panic!("expected InvalidTransaction, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spl_settlement_tx_rejects_exceeding_packet_limit_at_two_cosigners() {
+        // Issue #806: 2 distinct co-signers pushes SPL transact settlement past 1232 bytes
+        let program_id = Pubkey::new_from_array([1u8; 32]);
+        let authority = Pubkey::new_from_array([2u8; 32]);
+        let mut w0 = [3u8; 32];
+        let mut w1 = [4u8; 32];
+        w0[0] = 1;
+        w1[0] = 2;
+
+        let payload = CoSignPayload {
+            program_id: program_id.to_bytes(),
+            authority: authority.to_bytes(),
+            bridge_vault: Pubkey::new_from_array([5u8; 32]).to_bytes(),
+            blockhash: [7u8; 32],
+            quorum_validators: vec![w0, w1],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        };
+
+        let err = build_settlement_message(&payload)
+            .expect_err("2 distinct co-signers on SPL must be rejected as exceeding packet limit");
+        match err {
+            BridgeError::InvalidTransaction(msg) => {
+                assert!(msg.contains("exceeds the 1232-byte packet limit"), "error message: {msg}");
+            }
+            other => panic!("expected InvalidTransaction, got: {:?}", other),
+        }
     }
 }
