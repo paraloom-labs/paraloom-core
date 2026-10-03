@@ -170,7 +170,13 @@ impl LeaderSelector {
     /// # Returns
     /// Selected leader's NodeId
     pub fn select_leader(&self, seed: &[u8]) -> Result<NodeId> {
-        let active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
+        // `validators` is a `HashMap` whose iteration order is randomised per
+        // process, and the cumulative-weight walk below picks a different
+        // winner for a different visit order. Sort by `NodeId` so the walk is
+        // a function of the validator set alone and every node agrees (#706).
+        let mut active_validators: Vec<_> =
+            self.validators.values().filter(|v| v.is_active).collect();
+        active_validators.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
 
         if active_validators.is_empty() {
             return Err(anyhow!("No active validators available"));
@@ -188,7 +194,7 @@ impl LeaderSelector {
 
         // Select validator based on weighted random
         let mut cumulative_weight = 0u128;
-        for validator in active_validators {
+        for validator in &active_validators {
             cumulative_weight += validator.selection_weight();
             if random_value < cumulative_weight {
                 log::debug!(
@@ -201,11 +207,9 @@ impl LeaderSelector {
             }
         }
 
-        // Fallback to last validator (should never happen due to cumulative math)
-        Ok(self
-            .validators
-            .values()
-            .filter(|v| v.is_active)
+        // Fallback to last validator in the sorted order (should never happen
+        // due to cumulative math)
+        Ok(active_validators
             .last()
             .ok_or_else(|| anyhow!("No active validators"))?
             .node_id
@@ -364,6 +368,66 @@ mod tests {
 
         assert_eq!(leader1, leader2);
         assert_eq!(leader2, leader3);
+    }
+
+    /// Cross-node determinism (#706): independently populated selectors — each
+    /// with its own `HashMap` hash seed and a different insertion order — must
+    /// elect the same leader for the same seed. Calling `select_leader` twice
+    /// on one instance cannot catch this, since that instance's iteration
+    /// order is fixed.
+    #[test]
+    fn test_leader_selection_deterministic_across_nodes() {
+        let validators = [
+            ValidatorInfo::new(NodeId(vec![1]), 10_000_000_000, 1000),
+            ValidatorInfo::new(NodeId(vec![2]), 20_000_000_000, 1000),
+            ValidatorInfo::new(NodeId(vec![3]), 30_000_000_000, 1000),
+            ValidatorInfo::new(NodeId(vec![4]), 15_000_000_000, 2000),
+            ValidatorInfo::new(NodeId(vec![5]), 5_000_000_000, 4000),
+        ];
+
+        // One selector per rotation and its reverse, so insertion order and
+        // per-instance hash state both vary between "nodes".
+        let mut selectors = Vec::new();
+        for rotation in 0..validators.len() {
+            let mut order = validators.to_vec();
+            order.rotate_left(rotation);
+            for reversed in [false, true] {
+                if reversed {
+                    order.reverse();
+                }
+                let mut selector = LeaderSelector::new();
+                for v in &order {
+                    selector.register_validator(v.clone());
+                }
+                selectors.push(selector);
+            }
+        }
+
+        let total_weight: u128 = validators.iter().map(|v| v.selection_weight()).sum();
+        for i in 0..200 {
+            let seed = format!("request_{i}");
+
+            // Reference: the cumulative walk over validators in NodeId order.
+            let random_value = LeaderSelector::deterministic_random(seed.as_bytes(), total_weight);
+            let mut cumulative = 0u128;
+            let expected = validators
+                .iter()
+                .find(|v| {
+                    cumulative += v.selection_weight();
+                    random_value < cumulative
+                })
+                .unwrap()
+                .node_id
+                .clone();
+
+            for selector in &selectors {
+                assert_eq!(
+                    selector.select_leader(seed.as_bytes()).unwrap(),
+                    expected,
+                    "every node must elect the same leader for seed {seed}"
+                );
+            }
+        }
     }
 
     #[test]
