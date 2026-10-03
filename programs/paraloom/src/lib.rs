@@ -361,6 +361,16 @@ pub mod paraloom_program {
             ctx.accounts.validator_account.is_active,
             BridgeError::ValidatorNotActive
         );
+        require!(
+            ctx.accounts.validator_account.stake_amount
+                >= ctx.accounts.validator_registry.minimum_stake,
+            BridgeError::InsufficientStake
+        );
+        require!(
+            ctx.accounts.validator_account.token_stake_amount
+                >= ctx.accounts.validator_registry.min_token_stake,
+            BridgeError::InsufficientTokenStake
+        );
 
         // Supermajority co-sign (#260) — no single key settles.
         quorum::verify_validator_quorum(
@@ -565,16 +575,24 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
         require!(
             ctx.accounts.validator_account.is_active,
             BridgeError::ValidatorNotActive
+        );
+        require!(
+            ctx.accounts.validator_account.stake_amount
+                >= ctx.accounts.validator_registry.minimum_stake,
+            BridgeError::InsufficientStake
+        );
+        require!(
+            ctx.accounts.validator_account.token_stake_amount
+                >= ctx.accounts.validator_registry.min_token_stake,
+            BridgeError::InsufficientTokenStake
         );
 
         quorum::verify_validator_quorum(

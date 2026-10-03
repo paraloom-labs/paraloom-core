@@ -86,6 +86,14 @@ pub fn verify_validator_quorum(
         if !validator.is_active || validator.validator != *wallet.key {
             continue;
         }
+        // Dual-stake collateral requirement: a validator must hold both the
+        // registry's minimum SOL stake and the minimum token collateral.
+        // Under-collateralized validators are excluded from signing quorum.
+        if validator.stake_amount < registry.minimum_stake
+            || validator.token_stake_amount < registry.min_token_stake
+        {
+            continue;
+        }
         // Count each validator at most once.
         if seen.contains(wallet.key) {
             continue;
@@ -136,6 +144,15 @@ mod tests {
     }
 
     fn validator_data_staked(wallet: Pubkey, is_active: bool, stake_amount: u64) -> Vec<u8> {
+        validator_data_dual_staked(wallet, is_active, stake_amount, 0)
+    }
+
+    fn validator_data_dual_staked(
+        wallet: Pubkey,
+        is_active: bool,
+        stake_amount: u64,
+        token_stake_amount: u64,
+    ) -> Vec<u8> {
         let v = ValidatorAccount {
             validator: wallet,
             stake_amount,
@@ -150,7 +167,7 @@ mod tests {
             times_slashed: 0,
             unbonding_amount: 0,
             unbonding_slot: 0,
-            token_stake_amount: 0,
+            token_stake_amount,
             token_unbonding_amount: 0,
         };
         let mut buf = Vec::new();
@@ -397,5 +414,63 @@ mod tests {
             &[s, a]
         )
         .is_err());
+    }
+
+    #[test]
+    fn validator_with_insufficient_token_stake_is_not_counted() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let mut reg = registry(1);
+        reg.min_token_stake = 1_000_000_000;
+
+        let w0 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        // Validator has 1 SOL stake but 0 token stake (< min_token_stake 1_000_000_000).
+        let mut d0 = validator_data_dual_staked(w0, true, 1_000_000_000, 0);
+        let (mut l0, mut lp0) = (0u64, 0u64);
+        let mut e0 = [0u8; 0];
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let accts = [s0, a0];
+        assert!(verify_validator_quorum(&p, &reg, &Pubkey::default(), 0, &accts).is_err());
+    }
+
+    #[test]
+    fn validator_with_insufficient_sol_stake_is_not_counted() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let mut reg = registry_with_stake(1, 1_000_000_000);
+        reg.minimum_stake = 1_000_000_000;
+
+        let w0 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        // Validator has 500_000_000 SOL stake (< minimum_stake 1_000_000_000).
+        let mut d0 = validator_data_dual_staked(w0, true, 500_000_000, 0);
+        let (mut l0, mut lp0) = (0u64, 0u64);
+        let mut e0 = [0u8; 0];
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let accts = [s0, a0];
+        assert!(verify_validator_quorum(&p, &reg, &Pubkey::default(), 0, &accts).is_err());
+    }
+
+    #[test]
+    fn validator_with_sufficient_dual_stake_clears_quorum() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let mut reg = registry(1);
+        reg.minimum_stake = 1_000_000_000;
+        reg.min_token_stake = 5_000_000_000;
+
+        let w0 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        // Validator has 1 SOL stake and 5_000_000_000 token stake.
+        let mut d0 = validator_data_dual_staked(w0, true, 1_000_000_000, 5_000_000_000);
+        let (mut l0, mut lp0) = (0u64, 0u64);
+        let mut e0 = [0u8; 0];
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let accts = [s0, a0];
+        assert!(verify_validator_quorum(&p, &reg, &Pubkey::default(), 0, &accts).is_ok());
     }
 }
