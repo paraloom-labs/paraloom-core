@@ -82,6 +82,9 @@ impl SolanaBridge {
 
     /// Start bridge services
     pub async fn start(&mut self) -> Result<()> {
+        log::info!("Verifying Solana on-chain program version...");
+        self.program.verify_program_version().await?;
+
         log::info!("Starting Solana bridge event listener...");
         self.listener.start().await?;
 
