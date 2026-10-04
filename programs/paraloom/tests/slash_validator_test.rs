@@ -526,7 +526,7 @@ async fn slash_validator_forfeits_pending_rewards_proportionally() {
         times_slashed: 0,
         unbonding_amount: 0,
         unbonding_slot: 0,
-        token_stake_amount: TOKEN_STAKE,
+        token_stake_amount: 0,
         token_unbonding_amount: 0,
     };
     let mut data = Vec::new();
@@ -546,7 +546,6 @@ async fn slash_validator_forfeits_pending_rewards_proportionally() {
     );
 
     let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
-    bake_stake_vault(&mut pt, stake_mint, program_id, 1_000_000_000);
     let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     send(
@@ -644,7 +643,7 @@ async fn slash_unbonding_validator_forfeits_pending_rewards() {
         unbonding_amount: MIN_VALIDATOR_STAKE,
         unbonding_slot: 1000,
         token_stake_amount: 0,
-        token_unbonding_amount: TOKEN_STAKE,
+        token_unbonding_amount: 0,
     };
     let mut data = Vec::new();
     seeded
@@ -663,7 +662,6 @@ async fn slash_unbonding_validator_forfeits_pending_rewards() {
     );
 
     let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
-    bake_stake_vault(&mut pt, stake_mint, program_id, 1_000_000_000);
     let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
 
     send(
