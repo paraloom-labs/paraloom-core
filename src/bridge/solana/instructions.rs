@@ -1103,6 +1103,37 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::TRANSACT_SPL);
     }
 
+    #[test]
+    fn test_create_transact_spl_instruction_shielded_transfer_zero_ext_amount() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let default_recipient = Pubkey::default();
+        let fee_token = Pubkey::default();
+        let cosigner = Pubkey::new_unique();
+
+        let ix = create_transact_spl_instruction(
+            &program_id,
+            &authority,
+            &mint,
+            &default_recipient,
+            &fee_token,
+            &SPL_TOKEN_PROGRAM_ID,
+            [[10u8; 32], [20u8; 32]],
+            [[30u8; 32], [40u8; 32]],
+            [50u8; 32],
+            0,
+            vec![0u8; 256],
+            &[authority, cosigner],
+        )
+        .expect("build transact_spl instruction for shielded transfer");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts[5].pubkey, Pubkey::default());
+        assert_eq!(ix.accounts[6].pubkey, Pubkey::default());
+        assert_eq!(&ix.data[..8], &discriminators::TRANSACT_SPL);
+    }
+
     /// Field ordering is observable on the wire — Anchor decodes borsh fields
     /// in declaration order. Pins the layout
     /// `[nullifiers (64) | output_commitments (64) | root (32) | ext_amount (8, i64 LE) | proof_len (4) | proof…]`

@@ -562,13 +562,15 @@ pub mod paraloom_program {
         );
 
         // Bind the settlement to the recipient token account + signed amount.
-        // The asset is bound separately via the `asset` public input below, and
-        // the recipient token account address is mint-specific, so a proof for
-        // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        // For withdrawals (`ext_amount < 0`), binds the destination token account key.
+        // For internal transfers (`ext_amount == 0`), binds Pubkey::default() (zeros),
+        // exactly matching the circuit and client prover expectations (#866).
+        let recipient_key = if ext_amount < 0 {
+            ctx.accounts.recipient_token_account.key()
+        } else {
+            Pubkey::default()
+        };
+        let ext_data_hash = transact_ext_data_hash(&recipient_key, ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -624,6 +626,16 @@ pub mod paraloom_program {
 
         let mut fee = 0u64;
         if ext_amount < 0 {
+            // Validate recipient_token_account is an initialized TokenAccount for this mint
+            let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
+            let recipient_ta = TokenAccount::try_deserialize(&mut &recipient_data[..])?;
+            drop(recipient_data);
+            require_keys_eq!(
+                recipient_ta.mint,
+                ctx.accounts.mint.key(),
+                BridgeError::InvalidAmount
+            );
+
             let gross = ext_amount.unsigned_abs();
             fee = gross
                 .checked_mul(WITHDRAWAL_FEE_BPS)
@@ -664,6 +676,20 @@ pub mod paraloom_program {
             // accounts struct). The native path credits lamport `pending_rewards`
             // for a later claim; here the token fee is paid inline.
             if fee > 0 {
+                let fee_data = ctx.accounts.fee_token_account.try_borrow_data()?;
+                let fee_ta = TokenAccount::try_deserialize(&mut &fee_data[..])?;
+                drop(fee_data);
+                require_keys_eq!(
+                    fee_ta.mint,
+                    ctx.accounts.mint.key(),
+                    BridgeError::InvalidAmount
+                );
+                require_keys_eq!(
+                    fee_ta.owner,
+                    ctx.accounts.authority.key(),
+                    BridgeError::InvalidValidator
+                );
+
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -696,7 +722,7 @@ pub mod paraloom_program {
             new_root,
             ext_amount,
             fee,
-            recipient: ctx.accounts.recipient_token_account.key(),
+            recipient: recipient_key,
             timestamp: now,
             settlement_id,
         });
@@ -1914,13 +1940,23 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    ///
+    /// CHECK: Checked conditionally in instruction logic: when `ext_amount < 0`,
+    /// validated as an initialized TokenAccount matching `mint`. For internal
+    /// transfers (`ext_amount == 0`), accepts system accounts (e.g. `Pubkey::default()`)
+    /// without failing initialization constraints (#866).
+    #[account(mut)]
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid.
+    ///
+    /// CHECK: Checked conditionally in instruction logic: when `ext_amount < 0`
+    /// and `fee > 0`, validated as an initialized TokenAccount for `mint` owned
+    /// by `authority`. For internal transfers (`ext_amount == 0`), accepts uninitialized
+    /// or arbitrary accounts because no fee is charged (#866).
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
