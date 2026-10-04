@@ -562,13 +562,14 @@ pub mod paraloom_program {
         );
 
         // Bind the settlement to the recipient token account + signed amount.
-        // The asset is bound separately via the `asset` public input below, and
-        // the recipient token account address is mint-specific, so a proof for
-        // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        // For withdrawals (ext_amount < 0), the destination token account is bound into the proof.
+        // For shielded transfers (ext_amount == 0), the circuit binds Pubkey::default().
+        let recipient_key = if ext_amount < 0 {
+            ctx.accounts.recipient_token_account.key()
+        } else {
+            Pubkey::default()
+        };
+        let ext_data_hash = transact_ext_data_hash(&recipient_key, ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -660,10 +661,23 @@ pub mod paraloom_program {
             )?;
 
             // Settling-validator fee, paid in the withdrawn asset to the
-            // validator's own token account (constrained to `authority` in the
-            // accounts struct). The native path credits lamport `pending_rewards`
+            // validator's own token account. Deserialized and verified to belong
+            // to `authority` for `mint` so the fee cannot be diverted.
+            // The native path credits lamport `pending_rewards`
             // for a later claim; here the token fee is paid inline.
             if fee > 0 {
+                let fee_account = TokenAccount::try_deserialize(
+                    &mut &ctx.accounts.fee_token_account.try_borrow_data()?[..],
+                )?;
+                require!(
+                    fee_account.mint == ctx.accounts.mint.key(),
+                    BridgeError::InvalidAmount
+                );
+                require!(
+                    fee_account.owner == ctx.accounts.authority.key(),
+                    BridgeError::InvalidValidator
+                );
+
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -696,7 +710,7 @@ pub mod paraloom_program {
             new_root,
             ext_amount,
             fee,
-            recipient: ctx.accounts.recipient_token_account.key(),
+            recipient: recipient_key,
             timestamp: now,
             settlement_id,
         });
@@ -1914,13 +1928,22 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    ///
+    /// CHECK: Validated as an initialized TokenAccount via CPI when ext_amount < 0.
+    /// For shielded transfers (ext_amount == 0), no tokens move externally and this
+    /// is bound as `Pubkey::default()` into the proof. UncheckedAccount avoids
+    /// rejecting Pubkey::default() with AccountNotInitialized (#866).
+    #[account(mut)]
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid.
+    ///
+    /// CHECK: Validated inline as an initialized TokenAccount owned by `authority`
+    /// for `mint` when fee > 0 (ext_amount < 0). For shielded transfers (ext_amount == 0),
+    /// no fee is charged (#866).
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
