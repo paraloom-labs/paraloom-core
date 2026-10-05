@@ -1093,6 +1093,13 @@ pub mod paraloom_program {
         let token_slash = (old_token as u128 * slash_percentage as u128 / 100) as u64;
         validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
+// Forfeit any unclaimed settlement fees at slash time (#863): a slashed
+// validator must not retain transaction fees accrued before detection, and
+// zeroing `pending_rewards` here also releases the close-account invariant
+// (`pending_rewards == 0` in `withdraw_unbonded_stake`) without forcing a
+// payout from `bridge_vault`.
+validator_account.pending_rewards = 0;
+
         if was_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
             validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
