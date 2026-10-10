@@ -78,7 +78,7 @@ pub fn extract_deposit_events(
         }
     };
 
-    let account_keys = match parse_account_keys(&raw.account_keys) {
+    let mut account_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
         Err(bad) => {
             log::warn!(
@@ -90,6 +90,25 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    // For versioned (v0) transactions with an Address Lookup Table,
+    // append loaded addresses (writable then readonly) to resolve indices beyond static keys.
+    if let Some(meta) = &confirmed.transaction.meta {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+            for key_str in loaded.writable.iter().chain(loaded.readonly.iter()) {
+                if let Ok(pubkey) = key_str.parse::<Pubkey>() {
+                    account_keys.push(pubkey);
+                } else {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "tx {} has unparsable loaded address '{}';; skipping",
+                        signature,
+                        key_str
+                    );
+                }
+            }
+        }
+    }
 
     let mut events = Vec::new();
 
