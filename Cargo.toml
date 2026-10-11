@@ -132,6 +132,14 @@ path = "src/bin/migrate_bridge_state.rs"
 name = "set-bridge-authority"
 path = "src/bin/set_bridge_authority.rs"
 
+[[bin]]
+name = "slash-validator"
+path = "src/bin/slash_validator.rs"
+
+[[bin]]
+name = "deactivate-validator"
+path = "src/bin/deactivate_validator.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "solana-account-decoder", "borsh", "bs58"]
