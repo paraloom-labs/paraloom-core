@@ -132,6 +132,18 @@ path = "src/bin/migrate_bridge_state.rs"
 name = "set-bridge-authority"
 path = "src/bin/set_bridge_authority.rs"
 
+[[bin]]
+name = "init-asset-vault"
+path = "src/bin/init_asset_vault.rs"
+
+[[bin]]
+name = "set-asset-deposit-cap"
+path = "src/bin/set_asset_deposit_cap.rs"
+
+[[bin]]
+name = "set-min-token-stake"
+path = "src/bin/set_min_token_stake.rs"
+
 [features]
 default = ["solana-bridge"]
 solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "solana-account-decoder", "borsh", "bs58"]
