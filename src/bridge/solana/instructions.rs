@@ -220,11 +220,21 @@ pub fn create_initialize_instruction(
 
 /// Create an `initialize_validator_registry` instruction (#204-gated to the
 /// program's upgrade authority, same as `initialize`).
+///
+/// Account order matches the on-chain `InitializeValidatorRegistry` context:
+/// `validator_registry`, `authority`, `stake_mint`, `stake_token_vault`,
+/// `stake_vault_authority`, `program_data`, `token_program`, `system_program`,
+/// `rent`. `token_program` must be the program that owns `stake_mint` (classic
+/// SPL Token or Token-2022).
 pub fn create_initialize_validator_registry_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
+    stake_mint: &Pubkey,
+    token_program: &Pubkey,
 ) -> Result<Instruction> {
     let (registry_pda, _) = derive_validator_registry(program_id);
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
+    let (stake_vault_authority, _) = derive_stake_vault_authority(program_id);
     let (program_data_pda, _) = derive_program_data(program_id);
 
     Ok(Instruction {
@@ -232,8 +242,13 @@ pub fn create_initialize_validator_registry_instruction(
         accounts: vec![
             AccountMeta::new(registry_pda, false),
             AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(*stake_mint, false),
+            AccountMeta::new(stake_token_vault, false),
+            AccountMeta::new_readonly(stake_vault_authority, false),
             AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
         ],
         data: discriminators::INITIALIZE_VALIDATOR_REGISTRY.to_vec(),
     })
@@ -1310,5 +1325,57 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_initialize_validator_registry_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_initialize_validator_registry_instruction(
+            &program_id,
+            &authority,
+            &stake_mint,
+            &token_program,
+        )
+        .expect("build initialize_validator_registry instruction");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, authority);
+        assert!(ix.accounts[1].is_writable);
+        assert!(ix.accounts[1].is_signer);
+        assert_eq!(ix.accounts[2].pubkey, stake_mint);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[3].is_writable);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert!(!ix.accounts[4].is_writable);
+        assert_eq!(ix.accounts[5].pubkey, derive_program_data(&program_id).0);
+        assert!(!ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert!(!ix.accounts[6].is_writable);
+        assert_eq!(ix.accounts[7].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[7].is_writable);
+        assert_eq!(ix.accounts[8].pubkey, RENT_SYSVAR_ID);
+        assert!(!ix.accounts[8].is_writable);
+        assert_eq!(
+            ix.data,
+            discriminators::INITIALIZE_VALIDATOR_REGISTRY.to_vec()
+        );
     }
 }
