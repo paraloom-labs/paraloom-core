@@ -231,13 +231,34 @@ impl VoteTally {
     /// co-sign set equal to the counted set: a wallet that was counted is dialed
     /// under exactly the NodeId its signed vote arrived on.
     pub async fn valid_voters(&self, eligible_wallets: &HashSet<String>) -> Vec<NodeId> {
+        self.valid_voter_entries(eligible_wallets)
+            .await
+            .into_iter()
+            .map(|(_, node_id)| node_id)
+            .collect()
+    }
+
+    /// The `(wallet, node_id)` pairs of the wallets that voted `Valid` **and**
+    /// are in `eligible_wallets`, sorted by wallet for a deterministic order.
+    ///
+    /// Both halves come from the same signed vote: the ingress check verified
+    /// `wallet`'s ed25519 signature over a preimage that binds `node_id`. The
+    /// settlement co-sign set must be built from these pairs directly. Looking
+    /// the wallet up again by `node_id` in Discovery-fed state can return
+    /// `None` (the voter's Discovery has not landed, or it rotated its NodeId)
+    /// or a different wallet (Discovery is not signed), so the co-sign set would
+    /// no longer match the set that was counted.
+    pub async fn valid_voter_entries(
+        &self,
+        eligible_wallets: &HashSet<String>,
+    ) -> Vec<(String, NodeId)> {
         let votes = self.votes.read().await;
-        let mut out = Vec::new();
-        for (wallet, rec) in votes.iter() {
-            if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
-                out.push(rec.node_id.clone());
-            }
-        }
+        let mut out: Vec<(String, NodeId)> = votes
+            .iter()
+            .filter(|(wallet, rec)| rec.vote.is_valid() && eligible_wallets.contains(*wallet))
+            .map(|(wallet, rec)| (wallet.clone(), rec.node_id.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 }
@@ -316,6 +337,30 @@ mod tests {
         let eligible = wallets(&["W1"]);
         let voters = tally.valid_voters(&eligible).await;
         assert_eq!(voters, vec![NodeId(vec![1])]);
+    }
+
+    #[tokio::test]
+    async fn valid_voter_entries_keep_the_signed_wallet_per_node() {
+        let tally = VoteTally::new("req-1".to_string(), 1, 3);
+        for (w, n, valid) in [("W2", 2u8, true), ("W1", 7u8, true), ("W3", 3u8, false)] {
+            let vote = if valid {
+                VerificationVote::Valid
+            } else {
+                VerificationVote::Invalid { reason: "x".into() }
+            };
+            tally
+                .submit_vote(w.into(), NodeId(vec![n]), vote, vec![n])
+                .await
+                .unwrap();
+        }
+        let eligible = wallets(&["W1", "W2", "W3"]);
+        assert_eq!(
+            tally.valid_voter_entries(&eligible).await,
+            vec![
+                ("W1".to_string(), NodeId(vec![7])),
+                ("W2".to_string(), NodeId(vec![2])),
+            ]
+        );
     }
 
     #[tokio::test]

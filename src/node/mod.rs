@@ -2417,18 +2417,25 @@ impl Node {
         let (vault, _) = derive_bridge_vault(&program_id);
 
         // The validators that approved this transact become the co-signer
-        // quorum, mapped to their advertised settlement wallets; the leader
-        // signs as itself and is excluded from the peers it requests from.
+        // quorum. Each `(wallet, voter)` pair comes from the signed vote that was
+        // counted, so the wallets bound into the payload are exactly the counted
+        // wallets. Re-resolving the wallet by NodeId through Discovery state
+        // here dropped voters whose Discovery had not landed (or who rotated
+        // NodeId) and trusted an unsigned Discovery wallet over the signed one.
+        // The leader signs as itself and is excluded from the peers it requests
+        // from, by NodeId and by wallet.
         let self_id = self.node_info.id.clone();
+        let leader_wallet = leader.pubkey();
         let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&request.request_id).await {
+        for (wallet, voter) in coordinator.valid_cosigners(&request.request_id).await {
             if voter == self_id {
                 continue;
             }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
+            if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                if pubkey == leader_wallet {
+                    continue;
                 }
+                peers.push((pubkey, voter));
             }
         }
         let mut quorum_wallets = vec![leader.pubkey()];
