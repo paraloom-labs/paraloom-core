@@ -745,6 +745,23 @@ impl TransactVerificationCoordinator {
         }
     }
 
+    /// The `(wallet, node_id)` co-signers for a transact's settlement, taken
+    /// straight from the signed votes that were counted (see
+    /// [`VoteTally::valid_voter_entries`]). Use this — not
+    /// [`Self::validator_wallet`] on each voter — to build the co-sign set, so
+    /// the wallets the leader asks to sign are exactly the wallets that were
+    /// counted toward the quorum. Empty if the request is unknown here.
+    pub async fn valid_cosigners(&self, request_id: &str) -> Vec<(String, NodeId)> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => {
+                let eligible = self.eligible_wallets().await;
+                consensus.tally.valid_voter_entries(&eligible).await
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
     /// flap-surviving driver-auth check (replaces `is_registered_validator`,
     /// which used the flap-prone `self.validators`). The leader_selector entry
@@ -1571,5 +1588,114 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    // ---- co-sign set comes from the signed tally, not Discovery state ----
+
+    /// A staked co-signer that rotated its NodeId (restart) votes from a NodeId
+    /// that Discovery has not mapped yet. Its signed vote is counted and the
+    /// approval fires, so the co-sign set must still contain its wallet.
+    /// Arm-the-guard: building the set via `validator_wallet(&voter)` finds no
+    /// wallet for the new NodeId and drops the co-signer, leaving a
+    /// leader-only quorum that the program rejects with `QuorumNotMet`.
+    #[tokio::test]
+    async fn cosigners_include_counted_voter_unknown_to_discovery() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+
+        // W1 votes from a fresh NodeId 7 (restart / NodeId rotation).
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 7, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok(), "the signed W1 vote counts");
+
+        assert_eq!(
+            coord.validator_wallet(&NodeId(vec![7])).await,
+            None,
+            "Discovery state has no wallet for the rotated NodeId"
+        );
+        let cosigners = coord.valid_cosigners(&id).await;
+        assert!(
+            cosigners.contains(&("W1".to_string(), NodeId(vec![7]))),
+            "the counted wallet must be in the co-sign set under the NodeId it voted from: {cosigners:?}"
+        );
+    }
+
+    /// Discovery is unsigned, so the wallet it maps to a NodeId can differ from
+    /// the wallet that signed that NodeId's vote. The co-sign set must use the
+    /// signed wallet.
+    /// Arm-the-guard: resolving through `validator_wallet` binds W2 (never
+    /// voted) into the payload while dialing the node that holds W1.
+    #[tokio::test]
+    async fn cosigners_use_signed_wallet_not_discovery_wallet() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.sync_onchain_stakes(
+            stakes(&[
+                ("W0", 1_000_000_000),
+                ("W1", 1_000_000_000),
+                ("W2", 1_000_000_000),
+            ]),
+            3_000_000_000,
+        )
+        .await;
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        // node1 advertises W2 in (unsigned) Discovery, but signs its vote as W1.
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W2".to_string()))
+            .await;
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        // Need 2/3+ of the 2 SOL eligible (excluding W0): W1 alone is 1 SOL, so
+        // no approval is expected here; the co-sign set mapping is what matters.
+        let _ = approvals.try_recv();
+
+        assert_eq!(
+            c.validator_wallet(&NodeId(vec![1])).await,
+            Some("W2".to_string())
+        );
+        let cosigners = c.valid_cosigners(&id).await;
+        assert!(cosigners.contains(&("W1".to_string(), NodeId(vec![1]))));
+        assert!(
+            !cosigners.iter().any(|(w, _)| w == "W2"),
+            "a wallet that never voted must not enter the co-sign set: {cosigners:?}"
+        );
+    }
+
+    /// A peer that advertises the leader's own wallet in Discovery must not
+    /// displace its signed wallet in the co-sign set.
+    /// Arm-the-guard: with `validator_wallet` returning W0 for node1, the old
+    /// path bound `[W0, W0]` into the payload and never bound the counted W1.
+    #[tokio::test]
+    async fn cosigners_not_dropped_by_discovery_advertising_leader_wallet() {
+        let (coord, mut approvals) = coord_2of2().await;
+        // node1 re-advertises the leader's wallet W0 over Discovery.
+        coord
+            .register_validator_with_wallet(NodeId(vec![1]), Some("W0".to_string()))
+            .await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok());
+
+        assert_eq!(
+            coord.validator_wallet(&NodeId(vec![1])).await,
+            Some("W0".to_string())
+        );
+        let cosigners = coord.valid_cosigners(&id).await;
+        assert!(
+            cosigners.contains(&("W1".to_string(), NodeId(vec![1]))),
+            "the signed W1 co-signer must survive a spoofed Discovery wallet: {cosigners:?}"
+        );
     }
 }
