@@ -35,7 +35,13 @@ use paraloom::bridge::solana::*;
 #[cfg(feature = "solana-bridge")]
 use paraloom::privacy::poseidon_circom::v3_pubkey;
 #[cfg(feature = "solana-bridge")]
-use solana_client::rpc_client::RpcClient;
+use solana_account_decoder::UiAccountEncoding;
+#[cfg(feature = "solana-bridge")]
+use solana_client::{
+    rpc_client::RpcClient,
+    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+    rpc_filter::{Memcmp, RpcFilterType},
+};
 #[cfg(feature = "solana-bridge")]
 use solana_sdk::{
     commitment_config::CommitmentConfig, native_token::LAMPORTS_PER_SOL, pubkey::Pubkey,
@@ -1312,6 +1318,28 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 #[cfg(feature = "solana-bridge")]
 const VALIDATOR_ACCOUNT_DISCRIMINATOR: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
 
+/// `getProgramAccounts` config for enumerating `ValidatorAccount` PDAs.
+///
+/// Requests `UiAccountEncoding::Base64` and filters by `VALIDATOR_ACCOUNT_DISCRIMINATOR`:
+/// every current `ValidatorAccount` is 145 bytes (and `merkle_tree` is >32 KB),
+/// whereas Solana JSON-RPC rejects the default Base58 encoding whenever any
+/// matched account exceeds 128 bytes (`-32600 "Encoded binary (base 58) data
+/// should be less than 128 bytes"`).
+#[cfg(feature = "solana-bridge")]
+fn validator_accounts_config() -> RpcProgramAccountsConfig {
+    RpcProgramAccountsConfig {
+        filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+            0,
+            VALIDATOR_ACCOUNT_DISCRIMINATOR.to_vec(),
+        ))]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// Decode an on-chain `ValidatorAccount` into
 /// (validator, SOL stake, PARALOOM token stake base units, reputation, is_active).
 ///
@@ -1993,7 +2021,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
                 let accounts = client
-                    .get_program_accounts(&program_id)
+                    .get_program_accounts_with_config(&program_id, validator_accounts_config())
                     .context("Failed to fetch program accounts")?;
 
                 let mut validators: Vec<(Pubkey, f64, u64, u64, bool)> = accounts
@@ -2179,3 +2207,44 @@ file = ".paraloom/logs/paraloom.log"
 
     Ok(())
 }
+
+#[cfg(all(test, feature = "solana-bridge"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validator_accounts_config_requests_base64_and_discriminator_memcmp() {
+        let cfg = validator_accounts_config();
+        assert_eq!(cfg.account_config.encoding, Some(UiAccountEncoding::Base64));
+        let filters = cfg.filters.expect("memcmp filter must be set");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(
+            filters[0],
+            RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+                0,
+                VALIDATOR_ACCOUNT_DISCRIMINATOR.to_vec(),
+            ))
+        );
+    }
+
+    #[test]
+    fn decode_validator_account_parses_145_byte_dual_stake_layout() {
+        let mut data = vec![0u8; 145];
+        data[0..8].copy_from_slice(&VALIDATOR_ACCOUNT_DISCRIMINATOR);
+        let pk = Pubkey::new_unique();
+        data[8..40].copy_from_slice(pk.as_ref());
+        data[40..48].copy_from_slice(&(2 * LAMPORTS_PER_SOL).to_le_bytes());
+        data[48..56].copy_from_slice(&1_250u64.to_le_bytes());
+        data[88] = 1;
+        data[129..137].copy_from_slice(&500_000_000u64.to_le_bytes());
+
+        let (decoded_pk, sol_stake, token_stake, rep, active) =
+            decode_validator_account(&data).expect("valid 145-byte validator account");
+        assert_eq!(decoded_pk, pk);
+        assert!((sol_stake - 2.0).abs() < 1e-9);
+        assert_eq!(token_stake, 500_000_000);
+        assert_eq!(rep, 1_250);
+        assert!(active);
+    }
+}
+
