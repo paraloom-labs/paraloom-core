@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use wasmtime::*;
 
@@ -30,10 +31,105 @@ pub fn wasm_output_len(output_ptr: i32, memory_size: usize, max_output_size: usi
     }
 }
 
+/// Shared state coordinating a single wall-clock epoch ticker thread per `WasmEngine`.
+#[derive(Default)]
+struct EpochTickerState {
+    /// Number of currently executing WASM calls on this engine.
+    active_jobs: usize,
+    /// Whether the background epoch ticker thread is currently running.
+    ticker_running: bool,
+}
+
+/// RAII guard that keeps the engine's wall-clock epoch ticker running while a WASM
+/// call is in flight and stops it as soon as the last active call finishes.
+struct ActiveEpochGuard {
+    ticker_state: Arc<(Mutex<EpochTickerState>, Condvar)>,
+}
+
+impl ActiveEpochGuard {
+    fn acquire(engine: &Engine, ticker_state: &Arc<(Mutex<EpochTickerState>, Condvar)>) -> Self {
+        let mut state = ticker_state.0.lock().unwrap();
+        state.active_jobs += 1;
+
+        if !state.ticker_running {
+            state.ticker_running = true;
+            let engine_handle = engine.clone();
+            let ticker_state_clone = Arc::clone(ticker_state);
+
+            std::thread::spawn(move || {
+                let mut state = ticker_state_clone.0.lock().unwrap();
+                let mut last_tick = Instant::now();
+
+                loop {
+                    if state.active_jobs == 0 {
+                        state.ticker_running = false;
+                        break;
+                    }
+
+                    let (new_state, _) = ticker_state_clone
+                        .1
+                        .wait_timeout(state, Duration::from_millis(1))
+                        .unwrap();
+                    state = new_state;
+
+                    if state.active_jobs == 0 {
+                        state.ticker_running = false;
+                        break;
+                    }
+
+                    // Advance the engine epoch by the actual wall-clock milliseconds
+                    // elapsed since `last_tick`. OS sleep granularity is often >1ms
+                    // (~1.5-2ms on Linux/macOS, ~15.6ms on Windows), so advancing 1 tick
+                    // per sleep iteration would fall short of `timeout_ticks` and never
+                    // trigger the store's epoch deadline.
+                    let now = Instant::now();
+                    let elapsed_ms = now.duration_since(last_tick).as_millis() as u64;
+                    if elapsed_ms > 0 {
+                        for _ in 0..elapsed_ms {
+                            engine_handle.increment_epoch();
+                        }
+                        last_tick += Duration::from_millis(elapsed_ms);
+                    }
+                }
+            });
+        }
+
+        Self {
+            ticker_state: Arc::clone(ticker_state),
+        }
+    }
+}
+
+impl Drop for ActiveEpochGuard {
+    fn drop(&mut self) {
+        let mut state = self.ticker_state.0.lock().unwrap();
+        state.active_jobs = state.active_jobs.saturating_sub(1);
+        if state.active_jobs == 0 {
+            self.ticker_state.1.notify_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExecutionFailure {
+    Timeout(Duration),
+    Runtime(anyhow::Error),
+}
+
+fn is_epoch_interrupt(err: &anyhow::Error) -> bool {
+    if matches!(err.downcast_ref::<Trap>(), Some(Trap::Interrupt)) {
+        return true;
+    }
+    let msg = err.to_string().to_lowercase();
+    msg.contains("epoch") || msg.contains("wasm trap: interrupt")
+}
+
 /// WASM execution engine with resource isolation
 pub struct WasmEngine {
     /// Wasmtime engine
     engine: Engine,
+    /// Shared wall-clock epoch ticker coordinator
+    ticker_state: Arc<(Mutex<EpochTickerState>, Condvar)>,
 }
 
 impl WasmEngine {
@@ -66,7 +162,10 @@ impl WasmEngine {
             "WASM engine initialized with security settings, epoch interruption, and fuel tracking"
         );
 
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            ticker_state: Arc::new((Mutex::new(EpochTickerState::default()), Condvar::new())),
+        })
     }
 
     /// Execute a compute job with resource limits
@@ -161,14 +260,26 @@ impl WasmEngine {
         let input_len = job.input_data.len() as i32;
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                warn!(
+                    "Failed to write input data ({} bytes) to WASM memory for job {}: {}",
+                    job.input_data.len(),
+                    job.id,
+                    e
+                );
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("Failed to write input data to WASM memory: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
         let initial_fuel = store.get_fuel().unwrap_or(0);
 
         // Execute the function with timeout
-        let result = match self.execute_with_timeout(
+        let result = match self.execute_with_timeout_internal(
             &mut store,
             &execute_fn,
             input_ptr,
@@ -204,7 +315,15 @@ impl WasmEngine {
                     instructions_executed,
                 )
             }
-            Err(e) => {
+            Err(ExecutionFailure::Timeout(timeout)) => {
+                warn!("Job {} timed out after {:?}", job.id, timeout);
+                JobResult::timed_out(
+                    job.id.clone(),
+                    job.timeout_secs,
+                    start_time.elapsed().as_millis() as u64,
+                )
+            }
+            Err(ExecutionFailure::Runtime(e)) => {
                 warn!("Job {} execution failed: {}", job.id, e);
                 JobResult::failure(
                     job.id.clone(),
@@ -259,43 +378,33 @@ impl WasmEngine {
     }
 
     /// Execute a function with timeout
-    fn execute_with_timeout(
+    fn execute_with_timeout_internal(
         &self,
         store: &mut Store<ResourceLimiterImpl>,
         func: &TypedFunc<(i32, i32), i32>,
         input_ptr: i32,
         input_len: i32,
         timeout: Duration,
-    ) -> Result<i32> {
-        // Set epoch deadline for timeout
-        // Deadline is current epoch + timeout in ticks (1 tick = 1ms approximately)
-        let timeout_ticks = timeout.as_millis() as u64;
+    ) -> std::result::Result<i32, ExecutionFailure> {
+        if timeout.is_zero() {
+            return Err(ExecutionFailure::Timeout(timeout));
+        }
+
+        // Set epoch deadline for timeout (1 tick = 1ms of wall-clock time)
+        let timeout_ticks = timeout.as_millis().max(1) as u64;
         store.set_epoch_deadline(timeout_ticks);
 
-        // Start epoch incrementing in background
-        let engine_handle = self.engine.clone();
-        let timeout_duration = timeout;
-        let epoch_thread = std::thread::spawn(move || {
-            let start = Instant::now();
-            while start.elapsed() < timeout_duration {
-                engine_handle.increment_epoch();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
+        // Ensure the shared wall-clock epoch ticker is running while this call is active,
+        // and automatically stop/notify it when `_epoch_guard` is dropped.
+        let _epoch_guard = ActiveEpochGuard::acquire(&self.engine, &self.ticker_state);
 
-        // Execute the function
-        let result = func.call(store, (input_ptr, input_len)).map_err(|e| {
-            if e.to_string().contains("epoch") {
-                anyhow!("WASM execution timeout after {:?}", timeout)
+        func.call(store, (input_ptr, input_len)).map_err(|e| {
+            if is_epoch_interrupt(&e) {
+                ExecutionFailure::Timeout(timeout)
             } else {
-                anyhow!("WASM execution error: {}", e)
+                ExecutionFailure::Runtime(anyhow!("WASM execution error: {}", e))
             }
-        });
-
-        // Clean up epoch thread (it will finish naturally)
-        drop(epoch_thread);
-
-        result
+        })
     }
 }
 
@@ -391,5 +500,128 @@ mod tests {
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn test_infinite_loop_wasm_times_out_with_timed_out_status() {
+        let engine = WasmEngine::new().unwrap();
+
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    (loop $inf
+                        br $inf
+                    )
+                    i32.const 0
+                )
+            )
+        "#;
+
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let limits = ResourceLimits {
+            max_memory_bytes: 64 * 1024 * 1024,
+            // Very high instruction budget so only wall-clock epoch timeout can stop it
+            max_instructions: u64::MAX / 2,
+            timeout_secs: 1,
+        };
+        let job = ComputeJob::new(wasm_bytes, vec![], limits);
+
+        let start = Instant::now();
+        let result = engine.execute_job(&job).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.status, JobStatus::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "infinite loop job should time out promptly around 1s, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_completed_jobs_stop_epoch_ticker_and_do_not_accelerate_later_jobs() {
+        let engine = WasmEngine::new().unwrap();
+
+        let fast_wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let fast_wasm = wat::parse_str(fast_wat).unwrap();
+
+        // Run 30 fast jobs with 30s timeouts. Previously each job leaked a detached
+        // background thread incrementing the shared Engine epoch for 30s.
+        for _ in 0..30 {
+            let job = ComputeJob::new(fast_wasm.clone(), vec![], ResourceLimits::default());
+            let result = engine.execute_job(&job).unwrap();
+            assert_eq!(result.status, JobStatus::Completed);
+        }
+
+        // Wait briefly for the ticker thread to observe active_jobs == 0 and exit.
+        std::thread::sleep(Duration::from_millis(20));
+        {
+            let state = engine.ticker_state.0.lock().unwrap();
+            assert_eq!(state.active_jobs, 0);
+            assert!(
+                !state.ticker_running,
+                "epoch ticker thread must exit once all active jobs complete"
+            );
+        }
+
+        // Verify the engine epoch is no longer advancing while idle.
+        let idle_wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    (local $i i32)
+                    (block $done
+                        (loop $busy
+                            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                            (br_if $done (i32.ge_u (local.get $i) (i32.const 5000000)))
+                            (br $busy)
+                        )
+                    )
+                    i32.const 0
+                )
+            )
+        "#;
+        let busy_wasm = wat::parse_str(idle_wat).unwrap();
+        let job = ComputeJob::new(
+            busy_wasm,
+            vec![],
+            ResourceLimits {
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_instructions: 1_000_000_000,
+                timeout_secs: 1,
+            },
+        );
+        let result = engine.execute_job(&job).unwrap();
+        assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn test_undersized_wasm_memory_returns_failed_job_result() {
+        let engine = WasmEngine::new().unwrap();
+
+        // Module exports 0 pages of linear memory, so writing non-empty input fails.
+        let wat = r#"
+            (module
+                (memory (export "memory") 0)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let job = ComputeJob::new(wasm_bytes, vec![1, 2, 3, 4], ResourceLimits::default());
+
+        let result = engine
+            .execute_job(&job)
+            .expect("undersized WASM memory should return Ok(JobResult::failure), not Err");
+        assert!(matches!(result.status, JobStatus::Failed { .. }));
     }
 }

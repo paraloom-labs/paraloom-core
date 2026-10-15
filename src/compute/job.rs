@@ -215,6 +215,19 @@ impl JobResult {
             instructions_executed: 0,
         }
     }
+
+    /// Create a timed-out job result
+    pub fn timed_out(job_id: JobId, timeout_secs: u64, execution_time_ms: u64) -> Self {
+        Self {
+            job_id,
+            status: JobStatus::TimedOut,
+            output_data: None,
+            error: Some(format!("WASM execution timeout after {}s", timeout_secs)),
+            execution_time_ms,
+            memory_used_bytes: 0,
+            instructions_executed: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +284,18 @@ mod tests {
         assert!(matches!(result.status, JobStatus::Failed { .. }));
         assert!(result.output_data.is_none());
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_job_result_timed_out() {
+        let result = JobResult::timed_out("job789".to_string(), 5, 5002);
+
+        assert_eq!(result.status, JobStatus::TimedOut);
+        assert!(result.output_data.is_none());
+        assert_eq!(
+            result.error.as_deref(),
+            Some("WASM execution timeout after 5s")
+        );
+        assert_eq!(result.execution_time_ms, 5002);
     }
 }
