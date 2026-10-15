@@ -675,16 +675,23 @@ impl NetworkManager {
                                     let mut registry = peer_registry.lock().await;
                                     registry.mark_connected(NodeId(peer_id.to_bytes()));
                                 }
-                                libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                                    info!("Connection closed with peer: {} (cause: {:?})", peer_id, cause);
-
-                                    // Remove from connected peers list
-                                    let mut peers = connected_peers.lock().await;
-                                    peers.retain(|p| p != &peer_id);
-                                    drop(peers);
-
-                                    let mut registry = peer_registry.lock().await;
-                                    registry.mark_disconnected(NodeId(peer_id.to_bytes()));
+                                libp2p::swarm::SwarmEvent::ConnectionClosed {
+                                    peer_id,
+                                    num_established,
+                                    cause,
+                                    ..
+                                } => {
+                                    info!(
+                                        "Connection closed with peer: {} (remaining established: {}, cause: {:?})",
+                                        peer_id, num_established, cause
+                                    );
+                                    Self::handle_connection_closed(
+                                        &connected_peers,
+                                        &peer_registry,
+                                        peer_id,
+                                        num_established,
+                                    )
+                                    .await;
                                 }
                                 libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
                                     info!("Incoming connection");
@@ -1081,6 +1088,29 @@ impl NetworkManager {
         info!("Network event loop terminated");
     }
 
+    /// Apply a `SwarmEvent::ConnectionClosed` transition to the tracked peer state.
+    ///
+    /// `num_established` is the number of remaining established connections to
+    /// `peer_id` after this connection closed. Because `ConnectionLimits` permits
+    /// up to 8 concurrent connections per peer (simultaneous dials, or relay
+    /// circuit followed by DCUtR direct upgrade), a peer is only disconnected
+    /// when `num_established == 0`.
+    async fn handle_connection_closed(
+        connected_peers: &Mutex<Vec<PeerId>>,
+        peer_registry: &Mutex<PeerRegistry>,
+        peer_id: PeerId,
+        num_established: u32,
+    ) {
+        if num_established == 0 {
+            let mut peers = connected_peers.lock().await;
+            peers.retain(|p| p != &peer_id);
+            drop(peers);
+
+            let mut registry = peer_registry.lock().await;
+            registry.mark_disconnected(NodeId(peer_id.to_bytes()));
+        }
+    }
+
     /// Send a message to a peer (broadcasts via gossipsub)
     pub async fn send_message(&self, _peer: NodeId, message: Message) -> Result<()> {
         self.message_sender
@@ -1375,5 +1405,33 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn connection_closed_retains_peer_while_other_connections_remain_established() {
+        let key = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(key.public());
+        let node_id = NodeId(peer_id.to_bytes());
+
+        let connected_peers = Mutex::new(vec![peer_id]);
+        let peer_registry = Mutex::new(PeerRegistry::new());
+        peer_registry.lock().await.mark_connected(node_id);
+
+        // Closing a redundant connection while one connection remains established
+        // (`num_established == 1`) must NOT drop the peer from `connected_peers`
+        // or transition it to `Backoff` in `PeerRegistry`.
+        NetworkManager::handle_connection_closed(&connected_peers, &peer_registry, peer_id, 1)
+            .await;
+        assert_eq!(connected_peers.lock().await.as_slice(), &[peer_id]);
+        assert_eq!(peer_registry.lock().await.counts().connected, 1);
+        assert_eq!(peer_registry.lock().await.counts().backoff, 0);
+
+        // Closing the final connection (`num_established == 0`) removes the peer
+        // and transitions its registry entry to `Backoff`.
+        NetworkManager::handle_connection_closed(&connected_peers, &peer_registry, peer_id, 0)
+            .await;
+        assert!(connected_peers.lock().await.is_empty());
+        assert_eq!(peer_registry.lock().await.counts().connected, 0);
+        assert_eq!(peer_registry.lock().await.counts().backoff, 1);
     }
 }
