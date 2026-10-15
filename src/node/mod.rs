@@ -647,7 +647,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         return Ok(());
                     }
 
-                    let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
+                    let job = crate::compute::ComputeJob::with_id(job_id.clone(), wasm_code, input_data, limits);
                     let actual_job_id = job.id.clone();
 
                     // Store coordinator for result reporting
@@ -690,6 +690,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         Err(e) => {
                             log::error!("Failed to submit compute job: {}", e);
 
+                            // Clean up coordinator entry on failure
+                            {
+                                let mut coordinators = self.job_coordinators.lock().await;
+                                coordinators.remove(&actual_job_id);
+                            }
+
                             // Remove from pending storage on failure
                             if let Some(storage) = &self.compute_storage {
                                 if let Err(e) = storage.remove_pending_job(&actual_job_id) {
@@ -729,11 +735,23 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, accepted, message
                 );
 
+                // Update assignment state on coordinator
+                if let Some(coordinator) = &self.compute_coordinator {
+                    if accepted {
+                        if let Err(e) = coordinator.mark_job_fetched(&job_id).await {
+                            log::error!("Failed to mark job as fetched in coordinator: {}", e);
+                        }
+                    } else {
+                        if let Err(e) = coordinator.remove_assignment(&job_id).await {
+                            log::error!("Failed to remove assignment in coordinator: {}", e);
+                        }
+                    }
+                }
+
                 // If we have a manager (coordinator node), notify it
                 if let Some(_manager) = &self.compute_manager {
                     if accepted {
                         info!("Job {} was accepted by validator {}", job_id, source);
-                        // Assignment tracking is handled by JobCoordinator
                     } else {
                         // Job was rejected, we might need to reassign
                         log::warn!("Job {} was rejected by {}: {}", job_id, source, message);
@@ -781,12 +799,25 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, status
                 );
 
+                // Remove assignment on coordinator
+                if let Some(coordinator) = &self.compute_coordinator {
+                    if let Err(e) = coordinator.remove_assignment(&job_id).await {
+                        log::error!("Failed to remove assignment in coordinator on job result: {}", e);
+                    }
+                }
+
+                let error = match &status {
+                    crate::compute::JobStatus::Failed { error } => Some(error.clone()),
+                    crate::compute::JobStatus::TimedOut => Some("Job execution timed out".to_string()),
+                    _ => None,
+                };
+
                 // Store result and update job status
                 let result = crate::compute::JobResult {
                     job_id: job_id.clone(),
                     status,
                     output_data,
-                    error: None,
+                    error,
                     execution_time_ms,
                     memory_used_bytes,
                     instructions_executed,
@@ -3634,4 +3665,126 @@ mod tests {
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
     }
+
+    // --- distributed compute coordinator lifecycle (#895) ---
+
+    #[tokio::test]
+    async fn distributed_compute_preserves_job_id_and_updates_coordinator_lifecycle() {
+        use crate::compute::distribution::JobAssignment;
+        use crate::compute::job::{JobStatus, ResourceLimits};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. Setup a coordinator node
+        let mut coord_settings = Settings::development();
+        coord_settings.node.node_type = "Coordinator".to_string();
+        coord_settings.storage.data_dir = temp_dir.path().join("coord").to_str().unwrap().to_string();
+        let coord_node = Node::new(coord_settings).expect("construct coordinator node");
+
+        let coordinator = coord_node.compute_coordinator.as_ref().expect("has compute_coordinator");
+
+        let job_id = "test-job-fixed-uuid-1234".to_string();
+        let validator_id = NodeId::random();
+
+        // Assign job directly in coordinator pending assignments
+        {
+            let assignment = JobAssignment::new(job_id.clone(), validator_id.clone());
+            let mut pending = coordinator.pending_assignments.write().await;
+            pending.insert(job_id.clone(), assignment);
+        }
+
+        // Verify job is in pending_assignments
+        {
+            let pending = coordinator.pending_assignments.read().await;
+            assert!(pending.contains_key(&job_id), "job should be in pending_assignments");
+        }
+
+        // 2. Simulate ComputeJobResponse { accepted: true } received by coordinator
+        coord_node
+            .handle_message(
+                validator_id.clone(),
+                Message::ComputeJobResponse {
+                    job_id: job_id.clone(),
+                    accepted: true,
+                    message: "Job accepted for execution".to_string(),
+                },
+            )
+            .await
+            .expect("handle ComputeJobResponse accepted");
+
+        // Verify job moved from pending to active_assignments
+        {
+            let pending = coordinator.pending_assignments.read().await;
+            assert!(!pending.contains_key(&job_id), "job should no longer be pending");
+            let active = coordinator.active_assignments.read().await;
+            assert!(active.contains_key(&job_id), "job should now be in active_assignments");
+        }
+
+        // 3. Test Provider preserves job_id on ComputeJobRequest
+        let mut prov_settings = Settings::development();
+        prov_settings.node.node_type = "ResourceProvider".to_string();
+        prov_settings.storage.data_dir = temp_dir.path().join("prov").to_str().unwrap().to_string();
+        let prov_node = Node::new(prov_settings).expect("construct provider node");
+
+        let custom_job_id = "custom-coordinator-job-id-999".to_string();
+        let limits = ResourceLimits::default();
+
+        prov_node
+            .handle_message(
+                validator_id.clone(),
+                Message::ComputeJobRequest {
+                    job_id: custom_job_id.clone(),
+                    wasm_code: vec![],
+                    input_data: vec![],
+                    limits,
+                },
+            )
+            .await
+            .expect("handle ComputeJobRequest");
+
+        // Verify provider stored the exact job_id in job_coordinators
+        {
+            let coordinators = prov_node.job_coordinators.lock().await;
+            assert!(
+                coordinators.contains_key(&custom_job_id),
+                "job_coordinators must contain the exact incoming job_id"
+            );
+        }
+
+        // 4. Test ComputeJobResult removes assignment and propagates error
+        let failure_reason = "execution ran out of gas".to_string();
+        coord_node
+            .handle_message(
+                validator_id.clone(),
+                Message::ComputeJobResult {
+                    job_id: job_id.clone(),
+                    status: JobStatus::Failed {
+                        error: failure_reason.clone(),
+                    },
+                    output_data: None,
+                    execution_time_ms: 100,
+                    memory_used_bytes: 1024,
+                    instructions_executed: 50,
+                },
+            )
+            .await
+            .expect("handle ComputeJobResult");
+
+        // Verify job removed from coordinator active assignments
+        {
+            let active = coordinator.active_assignments.read().await;
+            assert!(!active.contains_key(&job_id), "job assignment should be removed from active");
+            let pending = coordinator.pending_assignments.read().await;
+            assert!(!pending.contains_key(&job_id), "job assignment should be removed from pending");
+        }
+
+        // If storage exists, verify result error was saved
+        if let Some(storage) = &coord_node.compute_storage {
+            let res = storage.get_result(&job_id).expect("get stored result");
+            assert!(res.is_some(), "result must be stored in compute_storage");
+            let res = res.unwrap();
+            assert_eq!(res.error, Some(failure_reason));
+        }
+    }
 }
+

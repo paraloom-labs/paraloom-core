@@ -114,7 +114,8 @@ impl PrivateComputeJob {
 
     /// Convert to standard compute job (for execution)
     pub fn to_compute_job(&self) -> ComputeJob {
-        ComputeJob::new(
+        ComputeJob::with_id(
+            self.job_id.clone(),
             self.wasm_code.clone(),
             self.encrypted_input.clone(),
             self.limits.clone(),
