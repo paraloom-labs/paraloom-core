@@ -287,6 +287,12 @@ impl Phase2Transcript {
     /// DLEQ proof and signature is the verifier module's job; this
     /// method only checks the data-layer chain integrity.
     pub fn verify_chain(&self) -> Result<(), TranscriptError> {
+        if self.version != TRANSCRIPT_VERSION {
+            return Err(TranscriptError::UnsupportedVersion {
+                got: self.version,
+                expected: TRANSCRIPT_VERSION,
+            });
+        }
         let mut expected = self.initial_srs_hash;
         for (i, contribution) in self.contributions.iter().enumerate() {
             if contribution.prior_hash != expected {
@@ -320,6 +326,8 @@ pub fn hash_contribution(contribution: &Contribution) -> TranscriptHash {
 pub enum TranscriptError {
     #[error("transcript chain broken at position {position}: prior_hash does not match the previous contribution")]
     ChainBroken { position: usize },
+    #[error("unsupported transcript version {got} (expected {expected})")]
+    UnsupportedVersion { got: u32, expected: u32 },
 }
 
 // Bring the digest trait into scope locally so the public API
@@ -492,6 +500,19 @@ mod tests {
         match try_hash_from_hex("aabbccdd") {
             Err(msg) => assert!(msg.contains("64 bytes")),
             Ok(_) => panic!("short hex must error"),
+        }
+    }
+
+    #[test]
+    fn verify_chain_rejects_unsupported_transcript_version() {
+        let mut t = Phase2Transcript::new(CircuitId::Deposit, [0u8; 64]);
+        t.version = TRANSCRIPT_VERSION + 1;
+        match t.verify_chain() {
+            Err(TranscriptError::UnsupportedVersion {
+                got,
+                expected: TRANSCRIPT_VERSION,
+            }) => assert_eq!(got, TRANSCRIPT_VERSION + 1),
+            other => panic!("expected UnsupportedVersion, got {:?}", other),
         }
     }
 }
