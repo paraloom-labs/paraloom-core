@@ -421,16 +421,32 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     request.request_id
                 );
 
+                // Pre-filter replays of already-settled spends against the
+                // off-chain nullifier set (#624 / #703) BEFORE consulting the
+                // `verified_transacts` cache or running Groth16 verification.
+                // Without this check, a settled spend replayed under a
+                // re-randomized proof (or with a varied dummy second nullifier
+                // and fresh ciphertexts) carries a new canonical request id,
+                // re-triggers full Groth16 verification, votes `Valid`, and
+                // appends bogus entries into `delivered_notes` (FIFO-evicting
+                // honest recipients' encrypted notes from `GET /transact/scan`),
+                // while an exact replay hits `already_verified` and votes
+                // `Valid` again.
+                let already_spent = self
+                    .has_spent_transact_nullifier(&request.nullifiers)
+                    .await;
+
                 // Short-circuit a request we have already verified `Valid` rather
                 // than re-running the proof (#726). `verified_transacts` only holds
                 // `Valid` results, so a cache hit is a proven-valid repeat; reusing
                 // it stops a valid transact re-broadcast from re-triggering the
                 // full Groth16 verification on every honest validator.
-                let already_verified = self
-                    .verified_transacts
-                    .lock()
-                    .await
-                    .contains_key(&request.request_id);
+                let already_verified = !already_spent
+                    && self
+                        .verified_transacts
+                        .lock()
+                        .await
+                        .contains_key(&request.request_id);
 
                 // Verify the transact zkSNARK proof, mirroring the transfer
                 // path (#350). Unlike a transfer, the v3 proof binds
@@ -438,7 +454,15 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // carried in the request), so verification needs no pool
                 // state; the pool gate below only keeps non-bridge nodes from
                 // voting on settlements they do not participate in.
-                let vote = if already_verified {
+                let vote = if already_spent {
+                    log::warn!(
+                        "Transact {} rejected before verification: input nullifier already spent",
+                        request.request_id
+                    );
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "Input nullifier already spent".to_string(),
+                    }
+                } else if already_verified {
                     info!(
                         "Transact {} already verified Valid; reusing cached result",
                         request.request_id
@@ -2233,6 +2257,18 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
+        // Pre-filter replays of already-settled spends against the off-chain
+        // nullifier set (#624 / #703) before allocating a consensus round,
+        // running Groth16 verification, recording `delivered_notes`, or
+        // broadcasting to the mesh.
+        if self
+            .has_spent_transact_nullifier(&request.nullifiers)
+            .await
+        {
+            return Err(anyhow!(
+                "transact rejected before consensus: input nullifier already spent"
+            ));
+        }
         // Register self into the validator set BEFORE start_verification, which
         // rejects an empty set with "No validators available". The initiator
         // never receives its own gossip broadcast, so on a single-node cohort (a
@@ -2681,18 +2717,44 @@ impl Node {
         self.compute_executor.clone()
     }
 
+    /// Whether either input nullifier has already been recorded as spent in
+    /// this node's off-chain [`ShieldedPool`] (`#624` / `#703`).
+    async fn has_spent_transact_nullifier(&self, nullifiers: &[[u8; 32]; 2]) -> bool {
+        let Some(pool) = &self.shielded_pool else {
+            return false;
+        };
+        for nf in nullifiers {
+            if pool.is_spent(&crate::privacy::types::Nullifier(*nf)).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Verify a v3 unified-transact zkSNARK proof (#350).
     ///
     /// Deliberately NOT verified against `pool.root().await`: the v3 proof is
     /// built against `request.root` — the on-chain incremental-tree root
     /// carried in the request — and the root's legitimacy is enforced at
     /// settlement by the program's `is_known_root` check over its root
-    /// history. The method therefore needs no pool state at all, which is why
-    /// it takes no pool parameter.
+    /// history. The off-chain pool's spent-nullifier set IS checked first so a
+    /// settled spend replayed with a re-randomized proof (or varied dummy
+    /// nullifier) is rejected before Groth16 verification (#624).
     async fn verify_transact_proof(
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
     ) -> Result<bool> {
+        if self
+            .has_spent_transact_nullifier(&request.nullifiers)
+            .await
+        {
+            log::warn!(
+                "transact proof rejected for {}: input nullifier already spent",
+                request.request_id
+            );
+            return Ok(false);
+        }
+
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
@@ -3633,5 +3695,81 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // Once a spend settles and `pool.record_spent` records its input nullifiers
+    // (#624 / #703), any replay spending either nullifier — including a
+    // re-randomized proof with a varied dummy second nullifier, fresh output
+    // commitments, and fresh ciphertexts (a distinct canonical request_id) —
+    // must be rejected before running the Groth16 verifier, starting a
+    // consensus round, or appending entries to `delivered_notes` (`/transact/scan`).
+    #[tokio::test]
+    async fn settled_nullifiers_are_rejected_before_proof_verify_and_scan_delivery() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let counter = verifier_calls.clone();
+        let node = Node::new(settings)
+            .expect("construct node")
+            .with_transact_proof_verifier(Arc::new(move |_req| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                true
+            }));
+
+        let real_nf = [0x42u8; 32];
+        let dummy_nf_a = [0x01u8; 32];
+        let mut req_a = ta_request(
+            "",
+            [9u8; 32],
+            [real_nf, dummy_nf_a],
+            [[5u8; 32], [6u8; 32]],
+            [2u8; 32],
+            0,
+        );
+        req_a.request_id = req_a.canonical_id();
+
+        // Unspent: verifier runs and succeeds.
+        assert!(node.verify_transact_proof(&req_a).await.expect("verify"));
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+
+        // Mark the settlement's nullifiers as spent in the off-chain pool,
+        // as `settle_transact_via_cosign` does once the transaction lands.
+        node.shielded_pool
+            .as_ref()
+            .expect("pool")
+            .record_spent([real_nf, dummy_nf_a])
+            .await;
+
+        // Re-randomized replay of the same spent note with a DIFFERENT dummy
+        // second nullifier, different output commitments, and different
+        // ciphertexts (producing a brand-new canonical request_id).
+        let dummy_nf_b = [0x99u8; 32];
+        let mut req_b = ta_request(
+            "",
+            [9u8; 32],
+            [real_nf, dummy_nf_b],
+            [[15u8; 32], [16u8; 32]],
+            [2u8; 32],
+            0,
+        );
+        req_b.ciphertexts = ["ee".repeat(88), "ff".repeat(88)];
+        req_b.request_id = req_b.canonical_id();
+        assert_ne!(req_a.request_id, req_b.request_id);
+
+        // `verify_transact_proof` rejects without invoking the Groth16 verifier.
+        assert!(!node.verify_transact_proof(&req_b).await.expect("verify"));
+        assert_eq!(
+            verifier_calls.load(Ordering::SeqCst),
+            1,
+            "spent-nullifier pre-filter must short-circuit before Groth16 verification"
+        );
+
+        // `initiate_transact_verification` rejects before consensus and does
+        // not record the replay's ciphertexts in `delivered_notes`.
+        assert!(node.initiate_transact_verification(req_b).await.is_err());
+        assert!(
+            node.delivered_notes().await.is_empty(),
+            "replayed spend must not pollute delivered_notes scan buffer"
+        );
     }
 }
