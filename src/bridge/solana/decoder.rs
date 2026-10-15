@@ -6,7 +6,9 @@
 //! [`DepositEvent`] type. Keeping the decoder pure and free of RPC I/O
 //! makes it directly unit-testable against synthetic instruction data.
 
-use crate::bridge::solana::instructions::{discriminators, DepositInstructionData};
+use crate::bridge::solana::instructions::{
+    discriminators, DepositInstructionData, TransactInstructionData,
+};
 use crate::bridge::DepositEvent;
 use borsh::BorshDeserialize;
 use solana_sdk::pubkey::Pubkey;
@@ -28,6 +30,24 @@ const DEPOSITOR_ACCOUNT_INDEX: usize = 2;
 /// [`extract_deposit_events`] consumes.
 pub const LISTENER_TX_ENCODING: UiTransactionEncoding = UiTransactionEncoding::Json;
 
+/// State-mutating Paraloom program event decoded from a finalized transaction.
+///
+/// Both deposit instructions (`deposit_note`, `deposit_note_spl`, legacy
+/// `deposit`, `deposit_spl`) and settlement instructions (`transact`,
+/// `transact_spl`) append leaves to the shared on-chain `[b"merkle_tree"]` PDA,
+/// so the listener must index both in execution order to keep the off-chain
+/// `ShieldedPool` tree and nullifier set aligned with on-chain state.
+#[derive(Debug, Clone)]
+pub enum BridgeProgramEvent {
+    Deposit(DepositEvent),
+    Transact {
+        signature: String,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+        block: u64,
+    },
+}
+
 /// Pull every Paraloom deposit instruction out of a confirmed Solana
 /// transaction and turn it into a [`DepositEvent`].
 ///
@@ -41,6 +61,23 @@ pub fn extract_deposit_events(
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
     program_id: &Pubkey,
 ) -> Vec<DepositEvent> {
+    extract_bridge_events(signature, confirmed, program_id)
+        .into_iter()
+        .filter_map(|ev| match ev {
+            BridgeProgramEvent::Deposit(d) => Some(d),
+            BridgeProgramEvent::Transact { .. } => None,
+        })
+        .collect()
+}
+
+/// Pull every state-mutating Paraloom instruction (`deposit_*` and
+/// `transact`/`transact_spl`) out of a confirmed Solana transaction in
+/// on-chain execution order.
+pub fn extract_bridge_events(
+    signature: &str,
+    confirmed: &EncodedConfirmedTransactionWithStatusMeta,
+    program_id: &Pubkey,
+) -> Vec<BridgeProgramEvent> {
     // Skip on-chain failures: a transaction whose execution errored out
     // didn't actually transfer funds, so no deposit should be emitted.
     if let Some(meta) = &confirmed.transaction.meta {
@@ -92,29 +129,41 @@ pub fn extract_deposit_events(
     };
 
     let mut events = Vec::new();
+    let inner_sets =
+        confirmed
+            .transaction
+            .meta
+            .as_ref()
+            .and_then(|meta| match &meta.inner_instructions {
+                solana_transaction_status::option_serializer::OptionSerializer::Some(inner) => {
+                    Some(inner.as_slice())
+                }
+                _ => None,
+            });
 
-    // Top-level instructions are already compiled — JSON encoding for
-    // an unparsed program drops the `UiInstruction` wrapper.
-    for compiled in &raw.instructions {
-        if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id) {
-            events.push(build_event(signature, confirmed, decoded));
-        }
-    }
-
-    // Inner instructions (CPI from another program into ours) come back
-    // through the meta field as `UiInstruction`, which needs the match
-    // because parsed instructions can also appear there.
-    if let Some(meta) = &confirmed.transaction.meta {
-        if let solana_transaction_status::option_serializer::OptionSerializer::Some(inner) =
-            &meta.inner_instructions
+    // Walk top-level instructions in execution order and interleave any CPI
+    // `inner_instructions` belonging to top-level instruction `ix_idx`
+    // immediately after `raw.instructions[ix_idx]` (and before
+    // `raw.instructions[ix_idx + 1]`), matching the order in which the Solana
+    // runtime executes instructions and appends leaves to `merkle_tree`.
+    for (ix_idx, compiled) in raw.instructions.iter().enumerate() {
+        if let Some(ev) =
+            decode_compiled_event(signature, confirmed, compiled, &account_keys, program_id)
         {
-            for inner_set in inner {
+            events.push(ev);
+        }
+        if let Some(inner) = inner_sets {
+            for inner_set in inner.iter().filter(|s| s.index as usize == ix_idx) {
                 for instruction in &inner_set.instructions {
-                    if let UiInstruction::Compiled(compiled) = instruction {
-                        if let Some(decoded) =
-                            decode_compiled_deposit(compiled, &account_keys, program_id)
-                        {
-                            events.push(build_event(signature, confirmed, decoded));
+                    if let UiInstruction::Compiled(inner_compiled) = instruction {
+                        if let Some(ev) = decode_compiled_event(
+                            signature,
+                            confirmed,
+                            inner_compiled,
+                            &account_keys,
+                            program_id,
+                        ) {
+                            events.push(ev);
                         }
                     }
                 }
@@ -122,7 +171,76 @@ pub fn extract_deposit_events(
         }
     }
 
+    // Also process any trailing inner_set whose index exceeds
+    // `raw.instructions.len()` (e.g. synthetic test fixtures).
+    if let Some(inner) = inner_sets {
+        for inner_set in inner
+            .iter()
+            .filter(|s| (s.index as usize) >= raw.instructions.len())
+        {
+            for instruction in &inner_set.instructions {
+                if let UiInstruction::Compiled(inner_compiled) = instruction {
+                    if let Some(ev) = decode_compiled_event(
+                        signature,
+                        confirmed,
+                        inner_compiled,
+                        &account_keys,
+                        program_id,
+                    ) {
+                        events.push(ev);
+                    }
+                }
+            }
+        }
+    }
+
     events
+}
+
+fn decode_compiled_event(
+    signature: &str,
+    confirmed: &EncodedConfirmedTransactionWithStatusMeta,
+    compiled: &solana_transaction_status::UiCompiledInstruction,
+    account_keys: &[Pubkey],
+    program_id: &Pubkey,
+) -> Option<BridgeProgramEvent> {
+    if let Some(decoded) = decode_compiled_deposit(compiled, account_keys, program_id) {
+        return Some(BridgeProgramEvent::Deposit(build_event(
+            signature, confirmed, decoded,
+        )));
+    }
+    decode_compiled_transact(signature, confirmed, compiled, account_keys, program_id)
+}
+
+fn decode_compiled_transact(
+    signature: &str,
+    confirmed: &EncodedConfirmedTransactionWithStatusMeta,
+    compiled: &solana_transaction_status::UiCompiledInstruction,
+    account_keys: &[Pubkey],
+    program_id: &Pubkey,
+) -> Option<BridgeProgramEvent> {
+    let program_index = compiled.program_id_index as usize;
+    let invoked_program = account_keys.get(program_index)?;
+    if invoked_program != program_id {
+        return None;
+    }
+
+    let raw_data = bs58::decode(&compiled.data).into_vec().ok()?;
+    if raw_data.len() < discriminators::TRANSACT.len() {
+        return None;
+    }
+    let disc = &raw_data[..8];
+    if disc != discriminators::TRANSACT && disc != discriminators::TRANSACT_SPL {
+        return None;
+    }
+
+    let data = TransactInstructionData::try_from_slice(&raw_data[8..]).ok()?;
+    Some(BridgeProgramEvent::Transact {
+        signature: signature.to_string(),
+        nullifiers: data.nullifiers,
+        output_commitments: data.output_commitments,
+        block: confirmed.slot,
+    })
 }
 
 /// Decoded result of a single deposit instruction. Kept private so the
@@ -515,5 +633,203 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn decodes_transact_and_transact_spl_settlement_events() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::{
+            EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage, UiRawMessage,
+            UiTransaction,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let account_keys = vec![other.to_string(), program_id.to_string()];
+
+        let nullifiers_1 = [[0x11; 32], [0x22; 32]];
+        let outputs_1 = [[0x33; 32], [0x44; 32]];
+        let payload_1 = TransactInstructionData {
+            nullifiers: nullifiers_1,
+            output_commitments: outputs_1,
+            root: [0x55; 32],
+            ext_amount: 0,
+            proof: vec![1, 2, 3, 4],
+        };
+        let mut bytes_1 = discriminators::TRANSACT.to_vec();
+        bytes_1.extend_from_slice(&borsh::to_vec(&payload_1).unwrap());
+
+        let nullifiers_2 = [[0x66; 32], [0x77; 32]];
+        let outputs_2 = [[0x88; 32], [0x99; 32]];
+        let payload_2 = TransactInstructionData {
+            nullifiers: nullifiers_2,
+            output_commitments: outputs_2,
+            root: [0xAA; 32],
+            ext_amount: -500,
+            proof: vec![5, 6, 7, 8],
+        };
+        let mut bytes_2 = discriminators::TRANSACT_SPL.to_vec();
+        bytes_2.extend_from_slice(&borsh::to_vec(&payload_2).unwrap());
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 42,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig_transact".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 1,
+                        },
+                        account_keys,
+                        recent_blockhash: Hash::default().to_string(),
+                        instructions: vec![
+                            UiCompiledInstruction {
+                                program_id_index: 1,
+                                accounts: vec![0],
+                                data: bs58::encode(bytes_1).into_string(),
+                                stack_height: None,
+                            },
+                            UiCompiledInstruction {
+                                program_id_index: 1,
+                                accounts: vec![0],
+                                data: bs58::encode(bytes_2).into_string(),
+                                stack_height: None,
+                            },
+                        ],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: None,
+                version: None,
+            },
+            block_time: None,
+        };
+
+        let events = extract_bridge_events("sig_transact", &confirmed, &program_id);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            BridgeProgramEvent::Transact {
+                signature,
+                nullifiers,
+                output_commitments,
+                block,
+            } => {
+                assert_eq!(signature, "sig_transact");
+                assert_eq!(*nullifiers, nullifiers_1);
+                assert_eq!(*output_commitments, outputs_1);
+                assert_eq!(*block, 42);
+            }
+            other => panic!("expected first event to be Transact, got {:?}", other),
+        }
+        match &events[1] {
+            BridgeProgramEvent::Transact {
+                signature,
+                nullifiers,
+                output_commitments,
+                block,
+            } => {
+                assert_eq!(signature, "sig_transact");
+                assert_eq!(*nullifiers, nullifiers_2);
+                assert_eq!(*output_commitments, outputs_2);
+                assert_eq!(*block, 42);
+            }
+            other => panic!("expected second event to be Transact, got {:?}", other),
+        }
+
+        // `extract_deposit_events` remains filtered to deposit instructions only.
+        assert!(extract_deposit_events("sig_transact", &confirmed, &program_id).is_empty());
+    }
+
+    #[test]
+    fn interleaves_inner_cpi_instructions_in_execution_order() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransaction, EncodedTransactionWithStatusMeta, UiInnerInstructions,
+            UiInstruction, UiMessage, UiRawMessage, UiTransaction, UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let wrapper_program = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let dummy = Pubkey::new_unique();
+
+        // account_keys: [dummy(0), dummy(1), depositor(2), program_id(3), wrapper_program(4)]
+        let account_keys = vec![
+            dummy.to_string(),
+            dummy.to_string(),
+            depositor.to_string(),
+            program_id.to_string(),
+            wrapper_program.to_string(),
+        ];
+
+        // Top-level ix 0 invokes `wrapper_program`, which CPIs into `program_id`
+        // with a deposit of 1_000 lamports (`inner_instructions` at `index: 0`).
+        // Top-level ix 1 directly invokes `program_id` with a deposit of 2_000
+        // lamports. On-chain, the CPI deposit at index 0 executes BEFORE
+        // top-level ix 1, so the decoder must emit `[1_000, 2_000]`.
+        let wrapper_ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0],
+            data: String::new(),
+            stack_height: None,
+        };
+        let cpi_deposit_ix =
+            make_compiled_ix(3, 2, encode_deposit_data(1_000, [1u8; 32], [2u8; 32]));
+        let top_deposit_ix =
+            make_compiled_ix(3, 2, encode_deposit_data(2_000, [3u8; 32], [4u8; 32]));
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 99,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig_interleaved".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 2,
+                        },
+                        account_keys,
+                        recent_blockhash: Hash::default().to_string(),
+                        instructions: vec![wrapper_ix, top_deposit_ix],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    status: Ok(()),
+                    err: None,
+                    fee: 5_000,
+                    pre_balances: vec![],
+                    post_balances: vec![],
+                    inner_instructions: OptionSerializer::Some(vec![UiInnerInstructions {
+                        index: 0,
+                        instructions: vec![UiInstruction::Compiled(cpi_deposit_ix)],
+                    }]),
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::None,
+                    post_token_balances: OptionSerializer::None,
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::None,
+                    return_data: OptionSerializer::None,
+                    compute_units_consumed: OptionSerializer::None,
+                    cost_units: OptionSerializer::None,
+                }),
+                version: None,
+            },
+            block_time: None,
+        };
+
+        let deposits = extract_deposit_events("sig_interleaved", &confirmed, &program_id);
+        assert_eq!(deposits.len(), 2);
+        assert_eq!(
+            deposits[0].amount, 1_000,
+            "CPI deposit under top-level ix 0 must precede top-level deposit at ix 1"
+        );
+        assert_eq!(deposits[1].amount, 2_000);
     }
 }
