@@ -647,7 +647,8 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         return Ok(());
                     }
 
-                    let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
+                    let job =
+                        crate::compute::ComputeJob::with_id(job_id, wasm_code, input_data, limits);
                     let actual_job_id = job.id.clone();
 
                     // Store coordinator for result reporting
@@ -690,7 +691,11 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         Err(e) => {
                             log::error!("Failed to submit compute job: {}", e);
 
-                            // Remove from pending storage on failure
+                            // Remove from pending storage and coordinator map on failure
+                            {
+                                let mut coordinators = self.job_coordinators.lock().await;
+                                coordinators.remove(&actual_job_id);
+                            }
                             if let Some(storage) = &self.compute_storage {
                                 if let Err(e) = storage.remove_pending_job(&actual_job_id) {
                                     log::error!("Failed to remove pending job: {}", e);
@@ -729,15 +734,21 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, accepted, message
                 );
 
-                // If we have a manager (coordinator node), notify it
+                // If we have a manager/coordinator (coordinator node), update assignment state
                 if let Some(_manager) = &self.compute_manager {
                     if accepted {
                         info!("Job {} was accepted by validator {}", job_id, source);
-                        // Assignment tracking is handled by JobCoordinator
                     } else {
-                        // Job was rejected, we might need to reassign
                         log::warn!("Job {} was rejected by {}: {}", job_id, source, message);
-                        // Could implement retry logic here
+                    }
+                }
+                if let Some(coordinator) = &self.compute_coordinator {
+                    if accepted {
+                        if let Err(e) = coordinator.mark_job_fetched(&job_id).await {
+                            log::error!("Failed to mark job {} as fetched: {}", job_id, e);
+                        }
+                    } else if let Err(e) = coordinator.remove_assignment(&job_id).await {
+                        log::error!("Failed to remove rejected job assignment {}: {}", job_id, e);
                     }
                 }
             }
@@ -781,16 +792,36 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, status
                 );
 
+                let error = match &status {
+                    crate::compute::JobStatus::Failed { error } => Some(error.clone()),
+                    crate::compute::JobStatus::TimedOut => {
+                        Some("Job execution timed out".to_string())
+                    }
+                    _ => None,
+                };
+
                 // Store result and update job status
                 let result = crate::compute::JobResult {
                     job_id: job_id.clone(),
                     status,
                     output_data,
-                    error: None,
+                    error,
                     execution_time_ms,
                     memory_used_bytes,
                     instructions_executed,
                 };
+
+                // Clear active/pending assignment in JobCoordinator so completed jobs
+                // are not falsely timed out and reassigned by handle_timeouts().
+                if let Some(coordinator) = &self.compute_coordinator {
+                    if let Err(e) = coordinator.remove_assignment(&job_id).await {
+                        log::error!(
+                            "Failed to remove completed job assignment {}: {}",
+                            job_id,
+                            e
+                        );
+                    }
+                }
 
                 // Store result in storage
                 if let Some(storage) = &self.compute_storage {
@@ -3633,5 +3664,117 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn distributed_compute_preserves_job_id_and_updates_coordinator_lifecycle() {
+        use crate::network::protocol::NetworkEventHandler;
+
+        let mut coord_settings = Settings::development();
+        coord_settings.node.node_type = "Coordinator".to_string();
+        let coord_node = Node::new(coord_settings).expect("construct coordinator node");
+
+        let mut provider_settings = Settings::development();
+        provider_settings.node.node_type = "ResourceProvider".to_string();
+        let mut provider_node = Node::new(provider_settings).expect("construct provider node");
+        provider_node.compute_auth = crate::compute::ComputeAuthPolicy::open();
+
+        let coord_peer = coord_node.node_info().id;
+        let provider_peer = provider_node.node_info().id;
+
+        let validator_hex = hex::encode(&provider_peer.0);
+        coord_node
+            .register_compute_validator(crate::compute::ValidatorCapacity::new(
+                validator_hex.clone(),
+                4,
+                4096,
+                4,
+            ))
+            .await
+            .unwrap();
+
+        let coordinator = coord_node.compute_coordinator().unwrap();
+        let manager = coord_node.compute_manager().unwrap();
+
+        let requested_job_id = "coord-assigned-job-42".to_string();
+        let assignment = coordinator
+            .assign_job(requested_job_id.clone())
+            .await
+            .unwrap()
+            .expect("assigned");
+        assert_eq!(assignment.validator_id, validator_hex);
+        assert_eq!(coordinator.get_stats().await.pending_assignments, 1);
+
+        // Provider receives ComputeJobRequest with the coordinator's job_id.
+        let limits = crate::compute::ResourceLimits::default();
+        provider_node
+            .handle_message(
+                coord_peer.clone(),
+                Message::ComputeJobRequest {
+                    job_id: requested_job_id.clone(),
+                    wasm_code: vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+                    input_data: vec![1, 2, 3],
+                    max_memory_bytes: limits.max_memory_bytes,
+                    max_instructions: limits.max_instructions,
+                    timeout_secs: limits.timeout_secs,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Provider must key its coordinator callback map by the coordinator's job_id,
+        // not a freshly generated random UUID.
+        {
+            let map = provider_node.job_coordinators.lock().await;
+            assert_eq!(map.get(&requested_job_id), Some(&coord_peer));
+        }
+
+        // Coordinator receives ComputeJobResponse(accepted=true) -> moves pending -> active.
+        coord_node
+            .handle_message(
+                provider_peer.clone(),
+                Message::ComputeJobResponse {
+                    job_id: requested_job_id.clone(),
+                    accepted: true,
+                    message: "accepted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let stats_after_accept = coordinator.get_stats().await;
+        assert_eq!(stats_after_accept.pending_assignments, 0);
+        assert_eq!(stats_after_accept.active_assignments, 1);
+
+        // Coordinator receives a failed ComputeJobResult -> clears active assignment
+        // and preserves the failure error string in JobManager.
+        coord_node
+            .handle_message(
+                provider_peer,
+                Message::ComputeJobResult {
+                    job_id: requested_job_id.clone(),
+                    status: crate::compute::JobStatus::Failed {
+                        error: "wasm trap: unreachable".to_string(),
+                    },
+                    output_data: None,
+                    execution_time_ms: 15,
+                    memory_used_bytes: 2048,
+                    instructions_executed: 500,
+                },
+            )
+            .await
+            .unwrap();
+
+        let stats_after_result = coordinator.get_stats().await;
+        assert_eq!(stats_after_result.pending_assignments, 0);
+        assert_eq!(stats_after_result.active_assignments, 0);
+
+        let recorded = manager
+            .get_result(&requested_job_id)
+            .expect("result stored under coordinator job_id");
+        assert_eq!(
+            recorded.error.as_deref(),
+            Some("wasm trap: unreachable"),
+            "failure error string must be preserved on ComputeJobResult"
+        );
     }
 }
