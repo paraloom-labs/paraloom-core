@@ -147,8 +147,23 @@ impl VoteTally {
 
     /// Whether consensus has been reached among the eligible wallets — those in
     /// `eligible_wallets` (the staked on-chain co-sign set minus equivocators).
+    ///
+    /// Consensus is reached when either:
+    /// 1. At least `min_validators_for_consensus` eligible wallets voted `Valid`, or
+    /// 2. At least `min_validators_for_consensus` eligible votes have arrived and
+    ///    the remaining unvoted eligible validators can no longer bring `Valid`
+    ///    up to `min_validators_for_consensus` (definitive rejection).
     pub async fn has_consensus(&self, eligible_wallets: &HashSet<String>) -> bool {
-        self.count_eligible_votes(eligible_wallets).await >= self.min_validators_for_consensus
+        let (valid_count, invalid_count, remaining_possible) =
+            self.eligible_tally_breakdown(eligible_wallets).await;
+        let total_cast = valid_count + invalid_count;
+
+        if valid_count >= self.min_validators_for_consensus {
+            return true;
+        }
+
+        total_cast >= self.min_validators_for_consensus
+            && valid_count + remaining_possible < self.min_validators_for_consensus
     }
 
     /// Check if consensus deadline has passed
@@ -157,13 +172,37 @@ impl VoteTally {
         now > self.deadline
     }
 
-    /// Number of submitted votes whose wallet is in `eligible_wallets`.
-    async fn count_eligible_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
+    /// Returns `(valid_count, invalid_count, remaining_possible)` among
+    /// `eligible_wallets`. `remaining_possible` is the upper bound on how many
+    /// additional eligible validators could still cast a vote, bounded by both
+    /// `total_validators` and `eligible_wallets.len()` (when `eligible_wallets`
+    /// is at least `min_validators_for_consensus`).
+    async fn eligible_tally_breakdown(
+        &self,
+        eligible_wallets: &HashSet<String>,
+    ) -> (usize, usize, usize) {
         let votes = self.votes.read().await;
-        votes
-            .keys()
-            .filter(|wallet| eligible_wallets.contains(*wallet))
-            .count()
+        let mut valid_count = 0usize;
+        let mut invalid_count = 0usize;
+
+        for (wallet, rec) in votes.iter() {
+            if eligible_wallets.contains(wallet) {
+                if rec.vote.is_valid() {
+                    valid_count += 1;
+                } else {
+                    invalid_count += 1;
+                }
+            }
+        }
+
+        let total_cast = valid_count + invalid_count;
+        let pool_cap = if eligible_wallets.len() >= self.min_validators_for_consensus {
+            self.total_validators.min(eligible_wallets.len())
+        } else {
+            self.total_validators
+        };
+        let remaining_possible = pool_cap.saturating_sub(total_cast);
+        (valid_count, invalid_count, remaining_possible)
     }
 
     /// Compute the consensus result, counting only votes whose wallet is in
@@ -175,40 +214,41 @@ impl VoteTally {
         &self,
         eligible_wallets: &HashSet<String>,
     ) -> Result<VerificationVote> {
-        let votes = self.votes.read().await;
+        let (valid_count, invalid_count, remaining_possible) =
+            self.eligible_tally_breakdown(eligible_wallets).await;
+        let total_cast = valid_count + invalid_count;
 
-        let mut eligible: Vec<&VerificationVote> = Vec::with_capacity(votes.len());
-        let mut excluded = 0usize;
-        for (wallet, rec) in votes.iter() {
-            if eligible_wallets.contains(wallet) {
-                eligible.push(&rec.vote);
-            } else {
-                excluded += 1;
-            }
-        }
-
-        if eligible.len() < self.min_validators_for_consensus {
+        if total_cast < self.min_validators_for_consensus {
+            let total_votes = self.votes.read().await.len();
+            let excluded = total_votes.saturating_sub(total_cast);
             return Err(anyhow!(
                 "Not enough eligible votes: {} < {} (excluded {} not in the staked set)",
-                eligible.len(),
+                total_cast,
                 self.min_validators_for_consensus,
                 excluded
             ));
         }
 
-        let valid_count = eligible.iter().filter(|v| v.is_valid()).count();
-        let invalid_count = eligible.len() - valid_count;
-
         if valid_count >= self.min_validators_for_consensus {
-            Ok(VerificationVote::Valid)
-        } else {
-            Ok(VerificationVote::Invalid {
-                reason: format!(
-                    "Consensus rejected: {} valid, {} invalid (need {})",
-                    valid_count, invalid_count, self.min_validators_for_consensus
-                ),
-            })
+            return Ok(VerificationVote::Valid);
         }
+
+        if valid_count + remaining_possible >= self.min_validators_for_consensus {
+            return Err(anyhow!(
+                "Consensus still pending: {} valid, {} invalid, {} remaining can still reach {}",
+                valid_count,
+                invalid_count,
+                remaining_possible,
+                self.min_validators_for_consensus
+            ));
+        }
+
+        Ok(VerificationVote::Invalid {
+            reason: format!(
+                "Consensus rejected: {} valid, {} invalid (need {})",
+                valid_count, invalid_count, self.min_validators_for_consensus
+            ),
+        })
     }
 
     /// Get completion percentage
@@ -357,5 +397,98 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_early_votes_do_not_prematurely_reject_before_remaining_validators_vote() {
+        // 2-of-3 BFT quorum: W1 votes Valid, W2 votes Invalid.
+        // Total cast is 2 == min_validators_for_consensus, but W3 has not voted yet
+        // and can still bring Valid to 2.
+        let tally = VoteTally::new("req-2of3".to_string(), 2, 3);
+        let eligible = wallets(&["W1", "W2", "W3"]);
+
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "byzantine".into(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !tally.has_consensus(&eligible).await,
+            "1 Valid + 1 Invalid out of 3 must not declare premature consensus while W3 can still vote Valid"
+        );
+        assert!(
+            tally.consensus_result(&eligible).await.is_err(),
+            "consensus_result must not return Invalid while Valid quorum is still reachable"
+        );
+
+        // When W3 votes Valid, consensus reaches Valid (2/3).
+        tally
+            .submit_vote(
+                "W3".into(),
+                NodeId(vec![3]),
+                VerificationVote::Valid,
+                vec![3],
+            )
+            .await
+            .unwrap();
+
+        assert!(tally.has_consensus(&eligible).await);
+        assert_eq!(
+            tally.consensus_result(&eligible).await.unwrap(),
+            VerificationVote::Valid
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_reaches_invalid_once_valid_quorum_is_impossible() {
+        // 2-of-3 BFT quorum: W1 and W2 both vote Invalid -> even if W3 votes Valid,
+        // Valid can at most reach 1 < 2, so Invalid consensus is definitive.
+        let tally = VoteTally::new("req-reject".to_string(), 2, 3);
+        let eligible = wallets(&["W1", "W2", "W3"]);
+
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "bad-1".into(),
+                },
+                vec![1],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "bad-2".into(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+
+        assert!(tally.has_consensus(&eligible).await);
+        assert!(matches!(
+            tally.consensus_result(&eligible).await.unwrap(),
+            VerificationVote::Invalid { .. }
+        ));
     }
 }

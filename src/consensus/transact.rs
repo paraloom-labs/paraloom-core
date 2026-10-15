@@ -1572,4 +1572,52 @@ mod tests {
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
     }
+
+    #[tokio::test]
+    async fn check_consensus_waits_when_single_byzantine_invalid_leaves_quorum_reachable() {
+        // 2-of-3 co-signer quorum (authority W0 excluded): W1 (2 SOL), W2 (1 SOL), W3 (2 SOL),
+        // total eligible = 5 SOL -> strict 2/3 threshold = (5 * 2) / 3 + 1 = 3.33 SOL + 1.
+        // W1 + W3 = 4 SOL >= threshold.
+        let (c, mut approvals) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        for (id, w) in [(1u8, "W1"), (2u8, "W2"), (3u8, "W3")] {
+            c.register_validator_with_wallet(NodeId(vec![id]), Some(w.to_string()))
+                .await;
+        }
+        c.sync_onchain_stakes(
+            stakes(&[
+                ("W1", 2_000_000_000),
+                ("W2", 1_000_000_000),
+                ("W3", 2_000_000_000),
+            ]),
+            5_000_000_000,
+        )
+        .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // W1 votes Valid, W2 (Byzantine) votes Invalid.
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 2, "W2", false)).await.unwrap();
+
+        // Poll check_consensus before W3 votes: must return Ok(None), NOT Ok(Some(Invalid)).
+        assert_eq!(
+            c.check_consensus(&id).await.unwrap(),
+            None,
+            "check_consensus must not prematurely reject with Invalid while W3 can still complete the 2/3 Valid quorum"
+        );
+
+        // W3 votes Valid -> 2/3 stake and count quorum reached -> settles as Valid.
+        c.submit_result(vote(&id, 3, "W3", true)).await.unwrap();
+        assert_eq!(
+            c.check_consensus(&id).await.unwrap(),
+            Some(VerificationVote::Valid)
+        );
+        assert!(approvals.try_recv().is_ok());
+    }
 }
