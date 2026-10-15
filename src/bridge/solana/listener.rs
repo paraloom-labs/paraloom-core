@@ -325,6 +325,7 @@ impl EventListener {
         // Per-signature outcome, in the ascending order deposits are processed,
         // so the cursor can advance only through the unbroken run of successes.
         let mut outcomes: Vec<(Signature, bool)> = Vec::new();
+        let mut batch_halted = false;
 
         for event in events {
             let amount = event.amount;
@@ -332,13 +333,27 @@ impl EventListener {
             let sig_str = event.signature.clone();
             let parsed = sig_str.parse::<Signature>().ok();
 
+            if batch_halted {
+                // Once an earlier deposit in the batch fails, do not insert
+                // later deposits into the pool ahead of it (which would invert
+                // leaf order in the off-chain Merkle tree) and mark their
+                // signatures as failed so they are removed from
+                // `seen_signatures` and retried in order on the next poll.
+                if let Some(sig) = parsed {
+                    outcomes.push((sig, false));
+                }
+                continue;
+            }
+
             match Self::process_deposit(&state.pool, event).await {
-                Ok(_) => {
-                    processed += 1;
-                    let mut stats_guard = state.stats.write().await;
-                    stats_guard.total_deposits += 1;
-                    stats_guard.volume_deposited += amount;
-                    drop(stats_guard);
+                Ok(newly_credited) => {
+                    if newly_credited {
+                        processed += 1;
+                        let mut stats_guard = state.stats.write().await;
+                        stats_guard.total_deposits += 1;
+                        stats_guard.volume_deposited += amount;
+                        drop(stats_guard);
+                    }
 
                     if slot > latest_slot {
                         latest_slot = slot;
@@ -354,6 +369,7 @@ impl EventListener {
                         sig_str,
                         e
                     );
+                    batch_halted = true;
                     if let Some(sig) = parsed {
                         outcomes.push((sig, false));
                     }
@@ -475,6 +491,8 @@ impl EventListener {
         let mut signatures = Vec::new();
         let mut before: Option<Signature> = None;
         let mut pages = 0usize;
+        let max_sigs = MAX_SIGNATURE_PAGES.saturating_mul(state.batch_limit.max(1));
+        let mut truncated_newer = false;
         // The cursor is the `until` boundary. If it ages out of the RPC's
         // queryable history (some providers retain devnet signatures only
         // briefly), the RPC rejects it as a boundary with a "Transaction not
@@ -517,6 +535,7 @@ impl EventListener {
                     effective_cursor = None;
                     before = None;
                     pages = 0;
+                    truncated_newer = false;
                     signatures.clear();
                     continue;
                 }
@@ -534,6 +553,16 @@ impl EventListener {
             signatures.extend(batch);
             pages += 1;
 
+            // Keep only the oldest `max_sigs` signatures (at the back of the
+            // newest-first vector) so a multi-window backlog processes the
+            // slice immediately contiguous with `effective_cursor` first and
+            // advances `last_signature` forward without skipping older pages.
+            if signatures.len() > max_sigs {
+                let drop_newest = signatures.len() - max_sigs;
+                signatures.drain(0..drop_newest);
+                truncated_newer = true;
+            }
+
             // A short page means this batch reached `cursor` (or the end of
             // history): there is nothing older left to walk.
             if batch_len < state.batch_limit {
@@ -543,12 +572,11 @@ impl EventListener {
             if effective_cursor.is_none() {
                 break;
             }
-            if pages >= MAX_SIGNATURE_PAGES {
+            if pages >= MAX_SIGNATURE_PAGES * 20 {
                 log::warn!(
                     target: "paraloom::bridge::solana",
-                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
-                    MAX_SIGNATURE_PAGES,
-                    MAX_SIGNATURE_PAGES * state.batch_limit
+                    "deposit listener hit the hard {}-page walk ceiling before reaching the cursor",
+                    pages
                 );
                 break;
             }
@@ -556,6 +584,14 @@ impl EventListener {
                 Some(sig) => before = Some(sig),
                 None => break,
             }
+        }
+        if truncated_newer {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "deposit listener backlog exceeded the {}-page window (~{} transactions); processing the oldest window above the cursor first",
+                MAX_SIGNATURE_PAGES,
+                max_sigs
+            );
         }
 
         if signatures.is_empty() {
@@ -643,8 +679,10 @@ impl EventListener {
         Ok(events)
     }
 
-    /// Process a single deposit event
-    async fn process_deposit(pool: &Arc<ShieldedPool>, event: DepositEvent) -> Result<()> {
+    /// Process a single deposit event. Returns `Ok(true)` when newly credited
+    /// into the pool, or `Ok(false)` when the commitment was already credited on
+    /// an earlier poll attempt.
+    async fn process_deposit(pool: &Arc<ShieldedPool>, event: DepositEvent) -> Result<bool> {
         log::info!(
             target: "paraloom::bridge::solana",
             "processing deposit: {} lamports from {:?}",
@@ -686,6 +724,8 @@ impl EventListener {
             Fr::from_le_bytes_mod_order(&event.asset_id),
         )));
 
+        let already_credited = pool.get_note(&commitment).await.is_some();
+
         // Credit the deposited amount, not a net of it: the on-chain leaf
         // commits to the full amount, so a fee netted here would credit a
         // supply that does not match the tree.
@@ -699,7 +739,7 @@ impl EventListener {
         .map_err(|e| BridgeError::DepositFailed(e.to_string()))?;
 
         log::info!(target: "paraloom::bridge::solana", "deposit processed successfully");
-        Ok(())
+        Ok(!already_credited)
     }
 }
 
@@ -1544,6 +1584,34 @@ mod tests {
                 .await,
             0
         );
+        assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_deposit_returns_false_when_already_credited() {
+        let pool = Arc::new(ShieldedPool::new());
+        let randomness = pedersen::generate_randomness();
+
+        let event = DepositEvent {
+            signature: "dup_sig".to_string(),
+            from: [1u8; 32],
+            amount: 1000,
+            recipient: [2u8; 32],
+            randomness,
+            asset_id: crate::privacy::types::NATIVE_SOL_ASSET,
+            fee: 0,
+            block: 100,
+            timestamp: 0,
+        };
+
+        let first = EventListener::process_deposit(&pool, event.clone())
+            .await
+            .unwrap();
+        assert!(first, "first credit must return true");
+
+        let second = EventListener::process_deposit(&pool, event).await.unwrap();
+        assert!(!second, "duplicate credit must return false");
+        assert_eq!(pool.total_supply().await, 1000);
         assert_eq!(pool.commitment_count().await, 1);
     }
 }
