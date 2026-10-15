@@ -350,7 +350,18 @@ pub mod paraloom_program {
         // Bind the settlement to the recipient and signed amount (finding D),
         // and derive `public_amount` from `ext_amount` so the funds moved can
         // never exceed the balance the owner proved (see `public_amount_bytes`).
-        let ext_data_hash = transact_ext_data_hash(&ctx.accounts.recipient.key(), ext_amount);
+        // For a pure shielded transfer (`ext_amount == 0`), no lamports leave
+        // the vault and the circuit/wallet always prove `recipient = [0u8; 32]`
+        // (`Pubkey::default()`), whereas the transaction account slot must carry
+        // a writable system-owned account (e.g. `authority`) because `[0u8; 32]`
+        // is `system_program::ID` (owned by `NativeLoader`, which cannot be
+        // marked writable in a Solana `Message` or pass `SystemAccount<'info>`).
+        let ext_recipient = if ext_amount == 0 {
+            Pubkey::default()
+        } else {
+            ctx.accounts.recipient.key()
+        };
+        let ext_data_hash = transact_ext_data_hash(&ext_recipient, ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
 
         // Reject an inactive settling validator up front, before any expensive
@@ -494,7 +505,7 @@ pub mod paraloom_program {
             new_root,
             ext_amount,
             fee,
-            recipient: ctx.accounts.recipient.key(),
+            recipient: ext_recipient,
             timestamp: now,
             settlement_id,
         });
