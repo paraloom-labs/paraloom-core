@@ -237,6 +237,39 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// Look up the validator bound to a given co-sign `wallet_pubkey` (#916).
+    pub fn get_validator_by_wallet(&self, wallet: &str) -> Option<&ValidatorInfo> {
+        self.validators
+            .values()
+            .find(|v| v.wallet_pubkey.as_deref() == Some(wallet))
+    }
+
+    /// Evict any existing validator entry (other than `keep_node`) that claims
+    /// `wallet` (#916). Ensures at most one `NodeId` represents a given
+    /// on-chain wallet so a rotated or duplicate `NodeId` cannot multiply that
+    /// wallet's stake weight or inflate the active validator count.
+    pub fn evict_other_nodes_with_wallet(
+        &mut self,
+        keep_node: &NodeId,
+        wallet: &str,
+    ) -> Vec<NodeId> {
+        let evicted: Vec<NodeId> = self
+            .validators
+            .iter()
+            .filter_map(|(id, info)| {
+                if id != keep_node && info.wallet_pubkey.as_deref() == Some(wallet) {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in &evicted {
+            self.validators.remove(id);
+        }
+        evicted
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self

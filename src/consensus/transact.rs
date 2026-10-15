@@ -32,6 +32,10 @@ pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
 /// Default reputation floor for consensus participation. A validator below this
 /// may still submit a vote, but the result is computed as if it had not.
 pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
+
+/// Default consecutive-timeout streak before a validator is flagged with
+/// [`crate::consensus::slashing::SlashingEvidence::PersistentUnavailability`].
+pub const DEFAULT_UNAVAILABILITY_STREAK_THRESHOLD: u64 = 3;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -388,7 +392,11 @@ impl TransactVerificationCoordinator {
         if let Some(path) = &self.equivocators_path {
             match serde_json::to_vec(set) {
                 Ok(bytes) => {
-                    if let Err(e) = std::fs::write(path, bytes) {
+                    let tmp_path = path.with_extension("json.tmp");
+                    let written = std::fs::write(&tmp_path, &bytes)
+                        .and_then(|()| std::fs::rename(&tmp_path, path))
+                        .or_else(|_| std::fs::write(path, &bytes));
+                    if let Err(e) = written {
                         log::warn!("could not persist equivocators to {:?}: {}", path, e);
                     }
                 }
@@ -477,6 +485,7 @@ impl TransactVerificationCoordinator {
                 || !rec.vote.is_valid()
                 || equivocators.contains(wallet)
                 || !onchain_stakes.contains_key(wallet)
+                || !self.wallet_meets_reputation_floor(wallet).await
             {
                 continue;
             }
@@ -517,13 +526,42 @@ impl TransactVerificationCoordinator {
         met
     }
 
+    /// Whether the validator bound to `wallet` (if registered in the reputation
+    /// tracker) meets [`DEFAULT_MIN_REPUTATION_FOR_CONSENSUS`] (#916).
+    async fn wallet_meets_reputation_floor(&self, wallet: &str) -> bool {
+        let node_id = {
+            let sel = self.leader_selector.read().await;
+            sel.get_validator_by_wallet(wallet)
+                .map(|v| v.node_id.clone())
+        };
+        match node_id {
+            Some(id) => self
+                .reputation_tracker
+                .get_reputation(&id)
+                .await
+                .map(|rep| rep >= DEFAULT_MIN_REPUTATION_FOR_CONSENSUS)
+                .unwrap_or(true),
+            None => true,
+        }
+    }
+
     /// The eligibility basis for counting: the staked on-chain co-sign wallets
-    /// minus any banned for equivocation. Replaces the flap-prone
+    /// minus any banned for equivocation or penalized below
+    /// [`DEFAULT_MIN_REPUTATION_FOR_CONSENSUS`]. Replaces the flap-prone
     /// `active_snapshot()` NodeId set at every tally call site.
     async fn eligible_wallets(&self) -> HashSet<String> {
-        let onchain = self.onchain_wallets.read().await;
-        let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        let candidates: Vec<String> = {
+            let onchain = self.onchain_wallets.read().await;
+            let equivocators = self.equivocators.read().await;
+            onchain.difference(&equivocators).cloned().collect()
+        };
+        let mut eligible = HashSet::with_capacity(candidates.len());
+        for w in candidates {
+            if self.wallet_meets_reputation_floor(&w).await {
+                eligible.insert(w);
+            }
+        }
+        eligible
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -568,6 +606,11 @@ impl TransactVerificationCoordinator {
         &self.slashing_tracker
     }
 
+    /// Reference to the validator reputation tracker (tests/pipelines read it).
+    pub fn reputation_tracker(&self) -> &Arc<ReputationTracker> {
+        &self.reputation_tracker
+    }
+
     /// Register a validator into the transact consensus, mirroring the
     /// withdrawal coordinator (reputation tracker + leader selector).
     pub async fn register_validator(&self, validator: NodeId) {
@@ -609,6 +652,13 @@ impl TransactVerificationCoordinator {
         }
 
         let mut validators = self.validators.write().await;
+        let mut leader_selector = self.leader_selector.write().await;
+        if let Some(ref w) = wallet_pubkey {
+            let evicted = leader_selector.evict_other_nodes_with_wallet(&validator, w);
+            if !evicted.is_empty() {
+                validators.retain(|v| !evicted.contains(v));
+            }
+        }
         if !validators.contains(&validator) {
             log::info!(
                 "Validator registered for transact consensus: {:?} (wallet: {:?})",
@@ -617,10 +667,18 @@ impl TransactVerificationCoordinator {
             );
             validators.push(validator.clone());
         }
+        drop(validators);
+        drop(leader_selector);
 
         self.reputation_tracker
             .register_validator(validator.clone())
             .await;
+
+        let rep = self
+            .reputation_tracker
+            .get_reputation(&validator)
+            .await
+            .unwrap_or(crate::consensus::reputation::BASE_REPUTATION);
 
         // Preserve an existing leader-selector entry's stake/reputation; only a
         // new validator is added with defaults, and an existing one only adopts a
@@ -629,10 +687,12 @@ impl TransactVerificationCoordinator {
         // clobbers a known wallet or resets accumulated state.
         let mut leader_selector = self.leader_selector.write().await;
         match leader_selector.get_validator(&validator).cloned() {
-            Some(existing) => {
+            Some(mut existing) => {
+                existing.reputation = rep;
                 if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
-                    leader_selector.update_validator(existing.with_wallet(wallet_pubkey));
+                    existing = existing.with_wallet(wallet_pubkey);
                 }
+                leader_selector.update_validator(existing);
                 // A reconnect re-activates a preserved (deactivated) entry;
                 // its stake/wallet/reputation are kept intact (see
                 // `unregister_validator` -> `deactivate_validator`).
@@ -646,7 +706,7 @@ impl TransactVerificationCoordinator {
                 // peer a fixed stake, collapsing the stake-weighted quorum into
                 // head-count and making it Sybil-forgeable.
                 leader_selector.register_validator(
-                    ValidatorInfo::new(validator, 0, 1000).with_wallet(wallet_pubkey),
+                    ValidatorInfo::new(validator, 0, rep).with_wallet(wallet_pubkey),
                 );
             }
         }
@@ -912,6 +972,8 @@ impl TransactVerificationCoordinator {
                 log::warn!("could not penalise equivocator {:?}: {}", validator, e);
             }
             self.slashing_tracker.record(validator, evidence).await;
+        } else if result.vote.is_valid() {
+            let _ = self.reputation_tracker.record_success(&validator).await;
         }
 
         // Emit the approval the first time this vote completes a `Valid` quorum.
@@ -992,18 +1054,64 @@ impl TransactVerificationCoordinator {
     /// The ingress write-surface inserts a request before any vote arrives, so
     /// requests that never reach quorum must be reclaimed by a periodic sweep.
     pub async fn cleanup_timeouts(&self) -> Result<usize> {
-        let mut pending = self.pending.write().await;
-        let timed_out: Vec<String> = pending
-            .iter()
-            .filter(|(_, consensus)| consensus.tally.is_timed_out())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let count = timed_out.len();
-        for id in timed_out {
-            pending.remove(&id);
+        let mut timed_out_rounds: Vec<(String, TransactConsensus)> = Vec::new();
+        {
+            let mut pending = self.pending.write().await;
+            let timed_out_ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, consensus)| consensus.tally.is_timed_out())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in timed_out_ids {
+                if let Some(consensus) = pending.remove(&id) {
+                    timed_out_rounds.push((id, consensus));
+                }
+            }
+        }
+        let count = timed_out_rounds.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let active_validators = self.validators.read().await.clone();
+        for (id, consensus) in timed_out_rounds {
             // A content-bound canonical id that timed out must be re-approvable
             // if the client re-proves it, so drop any stale emitted mark too.
             self.emitted.write().await.remove(&id);
+
+            let (voted_nodes, voted_wallets): (HashSet<NodeId>, HashSet<String>) = {
+                let votes = consensus.tally.votes.read().await;
+                let nodes = votes.values().map(|r| r.node_id.clone()).collect();
+                let wallets = votes.keys().cloned().collect();
+                (nodes, wallets)
+            };
+
+            for validator in &active_validators {
+                let wallet = self.validator_wallet(validator).await;
+                let responded = voted_nodes.contains(validator)
+                    || wallet.as_ref().is_some_and(|w| voted_wallets.contains(w));
+                if !responded {
+                    let _ = self.reputation_tracker.record_timeout(validator).await;
+                    let streak = {
+                        let mut streaks = self.timeout_streaks.write().await;
+                        let entry = streaks.entry(validator.clone()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+                    if streak >= DEFAULT_UNAVAILABILITY_STREAK_THRESHOLD {
+                        self.slashing_tracker
+                            .record(
+                                validator.clone(),
+                                crate::consensus::slashing::SlashingEvidence::PersistentUnavailability {
+                                    streak_length: streak,
+                                    threshold: DEFAULT_UNAVAILABILITY_STREAK_THRESHOLD,
+                                },
+                            )
+                            .await;
+                    }
+                }
+            }
+
             log::warn!("Cleaned up timed out transact verification: {}", id);
         }
         Ok(count)
@@ -1571,5 +1679,123 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_wallet_registration_replaces_prior_node_id_without_inflating_validator_count(
+    ) {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(2, 2);
+
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("SAME_WALLET".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("SAME_WALLET".to_string()))
+            .await;
+
+        assert_eq!(
+            coordinator.validator_count().await,
+            1,
+            "rotating NodeId under the same wallet must replace the prior NodeId (#916)"
+        );
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        assert!(
+            coordinator
+                .start_verification(canonical_request())
+                .await
+                .is_err(),
+            "a single wallet registered under two NodeIds must not satisfy a 2-validator threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_timeouts_records_timeout_streaks_and_persistent_unavailability_slashing() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(2, 2);
+        let responsive = NodeId(vec![1]);
+        let unresponsive = NodeId(vec![2]);
+        coordinator
+            .register_validator_with_wallet(responsive.clone(), Some("W1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(unresponsive.clone(), Some("W2".to_string()))
+            .await;
+
+        for round in 0..DEFAULT_UNAVAILABILITY_STREAK_THRESHOLD {
+            let mut req = sample_request();
+            req.ext_amount = -100 - (round as i64);
+            req.request_id = req.canonical_id();
+            let id = req.request_id.clone();
+            coordinator.start_verification(req).await.unwrap();
+            coordinator
+                .submit_result(vote(&id, 1, "W1", true))
+                .await
+                .unwrap();
+
+            // Force the round past its deadline.
+            {
+                let mut pending = coordinator.pending.write().await;
+                pending.get_mut(&id).unwrap().tally.deadline = 0;
+            }
+            let swept = coordinator.cleanup_timeouts().await.unwrap();
+            assert_eq!(swept, 1);
+        }
+
+        let metrics = coordinator
+            .reputation_tracker()
+            .get_metrics(&unresponsive)
+            .await
+            .unwrap();
+        assert_eq!(metrics.timeouts, DEFAULT_UNAVAILABILITY_STREAK_THRESHOLD);
+        let records = coordinator
+            .slashing_tracker()
+            .for_validator(&unresponsive)
+            .await;
+        assert_eq!(
+            records.len(),
+            1,
+            "missing DEFAULT_UNAVAILABILITY_STREAK_THRESHOLD consecutive rounds must record PersistentUnavailability"
+        );
+        assert!(
+            coordinator
+                .slashing_tracker()
+                .for_validator(&responsive)
+                .await
+                .is_empty(),
+            "responsive validator must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_floor_excludes_penalized_validator_from_quorum() {
+        let (coord, mut approvals) = coord_2of2().await;
+        // Penalize validator 1 (wallet W1) below DEFAULT_MIN_REPUTATION_FOR_CONSENSUS (200).
+        for _ in 0..20 {
+            coord
+                .reputation_tracker()
+                .record_failure(&NodeId(vec![1]))
+                .await
+                .unwrap();
+        }
+        assert!(
+            coord
+                .reputation_tracker()
+                .get_reputation(&NodeId(vec![1]))
+                .await
+                .unwrap()
+                < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+        );
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "validator below DEFAULT_MIN_REPUTATION_FOR_CONSENSUS must not count toward quorum (#916)"
+        );
     }
 }
