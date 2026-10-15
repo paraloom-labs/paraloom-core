@@ -781,6 +781,57 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, status
                 );
 
+                // Verify that `source` is the validator assigned to `job_id`
+                // before mutating storage or manager state, and clear the
+                // coordinator assignment once accepted.
+                let source_id = source.to_string();
+                if let Some(coordinator) = &self.compute_coordinator {
+                    match coordinator.assigned_validator(&job_id).await {
+                        Some(expected) if expected == source_id => {}
+                        Some(expected) => {
+                            warn!(
+                                "Rejecting ComputeJobResult for {} from {}: assigned to {}",
+                                job_id, source_id, expected
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            let manager_matches = self
+                                .compute_manager
+                                .as_ref()
+                                .and_then(|m| m.assigned_validator(&job_id))
+                                .map(|expected| expected == source_id)
+                                .unwrap_or(false);
+                            if !manager_matches {
+                                warn!(
+                                    "Rejecting ComputeJobResult for unassigned/unknown job {} from {}",
+                                    job_id, source_id
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    let _ = coordinator.remove_assignment(&job_id).await;
+                } else if let Some(manager) = &self.compute_manager {
+                    match manager.assigned_validator(&job_id) {
+                        Some(expected) if expected == source_id => {}
+                        Some(expected) => {
+                            warn!(
+                                "Rejecting ComputeJobResult for {} from {}: assigned to {}",
+                                job_id, source_id, expected
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            warn!(
+                                "Rejecting ComputeJobResult for unassigned/unknown job {} from {}",
+                                job_id, source_id
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
                 // Store result and update job status
                 let result = crate::compute::JobResult {
                     job_id: job_id.clone(),

@@ -205,14 +205,38 @@ impl JobCoordinator {
     /// Assign a job to the best available validator
     pub async fn assign_job(&self, job_id: JobId) -> Result<Option<JobAssignment>> {
         let validators = self.validators.read().await;
+        let mut pending = self.pending_assignments.write().await;
+        let active = self.active_assignments.read().await;
 
-        // Find validator with lowest load factor and available capacity
+        let effective_load = |v: &CapacityAnnouncement,
+                              pending_map: &HashMap<JobId, JobAssignment>,
+                              active_map: &HashMap<JobId, JobAssignment>|
+         -> usize {
+            let pending_count = pending_map
+                .values()
+                .filter(|a| a.validator_id == v.validator_id)
+                .count();
+            let active_count = active_map
+                .values()
+                .filter(|a| a.validator_id == v.validator_id)
+                .count();
+            v.current_load + pending_count + active_count
+        };
+
+        // Find validator with lowest effective load factor and available capacity
         let best_validator = validators
             .values()
-            .filter(|v| v.available_capacity() > 0)
+            .filter(|v| {
+                v.max_concurrent_jobs > 0
+                    && effective_load(v, &pending, &active) < v.max_concurrent_jobs
+            })
             .min_by(|a, b| {
-                a.load_factor()
-                    .partial_cmp(&b.load_factor())
+                let load_a =
+                    effective_load(a, &pending, &active) as f64 / a.max_concurrent_jobs as f64;
+                let load_b =
+                    effective_load(b, &pending, &active) as f64 / b.max_concurrent_jobs as f64;
+                load_a
+                    .partial_cmp(&load_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
@@ -220,7 +244,6 @@ impl JobCoordinator {
             let assignment = JobAssignment::new(job_id.clone(), validator.validator_id.clone());
 
             // Store as pending assignment
-            let mut pending = self.pending_assignments.write().await;
             pending.insert(job_id.clone(), assignment.clone());
 
             debug!(
@@ -235,6 +258,18 @@ impl JobCoordinator {
             debug!("No available validators for job {}", job_id);
             Ok(None)
         }
+    }
+
+    /// Return the validator assigned to `job_id` (pending or active), if any.
+    pub async fn assigned_validator(&self, job_id: &JobId) -> Option<ValidatorId> {
+        {
+            let pending = self.pending_assignments.read().await;
+            if let Some(a) = pending.get(job_id) {
+                return Some(a.validator_id.clone());
+            }
+        }
+        let active = self.active_assignments.read().await;
+        active.get(job_id).map(|a| a.validator_id.clone())
     }
 
     /// Mark a job as fetched by the validator (moves from pending to active)
@@ -300,6 +335,7 @@ impl JobCoordinator {
                     if old_assignment.retry_count < MAX_JOB_RETRIES {
                         // Find best validator with available capacity
                         let validators = self.validators.read().await;
+                        let active = self.active_assignments.read().await;
                         let mut best_validator: Option<&CapacityAnnouncement> = None;
                         let mut best_load = usize::MAX;
 
@@ -309,7 +345,11 @@ impl JobCoordinator {
                                     .values()
                                     .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
-                                pending_count
+                                let active_count = active
+                                    .values()
+                                    .filter(|a| a.validator_id == validator.validator_id)
+                                    .count();
+                                validator.current_load + pending_count + active_count
                             };
 
                             if current_load < validator.max_concurrent_jobs
@@ -452,6 +492,7 @@ impl JobCoordinator {
                     if old_assignment.retry_count < MAX_JOB_RETRIES {
                         // Find best validator with available capacity
                         let validators = self.validators.read().await;
+                        let active = self.active_assignments.read().await;
                         let mut best_validator: Option<&CapacityAnnouncement> = None;
                         let mut best_load = usize::MAX;
 
@@ -461,7 +502,11 @@ impl JobCoordinator {
                                     .values()
                                     .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
-                                pending_count
+                                let active_count = active
+                                    .values()
+                                    .filter(|a| a.validator_id == validator.validator_id)
+                                    .count();
+                                validator.current_load + pending_count + active_count
                             };
 
                             if current_load < validator.max_concurrent_jobs
@@ -917,5 +962,40 @@ mod tests {
         // Job should be removed from pending
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.pending_assignments, 0);
+    }
+
+    #[tokio::test]
+    async fn test_assign_job_accounts_for_in_flight_assignments() {
+        let coordinator = JobCoordinator::new();
+
+        // Both validators announce current_load = 0, max_concurrent_jobs = 1
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(
+                ValidatorCapacity::new("v1".to_string(), 4, 8192, 1),
+                0,
+            ))
+            .await;
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(
+                ValidatorCapacity::new("v2".to_string(), 4, 8192, 1),
+                0,
+            ))
+            .await;
+
+        let a1 = coordinator
+            .assign_job("job1".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let a2 = coordinator
+            .assign_job("job2".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(a1.validator_id, a2.validator_id);
+
+        // Both validators are now at capacity (1 in-flight assignment each)
+        let a3 = coordinator.assign_job("job3".to_string()).await.unwrap();
+        assert!(a3.is_none());
     }
 }
