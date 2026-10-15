@@ -4,7 +4,9 @@
 //! transactions, decodes them via [`crate::bridge::solana::decoder`],
 //! and feeds the resulting events into the local privacy pool.
 
-use crate::bridge::solana::decoder::{extract_deposit_events, LISTENER_TX_ENCODING};
+use crate::bridge::solana::decoder::{
+    extract_bridge_events, BridgeProgramEvent, LISTENER_TX_ENCODING,
+};
 use crate::bridge::solana::rpc::BridgeRpc;
 use crate::bridge::{BridgeConfig, BridgeError, BridgeStats, DepositEvent, Result};
 use crate::privacy::poseidon_circom::v3_commit;
@@ -314,48 +316,90 @@ impl EventListener {
         (cursor, failed)
     }
 
-    /// Run a single poll cycle: fetch new signatures, decode any deposits,
-    /// process them into the pool. Returns the number of events processed.
+    /// Run a single poll cycle: fetch new signatures, decode any deposits or
+    /// settlement transactions, and index them into the pool. Returns the
+    /// number of events processed.
     async fn poll_events(state: &PollerState) -> Result<usize> {
         let cursor = *state.last_signature.read().await;
-        let events = Self::fetch_events(state, cursor).await?;
+        let scanned_batch = Self::fetch_scanned_batch(state, cursor).await?;
 
         let mut processed = 0;
         let mut latest_slot: u64 = 0;
-        // Per-signature outcome, in the ascending order deposits are processed,
-        // so the cursor can advance only through the unbroken run of successes.
+        // Per-signature outcome, in the ascending order transactions are
+        // processed, so the cursor can advance only through the unbroken run
+        // of successes.
         let mut outcomes: Vec<(Signature, bool)> = Vec::new();
 
-        for event in events {
-            let amount = event.amount;
-            let slot = event.block;
-            let sig_str = event.signature.clone();
-            let parsed = sig_str.parse::<Signature>().ok();
+        for (sig, sig_events) in scanned_batch {
+            if sig_events.is_empty() {
+                // Non-deposit/non-transact program transactions, chain-reverted
+                // transactions (`s.err.is_some()`), and already-seen signatures
+                // carry no new state-mutating events to apply on this poll, so
+                // they succeed trivially and allow the scan cursor to advance
+                // once all preceding signatures have succeeded.
+                outcomes.push((sig, true));
+                continue;
+            }
 
-            match Self::process_deposit(&state.pool, event).await {
-                Ok(_) => {
-                    processed += 1;
-                    let mut stats_guard = state.stats.write().await;
-                    stats_guard.total_deposits += 1;
-                    stats_guard.volume_deposited += amount;
-                    drop(stats_guard);
+            for bridge_event in sig_events {
+                match bridge_event {
+                    BridgeProgramEvent::Deposit(event) => {
+                        let amount = event.amount;
+                        let slot = event.block;
+                        let sig_str = event.signature.clone();
 
-                    if slot > latest_slot {
-                        latest_slot = slot;
+                        match Self::process_deposit(&state.pool, event).await {
+                            Ok(_) => {
+                                processed += 1;
+                                let mut stats_guard = state.stats.write().await;
+                                stats_guard.total_deposits += 1;
+                                stats_guard.volume_deposited += amount;
+                                drop(stats_guard);
+
+                                if slot > latest_slot {
+                                    latest_slot = slot;
+                                }
+                                outcomes.push((sig, true));
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    target: "paraloom::bridge::solana",
+                                    "failed to process deposit {}: {}",
+                                    sig_str,
+                                    e
+                                );
+                                outcomes.push((sig, false));
+                            }
+                        }
                     }
-                    if let Some(sig) = parsed {
-                        outcomes.push((sig, true));
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        target: "paraloom::bridge::solana",
-                        "failed to process deposit {}: {}",
-                        sig_str,
-                        e
-                    );
-                    if let Some(sig) = parsed {
-                        outcomes.push((sig, false));
+                    BridgeProgramEvent::Transact {
+                        signature: sig_str,
+                        nullifiers,
+                        output_commitments,
+                        block: slot,
+                    } => {
+                        match state
+                            .pool
+                            .index_transact_settlement(nullifiers, output_commitments)
+                            .await
+                        {
+                            Ok(()) => {
+                                processed += 1;
+                                if slot > latest_slot {
+                                    latest_slot = slot;
+                                }
+                                outcomes.push((sig, true));
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    target: "paraloom::bridge::solana",
+                                    "failed to index transact settlement {}: {}",
+                                    sig_str,
+                                    e
+                                );
+                                outcomes.push((sig, false));
+                            }
+                        }
                     }
                 }
             }
@@ -455,10 +499,30 @@ impl EventListener {
     /// Signatures already seen during this listener's lifetime are
     /// filtered out before the RPC fetch to avoid redundant
     /// `getTransaction` calls.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn fetch_events(
         state: &PollerState,
         cursor: Option<Signature>,
     ) -> Result<Vec<DepositEvent>> {
+        let batch = Self::fetch_scanned_batch(state, cursor).await?;
+        let mut deposits = Vec::new();
+        for (_sig, events) in batch {
+            for event in events {
+                if let BridgeProgramEvent::Deposit(deposit) = event {
+                    deposits.push(deposit);
+                }
+            }
+        }
+        Ok(deposits)
+    }
+
+    /// Fetch the chronological list of scanned program signatures newer than
+    /// `cursor` along with any decoded [`BridgeProgramEvent`]s for each
+    /// signature.
+    async fn fetch_scanned_batch(
+        state: &PollerState,
+        cursor: Option<Signature>,
+    ) -> Result<Vec<(Signature, Vec<BridgeProgramEvent>)>> {
         // RPC calls go through the BridgeRpc trait — RealBridgeRpc
         // handles the spawn_blocking + ClientError mapping, mocks
         // return canned data directly.
@@ -564,7 +628,11 @@ impl EventListener {
 
         // The RPC returns newest-first; we want to process in the order
         // the chain produced them so the cursor advances monotonically.
-        let mut to_fetch = Vec::with_capacity(signatures.len());
+        // Preserve every valid signature in chain order alongside whether its
+        // transaction body must be fetched (`!s.err.is_some() && !seen.contains(&sig)`),
+        // so that non-deposit, reverted, and already-seen signatures still
+        // participate in cursor advancement once all preceding signatures succeed.
+        let mut ordered_plan = Vec::with_capacity(signatures.len());
         {
             let seen = state.seen_signatures.read().await;
             for s in signatures.into_iter().rev() {
@@ -580,19 +648,19 @@ impl EventListener {
                         continue;
                     }
                 };
-                if s.err.is_some() {
-                    continue;
-                }
-                if seen.contains(&sig) {
-                    continue;
-                }
-                to_fetch.push(sig);
+                let needs_fetch = s.err.is_none() && !seen.contains(&sig);
+                ordered_plan.push((sig, needs_fetch));
             }
         }
 
-        let mut events = Vec::new();
-        let mut newly_seen = Vec::with_capacity(to_fetch.len());
-        for sig in to_fetch {
+        let mut scanned = Vec::with_capacity(ordered_plan.len());
+        let mut newly_seen = Vec::with_capacity(ordered_plan.len());
+        for (sig, needs_fetch) in ordered_plan {
+            if !needs_fetch {
+                scanned.push((sig, Vec::new()));
+                continue;
+            }
+
             let confirmed = match state.rpc.get_transaction(&sig, LISTENER_TX_ENCODING).await {
                 Ok(tx) => tx,
                 Err(e) => {
@@ -619,8 +687,8 @@ impl EventListener {
             };
 
             let sig_str = sig.to_string();
-            let mut decoded = extract_deposit_events(&sig_str, &confirmed, &state.program_id);
-            events.append(&mut decoded);
+            let decoded = extract_bridge_events(&sig_str, &confirmed, &state.program_id);
+            scanned.push((sig, decoded));
             newly_seen.push(sig);
         }
 
@@ -640,7 +708,7 @@ impl EventListener {
             }
         }
 
-        Ok(events)
+        Ok(scanned)
     }
 
     /// Process a single deposit event
@@ -1545,5 +1613,328 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_events_indexes_settled_transact_commitments_and_nullifiers() {
+        use crate::bridge::solana::instructions::{discriminators, TransactInstructionData};
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use crate::privacy::Nullifier;
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::{
+            EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
+            EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage, UiRawMessage,
+            UiTransaction,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let sig_dep_1 = Signature::new_unique();
+        let sig_transact = Signature::new_unique();
+        let sig_dep_2 = Signature::new_unique();
+
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+
+        let nullifiers = [[0xAA; 32], [0xBB; 32]];
+        let output_commitments = [[0xCC; 32], [0xDD; 32]];
+        let transact_payload = TransactInstructionData {
+            nullifiers,
+            output_commitments,
+            root: [0x11; 32],
+            ext_amount: 0,
+            proof: vec![9, 9, 9],
+        };
+        let mut transact_data = discriminators::TRANSACT.to_vec();
+        transact_data.extend_from_slice(&borsh::to_vec(&transact_payload).unwrap());
+        let transact_tx = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 20,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec![sig_transact.to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 1,
+                        },
+                        account_keys: vec![depositor.to_string(), program_id.to_string()],
+                        recent_blockhash: Hash::default().to_string(),
+                        instructions: vec![UiCompiledInstruction {
+                            program_id_index: 1,
+                            accounts: vec![0],
+                            data: bs58::encode(transact_data).into_string(),
+                            stack_height: None,
+                        }],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: None,
+                version: None,
+            },
+            block_time: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        // RPC returns newest-first: [sig_dep_2 (slot 30), sig_transact (slot 20), sig_dep_1 (slot 10)]
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![
+            status(&sig_dep_2, 30),
+            status(&sig_transact, 20),
+            status(&sig_dep_1, 10),
+        ]));
+        mock.get_transactions.lock().unwrap().insert(
+            sig_dep_1,
+            synth_deposit_tx(
+                sig_dep_1,
+                10,
+                &program_id,
+                &depositor,
+                1_000,
+                [1u8; 32],
+                [2u8; 32],
+            ),
+        );
+        mock.get_transactions
+            .lock()
+            .unwrap()
+            .insert(sig_transact, transact_tx);
+        mock.get_transactions.lock().unwrap().insert(
+            sig_dep_2,
+            synth_deposit_tx(
+                sig_dep_2,
+                30,
+                &program_id,
+                &depositor,
+                2_000,
+                [3u8; 32],
+                [4u8; 32],
+            ),
+        );
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(30));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(
+            processed, 3,
+            "deposit_1, transact, and deposit_2 must all process"
+        );
+        // 1 leaf from deposit_1 + 2 output commitments from transact + 1 leaf from deposit_2 = 4 leaves
+        assert_eq!(state.pool.commitment_count().await, 4);
+        assert!(state.pool.is_spent(&Nullifier(nullifiers[0])).await);
+        assert!(state.pool.is_spent(&Nullifier(nullifiers[1])).await);
+
+        // Verify leaf positions in the commitment tree match the on-chain append order:
+        // leaf 0 = deposit_1, leaf 1 = output_commitments[0], leaf 2 = output_commitments[1], leaf 3 = deposit_2.
+        let path_out_0 = state
+            .pool
+            .path(&Commitment(output_commitments[0]))
+            .await
+            .expect("output_commitments[0] must be in the tree");
+        let path_out_1 = state
+            .pool
+            .path(&Commitment(output_commitments[1]))
+            .await
+            .expect("output_commitments[1] must be in the tree");
+        // `MerklePath::indices` stores `!is_right_child` at each level:
+        // index 1 (right child at level 0, left child at level 1) -> [false, true]
+        // index 2 (left child at level 0, right child at level 1) -> [true, false]
+        // index 3 (right child at level 0, right child at level 1) -> [false, false]
+        assert_eq!(&path_out_0.indices[..2], &[false, true]);
+        assert_eq!(&path_out_1.indices[..2], &[true, false]);
+
+        let dep_2_commitment = Commitment(fr_to_bytes_32(v3_commit(
+            Fr::from(2_000u64),
+            Fr::from_le_bytes_mod_order(&[3u8; 32]),
+            Fr::from_le_bytes_mod_order(&[4u8; 32]),
+            Fr::from_le_bytes_mod_order(&crate::privacy::types::NATIVE_SOL_ASSET),
+        )));
+        let path_dep_2 = state
+            .pool
+            .path(&dep_2_commitment)
+            .await
+            .expect("deposit_2 commitment must be in the tree");
+        assert_eq!(
+            &path_dep_2.indices[..2],
+            &[false, false],
+            "deposit_2 must land at leaf index 3 ([false, false]) after transact's 2 output commitments, not leaf index 1 ([false, true])"
+        );
+        let root = state.pool.root().await;
+        assert!(path_out_0.verify(&output_commitments[0], &root));
+        assert!(path_out_1.verify(&output_commitments[1], &root));
+        assert!(path_dep_2.verify(dep_2_commitment.as_bytes(), &root));
+        assert_eq!(*state.last_signature.read().await, Some(sig_dep_2));
+    }
+
+    #[tokio::test]
+    async fn poll_events_advances_cursor_across_non_deposit_and_reverted_program_transactions() {
+        use crate::bridge::solana::instructions::discriminators;
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_sdk::transaction::TransactionError;
+        use solana_transaction_status::{
+            EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
+            EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage, UiRawMessage,
+            UiTransaction,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let sig_deposit = Signature::new_unique();
+        let sig_non_deposit = Signature::new_unique();
+        let sig_reverted = Signature::new_unique();
+
+        let non_deposit_tx = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 11,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec![sig_non_deposit.to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 1,
+                        },
+                        account_keys: vec![depositor.to_string(), program_id.to_string()],
+                        recent_blockhash: Hash::default().to_string(),
+                        instructions: vec![UiCompiledInstruction {
+                            program_id_index: 1,
+                            accounts: vec![0],
+                            data: bs58::encode(discriminators::CLAIM_REWARDS).into_string(),
+                            stack_height: None,
+                        }],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: None,
+                version: None,
+            },
+            block_time: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        // Newest-first: [sig_reverted (slot 12), sig_non_deposit (slot 11), sig_deposit (slot 10)]
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![
+            RpcConfirmedTransactionStatusWithSignature {
+                signature: sig_reverted.to_string(),
+                slot: 12,
+                err: Some(TransactionError::AlreadyProcessed),
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            },
+            RpcConfirmedTransactionStatusWithSignature {
+                signature: sig_non_deposit.to_string(),
+                slot: 11,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            },
+            RpcConfirmedTransactionStatusWithSignature {
+                signature: sig_deposit.to_string(),
+                slot: 10,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            },
+        ]));
+        mock.get_transactions.lock().unwrap().insert(
+            sig_deposit,
+            synth_deposit_tx(
+                sig_deposit,
+                10,
+                &program_id,
+                &depositor,
+                1_000,
+                [5u8; 32],
+                [6u8; 32],
+            ),
+        );
+        mock.get_transactions
+            .lock()
+            .unwrap()
+            .insert(sig_non_deposit, non_deposit_tx);
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(12));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 1);
+        assert_eq!(
+            *state.last_signature.read().await,
+            Some(sig_reverted),
+            "cursor must advance across trailing non-deposit and reverted program transactions"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_events_advances_cursor_past_already_seen_newer_signature_after_older_heals() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let older = Signature::new_unique();
+        let newer = Signature::new_unique();
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+
+        // Simulate the post-partial-failure state after Poll 1 where `older`
+        // failed `process_deposit` (and was removed from `seen_signatures` for
+        // retry while freezing `last_signature == None`), whereas `newer`
+        // succeeded and remained in `seen_signatures`.
+        state.seen_signatures.write().await.insert(newer);
+
+        // Poll 2: `older` is re-fetched and succeeds, while `newer` is skipped
+        // by `seen_signatures` (no `get_transaction` entry configured for `newer`).
+        // The cursor must advance all the way to `Some(newer)`, not stop at `Some(older)`.
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![status(&newer, 8), status(&older, 7)]));
+        mock.get_transactions.lock().unwrap().insert(
+            older,
+            synth_deposit_tx(
+                older,
+                7,
+                &program_id,
+                &depositor,
+                1_000,
+                [1u8; 32],
+                [2u8; 32],
+            ),
+        );
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(8));
+
+        let processed_2 = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed_2, 1);
+        assert_eq!(state.pool.commitment_count().await, 1);
+        assert_eq!(
+            *state.last_signature.read().await,
+            Some(newer),
+            "cursor must advance through the already-seen newer signature once the older signature succeeds"
+        );
     }
 }

@@ -224,6 +224,43 @@ impl ShieldedPool {
         }
     }
 
+    /// Index a settled on-chain `transact` / `transact_spl` into the pool.
+    ///
+    /// Both settlement instructions append `output_commitments[0]` and
+    /// `output_commitments[1]` to the shared on-chain `[b"merkle_tree"]` PDA and
+    /// initialize the two nullifier PDAs (`programs/paraloom/src/lib.rs`).
+    /// Mirroring those two leaf appends and spent nullifiers here keeps the
+    /// off-chain `commitment_tree` (leaf indices, Merkle paths, and root) and
+    /// `nullifier_set` aligned with on-chain state across all validators.
+    pub async fn index_transact_settlement(
+        &self,
+        nullifiers: [[u8; 32]; 2],
+        output_commitments: [[u8; 32]; 2],
+    ) -> Result<()> {
+        let c0 = Commitment(output_commitments[0]);
+        let c1 = Commitment(output_commitments[1]);
+
+        if c0 == c1 {
+            if !self.deposited.read().await.contains(&c0) {
+                self.commitment_tree.insert(&c0).await?;
+                self.commitment_tree.insert(&c1).await?;
+                self.deposited.write().await.insert(c0);
+            }
+        } else {
+            if !self.deposited.read().await.contains(&c0) {
+                self.commitment_tree.insert(&c0).await?;
+                self.deposited.write().await.insert(c0);
+            }
+            if !self.deposited.read().await.contains(&c1) {
+                self.commitment_tree.insert(&c1).await?;
+                self.deposited.write().await.insert(c1);
+            }
+        }
+
+        self.record_spent(nullifiers).await;
+        Ok(())
+    }
+
     /// Get the native-SOL shielded supply.
     ///
     /// Back-compat accessor preserved from the single-asset pool; equivalent
