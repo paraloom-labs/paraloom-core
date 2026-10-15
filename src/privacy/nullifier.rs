@@ -77,10 +77,13 @@ impl NullifierSet {
     }
 
     /// Batch check multiple nullifiers
-    /// Returns true if ALL nullifiers are new (not yet spent)
+    /// Returns true if ALL nullifiers are new (not yet spent) and pairwise distinct
     pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
         let set = self.nullifiers.read().await;
-        nullifiers.iter().all(|n| !set.contains(n))
+        let mut seen_in_batch = HashSet::with_capacity(nullifiers.len());
+        nullifiers
+            .iter()
+            .all(|n| !set.contains(n) && seen_in_batch.insert(n))
     }
 
     /// Batch insert multiple nullifiers, returning the count of newly
@@ -92,9 +95,10 @@ impl NullifierSet {
     pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
 
+        let mut seen_in_batch = HashSet::with_capacity(nullifiers.len());
         let new_nullifiers: Vec<Nullifier> = nullifiers
             .into_iter()
-            .filter(|n| !set.contains(n))
+            .filter(|n| !set.contains(n) && seen_in_batch.insert(n.clone()))
             .collect();
 
         if new_nullifiers.is_empty() {
@@ -312,5 +316,23 @@ mod tests {
             .await
             .expect("in-memory insert");
         assert!(set1.contains(&nullifier2).await);
+    }
+
+    #[tokio::test]
+    async fn check_batch_and_insert_batch_reject_or_deduplicate_intra_batch_duplicates() {
+        let set = NullifierSet::new();
+        let n1 = Nullifier([11u8; 32]);
+        let n2 = Nullifier([22u8; 32]);
+
+        // Duplicate unspent nullifiers in the same batch must fail check_batch.
+        assert!(!set.check_batch(&[n1.clone(), n1.clone()]).await);
+
+        // insert_batch with duplicates must only count unique newly-added nullifiers.
+        let inserted = set
+            .insert_batch(vec![n1.clone(), n1.clone(), n2.clone()])
+            .await
+            .expect("batch insert");
+        assert_eq!(inserted, 2);
+        assert_eq!(set.len().await, 2);
     }
 }

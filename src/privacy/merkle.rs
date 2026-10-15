@@ -63,22 +63,51 @@ impl MerkleTree {
         let commitments = storage.get_all_commitments()?;
         let leaves: Vec<[u8; 32]> = commitments.iter().map(|c| *c.as_bytes()).collect();
 
-        // Load cached root if available
-        let cached_root = storage.get_merkle_root()?;
+        // Load previously persisted root if available
+        let stored_root = storage.get_merkle_root()?;
 
-        // Seed the recent-roots window with the reloaded tip so a proof built
-        // against the just-restored root verifies immediately after a restart.
-        let recent_roots = match cached_root {
-            Some(r) => std::collections::VecDeque::from([r]),
-            None => std::collections::VecDeque::new(),
-        };
-        Ok(MerkleTree {
+        let tree = MerkleTree {
             depth: DEFAULT_TREE_DEPTH,
-            leaves: Arc::new(RwLock::new(leaves)),
-            cached_root: Arc::new(RwLock::new(cached_root)),
-            recent_roots: Arc::new(RwLock::new(recent_roots)),
-            storage: Some(storage),
-        })
+            leaves: Arc::new(RwLock::new(Vec::new())),
+            cached_root: Arc::new(RwLock::new(None)),
+            recent_roots: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            storage: Some(storage.clone()),
+        };
+
+        // Recompute the authoritative root from the persisted leaves whenever the
+        // pool is non-empty or a prior cached root exists on disk. `insert` and
+        // `insert_batch` clear only the in-memory `cached_root` and `set_merkle_root`
+        // is intentionally async (#59, #68), so `stored_root` lags behind `leaves`
+        // whenever deposits were credited after the last `root()` call or a crash
+        // occurred before `set_merkle_root` flushed.
+        let (cached_root, recent_roots) = if !leaves.is_empty() || stored_root.is_some() {
+            let current_root = tree.compute_root(&leaves);
+            let mut recent = std::collections::VecDeque::new();
+            if let Some(prev) = stored_root {
+                if prev != current_root {
+                    recent.push_back(prev);
+                }
+            }
+            recent.push_back(current_root);
+            if stored_root != Some(current_root) {
+                if let Err(e) = storage.set_merkle_root(&current_root) {
+                    log::warn!(
+                        target: "paraloom::privacy::merkle",
+                        "failed to refresh Merkle root cache on startup: {}",
+                        e
+                    );
+                }
+            }
+            (Some(current_root), recent)
+        } else {
+            (None, std::collections::VecDeque::new())
+        };
+
+        *tree.leaves.write().await = leaves;
+        *tree.cached_root.write().await = cached_root;
+        *tree.recent_roots.write().await = recent_roots;
+
+        Ok(tree)
     }
 
     /// Insert a commitment as a leaf, returning the index it was placed
@@ -264,6 +293,9 @@ impl MerkleTree {
 
     /// Verify a Merkle path
     pub async fn verify(&self, leaf: &[u8; 32], path: &MerklePath) -> bool {
+        if path.path.len() != self.depth || path.indices.len() != self.depth {
+            return false;
+        }
         let root = self.root().await;
         path.verify(leaf, &root)
     }
@@ -634,5 +666,60 @@ mod tests {
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
         );
+    }
+
+    #[tokio::test]
+    async fn with_storage_recomputes_stale_cached_root_after_subsequent_inserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("privacy.db");
+        let c1 = Commitment([1u8; 32]);
+        let c2 = Commitment([2u8; 32]);
+
+        let (root_after_one, expected_root_after_two) = {
+            let storage = Arc::new(PrivacyStorage::open(&db_path).unwrap());
+            let tree = MerkleTree::with_storage(storage).await.unwrap();
+            tree.insert(&c1).await.unwrap();
+            let r1 = tree.root().await; // persists merkle_root = r1
+
+            // Second deposit is inserted without calling root() before restart.
+            tree.insert(&c2).await.unwrap();
+            let expected = tree.root_after(&[]).await;
+            assert_ne!(r1, expected);
+            (r1, expected)
+        };
+
+        let storage = Arc::new(PrivacyStorage::open(&db_path).unwrap());
+        let reloaded = MerkleTree::with_storage(storage).await.unwrap();
+        assert_eq!(reloaded.len().await, 2);
+        assert_eq!(
+            reloaded.root().await,
+            expected_root_after_two,
+            "reloaded tree must recompute root for all persisted leaves, not serve stale cached_root"
+        );
+        assert!(reloaded.knows_root(&expected_root_after_two).await);
+        assert!(reloaded.knows_root(&root_after_one).await);
+
+        let path1 = reloaded.path(1).await.unwrap();
+        assert!(reloaded.verify(c2.as_bytes(), &path1).await);
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_paths_not_matching_tree_depth() {
+        let tree = MerkleTree::new();
+        let c = Commitment([7u8; 32]);
+        tree.insert(&c).await.unwrap();
+        let root = tree.root().await;
+
+        // Empty path with leaf == root must be rejected by fixed-depth tree verification.
+        assert!(!tree.verify(&root, &MerklePath::empty()).await);
+
+        // Truncated (depth - 1) path for the internal node above leaf 0 must also be rejected.
+        let full_path = tree.path(0).await.unwrap();
+        let internal_node = MerkleTree::hash_pair(c.as_bytes(), &full_path.path[0]);
+        let truncated = MerklePath {
+            path: full_path.path[1..].to_vec(),
+            indices: full_path.indices[1..].to_vec(),
+        };
+        assert!(!tree.verify(&internal_node, &truncated).await);
     }
 }

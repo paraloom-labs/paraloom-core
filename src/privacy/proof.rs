@@ -305,6 +305,11 @@ impl ProofVerifier {
                 };
             }
         }
+        if nullifiers[0] == nullifiers[1] {
+            return VerificationResult::Invalid {
+                reason: "duplicate input nullifier in transact".to_string(),
+            };
+        }
         for commitment in output_commitments {
             if !is_canonical_le(commitment) {
                 return VerificationResult::Invalid {
@@ -661,5 +666,25 @@ mod tests {
         h.update(amount.to_le_bytes());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(withdraw_ext_data_hash(&recipient, amount), expected);
+    }
+
+    #[test]
+    fn transact_parts_rejects_duplicate_input_nullifiers() {
+        let dup = [7u8; 32];
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[dup, dup],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("duplicate input nullifier"), "{reason}")
+            }
+            _ => panic!("duplicate input nullifiers must be invalid"),
+        }
     }
 }
