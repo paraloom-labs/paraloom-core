@@ -227,6 +227,14 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 info!("Received Pong from {}", source);
             }
             Message::Discovery { node_info } => {
+                if node_info.id != source {
+                    log::warn!(
+                        "dropping discovery from {:?}: claimed node_info.id {:?} != sender",
+                        source,
+                        node_info.id
+                    );
+                    return Ok(());
+                }
                 info!("Discovered node {}: {:?}", source, node_info);
 
                 // If we're a coordinator, register this validator
@@ -247,9 +255,14 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // quorum-sized set, and leader selection weighs these members.
                 // Independent of the compute coordinator above — a
                 // bridge-enabled validator node has the former without being a
-                // compute Coordinator.
+                // compute Coordinator, and may be configured as either
+                // `ResourceProvider` or `Bridge` (matching `runs_bridge` in
+                // `Node::new`, #914).
                 if let Some(transact) = &self.transact_coordinator {
-                    if node_info.node_type == NodeType::ResourceProvider {
+                    if matches!(
+                        node_info.node_type,
+                        NodeType::ResourceProvider | NodeType::Bridge
+                    ) {
                         transact
                             .register_validator_with_wallet(
                                 source.clone(),
@@ -910,6 +923,31 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             });
         }
 
+        // Bind `payload.authority` to the requester's registered co-sign wallet
+        // when known (#914): #723 keys the per-nullifier co-sign budget on
+        // `(nullifier, payload.authority)` assuming a peer can only submit under
+        // its own authority, so a registered peer that sets `payload.authority`
+        // to another validator's (the leader's) pubkey must be declined before
+        // it can exhaust that authority's budget.
+        if let Some(coordinator) = &self.transact_coordinator {
+            if let Some(source_wallet) = coordinator.validator_wallet(&source).await {
+                let expected_authority = source_wallet.parse::<Pubkey>().ok();
+                let payload_authority = CoSignPayload::from_bytes(&request.message)
+                    .ok()
+                    .map(|p| Pubkey::new_from_array(p.authority));
+                if expected_authority.is_none() || expected_authority != payload_authority {
+                    log::warn!(
+                        "declining co-sign request from {source:?}: payload authority does not match registered wallet {source_wallet}"
+                    );
+                    return Ok(CoSignResponse {
+                        request_id: request.request_id,
+                        wallet_pubkey: String::new(),
+                        signature: None,
+                    });
+                }
+            }
+        }
+
         // Pin the program to our own config before the signer sees the request:
         // an unparseable configured id means we cannot bind it, so decline
         // rather than sign against a requester-supplied program.
@@ -1124,6 +1162,36 @@ async fn cosign_settlement(
 /// whether the nullifier landed and reports `AlreadySettled`.
 fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
     matches!(e, crate::bridge::BridgeError::AlreadySettled)
+}
+
+/// Build the deduplicated `(quorum_wallets, peers)` pair for a co-signing
+/// settlement round (#914). Excludes `self_id`, skips unparseable or missing
+/// wallets, and deduplicates by wallet `Pubkey` against `leader_pubkey` and
+/// earlier voters so on-chain settlement never fails with
+/// `BridgeError::DuplicateValidatorSigners`.
+fn build_cosign_peer_set(
+    leader_pubkey: Pubkey,
+    self_id: &NodeId,
+    voters_with_wallets: impl IntoIterator<Item = (NodeId, Option<String>)>,
+) -> (Vec<Pubkey>, Vec<(Pubkey, NodeId)>) {
+    let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+    let mut seen_wallets: std::collections::HashSet<Pubkey> =
+        std::collections::HashSet::from([leader_pubkey]);
+    for (voter, wallet) in voters_with_wallets {
+        if &voter == self_id {
+            continue;
+        }
+        if let Some(wallet) = wallet {
+            if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                if seen_wallets.insert(pubkey) {
+                    peers.push((pubkey, voter));
+                }
+            }
+        }
+    }
+    let mut quorum_wallets = vec![leader_pubkey];
+    quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+    (quorum_wallets, peers)
 }
 
 /// Decide which admitted validators to deactivate on one connectivity-reconcile
@@ -1723,6 +1791,18 @@ impl Node {
         // dropped, so the set tracks real connectivity independent of gossip
         // timing. A wallet learned via Discovery is preserved — registration is
         // wallet-preserving — and is what the #260 co-sign step uses.
+        // Initialize the Solana bridge BEFORE seeding the validator allowlist
+        // and spawning the stake reconciler (#914). `Bridge::new` leaves
+        // `solana_bridge` as `None` until `bridge.init(pool)` runs, so calling
+        // `list_validator_stakes` / `registry_total_active_stake` before
+        // `bridge.init` unconditionally failed with `ConfigError("Solana bridge
+        // not initialized")`, leaving the allowlist empty (fail-open) and the
+        // stake denominator 0 for the first 60s reconciler interval.
+        if let (Some(bridge), Some(pool)) = (&self.bridge, &self.shielded_pool) {
+            let mut guard = bridge.lock().await;
+            guard.init(pool.clone()).await?;
+        }
+
         // Seed the on-chain validator allowlist ONCE, synchronously, before the
         // reconcilers spawn — so the registration gate is armed from t=0 and no
         // peer slips in during an empty-allowlist fail-open window.
@@ -2075,14 +2155,13 @@ impl Node {
             info!("Result reporting started for ResourceProvider node");
         }
 
-        // Start the Solana bridge deposit listener (#163). On a
-        // bridge-enabled validator/bridge node this spawns the
-        // EventListener, which polls Solana and indexes deposit
+        // Start the Solana bridge deposit listener (#163). `bridge.init` ran
+        // earlier before the startup validator allowlist seed (#914); this
+        // spawns the EventListener, which polls Solana and indexes deposit
         // commitments into the shielded pool so a withdrawing client
         // can later obtain a Merkle path for the note it spends.
-        if let (Some(bridge), Some(pool)) = (&self.bridge, &self.shielded_pool) {
+        if let (Some(bridge), Some(_pool)) = (&self.bridge, &self.shielded_pool) {
             let mut bridge = bridge.lock().await;
-            bridge.init(pool.clone()).await?;
             bridge.start().await?;
             info!("Solana bridge deposit listener started");
         }
@@ -2419,20 +2498,17 @@ impl Node {
         // The validators that approved this transact become the co-signer
         // quorum, mapped to their advertised settlement wallets; the leader
         // signs as itself and is excluded from the peers it requests from.
+        // Deduplicate by wallet pubkey (#914) so a peer sharing the leader's
+        // wallet or two voters sharing one wallet can never produce duplicate
+        // validator signers on-chain (`BridgeError::DuplicateValidatorSigners`).
         let self_id = self.node_info.id.clone();
-        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+        let mut voters_with_wallets = Vec::new();
         for voter in coordinator.valid_voters(&request.request_id).await {
-            if voter == self_id {
-                continue;
-            }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
-                }
-            }
+            let wallet = coordinator.validator_wallet(&voter).await;
+            voters_with_wallets.push((voter, wallet));
         }
-        let mut quorum_wallets = vec![leader.pubkey()];
-        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+        let (quorum_wallets, peers) =
+            build_cosign_peer_set(leader.pubkey(), &self_id, voters_with_wallets);
         let threshold = quorum_wallets.len();
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
@@ -3633,5 +3709,177 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn discovery_registers_bridge_node_and_rejects_mismatched_node_id() {
+        use crate::network::protocol::NetworkEventHandler;
+        use crate::types::ResourceContribution;
+
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let coordinator = node.transact_coordinator.as_ref().unwrap();
+
+        let bridge_peer = NodeId(vec![0xB1, 0xB2]);
+        let bridge_wallet = Keypair::new().pubkey().to_string();
+        let resources = ResourceContribution {
+            cpu_cores: 4,
+            memory_mb: 4096,
+            storage_mb: 10240,
+            bandwidth_kbps: 1000,
+        };
+
+        // Spoofed discovery where node_info.id != source must be ignored.
+        node.handle_message(
+            bridge_peer.clone(),
+            Message::Discovery {
+                node_info: NodeInfo {
+                    id: NodeId(vec![0xFF]),
+                    node_type: NodeType::Bridge,
+                    resources: resources.clone(),
+                    address: "/ip4/127.0.0.1/tcp/9001".to_string(),
+                    wallet_pubkey: Some(bridge_wallet.clone()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !coordinator.is_registered_validator(&bridge_peer).await,
+            "Discovery with mismatched node_info.id != source must be rejected"
+        );
+
+        // Authentic NodeType::Bridge discovery registers in transact_coordinator.
+        node.handle_message(
+            bridge_peer.clone(),
+            Message::Discovery {
+                node_info: NodeInfo {
+                    id: bridge_peer.clone(),
+                    node_type: NodeType::Bridge,
+                    resources,
+                    address: "/ip4/127.0.0.1/tcp/9001".to_string(),
+                    wallet_pubkey: Some(bridge_wallet.clone()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            coordinator.is_registered_validator(&bridge_peer).await,
+            "NodeType::Bridge validator must be registered on Discovery"
+        );
+        assert_eq!(
+            coordinator.validator_wallet(&bridge_peer).await,
+            Some(bridge_wallet)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_cosign_request_rejects_payload_authority_mismatch_preserving_leader_budget() {
+        use crate::network::protocol::NetworkEventHandler;
+
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        settings.bridge.program_id = configured_program().to_string();
+        let mut node = Node::new(settings).expect("construct node");
+        let signer_kp = Arc::new(Keypair::new());
+        node.cosign_keypair = Some(signer_kp.clone());
+
+        let leader_kp = Keypair::new();
+        let forger_kp = Keypair::new();
+        let leader_peer = NodeId(vec![0x10]);
+        let forger_peer = NodeId(vec![0x20]);
+
+        let coordinator = node.transact_coordinator.as_ref().unwrap();
+        coordinator
+            .register_validator_with_wallet(
+                leader_peer.clone(),
+                Some(leader_kp.pubkey().to_string()),
+            )
+            .await;
+        coordinator
+            .register_validator_with_wallet(
+                forger_peer.clone(),
+                Some(forger_kp.pubkey().to_string()),
+            )
+            .await;
+        node.apply_onchain_stakes(HashMap::from([
+            (leader_kp.pubkey().to_string(), 1_000_000_000),
+            (forger_kp.pubkey().to_string(), 1_000_000_000),
+        ]))
+        .await;
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        node.verified_transacts.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        // Forger sends CoSignRequests claiming `payload.authority = leader_kp.pubkey()`.
+        let spoofed_leader_payload = ta_payload(
+            leader_kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
+            let resp = node
+                .handle_cosign_request(
+                    forger_peer.clone(),
+                    cosign_req("t1", SettlementKind::Transact, &spoofed_leader_payload),
+                )
+                .await
+                .unwrap();
+            assert!(
+                resp.signature.is_none(),
+                "forger claiming leader's authority must be declined"
+            );
+        }
+
+        // Legitimate leader's request under its own authority succeeds because its budget was untouched.
+        let legit_resp = node
+            .handle_cosign_request(
+                leader_peer,
+                cosign_req("t1", SettlementKind::Transact, &spoofed_leader_payload),
+            )
+            .await
+            .unwrap();
+        assert!(
+            legit_resp.signature.is_some(),
+            "legitimate leader must still receive a co-signature"
+        );
+    }
+
+    #[test]
+    fn build_cosign_peer_set_deduplicates_leader_and_duplicate_peer_wallets() {
+        let leader_pk = Keypair::new().pubkey();
+        let peer1_pk = Keypair::new().pubkey();
+        let peer2_pk = Keypair::new().pubkey();
+        let self_id = NodeId(vec![0]);
+
+        let voters = vec![
+            (self_id.clone(), Some(leader_pk.to_string())),
+            // Peer 1 shares leader's wallet -> must be excluded.
+            (NodeId(vec![1]), Some(leader_pk.to_string())),
+            // Peer 2 and Peer 3 share peer1_pk -> only first included.
+            (NodeId(vec![2]), Some(peer1_pk.to_string())),
+            (NodeId(vec![3]), Some(peer1_pk.to_string())),
+            // Peer 4 has distinct peer2_pk -> included.
+            (NodeId(vec![4]), Some(peer2_pk.to_string())),
+        ];
+
+        let (quorum_wallets, peers) = build_cosign_peer_set(leader_pk, &self_id, voters);
+        assert_eq!(quorum_wallets, vec![leader_pk, peer1_pk, peer2_pk]);
+        assert_eq!(
+            peers,
+            vec![(peer1_pk, NodeId(vec![2])), (peer2_pk, NodeId(vec![4]))]
+        );
     }
 }
