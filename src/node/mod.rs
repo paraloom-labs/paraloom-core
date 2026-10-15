@@ -1143,6 +1143,27 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
 /// `threshold` misses is returned for deactivation and dropped from tracking
 /// (re-admitted when it reconnects). A genuinely gone peer is still deactivated
 /// after `threshold` ticks.
+/// Seed `known` with any remote validators already admitted into the transact
+/// coordinator (via `Message::Discovery`), excluding `local_node_id` (which is
+/// self-registered when initiating a verification and never appears in
+/// `connected_peers()`).
+///
+/// Without this, a peer that connected, announced `Discovery`, and disconnected
+/// between two reconciler ticks — or was (re-)registered via multi-hop gossip
+/// while absent from `connected` — never entered `known` and remained active in
+/// `TransactVerificationCoordinator` indefinitely.
+fn seed_admitted_peers(
+    known: &mut std::collections::HashSet<NodeId>,
+    admitted: &[NodeId],
+    local_node_id: &NodeId,
+) {
+    for peer in admitted {
+        if peer != local_node_id {
+            known.insert(peer.clone());
+        }
+    }
+}
+
 fn reconcile_deactivations(
     known: &mut std::collections::HashSet<NodeId>,
     misses: &mut HashMap<NodeId, u32>,
@@ -1756,6 +1777,7 @@ impl Node {
         if self.transact_coordinator.is_some() {
             let network = Arc::clone(&self.network);
             let transact = self.transact_coordinator.clone();
+            let local_node_id = self.node_info.id.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
                 // Deactivate a co-signer only after it has been absent for this
@@ -1769,6 +1791,10 @@ impl Node {
                     ticker.tick().await;
                     let connected: std::collections::HashSet<NodeId> =
                         network.connected_peers().await.into_iter().collect();
+                    if let Some(t) = &transact {
+                        let admitted = t.registered_validators().await;
+                        seed_admitted_peers(&mut known, &admitted, &local_node_id);
+                    }
                     // Registration is Discovery-driven ONLY (wallet-bearing and
                     // gated to on-chain validators). The old wallet=None
                     // registration here re-seeded a flapped validator at stake 0
@@ -2819,6 +2845,29 @@ mod tests {
         // Only peer 1 ever connects; peer 9 is never admitted.
         reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 1);
         assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[1]), 1).is_empty());
+    }
+
+    #[test]
+    fn discovery_admitted_peer_absent_from_connected_is_deactivated_while_local_node_is_excluded() {
+        let mut known = std::collections::HashSet::new();
+        let mut misses = HashMap::new();
+        let local = node_id(1);
+        let remote = node_id(2);
+        let admitted = vec![local.clone(), remote.clone()];
+
+        // Peer 2 was admitted via Discovery between ticks (or re-activated via
+        // multi-hop gossip) and is absent from `connected`; local node 1 is
+        // self-registered and never in `connected_peers()`.
+        seed_admitted_peers(&mut known, &admitted, &local);
+        assert!(!known.contains(&local));
+        assert!(known.contains(&remote));
+
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[]), 3).is_empty());
+        seed_admitted_peers(&mut known, &admitted, &local);
+        assert!(reconcile_deactivations(&mut known, &mut misses, &set(&[]), 3).is_empty());
+        seed_admitted_peers(&mut known, &admitted, &local);
+        let dropped = reconcile_deactivations(&mut known, &mut misses, &set(&[]), 3);
+        assert_eq!(dropped, vec![remote]);
     }
 
     // --- #260/#350 co-sign handler (cosign_settlement), v3 transact ---

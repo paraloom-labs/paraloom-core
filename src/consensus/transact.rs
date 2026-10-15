@@ -767,6 +767,11 @@ impl TransactVerificationCoordinator {
         self.validators.read().await.len()
     }
 
+    /// Snapshot of currently registered active validators.
+    pub async fn registered_validators(&self) -> Vec<NodeId> {
+        self.validators.read().await.clone()
+    }
+
     /// Whether `node_id` is in the active validator set. Used to authenticate
     /// the source of a co-sign request (#648): only a registered validator may
     /// drive a co-sign round, so an unregistered mesh peer cannot copy a spend's
