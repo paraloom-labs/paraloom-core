@@ -1089,6 +1089,13 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                         JobStatus::Failed { error } => {
                             println!("\n[ERROR] Job failed: {}", error);
                         }
+                        JobStatus::TimedOut => {
+                            if let Some(error) = &job_result.error {
+                                println!("\n[WARN] Job timed out: {}", error);
+                            } else {
+                                println!("\n[WARN] Job timed out");
+                            }
+                        }
                         _ => {
                             println!("\n[WARN] Job not yet completed");
                             println!(

@@ -180,17 +180,33 @@ impl JobExecutor {
                         // Execute in separate task
                         let engine_clone = engine.clone();
                         let active_jobs_clone = active_jobs.clone();
+                        let completed_results_clone = completed_results.clone();
                         let result_tx_clone = result_tx.clone();
 
                         task::spawn(async move {
-                            // Execute the job
-                            let result = match engine_clone.execute_job(&job) {
-                                Ok(r) => r,
-                                Err(e) => {
+                            // Execute CPU-bound WASM job on the blocking pool so it cannot
+                            // starve Tokio async worker threads.
+                            let job_for_exec = job.clone();
+                            let exec_outcome = task::spawn_blocking(move || {
+                                engine_clone.execute_job(&job_for_exec)
+                            })
+                            .await;
+
+                            let result = match exec_outcome {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
                                     warn!("Job {} execution error: {}", job_id, e);
                                     JobResult::failure(
                                         job_id.clone(),
                                         format!("Execution error: {}", e),
+                                        0,
+                                    )
+                                }
+                                Err(join_err) => {
+                                    warn!("Job {} blocking task panicked: {}", job_id, join_err);
+                                    JobResult::failure(
+                                        job_id.clone(),
+                                        format!("Execution task panicked: {}", join_err),
                                         0,
                                     )
                                 }
@@ -200,6 +216,11 @@ impl JobExecutor {
                                 "Job {} execution completed with status: {:?}",
                                 job_id, result.status
                             );
+
+                            // Record into completed_results BEFORE removing from active_jobs so
+                            // callers polling get_job_status / get_job_result never observe a
+                            // window where an in-flight job disappears and returns None.
+                            Self::insert_completed_result(&completed_results_clone, result.clone());
 
                             // Remove from active jobs
                             {
@@ -227,6 +248,22 @@ impl JobExecutor {
         Ok(())
     }
 
+    fn insert_completed_result(
+        completed_results: &Arc<Mutex<HashMap<JobId, JobResult>>>,
+        result: JobResult,
+    ) {
+        let mut completed = completed_results.lock().unwrap();
+        // Bound the retained results so they cannot grow without limit as
+        // jobs finish (#610): evict an arbitrary older result before adding
+        // a new job id past the ceiling.
+        if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
+            if let Some(victim) = completed.keys().next().cloned() {
+                completed.remove(&victim);
+            }
+        }
+        completed.insert(result.job_id.clone(), result);
+    }
+
     /// Process completed job results
     async fn process_results(
         result_rx: Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
@@ -236,17 +273,7 @@ impl JobExecutor {
 
         while let Ok(result) = rx.try_recv() {
             debug!("Processing result for job {}", result.job_id);
-
-            let mut completed = completed_results.lock().unwrap();
-            // Bound the retained results so they cannot grow without limit as
-            // jobs finish (#610): evict an arbitrary older result before adding
-            // a new job id past the ceiling.
-            if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
-                if let Some(victim) = completed.keys().next().cloned() {
-                    completed.remove(&victim);
-                }
-            }
-            completed.insert(result.job_id.clone(), result);
+            Self::insert_completed_result(&completed_results, result);
         }
     }
 
@@ -271,7 +298,7 @@ impl JobExecutor {
                     total_memory += result.memory_used_bytes;
                     total_instructions += result.instructions_executed;
                 }
-                JobStatus::Failed { .. } => {
+                JobStatus::Failed { .. } | JobStatus::TimedOut => {
                     failed_count += 1;
                 }
                 _ => {}
@@ -406,5 +433,56 @@ mod tests {
         // bound (#610).
         let overflow = ComputeJob::new(vec![], vec![], ResourceLimits::default());
         assert!(executor.submit_job(overflow).is_err());
+    }
+
+    #[tokio::test]
+    async fn job_status_never_returns_none_during_completion_transition() {
+        let executor = JobExecutor::new().unwrap();
+        executor.start().await.unwrap();
+
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let job = ComputeJob::new(wasm_bytes, vec![1, 2, 3], ResourceLimits::default());
+        let job_id = executor.submit_job(job).unwrap();
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let status = executor.get_job_status(&job_id);
+            assert!(
+                status.is_some(),
+                "get_job_status must never return None while transitioning from active to completed"
+            );
+            if status == Some(JobStatus::Completed) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "job did not complete before test deadline"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let result = executor.get_job_result(&job_id);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status, JobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn timed_out_jobs_are_counted_in_failed_stats() {
+        let executor = JobExecutor::new().unwrap();
+        JobExecutor::insert_completed_result(
+            &executor.completed_results,
+            JobResult::timed_out("timeout-job".to_string(), 1, 1005),
+        );
+
+        let stats = executor.get_stats();
+        assert_eq!(stats.failed_jobs, 1);
     }
 }
