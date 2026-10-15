@@ -991,6 +991,7 @@ async fn cosign_settlement(
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -3382,6 +3383,89 @@ mod tests {
         assert_eq!(
             resp.signature, None,
             "a substituted ext_amount must be declined"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_native_transact_for_spl_verified_request_and_preserves_cap() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient_token_account = [9u8; 32];
+        let mint = [0xAA; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000i64;
+
+        let mut spl_req = ta_request(
+            "spl-1",
+            recipient_token_account,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        spl_req.mint = Some(mint);
+        tas.lock().await.insert("spl-1".to_string(), spl_req);
+
+        // A peer presenting a native-SOL SettlementParams::Transact payload for
+        // an SPL-verified request must be declined before touching cosign_counts,
+        // even when all other fields (and the on-chain authority) match.
+        let cross_asset_native = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient_token_account,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
+            let declined = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("spl-1", SettlementKind::Transact, &cross_asset_native),
+            )
+            .await;
+            assert_eq!(
+                declined.signature, None,
+                "native Transact payload must be declined for an SPL-verified request"
+            );
+        }
+
+        // The legitimate TransactSpl payload for the same request and authority
+        // must still be signed because the rejected cross-asset attempts did not
+        // consume the (nullifier, authority) co-sign budget.
+        let spl_payload = CoSignPayload {
+            program_id: [1u8; 32],
+            authority: kp.pubkey().to_bytes(),
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![kp.pubkey().to_bytes()],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account,
+                mint,
+                nullifiers,
+                output_commitments: outputs,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+        let signed = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("spl-1", SettlementKind::Transact, &spl_payload),
+        )
+        .await;
+        assert!(
+            signed.signature.is_some(),
+            "matching TransactSpl payload must still sign"
         );
     }
 
