@@ -569,7 +569,24 @@ impl PrivateJobCoordinator {
         // Step 3: Check multi-validator consensus (if enabled)
         if let Some(coordinator) = &self.verification_coordinator {
             match coordinator.check_consensus(&result.job_id).await? {
-                crate::compute::ConsensusResult::Agreed(_) => {
+                crate::compute::ConsensusResult::Agreed(agreed_result) => {
+                    let Some(agreed_output) = agreed_result.output_data.as_deref() else {
+                        log::warn!(
+                            "Consensus result for job {} is missing output data",
+                            result.job_id
+                        );
+                        return Ok(false);
+                    };
+                    let agreed_hash = PrivateComputeJob::hash_data(agreed_output);
+                    if agreed_hash != result.output_hash {
+                        log::warn!(
+                            "Private job {} result output_hash ({}) does not match validator consensus output_hash ({})",
+                            result.job_id,
+                            result.output_hash,
+                            agreed_hash
+                        );
+                        return Ok(false);
+                    }
                     log::info!(
                         "Multi-validator consensus reached for job {}",
                         result.job_id
@@ -1077,5 +1094,96 @@ mod tests {
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_verify_result_rejects_mismatched_consensus_output() {
+        use crate::compute::{JobResult, JobStatus, VerificationCoordinator};
+
+        let pool = Arc::new(ShieldedPool::new());
+        let verifier = Arc::new(VerificationCoordinator::new());
+        let coordinator = PrivateJobCoordinator::with_verification(pool, verifier.clone());
+
+        let job_id = "test-forged-private-output".to_string();
+        let owner_address = ShieldedAddress([66u8; 32]);
+
+        let validators = vec![
+            "validator-1".to_string(),
+            "validator-2".to_string(),
+            "validator-3".to_string(),
+        ];
+        verifier
+            .create_verification_request(job_id.clone(), validators.clone())
+            .await
+            .unwrap();
+
+        // 2/3 honest validators agree on [1, 2, 3, 4], 1 Byzantine validator reports [9, 9, 9, 9].
+        let agreed_output = vec![1, 2, 3, 4];
+        let forged_output = vec![9, 9, 9, 9];
+
+        for validator_id in validators.iter().take(2) {
+            verifier
+                .submit_result(
+                    &job_id,
+                    validator_id.clone(),
+                    JobResult {
+                        job_id: job_id.clone(),
+                        status: JobStatus::Completed,
+                        output_data: Some(agreed_output.clone()),
+                        error: None,
+                        execution_time_ms: 100,
+                        memory_used_bytes: 1024,
+                        instructions_executed: 50000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        verifier
+            .submit_result(
+                &job_id,
+                validators[2].clone(),
+                JobResult {
+                    job_id: job_id.clone(),
+                    status: JobStatus::Completed,
+                    output_data: Some(forged_output.clone()),
+                    error: None,
+                    execution_time_ms: 100,
+                    memory_used_bytes: 1024,
+                    instructions_executed: 50000,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Construct a PrivateJobResult from the Byzantine [9, 9, 9, 9] output.
+        let forged_private_result = PrivateJobResult::from_job_result(
+            job_id.clone(),
+            JobResult {
+                job_id: job_id.clone(),
+                status: JobStatus::Completed,
+                output_data: Some(forged_output),
+                error: None,
+                execution_time_ms: 100,
+                memory_used_bytes: 1024,
+                instructions_executed: 50000,
+            },
+            &owner_address,
+        )
+        .unwrap();
+
+        // Must be rejected because its output_hash does not match the 2/3 agreed output.
+        let verified = coordinator
+            .verify_result(&forged_private_result)
+            .await
+            .unwrap();
+        assert!(
+            !verified,
+            "PrivateJobResult whose output_hash mismatches the agreed validator output must be rejected"
+        );
+        assert!(coordinator
+            .finalize_result(forged_private_result)
+            .await
+            .is_err());
     }
 }
