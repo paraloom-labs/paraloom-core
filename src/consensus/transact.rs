@@ -817,16 +817,22 @@ impl TransactVerificationCoordinator {
             self.total_validators,
         );
 
+        const MAX_PENDING_TRANSACT_REQUESTS: usize = 4096;
+
+        let mut pending = self.pending.write().await;
+        if !pending.contains_key(&request_id) && pending.len() >= MAX_PENDING_TRANSACT_REQUESTS {
+            return Err(anyhow!(
+                "too many pending transact verification requests ({MAX_PENDING_TRANSACT_REQUESTS}), rejecting new request"
+            ));
+        }
+
         // Insert-if-absent: a duplicate start for an already in-flight canonical
         // id (a client retry or a re-broadcast) must not discard the votes
         // already collected for this round. The id is content-bound
         // (`canonical_id`), so an existing entry is the same settlement — keep
         // collecting on it rather than resetting the tally.
-        self.pending
-            .write()
-            .await
-            .entry(request_id.clone())
-            .or_insert(consensus);
+        pending.entry(request_id.clone()).or_insert(consensus);
+        drop(pending);
 
         log::info!("Started transact verification: {}", request_id);
         Ok(request_id)
@@ -1571,5 +1577,39 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn start_verification_caps_pending_requests() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(1, 1);
+        coordinator.register_validator(NodeId(vec![1])).await;
+
+        let mut first_req = None;
+        for i in 0..4096u32 {
+            let mut r = sample_request();
+            r.proof = i.to_le_bytes().to_vec();
+            r.request_id = r.canonical_id();
+            if first_req.is_none() {
+                first_req = Some(r.clone());
+            }
+            coordinator.start_verification(r).await.unwrap();
+        }
+
+        // Idempotent retry of an existing pending request still succeeds.
+        coordinator
+            .start_verification(first_req.unwrap())
+            .await
+            .expect("existing pending request must still be accepted");
+
+        // A new distinct request beyond the cap is rejected.
+        let mut overflow = sample_request();
+        overflow.proof = 999_999u32.to_le_bytes().to_vec();
+        overflow.request_id = overflow.canonical_id();
+        let err = coordinator
+            .start_verification(overflow)
+            .await
+            .expect_err("pending map must be capped");
+        assert!(err.to_string().contains("too many pending"));
     }
 }
