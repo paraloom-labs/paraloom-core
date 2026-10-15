@@ -2249,88 +2249,77 @@ impl Node {
                 .await;
         }
 
+        // Verify the proof locally BEFORE starting a consensus round or
+        // inserting into `coordinator.pending`. Under #755 an invalid proof is
+        // never broadcast to the mesh, so starting verification first stranded
+        // a dead pending round on multi-validator cohorts until timeout sweep
+        // and caused `POST /transact/submit` to return `200 OK` for a locally
+        // rejected proof.
+        match self.verify_transact_proof(&request).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(anyhow!("self-verify: transact proof verification failed"));
+            }
+            Err(e) => {
+                return Err(anyhow!("self-verify error: {e}"));
+            }
+        }
+
         let request_id = coordinator.start_verification(request.clone()).await?;
 
-        // The initiator does not receive its own gossip broadcast, so it must
-        // self-verify and submit its own vote — the withdrawal/transfer twins do
-        // the same. Without it a 2-node cohort only ever collects the remote vote
-        // and never reaches the quorum. Still one vote toward the BFT threshold,
-        // not a bypass of it.
-        let locally_valid = {
-            let vote = match self.verify_transact_proof(&request).await {
-                Ok(true) => {
-                    // Record the encrypted notes (#196) only AFTER the proof
-                    // verifies and only the first time we see this canonical
-                    // settlement — mirroring the mesh path (#382). Recording
-                    // before verify would let an invalid proof leave notes;
-                    // recording on every sighting would let a replay with
-                    // mutated (non-proof-bound) ciphertexts pollute and
-                    // FIFO-evict the authentic ciphertext.
-                    let already_seen = self
-                        .verified_transacts
-                        .lock()
-                        .await
-                        .contains_key(&request_id);
-                    if !already_seen {
-                        self.record_delivered_notes(
-                            &request.output_commitments,
-                            &request.ciphertexts,
-                            request.mint,
-                        )
-                        .await;
-                    }
-                    cache_verified(
-                        &self.verified_transacts,
-                        request_id.clone(),
-                        request.clone(),
-                    )
-                    .await;
-                    crate::consensus::vote_tally::VerificationVote::Valid
-                }
-                Ok(false) => crate::consensus::vote_tally::VerificationVote::Invalid {
-                    reason: "self-verify: proof verification failed".to_string(),
-                },
-                Err(e) => crate::consensus::vote_tally::VerificationVote::Invalid {
-                    reason: format!("self-verify error: {e}"),
-                },
-            };
-            let locally_valid =
-                matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid);
-            // Sign the self-vote with the co-sign key so it passes submit_result's
-            // structural backstop and counts under this node's own wallet. Without
-            // a co-sign keypair this node cannot settle anyway, so skip.
-            match self.signed_vote(request_id.clone(), vote) {
-                Some(result) => {
-                    if let Err(e) = coordinator.submit_result(result).await {
-                        log::debug!("self-vote submit_result dropped for {request_id}: {e}");
-                    }
-                }
-                None => log::warn!("no co-sign keypair; skipping self-vote for {request_id}"),
-            }
-            locally_valid
-        };
-
-        // Only broadcast a proof we ourselves verified as Valid. An invalid
-        // submission to the ingress is already recorded as a local Invalid vote
-        // and can never reach quorum, so broadcasting it would only let a flood
-        // of bad proofs make every mesh validator run a Groth16 verification
-        // (#755). A valid proof broadcasts exactly as before, so settlement is
-        // unaffected; only the amplification of invalid work is removed.
-        if locally_valid {
-            self.network
-                .send_message(
-                    NodeId(vec![]),
-                    Message::TransactVerificationRequest { request },
-                )
-                .await?;
+        // Record the encrypted notes (#196) only AFTER the proof verifies and
+        // consensus starts, and only the first time we see this canonical
+        // settlement — mirroring the mesh path (#382).
+        let already_seen = self
+            .verified_transacts
+            .lock()
+            .await
+            .contains_key(&request_id);
+        if !already_seen {
+            self.record_delivered_notes(
+                &request.output_commitments,
+                &request.ciphertexts,
+                request.mint,
+            )
+            .await;
         }
+        cache_verified(
+            &self.verified_transacts,
+            request_id.clone(),
+            request.clone(),
+        )
+        .await;
+
+        // The initiator does not receive its own gossip broadcast, so it must
+        // submit its own Valid vote. Without it a 2-node cohort only ever
+        // collects the remote vote and never reaches the quorum.
+        match self.signed_vote(
+            request_id.clone(),
+            crate::consensus::vote_tally::VerificationVote::Valid,
+        ) {
+            Some(result) => {
+                if let Err(e) = coordinator.submit_result(result).await {
+                    log::debug!("self-vote submit_result dropped for {request_id}: {e}");
+                }
+            }
+            None => log::warn!("no co-sign keypair; skipping self-vote for {request_id}"),
+        }
+
+        self.network
+            .send_message(
+                NodeId(vec![]),
+                Message::TransactVerificationRequest { request },
+            )
+            .await?;
         info!("initiated transact verification: {}", request_id);
         Ok(request_id)
     }
 
     /// Record the encrypted output notes of a transfer for recipient scanning
-    /// (#196), de-duplicated by `(commitment, ciphertext)` so the same transfer
-    /// seen via both ingress and gossip is stored once.
+    /// (#196), de-duplicated by `output_commitment` so the first verified
+    /// ciphertext for a commitment wins and replays (across `verified_transacts`
+    /// eviction or re-randomized proofs) cannot append mutated ciphertexts or
+    /// FIFO-evict authentic notes.
     async fn record_delivered_notes(
         &self,
         output_commitments: &[[u8; 32]; 2],
@@ -2353,14 +2342,18 @@ impl Node {
 
         let mut store = self.delivered_notes.lock().await;
         for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
+            if ciphertext.is_empty() {
+                continue;
+            }
             let note = transact_ingress::DeliveredNote {
                 output_commitment: hex::encode(commitment),
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            if store
+                .iter()
+                .any(|d| d.output_commitment == note.output_commitment)
+            {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3633,5 +3626,77 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_delivered_notes_deduplicates_by_commitment_and_skips_empty_ciphertexts() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let c0 = [0x11u8; 32];
+        let c1 = [0x22u8; 32];
+        let auth_ct0 = "aa".repeat(88);
+        let auth_ct1 = "bb".repeat(88);
+
+        node.record_delivered_notes(&[c0, c1], &[auth_ct0.clone(), auth_ct1.clone()], None)
+            .await;
+
+        // Replay of the same commitments with mutated ciphertexts (e.g. after
+        // `verified_transacts` eviction or a re-randomized Groth16 proof) must
+        // not append duplicate scan rows or overwrite the authentic ciphertexts.
+        node.record_delivered_notes(&[c0, c1], &["cc".repeat(88), "dd".repeat(88)], None)
+            .await;
+
+        // Empty ciphertexts (e.g. withdrawal / dummy output legs) must not be
+        // stored in the scan buffer.
+        node.record_delivered_notes(&[[0x33u8; 32], [0x44u8; 32]], &[String::new(), String::new()], None)
+            .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].output_commitment, hex::encode(c0));
+        assert_eq!(delivered[0].ciphertext, auth_ct0);
+        assert_eq!(delivered[1].output_commitment, hex::encode(c1));
+        assert_eq!(delivered[1].ciphertext, auth_ct1);
+    }
+
+    #[tokio::test]
+    async fn initiate_transact_verification_rejects_invalid_proof_before_starting_round() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings)
+            .expect("construct node")
+            .with_transact_consensus_thresholds(1, 1)
+            .with_transact_proof_verifier(Arc::new(|_| false));
+
+        let mut req = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [1u8; 32],
+            mint: None,
+            nullifiers: [[2u8; 32], [3u8; 32]],
+            output_commitments: [[4u8; 32], [5u8; 32]],
+            root: [6u8; 32],
+            ext_amount: 0,
+            proof: vec![1, 2, 3],
+            ciphertexts: ["aa".repeat(88), "bb".repeat(88)],
+            timestamp: 1,
+        };
+        req.request_id = req.canonical_id();
+        let id = req.request_id.clone();
+
+        let err = node
+            .initiate_transact_verification(req)
+            .await
+            .expect_err("invalid proof must be rejected at initiation");
+        assert!(
+            err.to_string().contains("proof verification failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            node.transact_vote_counts(&id).await.is_err(),
+            "rejected proof must not allocate a pending consensus round"
+        );
+        assert!(
+            node.delivered_notes().await.is_empty(),
+            "rejected proof must not record delivered notes"
+        );
     }
 }
