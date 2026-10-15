@@ -168,8 +168,36 @@ pub fn prove_withdraw_to_fresh(
     membership: &Membership,
     recipient: &[u8; 32],
 ) -> Result<WithdrawToFresh> {
+    prove_withdraw_to_fresh_for_asset(
+        proving_key,
+        sk,
+        blinding,
+        note_pubkey,
+        amount,
+        [0u8; 32],
+        membership,
+        recipient,
+    )
+}
+
+/// Asset-aware variant of [`prove_withdraw_to_fresh`]: `asset_id` is `[0u8; 32]`
+/// for native SOL or `mint_to_asset(&mint)` for an SPL token note (#779), and
+/// `recipient` is the destination system account (native) or destination token
+/// account (SPL) bound into `ext_data_hash`.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_withdraw_to_fresh_for_asset(
+    proving_key: &ark_groth16::ProvingKey<ark_bn254::Bn254>,
+    sk: Fr,
+    blinding: Fr,
+    note_pubkey: Fr,
+    amount: u64,
+    asset_id: [u8; 32],
+    membership: &Membership,
+    recipient: &[u8; 32],
+) -> Result<WithdrawToFresh> {
     let root = Fr::from_le_bytes_mod_order(&membership.root);
-    let commitment = v3_commit(Fr::from(amount), note_pubkey, blinding, Fr::from(0u64));
+    let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
+    let commitment = v3_commit(Fr::from(amount), note_pubkey, blinding, asset_fr);
     let leaf_index = membership.leaf_index;
 
     let sig0 = v3_signature(sk, commitment, Fr::from(leaf_index));
@@ -177,13 +205,13 @@ pub fn prove_withdraw_to_fresh(
     // Zero-value dummy input (membership skipped in-circuit for a zero note).
     let dsk = rand_fr();
     let dbl = rand_fr();
-    let dc = v3_commit(Fr::from(0u64), v3_pubkey(dsk), dbl, Fr::from(0u64));
+    let dc = v3_commit(Fr::from(0u64), v3_pubkey(dsk), dbl, asset_fr);
     let dsig = v3_signature(dsk, dc, Fr::from(0u64));
     let nf1 = v3_nullifier(dc, Fr::from(0u64), dsig);
     // Two zero-value output notes (full withdrawal, no change).
     let (ob0, ob1) = (rand_fr(), rand_fr());
-    let oc0 = v3_commit(Fr::from(0u64), note_pubkey, ob0, Fr::from(0u64));
-    let oc1 = v3_commit(Fr::from(0u64), note_pubkey, ob1, Fr::from(0u64));
+    let oc0 = v3_commit(Fr::from(0u64), note_pubkey, ob0, asset_fr);
+    let oc1 = v3_commit(Fr::from(0u64), note_pubkey, ob1, asset_fr);
 
     let ext_amount: i64 = -(amount as i64);
     let ext_data_hash: [u8; 32] = {
@@ -199,7 +227,7 @@ pub fn prove_withdraw_to_fresh(
         root: Some(fr_to_le(&root)),
         public_amount: Some(fr_to_le(&public_amount)),
         ext_data_hash: Some(ext_data_hash),
-        asset_id: Some([0u8; 32]),
+        asset_id: Some(asset_id),
         input_nullifiers: vec![Some(fr_to_le(&nf0)), Some(fr_to_le(&nf1))],
         output_commitments: vec![Some(fr_to_le(&oc0)), Some(fr_to_le(&oc1))],
         in_amounts: vec![Some(amount), Some(0)],
@@ -230,7 +258,7 @@ pub fn prove_withdraw_to_fresh(
         &membership.root,
         recipient,
         ext_amount,
-        &[0u8; 32],
+        &asset_id,
         &[fr_to_le(&nf0), fr_to_le(&nf1)],
         &[fr_to_le(&oc0), fr_to_le(&oc1)],
         &proof,
@@ -258,7 +286,20 @@ pub fn post_transact(
     w: &WithdrawToFresh,
     ciphertexts: [Vec<u8>; 2],
 ) -> Result<String> {
-    let body = serde_json::json!({
+    post_transact_with_mint(ingress, recipient, None, w, ciphertexts)
+}
+
+/// POST a withdraw-to-fresh transact with an optional SPL `mint` (#779). When
+/// `mint` is `Some(mint_bytes)`, `/transact/submit` routes settlement through
+/// `transact_spl` and `recipient` is the destination token account.
+pub fn post_transact_with_mint(
+    ingress: &str,
+    recipient: &[u8; 32],
+    mint: Option<&[u8; 32]>,
+    w: &WithdrawToFresh,
+    ciphertexts: [Vec<u8>; 2],
+) -> Result<String> {
+    let mut body = serde_json::json!({
         "recipient": hex::encode(recipient),
         "nullifiers": [hex::encode(w.nullifiers[0]), hex::encode(w.nullifiers[1])],
         "output_commitments": [
@@ -270,6 +311,9 @@ pub fn post_transact(
         "proof": hex::encode(&w.proof),
         "ciphertexts": [hex::encode(&ciphertexts[0]), hex::encode(&ciphertexts[1])],
     });
+    if let Some(m) = mint {
+        body["mint"] = serde_json::Value::String(hex::encode(m));
+    }
     let resp = reqwest::blocking::Client::new()
         .post(format!("{ingress}/transact/submit"))
         .json(&body)
@@ -304,6 +348,33 @@ pub fn wait_for_settlement(
     while std::time::Instant::now() < deadline {
         std::thread::sleep(step);
         let bal = client.get_balance(recipient).unwrap_or(0);
+        if bal > 0 && client.get_account(&nf_pda).is_ok() {
+            return Ok(bal);
+        }
+    }
+    Err(TransactSubmitError::SettlementTimeout(timeout))
+}
+
+/// Poll on-chain until the quorum settles an SPL withdraw (`transact_spl`):
+/// `recipient_token_account` holds a positive token balance and the `nf0`
+/// nullifier PDA exists.
+pub fn wait_for_token_settlement(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    recipient_token_account: &Pubkey,
+    nf0: &[u8; 32],
+    timeout: Duration,
+) -> Result<u64> {
+    let (nf_pda, _) = derive_nullifier_account(program_id, nf0);
+    let deadline = std::time::Instant::now() + timeout;
+    let step = Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(step);
+        let bal = client
+            .get_token_account_balance(recipient_token_account)
+            .ok()
+            .and_then(|b| b.amount.parse::<u64>().ok())
+            .unwrap_or(0);
         if bal > 0 && client.get_account(&nf_pda).is_ok() {
             return Ok(bal);
         }

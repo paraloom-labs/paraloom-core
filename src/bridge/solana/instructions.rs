@@ -730,6 +730,57 @@ pub fn create_deposit_note_instruction(
     })
 }
 
+/// Create the `deposit_note_spl` instruction (#779): the SPL analogue of
+/// [`create_deposit_note_instruction`].
+///
+/// Account order must match the on-chain `DepositNoteSpl` accounts struct
+/// (`programs/paraloom/src/lib.rs`) and `decoder.rs`:
+/// `bridge_state` (0), `asset_config` (1), `mint` (2), `asset_vault` (3),
+/// `depositor_token_account` (4), `merkle_tree` (5), `depositor` (6, signer),
+/// `token_program` (7).
+#[allow(clippy::too_many_arguments)]
+pub fn create_deposit_note_spl_instruction(
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    mint: &Pubkey,
+    depositor_token_account: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+    pubkey: [u8; 32],
+    blinding: [u8; 32],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_config_pda, _) = derive_asset_config(program_id, mint);
+    let (asset_vault_pda, _) = derive_asset_vault(program_id, mint);
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+
+    let data = DepositNoteInstructionData {
+        amount,
+        pubkey,
+        blinding,
+    };
+
+    let mut instruction_data = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(bridge_state_pda, false),
+            AccountMeta::new(asset_config_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(asset_vault_pda, false),
+            AccountMeta::new(*depositor_token_account, false),
+            AccountMeta::new(merkle_tree_pda, false),
+            AccountMeta::new(*depositor, true),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: instruction_data,
+    })
+}
+
 /// Create the `initialize_merkle_tree` instruction (circuit v3, #350).
 ///
 /// One-time creation of the on-chain incremental tree, gated to the program
@@ -906,6 +957,11 @@ pub fn derive_asset_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
 /// (`seeds = [b"asset_vault", mint]`). Custody for one SPL asset.
 pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
+}
+
+/// Derive the per-asset config PDA for `mint` (`seeds = [b"asset_config", mint]`).
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
 }
 
 /// Derive the canonical Associated Token Account address for `owner` + `mint`,
@@ -1163,6 +1219,56 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE);
         // amount immediately follows the discriminator (borsh u64 LE).
         assert_eq!(&ix.data[8..16], &1_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_deposit_note_spl_instruction() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor_token = Pubkey::new_unique();
+
+        let ix = create_deposit_note_spl_instruction(
+            &program_id,
+            &depositor,
+            &mint,
+            &depositor_token,
+            &SPL_TOKEN_2022_PROGRAM_ID,
+            2_500_000,
+            [7u8; 32],
+            [8u8; 32],
+        )
+        .expect("build deposit_note_spl instruction");
+
+        // bridge_state(0), asset_config(1), mint(2), asset_vault(3),
+        // depositor_token_account(4), merkle_tree(5), depositor(6), token_program(7).
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
+        assert!(!ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_asset_config(&program_id, &mint).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, mint);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_asset_vault(&program_id, &mint).0
+        );
+        assert!(ix.accounts[3].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, depositor_token);
+        assert!(ix.accounts[4].is_writable);
+        assert_eq!(ix.accounts[5].pubkey, derive_merkle_tree(&program_id).0);
+        assert!(ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[6].pubkey, depositor);
+        assert!(ix.accounts[6].is_signer);
+        assert!(ix.accounts[6].is_writable);
+        assert_eq!(ix.accounts[7].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
+        assert!(!ix.accounts[7].is_writable);
+
+        assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE_SPL);
+        assert_eq!(&ix.data[8..16], &2_500_000u64.to_le_bytes());
     }
 
     #[test]

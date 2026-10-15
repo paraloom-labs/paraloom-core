@@ -213,9 +213,12 @@ pub trait SwapSubmitter: Send + Sync {
 }
 
 /// Lamports left at the ephemeral address when re-depositing a native-SOL swap
-/// output, to cover the re-deposit transaction's own fee. The realized balance
-/// minus this reserve is what gets re-shielded.
-const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 10_000;
+/// output, covering both the 0-byte system-account rent-exemption minimum
+/// (`890,880` lamports) and the re-deposit transaction's own signature fee
+/// (`10,000` lamports). Leaving a non-zero balance below `890,880` lamports on
+/// the fee-payer system account causes the Solana runtime to reject the
+/// transaction with `InsufficientFundsForRent`.
+const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 890_880 + 10_000;
 
 /// Production [`JupiterHttpClient`] over `reqwest`, talking to a configurable
 /// base URL.
@@ -366,14 +369,22 @@ impl SwapSubmitter for RpcSwapSubmitter {
         use solana_sdk::commitment_config::CommitmentConfig;
 
         let rpc_url = self.rpc_url.clone();
-        // Jupiter's swap output tokens are classic SPL Token accounts.
-        let ata = crate::bridge::solana::derive_associated_token_address(
-            owner,
-            mint,
-            &crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
-        );
+        let owner = *owner;
+        let mint = *mint;
         tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // Resolve the token program that owns `mint` (classic SPL Token or
+            // Token-2022) before deriving the ATA: the token program is part of
+            // the ATA PDA seeds, so hardcoding SPL_TOKEN_PROGRAM_ID derives the
+            // wrong address for Token-2022 output mints.
+            let mint_owner = client.get_account(&mint).ok().map(|a| a.owner);
+            let token_program =
+                crate::relayer::onchain::token_program_for_mint_owner(mint_owner.as_ref());
+            let ata = crate::bridge::solana::derive_associated_token_address(
+                &owner,
+                &mint,
+                &token_program,
+            );
             // A missing/unreadable ATA yields None, not an error: the caller then
             // falls back to the quote estimate rather than aborting the swap.
             match client.get_token_account_balance(&ata) {
@@ -973,5 +984,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_deposit_reserve_preserves_rent_exemption_after_tx_fee() {
+        let min_rent = solana_sdk::rent::Rent::default().minimum_balance(0);
+        assert!(
+            NATIVE_DEPOSIT_RESERVE_LAMPORTS >= min_rent + 5_000,
+            "reserve ({NATIVE_DEPOSIT_RESERVE_LAMPORTS}) must keep the ephemeral fee payer above 0-byte rent exemption ({min_rent}) after the 5,000-lamport base signature fee"
+        );
     }
 }
