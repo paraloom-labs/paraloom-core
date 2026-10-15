@@ -44,6 +44,9 @@ pub enum VerifyError {
     #[error("contribution {position}: DLEQ verification failed: {source}")]
     DleqRejected { position: usize, source: BgmError },
 
+    #[error("contribution {position}: delta_after repeats an earlier SRS delta in the chain")]
+    DuplicateDelta { position: usize },
+
     #[error(
         "final proving key does not match the transcript: its delta is not the \
          delta the chain culminates in"
@@ -86,6 +89,7 @@ pub fn verify_phase2_transcript(
 
     let mut delta_before_g1 = initial_pk.delta_g1;
     let mut delta_before_g2 = initial_pk.vk.delta_g2;
+    let mut seen_deltas = vec![(delta_before_g1, delta_before_g2)];
 
     for (position, contribution) in transcript.contributions.iter().enumerate() {
         let delta_after_g1 = G1Affine::deserialize_compressed(&contribution.delta_after_g1[..])
@@ -103,6 +107,14 @@ pub fn verify_phase2_transcript(
             &proof,
         )
         .map_err(|source| VerifyError::DleqRejected { position, source })?;
+
+        if seen_deltas
+            .iter()
+            .any(|(prev_g1, prev_g2)| *prev_g1 == delta_after_g1 || *prev_g2 == delta_after_g2)
+        {
+            return Err(VerifyError::DuplicateDelta { position });
+        }
+        seen_deltas.push((delta_after_g1, delta_after_g2));
 
         delta_before_g1 = delta_after_g1;
         delta_before_g2 = delta_after_g2;
@@ -613,6 +625,52 @@ mod tests {
         match verify_final_pk(&initial_pk, &transcript, &other_pk) {
             Err(VerifyError::FinalPkDeltaMismatch) => {}
             other => panic!("expected FinalPkDeltaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inverse_delta_cycle_in_transcript_is_rejected() {
+        use crate::ceremony::bgm17::apply_contribution;
+        use ark_ff::Field;
+
+        let mut rng = rng();
+        let (initial_pk, _vk) =
+            Groth16::<Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+        let initial_hash: TranscriptHash = [0x11u8; 64];
+        let mut transcript = Phase2Transcript::new(CircuitId::Deposit, initial_hash);
+
+        let mut pk = initial_pk.clone();
+        let delta_1 = Fr::from(7u64);
+        let delta_2 = delta_1.inverse().unwrap();
+        let delta_3 = Fr::from(13u64);
+
+        for (idx, scalar) in [delta_1, delta_2, delta_3].into_iter().enumerate() {
+            let proof = apply_contribution(&mut pk, scalar, &mut rng).unwrap();
+            let mut g1_bytes = Vec::new();
+            pk.delta_g1.serialize_compressed(&mut g1_bytes).unwrap();
+            let mut g2_bytes = Vec::new();
+            pk.vk.delta_g2.serialize_compressed(&mut g2_bytes).unwrap();
+            let prior_hash = match transcript.contributions.last() {
+                Some(prev) => hash_contribution(prev),
+                None => initial_hash,
+            };
+            transcript
+                .append(Contribution {
+                    prior_hash,
+                    contributor: NodeId(vec![idx as u8 + 1]),
+                    delta_after_g1: g1_bytes,
+                    delta_after_g2: g2_bytes,
+                    dleq_proof: proof.to_bytes(),
+                    contributor_pubkey: Vec::new(),
+                    signature: Vec::new(),
+                    attestation: format!("step {}", idx),
+                })
+                .unwrap();
+        }
+
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::DuplicateDelta { position: 1 }) => {}
+            other => panic!("expected DuplicateDelta at position 1, got {:?}", other),
         }
     }
 }

@@ -111,9 +111,15 @@ pub fn enforce_finalize_policy(
         return Err(PolicyError::EmptyTranscript);
     }
     let min = policy.min_contributions.max(1);
-    if transcript.len() < min {
+    let distinct_contributors: std::collections::HashSet<_> = transcript
+        .contributions
+        .iter()
+        .map(|c| &c.contributor)
+        .collect();
+    let effective_count = transcript.len().min(distinct_contributors.len());
+    if effective_count < min {
         return Err(PolicyError::TooFewContributions {
-            got: transcript.len(),
+            got: effective_count,
             min,
         });
     }
@@ -299,5 +305,40 @@ mod tests {
         let tail = hash_contribution(t.contributions.last().unwrap());
         enforce_finalize_policy(&policy(4, Some(tail)), &PINNED, &initial, &final_pk, &t)
             .expect("exact-count policy with the true tail pin passes");
+    }
+
+    #[test]
+    fn duplicate_contributor_does_not_inflate_min_contributions() {
+        let initial = pk_from_seed(1);
+        let final_pk = pk_from_seed(2);
+        let mut t = Phase2Transcript::new(CircuitId::Withdraw, PINNED);
+        let c1 = Contribution {
+            prior_hash: PINNED,
+            contributor: NodeId(vec![1]),
+            delta_after_g1: vec![0xAA; 48],
+            delta_after_g2: vec![0xBB; 96],
+            dleq_proof: vec![0xCC; 96],
+            contributor_pubkey: Vec::new(),
+            signature: Vec::new(),
+            attestation: "first".to_string(),
+        };
+        let h1 = hash_contribution(&c1);
+        t.append(c1).unwrap();
+        t.append(Contribution {
+            prior_hash: h1,
+            contributor: NodeId(vec![1]),
+            delta_after_g1: vec![0xDD; 48],
+            delta_after_g2: vec![0xEE; 96],
+            dleq_proof: vec![0xFF; 96],
+            contributor_pubkey: Vec::new(),
+            signature: Vec::new(),
+            attestation: "second from same contributor".to_string(),
+        })
+        .unwrap();
+
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::TooFewContributions { got: 1, min: 2 }) => {}
+            other => panic!("expected TooFewContributions(1,2), got {:?}", other),
+        }
     }
 }

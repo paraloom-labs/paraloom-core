@@ -40,6 +40,9 @@ pub enum ContributeError {
 
     #[error("transcript chain rejected the new contribution: {0}")]
     Transcript(#[from] TranscriptError),
+
+    #[error("prior proving key delta does not match the tip of the prior transcript")]
+    PriorPkDeltaMismatch,
 }
 
 /// Apply one contribution and return the updated proving key plus
@@ -69,6 +72,26 @@ pub fn contribute<R: RngCore + CryptoRng>(
     attestation: String,
     rng: &mut R,
 ) -> Result<(ProvingKey<Bn254>, Phase2Transcript), ContributeError> {
+    if let Some(ref existing) = prior_transcript {
+        existing.verify_chain()?;
+        if let Some(tip) = existing.contributions.last() {
+            let mut prior_g1 = Vec::new();
+            prior_pk
+                .delta_g1
+                .serialize_compressed(&mut prior_g1)
+                .map_err(|e| ContributeError::Serialize(format!("prior delta_g1: {}", e)))?;
+            let mut prior_g2 = Vec::new();
+            prior_pk
+                .vk
+                .delta_g2
+                .serialize_compressed(&mut prior_g2)
+                .map_err(|e| ContributeError::Serialize(format!("prior delta_g2: {}", e)))?;
+            if prior_g1 != tip.delta_after_g1 || prior_g2 != tip.delta_after_g2 {
+                return Err(ContributeError::PriorPkDeltaMismatch);
+            }
+        }
+    }
+
     let delta_i = Fr::rand(rng);
     let proof = apply_contribution(&mut prior_pk, delta_i, rng)?;
 
@@ -240,5 +263,36 @@ mod tests {
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    #[test]
+    fn contribute_rejects_mismatched_prior_pk() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+
+        let (_after_pk_1, transcript_1) = contribute(
+            initial_pk.clone(),
+            None,
+            CircuitId::Transfer,
+            [0u8; 64],
+            NodeId(vec![0x01]),
+            "first contributor".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        // Passing initial_pk instead of after_pk_1 alongside transcript_1 must be rejected.
+        match contribute(
+            initial_pk,
+            Some(transcript_1),
+            CircuitId::Transfer,
+            [0u8; 64],
+            NodeId(vec![0x02]),
+            "second contributor with wrong pk".to_string(),
+            &mut rng,
+        ) {
+            Err(ContributeError::PriorPkDeltaMismatch) => {}
+            other => panic!("expected PriorPkDeltaMismatch, got {:?}", other),
+        }
     }
 }
