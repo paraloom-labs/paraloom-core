@@ -1,12 +1,14 @@
 //! Production [`Submitter`] for the private-swap relayer, settling over the v3
-//! `transact` (withdraw-to-fresh) + `deposit_note` (re-shield) flow.
+//! `transact` / `transact_spl` (withdraw-to-fresh) + `deposit_note` /
+//! `deposit_note_spl` (re-shield) flow.
 //!
-//! The withdraw leg is a v3 `transact` with `ext_amount < 0` and
-//! `recipient = fresh_address`: it is proved with the transact proving key,
+//! The withdraw leg is a v3 `transact` (native SOL) or `transact_spl` (#779,
+//! SPL token) with `ext_amount < 0` and `recipient = fresh_address` (or the
+//! fresh address's ATA for SPL): it is proved with the transact proving key,
 //! POSTed to the public transact ingress, and settled by the 2-of-2 validator
 //! co-sign quorum (see [`crate::relayer::transact_submit`]). The re-shield leg
-//! is a permissionless `deposit_note` signed by the fresh ephemeral key. SPL
-//! re-shielding is unavailable on the native-only v3 program.
+//! is a permissionless `deposit_note` (native SOL) or `deposit_note_spl` (SPL
+//! token) signed by the fresh ephemeral key.
 
 use ark_bn254::Bn254;
 use ark_bn254::Fr;
@@ -21,14 +23,28 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 
-use crate::bridge::solana::{create_deposit_note_instruction, derive_bridge_vault};
-use crate::privacy::poseidon_circom::v3_commit;
+use crate::bridge::solana::{
+    create_deposit_note_instruction, create_deposit_note_spl_instruction,
+    derive_associated_token_address, derive_bridge_vault, SPL_TOKEN_2022_PROGRAM_ID,
+    SPL_TOKEN_PROGRAM_ID,
+};
+use crate::privacy::poseidon_circom::{mint_to_asset, v3_commit};
 use crate::privacy::types::ShieldedAddress;
 use crate::relayer::private_swap::{RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg};
 use crate::relayer::transact_submit;
 
 /// Default settlement poll timeout (matches the demo's 120s window).
 const SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Resolve which token program owns `mint` (`SPL_TOKEN_2022_PROGRAM_ID` when
+/// the mint account's owner is Token-2022, defaulting to classic
+/// `SPL_TOKEN_PROGRAM_ID`).
+pub(crate) fn token_program_for_mint_owner(mint_owner: Option<&Pubkey>) -> Pubkey {
+    match mint_owner {
+        Some(owner) if *owner == SPL_TOKEN_2022_PROGRAM_ID => SPL_TOKEN_2022_PROGRAM_ID,
+        _ => SPL_TOKEN_PROGRAM_ID,
+    }
+}
 
 /// Settles the relayer's on-chain legs against a live Solana RPC + transact
 /// ingress. Cloneable config is moved into the blocking tasks that run the
@@ -80,11 +96,6 @@ impl Submitter for OnChainSubmitter {
         leaf_index: u64,
         fresh_address: [u8; 32],
     ) -> Result<SubmittedLeg> {
-        if !matches!(leg, WithdrawLeg::Native) {
-            return Err(RelayerError::SubmissionFailed(
-                "SPL withdraw is unavailable on the native-only v3 program".to_string(),
-            ));
-        }
         let program_id = self.program_id;
         let rpc_url = self.rpc_url.clone();
         let ingress = self.ingress_url.clone();
@@ -102,17 +113,32 @@ impl Submitter for OnChainSubmitter {
             let sk_fr = Fr::from_le_bytes_mod_order(&sk);
             let blinding_fr = Fr::from_le_bytes_mod_order(&blinding);
             let note_pk_fr = Fr::from_le_bytes_mod_order(&note_pubkey);
-            let commitment = v3_commit(Fr::from(amount), note_pk_fr, blinding_fr, Fr::from(0u64));
+            let fresh_pk = Pubkey::new_from_array(fresh_address);
+
+            let (asset_id, settlement_recipient, mint_opt) = match leg {
+                WithdrawLeg::Native => ([0u8; 32], fresh_address, None),
+                WithdrawLeg::Spl(mint_bytes) => {
+                    let mint_pk = Pubkey::new_from_array(mint_bytes);
+                    let mint_owner = client.get_account(&mint_pk).ok().map(|a| a.owner);
+                    let token_program = token_program_for_mint_owner(mint_owner.as_ref());
+                    let ata = derive_associated_token_address(&fresh_pk, &mint_pk, &token_program);
+                    (mint_to_asset(&mint_bytes), ata.to_bytes(), Some(mint_bytes))
+                }
+            };
+
+            let asset_fr = Fr::from_le_bytes_mod_order(&asset_id);
+            let commitment = v3_commit(Fr::from(amount), note_pk_fr, blinding_fr, asset_fr);
             let membership =
                 transact_submit::read_membership(&client, &program_id, leaf_index, commitment)?;
-            let w = transact_submit::prove_withdraw_to_fresh(
+            let w = transact_submit::prove_withdraw_to_fresh_for_asset(
                 &pk,
                 sk_fr,
                 blinding_fr,
                 note_pk_fr,
                 amount,
+                asset_id,
                 &membership,
-                &fresh_address,
+                &settlement_recipient,
             )?;
             // Two well-formed placeholder envelopes: the withdraw's output notes
             // are zero-value, but the ingress still requires valid ciphertexts.
@@ -123,18 +149,37 @@ impl Submitter for OnChainSubmitter {
                 crate::privacy::note_crypto::seal(&demo_recipient, b"withdraw out 0").to_bytes();
             let ct1 =
                 crate::privacy::note_crypto::seal(&demo_recipient, b"withdraw out 1").to_bytes();
-            transact_submit::post_transact(&ingress, &fresh_address, &w, [ct0, ct1])?;
-
-            let recipient_pk = Pubkey::new_from_array(fresh_address);
-            transact_submit::wait_for_settlement(
-                &client,
-                &program_id,
-                &recipient_pk,
-                &w.nullifiers[0],
-                SETTLEMENT_TIMEOUT,
+            transact_submit::post_transact_with_mint(
+                &ingress,
+                &settlement_recipient,
+                mint_opt.as_ref(),
+                &w,
+                [ct0, ct1],
             )?;
+
+            let recipient_pk = Pubkey::new_from_array(settlement_recipient);
+            match leg {
+                WithdrawLeg::Native => {
+                    transact_submit::wait_for_settlement(
+                        &client,
+                        &program_id,
+                        &recipient_pk,
+                        &w.nullifiers[0],
+                        SETTLEMENT_TIMEOUT,
+                    )?;
+                }
+                WithdrawLeg::Spl(_) => {
+                    transact_submit::wait_for_token_settlement(
+                        &client,
+                        &program_id,
+                        &recipient_pk,
+                        &w.nullifiers[0],
+                        SETTLEMENT_TIMEOUT,
+                    )?;
+                }
+            }
             // Settlement lands via the quorum, not a single tx we hold — return
-            // the fresh address as the leg's on-chain reference.
+            // the fresh address (or its ATA) as the leg's on-chain reference.
             Ok(recipient_pk.to_string())
         })
         .await
@@ -157,28 +202,44 @@ impl Submitter for OnChainSubmitter {
         recipient: ShieldedAddress,
         randomness: [u8; 32],
     ) -> Result<SubmittedLeg> {
-        if !matches!(leg, WithdrawLeg::Native) {
-            return Err(RelayerError::SubmissionFailed(
-                "SPL re-shield is unavailable on the native-only v3 program (needs a redeploy)"
-                    .to_string(),
-            ));
-        }
         let program_id = self.program_id;
         let fresh_address = signer.pubkey().to_bytes();
         let signer = signer.insecure_clone();
         let client = self.client();
 
         let sig = tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
-            let (vault, _) = derive_bridge_vault(&program_id);
-            let ix = create_deposit_note_instruction(
-                &program_id,
-                &signer.pubkey(),
-                &vault,
-                amount,
-                recipient.0,
-                randomness,
-            )
-            .map_err(|e| e.to_string())?;
+            let ix = match leg {
+                WithdrawLeg::Native => {
+                    let (vault, _) = derive_bridge_vault(&program_id);
+                    create_deposit_note_instruction(
+                        &program_id,
+                        &signer.pubkey(),
+                        &vault,
+                        amount,
+                        recipient.0,
+                        randomness,
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+                WithdrawLeg::Spl(mint_bytes) => {
+                    let mint = Pubkey::new_from_array(mint_bytes);
+                    let mint_owner = client.get_account(&mint).ok().map(|a| a.owner);
+                    let token_program = token_program_for_mint_owner(mint_owner.as_ref());
+                    let depositor_ata =
+                        derive_associated_token_address(&signer.pubkey(), &mint, &token_program);
+                    create_deposit_note_spl_instruction(
+                        &program_id,
+                        &signer.pubkey(),
+                        &mint,
+                        &depositor_ata,
+                        &token_program,
+                        amount,
+                        recipient.0,
+                        randomness,
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+            };
             let bh = client.get_latest_blockhash().map_err(|e| e.to_string())?;
             let tx =
                 Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[&signer], bh);
@@ -197,5 +258,23 @@ impl Submitter for OnChainSubmitter {
             fresh_address,
             signature: sig,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_program_for_mint_owner_selects_token_2022_when_owned_by_token_2022() {
+        assert_eq!(
+            token_program_for_mint_owner(Some(&SPL_TOKEN_2022_PROGRAM_ID)),
+            SPL_TOKEN_2022_PROGRAM_ID
+        );
+        assert_eq!(
+            token_program_for_mint_owner(Some(&SPL_TOKEN_PROGRAM_ID)),
+            SPL_TOKEN_PROGRAM_ID
+        );
+        assert_eq!(token_program_for_mint_owner(None), SPL_TOKEN_PROGRAM_ID);
     }
 }

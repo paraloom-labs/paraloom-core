@@ -93,6 +93,24 @@ pub enum RelayerError {
     /// check, which the provider setting alone did not give a single request.
     #[error("swap output {out_amount} is below the caller minimum {min_out}")]
     SlippageExceeded { out_amount: u64, min_out: u64 },
+
+    /// A re-shield commitment input (`reshield_recipient` or
+    /// `reshield_randomness`) is not a canonical BN254 scalar (`>= Fr::MODULUS`),
+    /// which would cause on-chain `deposit_note` / `deposit_note_spl` to revert
+    /// after the input note is already burned.
+    #[error("non-canonical BN254 scalar for {0}")]
+    NonCanonicalScalar(&'static str),
+}
+
+fn is_canonical_bn254_scalar(bytes: &[u8; 32]) -> bool {
+    use ark_bn254::Fr;
+    use ark_ff::{BigInteger, PrimeField};
+    let fr = Fr::from_le_bytes_mod_order(bytes);
+    let le = fr.into_bigint().to_bytes_le();
+    let mut canonical = [0u8; 32];
+    let len = le.len().min(32);
+    canonical[..len].copy_from_slice(&le[..len]);
+    &canonical == bytes
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -401,33 +419,12 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
-        // Step 1: withdraw the spent note to the fresh address via a v3
-        // transact. The submitter takes the note's v3 spend witness, proves the
-        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
-        // the nullifier burn severs the deposit -> fresh-address link on-chain.
-        let withdraw_leg = self
-            .submitter
-            .submit_withdraw_to_fresh(
-                in_leg,
-                amount_in,
-                request.in_sk,
-                request.in_blinding,
-                request.in_note_pubkey,
-                request.in_leaf_index,
-                fresh_address,
-            )
-            .await?;
-
-        // Step 2: swap on public liquidity from the fresh address. The provider
-        // signs and submits the public trade from `ephemeral`, so the trade
-        // originates at the unlinkable fresh address.
-        //
-        // The on-chain withdraw deducts the protocol withdrawal fee
-        // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
-        // fresh address holds `amount_in - fee`, not the gross note value.
-        // Swapping the gross amount would exceed the fresh address's balance and
-        // fail *after* the nullifier is already burned, stranding the funds —
-        // so the swap trades the realized post-fee amount.
+        // Validate the post-fee, post-overhead swap amount BEFORE submitting the
+        // on-chain withdrawal. Computing `swap_amount` only after
+        // `submit_withdraw_to_fresh` meant a note whose post-fee value was
+        // `<= native_swap_overhead_lamports` (or `== 0`) was first burned on-chain
+        // and transferred to `ephemeral` before failing with `InvalidAmount`,
+        // stranding the withdrawn funds when `execute` dropped `ephemeral`.
         let withdrawal_fee = amount_in
             .checked_mul(WITHDRAWAL_FEE_BPS)
             .map(|x| x / 10_000)
@@ -449,6 +446,27 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         } else {
             withdrawn
         };
+
+        // Step 1: withdraw the spent note to the fresh address via a v3
+        // transact. The submitter takes the note's v3 spend witness, proves the
+        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
+        // the nullifier burn severs the deposit -> fresh-address link on-chain.
+        let withdraw_leg = self
+            .submitter
+            .submit_withdraw_to_fresh(
+                in_leg,
+                amount_in,
+                request.in_sk,
+                request.in_blinding,
+                request.in_note_pubkey,
+                request.in_leaf_index,
+                fresh_address,
+            )
+            .await?;
+
+        // Step 2: swap on public liquidity from the fresh address. The provider
+        // signs and submits the public trade from `ephemeral`, so the trade
+        // originates at the unlinkable fresh address.
         let swap = self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
@@ -481,14 +499,25 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
     ///
     /// # Availability
     ///
-    /// The re-deposit leg re-shields `asset_out`. On the native-only v3 program
-    /// the submitter only accepts a native-SOL re-deposit, so a non-native
-    /// `asset_out` (e.g. USDC) fails at the deposit leg — re-shielding a token
-    /// needs the SPL redeploy. Until then, [`execute_swap_out`] delivers the
-    /// swapped token to the unlinkable fresh address without re-shielding it.
+    /// The re-deposit leg re-shields `asset_out` via `deposit_note` (native SOL)
+    /// or `deposit_note_spl` (#779, SPL tokens). Callers that want the swapped
+    /// asset left at a caller-supplied fresh address without re-shielding can use
+    /// [`execute_swap_out`].
     ///
     /// [`execute_swap_out`]: Self::execute_swap_out
     pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
+        // Validate the re-shield commitment scalars up front before burning the
+        // input note on-chain: `deposit_note` and `deposit_note_spl` enforce
+        // canonical BN254 field elements (`< Fr::MODULUS`) on both `pubkey` and
+        // `blinding`. Rejecting non-canonical scalars here prevents Step 4 from
+        // reverting after Steps 1-2 have already spent the note into `ephemeral`.
+        if !is_canonical_bn254_scalar(&request.reshield_recipient.0) {
+            return Err(RelayerError::NonCanonicalScalar("reshield_recipient"));
+        }
+        if !is_canonical_bn254_scalar(&request.reshield_randomness) {
+            return Err(RelayerError::NonCanonicalScalar("reshield_randomness"));
+        }
+
         // A brand-new keypair per swap — nothing on-chain links it to the user.
         // This is the relayer-layer expression of the link-severing property
         // that the withdrawal nullifier enforces on-chain.
@@ -507,6 +536,9 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // the provider is configured to realize, validated for bounds above.
         let relayer_fee = 0u64;
         let net_out_amount = gross_out_amount;
+        if net_out_amount == 0 {
+            return Err(RelayerError::InvalidAmount(0));
+        }
 
         // Step 4: re-deposit the net output into the shielded pool to the
         // user's new recipient, producing a fresh `asset_out` note.
@@ -742,6 +774,52 @@ mod tests {
             .await
             .expect_err("overhead consuming the whole note must fail, not swap 0");
         assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+        // Validation must fire BEFORE burning the input note on-chain.
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "withdraw leg must not be submitted when overhead consumes the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_canonical_reshield_scalars_are_rejected_before_withdraw() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        // [0xFF; 32] exceeds the BN254 scalar field modulus (~2^254).
+        let mut bad_recipient = request(native_note(1_000_000), NATIVE_SOL_ASSET, 0);
+        bad_recipient.reshield_recipient = ShieldedAddress::from_bytes([0xFFu8; 32]);
+        let err = relayer
+            .execute(bad_recipient)
+            .await
+            .expect_err("non-canonical reshield_recipient must error before withdraw");
+        assert!(matches!(
+            err,
+            RelayerError::NonCanonicalScalar("reshield_recipient")
+        ));
+        assert!(relayer.submitter.recorded().is_empty());
+
+        let mut bad_randomness = request(native_note(1_000_000), NATIVE_SOL_ASSET, 0);
+        bad_randomness.reshield_randomness = [0xFFu8; 32];
+        let err = relayer
+            .execute(bad_randomness)
+            .await
+            .expect_err("non-canonical reshield_randomness must error before withdraw");
+        assert!(matches!(
+            err,
+            RelayerError::NonCanonicalScalar("reshield_randomness")
+        ));
+        assert!(relayer.submitter.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_net_output_is_rejected_before_redeposit() {
+        let relayer =
+            PrivateSwapRelayer::new(MockSwapProvider::with_rate(0, 1), MockSubmitter::new());
+        let err = relayer
+            .execute(request(native_note(1_000_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("zero net output must error before deposit_note");
+        assert!(matches!(err, RelayerError::InvalidAmount(0)));
+        assert_eq!(relayer.submitter.recorded().len(), 1);
     }
 
     #[tokio::test]
