@@ -580,7 +580,22 @@ pub fn create_transact_instruction(
     let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
     let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
     let (validator_pda, _) = derive_validator_account(program_id, authority);
-    let recipient_pubkey = Pubkey::new_from_array(recipient);
+    // For a pure shielded transfer (`ext_amount == 0`), the wallet/prover binds
+    // `recipient = [0u8; 32]`, which is `SYSTEM_PROGRAM_ID`. Passing
+    // `SYSTEM_PROGRAM_ID` to `AccountMeta::new(..., false)` upgrades the
+    // built-in System Program to writable in the compiled Solana `Message`
+    // (`TransactionError::InvalidWritableAccount`) and fails Anchor's
+    // `SystemAccount<'info>` owner check (`ErrorCode::AccountNotSystemOwned`,
+    // since `SYSTEM_PROGRAM_ID` is owned by `NativeLoader`). Substitute
+    // `*authority` (already a writable `SystemAccount` in the transaction) for
+    // the account slot when `ext_amount == 0 && recipient == [0u8; 32]`; the
+    // on-chain `transact` handler hashes `Pubkey::default()` into `ext_data_hash`
+    // whenever `ext_amount == 0`.
+    let recipient_pubkey = if ext_amount == 0 && recipient == [0u8; 32] {
+        *authority
+    } else {
+        Pubkey::new_from_array(recipient)
+    };
 
     let data = TransactInstructionData {
         nullifiers,
@@ -1034,6 +1049,47 @@ mod tests {
         assert!(!ix.accounts[13].is_signer);
 
         assert_eq!(&ix.data[..8], &discriminators::TRANSACT);
+    }
+
+    #[test]
+    fn test_create_transact_instruction_shielded_transfer_zero_recipient_keeps_system_program_readonly()
+    {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let bridge_vault = Pubkey::new_unique();
+        let cosigner = Pubkey::new_unique();
+
+        let ix = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [0u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            0,
+            vec![0u8; 256],
+            &[authority, cosigner],
+        )
+        .expect("build shielded transfer transact instruction");
+
+        // `recipient` slot (index 5) substitutes `authority` rather than
+        // `SYSTEM_PROGRAM_ID` (`[0u8; 32]`), so compiling the instruction into
+        // a Solana `Message` never upgrades `SYSTEM_PROGRAM_ID` to writable or
+        // passes the `NativeLoader`-owned System Program to `SystemAccount<'info>`.
+        assert_eq!(ix.accounts[5].pubkey, authority);
+        assert!(ix.accounts[5].is_writable);
+
+        let msg = solana_sdk::message::Message::new(&[ix], Some(&authority));
+        let sys_idx = msg
+            .account_keys
+            .iter()
+            .position(|k| *k == SYSTEM_PROGRAM_ID)
+            .expect("system_program must be in message account_keys");
+        assert!(
+            !msg.is_writable(sys_idx),
+            "SYSTEM_PROGRAM_ID must remain read-only in compiled message"
+        );
     }
 
     #[test]
