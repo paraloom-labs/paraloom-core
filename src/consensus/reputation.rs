@@ -110,18 +110,23 @@ impl ValidatorMetrics {
 
         // Decay formula: reputation * (1 - decay_rate)^days
         // decay_rate = REPUTATION_DECAY_PER_DAY / 10000 (basis points to percentage)
+        let old_reputation = self.reputation;
         let decay_rate = REPUTATION_DECAY_PER_DAY as f64 / 10000.0;
-        let multiplier = (1.0 - decay_rate).powi(days_inactive as i32);
+        let clamped_days = days_inactive.min(365_000) as i32;
+        let multiplier = (1.0 - decay_rate).powi(clamped_days);
 
         let new_reputation = (self.reputation as f64 * multiplier) as u64;
         self.reputation = new_reputation.max(MIN_REPUTATION);
+        self.last_active = self
+            .last_active
+            .saturating_add(days_inactive.saturating_mul(SECONDS_PER_DAY));
 
         log::debug!(
             "Applied {} days decay to {:?}: {} -> {}",
             days_inactive,
             self.node_id,
-            self.reputation,
-            new_reputation
+            old_reputation,
+            self.reputation
         );
     }
 
@@ -189,7 +194,11 @@ impl ReputationTracker {
         let list: Vec<&ValidatorMetrics> = metrics.values().collect();
         match serde_json::to_vec(&list) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, &bytes) {
+                let tmp_path = path.with_extension("json.tmp");
+                let written = std::fs::write(&tmp_path, &bytes)
+                    .and_then(|()| std::fs::rename(&tmp_path, path))
+                    .or_else(|_| std::fs::write(path, &bytes));
+                if let Err(e) = written {
                     log::warn!("failed to persist reputation to {}: {e}", path.display());
                 }
             }
@@ -325,6 +334,10 @@ impl ReputationTracker {
             if validator.reputation != old_reputation {
                 count += 1;
             }
+        }
+
+        if count > 0 {
+            self.persist_locked(&metrics);
         }
 
         log::debug!("Applied decay to {} validators", count);
@@ -598,5 +611,41 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+
+        // Calling apply_decay() again immediately must be a no-op because
+        // last_active was advanced by the 10 decayed days (#916).
+        let after_first = metrics.reputation;
+        metrics.apply_decay();
+        assert_eq!(
+            metrics.reputation, after_first,
+            "second immediate apply_decay must not re-apply the same 10-day decay"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_decay_all_persists_decayed_reputation_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation.json");
+        let node = NodeId(vec![7, 8, 9]);
+
+        let decayed = {
+            let tracker = ReputationTracker::with_persistence(path.clone());
+            tracker.register_validator(node.clone()).await;
+            {
+                let mut m = tracker.metrics.write().await;
+                m.get_mut(&node).unwrap().last_active -= 10 * SECONDS_PER_DAY;
+            }
+            let count = tracker.apply_decay_all().await;
+            assert_eq!(count, 1);
+            tracker.get_reputation(&node).await.unwrap()
+        };
+        assert!(decayed < BASE_REPUTATION);
+
+        let reloaded = ReputationTracker::with_persistence(path);
+        assert_eq!(
+            reloaded.get_reputation(&node).await,
+            Some(decayed),
+            "apply_decay_all must persist decayed reputation to disk (#916)"
+        );
     }
 }
