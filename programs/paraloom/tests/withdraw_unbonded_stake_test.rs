@@ -28,9 +28,11 @@ use solana_sdk::{
 };
 
 mod common;
+use anchor_lang::solana_program::program_pack::Pack;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+    register_validator_ix, slash_validator_ix, stake_vault_pdas, withdraw_unbonded_ix,
+    TEST_TOKEN_FUND,
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
@@ -69,6 +71,18 @@ async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
         .get_balance(key)
         .await
         .expect("get balance")
+}
+
+async fn token_balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
+    let raw = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .expect("rpc")
+        .expect("token account exists");
+    spl_token::state::Account::unpack(&raw.data)
+        .expect("unpack token account")
+        .amount
 }
 
 async fn load_validator(ctx: &mut ProgramTestContext, pda: Pubkey) -> ValidatorAccount {
@@ -439,6 +453,18 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     .await
     .expect("register");
 
+    let (vault_pda, _) = stake_vault_pdas(program_id);
+    assert_eq!(
+        token_balance(&mut ctx, validator_token).await,
+        TEST_TOKEN_FUND - TOKEN_STAKE,
+        "register must move TOKEN_STAKE out of validator token account"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, vault_pda).await,
+        TOKEN_STAKE,
+        "stake_token_vault must hold TOKEN_STAKE after register"
+    );
+
     // 3. Deactivate — admin-signed (the registry authority). Routes the stake
     //    into unbonding instead of stranding it.
     send(
@@ -464,6 +490,14 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     assert_eq!(
         acc.unbonding_amount, MIN_VALIDATOR_STAKE,
         "the full stake must be routed into unbonding, not stranded"
+    );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake zeroed on deactivate"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "the full token stake must be routed into token_unbonding_amount, not stranded"
     );
     assert!(
         acc.unbonding_slot >= UNBONDING_SLOTS,
@@ -501,12 +535,24 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     .await
     .expect("deactivated validator must be able to withdraw its unbonded stake");
 
-    // The wallet got the released stake plus the refunded rent, and the PDA is
-    // closed (#392) — a fully-exited validator leaves no rent-locked husk behind.
+    // The wallet got the released stake plus the refunded rent, the validator
+    // token account got its full staked token balance back from the vault, and
+    // the PDA is closed (#392) — a fully-exited validator leaves no rent-locked
+    // husk or stranded vault tokens behind.
     let wallet_after = balance(&mut ctx, validator.pubkey()).await;
     assert!(
         wallet_after > wallet_before,
         "wallet credited by the released stake + refunded rent"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, validator_token).await,
+        TEST_TOKEN_FUND,
+        "withdraw_unbonded_stake must return the full unbonded token stake to the validator"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, vault_pda).await,
+        0,
+        "no token stake may be left stranded in stake_token_vault after PDA close"
     );
     let closed = ctx
         .banks_client
@@ -516,5 +562,119 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     assert!(
         closed.is_none() || closed.unwrap().lamports == 0,
         "PDA must be closed after withdraw"
+    );
+}
+
+/// Regression: when a validator is deactivated via `deactivate_validator`, its
+/// dual-stake token half (`token_unbonding_amount`) must remain slashable during
+/// the `UNBONDING_SLOTS` window in lockstep with `unbonding_amount`, and only
+/// the unslashed remainder may be returned on `withdraw_unbonded_stake`.
+#[tokio::test]
+async fn deactivated_validator_token_stake_remains_slashable_during_unbonding() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let mut ctx = pt.start_with_context().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+    let (vault_pda, _) = stake_vault_pdas(program_id);
+
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await
+    .expect("init registry");
+
+    send(
+        &mut ctx,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await
+    .expect("register");
+
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivate");
+
+    // Slash 25% while the deactivated validator is in the unbonding window.
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            25,
+        ),
+    )
+    .await
+    .expect("slash deactivated validator during unbonding");
+
+    let expected_token_slash = TOKEN_STAKE / 4;
+    let expected_token_remaining = TOKEN_STAKE - expected_token_slash;
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert_eq!(
+        acc.token_unbonding_amount, expected_token_remaining,
+        "25% of token_unbonding_amount must be slashed"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, vault_pda).await,
+        expected_token_remaining,
+        "25% of the unbonding tokens must be burned from stake_token_vault"
+    );
+
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    send(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect("withdraw remaining unbonded stake");
+
+    assert_eq!(
+        token_balance(&mut ctx, validator_token).await,
+        TEST_TOKEN_FUND - expected_token_slash,
+        "validator receives the unslashed 75% of its token stake"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, vault_pda).await,
+        0,
+        "stake_token_vault is empty after withdraw"
     );
 }
