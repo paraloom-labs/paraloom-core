@@ -267,14 +267,18 @@ impl PrivacyStorage {
         Ok(())
     }
 
-    /// Check if all nullifiers in batch are unspent (don't exist)
+    /// Check if all nullifiers in batch are unspent (don't exist) and pairwise distinct
     pub fn check_nullifiers_batch(&self, nullifiers: &[Nullifier]) -> Result<bool> {
         let cf = self
             .db
             .cf_handle(CF_NULLIFIER_SET)
             .ok_or_else(|| anyhow!("Nullifier set CF not found"))?;
 
+        let mut seen = std::collections::HashSet::with_capacity(nullifiers.len());
         for nullifier in nullifiers {
+            if !seen.insert(nullifier) {
+                return Ok(false); // Duplicate nullifier within batch
+            }
             if self.db.get_cf(cf, nullifier.as_bytes())?.is_some() {
                 return Ok(false); // Found spent nullifier
             }
@@ -700,5 +704,15 @@ mod tests {
                  follow numeric index order, not RocksDB bytewise key order"
             );
         }
+    }
+
+    #[test]
+    fn check_nullifiers_batch_rejects_duplicate_unspent_nullifiers() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+        let n = Nullifier([99u8; 32]);
+        assert!(!storage
+            .check_nullifiers_batch(&[n.clone(), n])
+            .unwrap());
     }
 }
