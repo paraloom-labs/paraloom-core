@@ -1051,6 +1051,9 @@ async fn cosign_settlement(
     if !approved {
         return declined("parameters do not match a settlement we verified");
     }
+    if cap_nullifiers[0] == cap_nullifiers[1] {
+        return declined("duplicate input nullifiers in settlement payload");
+    }
 
     // Rebuild the exact settlement message ourselves and sign it.
     let message = match build_settlement_message(&payload) {
@@ -1086,18 +1089,22 @@ async fn cosign_settlement(
         {
             return declined("co-sign count limit reached for an input nullifier");
         }
-        for nf in cap_nullifiers {
+        for nf in &cap_nullifiers {
             // Bound the map so it cannot grow without limit as settlements
             // accumulate (#626): if a new nullifier would exceed the ceiling,
-            // drop an arbitrary existing entry first. An evicted entry belongs
-            // to an older spend whose nullifiers have almost certainly settled
-            // on chain, so resetting its budget is harmless.
-            if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
-                if let Some(victim) = counts.keys().next().cloned() {
+            // drop an arbitrary existing entry first, excluding the sibling
+            // nullifier from the current settlement so inserting the second
+            // nullifier never evicts the first one we just recorded.
+            if !counts.contains_key(nf) && counts.len() >= MAX_COSIGN_COUNTS {
+                if let Some(victim) = counts
+                    .keys()
+                    .find(|k| !cap_nullifiers.contains(k))
+                    .cloned()
+                {
                     counts.remove(&victim);
                 }
             }
-            *counts.entry(nf).or_insert(0) += 1;
+            *counts.entry(nf.clone()).or_insert(0) += 1;
         }
     }
 
@@ -1198,6 +1205,9 @@ async fn settle_approved_transacts<F, Fut>(
             match submit(approved.clone()).await {
                 Ok(sig) => {
                     info!("on-chain transact settled for {}: {}", request_id, sig);
+                    if let Some(coord) = &coordinator {
+                        let _ = coord.cleanup(&request_id).await;
+                    }
                     break;
                 }
                 Err(e) if is_replay_error(&e) => {
@@ -1205,6 +1215,9 @@ async fn settle_approved_transacts<F, Fut>(
                         "transact {} already settled (nullifier spent), skipping",
                         request_id
                     );
+                    if let Some(coord) = &coordinator {
+                        let _ = coord.cleanup(&request_id).await;
+                    }
                     break;
                 }
                 Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
@@ -1224,10 +1237,11 @@ async fn settle_approved_transacts<F, Fut>(
                         MAX_SETTLE_ATTEMPTS,
                         e
                     );
-                    // Un-emit so the client can re-prove the identical canonical
-                    // id and have it approved again, instead of it being wedged
-                    // (approved-once, never settled) until a restart.
+                    // Clean up the pending round and un-emit so the client can
+                    // re-prove the identical canonical id and have it approved
+                    // again, instead of it being wedged until a restart.
                     if let Some(coord) = &coordinator {
+                        let _ = coord.cleanup(&request_id).await;
                         coord.clear_emitted(&request_id).await;
                     }
                 }
@@ -2522,27 +2536,39 @@ impl Node {
         // recorded either way. Previously only the winner recorded it, so a
         // losing node's off-chain nullifier set drifted from the chain it is
         // meant to pre-filter against (#703).
-        let settled = match &result {
-            Ok(_) => true,
-            // Only ask the chain on failure, and only about the first
-            // nullifier: the pair is spent atomically in one instruction, so
-            // either both PDAs exist or neither does.
+        let (nf0_spent, nf1_spent) = match &result {
+            Ok(_) => (true, true),
+            // Ask the chain about both input nullifiers on failure: a peer may
+            // have landed the exact settlement (both spent) or a conflicting
+            // spend may have consumed nullifiers[1] while leaving nullifiers[0]
+            // unspent.
             Err(_) => {
-                bridge
-                    .lock()
-                    .await
-                    .is_nullifier_spent(&approved.request.nullifiers[0])
-                    .await
+                let b = bridge.lock().await;
+                let s0 = b.is_nullifier_spent(&approved.request.nullifiers[0]).await;
+                let s1 = b.is_nullifier_spent(&approved.request.nullifiers[1]).await;
+                (s0, s1)
             }
         };
+        let settled = nf0_spent || nf1_spent;
 
         if settled {
-            // Mark the input nullifiers spent in the off-chain set so this
-            // node's `check_batch` pre-filters replays before consensus,
-            // matching the on-chain nullifier PDAs that are the authoritative
-            // double-spend gate (#624).
+            // Mark the confirmed-spent input nullifier(s) in the off-chain set
+            // so this node's `check_batch` pre-filters replays before consensus,
+            // matching the on-chain nullifier PDAs (#624) without falsely
+            // marking an unspent sibling nullifier as spent.
             if let Some(pool) = &self.shielded_pool {
-                pool.record_spent(approved.request.nullifiers).await;
+                match (nf0_spent, nf1_spent) {
+                    (true, true) => pool.record_spent(approved.request.nullifiers).await,
+                    (true, false) => {
+                        let nf0 = approved.request.nullifiers[0];
+                        pool.record_spent([nf0, nf0]).await;
+                    }
+                    (false, true) => {
+                        let nf1 = approved.request.nullifiers[1];
+                        pool.record_spent([nf1, nf1]).await;
+                    }
+                    (false, false) => {}
+                }
             }
         }
 
@@ -3633,5 +3659,132 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_duplicate_nullifiers_and_never_evicts_sibling() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let recipient = [9u8; 32];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1i64;
+
+        // 1. Duplicate input nullifiers must be declined outright.
+        let dup_nullifiers = [[7u8; 32], [7u8; 32]];
+        tas.lock().await.insert(
+            "dup".to_string(),
+            ta_request("dup", recipient, dup_nullifiers, outputs, root, ext_amount),
+        );
+        let dup_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            dup_nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let dup_resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("dup", SettlementKind::Transact, &dup_payload),
+        )
+        .await;
+        assert_eq!(
+            dup_resp.signature, None,
+            "duplicate input nullifiers must be declined"
+        );
+
+        // 2. When cosign_counts is at MAX_COSIGN_COUNTS, inserting both fresh
+        // nullifiers of a new settlement must keep BOTH in the map (inserting
+        // the second nullifier must never evict the first).
+        {
+            let mut c = counts.lock().await;
+            for i in 0..MAX_COSIGN_COUNTS {
+                c.insert(format!("old-{i}"), 1);
+            }
+        }
+        let fresh_nullifiers = [[0xA1; 32], [0xA2; 32]];
+        tas.lock().await.insert(
+            "fresh".to_string(),
+            ta_request(
+                "fresh",
+                recipient,
+                fresh_nullifiers,
+                outputs,
+                root,
+                ext_amount,
+            ),
+        );
+        let fresh_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            fresh_nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let fresh_resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("fresh", SettlementKind::Transact, &fresh_payload),
+        )
+        .await;
+        assert!(fresh_resp.signature.is_some());
+
+        let auth = hex::encode(kp.pubkey().to_bytes());
+        let key0 = format!("{}:{auth}", hex::encode(fresh_nullifiers[0]));
+        let key1 = format!("{}:{auth}", hex::encode(fresh_nullifiers[1]));
+        let c = counts.lock().await;
+        assert_eq!(c.get(&key0).copied(), Some(1), "first nullifier must remain tracked");
+        assert_eq!(c.get(&key1).copied(), Some(1), "second nullifier must remain tracked");
+        assert_eq!(c.len(), MAX_COSIGN_COUNTS);
+    }
+
+    #[tokio::test]
+    async fn settle_approved_transacts_cleans_up_pending_round_on_settle() {
+        let mut coord = TransactVerificationCoordinator::new();
+        coord.set_consensus_thresholds(2, 2);
+        let coord = Arc::new(coord);
+        coord.register_validator(NodeId(vec![1])).await;
+        coord.register_validator(NodeId(vec![2])).await;
+
+        let mut req = ta_request(
+            "placeholder",
+            [0u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            0,
+        );
+        req.request_id = req.canonical_id();
+        let id = req.request_id.clone();
+
+        coord.start_verification(req.clone()).await.unwrap();
+        assert!(
+            coord.get_status(&id).await.is_ok(),
+            "round is in pending before settlement completes"
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ApprovedTransact { request: req }).unwrap();
+        drop(tx);
+
+        settle_approved_transacts(
+            rx,
+            |_approved| async move { Ok("settled-sig".to_string()) },
+            Some(coord.clone()),
+        )
+        .await;
+
+        assert!(
+            coord.get_status(&id).await.is_err(),
+            "settled round must be cleaned up from pending so timeout sweeps do not touch it"
+        );
     }
 }

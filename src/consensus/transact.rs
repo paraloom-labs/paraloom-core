@@ -714,13 +714,44 @@ impl TransactVerificationCoordinator {
             *self.onchain_stakes.write().await = stakes.clone();
         }
 
-        let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.apply_onchain_stakes(&stakes);
+        {
+            let mut leader_selector = self.leader_selector.write().await;
+            leader_selector.apply_onchain_stakes(&stakes);
+        }
         log::debug!(
             "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
             stakes.len(),
             registry_total_active_stake
         );
+
+        // Re-evaluate in-flight rounds whose votes arrived before the stake
+        // snapshot landed (or before a stake update cleared the threshold) so
+        // they are not stranded until timeout now that quorum is met.
+        if !stakes.is_empty() {
+            if let Some(tx) = &self.approval_tx {
+                let pending = self.pending.read().await;
+                let eligible = self.eligible_wallets().await;
+                let mut emitted = self.emitted.write().await;
+                for (request_id, consensus) in pending.iter() {
+                    if !consensus.tally.is_timed_out()
+                        && !emitted.contains(request_id)
+                        && consensus.tally.has_consensus(&eligible).await
+                        && self.stake_quorum_met(&consensus.tally).await
+                        && matches!(
+                            consensus.tally.consensus_result(&eligible).await,
+                            Ok(VerificationVote::Valid)
+                        )
+                    {
+                        let approved = ApprovedTransact {
+                            request: consensus.request.clone(),
+                        };
+                        if tx.send(approved).is_ok() {
+                            emitted.insert(request_id.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Look up the Solana wallet pubkey a registered validator co-signs
@@ -991,19 +1022,23 @@ impl TransactVerificationCoordinator {
     /// Remove timed-out pending verifications so the map cannot grow unbounded.
     /// The ingress write-surface inserts a request before any vote arrives, so
     /// requests that never reach quorum must be reclaimed by a periodic sweep.
+    /// Rounds that already reached quorum and emitted an `ApprovedTransact`
+    /// (`self.emitted`) are owned by `settle_approved_transacts`, which cleans
+    /// them up upon settlement completion or calls `clear_emitted` on final
+    /// failure; skipping them here keeps `valid_voters` intact across retry
+    /// attempts and preserves the `emitted` replay guard.
     pub async fn cleanup_timeouts(&self) -> Result<usize> {
         let mut pending = self.pending.write().await;
+        let emitted = self.emitted.read().await;
         let timed_out: Vec<String> = pending
             .iter()
-            .filter(|(_, consensus)| consensus.tally.is_timed_out())
+            .filter(|(id, consensus)| consensus.tally.is_timed_out() && !emitted.contains(*id))
             .map(|(id, _)| id.clone())
             .collect();
+        drop(emitted);
         let count = timed_out.len();
         for id in timed_out {
             pending.remove(&id);
-            // A content-bound canonical id that timed out must be re-approvable
-            // if the client re-proves it, so drop any stale emitted mark too.
-            self.emitted.write().await.remove(&id);
             log::warn!("Cleaned up timed out transact verification: {}", id);
         }
         Ok(count)
@@ -1571,5 +1606,83 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn sync_onchain_stakes_wakes_withheld_pending_rounds() {
+        let (c, mut approvals) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // Both validators vote Valid BEFORE the first on-chain stake snapshot
+        // lands: approval must be withheld while eligible stake is 0.
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "approval must be withheld before the on-chain stake snapshot lands"
+        );
+
+        // When the stake snapshot lands, sync_onchain_stakes must re-evaluate
+        // the pending round and emit the approval without needing a new vote.
+        c.sync_onchain_stakes(
+            stakes(&[("W0", 1_000_000_000), ("W1", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+        let emitted = approvals
+            .try_recv()
+            .expect("sync_onchain_stakes must emit approval for ready in-flight round");
+        assert_eq!(emitted.request.request_id, id);
+        assert!(
+            approvals.try_recv().is_err(),
+            "approval must be emitted at most once"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_timeouts_preserves_emitted_round_voters_and_replay_guard() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok());
+
+        // Force the round's deadline into the past while settlement is still
+        // in flight (before settle_approved_transacts calls cleanup).
+        {
+            let mut pending = coord.pending.write().await;
+            let entry = pending.get_mut(&id).unwrap();
+            entry.tally.deadline = 0;
+        }
+
+        let swept = coord.cleanup_timeouts().await.unwrap();
+        assert_eq!(
+            swept, 0,
+            "an already-emitted round must not be swept as timed out while in flight"
+        );
+        assert_eq!(
+            coord.valid_voters(&id).await.len(),
+            2,
+            "valid_voters must stay available for retry attempts until cleanup"
+        );
+
+        // Once settlement finishes and calls cleanup(&id), pending is removed
+        // while emitted stays set so a replayed vote cannot re-emit.
+        coord.cleanup(&id).await.unwrap();
+        assert!(coord.valid_voters(&id).await.is_empty());
+        assert!(coord.emitted.read().await.contains(&id));
     }
 }
