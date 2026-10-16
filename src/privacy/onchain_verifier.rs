@@ -40,6 +40,9 @@ fn rev32(src: &[u8]) -> [u8; 32] {
 
 /// G1 point → 64-byte big-endian `[x || y]`.
 fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    if p.is_zero() {
+        return [0u8; 64];
+    }
     // arkworks uncompressed G1 = `x_le(32) || y_le(32)`.
     let mut le = Vec::with_capacity(64);
     p.serialize_uncompressed(&mut le)
@@ -52,6 +55,9 @@ fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
 
 /// G2 point → 128-byte big-endian `[x.c1 || x.c0 || y.c1 || y.c0]`.
 fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
+    if p.is_zero() {
+        return [0u8; 128];
+    }
     // arkworks uncompressed G2 = `x.c0_le || x.c1_le || y.c0_le || y.c1_le`.
     // alt_bn128 wants `x.c1_be || x.c0_be || y.c1_be || y.c0_be`.
     let mut le = Vec::with_capacity(128);
