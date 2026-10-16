@@ -161,10 +161,11 @@ async fn submit_handler(
     // Deposits (`ext_amount > 0`) go through `deposit_note`, never this
     // ingress; the on-chain program rejects them anyway, so fail fast at the
     // door instead of burning a consensus round on a doomed request.
-    if req.ext_amount > 0 {
+    // Also reject i64::MIN to prevent negation overflow on-chain.
+    if req.ext_amount > 0 || req.ext_amount == i64::MIN {
         return Err((
             StatusCode::BAD_REQUEST,
-            "ext_amount must be <= 0 (deposits go through deposit_note)".to_string(),
+            "ext_amount must be <= 0 and > i64::MIN (deposits go through deposit_note)".to_string(),
         ));
     }
 
@@ -177,6 +178,20 @@ async fn submit_handler(
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
+
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "duplicate input nullifiers".to_string(),
+        ));
+    }
+
+    if output_commitments[0] == output_commitments[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "duplicate output commitments".to_string(),
+        ));
+    }
 
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
     let proof = hex::decode(proof_hex)
@@ -555,6 +570,32 @@ mod tests {
     async fn reserved_envelope_tag_is_400() {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ext_amount_min_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let resp = app
+            .oneshot(post_json(&body_with_ext_amount(i64::MIN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_nullifiers_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(&"22".repeat(32), &"11".repeat(32));
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_output_commitments_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(&"44".repeat(32), &"33".repeat(32));
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }

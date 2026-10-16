@@ -712,15 +712,51 @@ impl TransactVerificationCoordinator {
             *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
             *self.onchain_registry_total.write().await = registry_total_active_stake;
             *self.onchain_stakes.write().await = stakes.clone();
-        }
 
-        let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.apply_onchain_stakes(&stakes);
-        log::debug!(
-            "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
-            stakes.len(),
-            registry_total_active_stake
-        );
+            let mut leader_selector = self.leader_selector.write().await;
+            leader_selector.apply_onchain_stakes(&stakes);
+            drop(leader_selector);
+
+            log::debug!(
+                "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
+                stakes.len(),
+                registry_total_active_stake
+            );
+
+            // Re-evaluate pending rounds that may now satisfy stake quorum
+            if let Some(tx) = &self.approval_tx {
+                let eligible = self.eligible_wallets().await;
+                let pending = self.pending.read().await;
+                let mut emitted = self.emitted.write().await;
+
+                for (id, consensus) in pending.iter() {
+                    if !consensus.tally.is_timed_out()
+                        && !emitted.contains(id)
+                        && consensus.tally.has_consensus(&eligible).await
+                        && self.stake_quorum_met(&consensus.tally).await
+                        && matches!(
+                            consensus.tally.consensus_result(&eligible).await,
+                            Ok(VerificationVote::Valid)
+                        )
+                    {
+                        let approved = ApprovedTransact {
+                            request: consensus.request.clone(),
+                        };
+                        if tx.send(approved).is_ok() {
+                            emitted.insert(id.clone());
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut leader_selector = self.leader_selector.write().await;
+            leader_selector.apply_onchain_stakes(&stakes);
+            log::debug!(
+                "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
+                stakes.len(),
+                registry_total_active_stake
+            );
+        }
     }
 
     /// Look up the Solana wallet pubkey a registered validator co-signs
@@ -993,11 +1029,13 @@ impl TransactVerificationCoordinator {
     /// requests that never reach quorum must be reclaimed by a periodic sweep.
     pub async fn cleanup_timeouts(&self) -> Result<usize> {
         let mut pending = self.pending.write().await;
+        let emitted = self.emitted.read().await;
         let timed_out: Vec<String> = pending
             .iter()
-            .filter(|(_, consensus)| consensus.tally.is_timed_out())
+            .filter(|(id, consensus)| !emitted.contains(*id) && consensus.tally.is_timed_out())
             .map(|(id, _)| id.clone())
             .collect();
+        drop(emitted);
         let count = timed_out.len();
         for id in timed_out {
             pending.remove(&id);
@@ -1571,5 +1609,78 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn sync_onchain_stakes_emits_withheld_pending_rounds() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // Submit votes before onchain stake snapshot lands
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+
+        // Approval is withheld because onchain stakes have not landed yet
+        assert!(
+            approvals.try_recv().is_err(),
+            "approval must be withheld while onchain stakes have not landed"
+        );
+
+        // Now sync onchain stakes
+        c.sync_onchain_stakes(
+            stakes(&[("W0", 1_000_000_000), ("W1", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        // The withheld round must now be emitted!
+        assert!(
+            approvals.try_recv().is_ok(),
+            "sync_onchain_stakes must emit pending round that now satisfies quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_timeouts_skips_emitted_rounds() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok(), "approval emitted");
+
+        // Manually mark tally as timed out in pending to test cleanup_timeouts
+        {
+            let mut pending = coord.pending.write().await;
+            if let Some(consensus) = pending.get_mut(&id) {
+                consensus.tally.deadline = 0;
+            }
+        }
+
+        let cleaned = coord.cleanup_timeouts().await.unwrap();
+        assert_eq!(cleaned, 0, "cleanup_timeouts must skip emitted round");
+
+        // Round should still be in pending and emitted
+        assert!(
+            coord.pending.read().await.contains_key(&id),
+            "emitted round must remain in pending"
+        );
+        assert!(
+            coord.emitted.read().await.contains(&id),
+            "emitted round must retain emitted guard"
+        );
     }
 }
