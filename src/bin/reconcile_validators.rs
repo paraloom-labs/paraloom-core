@@ -77,6 +77,10 @@ const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
 // abort typed-loading a 129-byte account against the 145-byte layout.
 const NEW_LEN: usize = 145;
 
+/// `sha256("account:ValidatorRegistry")[..8]`.
+const VALIDATOR_REGISTRY_DISC: [u8; 8] = [168, 113, 195, 186, 62, 121, 163, 230];
+const VALIDATOR_REGISTRY_LEN: usize = 112;
+
 struct ValidatorRow {
     wallet: Pubkey,
     pda: Pubkey,
@@ -85,14 +89,25 @@ struct ValidatorRow {
     stake_amount: u64,
 }
 
-fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
+fn decode(program_id: &Pubkey, pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
+    if acc.owner != *program_id {
+        return None;
+    }
     let d = &acc.data;
     if d.len() < 89 || d[0..8] != VALIDATOR_DISC {
         return None;
     }
     let wallet = Pubkey::new_from_array(d[8..40].try_into().ok()?);
+    let (expected_pda, _) = derive_validator_account(program_id, &wallet);
+    if pda != expected_pda {
+        return None;
+    }
     let stake_amount = u64::from_le_bytes(d[40..48].try_into().ok()?);
-    let is_active = d[88] != 0; // offset: disc(8)+pubkey(32)+5*u64/i64(40)+... = byte 88
+    let is_active = match d[88] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    }; // offset: disc(8)+pubkey(32)+5*u64/i64(40)+... = byte 88
     Some(ValidatorRow {
         wallet,
         pda,
@@ -197,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rows: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     rows.sort_by_key(|r| r.wallet.to_bytes());
 
@@ -313,7 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refreshed: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     let active_sum: u64 = refreshed
         .iter()
@@ -324,6 +339,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (registry_pda, _) = derive_validator_registry(&program_id);
     let reg = client.get_account(&registry_pda)?;
+    if reg.owner != program_id {
+        return Err(format!(
+            "ValidatorRegistry owner mismatch: expected {program_id}, got {}",
+            reg.owner
+        )
+        .into());
+    }
+    if reg.data.len() < VALIDATOR_REGISTRY_LEN || reg.data[0..8] != VALIDATOR_REGISTRY_DISC {
+        return Err(format!(
+            "ValidatorRegistry account invalid or unmigrated (len={}, need >= {VALIDATOR_REGISTRY_LEN})",
+            reg.data.len()
+        )
+        .into());
+    }
     // ValidatorRegistry: disc(8) + authority(32) + total(8) + active(8) + min(8) + total_active_stake(8)
     let reg_active = u64::from_le_bytes(reg.data[48..56].try_into()?);
     let reg_stake = u64::from_le_bytes(reg.data[64..72].try_into()?);
@@ -342,9 +371,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ✓ invariant holds (total_active_stake == Σ active stake).");
     } else {
         println!("  ✗ INVARIANT MISMATCH — do NOT unpause; investigate before any settlement.");
+        return Err(
+            "post-reconcile invariant mismatch: total_active_stake != sum(active stake) or active_validators != count(active PDAs)"
+                .into(),
+        );
     }
     println!(
         "\nReconcile complete. Smoke-test a >=2-independent-co-signer settlement before unpausing."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_rejects_non_canonical_pda_wrong_owner_and_invalid_bool() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (canonical_pda, _) = derive_validator_account(&program_id, &wallet);
+
+        let mut data = vec![0u8; NEW_LEN];
+        data[0..8].copy_from_slice(&VALIDATOR_DISC);
+        data[8..40].copy_from_slice(wallet.as_ref());
+        data[40..48].copy_from_slice(&3_000_000_000u64.to_le_bytes());
+        data[88] = 1;
+
+        let valid_acc = Account {
+            lamports: 1_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let row = decode(&program_id, canonical_pda, &valid_acc).expect("valid row");
+        assert_eq!(row.wallet, wallet);
+        assert_eq!(row.stake_amount, 3_000_000_000);
+        assert!(row.is_active);
+
+        // Non-canonical PDA address must be rejected.
+        assert!(decode(&program_id, Pubkey::new_unique(), &valid_acc).is_none());
+
+        // Wrong owner must be rejected.
+        let mut wrong_owner = valid_acc.clone();
+        wrong_owner.owner = Pubkey::new_unique();
+        assert!(decode(&program_id, canonical_pda, &wrong_owner).is_none());
+
+        // Invalid boolean byte (> 1) must be rejected.
+        let mut bad_bool = valid_acc;
+        bad_bool.data[88] = 2;
+        assert!(decode(&program_id, canonical_pda, &bad_bool).is_none());
+    }
 }
