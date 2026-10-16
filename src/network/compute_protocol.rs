@@ -5,9 +5,10 @@
 //! - Querying job status and results
 
 use async_trait::async_trait;
+use bincode::Options;
 use futures::prelude::*;
 use libp2p::request_response::Codec;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 
 use crate::compute::{JobId, JobResult, JobStatus, ResourceLimits};
@@ -43,6 +44,35 @@ where
         ));
     }
     Ok(buf)
+}
+
+fn deserialize_bounded<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
+    let limit = buf.len().min(MAX_COMPUTE_PAYLOAD_BYTES) as u64;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn serialize_bounded<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let data = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_COMPUTE_PAYLOAD_BYTES as u64)
+        .serialize(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if data.len() > MAX_COMPUTE_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compute payload exceeds {} bytes",
+                MAX_COMPUTE_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    Ok(data)
 }
 
 /// Request to submit a compute job
@@ -95,7 +125,7 @@ impl Codec for ComputeJobCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn read_response<T>(
@@ -107,7 +137,7 @@ impl Codec for ComputeJobCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn write_request<T>(
@@ -119,8 +149,7 @@ impl Codec for ComputeJobCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&req)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -134,8 +163,7 @@ impl Codec for ComputeJobCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&res)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -160,7 +188,7 @@ impl Codec for ComputeQueryCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn read_response<T>(
@@ -172,7 +200,7 @@ impl Codec for ComputeQueryCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn write_request<T>(
@@ -184,8 +212,7 @@ impl Codec for ComputeQueryCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&req)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -199,8 +226,7 @@ impl Codec for ComputeQueryCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&res)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -228,6 +254,29 @@ mod tests {
         let err = read_size_bounded(&mut cursor)
             .await
             .expect_err("over-limit payload must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn codecs_reject_short_frame_with_huge_bincode_length_prefix() {
+        let mut malicious = Vec::new();
+        malicious.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        malicious.extend_from_slice(&[0u8; 8]);
+
+        let mut job_codec = ComputeJobCodec;
+        let job_proto = COMPUTE_JOB_PROTOCOL;
+        let err = job_codec
+            .read_request(&job_proto, &mut Cursor::new(malicious.clone()))
+            .await
+            .expect_err("oversized length prefix must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut query_codec = ComputeQueryCodec;
+        let query_proto = COMPUTE_QUERY_PROTOCOL;
+        let err = query_codec
+            .read_request(&query_proto, &mut Cursor::new(malicious))
+            .await
+            .expect_err("oversized length prefix must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

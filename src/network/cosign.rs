@@ -18,9 +18,10 @@
 //! budgets are independent.
 
 use async_trait::async_trait;
+use bincode::Options;
 use futures::prelude::*;
 use libp2p::request_response::{Behaviour as RequestResponse, Codec, Config, ProtocolSupport};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
 
@@ -100,6 +101,35 @@ where
     Ok(buf)
 }
 
+/// Deserialize a co-sign frame with a bincode allocation ceiling bounded by the
+/// frame buffer and [`MAX_COSIGN_PAYLOAD_BYTES`], preventing a tiny frame with
+/// a crafted `u64` length prefix from triggering an unbounded pre-allocation.
+fn deserialize_bounded<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
+    let limit = buf.len().min(MAX_COSIGN_PAYLOAD_BYTES) as u64;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn serialize_bounded<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let data = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_COSIGN_PAYLOAD_BYTES as u64)
+        .serialize(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if data.len() > MAX_COSIGN_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cosign payload exceeds {} bytes", MAX_COSIGN_PAYLOAD_BYTES),
+        ));
+    }
+    Ok(data)
+}
+
 /// Bincode-backed codec, structurally identical to `HeartbeatCodec`.
 #[derive(Debug, Clone, Default)]
 pub struct CoSignCodec;
@@ -119,7 +149,7 @@ impl Codec for CoSignCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn read_response<T>(
@@ -131,7 +161,7 @@ impl Codec for CoSignCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn write_request<T>(
@@ -143,8 +173,7 @@ impl Codec for CoSignCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&req)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -158,8 +187,7 @@ impl Codec for CoSignCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&res)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -202,6 +230,29 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    #[tokio::test]
+    async fn codec_rejects_short_frame_with_huge_bincode_length_prefix() {
+        // A 16-byte frame whose leading u64 claims a 1 TiB String length must
+        // be rejected as InvalidData before bincode attempts to pre-allocate.
+        let mut malicious = Vec::new();
+        malicious.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        malicious.extend_from_slice(&[0u8; 8]);
+
+        let mut codec = CoSignCodec;
+        let proto = COSIGN_PROTOCOL;
+        let err = codec
+            .read_request(&proto, &mut Cursor::new(malicious.clone()))
+            .await
+            .expect_err("oversized length prefix must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let err = codec
+            .read_response(&proto, &mut Cursor::new(malicious))
+            .await
+            .expect_err("oversized length prefix must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn cosign_request_round_trips_through_bincode() {
         let request = CoSignRequest {
@@ -209,8 +260,8 @@ mod tests {
             kind: SettlementKind::Transact,
             message: vec![0x01, 0x02, 0x03, 0x04],
         };
-        let encoded = bincode::serialize(&request).expect("serialize");
-        let decoded: CoSignRequest = bincode::deserialize(&encoded).expect("deserialize");
+        let encoded = serialize_bounded(&request).expect("serialize");
+        let decoded: CoSignRequest = deserialize_bounded(&encoded).expect("deserialize");
         assert_eq!(decoded.request_id, request.request_id);
         assert_eq!(decoded.kind, request.kind);
         assert_eq!(decoded.message, request.message);
@@ -223,8 +274,8 @@ mod tests {
             wallet_pubkey: "Hky4Zx2WaLLet".to_string(),
             signature: Some(vec![0xEEu8; 64]),
         };
-        let encoded = bincode::serialize(&response).expect("serialize");
-        let decoded: CoSignResponse = bincode::deserialize(&encoded).expect("deserialize");
+        let encoded = serialize_bounded(&response).expect("serialize");
+        let decoded: CoSignResponse = deserialize_bounded(&encoded).expect("deserialize");
         assert_eq!(decoded.request_id, response.request_id);
         assert_eq!(decoded.wallet_pubkey, response.wallet_pubkey);
         assert_eq!(decoded.signature, Some(vec![0xEEu8; 64]));
@@ -237,8 +288,8 @@ mod tests {
             wallet_pubkey: "DeCLineD".to_string(),
             signature: None,
         };
-        let encoded = bincode::serialize(&response).expect("serialize");
-        let decoded: CoSignResponse = bincode::deserialize(&encoded).expect("deserialize");
+        let encoded = serialize_bounded(&response).expect("serialize");
+        let decoded: CoSignResponse = deserialize_bounded(&encoded).expect("deserialize");
         assert_eq!(decoded.signature, None);
         assert_eq!(decoded.request_id, response.request_id);
     }
@@ -246,8 +297,8 @@ mod tests {
     #[test]
     fn settlement_kind_transact_round_trips() {
         let kind = SettlementKind::Transact;
-        let encoded = bincode::serialize(&kind).expect("serialize");
-        let decoded: SettlementKind = bincode::deserialize(&encoded).expect("deserialize");
+        let encoded = serialize_bounded(&kind).expect("serialize");
+        let decoded: SettlementKind = deserialize_bounded(&encoded).expect("deserialize");
         assert_eq!(decoded, kind);
     }
 }

@@ -1,9 +1,10 @@
 //! Request-Response protocol for reliable result collection
 
 use async_trait::async_trait;
+use bincode::Options;
 use futures::prelude::*;
 use libp2p::request_response::{Behaviour as RequestResponse, Codec, Config, ProtocolSupport};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ pub const RESULT_PROTOCOL: &str = "/paraloom/result/1.0.0";
 /// audit (#69, follow-up to #58) flagged this as a denial-of-service
 /// vector.
 ///
-/// 4 MiB is generously above what a real \`TaskResult\` payload should
+/// 4 MiB is generously above what a real `TaskResult` payload should
 /// produce: a Groth16 proof is ~190 bytes, output bytes are bounded
 /// elsewhere, and the surrounding bincode overhead is small. Tighten
 /// when production telemetry confirms a smaller bound is safe; loosen
@@ -50,6 +51,35 @@ where
         ));
     }
     Ok(buf)
+}
+
+fn deserialize_bounded<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
+    let limit = buf.len().min(MAX_RESULT_PAYLOAD_BYTES) as u64;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn serialize_bounded<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let data = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_RESULT_PAYLOAD_BYTES as u64)
+        .serialize(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if data.len() > MAX_RESULT_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "request-response payload exceeds {} bytes",
+                MAX_RESULT_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    Ok(data)
 }
 
 /// Request: TaskResult from validator
@@ -84,7 +114,7 @@ impl Codec for ResultCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn read_response<T>(
@@ -96,7 +126,7 @@ impl Codec for ResultCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn write_request<T>(
@@ -108,8 +138,7 @@ impl Codec for ResultCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&req)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -123,8 +152,7 @@ impl Codec for ResultCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&res)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -168,11 +196,11 @@ mod tests {
         assert_eq!(read.len(), MAX_RESULT_PAYLOAD_BYTES);
     }
 
-    /// A payload of \`limit + 1\` bytes is the regression case the
-    /// audit (#69) cares about: previously \`read_to_end\` would
+    /// A payload of `limit + 1` bytes is the regression case the
+    /// audit (#69) cares about: previously `read_to_end` would
     /// happily allocate the full attacker-supplied size, OOMing the
     /// coordinator. The bounded reader must surface
-    /// \`InvalidData\` instead.
+    /// `InvalidData` instead.
     #[tokio::test]
     async fn read_size_bounded_rejects_payload_over_limit() {
         let payload = vec![0xEFu8; MAX_RESULT_PAYLOAD_BYTES + 1];
@@ -192,5 +220,20 @@ mod tests {
             .await
             .expect("empty input is OK");
         assert!(read.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codec_rejects_short_frame_with_huge_bincode_length_prefix() {
+        let mut malicious = Vec::new();
+        malicious.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        malicious.extend_from_slice(&[0u8; 8]);
+
+        let mut codec = ResultCodec;
+        let proto = RESULT_PROTOCOL;
+        let err = codec
+            .read_request(&proto, &mut Cursor::new(malicious))
+            .await
+            .expect_err("oversized length prefix must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
