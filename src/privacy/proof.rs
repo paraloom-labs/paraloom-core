@@ -5,6 +5,7 @@
 use crate::privacy::circuits::Groth16ProofSystem;
 use crate::privacy::types::{Commitment, MerklePath, Nullifier};
 use ark_bn254::{Bn254, Fr};
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
@@ -94,11 +95,22 @@ impl VerificationChunk {
                     };
                 }
 
-                // Commitments must be non-zero
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
                 for commitment in commitments {
                     if commitment.as_bytes() == &[0u8; 32] {
                         return VerificationResult::Invalid {
                             reason: "Zero commitment detected".to_string(),
+                        };
+                    }
+                    if !is_canonical_le(commitment.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "non-canonical output commitment encoding".to_string(),
+                        };
+                    }
+                    if !seen.insert(commitment.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "Duplicate output commitment in transaction".to_string(),
                         };
                     }
                 }
@@ -113,10 +125,19 @@ impl VerificationChunk {
                     };
                 }
 
-                // Check for duplicates within batch
                 use std::collections::HashSet;
                 let mut seen = HashSet::new();
                 for nullifier in nullifiers {
+                    if nullifier.as_bytes() == &[0u8; 32] {
+                        return VerificationResult::Invalid {
+                            reason: "Zero nullifier detected".to_string(),
+                        };
+                    }
+                    if !is_canonical_le(nullifier.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "non-canonical nullifier encoding".to_string(),
+                        };
+                    }
                     if !seen.insert(nullifier) {
                         return VerificationResult::Invalid {
                             reason: "Duplicate nullifier in transaction".to_string(),
@@ -215,10 +236,20 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadErr
         }
     };
 
-    VerifyingKey::<Bn254>::deserialize_compressed(&bytes[..]).map_err(|e| KeyLoadError::Malformed {
-        path: path.to_path_buf(),
-        source: e,
-    })
+    let mut reader = &bytes[..];
+    let key = VerifyingKey::<Bn254>::deserialize_compressed(&mut reader).map_err(|e| {
+        KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    if !reader.is_empty() {
+        return Err(KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: ark_serialize::SerializationError::InvalidData,
+        });
+    }
+    Ok(key)
 }
 
 /// ZK Proof verifier interface
@@ -286,6 +317,11 @@ impl ProofVerifier {
                 reason: "positive ext_amount: deposits go through deposit_note".to_string(),
             };
         }
+        if ext_amount == i64::MIN {
+            return VerificationResult::Invalid {
+                reason: "ext_amount must be > i64::MIN".to_string(),
+            };
+        }
 
         // Reject non-canonical encodings (see `is_canonical_le`) before any
         // disk or crypto work: the nullifier bytes seed the on-chain PDA and
@@ -296,6 +332,16 @@ impl ProofVerifier {
         if !is_canonical_le(root) {
             return VerificationResult::Invalid {
                 reason: "non-canonical root encoding".to_string(),
+            };
+        }
+        if !is_canonical_le(asset_id) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical asset_id encoding".to_string(),
+            };
+        }
+        if nullifiers[0] == nullifiers[1] {
+            return VerificationResult::Invalid {
+                reason: "duplicate input nullifiers".to_string(),
             };
         }
         for nullifier in nullifiers {
@@ -336,6 +382,12 @@ impl ProofVerifier {
                 };
             }
         };
+
+        if proof.a.is_zero() || proof.b.is_zero() || proof.c.is_zero() {
+            return VerificationResult::Invalid {
+                reason: "identity-point Groth16 proof rejected".to_string(),
+            };
+        }
 
         // The suite names the key that verifies it, so a second suite cannot
         // silently borrow this one: adding a variant makes this a compile
@@ -661,5 +713,100 @@ mod tests {
         h.update(amount.to_le_bytes());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(withdraw_ext_data_hash(&recipient, amount), expected);
+    }
+
+    #[test]
+    fn transact_parts_rejects_min_i64_ext_amount() {
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            i64::MIN,
+            &[0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0xFFu8; 8],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("i64::MIN"), "{reason}");
+            }
+            _ => panic!("i64::MIN ext_amount must be rejected"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_non_canonical_asset_id() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut non_canonical = [0u8; 32];
+        non_canonical[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &non_canonical,
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0xFFu8; 8],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical asset_id"), "{reason}");
+            }
+            _ => panic!("non-canonical asset_id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_duplicate_input_nullifiers() {
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[[1u8; 32], [1u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0xFFu8; 8],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("duplicate input nullifiers"), "{reason}");
+            }
+            _ => panic!("duplicate input nullifiers must be rejected"),
+        }
+    }
+
+    #[test]
+    fn test_output_commitments_chunk_rejects_non_canonical_and_duplicates() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut non_canonical = [0u8; 32];
+        non_canonical[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let chunk = VerificationChunk::OutputCommitments {
+            commitments: vec![Commitment([1u8; 32]), Commitment(non_canonical)],
+        };
+        assert!(!chunk.verify().is_valid());
+
+        let chunk_dup = VerificationChunk::OutputCommitments {
+            commitments: vec![Commitment([1u8; 32]), Commitment([1u8; 32])],
+        };
+        assert!(!chunk_dup.verify().is_valid());
+    }
+
+    #[test]
+    fn test_nullifier_uniqueness_chunk_rejects_zero_and_non_canonical() {
+        let chunk_zero = VerificationChunk::NullifierUniqueness {
+            nullifiers: vec![Nullifier([0u8; 32]), Nullifier([1u8; 32])],
+        };
+        assert!(!chunk_zero.verify().is_valid());
+
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut non_canonical = [0u8; 32];
+        non_canonical[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let chunk_nc = VerificationChunk::NullifierUniqueness {
+            nullifiers: vec![Nullifier([1u8; 32]), Nullifier(non_canonical)],
+        };
+        assert!(!chunk_nc.verify().is_valid());
     }
 }

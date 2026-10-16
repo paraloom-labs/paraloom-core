@@ -91,38 +91,12 @@ pub struct CoSignPayload {
     pub params: SettlementParams,
 }
 
-impl CoSignPayload {
-    /// Serialize for transport in `CoSignRequest.message`.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| BridgeError::Serialization(e.to_string()))
-    }
-
-    /// Deserialize a payload received in a `CoSignRequest`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let payload: Self =
-            bincode::deserialize(bytes).map_err(|e| BridgeError::Serialization(e.to_string()))?;
-        // A BN254 Groth16 proof in alt_bn128 wire form is exactly 256 bytes.
-        // Reject an oversized `proof` field so a co-sign request cannot carry
-        // megabytes of padding to every co-signer (#757); the on-chain
-        // `MAX_PROOF_LEN` only binds at submission, after each node has already
-        // decoded the payload.
-        let proof = match &payload.params {
-            SettlementParams::Transact { proof, .. } => proof,
-            SettlementParams::TransactSpl { proof, .. } => proof,
-        };
-        if proof.len() > MAX_PROOF_BYTES {
-            return Err(BridgeError::Serialization(format!(
-                "co-sign proof field is {} bytes, exceeds {MAX_PROOF_BYTES}",
-                proof.len()
-            )));
-        }
-        Ok(payload)
-    }
-}
+/// Maximum byte size of a serialized [`CoSignPayload`].
+pub const MAX_COSIGN_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// The exact byte length of a BN254 Groth16 proof in alt_bn128 wire form (two G1
 /// points + one G2 point). The `proof` field of a decoded co-sign payload must
-/// not exceed this (#757).
+/// be exactly this (#757, #961).
 pub const MAX_PROOF_BYTES: usize = 256;
 
 /// Upper bound on co-signers in a single settlement transaction.
@@ -138,22 +112,86 @@ pub const MAX_PROOF_BYTES: usize = 256;
 /// binds far sooner) while never constraining a realistic BFT quorum.
 pub const MAX_QUORUM_COSIGNERS: usize = 100;
 
+fn validate_payload(payload: &CoSignPayload) -> Result<()> {
+    if payload.quorum_validators.is_empty()
+        || payload.quorum_validators.len() > MAX_QUORUM_COSIGNERS
+    {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "co-sign quorum has {} validators, must be between 1 and {}",
+            payload.quorum_validators.len(),
+            MAX_QUORUM_COSIGNERS
+        )));
+    }
+    let (proof, ext_amount, nullifiers) = match &payload.params {
+        SettlementParams::Transact {
+            proof,
+            ext_amount,
+            nullifiers,
+            ..
+        } => (proof, *ext_amount, *nullifiers),
+        SettlementParams::TransactSpl {
+            proof,
+            ext_amount,
+            nullifiers,
+            ..
+        } => (proof, *ext_amount, *nullifiers),
+    };
+    if proof.len() != MAX_PROOF_BYTES {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "co-sign proof field is {} bytes, must be exactly {MAX_PROOF_BYTES}",
+            proof.len()
+        )));
+    }
+    if ext_amount > 0 || ext_amount == i64::MIN {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "ext_amount must be <= 0 and > i64::MIN, got {ext_amount}"
+        )));
+    }
+    if nullifiers[0] == nullifiers[1] {
+        return Err(BridgeError::InvalidTransaction(
+            "input nullifiers must be distinct".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+impl CoSignPayload {
+    /// Serialize for transport in `CoSignRequest.message`.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| BridgeError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize a payload received in a `CoSignRequest`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_COSIGN_PAYLOAD_BYTES {
+            return Err(BridgeError::Serialization(format!(
+                "co-sign payload is {} bytes, exceeds {MAX_COSIGN_PAYLOAD_BYTES}",
+                bytes.len()
+            )));
+        }
+        let mut reader = bytes;
+        let payload: Self = bincode::deserialize_from(&mut reader)
+            .map_err(|e| BridgeError::Serialization(e.to_string()))?;
+        if !reader.is_empty() {
+            return Err(BridgeError::Serialization(
+                "trailing unconsumed bytes after co-sign payload".to_string(),
+            ));
+        }
+        validate_payload(&payload).map_err(|e| match e {
+            BridgeError::InvalidTransaction(msg) => BridgeError::Serialization(msg),
+            other => other,
+        })?;
+        Ok(payload)
+    }
+}
+
 /// Rebuild the exact settlement transaction [`Message`] every co-signer signs.
 ///
 /// Deterministic in `payload`: the same payload always yields byte-identical
 /// `Message::serialize()` output, which is the property the multi-signature
 /// assembly relies on.
 pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
-    // Reject an oversized co-signer set before building the message: the count
-    // comes off the wire and more accounts than a transaction can index would
-    // panic the message compiler (see MAX_QUORUM_COSIGNERS).
-    if payload.quorum_validators.len() > MAX_QUORUM_COSIGNERS {
-        return Err(BridgeError::InvalidTransaction(format!(
-            "co-sign quorum has {} validators, exceeds the {} maximum",
-            payload.quorum_validators.len(),
-            MAX_QUORUM_COSIGNERS
-        )));
-    }
+    validate_payload(payload)?;
 
     let program_id = Pubkey::new_from_array(payload.program_id);
     let authority = Pubkey::new_from_array(payload.authority);
@@ -325,5 +363,56 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    #[test]
+    fn from_bytes_rejects_trailing_bytes_and_oversized_payload() {
+        let payload = sample_transact_payload();
+        let mut bytes = payload.to_bytes().expect("serialize");
+        bytes.push(0x42); // trailing byte
+        let err = CoSignPayload::from_bytes(&bytes).expect_err("trailing bytes must fail");
+        assert!(matches!(err, BridgeError::Serialization(_)));
+
+        let oversized = vec![0u8; MAX_COSIGN_PAYLOAD_BYTES + 1];
+        let err = CoSignPayload::from_bytes(&oversized).expect_err("oversized payload must fail");
+        assert!(matches!(err, BridgeError::Serialization(_)));
+    }
+
+    #[test]
+    fn rejects_truncated_proof_and_empty_quorum() {
+        let mut payload = sample_transact_payload();
+        if let SettlementParams::Transact { ref mut proof, .. } = payload.params {
+            *proof = vec![0u8; 255]; // truncated proof
+        }
+        assert!(build_settlement_message(&payload).is_err());
+        let bytes = payload.to_bytes().unwrap();
+        assert!(CoSignPayload::from_bytes(&bytes).is_err());
+
+        let mut empty_quorum = sample_transact_payload();
+        empty_quorum.quorum_validators = vec![];
+        assert!(build_settlement_message(&empty_quorum).is_err());
+        let bytes = empty_quorum.to_bytes().unwrap();
+        assert!(CoSignPayload::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_ext_amount_overflow_and_duplicate_nullifiers() {
+        let mut min_amount = sample_transact_payload();
+        if let SettlementParams::Transact {
+            ref mut ext_amount, ..
+        } = min_amount.params
+        {
+            *ext_amount = i64::MIN;
+        }
+        assert!(build_settlement_message(&min_amount).is_err());
+
+        let mut dup_nf = sample_transact_payload();
+        if let SettlementParams::Transact {
+            ref mut nullifiers, ..
+        } = dup_nf.params
+        {
+            nullifiers[1] = nullifiers[0];
+        }
+        assert!(build_settlement_message(&dup_nf).is_err());
     }
 }
