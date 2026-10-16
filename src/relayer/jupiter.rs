@@ -446,6 +446,14 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         platform_fee_bps: u16,
         fee_account: Option<String>,
     ) -> Result<Self> {
+        if slippage_bps > 10_000 {
+            return Err(RelayerError::SwapFailed(format!(
+                "slippage_bps {slippage_bps} exceeds 10000 (100%)"
+            )));
+        }
+        let fee_account = fee_account
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if platform_fee_bps > 0 && fee_account.is_none() {
             return Err(RelayerError::SwapFailed(
                 "platform_fee_bps > 0 requires a fee_account".into(),
@@ -484,6 +492,16 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         self
     }
 
+    fn is_valid_dexes(dexes: &str) -> bool {
+        let trimmed = dexes.trim();
+        !trimmed.is_empty()
+            && !trimmed.chars().any(|c| {
+                matches!(c, '&' | '=' | '?' | '#' | '/' | '\\')
+                    || c.is_whitespace()
+                    || c.is_control()
+            })
+    }
+
     /// Build the `/quote (v1)` query string for the given pair/amount, folding in
     /// the configured slippage and platform fee.
     fn quote_query(&self, input_mint: &str, output_mint: &str, amount: u64) -> String {
@@ -498,13 +516,16 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
             q.push_str("&onlyDirectRoutes=true");
         }
         if let Some(dexes) = &self.dexes {
-            q.push_str(&format!("&dexes={}", dexes));
+            if Self::is_valid_dexes(dexes) {
+                q.push_str(&format!("&dexes={}", dexes.trim()));
+            }
         }
         q
     }
 
     /// Parse a `/quote (v1)` body into the realized gross output, treating an
-    /// `error` field or an empty `routePlan` as [`RelayerError::NoRoute`].
+    /// `error` field, an empty `routePlan`, or a zero `outAmount` as
+    /// [`RelayerError::NoRoute`].
     fn parse_quote(raw: &serde_json::Value) -> Result<u64> {
         let quote: QuoteResponse = serde_json::from_value(raw.clone())
             .map_err(|e| RelayerError::SwapFailed(format!("malformed quote: {e}")))?;
@@ -514,9 +535,15 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if quote.route_plan.is_empty() {
             return Err(RelayerError::NoRoute("empty routePlan".into()));
         }
-        quote.out_amount.parse::<u64>().map_err(|e| {
+        let out_amount = quote.out_amount.parse::<u64>().map_err(|e| {
             RelayerError::SwapFailed(format!("bad outAmount '{}': {e}", quote.out_amount))
-        })
+        })?;
+        if out_amount == 0 {
+            return Err(RelayerError::NoRoute(
+                "quote returned zero outAmount".into(),
+            ));
+        }
+        Ok(out_amount)
     }
 
     /// Decode Jupiter's base64 `swapTransaction` into a [`VersionedTransaction`].
@@ -547,6 +574,18 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
     ) -> Result<(u64, serde_json::Value)> {
         if amount == 0 {
             return Err(RelayerError::InvalidAmount(0));
+        }
+        if asset_in == asset_out {
+            return Err(RelayerError::SwapFailed(
+                "input and output assets must differ".into(),
+            ));
+        }
+        if let Some(dexes) = &self.dexes {
+            if !Self::is_valid_dexes(dexes) {
+                return Err(RelayerError::SwapFailed(
+                    "invalid dexes filter: must be non-empty and free of query delimiters".into(),
+                ));
+            }
         }
         let input_mint = asset_to_mint(asset_in);
         let output_mint = asset_to_mint(asset_out);
@@ -587,6 +626,11 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
             .await?;
         let resp: SwapTxResponse = serde_json::from_value(swap_raw)
             .map_err(|e| RelayerError::SwapFailed(format!("malformed swap response: {e}")))?;
+        if resp.swap_transaction.trim().is_empty() {
+            return Err(RelayerError::SwapFailed(
+                "empty swapTransaction in swap response".into(),
+            ));
+        }
         Ok(SwapQuote {
             out_amount,
             swap_transaction: resp.swap_transaction,
@@ -635,7 +679,14 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             // minus a reserve for the re-deposit fee, falling back to the quote
             // only when the balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
-                Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
+                Some(bal) => bal
+                    .checked_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS)
+                    .filter(|&a| a > 0)
+                    .ok_or_else(|| {
+                        RelayerError::SwapFailed(format!(
+                            "realized native balance {bal} does not exceed deposit reserve {NATIVE_DEPOSIT_RESERVE_LAMPORTS}"
+                        ))
+                    })?,
                 None => out_amount,
             }
         } else {
@@ -646,6 +697,11 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
                 .await?
                 .unwrap_or(out_amount)
         };
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "realized swap output is zero".into(),
+            ));
+        }
 
         Ok(SwapResult { out_amount })
     }
@@ -973,5 +1029,95 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn slippage_over_100_percent_or_blank_fee_account_is_rejected() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        assert!(matches!(
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 10_001, 0, None),
+            Err(RelayerError::SwapFailed(_))
+        ));
+
+        let http2 = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        assert!(matches!(
+            JupiterSwapProvider::new(
+                http2,
+                RecordingSubmitter::default(),
+                50,
+                30,
+                Some("   ".into()),
+            ),
+            Err(RelayerError::SwapFailed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_quote_rejects_zero_out_amount_even_with_route_plan() {
+        let quote = serde_json::json!({
+            "outAmount": "0",
+            "routePlan": [ { "swapInfo": { "label": "Orca" }, "percent": 100 } ]
+        });
+        let err = JupiterSwapProvider::<CannedClient, RecordingSubmitter>::parse_quote(&quote)
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::NoRoute(_)));
+    }
+
+    #[tokio::test]
+    async fn self_swap_and_injected_dexes_are_rejected_before_request() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let provider =
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 50, 0, None).unwrap();
+        let err = provider
+            .swap(NATIVE_SOL_ASSET, NATIVE_SOL_ASSET, 100_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
+        assert!(provider.http.seen_query.lock().unwrap().is_none());
+
+        let http2 = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let injected = JupiterSwapProvider::new(http2, RecordingSubmitter::default(), 50, 0, None)
+            .unwrap()
+            .with_dexes("Whirlpool&slippageBps=9999");
+        assert!(!injected
+            .quote_query(WRAPPED_SOL_MINT, "OutMint", 1_000)
+            .contains("slippageBps=9999"));
+        let err2 = injected
+            .swap(NATIVE_SOL_ASSET, [0x22u8; 32], 100_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, RelayerError::SwapFailed(_)));
+        assert!(injected.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_output_at_or_below_deposit_reserve_errors_instead_of_saturating_to_zero() {
+        struct DepletedBalanceSubmitter;
+        #[async_trait::async_trait]
+        impl SwapSubmitter for DepletedBalanceSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(NATIVE_DEPOSIT_RESERVE_LAMPORTS))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "1000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider =
+            JupiterSwapProvider::new(http, DepletedBalanceSubmitter, 50, 0, None).unwrap();
+        let err = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
     }
 }
