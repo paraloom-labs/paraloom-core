@@ -18,6 +18,7 @@
 //! encoding.
 
 use ark_bn254::{Fr, G1Affine, G2Affine};
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
@@ -40,6 +41,9 @@ fn rev32(src: &[u8]) -> [u8; 32] {
 
 /// G1 point → 64-byte big-endian `[x || y]`.
 fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    if p.is_zero() {
+        return [0u8; 64];
+    }
     // arkworks uncompressed G1 = `x_le(32) || y_le(32)`.
     let mut le = Vec::with_capacity(64);
     p.serialize_uncompressed(&mut le)
@@ -52,6 +56,9 @@ fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
 
 /// G2 point → 128-byte big-endian `[x.c1 || x.c0 || y.c1 || y.c0]`.
 fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
+    if p.is_zero() {
+        return [0u8; 128];
+    }
     // arkworks uncompressed G2 = `x.c0_le || x.c1_le || y.c0_le || y.c1_le`.
     // alt_bn128 wants `x.c1_be || x.c0_be || y.c1_be || y.c0_be`.
     let mut le = Vec::with_capacity(128);
@@ -377,6 +384,22 @@ mod tests {
             !verify(&wire_proof, &bad_dest, &vk_view),
             "a proof bound to one ext_data_hash must not verify against another"
         );
+    }
+
+    #[test]
+    fn identity_points_encode_to_all_zero_alt_bn128_wire_format() {
+        let g1_zero = g1_to_wire(&G1Affine::identity());
+        let g2_zero = g2_to_wire(&G2Affine::identity());
+        assert_eq!(g1_zero, [0u8; 64]);
+        assert_eq!(g2_zero, [0u8; 128]);
+
+        // Verify alt_bn128_addition accepts the encoded identity point.
+        let gen = g1_to_wire(&G1Affine::generator());
+        let mut add_in = [0u8; 128];
+        add_in[..64].copy_from_slice(&gen);
+        add_in[64..].copy_from_slice(&g1_zero);
+        let sum = alt_bn128_addition(&add_in).expect("addition with identity must succeed");
+        assert_eq!(sum.as_slice(), &gen[..]);
     }
 
     /// Dev tool — regenerates the on-chain program's withdraw verifying-key

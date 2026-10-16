@@ -180,7 +180,11 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
 
         // CONSTRAINT 1: input_value >= withdraw_amount (change is u64-bounded).
         let change_value = match (self.input_value, self.withdraw_amount) {
-            (Some(input), Some(withdraw)) => Some(input.saturating_sub(withdraw)),
+            (Some(input), Some(withdraw)) => Some(
+                input
+                    .checked_sub(withdraw)
+                    .ok_or(SynthesisError::Unsatisfiable)?,
+            ),
             _ => None,
         };
         let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;
@@ -312,6 +316,21 @@ impl TransferCircuitV2 {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let num_inputs = self.input_values.len();
+        let num_outputs = self.output_values.len();
+        if num_inputs == 0
+            || num_outputs == 0
+            || self.nullifiers.len() != num_inputs
+            || self.input_blindings.len() != num_inputs
+            || self.input_privkeys.len() != num_inputs
+            || self.input_paths.len() != num_inputs
+            || self.output_commitments.len() != num_outputs
+            || self.output_blindings.len() != num_outputs
+            || self.output_pubkeys.len() != num_outputs
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+
         // --- Public inputs ---
         let merkle_root_var = FpVar::new_input(cs.clone(), || {
             Ok(self
@@ -647,6 +666,20 @@ impl Default for TransactCircuitV3 {
 
 impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        if self.input_nullifiers.len() != TX_NINS
+            || self.in_amounts.len() != TX_NINS
+            || self.in_privkeys.len() != TX_NINS
+            || self.in_blindings.len() != TX_NINS
+            || self.in_leaf_indices.len() != TX_NINS
+            || self.in_paths.len() != TX_NINS
+            || self.output_commitments.len() != TX_NOUTS
+            || self.out_amounts.len() != TX_NOUTS
+            || self.out_pubkeys.len() != TX_NOUTS
+            || self.out_blindings.len() != TX_NOUTS
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+
         // Field-element public input from optional LE bytes.
         let input_fe = |cs: ConstraintSystemRef<Fr>, v: Option<[u8; 32]>| {
             FpVar::new_input(cs, || {
@@ -692,10 +725,11 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
 
             // leaf_index as 32 bits: gives both the field element (bound into the
             // signature/nullifier) and the per-level direction selectors.
+            // Reject any u64 leaf_index >= 2^32 rather than silently truncating
+            // via `as u32`.
             let idx_u32 = UInt32::new_witness(cs.clone(), || {
-                self.in_leaf_indices[tx]
-                    .map(|i| i as u32)
-                    .ok_or(SynthesisError::AssignmentMissing)
+                let raw = self.in_leaf_indices[tx].ok_or(SynthesisError::AssignmentMissing)?;
+                u32::try_from(raw).map_err(|_| SynthesisError::Unsatisfiable)
             })?;
             let idx_bits = idx_u32.to_bits_le();
             let leaf_index_var = Boolean::le_bits_to_fp_var(&idx_bits)?;
@@ -713,6 +747,12 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
             let nullifier_var =
                 v3_nullifier_gadget(cs.clone(), &commitment_var, &leaf_index_var, &signature_var)?;
             nullifier_var.enforce_equal(&nullifier_pub[tx])?;
+
+            if let Some(ref p) = self.in_paths[tx] {
+                if p.len() != TX_LEVELS {
+                    return Err(SynthesisError::Unsatisfiable);
+                }
+            }
 
             // Membership fold: direction bit `i` picks (current,sibling) order.
             let mut current = commitment_var;
@@ -810,8 +850,43 @@ impl Groth16ProofSystem {
         circuit: C,
         rng: &mut R,
     ) -> Result<Proof<Bn254>, SynthesisError> {
-        ark_groth16::Groth16::<Bn254, CircomReduction>::prove(pk, circuit, rng)
-            .map_err(|_| SynthesisError::Unsatisfiable)
+        use ark_ff::UniformRand;
+        use ark_relations::r1cs::{ConstraintSystem, OptimizationGoal};
+        use core::ops::Deref;
+
+        let cs = ConstraintSystem::new_ref();
+        cs.set_optimization_goal(OptimizationGoal::Constraints);
+        circuit.generate_constraints(cs.clone())?;
+        if !cs.is_satisfied()? {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+        cs.finalize();
+
+        let matrices = cs.to_matrices().ok_or(SynthesisError::Unsatisfiable)?;
+        let num_inputs = cs.num_instance_variables();
+        let num_constraints = cs.num_constraints();
+        let full_assignment = {
+            let borrow = cs.borrow().ok_or(SynthesisError::AssignmentMissing)?;
+            let prover = borrow.deref();
+            [
+                prover.instance_assignment.as_slice(),
+                prover.witness_assignment.as_slice(),
+            ]
+            .concat()
+        };
+
+        let r = Fr::rand(rng);
+        let s = Fr::rand(rng);
+        ark_groth16::Groth16::<Bn254, CircomReduction>::create_proof_with_reduction_and_matrices(
+            pk,
+            r,
+            s,
+            &matrices,
+            num_inputs,
+            num_constraints,
+            &full_assignment,
+        )
+        .map_err(|_| SynthesisError::Unsatisfiable)
     }
 
     /// Verify a proof
@@ -1827,7 +1902,98 @@ mod tests {
             let mut bad = public_inputs.clone();
             bad[0] = Fr::from(123u64);
             assert!(!Groth16ProofSystem::verify(&vk, &bad, &proof).expect("verify"));
+
+            // Proving an unsatisfied circuit (e.g. unbalanced public_amount or
+            // tampered nullifier) must fail at prove time rather than silently
+            // emitting a bogus proof via CircomReduction.
+            let mut unbalanced = circuit.clone();
+            unbalanced.public_amount = Some(fr_le(Fr::from(999_999u64)));
+            assert!(
+                matches!(
+                    Groth16ProofSystem::prove(&pk, unbalanced, &mut rng),
+                    Err(SynthesisError::Unsatisfiable)
+                ),
+                "Groth16ProofSystem::prove must reject an unbalanced TransactCircuitV3"
+            );
         }
+
+        #[test]
+        fn rejects_leaf_index_overflow_and_malformed_vectors() {
+            let valid = build(
+                [
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(11u64),
+                        blinding: Fr::from(1u64),
+                        index: 0,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(12u64),
+                        blinding: Fr::from(2u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 700,
+                        pubkey: v3_pubkey(Fr::from(21u64)),
+                        blinding: Fr::from(5u64),
+                    },
+                    OutNote {
+                        amount: 300,
+                        pubkey: v3_pubkey(Fr::from(22u64)),
+                        blinding: Fr::from(6u64),
+                    },
+                ],
+                asset(),
+                [7u8; 32],
+            );
+
+            // leaf_index == 2^32 previously wrapped to 0 via `as u32` and
+            // satisfied the dummy-input nullifier at index 0.
+            let mut overflow_idx = valid.clone();
+            overflow_idx.in_leaf_indices[0] = Some(1u64 << 32);
+            assert!(!synth(overflow_idx));
+
+            // Path with excess levels (> TX_LEVELS) must be rejected.
+            let mut long_path = valid.clone();
+            long_path.in_paths[0].as_mut().unwrap().push([0u8; 32]);
+            assert!(!synth(long_path));
+
+            // Short witness vector (< TX_NINS) must return Err, not panic.
+            let mut short_vec = valid;
+            short_vec.in_amounts.pop();
+            assert!(!synth(short_vec));
+        }
+    }
+
+    #[test]
+    fn transfer_v2_rejects_empty_or_mismatched_witness_vectors() {
+        let (root, nfs, vals, blinds, sks, paths) = two_input_tree();
+        let (opk0, opk1) = ([8u8; 32], [9u8; 32]);
+        let (ob0, ob1) = ([10u8; 32], [11u8; 32]);
+        let ocs = vec![v2_out_commit(opk0, 500, ob0), v2_out_commit(opk1, 500, ob1)];
+
+        // Empty inputs/outputs must not trivially satisfy 0 == 0
+        assert!(!synth_v2_transfer(TransferCircuitV2::new(0, 0)));
+
+        // Extra unconstrained public nullifier must be rejected
+        let mut extra_nf = TransferCircuitV2::with_witness(
+            root,
+            nfs,
+            ocs,
+            vals,
+            blinds,
+            sks,
+            paths,
+            vec![500, 500],
+            vec![ob0, ob1],
+            vec![opk0, opk1],
+            [0u8; 32],
+        );
+        extra_nf.nullifiers.push(Some([0x55u8; 32]));
+        assert!(!synth_v2_transfer(extra_nf));
     }
 }
 
