@@ -85,9 +85,29 @@ where
             let send = &send;
             let request = request.clone();
             async move {
-                let response = send(peer, request).await?;
+                let response = send(peer.clone(), request.clone()).await?;
+                if response.request_id != request.request_id {
+                    log::warn!(
+                        "co-sign response from {:?} had mismatched request_id '{}' (expected '{}'); ignoring",
+                        peer,
+                        response.request_id,
+                        request.request_id
+                    );
+                    return None;
+                }
                 let sig = response.signature?;
                 let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
+                if !peers
+                    .iter()
+                    .any(|(expected_wallet, peer_id)| *peer_id == peer && *expected_wallet == wallet)
+                {
+                    log::warn!(
+                        "co-sign response from {:?} claimed unexpected wallet {}; ignoring",
+                        peer,
+                        wallet
+                    );
+                    return None;
+                }
                 Some((wallet, sig))
             }
         },
@@ -195,5 +215,85 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn ignores_response_with_mismatched_request_id() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey()];
+        let peers = vec![(p1.pubkey(), NodeId(vec![1]))];
+
+        let result = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-current",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            2,
+            |_peer, request| {
+                let p1 = &p1;
+                async move {
+                    let mut resp = honest_response(p1, &request);
+                    resp.request_id = "req-stale".to_string();
+                    Some(resp)
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "response echoing a mismatched request_id must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_response_claiming_another_peers_wallet() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey()];
+        let peers = vec![
+            (p1.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+        ];
+
+        // Peer 1 returns a signature under peer 2's wallet while peer 2 declines.
+        // Peer 1 must not be allowed to satisfy the round using peer 2's wallet.
+        let result = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            3,
+            |peer, request| {
+                let p2 = &p2;
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        Some(honest_response(p2, &request))
+                    } else {
+                        None
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "response claiming a wallet not bound to the queried peer must be rejected"
+        );
     }
 }

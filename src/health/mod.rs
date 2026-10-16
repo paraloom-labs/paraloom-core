@@ -192,7 +192,11 @@ async fn readiness_handler(Extension(state): Extension<HealthServerState>) -> im
 async fn metrics_handler(Extension(state): Extension<HealthServerState>) -> impl IntoResponse {
     let uptime = state.uptime_seconds();
     let peers = state.current_peer_count();
-    let ready = if state.is_ready() { 1u8 } else { 0 };
+    let ready = if state.is_ready() && peers >= state.min_peers_for_ready {
+        1u8
+    } else {
+        0
+    };
     let body = format!(
         "# HELP paraloom_uptime_seconds Process uptime in seconds.\n\
          # TYPE paraloom_uptime_seconds gauge\n\
@@ -411,6 +415,31 @@ mod tests {
         assert!(text.contains("paraloom_ready 1"));
         assert!(text.contains("paraloom_build_info"));
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// `paraloom_ready` in `/metrics` is documented as 1 iff `/ready` would
+    /// return 200; when `mark_ready` is true but `peer_count < min_peers_for_ready`,
+    /// `/ready` returns 503 so `paraloom_ready` must report 0.
+    #[tokio::test]
+    async fn metrics_reports_ready_zero_when_peers_below_threshold() {
+        let state = HealthServerState::new().with_min_peers(3);
+        state.mark_ready();
+        state.set_peer_count(1);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("paraloom_peer_count 1"));
+        assert!(text.contains("paraloom_ready 0"));
     }
 
     /// Bare construction observes default values — no peers,

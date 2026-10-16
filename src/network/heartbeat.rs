@@ -8,9 +8,10 @@
 //! folding it in keeps the standby-side state machine simple.
 
 use async_trait::async_trait;
+use bincode::Options;
 use futures::prelude::*;
 use libp2p::request_response::{Behaviour as RequestResponse, Codec, Config, ProtocolSupport};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
 
@@ -69,6 +70,35 @@ where
     Ok(buf)
 }
 
+fn deserialize_bounded<T: DeserializeOwned>(buf: &[u8]) -> io::Result<T> {
+    let limit = buf.len().min(MAX_HEARTBEAT_PAYLOAD_BYTES) as u64;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn serialize_bounded<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    let data = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_HEARTBEAT_PAYLOAD_BYTES as u64)
+        .serialize(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if data.len() > MAX_HEARTBEAT_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "heartbeat payload exceeds {} bytes",
+                MAX_HEARTBEAT_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    Ok(data)
+}
+
 /// Bincode-backed codec, structurally identical to `ResultCodec`.
 #[derive(Debug, Clone, Default)]
 pub struct HeartbeatCodec;
@@ -88,7 +118,7 @@ impl Codec for HeartbeatCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn read_response<T>(
@@ -100,7 +130,7 @@ impl Codec for HeartbeatCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_size_bounded(io).await?;
-        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        deserialize_bounded(&buf)
     }
 
     async fn write_request<T>(
@@ -112,8 +142,7 @@ impl Codec for HeartbeatCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&req)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -127,8 +156,7 @@ impl Codec for HeartbeatCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let data =
-            bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = serialize_bounded(&res)?;
         io.write_all(&data).await?;
         io.close().await
     }
@@ -170,6 +198,21 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    #[tokio::test]
+    async fn codec_rejects_short_frame_with_huge_bincode_length_prefix() {
+        let mut malicious = Vec::new();
+        malicious.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        malicious.extend_from_slice(&[0u8; 8]);
+
+        let mut codec = HeartbeatCodec;
+        let proto = HEARTBEAT_PROTOCOL;
+        let err = codec
+            .read_request(&proto, &mut Cursor::new(malicious))
+            .await
+            .expect_err("oversized length prefix must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn heartbeat_request_round_trips_through_bincode() {
         let request = HeartbeatRequest {
@@ -177,8 +220,8 @@ mod tests {
             sequence: 42,
             snapshot: CoordinatorSnapshot::default(),
         };
-        let encoded = bincode::serialize(&request).expect("serialize");
-        let decoded: HeartbeatRequest = bincode::deserialize(&encoded).expect("deserialize");
+        let encoded = serialize_bounded(&request).expect("serialize");
+        let decoded: HeartbeatRequest = deserialize_bounded(&encoded).expect("deserialize");
         assert_eq!(decoded.primary, request.primary);
         assert_eq!(decoded.sequence, request.sequence);
         assert_eq!(
@@ -193,8 +236,8 @@ mod tests {
             accepted: true,
             last_applied_sequence: 99,
         };
-        let encoded = bincode::serialize(&response).expect("serialize");
-        let decoded: HeartbeatResponse = bincode::deserialize(&encoded).expect("deserialize");
+        let encoded = serialize_bounded(&response).expect("serialize");
+        let decoded: HeartbeatResponse = deserialize_bounded(&encoded).expect("deserialize");
         assert_eq!(decoded.accepted, response.accepted);
         assert_eq!(
             decoded.last_applied_sequence,
