@@ -23,7 +23,7 @@ use solana_sdk::{
 
 mod common;
 use common::{
-    add_program_data, add_stake_mint, bake_stake_vault, entry, funded_validator,
+    add_program_data, add_stake_mint, entry, funded_validator,
     init_validator_registry_ix, register_validator_ix, slash_validator_ix,
 };
 
