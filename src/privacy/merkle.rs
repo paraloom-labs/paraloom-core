@@ -102,10 +102,42 @@ impl MerkleTree {
             })?;
         }
 
+        // If recent_roots is empty, record the pre-insert root into recent_roots
+        {
+            let mut recent = self.recent_roots.write().await;
+            if recent.is_empty() {
+                let pre_root = self.compute_root(&leaves);
+                recent.push_back(pre_root);
+            }
+        }
+
         leaves.push(*commitment.as_bytes());
 
+        let new_root = self.compute_root(&leaves);
+
         let mut cached_root = self.cached_root.write().await;
-        *cached_root = None;
+        *cached_root = Some(new_root);
+        drop(cached_root);
+
+        {
+            let mut recent = self.recent_roots.write().await;
+            if recent.back() != Some(&new_root) {
+                recent.push_back(new_root);
+                while recent.len() > ROOT_HISTORY_LEN {
+                    recent.pop_front();
+                }
+            }
+        }
+
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.set_merkle_root(&new_root) {
+                log::warn!(
+                    target: "paraloom::privacy::merkle",
+                    "failed to persist Merkle root cache: {} — recomputation will trigger on next restart",
+                    e
+                );
+            }
+        }
 
         Ok(index)
     }
@@ -117,6 +149,10 @@ impl MerkleTree {
         &self,
         commitments: &[Commitment],
     ) -> Result<Vec<usize>, anyhow::Error> {
+        if commitments.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut leaves = self.leaves.write().await;
         let start_index = leaves.len();
         let indices: Vec<usize> = (start_index..start_index + commitments.len()).collect();
@@ -134,12 +170,43 @@ impl MerkleTree {
                 })?;
         }
 
-        for commitment in commitments {
-            leaves.push(*commitment.as_bytes());
+        // If recent_roots is empty, record the pre-insert root into recent_roots
+        {
+            let mut recent = self.recent_roots.write().await;
+            if recent.is_empty() {
+                let pre_root = self.compute_root(&leaves);
+                recent.push_back(pre_root);
+            }
+        }
+
+        let mut latest_root = [0u8; 32];
+        {
+            let mut recent = self.recent_roots.write().await;
+            for commitment in commitments {
+                leaves.push(*commitment.as_bytes());
+                latest_root = self.compute_root(&leaves);
+                if recent.back() != Some(&latest_root) {
+                    recent.push_back(latest_root);
+                    while recent.len() > ROOT_HISTORY_LEN {
+                        recent.pop_front();
+                    }
+                }
+            }
         }
 
         let mut cached_root = self.cached_root.write().await;
-        *cached_root = None;
+        *cached_root = Some(latest_root);
+        drop(cached_root);
+
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.set_merkle_root(&latest_root) {
+                log::warn!(
+                    target: "paraloom::privacy::merkle",
+                    "failed to persist Merkle root cache: {} — recomputation will trigger on next restart",
+                    e
+                );
+            }
+        }
 
         Ok(indices)
     }
@@ -633,6 +700,45 @@ mod tests {
         assert!(
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn intermediate_roots_known_without_calling_root() {
+        let tree = MerkleTree::new();
+        let empty_tree = MerkleTree::new();
+        let r0 = empty_tree.root().await;
+
+        // Insert c1 without calling tree.root().await
+        tree.insert(&Commitment([1u8; 32])).await.unwrap();
+        let reference_tree = MerkleTree::new();
+        reference_tree.insert(&Commitment([1u8; 32])).await.unwrap();
+        let r1 = reference_tree.root().await;
+
+        // Insert c2 without calling tree.root().await
+        tree.insert(&Commitment([2u8; 32])).await.unwrap();
+
+        assert!(tree.knows_root(&r0).await, "empty root r0 must be known");
+        assert!(
+            tree.knows_root(&r1).await,
+            "intermediate root r1 must be known"
+        );
+
+        // Test insert_batch intermediate roots
+        let batch_tree = MerkleTree::new();
+        batch_tree
+            .insert_batch(&[Commitment([10u8; 32]), Commitment([20u8; 32])])
+            .await
+            .unwrap();
+
+        let ref_batch1 = MerkleTree::new();
+        ref_batch1.insert(&Commitment([10u8; 32])).await.unwrap();
+        let b1 = ref_batch1.root().await;
+
+        assert!(batch_tree.knows_root(&r0).await, "r0 known in batch tree");
+        assert!(
+            batch_tree.knows_root(&b1).await,
+            "intermediate root b1 known in batch tree"
         );
     }
 }
