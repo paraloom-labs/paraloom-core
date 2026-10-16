@@ -21,8 +21,16 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "Trailing bytes in proof: consumed {}, total {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,8 +44,16 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "Trailing bytes in verifying key: consumed {}, total {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(vk)
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
@@ -56,8 +72,16 @@ pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
 /// Convert bytes to field element
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let fr = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "Trailing bytes in field element: consumed {}, total {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(fr)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -284,6 +308,19 @@ mod tests {
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut rng = ark_std::test_rng();
+        let field = Fr::rand(&mut rng);
+        let mut bytes = Vec::new();
+        field.serialize_compressed(&mut bytes).unwrap();
+        assert!(bytes_to_field(&bytes).is_ok());
+
+        let mut with_trailing = bytes.clone();
+        with_trailing.push(0x55);
+        assert!(bytes_to_field(&with_trailing).is_err());
     }
 
     // ── Proof-suite envelope ──────────────────────────────────────────

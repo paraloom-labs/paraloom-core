@@ -657,12 +657,14 @@ impl EventListener {
 
         // Create deposit transaction, indexed under the deposit's asset (#237):
         // an SPL deposit carries its mint, a native deposit NATIVE_SOL.
+        // On-chain `deposit_note` moves and commits to the full `event.amount`,
+        // not a net of the fee, so the note is created with fee 0.
         let deposit_tx = DepositTx::new_asset(
             event.from.to_vec(),
             event.amount,
             recipient,
             event.randomness,
-            event.fee,
+            0,
             event.asset_id,
         );
 
