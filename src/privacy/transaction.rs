@@ -98,7 +98,7 @@ impl DepositTx {
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
+        let output_note = Note::new(recipient, amount.saturating_sub(fee), randomness, asset_id);
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()
@@ -120,7 +120,7 @@ impl DepositTx {
     /// Verify deposit transaction
     pub fn verify(&self) -> bool {
         // Check amount covers fee
-        if self.amount < self.fee {
+        if self.amount < self.fee || self.amount == 0 {
             return false;
         }
 
@@ -279,7 +279,7 @@ impl WithdrawTx {
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
         // Amount must cover fee
-        if self.amount < self.fee {
+        if self.amount < self.fee || self.amount == 0 {
             return false;
         }
 
