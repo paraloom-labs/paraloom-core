@@ -71,22 +71,19 @@ async fn main() -> anyhow::Result<()> {
             if let Some(manager) = coordinator_node.compute_manager() {
                 if let Some(result) = manager.get_result(&job_id) {
                     println!("\nSUCCESS! Job completed on remote validator!");
-                    println!("   Status: {:?}", result.status);
-                    println!("   Execution time: {}ms", result.execution_time_ms);
+                    println!("   Status: ");
+                    println!("       Result: {}", result);
                 } else {
-                    println!("\nResult not yet available (may still be executing)");
+                    println!("\nERROR! Job did not complete.");
                 }
+            } else {
+                println!("\nERROR! Could not find job manager.");
             }
-        }
-        Err(e) => {
-            println!("   Failed to submit job: {}", e);
+        },
+        Err(err) => {
+            println!("ERROR! Failed to submit job: {}", err);
         }
     }
-
-    println!("\nShutting down nodes...");
-    drop(coordinator_node);
-    drop(validator_handle);
-    drop(coord_handle);
 
     Ok(())
 }
