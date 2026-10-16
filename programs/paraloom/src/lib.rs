@@ -1632,24 +1632,14 @@ pub mod paraloom_program {
     /// stale-low quorum denominator. It does not move the staked lamports; those
     /// are returned through `unregister_validator`.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
-        let was_active = ctx.accounts.validator_account.is_active;
-        let stake = ctx.accounts.validator_account.stake_amount;
         let who = ctx.accounts.validator_account.validator;
-        if was_active {
+        if ctx.accounts.validator_account.is_active {
             let now_slot = Clock::get()?.slot;
-            let v = &mut ctx.accounts.validator_account;
-            v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
-            // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
-            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
-            // the delay, same as unregister.
-            v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
-            v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
-            v.stake_amount = 0;
-            let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
+            deactivate_validator_state(
+                &mut ctx.accounts.validator_account,
+                &mut ctx.accounts.validator_registry,
+                now_slot,
+            );
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -2916,4 +2906,91 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+/// Apply the state transitions for `deactivate_validator`, moving both the SOL
+/// stake (`stake_amount` -> `unbonding_amount`) and the PARALOOM token stake
+/// (`token_stake_amount` -> `token_unbonding_amount`) into the unbonding window
+/// in lockstep while decrementing the registry's active counters.
+fn deactivate_validator_state(
+    v: &mut ValidatorAccount,
+    registry: &mut ValidatorRegistry,
+    now_slot: u64,
+) {
+    if !v.is_active {
+        return;
+    }
+    let stake = v.stake_amount;
+    let token_stake = v.token_stake_amount;
+    v.is_active = false;
+    // Route both the SOL and token stake halves into unbonding rather than
+    // stranding them: a deactivated validator can't `unregister` (that requires
+    // is_active), so without this its lamports and staked tokens would have no
+    // exit and be frozen forever (and the token half would escape
+    // unbonding-window slashing). Reclaimable via `withdraw_unbonded_stake`
+    // after the delay, same as unregister.
+    v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+    v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+    v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+    v.stake_amount = 0;
+    v.token_stake_amount = 0;
+    registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+    registry.active_validators = registry.active_validators.saturating_sub(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deactivate_validator_state_moves_both_sol_and_token_stake_to_unbonding() {
+        let validator_key = Pubkey::new_unique();
+        let authority_key = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+
+        let mut v = ValidatorAccount {
+            validator: validator_key,
+            stake_amount: MIN_VALIDATOR_STAKE,
+            reputation_score: 100,
+            total_tasks_verified: 0,
+            successful_verifications: 0,
+            registered_at: 1_700_000_000,
+            last_active: 1_700_000_000,
+            is_active: true,
+            pending_rewards: 0,
+            total_earnings: 0,
+            times_slashed: 0,
+            unbonding_amount: 0,
+            unbonding_slot: 0,
+            token_stake_amount: RECOMMENDED_MIN_TOKEN_STAKE,
+            token_unbonding_amount: 0,
+        };
+        let mut registry = ValidatorRegistry {
+            authority: authority_key,
+            total_validators: 1,
+            active_validators: 1,
+            minimum_stake: MIN_VALIDATOR_STAKE,
+            total_active_stake: MIN_VALIDATOR_STAKE,
+            stake_mint,
+            min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+        };
+
+        let slot = 42_000;
+        deactivate_validator_state(&mut v, &mut registry, slot);
+
+        assert!(!v.is_active);
+        assert_eq!(v.stake_amount, 0);
+        assert_eq!(v.unbonding_amount, MIN_VALIDATOR_STAKE);
+        assert_eq!(v.token_stake_amount, 0);
+        assert_eq!(v.token_unbonding_amount, RECOMMENDED_MIN_TOKEN_STAKE);
+        assert_eq!(v.unbonding_slot, slot + UNBONDING_SLOTS);
+        assert_eq!(registry.active_validators, 0);
+        assert_eq!(registry.total_active_stake, 0);
+
+        // Idempotent when called again on an already-deactivated validator.
+        deactivate_validator_state(&mut v, &mut registry, slot + 500);
+        assert_eq!(v.unbonding_amount, MIN_VALIDATOR_STAKE);
+        assert_eq!(v.token_unbonding_amount, RECOMMENDED_MIN_TOKEN_STAKE);
+        assert_eq!(v.unbonding_slot, slot + UNBONDING_SLOTS);
+    }
 }
