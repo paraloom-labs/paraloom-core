@@ -21,8 +21,16 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes after compressed proof: consumed {} of {} bytes",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,8 +44,16 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes after compressed verifying key: consumed {} of {} bytes",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(vk)
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
@@ -56,8 +72,16 @@ pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
 /// Convert bytes to field element
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes after compressed field element: consumed {} of {} bytes",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -358,5 +382,40 @@ mod tests {
                 assert_eq!(body.len(), suite.body_len());
             }
         }
+    }
+
+    #[test]
+    fn deserialize_proof_vk_and_field_reject_trailing_bytes() {
+        let mut rng = ark_std::test_rng();
+
+        // 1. Field element with trailing byte must be rejected.
+        let field = Fr::rand(&mut rng);
+        let mut field_bytes = field_to_bytes(&field).to_vec();
+        assert_eq!(bytes_to_field(&field_bytes).unwrap(), field);
+        field_bytes.push(0x42);
+        assert!(
+            bytes_to_field(&field_bytes).is_err(),
+            "bytes_to_field must reject trailing bytes"
+        );
+
+        // 2. Compressed proof with trailing byte must be rejected.
+        let proof = Proof::<Bn254>::default();
+        let mut proof_bytes = serialize_proof(&proof).unwrap();
+        assert_eq!(deserialize_proof(&proof_bytes).unwrap(), proof);
+        proof_bytes.push(0x99);
+        assert!(
+            deserialize_proof(&proof_bytes).is_err(),
+            "deserialize_proof must reject trailing bytes"
+        );
+
+        // 3. Compressed verifying key with trailing byte must be rejected.
+        let vk = VerifyingKey::<Bn254>::default();
+        let mut vk_bytes = serialize_vk(&vk).unwrap();
+        assert_eq!(deserialize_vk(&vk_bytes).unwrap(), vk);
+        vk_bytes.push(0xAB);
+        assert!(
+            deserialize_vk(&vk_bytes).is_err(),
+            "deserialize_vk must reject trailing bytes"
+        );
     }
 }
