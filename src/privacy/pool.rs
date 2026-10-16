@@ -124,42 +124,58 @@ impl ShieldedPool {
         amount: u64,
         asset_id: AssetId,
     ) -> Result<Commitment> {
-        // Idempotent: a deposit whose commitment is already credited must not
-        // be inserted or credited again. Two paths replay one: the bridge
-        // listener re-fetches a deposit that failed on a prior poll, and — the
-        // case that matters — it also re-fetches deposits that succeeded after
-        // a failed sibling, because the cursor freezes below the failure. If
-        // the process restarts inside that window the replay arrives against a
-        // reloaded pool, so the check has to be backed by persisted state
-        // rather than by anything built fresh at construction. The note carries
-        // fresh randomness per deposit, so an equal commitment means the same
-        // deposit, not a distinct one.
-        if self.deposited.read().await.contains(&commitment) {
+        if note.amount != amount {
+            return Err(anyhow!(
+                "deposit note amount ({}) does not match credited amount ({})",
+                note.amount,
+                amount
+            ));
+        }
+        if note.asset_id != asset_id {
+            return Err(anyhow!(
+                "deposit note asset_id ({:?}) does not match credited asset_id ({:?})",
+                note.asset_id,
+                asset_id
+            ));
+        }
+
+        // Serialize check-and-insert across `deposited` and `supplies` so two
+        // concurrent callers presenting the same commitment cannot both pass a
+        // read-only check and append duplicate leaves / double-credit supply.
+        let mut deposited = self.deposited.write().await;
+        if deposited.contains(&commitment) {
             return Ok(commitment);
         }
+
+        let mut supplies = self.supplies.write().await;
+        let current_supply = supplies.get(&asset_id).copied().unwrap_or(0);
+        let new_supply = current_supply.checked_add(amount).ok_or_else(|| {
+            anyhow!(
+                "shielded pool supply overflow for asset {:?}: {} + {}",
+                asset_id,
+                current_supply,
+                amount
+            )
+        })?;
 
         // Add to commitment tree (auto-persists if storage available).
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
         let _index = self.commitment_tree.insert(&commitment).await?;
 
-        // Mark it credited before anything else reads the pool, in the same
-        // place the tree is appended.
-        self.deposited.write().await.insert(commitment.clone());
+        // Persist the asset's supply to storage if available before committing
+        // the in-memory supply and idempotency maps.
+        if let Some(storage) = &self.storage {
+            storage.set_asset_supply(&asset_id, new_supply)?;
+        }
 
-        // Store note
+        deposited.insert(commitment.clone());
+        supplies.insert(asset_id, new_supply);
+        drop(supplies);
+        drop(deposited);
+
         let mut notes = self.notes.write().await;
         notes.insert(commitment.clone(), note);
-
-        // Credit this asset's supply
-        let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
-
-        // Persist the asset's supply to storage if available
-        if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
-        }
 
         Ok(commitment)
     }
@@ -487,5 +503,104 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn deposit_rejects_note_amount_or_asset_mismatch_without_mutating_pool() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([4u8; 32]);
+        let usdc: AssetId = [9u8; 32];
+
+        // Mismatched amount: note commits to 1_000, caller attempts to credit 500.
+        let note_wrong_amt = Note::new_native(addr.clone(), 1_000, [1u8; 32]);
+        assert!(pool.deposit(note_wrong_amt, 500).await.is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+        assert_eq!(pool.total_supply().await, 0);
+
+        // Mismatched asset_id: note commits to NATIVE_SOL_ASSET, caller attempts to credit `usdc`.
+        let note_wrong_asset = Note::new_native(addr, 1_000, [2u8; 32]);
+        assert!(pool
+            .deposit_asset(note_wrong_asset, 1_000, usdc)
+            .await
+            .is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+        assert_eq!(pool.supply_of(usdc).await, 0);
+    }
+
+    #[tokio::test]
+    async fn deposit_supply_overflow_fails_atomically_without_mutating_tree_or_deposited() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([5u8; 32]);
+
+        let initial_note = Note::new_native(addr.clone(), u64::MAX - 10, [1u8; 32]);
+        pool.deposit(initial_note, u64::MAX - 10).await.unwrap();
+        assert_eq!(pool.commitment_count().await, 1);
+        assert_eq!(pool.total_supply().await, u64::MAX - 10);
+        let root_before = pool.root().await;
+
+        // A second deposit that overflows u64::MAX must return Err without
+        // panicking and without appending a leaf or poisoning `deposited`.
+        let overflow_note = Note::new_native(addr, 20, [2u8; 32]);
+        let overflow_commitment = overflow_note.commitment();
+        assert!(pool.deposit(overflow_note, 20).await.is_err());
+
+        assert_eq!(pool.commitment_count().await, 1);
+        assert_eq!(pool.total_supply().await, u64::MAX - 10);
+        assert_eq!(pool.root().await, root_before);
+        assert!(pool.get_note(&overflow_commitment).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_credit_commitment_remains_idempotent() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([6u8; 32]);
+        let note = Note::new_native(addr, 1_000, [3u8; 32]);
+        let commitment = note.commitment();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = pool.clone();
+            let c = commitment.clone();
+            let n = note.clone();
+            handles.push(tokio::spawn(async move {
+                p.credit_commitment(c, n, 1_000, NATIVE_SOL_ASSET).await
+            }));
+        }
+
+        for h in handles {
+            let got = h.await.unwrap().unwrap();
+            assert_eq!(got, commitment);
+        }
+
+        assert_eq!(
+            pool.commitment_count().await,
+            1,
+            "concurrent duplicate credits must insert only one Merkle leaf"
+        );
+        assert_eq!(
+            pool.total_supply().await,
+            1_000,
+            "concurrent duplicate credits must credit supply only once"
+        );
+    }
+
+    #[tokio::test]
+    async fn knows_root_retains_intermediate_roots_across_back_to_back_deposits() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([8u8; 32]);
+        let n1 = Note::new_native(addr.clone(), 100, [10u8; 32]);
+        let n2 = Note::new_native(addr, 200, [20u8; 32]);
+
+        // Compute expected intermediate root after first deposit without calling
+        // `pool.root().await` between the two deposits.
+        let expected_r1 = pool.root_after(&[n1.commitment()]).await;
+
+        pool.deposit(n1, 100).await.unwrap();
+        pool.deposit(n2, 200).await.unwrap();
+
+        assert!(
+            pool.knows_root(&expected_r1).await,
+            "pool must recognize the intermediate root after the first deposit even when root() was not called between deposits"
+        );
     }
 }

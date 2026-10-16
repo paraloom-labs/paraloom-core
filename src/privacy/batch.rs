@@ -63,14 +63,14 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
-        if proofs.is_empty() {
-            return BatchVerificationResult::AllValid;
-        }
-
         if proofs.len() != public_inputs.len() {
             return BatchVerificationResult::Error {
                 reason: "Mismatched number of proofs and public inputs".to_string(),
             };
+        }
+
+        if proofs.is_empty() {
+            return BatchVerificationResult::AllValid;
         }
 
         // For small batches, verify individually
@@ -131,10 +131,24 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
+        if proofs.is_empty() {
+            return BatchVerificationResult::AllValid;
+        }
+
         let mut invalid_indices = Vec::new();
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
-            match crate::privacy::circuits::Groth16ProofSystem::verify(vk, inputs, proof) {
+            let verify_res = match &self.pvk {
+                Some(pvk) => self.verify_single_with_prepared(pvk, inputs, proof),
+                None => crate::privacy::circuits::Groth16ProofSystem::verify(vk, inputs, proof),
+            };
+            match verify_res {
                 Ok(true) => continue,
                 Ok(false) => invalid_indices.push(i),
                 Err(_) => {
@@ -190,12 +204,24 @@ impl AdaptiveBatchVerifier {
         }
     }
 
+    pub fn with_prepared_vk(vk: &VerifyingKey<Bn254>) -> Self {
+        AdaptiveBatchVerifier {
+            verifier: BatchVerifier::with_prepared_vk(vk),
+        }
+    }
+
     pub fn verify(
         &self,
         vk: &VerifyingKey<Bn254>,
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
         match proofs.len() {
             0 => BatchVerificationResult::AllValid,
             1..=2 => self.verifier.verify_individually(vk, public_inputs, proofs),
@@ -327,5 +353,38 @@ mod tests {
         // Large batch should also work
         let result = verifier.verify_batch(&vk, &[], &[]);
         assert_eq!(result, BatchVerificationResult::AllValid);
+    }
+
+    #[test]
+    fn adaptive_and_batch_verifiers_reject_all_length_mismatches() {
+        let mut rng = StdRng::seed_from_u64(42u64);
+        let circuit = DepositCircuitV2::new();
+        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+
+        let batch = BatchVerifier::with_prepared_vk(&vk);
+        let adaptive = AdaptiveBatchVerifier::with_prepared_vk(&vk);
+
+        // 0 proofs with non-empty public_inputs must not return AllValid.
+        let non_empty_inputs = vec![vec![Fr::from(1u64)]];
+        assert!(matches!(
+            batch.verify_batch(&vk, &non_empty_inputs, &[]),
+            BatchVerificationResult::Error { .. }
+        ));
+        assert!(matches!(
+            adaptive.verify(&vk, &non_empty_inputs, &[]),
+            BatchVerificationResult::Error { .. }
+        ));
+
+        // 1 or 2 proofs with empty or shorter public_inputs must not silently
+        // truncate via `.zip()` and return AllValid.
+        let dummy_proof = Proof::<Bn254>::default();
+        assert!(matches!(
+            adaptive.verify(&vk, &[], std::slice::from_ref(&dummy_proof)),
+            BatchVerificationResult::Error { .. }
+        ));
+        assert!(matches!(
+            adaptive.verify(&vk, &non_empty_inputs, &[dummy_proof.clone(), dummy_proof]),
+            BatchVerificationResult::Error { .. }
+        ));
     }
 }
