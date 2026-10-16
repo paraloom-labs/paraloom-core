@@ -73,6 +73,15 @@ impl R1CSToQAP for CircomReduction {
             a[start..end].clone_from_slice(&full_assignment[..num_inputs]);
         }
 
+        for i in 0..num_constraints {
+            let a_val = a[i];
+            let b_val = b[i];
+            let c_val = evaluate_constraint(&matrices.c[i], full_assignment);
+            if a_val * b_val != c_val {
+                return Err(SynthesisError::Unsatisfiable);
+            }
+        }
+
         let mut c = vec![zero; domain_size];
         c[..num_constraints]
             .iter_mut()
