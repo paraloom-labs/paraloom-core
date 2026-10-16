@@ -180,7 +180,7 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
 
         // CONSTRAINT 1: input_value >= withdraw_amount (change is u64-bounded).
         let change_value = match (self.input_value, self.withdraw_amount) {
-            (Some(input), Some(withdraw)) => Some(input.saturating_sub(withdraw)),
+            (Some(input), Some(withdraw)) => input.checked_sub(withdraw),
             _ => None,
         };
         let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;
@@ -694,7 +694,7 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
             // signature/nullifier) and the per-level direction selectors.
             let idx_u32 = UInt32::new_witness(cs.clone(), || {
                 self.in_leaf_indices[tx]
-                    .map(|i| i as u32)
+                    .and_then(|i| u32::try_from(i).ok())
                     .ok_or(SynthesisError::AssignmentMissing)
             })?;
             let idx_bits = idx_u32.to_bits_le();
