@@ -991,6 +991,7 @@ async fn cosign_settlement(
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -1086,18 +1087,18 @@ async fn cosign_settlement(
         {
             return declined("co-sign count limit reached for an input nullifier");
         }
-        for nf in cap_nullifiers {
+        for nf in &cap_nullifiers {
             // Bound the map so it cannot grow without limit as settlements
             // accumulate (#626): if a new nullifier would exceed the ceiling,
             // drop an arbitrary existing entry first. An evicted entry belongs
             // to an older spend whose nullifiers have almost certainly settled
             // on chain, so resetting its budget is harmless.
-            if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
-                if let Some(victim) = counts.keys().next().cloned() {
+            if !counts.contains_key(nf) && counts.len() >= MAX_COSIGN_COUNTS {
+                if let Some(victim) = counts.keys().find(|k| !cap_nullifiers.contains(k)).cloned() {
                     counts.remove(&victim);
                 }
             }
-            *counts.entry(nf).or_insert(0) += 1;
+            *counts.entry(nf.clone()).or_insert(0) += 1;
         }
     }
 
@@ -2359,7 +2360,9 @@ impl Node {
                 mint: mint.clone(),
             };
             if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
+                d.output_commitment == note.output_commitment
+                    && d.ciphertext == note.ciphertext
+                    && d.mint == note.mint
             }) {
                 continue;
             }
@@ -2696,6 +2699,19 @@ impl Node {
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
+        }
+
+        // Pre-filter already-spent nullifiers via self.shielded_pool (#624, #961)
+        if let Some(pool) = &self.shielded_pool {
+            for nf in &request.nullifiers {
+                if pool.is_spent(&crate::privacy::Nullifier(*nf)).await {
+                    log::warn!(
+                        "transact proof rejected for {}: nullifier already spent",
+                        request.request_id
+                    );
+                    return Ok(false);
+                }
+            }
         }
 
         // Asset id: all-zero for native SOL, or `mint_to_asset(mint)` for an SPL

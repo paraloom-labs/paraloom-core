@@ -161,10 +161,11 @@ async fn submit_handler(
     // Deposits (`ext_amount > 0`) go through `deposit_note`, never this
     // ingress; the on-chain program rejects them anyway, so fail fast at the
     // door instead of burning a consensus round on a doomed request.
-    if req.ext_amount > 0 {
+    // Also reject ext_amount == i64::MIN to prevent overflow on negation.
+    if req.ext_amount > 0 || req.ext_amount == i64::MIN {
         return Err((
             StatusCode::BAD_REQUEST,
-            "ext_amount must be <= 0 (deposits go through deposit_note)".to_string(),
+            "ext_amount must be <= 0 and > i64::MIN (deposits go through deposit_note)".to_string(),
         ));
     }
 
@@ -175,6 +176,12 @@ async fn submit_handler(
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input nullifiers must be distinct".to_string(),
+        ));
+    }
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
 

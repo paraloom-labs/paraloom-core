@@ -590,6 +590,16 @@ impl TransactVerificationCoordinator {
         // tests) — the stake gate still withholds on 0 total stake, so a
         // transiently-admitted peer is inert.
         {
+            if let Some(w) = &wallet_pubkey {
+                if self.equivocators.read().await.contains(w) {
+                    log::warn!(
+                        "transact registration rejected (banned equivocator): {:?} wallet={:?}",
+                        validator,
+                        wallet_pubkey
+                    );
+                    return;
+                }
+            }
             let allow = self.onchain_wallets.read().await;
             if !allow.is_empty() {
                 let admitted = wallet_pubkey
@@ -752,12 +762,18 @@ impl TransactVerificationCoordinator {
     /// co-signer still authenticates. Fail-open only while the on-chain set is
     /// empty (pre-first-snapshot), matching the registration gate.
     pub async fn source_is_onchain_validator(&self, node_id: &NodeId) -> bool {
+        let wallet = self.validator_wallet(node_id).await;
+        if let Some(w) = &wallet {
+            if self.equivocators.read().await.contains(w) {
+                return false;
+            }
+        }
         let onchain = self.onchain_wallets.read().await;
         if onchain.is_empty() {
             return true;
         }
-        match self.validator_wallet(node_id).await {
-            Some(wallet) => onchain.contains(&wallet),
+        match wallet {
+            Some(w) => onchain.contains(&w),
             None => false,
         }
     }
@@ -867,8 +883,21 @@ impl TransactVerificationCoordinator {
 
         // Eligibility: while the on-chain wallet set is known, only a staked
         // co-sign wallet may be counted (fail-open only while it is empty, as
-        // the registration gate does).
+        // the registration gate does). Banned equivocator wallets are dropped.
         {
+            if self
+                .equivocators
+                .read()
+                .await
+                .contains(&result.wallet_pubkey)
+            {
+                log::warn!(
+                    "dropping vote from banned equivocator wallet {} for {}",
+                    result.wallet_pubkey,
+                    result.request_id
+                );
+                return Ok(());
+            }
             let onchain = self.onchain_wallets.read().await;
             if !onchain.is_empty() && !onchain.contains(&result.wallet_pubkey) {
                 log::warn!(
@@ -908,6 +937,20 @@ impl TransactVerificationCoordinator {
                 eq.insert(result.wallet_pubkey.clone());
                 self.persist_equivocators(&eq).await;
             }
+            // Purge standing vote from consensus tally
+            consensus
+                .tally
+                .votes
+                .write()
+                .await
+                .remove(&result.wallet_pubkey);
+            // Unregister/deactivate its NodeId upon equivocation
+            self.validators.write().await.retain(|v| v != &validator);
+            self.leader_selector
+                .write()
+                .await
+                .deactivate_validator(&validator);
+
             if let Err(e) = self.reputation_tracker.record_failure(&validator).await {
                 log::warn!("could not penalise equivocator {:?}: {}", validator, e);
             }
@@ -976,8 +1019,27 @@ impl TransactVerificationCoordinator {
         let consensus = pending
             .get(request_id)
             .ok_or_else(|| anyhow!("Request not found: {}", request_id))?;
-        let percentage = consensus.tally.completion_percentage().await;
-        let (valid, invalid) = consensus.tally.vote_counts().await;
+        let onchain = self.onchain_wallets.read().await;
+        let equivocators = self.equivocators.read().await;
+        let votes = consensus.tally.votes.read().await;
+
+        let eligible_votes: Vec<_> = votes
+            .iter()
+            .filter(|(wallet, _)| {
+                let is_staked = onchain.is_empty() || onchain.contains(*wallet);
+                let is_equivocator = equivocators.contains(*wallet);
+                is_staked && !is_equivocator
+            })
+            .map(|(_, rec)| rec)
+            .collect();
+
+        let valid = eligible_votes.iter().filter(|r| r.vote.is_valid()).count();
+        let invalid = eligible_votes.len() - valid;
+        let percentage = if consensus.tally.total_validators > 0 {
+            (eligible_votes.len() as f64 / consensus.tally.total_validators as f64) * 100.0
+        } else {
+            0.0
+        };
         Ok((percentage, valid, invalid))
     }
 
@@ -1571,5 +1633,67 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn banned_equivocator_cannot_register_or_vote_and_filtered_from_status() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(1, 1);
+        let banned_wallet = "BANNED_WALLET".to_string();
+        let banned_node = NodeId(vec![99]);
+
+        // Register initially when onchain validator
+        coordinator
+            .onchain_wallets
+            .write()
+            .await
+            .insert(banned_wallet.clone());
+        coordinator
+            .register_validator_with_wallet(banned_node.clone(), Some(banned_wallet.clone()))
+            .await;
+        assert!(coordinator.is_registered_validator(&banned_node).await);
+        assert!(coordinator.source_is_onchain_validator(&banned_node).await);
+
+        // Ban the wallet for equivocation
+        coordinator
+            .equivocators
+            .write()
+            .await
+            .insert(banned_wallet.clone());
+
+        // Banned wallet immediately fails source_is_onchain_validator
+        assert!(
+            !coordinator.source_is_onchain_validator(&banned_node).await,
+            "banned equivocator must fail source_is_onchain_validator"
+        );
+
+        // Re-registration with rotated node id is rejected
+        let rotated_node = NodeId(vec![100]);
+        coordinator
+            .register_validator_with_wallet(rotated_node.clone(), Some(banned_wallet.clone()))
+            .await;
+        assert!(
+            !coordinator.is_registered_validator(&rotated_node).await,
+            "banned equivocator must not be registered"
+        );
+        assert!(
+            !coordinator.source_is_onchain_validator(&rotated_node).await,
+            "banned equivocator must fail source_is_onchain_validator"
+        );
+
+        // Vote submission dropped
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coordinator.start_verification(req).await.unwrap();
+
+        coordinator
+            .submit_result(vote(&id, 99, &banned_wallet, true))
+            .await
+            .unwrap();
+
+        let (pct, valid, invalid) = coordinator.get_status(&id).await.unwrap();
+        assert_eq!(valid, 0, "banned vote must not be counted in get_status");
+        assert_eq!(invalid, 0);
+        assert_eq!(pct, 0.0);
     }
 }
