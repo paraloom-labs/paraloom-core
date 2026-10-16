@@ -16,6 +16,88 @@ use std::sync::Arc;
 /// begins at offset [`ANCHOR_DISCRIMINATOR_LEN`].
 const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 
+/// `sha256("account:ValidatorAccount")[..8]`.
+const VALIDATOR_ACCOUNT_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
+
+/// Current on-chain `ValidatorAccount` size: 8-byte Anchor discriminator +
+/// 137-byte `INIT_SPACE` (post-dual-stake layout with `token_stake_amount` and
+/// `token_unbonding_amount`). Pre-migration 113-byte and 129-byte accounts are
+/// rejected by `ValidatorAccount::try_deserialize` in `verify_validator_quorum`
+/// and by `Account<'info, ValidatorAccount>` in `transact` / `transact_spl`.
+const VALIDATOR_ACCOUNT_LEN: usize = 145;
+
+/// `sha256("account:ValidatorRegistry")[..8]`.
+const VALIDATOR_REGISTRY_DISC: [u8; 8] = [168, 113, 195, 186, 62, 121, 163, 230];
+
+/// Current on-chain `ValidatorRegistry` size: 8-byte Anchor discriminator +
+/// `authority` (32) + 4×`u64` counters (32) + `stake_mint` (32) +
+/// `min_token_stake` (8) = 112 bytes.
+const VALIDATOR_REGISTRY_LEN: usize = 112;
+
+/// Decode and validate a raw on-chain `ValidatorAccount` PDA, returning
+/// `(validator_wallet, stake_amount)` only if the account satisfies every
+/// invariant required by on-chain `quorum::verify_validator_quorum` and
+/// `transact`:
+/// - owned by `program_id`,
+/// - migrated to the current 145-byte dual-stake layout with the
+///   `ValidatorAccount` Anchor discriminator,
+/// - canonical Borsh `is_active == true` (`1u8`) and `stake_amount > 0`,
+/// - located at the canonical `[b"validator", wallet]` PDA for `program_id`.
+fn decode_active_validator_stake(
+    program_id: &Pubkey,
+    pda: &Pubkey,
+    acc: &solana_sdk::account::Account,
+) -> Option<(Pubkey, u64)> {
+    if acc.owner != *program_id {
+        return None;
+    }
+    let d = &acc.data;
+    if d.len() < VALIDATOR_ACCOUNT_LEN || d[0..8] != VALIDATOR_ACCOUNT_DISC || d[88] != 1 {
+        return None;
+    }
+    let wallet = Pubkey::new_from_array(d[8..40].try_into().ok()?);
+    let (expected_pda, _) = super::derive_validator_account(program_id, &wallet);
+    if *pda != expected_pda {
+        return None;
+    }
+    let stake = u64::from_le_bytes(d[40..48].try_into().ok()?);
+    if stake == 0 {
+        return None;
+    }
+    Some((wallet, stake))
+}
+
+/// Extract `total_active_stake` from a raw `ValidatorRegistry` account after
+/// verifying program ownership, the `ValidatorRegistry` Anchor discriminator,
+/// and the post-dual-stake 112-byte layout size.
+fn parse_registry_total_active_stake(
+    program_id: &Pubkey,
+    account: &solana_sdk::account::Account,
+) -> Result<u64> {
+    if account.owner != *program_id {
+        return Err(BridgeError::Serialization(format!(
+            "ValidatorRegistry account owner mismatch: expected {}, got {}",
+            program_id, account.owner
+        )));
+    }
+    let d = &account.data;
+    if d.len() < VALIDATOR_REGISTRY_LEN {
+        return Err(BridgeError::Serialization(format!(
+            "ValidatorRegistry account too short: {} bytes (need >= {})",
+            d.len(),
+            VALIDATOR_REGISTRY_LEN
+        )));
+    }
+    if d[0..8] != VALIDATOR_REGISTRY_DISC {
+        return Err(BridgeError::Serialization(
+            "ValidatorRegistry account discriminator mismatch".to_string(),
+        ));
+    }
+    Ok(u64::from_le_bytes(
+        d[64..72].try_into().expect("8-byte total_active_stake"),
+    ))
+}
+
 /// Pull the `program_version: u32` out of a raw `BridgeState` account
 /// buffer. The on-chain layout puts `program_version` as the first
 /// field (after the 8-byte Anchor discriminator), so the value lives
@@ -70,17 +152,15 @@ impl ProgramInterface {
     /// on-chain stake instead of a placeholder, so the stake-weighted quorum
     /// reflects actual at-risk capital.
     ///
-    /// Base64 encoding is requested because a current `ValidatorAccount` is 129
+    /// Base64 encoding is requested because a current `ValidatorAccount` is 145
     /// bytes and the RPC rejects base58 above 128. The layout after the 8-byte
     /// discriminator is `wallet[8..40]`, `stake_amount[40..48]`, and the
     /// `is_active` flag at byte 88.
     pub async fn list_validator_stakes(&self) -> Result<Vec<(Pubkey, u64)>> {
-        // sha256("account:ValidatorAccount")[..8].
-        const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
         let config = RpcProgramAccountsConfig {
             filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
                 0,
-                VALIDATOR_DISC.to_vec(),
+                VALIDATOR_ACCOUNT_DISC.to_vec(),
             ))]),
             account_config: RpcAccountInfoConfig {
                 encoding: Some(UiAccountEncoding::Base64),
@@ -93,14 +173,15 @@ impl ProgramInterface {
             .get_program_accounts(&self.program_id, config)
             .await?;
         let mut stakes = Vec::with_capacity(accounts.len());
-        for (_pda, acc) in accounts {
-            let d = &acc.data;
-            if d.len() < 89 || d[0..8] != VALIDATOR_DISC || d[88] == 0 {
-                continue; // wrong account, truncated, or inactive
+        let mut seen = std::collections::HashSet::with_capacity(accounts.len());
+        for (pda, acc) in accounts {
+            if let Some((wallet, stake)) =
+                decode_active_validator_stake(&self.program_id, &pda, &acc)
+            {
+                if seen.insert(wallet) {
+                    stakes.push((wallet, stake));
+                }
             }
-            let wallet = Pubkey::new_from_array(d[8..40].try_into().expect("32-byte wallet"));
-            let stake = u64::from_le_bytes(d[40..48].try_into().expect("8-byte stake"));
-            stakes.push((wallet, stake));
         }
         Ok(stakes)
     }
@@ -113,21 +194,13 @@ impl ProgramInterface {
     ///
     /// Layout after the 8-byte Anchor discriminator: `authority[8..40]`,
     /// `total_validators[40..48]`, `active_validators[48..56]`,
-    /// `minimum_stake[56..64]`, `total_active_stake[64..72]`.
+    /// `minimum_stake[56..64]`, `total_active_stake[64..72]`,
+    /// `stake_mint[72..104]`, `min_token_stake[104..112]`.
     pub async fn registry_total_active_stake(&self) -> Result<u64> {
         let (registry_pda, _) =
             Pubkey::find_program_address(&[b"validator_registry"], &self.program_id);
         let account = self.rpc.get_account(&registry_pda).await?;
-        let d = &account.data;
-        if d.len() < 72 {
-            return Err(BridgeError::Serialization(format!(
-                "ValidatorRegistry account too short: {} bytes (need >= 72)",
-                d.len()
-            )));
-        }
-        Ok(u64::from_le_bytes(
-            d[64..72].try_into().expect("8-byte total_active_stake"),
-        ))
+        parse_registry_total_active_stake(&self.program_id, &account)
     }
 
     /// Verify a deposit transaction exists on Solana
@@ -230,6 +303,12 @@ impl ProgramInterface {
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
         let account = self.rpc.get_account(&state_pda).await?;
+        if account.owner != self.program_id {
+            return Err(BridgeError::ConfigError(format!(
+                "BridgeState account owner mismatch: expected {}, got {}",
+                self.program_id, account.owner
+            )));
+        }
         parse_program_version(&account.data)
     }
 
@@ -452,6 +531,20 @@ mod tests {
         assert!(matches!(err, BridgeError::ConfigError(_)));
     }
 
+    #[tokio::test]
+    async fn verify_program_version_rejects_wrong_owner() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut acc = bridge_state_account(crate::bridge::EXPECTED_PROGRAM_VERSION);
+        acc.owner = Pubkey::new_unique();
+        *mock.next_get_account.lock().unwrap() = Some(Ok(acc));
+        let program = program_with_mock(mock);
+        let err = program
+            .verify_program_version()
+            .await
+            .expect_err("wrong owner");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
     #[test]
     fn parse_program_version_reads_v04() {
         let mut buf = vec![0xAAu8; 8]; // discriminator
@@ -481,5 +574,152 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    fn synth_validator_account(
+        program_id: &Pubkey,
+        wallet: &Pubkey,
+        stake: u64,
+        is_active: u8,
+        len: usize,
+    ) -> (Pubkey, Account) {
+        let (pda, _) = crate::bridge::solana::derive_validator_account(program_id, wallet);
+        let mut data = vec![0u8; len.max(89)];
+        data[0..8].copy_from_slice(&VALIDATOR_ACCOUNT_DISC);
+        data[8..40].copy_from_slice(wallet.as_ref());
+        data[40..48].copy_from_slice(&stake.to_le_bytes());
+        data[88] = is_active;
+        data.truncate(len);
+        (
+            pda,
+            Account {
+                lamports: 1_000_000,
+                data,
+                owner: *program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn decode_active_validator_stake_enforces_migrated_canonical_active_pda() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+
+        // 1. Canonical 145-byte active ValidatorAccount with non-zero stake succeeds.
+        let (pda, acc) = synth_validator_account(
+            &program_id,
+            &wallet,
+            5_000_000_000,
+            1,
+            VALIDATOR_ACCOUNT_LEN,
+        );
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda, &acc),
+            Some((wallet, 5_000_000_000))
+        );
+
+        // 2. Unmigrated 113-byte (pre-#375) and 129-byte (pre-dual-stake) accounts must
+        // be rejected so off-chain quorum never counts a validator that fails
+        // `ValidatorAccount::try_deserialize` on-chain.
+        let (pda_113, acc_113) =
+            synth_validator_account(&program_id, &wallet, 5_000_000_000, 1, 113);
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda_113, &acc_113),
+            None
+        );
+        let (pda_129, acc_129) =
+            synth_validator_account(&program_id, &wallet, 5_000_000_000, 1, 129);
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda_129, &acc_129),
+            None
+        );
+
+        // 3. Non-canonical PDA address (even with valid data & owner) must be rejected.
+        let wrong_pda = Pubkey::new_unique();
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &wrong_pda, &acc),
+            None
+        );
+
+        // 4. Wrong account owner must be rejected.
+        let mut wrong_owner_acc = acc.clone();
+        wrong_owner_acc.owner = Pubkey::new_unique();
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda, &wrong_owner_acc),
+            None
+        );
+
+        // 5. Non-canonical boolean byte (e.g. 2) and inactive (0) must be rejected.
+        let (_, acc_inactive) = synth_validator_account(
+            &program_id,
+            &wallet,
+            5_000_000_000,
+            0,
+            VALIDATOR_ACCOUNT_LEN,
+        );
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda, &acc_inactive),
+            None
+        );
+        let (_, acc_bad_bool) = synth_validator_account(
+            &program_id,
+            &wallet,
+            5_000_000_000,
+            2,
+            VALIDATOR_ACCOUNT_LEN,
+        );
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda, &acc_bad_bool),
+            None
+        );
+
+        // 6. Zero stake must be rejected.
+        let (_, acc_zero_stake) =
+            synth_validator_account(&program_id, &wallet, 0, 1, VALIDATOR_ACCOUNT_LEN);
+        assert_eq!(
+            decode_active_validator_stake(&program_id, &pda, &acc_zero_stake),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_total_active_stake_validates_owner_discriminator_and_length() {
+        let program_id = Pubkey::default();
+        let mut data = vec![0u8; VALIDATOR_REGISTRY_LEN];
+        data[0..8].copy_from_slice(&VALIDATOR_REGISTRY_DISC);
+        data[64..72].copy_from_slice(&15_000_000_000u64.to_le_bytes());
+
+        let valid_acc = Account {
+            lamports: 1_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(valid_acc.clone()));
+        let program = program_with_mock(mock);
+        assert_eq!(
+            program.registry_total_active_stake().await.unwrap(),
+            15_000_000_000
+        );
+
+        // Unmigrated 72-byte pre-dual-stake registry must be rejected.
+        let mut short_acc = valid_acc.clone();
+        short_acc.data.truncate(72);
+        assert!(parse_registry_total_active_stake(&program_id, &short_acc).is_err());
+
+        // Wrong discriminator must be rejected.
+        let mut bad_disc_acc = valid_acc.clone();
+        bad_disc_acc.data[0] ^= 0xFF;
+        assert!(parse_registry_total_active_stake(&program_id, &bad_disc_acc).is_err());
+
+        // Wrong owner must be rejected.
+        let mut bad_owner_acc = valid_acc;
+        bad_owner_acc.owner = Pubkey::new_unique();
+        assert!(parse_registry_total_active_stake(&program_id, &bad_owner_acc).is_err());
     }
 }

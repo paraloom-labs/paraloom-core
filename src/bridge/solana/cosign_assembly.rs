@@ -41,8 +41,13 @@ where
     F: Fn(NodeId) -> Fut,
     Fut: Future<Output = Option<(Pubkey, Vec<u8>)>>,
 {
+    if threshold == 0 {
+        return Err(BridgeError::Serialization(
+            "co-sign threshold must be at least 1".to_string(),
+        ));
+    }
+
     let message_bytes = message.serialize();
-    let expected: std::collections::HashSet<Pubkey> = peers.iter().map(|(w, _)| *w).collect();
 
     let mut collected: HashMap<Pubkey, Vec<u8>> = HashMap::new();
     // The leader's own signature is trusted but still verified, so a wiring bug
@@ -54,15 +59,21 @@ where
     }
     collected.insert(own.0, own.1);
 
-    for (_, peer) in peers {
+    for (expected_wallet, peer) in peers {
         if collected.len() >= threshold {
             break;
+        }
+        if collected.contains_key(expected_wallet) {
+            continue; // already holds a verified signature for this wallet
         }
         let Some((wallet, sig)) = request(peer.clone()).await else {
             continue; // declined or timed out
         };
-        if !expected.contains(&wallet) || collected.contains_key(&wallet) {
-            continue; // unexpected or duplicate signer
+        if wallet != *expected_wallet || collected.contains_key(&wallet) {
+            log::warn!(
+                "co-sign peer returned unexpected or duplicate wallet {wallet} (expected {expected_wallet}); ignoring"
+            );
+            continue; // peer must sign for its own bound validator wallet
         }
         if !signature_is_valid(&wallet, &sig, &message_bytes) {
             log::warn!("co-sign signature from {wallet} did not verify; ignoring");
@@ -94,8 +105,27 @@ pub fn assemble_transaction(
     signatures: &HashMap<Pubkey, Vec<u8>>,
 ) -> Result<Transaction> {
     let num_signers = message.header.num_required_signatures as usize;
+    if num_signers == 0 {
+        return Err(BridgeError::Serialization(
+            "settlement message requires at least one signer".to_string(),
+        ));
+    }
+    let signer_keys = message.account_keys.get(..num_signers).ok_or_else(|| {
+        BridgeError::Serialization(format!(
+            "message header requires {} signers but only {} account keys are present",
+            num_signers,
+            message.account_keys.len()
+        ))
+    })?;
+
     let mut ordered = Vec::with_capacity(num_signers);
-    for key in &message.account_keys[..num_signers] {
+    let mut seen_signers = std::collections::HashSet::with_capacity(num_signers);
+    for key in signer_keys {
+        if !seen_signers.insert(*key) {
+            return Err(BridgeError::Serialization(format!(
+                "duplicate required signer {key} in message header"
+            )));
+        }
         let sig_bytes = signatures.get(key).ok_or_else(|| {
             BridgeError::Serialization(format!("missing co-signature for required signer {key}"))
         })?;
@@ -252,5 +282,70 @@ mod tests {
             result.is_err(),
             "a forged signature must not count toward the quorum"
         );
+    }
+
+    #[tokio::test]
+    async fn gather_rejects_mismatched_wallet_from_peer_and_zero_threshold() {
+        let leader = Keypair::new();
+        let v1 = Keypair::new();
+        let v2 = Keypair::new();
+        let message = two_signer_message(&leader.pubkey(), &v1.pubkey());
+        let own = sign(&leader, &message);
+        let peers = vec![
+            (v1.pubkey(), NodeId(vec![1])),
+            (v2.pubkey(), NodeId(vec![2])),
+        ];
+
+        // Zero threshold is rejected up front.
+        assert!(
+            gather_signatures(&message, own.clone(), &peers, 0, |_peer| async { None })
+                .await
+                .is_err()
+        );
+
+        // Peer 1 (expected to sign as v1) returns a valid signature for v2 instead,
+        // and Peer 2 declines. Because Peer 1's response does not match its expected
+        // wallet v1, it must be rejected rather than satisfying a threshold of 2.
+        let msg = message.clone();
+        let result = gather_signatures(&message, own, &peers, 2, |peer| {
+            let msg = msg.clone();
+            let v2 = &v2;
+            async move {
+                if peer == NodeId(vec![1]) {
+                    Some(sign(v2, &msg))
+                } else {
+                    None
+                }
+            }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "a peer returning another validator's wallet must not be accepted"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_zero_signers_out_of_bounds_header_and_duplicate_signers() {
+        let a = Keypair::new();
+        let b = Keypair::new();
+
+        // 1. 0 required signers must error instead of assembling an unsigned tx.
+        let mut zero_signer_msg = two_signer_message(&a.pubkey(), &b.pubkey());
+        zero_signer_msg.header.num_required_signatures = 0;
+        assert!(assemble_transaction(zero_signer_msg, &HashMap::new()).is_err());
+
+        // 2. num_required_signatures > account_keys.len() must return Err, never panic.
+        let mut oob_msg = two_signer_message(&a.pubkey(), &b.pubkey());
+        oob_msg.header.num_required_signatures = 99;
+        assert!(assemble_transaction(oob_msg, &HashMap::new()).is_err());
+
+        // 3. Duplicate signer pubkey in the required-signer slice must be rejected.
+        let mut dup_msg = two_signer_message(&a.pubkey(), &b.pubkey());
+        dup_msg.account_keys[1] = a.pubkey();
+        let mut sigs = HashMap::new();
+        let (wa, sa) = sign(&a, &dup_msg);
+        sigs.insert(wa, sa);
+        assert!(assemble_transaction(dup_msg, &sigs).is_err());
     }
 }
