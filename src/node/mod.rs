@@ -1048,6 +1048,10 @@ async fn cosign_settlement(
             (approved, cap_nullifiers)
         }
     };
+    if cap_nullifiers[0] == cap_nullifiers[1] {
+        return declined("duplicate input nullifiers");
+    }
+
     if !approved {
         return declined("parameters do not match a settlement we verified");
     }
@@ -1086,18 +1090,17 @@ async fn cosign_settlement(
         {
             return declined("co-sign count limit reached for an input nullifier");
         }
-        for nf in cap_nullifiers {
+        for nf in cap_nullifiers.iter() {
             // Bound the map so it cannot grow without limit as settlements
             // accumulate (#626): if a new nullifier would exceed the ceiling,
-            // drop an arbitrary existing entry first. An evicted entry belongs
-            // to an older spend whose nullifiers have almost certainly settled
-            // on chain, so resetting its budget is harmless.
-            if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
-                if let Some(victim) = counts.keys().next().cloned() {
+            // drop an arbitrary existing entry first, excluding the current settlement's
+            // nullifiers to prevent sibling self-eviction.
+            if !counts.contains_key(nf) && counts.len() >= MAX_COSIGN_COUNTS {
+                if let Some(victim) = counts.keys().find(|k| !cap_nullifiers.contains(k)).cloned() {
                     counts.remove(&victim);
                 }
             }
-            *counts.entry(nf).or_insert(0) += 1;
+            *counts.entry(nf.clone()).or_insert(0) += 1;
         }
     }
 
@@ -1198,6 +1201,9 @@ async fn settle_approved_transacts<F, Fut>(
             match submit(approved.clone()).await {
                 Ok(sig) => {
                     info!("on-chain transact settled for {}: {}", request_id, sig);
+                    if let Some(coord) = &coordinator {
+                        let _ = coord.cleanup(&request_id).await;
+                    }
                     break;
                 }
                 Err(e) if is_replay_error(&e) => {
@@ -1205,6 +1211,9 @@ async fn settle_approved_transacts<F, Fut>(
                         "transact {} already settled (nullifier spent), skipping",
                         request_id
                     );
+                    if let Some(coord) = &coordinator {
+                        let _ = coord.cleanup(&request_id).await;
+                    }
                     break;
                 }
                 Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
@@ -1228,6 +1237,7 @@ async fn settle_approved_transacts<F, Fut>(
                     // id and have it approved again, instead of it being wedged
                     // (approved-once, never settled) until a restart.
                     if let Some(coord) = &coordinator {
+                        let _ = coord.cleanup(&request_id).await;
                         coord.clear_emitted(&request_id).await;
                     }
                 }
@@ -2522,27 +2532,29 @@ impl Node {
         // recorded either way. Previously only the winner recorded it, so a
         // losing node's off-chain nullifier set drifted from the chain it is
         // meant to pre-filter against (#703).
-        let settled = match &result {
-            Ok(_) => true,
-            // Only ask the chain on failure, and only about the first
-            // nullifier: the pair is spent atomically in one instruction, so
-            // either both PDAs exist or neither does.
+        let (settled, spent_nullifiers) = match &result {
+            Ok(_) => (true, approved.request.nullifiers.to_vec()),
             Err(_) => {
-                bridge
-                    .lock()
-                    .await
-                    .is_nullifier_spent(&approved.request.nullifiers[0])
-                    .await
+                let mut spent = Vec::new();
+                let b = bridge.lock().await;
+                if b.is_nullifier_spent(&approved.request.nullifiers[0]).await {
+                    spent.push(approved.request.nullifiers[0]);
+                }
+                if b.is_nullifier_spent(&approved.request.nullifiers[1]).await {
+                    spent.push(approved.request.nullifiers[1]);
+                }
+                let is_settled = !spent.is_empty();
+                (is_settled, spent)
             }
         };
 
         if settled {
-            // Mark the input nullifiers spent in the off-chain set so this
+            // Mark only confirmed-spent nullifier(s) in the off-chain set so this
             // node's `check_batch` pre-filters replays before consensus,
             // matching the on-chain nullifier PDAs that are the authoritative
             // double-spend gate (#624).
             if let Some(pool) = &self.shielded_pool {
-                pool.record_spent(approved.request.nullifiers).await;
+                pool.record_spent(spent_nullifiers).await;
             }
         }
 
@@ -3323,6 +3335,99 @@ mod tests {
             counts.lock().await.len() <= MAX_COSIGN_COUNTS,
             "cosign_counts must stay bounded"
         );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_duplicate_input_nullifiers() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [7u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "dup".to_string(),
+            ta_request("dup", recipient, nullifiers, outputs, root, ext_amount),
+        );
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("dup", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "duplicate input nullifiers must be declined"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_counts_sibling_never_evicts_sibling_at_capacity() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let recipient = [9u8; 32];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1i64;
+
+        // Fill counts to MAX_COSIGN_COUNTS
+        {
+            let mut map = counts.lock().await;
+            for i in 0..MAX_COSIGN_COUNTS {
+                map.insert(format!("existing_{i}"), 1);
+            }
+        }
+
+        let n0 = [0xAA; 32];
+        let n1 = [0xBB; 32];
+        let nullifiers = [n0, n1];
+        let id = "cap_test";
+        tas.lock().await.insert(
+            id.to_string(),
+            ta_request(id, recipient, nullifiers, outputs, root, ext_amount),
+        );
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req(id, SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert!(resp.signature.is_some(), "cosign must succeed");
+
+        // Verify both nullifiers exist in counts and have count 1
+        let map = counts.lock().await;
+        let auth = hex::encode(payload.authority);
+        let key0 = format!("{}:{auth}", hex::encode(n0));
+        let key1 = format!("{}:{auth}", hex::encode(n1));
+        assert_eq!(
+            map.get(&key0).copied(),
+            Some(1),
+            "n0 must not be evicted by sibling n1"
+        );
+        assert_eq!(map.get(&key1).copied(), Some(1), "n1 must be recorded");
     }
 
     #[tokio::test]

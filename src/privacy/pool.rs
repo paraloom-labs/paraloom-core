@@ -216,7 +216,10 @@ impl ShieldedPool {
     /// authoritative double-spend gate; this only keeps the off-chain filter in
     /// step. Best-effort: a set-write error must not fail a settlement that has
     /// already landed on chain.
-    pub async fn record_spent(&self, nullifiers: [[u8; 32]; 2]) {
+    pub async fn record_spent<I>(&self, nullifiers: I)
+    where
+        I: IntoIterator<Item = [u8; 32]>,
+    {
         for n in nullifiers {
             if let Err(e) = self.nullifier_set.insert(Nullifier(n)).await {
                 log::warn!("failed to record spent nullifier off-chain: {e}");
