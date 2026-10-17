@@ -688,12 +688,14 @@ impl EventListener {
 
         // Credit the deposited amount, not a net of it: the on-chain leaf
         // commits to the full amount, so a fee netted here would credit a
-        // supply that does not match the tree.
-        pool.credit_commitment(
+        // supply that does not match the tree. Key idempotency on the unique
+        // on-chain deposit event identifier (leaf_index or signature:event_index).
+        pool.credit_commitment_with_id(
             commitment,
             deposit_tx.output_note,
             event.amount,
             event.asset_id,
+            Some(event.deposit_id()),
         )
         .await
         .map_err(|e| BridgeError::DepositFailed(e.to_string()))?;
@@ -1498,6 +1500,8 @@ mod tests {
             fee: 10,
             block: 100,
             timestamp: 0,
+            event_index: 0,
+            leaf_index: None,
         };
 
         let result = EventListener::process_deposit(&pool, event).await;
@@ -1533,6 +1537,8 @@ mod tests {
             fee: 10,
             block: 100,
             timestamp: 0,
+            event_index: 0,
+            leaf_index: None,
         };
 
         EventListener::process_deposit(&pool, event).await.unwrap();

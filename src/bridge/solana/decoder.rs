@@ -91,13 +91,44 @@ pub fn extract_deposit_events(
         }
     };
 
-    let mut events = Vec::new();
+    let mut parsed_leaf_indices: Vec<u64> = Vec::new();
+    if let Some(meta) = &confirmed.transaction.meta {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(logs) =
+            &meta.log_messages
+        {
+            for log in logs {
+                if let Some(pos) = log.find("deposit note appended at leaf ") {
+                    let rest = &log[pos + "deposit note appended at leaf ".len()..];
+                    let num_str = rest.split_whitespace().next().unwrap_or("");
+                    if let Ok(idx) = num_str.parse::<u64>() {
+                        parsed_leaf_indices.push(idx);
+                    }
+                } else if let Some(pos) = log.find("Deposit note appended at leaf ") {
+                    let rest = &log[pos + "Deposit note appended at leaf ".len()..];
+                    let num_str = rest.split_whitespace().next().unwrap_or("");
+                    if let Ok(idx) = num_str.parse::<u64>() {
+                        parsed_leaf_indices.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut event_count = 0usize;
 
     // Top-level instructions are already compiled — JSON encoding for
     // an unparsed program drops the `UiInstruction` wrapper.
     for compiled in &raw.instructions {
         if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id) {
-            events.push(build_event(signature, confirmed, decoded));
+            let leaf_index = parsed_leaf_indices.get(event_count).copied();
+            events.push(build_event(
+                signature,
+                confirmed,
+                decoded,
+                event_count,
+                leaf_index,
+            ));
+            event_count += 1;
         }
     }
 
@@ -114,7 +145,15 @@ pub fn extract_deposit_events(
                         if let Some(decoded) =
                             decode_compiled_deposit(compiled, &account_keys, program_id)
                         {
-                            events.push(build_event(signature, confirmed, decoded));
+                            let leaf_index = parsed_leaf_indices.get(event_count).copied();
+                            events.push(build_event(
+                                signature,
+                                confirmed,
+                                decoded,
+                                event_count,
+                                leaf_index,
+                            ));
+                            event_count += 1;
                         }
                     }
                 }
@@ -134,6 +173,9 @@ struct DecodedDeposit {
     /// `deposit_note_spl` (#779), or the legacy `deposit_spl`'s raw mint bytes
     /// (#237). The v3 arms must use whatever the program hashed into the leaf.
     asset_id: [u8; 32],
+    /// For SPL deposits, the account index of `asset_vault` in the transaction's
+    /// `account_keys`, used to verify realized token balance delta from transaction meta.
+    vault_account_key_index: Option<u8>,
 }
 
 /// `deposit_spl` account layout: bridge_state(0), mint(1), …, depositor(5).
@@ -151,6 +193,7 @@ const DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX: usize = 3;
 /// ahead of the mint, so neither the legacy `deposit_spl` positions nor the
 /// native `deposit_note` ones carry over.
 const DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX: usize = 2;
+const DEPOSIT_NOTE_SPL_ASSET_VAULT_ACCOUNT_INDEX: usize = 3;
 const DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 6;
 
 /// Try to interpret a single compiled instruction as a Paraloom
@@ -178,36 +221,43 @@ fn decode_compiled_deposit(
     // asset. `deposit_note` and `deposit_note_spl` are the two the program
     // still exposes; the two legacy arms stay so historical deposits made
     // before `8830226` removed them still decode.
-    let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT_NOTE {
-        (
-            DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::types::NATIVE_SOL_ASSET,
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
-        let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
-        let mint = account_keys.get(mint_index)?;
-        // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
-        // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
-        // the leaf, and `process_deposit` reduces this field into the same
-        // `v3_commit` the program computed. Feeding it raw bytes would credit a
-        // commitment the chain never appended — blind is recoverable, a wrong
-        // leaf in the pool is not.
-        (
-            DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT {
-        (
-            DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::types::NATIVE_SOL_ASSET,
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
-        let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
-        let mint = account_keys.get(mint_index)?;
-        (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes())
-    } else {
-        return None;
-    };
+    let (depositor_index, asset_id, vault_account_key_index) =
+        if raw_data[..8] == discriminators::DEPOSIT_NOTE {
+            (
+                DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
+                crate::privacy::types::NATIVE_SOL_ASSET,
+                None,
+            )
+        } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
+            let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
+            let mint = account_keys.get(mint_index)?;
+            let vault_idx = *compiled
+                .accounts
+                .get(DEPOSIT_NOTE_SPL_ASSET_VAULT_ACCOUNT_INDEX)? as u8;
+            // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
+            // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
+            // the leaf, and `process_deposit` reduces this field into the same
+            // `v3_commit` the program computed. Feeding it raw bytes would credit a
+            // commitment the chain never appended — blind is recoverable, a wrong
+            // leaf in the pool is not.
+            (
+                DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
+                crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
+                Some(vault_idx),
+            )
+        } else if raw_data[..8] == discriminators::DEPOSIT {
+            (
+                DEPOSITOR_ACCOUNT_INDEX,
+                crate::privacy::types::NATIVE_SOL_ASSET,
+                None,
+            )
+        } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
+            let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
+            let mint = account_keys.get(mint_index)?;
+            (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes(), None)
+        } else {
+            return None;
+        };
 
     let payload = &raw_data[8..];
     let data = DepositInstructionData::try_from_slice(payload).ok()?;
@@ -219,6 +269,7 @@ fn decode_compiled_deposit(
         data,
         depositor: *depositor,
         asset_id,
+        vault_account_key_index,
     })
 }
 
@@ -226,11 +277,45 @@ fn build_event(
     signature: &str,
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
     decoded: DecodedDeposit,
+    event_index: usize,
+    leaf_index: Option<u64>,
 ) -> DepositEvent {
+    let mut amount = decoded.data.amount;
+
+    // For DEPOSIT_NOTE_SPL, derive the realized vault deposit amount from
+    // pre_token_balances and post_token_balances if available, so fee-on-transfer
+    // mints credit the actual received amount matching on-chain leaf commitment and TVL.
+    if let (Some(vault_idx), Some(meta)) =
+        (decoded.vault_account_key_index, &confirmed.transaction.meta)
+    {
+        if let (
+            solana_transaction_status::option_serializer::OptionSerializer::Some(pre),
+            solana_transaction_status::option_serializer::OptionSerializer::Some(post),
+        ) = (&meta.pre_token_balances, &meta.post_token_balances)
+        {
+            let post_bal = post
+                .iter()
+                .find(|b| b.account_index == vault_idx)
+                .and_then(|b| b.ui_token_amount.amount.parse::<u64>().ok());
+            let pre_bal = pre
+                .iter()
+                .find(|b| b.account_index == vault_idx)
+                .and_then(|b| b.ui_token_amount.amount.parse::<u64>().ok())
+                .unwrap_or(0);
+            if let Some(post_amt) = post_bal {
+                if let Some(delta) = post_amt.checked_sub(pre_bal) {
+                    if delta > 0 {
+                        amount = delta;
+                    }
+                }
+            }
+        }
+    }
+
     DepositEvent {
         signature: signature.to_string(),
         from: decoded.depositor.to_bytes(),
-        amount: decoded.data.amount,
+        amount,
         recipient: decoded.data.recipient,
         randomness: decoded.data.randomness,
         asset_id: decoded.asset_id,
@@ -242,6 +327,8 @@ fn build_event(
         fee: 0,
         block: confirmed.slot,
         timestamp: confirmed.block_time.unwrap_or_default(),
+        event_index,
+        leaf_index,
     }
 }
 
@@ -515,5 +602,135 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn decodes_deposit_note_spl_with_realized_token_balance_delta() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiRawMessage, UiTokenAmount, UiTransaction,
+            UiTransactionStatusMeta, UiTransactionTokenBalance,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        let dummy = Pubkey::new_unique();
+
+        // account_keys: dummy@0, dummy@1, mint@2, vault@3, dummy@4, dummy@5, depositor@6, dummy@7, program@8
+        let account_keys = vec![
+            dummy.to_string(),
+            dummy.to_string(),
+            mint.to_string(),
+            vault.to_string(),
+            dummy.to_string(),
+            dummy.to_string(),
+            depositor.to_string(),
+            dummy.to_string(),
+            program_id.to_string(),
+        ];
+
+        let gross_amount = 5_000_000u64;
+        let realized_delta = 4_850_000u64; // Token-2022 transfer fee deducted
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount: gross_amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 8,
+            accounts: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let raw = UiRawMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            account_keys,
+            recent_blockhash: Hash::default().to_string(),
+            instructions: vec![ix],
+            address_table_lookups: None,
+        };
+
+        let vault_account_index = 3u8;
+        let pre_token_balance = UiTransactionTokenBalance {
+            account_index: vault_account_index,
+            mint: mint.to_string(),
+            ui_token_amount: UiTokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "1000000".to_string(),
+                ui_amount_string: "1.0".to_string(),
+            },
+            owner: OptionSerializer::None,
+            program_id: OptionSerializer::None,
+        };
+        let post_token_balance = UiTransactionTokenBalance {
+            account_index: vault_account_index,
+            mint: mint.to_string(),
+            ui_token_amount: UiTokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: (1_000_000u64 + realized_delta).to_string(),
+                ui_amount_string: "5.85".to_string(),
+            },
+            owner: OptionSerializer::None,
+            program_id: OptionSerializer::None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            status: Ok(()),
+            err: None,
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::None,
+            log_messages: OptionSerializer::Some(vec![
+                "Program log: SPL deposit note appended at leaf 77".to_string(),
+            ]),
+            pre_token_balances: OptionSerializer::Some(vec![pre_token_balance]),
+            post_token_balances: OptionSerializer::Some(vec![post_token_balance]),
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::None,
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 400,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["spl_tx_sig".to_string()],
+                    message: UiMessage::Raw(raw),
+                }),
+                meta: Some(meta),
+                version: None,
+            },
+            block_time: Some(1700000000),
+        };
+
+        let events = extract_deposit_events("spl_tx_sig", &confirmed, &program_id);
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(
+            ev.amount, realized_delta,
+            "decoder must use realized vault delta instead of gross amount"
+        );
+        assert_eq!(ev.event_index, 0);
+        assert_eq!(ev.leaf_index, Some(77));
+        assert_eq!(ev.deposit_id(), "leaf:77");
     }
 }

@@ -22,16 +22,15 @@ pub struct ShieldedPool {
     /// Nullifier set preventing double-spending
     nullifier_set: NullifierSet,
 
-    /// Commitments this pool has already credited, seeded from persisted
-    /// state on every construction.
+    /// Deposit event identifiers or commitments this pool has already credited,
+    /// seeded from persisted state on every construction.
     ///
     /// Deposit idempotency hangs on this rather than on `notes`, which is a
     /// cache with no persistence behind it: reloading a pool would leave it
     /// empty and let a replayed deposit through, which is exactly the case
     /// the guard exists for. `commitment_tree` is the authoritative record and
-    /// this is derived from it, so the two cannot disagree — the tree has a
-    /// single insert site, right beside the one that updates this.
-    deposited: Arc<RwLock<HashSet<Commitment>>>,
+    /// this is derived from it.
+    deposited: Arc<RwLock<HashSet<String>>>,
 
     /// Note storage (commitment -> encrypted note)
     /// In production, notes would be encrypted
@@ -72,9 +71,12 @@ impl ShieldedPool {
         let supplies = storage.get_all_asset_supplies()?;
 
         // Seed the idempotency set from the same persisted record the tree is
-        // rebuilt from, so a deposit credited before a restart is still
-        // recognised after one.
-        let deposited: HashSet<Commitment> = storage.get_all_commitments()?.into_iter().collect();
+        // rebuilt from, indexing both numeric leaf indices and commitments.
+        let mut deposited = HashSet::new();
+        for (idx, c) in storage.get_all_commitments()?.into_iter().enumerate() {
+            deposited.insert(format!("leaf:{}", idx));
+            deposited.insert(c.to_string());
+        }
 
         Ok(ShieldedPool {
             commitment_tree,
@@ -124,17 +126,25 @@ impl ShieldedPool {
         amount: u64,
         asset_id: AssetId,
     ) -> Result<Commitment> {
-        // Idempotent: a deposit whose commitment is already credited must not
-        // be inserted or credited again. Two paths replay one: the bridge
-        // listener re-fetches a deposit that failed on a prior poll, and — the
-        // case that matters — it also re-fetches deposits that succeeded after
-        // a failed sibling, because the cursor freezes below the failure. If
-        // the process restarts inside that window the replay arrives against a
-        // reloaded pool, so the check has to be backed by persisted state
-        // rather than by anything built fresh at construction. The note carries
-        // fresh randomness per deposit, so an equal commitment means the same
-        // deposit, not a distinct one.
-        if self.deposited.read().await.contains(&commitment) {
+        self.credit_commitment_with_id(commitment, note, amount, asset_id, None)
+            .await
+    }
+
+    /// Credit a deposit with an explicit deposit event identifier (e.g. from the on-chain bridge).
+    ///
+    /// Keying idempotency on the unique on-chain event identifier (such as `leaf_index` or
+    /// `signature:event_index`) ensures that distinct on-chain deposits with identical commitments
+    /// append to the Merkle tree in lockstep with the on-chain MerkleTreeAccount without being skipped.
+    pub async fn credit_commitment_with_id(
+        &self,
+        commitment: Commitment,
+        note: Note,
+        amount: u64,
+        asset_id: AssetId,
+        deposit_id: Option<String>,
+    ) -> Result<Commitment> {
+        let id = deposit_id.unwrap_or_else(|| commitment.to_string());
+        if self.deposited.read().await.contains(&id) {
             return Ok(commitment);
         }
 
@@ -145,7 +155,7 @@ impl ShieldedPool {
 
         // Mark it credited before anything else reads the pool, in the same
         // place the tree is appended.
-        self.deposited.write().await.insert(commitment.clone());
+        self.deposited.write().await.insert(id);
 
         // Store note
         let mut notes = self.notes.write().await;
@@ -383,6 +393,53 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(pool.commitment_count().await, 1);
         assert_eq!(pool.total_supply().await, 1000);
+    }
+
+    #[tokio::test]
+    async fn distinct_deposits_with_identical_commitments_append_in_lockstep() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([7u8; 32]);
+        let note = Note::new_native(addr, 1000, [9u8; 32]);
+        let commitment = note.commitment();
+
+        // Two distinct on-chain deposit events carrying the same commitment
+        pool.credit_commitment_with_id(
+            commitment.clone(),
+            note.clone(),
+            1000,
+            NATIVE_SOL_ASSET,
+            Some("leaf:0".to_string()),
+        )
+        .await
+        .unwrap();
+
+        pool.credit_commitment_with_id(
+            commitment.clone(),
+            note.clone(),
+            1000,
+            NATIVE_SOL_ASSET,
+            Some("leaf:1".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Both deposits must be appended to the Merkle tree in lockstep with the on-chain program
+        assert_eq!(pool.commitment_count().await, 2);
+        assert_eq!(pool.total_supply().await, 2000);
+
+        // Replaying leaf:0 must be idempotent
+        pool.credit_commitment_with_id(
+            commitment.clone(),
+            note,
+            1000,
+            NATIVE_SOL_ASSET,
+            Some("leaf:0".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pool.commitment_count().await, 2);
+        assert_eq!(pool.total_supply().await, 2000);
     }
 
     #[tokio::test]
