@@ -1572,4 +1572,53 @@ mod tests {
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
     }
+
+    #[tokio::test]
+    async fn check_consensus_waits_when_single_byzantine_invalid_leaves_quorum_reachable() {
+        let mut c = TransactVerificationCoordinator::new();
+        // 2-of-3 quorum
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![3]), Some("W3".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[
+                ("W1", 1_000_000_000),
+                ("W2", 1_000_000_000),
+                ("W3", 1_000_000_000),
+            ]),
+            3_000_000_000,
+        )
+        .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // W1 votes Valid
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        // 1 of 3: still pending
+        assert_eq!(c.check_consensus(&id).await.unwrap(), None);
+
+        // W2 votes Invalid (single byzantine validator)
+        c.submit_result(vote(&id, 2, "W2", false)).await.unwrap();
+
+        // With 1 valid and 1 invalid, 2-of-3 quorum is still reachable (W3 unvoted).
+        // check_consensus must wait (return None), NOT return Some(Invalid)!
+        assert_eq!(
+            c.check_consensus(&id).await.unwrap(),
+            None,
+            "must return None while valid quorum is still reachable"
+        );
+
+        // When W3 votes Valid, quorum is met and check_consensus returns Some(Valid)
+        c.submit_result(vote(&id, 3, "W3", true)).await.unwrap();
+        assert_eq!(
+            c.check_consensus(&id).await.unwrap(),
+            Some(VerificationVote::Valid)
+        );
+    }
 }
