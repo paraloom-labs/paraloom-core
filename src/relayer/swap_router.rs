@@ -99,6 +99,12 @@ async fn route_handler(
     if req.amount == 0 {
         return Err((StatusCode::BAD_REQUEST, "amount must be > 0".to_string()));
     }
+    if asset_in == asset_out {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input_mint and output_mint cannot be identical".to_string(),
+        ));
+    }
 
     match quoter
         .quote_swap(asset_in, asset_out, req.amount, &user)
@@ -313,5 +319,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn identical_mints_return_400() {
+        let mut b = valid_body();
+        b["input_mint"] = serde_json::json!("SOL");
+        b["output_mint"] = serde_json::json!("So11111111111111111111111111111111111111112");
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("cannot be identical"));
     }
 }

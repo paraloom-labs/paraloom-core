@@ -550,6 +550,11 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         }
         let input_mint = asset_to_mint(asset_in);
         let output_mint = asset_to_mint(asset_out);
+        if input_mint == output_mint {
+            return Err(RelayerError::SwapFailed(
+                "input and output mints cannot be identical".into(),
+            ));
+        }
 
         let query = self.quote_query(&input_mint, &output_mint, amount);
         let quote_raw = self.http.get_quote(&query).await?;
