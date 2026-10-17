@@ -132,19 +132,24 @@ impl ComputeStorage {
 
     // ========== Active Jobs Operations ==========
 
-    /// Mark a job as active (currently executing)
+    /// Mark a job as active (currently executing) atomically
     pub fn mark_job_active(&self, job: &ComputeJob) -> Result<()> {
-        let cf = self
+        let active_cf = self
             .db
             .cf_handle(CF_ACTIVE_JOBS)
             .ok_or_else(|| anyhow!("Active jobs CF not found"))?;
+        let pending_cf = self
+            .db
+            .cf_handle(CF_PENDING_JOBS)
+            .ok_or_else(|| anyhow!("Pending jobs CF not found"))?;
 
         let key = job.id.as_bytes();
         let value = bincode::serialize(job)?;
-        self.db.put_cf(cf, key, value)?;
 
-        // Remove from pending
-        self.remove_pending_job(&job.id)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(active_cf, key, value);
+        batch.delete_cf(pending_cf, key);
+        self.db.write(batch)?;
 
         debug!("Marked job as active: {}", job.id);
         Ok(())
@@ -213,19 +218,24 @@ impl ComputeStorage {
 
     // ========== Completed Results Operations ==========
 
-    /// Store a completed job result
+    /// Store a completed job result and remove from active queue atomically
     pub fn store_result(&self, result: &JobResult) -> Result<()> {
-        let cf = self
+        let completed_cf = self
             .db
             .cf_handle(CF_COMPLETED_RESULTS)
             .ok_or_else(|| anyhow!("Completed results CF not found"))?;
+        let active_cf = self
+            .db
+            .cf_handle(CF_ACTIVE_JOBS)
+            .ok_or_else(|| anyhow!("Active jobs CF not found"))?;
 
         let key = result.job_id.as_bytes();
         let value = bincode::serialize(result)?;
-        self.db.put_cf(cf, key, value)?;
 
-        // Remove from active jobs
-        self.remove_active_job(&result.job_id)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(completed_cf, key, value);
+        batch.delete_cf(active_cf, key);
+        self.db.write(batch)?;
 
         debug!("Stored result for job: {}", result.job_id);
         Ok(())
@@ -294,7 +304,7 @@ impl ComputeStorage {
 
     // ========== Utility Operations ==========
 
-    /// Clear all pending jobs (for testing/cleanup)
+    /// Clear all pending jobs (for testing/cleanup) atomically
     pub fn clear_pending_jobs(&self) -> Result<()> {
         let cf = self
             .db
@@ -302,10 +312,12 @@ impl ComputeStorage {
             .ok_or_else(|| anyhow!("Pending jobs CF not found"))?;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        let mut batch = rocksdb::WriteBatch::default();
         for item in iter {
             let (key, _) = item?;
-            self.db.delete_cf(cf, key)?;
+            batch.delete_cf(cf, key);
         }
+        self.db.write(batch)?;
 
         info!("Cleared all pending jobs");
         Ok(())
@@ -416,5 +428,20 @@ mod tests {
         let retrieved = storage.get_result(&job_id).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().job_id, job_id);
+    }
+
+    #[test]
+    fn test_clear_pending_jobs_batch() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        for i in 0..5 {
+            let job = ComputeJob::new(vec![i], vec![i + 1], ResourceLimits::default());
+            storage.add_pending_job(&job).unwrap();
+        }
+        assert_eq!(storage.count_pending_jobs().unwrap(), 5);
+
+        storage.clear_pending_jobs().unwrap();
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
     }
 }
