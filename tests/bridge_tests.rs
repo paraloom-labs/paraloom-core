@@ -69,6 +69,8 @@ async fn test_deposit_event_structure() {
         fee: 10,
         block: 12345,
         timestamp: 1699564800,
+        event_index: 0,
+        leaf_index: None,
     };
 
     assert_eq!(event.amount, 1000);

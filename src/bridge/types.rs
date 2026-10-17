@@ -35,6 +35,26 @@ pub struct DepositEvent {
 
     /// Timestamp
     pub timestamp: i64,
+
+    /// Event index within the transaction to disambiguate multiple deposits
+    #[serde(default)]
+    pub event_index: usize,
+
+    /// On-chain leaf index where the deposit was committed in MerkleTreeAccount (if known)
+    #[serde(default)]
+    pub leaf_index: Option<u64>,
+}
+
+impl DepositEvent {
+    /// Unique identifier for idempotency guarding in the shielded pool.
+    /// Prefers on-chain `leaf_index` when known; falls back to `(signature, event_index)`.
+    pub fn deposit_id(&self) -> String {
+        if let Some(leaf) = self.leaf_index {
+            format!("leaf:{}", leaf)
+        } else {
+            format!("{}:{}", self.signature, self.event_index)
+        }
+    }
 }
 
 /// Withdrawal request to Solana
