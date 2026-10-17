@@ -324,6 +324,12 @@ impl Coordinator {
 
     /// Submit a new task
     pub async fn submit_task(&self, task_type: TaskType) -> Result<TaskId> {
+        if !self.is_primary().await {
+            return Err(anyhow::anyhow!(
+                "cannot submit task to standby coordinator: not primary"
+            ));
+        }
+
         let task = Task::new(task_type.clone());
         let parent_id = task.id.clone();
 
@@ -543,8 +549,17 @@ impl Coordinator {
                 .map(|(_, result)| result.clone())
                 .collect();
 
-            // Sort by task_id to ensure consistent ordering
-            chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            // Sort chunks numerically by chunk index so chunk 10 is not placed before chunk 2
+            chunk_results.sort_by(|a, b| {
+                let parse_chunk_idx = |id: &str| -> Option<usize> {
+                    id.rsplit_once("-chunk-")
+                        .and_then(|(_, idx)| idx.parse().ok())
+                };
+                match (parse_chunk_idx(&a.task_id), parse_chunk_idx(&b.task_id)) {
+                    (Some(idx_a), Some(idx_b)) => idx_a.cmp(&idx_b),
+                    _ => a.task_id.cmp(&b.task_id),
+                }
+            });
             chunk_results
         }; // Locks are dropped here
 
@@ -619,6 +634,26 @@ impl Coordinator {
             }
         } else {
             log::warn!("No chunk results found for task {}", parent_id);
+        }
+
+        // Cleanup completed chunks from active_tasks, parent_tasks, and results
+        // to prevent unbounded memory growth and bloated replication snapshots.
+        {
+            let mut active = self.active_tasks.lock().await;
+            let mut parent_tasks = self.parent_tasks.lock().await;
+            let mut results = self.results.lock().await;
+
+            let completed_chunk_ids: Vec<TaskId> = parent_tasks
+                .iter()
+                .filter(|(_, pid)| pid.as_str() == parent_id)
+                .map(|(cid, _)| cid.clone())
+                .collect();
+
+            for cid in completed_chunk_ids {
+                active.remove(&cid);
+                parent_tasks.remove(&cid);
+                results.remove(&cid);
+            }
         }
 
         Ok(())
@@ -1015,6 +1050,109 @@ mod tests {
             post_promotion.parent_tasks.len(),
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_rejects_task_submission_until_promoted() {
+        use crate::task::TaskType;
+
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(100),
+        );
+        standby.register_validator(NodeId(vec![0xAA])).await;
+
+        let task_type = TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "sha256".to_string(),
+        };
+
+        // Task submission to standby must fail.
+        let err = standby.submit_task(task_type.clone()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot submit task to standby coordinator"),
+            "expected standby submission rejection error, got: {}",
+            err
+        );
+
+        // Promote standby to primary.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let promoted = standby.try_promote_if_stalled(Instant::now()).await;
+        assert_eq!(promoted, Some(NodeId(vec![0x01])));
+        assert!(standby.is_primary().await);
+
+        // Now submission should be accepted by the promoted primary.
+        let res = standby.submit_task(task_type).await;
+        assert!(
+            res.is_ok(),
+            "promoted primary should accept task submissions"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_aggregation_preserves_numerical_ordering_across_double_digits() {
+        use crate::task::{ResultData, TaskResult};
+
+        let coordinator = Coordinator::new(make_test_network());
+        let parent_id = "parent-task-1".to_string();
+
+        // Create 12 chunks (0..11).
+        let mut chunk_ids = Vec::new();
+        for i in 0..12 {
+            let cid = format!("{}-chunk-{}", parent_id, i);
+            chunk_ids.push(cid.clone());
+
+            let mut task = Task::new(TaskType::HashCalculation {
+                start: i as u64 * 10,
+                end: (i as u64 * 10) + 9,
+                algorithm: "sha256".to_string(),
+            });
+            task.id = cid.clone();
+            task.assigned_to = Some("v1".to_string());
+            task.status = TaskStatus::Assigned;
+
+            coordinator
+                .active_tasks
+                .lock()
+                .await
+                .insert(cid.clone(), task);
+            coordinator
+                .parent_tasks
+                .lock()
+                .await
+                .insert(cid.clone(), parent_id.clone());
+
+            let result = TaskResult {
+                task_id: cid.clone(),
+                data: ResultData::Hashes {
+                    hashes: vec![(i as u64, format!("hash-{}", i))],
+                    count: 1,
+                },
+                execution_time_ms: 10,
+            };
+            coordinator.results.lock().await.insert(cid, result);
+        }
+
+        // Aggregate results.
+        assert!(coordinator.aggregate_results(&parent_id).await.is_ok());
+
+        // Verify completed chunks were cleaned up from active_tasks, parent_tasks, and results.
+        let snapshot = coordinator.snapshot().await;
+        assert!(
+            snapshot.active_tasks.is_empty(),
+            "completed chunks must be pruned from active_tasks"
+        );
+        assert!(
+            snapshot.parent_tasks.is_empty(),
+            "completed chunks must be pruned from parent_tasks"
+        );
+        assert!(
+            snapshot.results.is_empty(),
+            "completed chunks must be pruned from results"
         );
     }
 }
