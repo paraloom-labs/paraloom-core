@@ -14,12 +14,12 @@ use std::time::Instant;
 /// cap a `start=0, end=u64::MAX` range overflows the item count (panic in
 /// debug, wrap in release) and loops ~2^64 times, growing the output vector
 /// until the validator is OOM-killed (#609).
-const MAX_HASH_TASK_ITEMS: u64 = 1_000_000;
+pub const MAX_HASH_TASK_ITEMS: u64 = 1_000_000;
 
 /// Validate a peer-supplied `HashCalculation` range and return its item count,
 /// rejecting an inverted range or one larger than [`MAX_HASH_TASK_ITEMS`]. The
 /// `+ 1` is overflow-checked so `end = u64::MAX` cannot panic or wrap (#609).
-fn checked_hash_count(start: u64, end: u64) -> Result<u64> {
+pub fn checked_hash_count(start: u64, end: u64) -> Result<u64> {
     if end < start {
         return Err(anyhow::anyhow!(
             "invalid hash range: end ({end}) < start ({start})"
@@ -54,7 +54,41 @@ impl Validator {
     }
 
     /// Handle incoming task request
-    pub async fn handle_task_request(&self, task: Task, coordinator_id: NodeId) -> Result<()> {
+    pub async fn handle_task_request(
+        &self,
+        source: &NodeId,
+        task: Task,
+        coordinator_id: NodeId,
+    ) -> Result<()> {
+        if source != &coordinator_id {
+            return Err(anyhow::anyhow!(
+                "task request coordinator_id {:?} does not match message source {:?}",
+                coordinator_id,
+                source
+            ));
+        }
+
+        if let Some(expected) = &self.coordinator_id {
+            if source != expected {
+                return Err(anyhow::anyhow!(
+                    "task request from {:?} does not match configured coordinator {:?}",
+                    source,
+                    expected
+                ));
+            }
+        }
+
+        if let Some(assigned) = &task.assigned_to {
+            let local_id = format!("{:?}", self.network.local_peer_id());
+            if assigned != &local_id {
+                return Err(anyhow::anyhow!(
+                    "task assigned to {} does not match local validator {}",
+                    assigned,
+                    local_id
+                ));
+            }
+        }
+
         info!("Validator received task: {} from coordinator", task.id);
 
         // Execute task
@@ -164,5 +198,48 @@ mod tests {
     fn hash_count_rejects_oversized_and_inverted_ranges() {
         assert!(checked_hash_count(0, MAX_HASH_TASK_ITEMS).is_err());
         assert!(checked_hash_count(5, 4).is_err());
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_spoofed_or_unassigned_task_requests() {
+        use crate::config::Settings;
+        use crate::network::protocol::NetworkManager;
+        use crate::task::{Task, TaskType};
+        use crate::types::NodeId;
+        use std::sync::Arc;
+
+        let network =
+            Arc::new(NetworkManager::new(&Settings::development()).expect("test network"));
+        let mut validator = super::Validator::new(network);
+        let coordinator = NodeId(vec![0xAA]);
+        let spoofed_peer = NodeId(vec![0xBB]);
+        let other_coordinator = NodeId(vec![0xCC]);
+
+        let task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 5,
+            algorithm: "sha256".to_string(),
+        });
+
+        // 1. Rejected when coordinator_id in payload doesn't match message source
+        assert!(validator
+            .handle_task_request(&spoofed_peer, task.clone(), coordinator.clone())
+            .await
+            .is_err());
+
+        // 2. Rejected when configured coordinator doesn't match source
+        validator.set_coordinator(coordinator.clone());
+        assert!(validator
+            .handle_task_request(&other_coordinator, task.clone(), other_coordinator.clone())
+            .await
+            .is_err());
+
+        // 3. Rejected when task.assigned_to does not match local peer id
+        let mut unassigned_task = task.clone();
+        unassigned_task.assigned_to = Some("PeerId(12D3Kfoo)".to_string());
+        assert!(validator
+            .handle_task_request(&coordinator, unassigned_task, coordinator.clone())
+            .await
+            .is_err());
     }
 }

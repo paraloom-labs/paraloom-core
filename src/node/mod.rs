@@ -270,7 +270,9 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             } => {
                 if let Some(validator) = &self.validator {
                     let validator = validator.lock().await;
-                    validator.handle_task_request(task, coordinator_id).await?;
+                    validator
+                        .handle_task_request(&source, task, coordinator_id)
+                        .await?;
                 }
             }
             Message::TaskResponse { result } => {
@@ -280,7 +282,9 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             }
             Message::TaskError { task_id, error } => {
                 if let Some(coordinator) = &self.coordinator {
-                    coordinator.handle_task_error(task_id, error).await?;
+                    coordinator
+                        .handle_task_error(&source, task_id, error)
+                        .await?;
                 }
             }
 
