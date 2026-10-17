@@ -405,35 +405,49 @@ impl Coordinator {
     }
 
     /// Split a task into chunks
-    async fn split_task(&self, task: &Task) -> Result<Vec<Task>> {
+    pub(crate) async fn split_task(&self, task: &Task) -> Result<Vec<Task>> {
         match &task.task_type {
             TaskType::HashCalculation {
                 start,
                 end,
                 algorithm,
             } => {
+                if start > end {
+                    return Err(anyhow::anyhow!(
+                        "invalid task range: start ({}) > end ({})",
+                        start,
+                        end
+                    ));
+                }
+
                 let validators = self.validators.lock().await;
-                let num_validators = validators.len().max(1);
-                let total = end - start + 1;
-                let chunk_size = total.div_ceil(num_validators as u64);
+                let num_validators = (validators.len().max(1)) as u128;
+                let total = (*end as u128) - (*start as u128) + 1;
+                let chunk_size = total.div_ceil(num_validators);
 
                 let mut chunks = Vec::new();
-                let mut current_start = *start;
+                let mut current_start = *start as u128;
 
                 for i in 0..num_validators {
-                    let chunk_end = (current_start + chunk_size - 1).min(*end);
-
-                    if current_start <= *end {
-                        let mut chunk = Task::new(TaskType::HashCalculation {
-                            start: current_start,
-                            end: chunk_end,
-                            algorithm: algorithm.clone(),
-                        });
-                        chunk.id = format!("{}-chunk-{}", task.id, i);
-
-                        chunks.push(chunk);
-                        current_start = chunk_end + 1;
+                    if current_start > *end as u128 {
+                        break;
                     }
+
+                    let chunk_end = (current_start + chunk_size - 1).min(*end as u128);
+
+                    let mut chunk = Task::new(TaskType::HashCalculation {
+                        start: current_start as u64,
+                        end: chunk_end as u64,
+                        algorithm: algorithm.clone(),
+                    });
+                    chunk.id = format!("{}-chunk-{}", task.id, i);
+
+                    chunks.push(chunk);
+
+                    if chunk_end >= *end as u128 {
+                        break;
+                    }
+                    current_start = chunk_end + 1;
                 }
 
                 Ok(chunks)
@@ -624,13 +638,66 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Handle task error
-    pub async fn handle_task_error(&self, task_id: String, error: String) -> Result<()> {
-        info!("Task error: {} - {}", task_id, error);
+    /// Handle task error from validator
+    pub async fn handle_task_error(
+        &self,
+        source: &NodeId,
+        task_id: String,
+        error: String,
+    ) -> Result<()> {
+        info!("Task error: {} from {:?} - {}", task_id, source, error);
 
+        // Authenticate the error reporting node against task assignment and
+        // enforce valid state transition.
         let mut active = self.active_tasks.lock().await;
-        if let Some(task) = active.get_mut(&task_id) {
-            task.status = TaskStatus::Failed { error };
+        let task = active.get_mut(&task_id).ok_or_else(|| {
+            anyhow::anyhow!("error for unknown or inactive task {}", task_id)
+        })?;
+        if task.assigned_to.as_deref() != Some(format!("{:?}", source).as_str()) {
+            return Err(anyhow::anyhow!(
+                "task error for {} from unauthorized peer {:?}",
+                task_id,
+                source
+            ));
+        }
+        if matches!(task.status, TaskStatus::Completed | TaskStatus::Failed { .. }) {
+            return Err(anyhow::anyhow!(
+                "task {} already in terminal state",
+                task_id
+            ));
+        }
+        task.status = TaskStatus::Failed { error: error.clone() };
+
+        // Acquire parent_tasks and results while holding active_tasks to
+        // atomically prune the failed task and avoid unbounded memory leaks.
+        let mut parent_tasks = self.parent_tasks.lock().await;
+        let mut results = self.results.lock().await;
+
+        let parent_id = parent_tasks.get(&task_id).cloned();
+        let chunk_ids: Vec<TaskId> = if let Some(ref pid) = parent_id {
+            parent_tasks
+                .iter()
+                .filter(|(_, p)| p.as_str() == pid.as_str())
+                .map(|(cid, _)| cid.clone())
+                .collect()
+        } else {
+            vec![task_id.clone()]
+        };
+
+        for cid in &chunk_ids {
+            active.remove(cid);
+            parent_tasks.remove(cid);
+            results.remove(cid);
+        }
+
+        if let Some(pid) = parent_id {
+            log::warn!(
+                "Task chunk {} failed: {}; pruned parent task {} and {} associated chunks",
+                task_id,
+                error,
+                pid,
+                chunk_ids.len()
+            );
         }
 
         Ok(())
@@ -1015,6 +1082,178 @@ mod tests {
             post_promotion.parent_tasks.len(),
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_task_rejects_inverted_range() {
+        let coordinator = Coordinator::new(make_test_network());
+        let task = Task::new(TaskType::HashCalculation {
+            start: 100,
+            end: 50,
+            algorithm: "sha256".to_string(),
+        });
+        let result = coordinator.split_task(&task).await;
+        assert!(result.is_err(), "split_task should reject start > end");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid task range"));
+    }
+
+    #[tokio::test]
+    async fn split_task_handles_full_u64_range_without_overflow() {
+        let coordinator = Coordinator::new(make_test_network());
+        // With 1 validator
+        let task_single = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: u64::MAX,
+            algorithm: "sha256".to_string(),
+        });
+        let chunks_single = coordinator
+            .split_task(&task_single)
+            .await
+            .expect("should split 0..=u64::MAX with 1 validator");
+        assert_eq!(chunks_single.len(), 1);
+        let TaskType::HashCalculation { start, end, .. } = &chunks_single[0].task_type;
+        assert_eq!(*start, 0);
+        assert_eq!(*end, u64::MAX);
+
+        // With 4 validators
+        coordinator
+            .register_validator(NodeId(vec![0x01]))
+            .await;
+        coordinator
+            .register_validator(NodeId(vec![0x02]))
+            .await;
+        coordinator
+            .register_validator(NodeId(vec![0x03]))
+            .await;
+        coordinator
+            .register_validator(NodeId(vec![0x04]))
+            .await;
+
+        let chunks_multi = coordinator
+            .split_task(&task_single)
+            .await
+            .expect("should split 0..=u64::MAX across 4 validators");
+        assert_eq!(chunks_multi.len(), 4);
+
+        // Verify continuity and boundaries
+        let mut expected_start = 0u64;
+        for (i, chunk) in chunks_multi.iter().enumerate() {
+            let TaskType::HashCalculation { start, end, .. } = &chunk.task_type;
+            assert_eq!(*start, expected_start);
+            if i == 3 {
+                assert_eq!(*end, u64::MAX);
+            } else {
+                assert!(*end >= *start);
+                expected_start = *end + 1;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_task_error_authenticates_sender_and_prunes_parent_and_chunks() {
+        use crate::task::ResultData;
+
+        let coordinator = Coordinator::new(make_test_network());
+        let validator_a = NodeId(vec![0xAA]);
+        let validator_b = NodeId(vec![0xBB]);
+        let unauthorized = NodeId(vec![0xEE]);
+
+        let parent_id = "parent-task-err".to_string();
+        let chunk_0 = format!("{}-chunk-0", parent_id);
+        let chunk_1 = format!("{}-chunk-1", parent_id);
+
+        let mut t0 = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "sha256".to_string(),
+        });
+        t0.id = chunk_0.clone();
+        t0.assigned_to = Some(format!("{:?}", validator_a));
+        t0.status = TaskStatus::Assigned;
+
+        let mut t1 = Task::new(TaskType::HashCalculation {
+            start: 11,
+            end: 20,
+            algorithm: "sha256".to_string(),
+        });
+        t1.id = chunk_1.clone();
+        t1.assigned_to = Some(format!("{:?}", validator_b));
+        t1.status = TaskStatus::Assigned;
+
+        // Setup coordinator active tasks and parent tasks
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert(chunk_0.clone(), t0);
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert(chunk_1.clone(), t1);
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert(chunk_0.clone(), parent_id.clone());
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert(chunk_1.clone(), parent_id.clone());
+
+        // Validator B completed chunk 1 earlier
+        let res1 = TaskResult {
+            task_id: chunk_1.clone(),
+            data: ResultData::Hashes {
+                hashes: vec![],
+                count: 0,
+            },
+            execution_time_ms: 10,
+        };
+        coordinator
+            .results
+            .lock()
+            .await
+            .insert(chunk_1.clone(), res1);
+
+        // Unauthorized peer tries to report error for chunk 0
+        let unauth_res = coordinator
+            .handle_task_error(&unauthorized, chunk_0.clone(), "failed".to_string())
+            .await;
+        assert!(
+            unauth_res.is_err(),
+            "unauthorized peer must be rejected when reporting error"
+        );
+
+        // Legitimate assignee validator_a reports error
+        let auth_res = coordinator
+            .handle_task_error(&validator_a, chunk_0.clone(), "compute failed".to_string())
+            .await;
+        assert!(
+            auth_res.is_ok(),
+            "authorized validator error report should succeed"
+        );
+
+        // Verify active_tasks, parent_tasks, and results are all pruned of the failed parent and chunks
+        let snapshot = coordinator.snapshot().await;
+        assert!(
+            !snapshot.active_tasks.contains_key(&chunk_0)
+                && !snapshot.active_tasks.contains_key(&chunk_1),
+            "failed task and sibling chunks should be pruned from active_tasks"
+        );
+        assert!(
+            !snapshot.parent_tasks.contains_key(&chunk_0)
+                && !snapshot.parent_tasks.contains_key(&chunk_1),
+            "failed task chunks should be pruned from parent_tasks"
+        );
+        assert!(
+            !snapshot.results.contains_key(&chunk_1),
+            "associated results should be pruned on failure"
         );
     }
 }
