@@ -115,6 +115,9 @@ impl ValidatorMetrics {
 
         let new_reputation = (self.reputation as f64 * multiplier) as u64;
         self.reputation = new_reputation.max(MIN_REPUTATION);
+        self.last_active = self
+            .last_active
+            .saturating_add(days_inactive * SECONDS_PER_DAY);
 
         log::debug!(
             "Applied {} days decay to {:?}: {} -> {}",
@@ -325,6 +328,10 @@ impl ReputationTracker {
             if validator.reputation != old_reputation {
                 count += 1;
             }
+        }
+
+        if count > 0 {
+            self.persist_locked(&metrics);
         }
 
         log::debug!("Applied decay to {} validators", count);
@@ -598,5 +605,39 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+
+        // Advancing last_active prevents compounding decay on repeated calls (#980)
+        assert_eq!(metrics.days_inactive(), 0);
+        let decayed_rep = metrics.reputation;
+        metrics.apply_decay();
+        assert_eq!(metrics.reputation, decayed_rep);
+    }
+
+    #[tokio::test]
+    async fn test_apply_decay_all_persists_to_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation_decay.json");
+        let tracker = ReputationTracker::with_persistence(path.clone());
+
+        let node_id = NodeId(vec![7]);
+        tracker.register_validator(node_id.clone()).await;
+
+        // Manually age the validator by 5 days
+        {
+            let mut metrics = tracker.metrics.write().await;
+            let val = metrics.get_mut(&node_id).unwrap();
+            val.last_active -= 5 * SECONDS_PER_DAY;
+        }
+
+        let updated = tracker.apply_decay_all().await;
+        assert_eq!(updated, 1);
+
+        let in_memory_rep = tracker.get_reputation(&node_id).await.unwrap();
+
+        // Reload from disk: must match in-memory decayed reputation
+        let reloaded = ReputationTracker::with_persistence(path);
+        let persisted_rep = reloaded.get_reputation(&node_id).await.unwrap();
+        assert_eq!(persisted_rep, in_memory_rep);
+        assert!(persisted_rep < BASE_REPUTATION);
     }
 }

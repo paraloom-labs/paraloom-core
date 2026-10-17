@@ -170,11 +170,15 @@ impl LeaderSelector {
     /// # Returns
     /// Selected leader's NodeId
     pub fn select_leader(&self, seed: &[u8]) -> Result<NodeId> {
-        let active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
+        let mut active_validators: Vec<_> =
+            self.validators.values().filter(|v| v.is_active).collect();
 
         if active_validators.is_empty() {
             return Err(anyhow!("No active validators available"));
         }
+
+        // Canonical sort by node_id to prevent non-deterministic leader divergence across nodes (#980)
+        active_validators.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
         // Calculate total weight
         let total_weight: u128 = active_validators.iter().map(|v| v.selection_weight()).sum();
@@ -188,7 +192,7 @@ impl LeaderSelector {
 
         // Select validator based on weighted random
         let mut cumulative_weight = 0u128;
-        for validator in active_validators {
+        for validator in &active_validators {
             cumulative_weight += validator.selection_weight();
             if random_value < cumulative_weight {
                 log::debug!(
@@ -202,10 +206,7 @@ impl LeaderSelector {
         }
 
         // Fallback to last validator (should never happen due to cumulative math)
-        Ok(self
-            .validators
-            .values()
-            .filter(|v| v.is_active)
+        Ok(active_validators
             .last()
             .ok_or_else(|| anyhow!("No active validators"))?
             .node_id
@@ -491,5 +492,36 @@ mod tests {
         selector.unregister_validator(&NodeId(vec![1]));
 
         assert_eq!(selector.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn test_deterministic_leader_selection_independent_of_insertion_order() {
+        let mut selector_a = LeaderSelector::new();
+        let mut selector_b = LeaderSelector::new();
+
+        let v1 = ValidatorInfo::new(NodeId(vec![10]), 10_000_000_000, 1000);
+        let v2 = ValidatorInfo::new(NodeId(vec![20]), 20_000_000_000, 1000);
+        let v3 = ValidatorInfo::new(NodeId(vec![30]), 30_000_000_000, 1000);
+
+        // Insertion order A: v1, v2, v3
+        selector_a.register_validator(v1.clone());
+        selector_a.register_validator(v2.clone());
+        selector_a.register_validator(v3.clone());
+
+        // Insertion order B: v3, v1, v2
+        selector_b.register_validator(v3);
+        selector_b.register_validator(v1);
+        selector_b.register_validator(v2);
+
+        // Test across 20 distinct seeds
+        for i in 0..20u8 {
+            let seed = [i; 32];
+            let leader_a = selector_a.select_leader(&seed).unwrap();
+            let leader_b = selector_b.select_leader(&seed).unwrap();
+            assert_eq!(
+                leader_a, leader_b,
+                "Leader selection must be identical regardless of insertion order for seed {i}"
+            );
+        }
     }
 }
