@@ -113,15 +113,19 @@ impl ValidatorMetrics {
         let decay_rate = REPUTATION_DECAY_PER_DAY as f64 / 10000.0;
         let multiplier = (1.0 - decay_rate).powi(days_inactive as i32);
 
+        let old_reputation = self.reputation;
         let new_reputation = (self.reputation as f64 * multiplier) as u64;
         self.reputation = new_reputation.max(MIN_REPUTATION);
+        self.last_active = self
+            .last_active
+            .saturating_add(days_inactive.saturating_mul(SECONDS_PER_DAY));
 
         log::debug!(
             "Applied {} days decay to {:?}: {} -> {}",
             days_inactive,
             self.node_id,
-            self.reputation,
-            new_reputation
+            old_reputation,
+            self.reputation
         );
     }
 
@@ -317,14 +321,23 @@ impl ReputationTracker {
     pub async fn apply_decay_all(&self) -> usize {
         let mut metrics = self.metrics.write().await;
         let mut count = 0;
+        let mut mutated = false;
 
         for validator in metrics.values_mut() {
             let old_reputation = validator.reputation;
+            let old_last_active = validator.last_active;
             validator.apply_decay();
 
             if validator.reputation != old_reputation {
                 count += 1;
             }
+            if validator.reputation != old_reputation || validator.last_active != old_last_active {
+                mutated = true;
+            }
+        }
+
+        if mutated {
+            self.persist_locked(&metrics);
         }
 
         log::debug!("Applied decay to {} validators", count);
@@ -598,5 +611,41 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+
+        // Calling apply_decay again immediately must not re-apply the 10-day decay.
+        let after_first_decay = metrics.reputation;
+        metrics.apply_decay();
+        assert_eq!(
+            metrics.reputation, after_first_decay,
+            "apply_decay must advance last_active so repeated ticks do not re-compound decay"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_decay_all_persists_decayed_reputation_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation_decay.json");
+        let node = NodeId(vec![9, 9, 9]);
+
+        let decayed = {
+            let tracker = ReputationTracker::with_persistence(path.clone());
+            tracker.register_validator(node.clone()).await;
+            {
+                let mut metrics = tracker.metrics.write().await;
+                let v = metrics.get_mut(&node).unwrap();
+                v.last_active = v.last_active.saturating_sub(5 * SECONDS_PER_DAY);
+            }
+            let count = tracker.apply_decay_all().await;
+            assert_eq!(count, 1);
+            tracker.get_reputation(&node).await.unwrap()
+        };
+        assert!(decayed < BASE_REPUTATION);
+
+        let reloaded = ReputationTracker::with_persistence(path);
+        assert_eq!(
+            reloaded.get_reputation(&node).await,
+            Some(decayed),
+            "apply_decay_all must persist decayed reputation to disk"
+        );
     }
 }

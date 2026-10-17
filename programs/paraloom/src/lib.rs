@@ -1096,11 +1096,15 @@ pub mod paraloom_program {
         if was_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
             validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
-            // A slash that drops stake below the registry minimum deactivates
-            // the validator: registration requires `stake >= minimum_stake`, so
-            // a validator below that bar must stop settling and stop counting
+            // A slash that drops either collateral half below the registry
+            // minimum deactivates the validator: registration requires both
+            // `stake >= minimum_stake` AND `token_stake_amount >= min_token_stake`,
+            // so a validator below either bar must stop settling and stop counting
             // toward the BFT quorum.
-            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
+                || validator_account.token_stake_amount
+                    < ctx.accounts.validator_registry.min_token_stake
+            {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
@@ -1634,19 +1638,24 @@ pub mod paraloom_program {
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
+        let token_stake = ctx.accounts.validator_account.token_stake_amount;
         let who = ctx.accounts.validator_account.validator;
         if was_active {
             let now_slot = Clock::get()?.slot;
             let v = &mut ctx.accounts.validator_account;
             v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
-            // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
-            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
-            // the delay, same as unregister.
+            // Route BOTH collateral halves into unbonding rather than stranding
+            // them: a deactivated validator can't `unregister` (that requires
+            // is_active), so without this its lamports and dual-stake tokens
+            // would have no exit and be frozen forever (and `withdraw_unbonded_stake`
+            // closes `validator_account`, which would permanently orphan any
+            // `token_stake_amount` left in `stake_token_vault`). Reclaimable via
+            // `withdraw_unbonded_stake` after the delay, same as unregister.
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+            v.token_stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
