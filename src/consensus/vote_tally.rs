@@ -147,8 +147,34 @@ impl VoteTally {
 
     /// Whether consensus has been reached among the eligible wallets — those in
     /// `eligible_wallets` (the staked on-chain co-sign set minus equivocators).
+    ///
+    /// Consensus is reached when either:
+    /// 1. `valid_count >= min_validators_for_consensus` (`VerificationVote::Valid`), or
+    /// 2. `total_cast >= min_validators_for_consensus` and `valid_count + remaining_possible < min_validators_for_consensus`
+    ///    (remaining unvoted eligible validators cannot achieve quorum, so rejection is definitive).
     pub async fn has_consensus(&self, eligible_wallets: &HashSet<String>) -> bool {
-        self.count_eligible_votes(eligible_wallets).await >= self.min_validators_for_consensus
+        let votes = self.votes.read().await;
+        let mut eligible_votes_count = 0usize;
+        let mut valid_count = 0usize;
+        for (wallet, rec) in votes.iter() {
+            if eligible_wallets.contains(wallet) {
+                eligible_votes_count += 1;
+                if rec.vote.is_valid() {
+                    valid_count += 1;
+                }
+            }
+        }
+
+        if valid_count >= self.min_validators_for_consensus {
+            return true;
+        }
+
+        if eligible_votes_count < self.min_validators_for_consensus {
+            return false;
+        }
+
+        let remaining_possible = eligible_wallets.len().saturating_sub(eligible_votes_count);
+        valid_count + remaining_possible < self.min_validators_for_consensus
     }
 
     /// Check if consensus deadline has passed
@@ -158,6 +184,7 @@ impl VoteTally {
     }
 
     /// Number of submitted votes whose wallet is in `eligible_wallets`.
+    #[allow(dead_code)]
     async fn count_eligible_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
         let votes = self.votes.read().await;
         votes
@@ -198,16 +225,25 @@ impl VoteTally {
 
         let valid_count = eligible.iter().filter(|v| v.is_valid()).count();
         let invalid_count = eligible.len() - valid_count;
+        let remaining_possible = eligible_wallets.len().saturating_sub(eligible.len());
 
         if valid_count >= self.min_validators_for_consensus {
             Ok(VerificationVote::Valid)
-        } else {
+        } else if valid_count + remaining_possible < self.min_validators_for_consensus {
             Ok(VerificationVote::Invalid {
                 reason: format!(
                     "Consensus rejected: {} valid, {} invalid (need {})",
                     valid_count, invalid_count, self.min_validators_for_consensus
                 ),
             })
+        } else {
+            Err(anyhow!(
+                "Consensus pending: {} valid, {} invalid (need {}, {} eligible votes remaining)",
+                valid_count,
+                invalid_count,
+                self.min_validators_for_consensus,
+                remaining_possible
+            ))
         }
     }
 
@@ -356,6 +392,111 @@ mod tests {
                 assert_eq!(new_signature, vec![8, 8]);
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_early_votes_do_not_prematurely_reject_before_remaining_validators_vote() {
+        // 2-of-3 quorum: 2 valid votes needed out of 3 eligible validators.
+        let tally = VoteTally::new("req-mixed".to_string(), 2, 3);
+        let eligible = wallets(&["W1", "W2", "W3"]);
+
+        // W1 votes Valid.
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
+            )
+            .await
+            .unwrap();
+
+        // 1 of 3: consensus not reached.
+        assert!(!tally.has_consensus(&eligible).await);
+        assert!(tally.consensus_result(&eligible).await.is_err());
+
+        // W2 votes Invalid (e.g. Byzantine or transient verifier).
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "bad proof".into(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+
+        // 2 of 3 cast: 1 valid, 1 invalid.
+        // W3 has not voted yet, so 2 valid votes is still reachable (1 + 1 == 2).
+        // Must NOT prematurely declare Invalid consensus!
+        assert!(
+            !tally.has_consensus(&eligible).await,
+            "must not reach consensus while valid quorum is still reachable"
+        );
+        let res = tally.consensus_result(&eligible).await;
+        assert!(
+            res.is_err(),
+            "consensus_result must return Err (pending) when quorum is still reachable: got {:?}",
+            res
+        );
+
+        // When W3 votes Valid, quorum of 2 valid votes is achieved!
+        tally
+            .submit_vote(
+                "W3".into(),
+                NodeId(vec![3]),
+                VerificationVote::Valid,
+                vec![3],
+            )
+            .await
+            .unwrap();
+
+        assert!(tally.has_consensus(&eligible).await);
+        let res = tally.consensus_result(&eligible).await.unwrap();
+        assert_eq!(res, VerificationVote::Valid);
+    }
+
+    #[tokio::test]
+    async fn definitive_rejection_when_valid_quorum_unreachable() {
+        // 2-of-3 quorum: if 2 validators vote Invalid, remaining 1 cannot reach 2.
+        let tally = VoteTally::new("req-reject".to_string(), 2, 3);
+        let eligible = wallets(&["W1", "W2", "W3"]);
+
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "invalid".into(),
+                },
+                vec![1],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "invalid".into(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+
+        // 2 invalid cast: max possible valid is 0 + 1 = 1 < 2.
+        // Rejection is definitive!
+        assert!(tally.has_consensus(&eligible).await);
+        let res = tally.consensus_result(&eligible).await.unwrap();
+        match res {
+            VerificationVote::Invalid { reason } => {
+                assert!(reason.contains("Consensus rejected: 0 valid, 2 invalid (need 2)"));
+            }
+            _ => panic!("expected Invalid consensus result"),
         }
     }
 }
