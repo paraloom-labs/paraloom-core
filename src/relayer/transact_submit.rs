@@ -49,6 +49,8 @@ pub enum TransactSubmitError {
     SettlementTimeout(Duration),
     #[error("account data too short: {0}")]
     ShortAccount(&'static str),
+    #[error("invalid withdrawal amount {0}: must be non-zero and <= i64::MAX")]
+    InvalidAmount(u64),
 }
 
 pub type Result<T> = std::result::Result<T, TransactSubmitError>;
@@ -143,6 +145,7 @@ pub fn read_membership(
 }
 
 /// The tagged proof + on-chain public parts of a withdraw-to-fresh v3 transact.
+#[derive(Debug, Clone)]
 pub struct WithdrawToFresh {
     /// Tagged (`Groth16Bn254TransactV3`) wire proof.
     pub proof: Vec<u8>,
@@ -168,6 +171,13 @@ pub fn prove_withdraw_to_fresh(
     membership: &Membership,
     recipient: &[u8; 32],
 ) -> Result<WithdrawToFresh> {
+    let signed_amount: i64 =
+        i64::try_from(amount).map_err(|_| TransactSubmitError::InvalidAmount(amount))?;
+    if signed_amount <= 0 {
+        return Err(TransactSubmitError::InvalidAmount(amount));
+    }
+    let ext_amount: i64 = -signed_amount;
+
     let root = Fr::from_le_bytes_mod_order(&membership.root);
     let commitment = v3_commit(Fr::from(amount), note_pubkey, blinding, Fr::from(0u64));
     let leaf_index = membership.leaf_index;
@@ -185,7 +195,6 @@ pub fn prove_withdraw_to_fresh(
     let oc0 = v3_commit(Fr::from(0u64), note_pubkey, ob0, Fr::from(0u64));
     let oc1 = v3_commit(Fr::from(0u64), note_pubkey, ob1, Fr::from(0u64));
 
-    let ext_amount: i64 = -(amount as i64);
     let ext_data_hash: [u8; 32] = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -320,5 +329,95 @@ pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
         // active_validators is the u64 at [48..56] after the 8-byte discriminator.
         Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+
+    #[derive(Clone)]
+    struct DummyCircuit;
+
+    impl ConstraintSynthesizer<Fr> for DummyCircuit {
+        fn generate_constraints(
+            self,
+            cs: ConstraintSystemRef<Fr>,
+        ) -> std::result::Result<(), SynthesisError> {
+            let v = cs.new_input_variable(|| Ok(Fr::from(1u64)))?;
+            cs.enforce_constraint(
+                ark_relations::lc!() + v,
+                ark_relations::lc!() + ark_relations::r1cs::Variable::One,
+                ark_relations::lc!() + v,
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_prove_withdraw_to_fresh_rejects_invalid_amounts() {
+        let mut rng = ark_std::rand::thread_rng();
+        let (pk, _) =
+            Groth16ProofSystem::setup(DummyCircuit, &mut rng).expect("dummy setup succeeds");
+        let sk = Fr::from(1u64);
+        let blinding = Fr::from(2u64);
+        let note_pubkey = Fr::from(3u64);
+        let membership = Membership {
+            leaf_index: 0,
+            root: [0u8; 32],
+            path: vec![[0u8; 32]; TX_LEVELS],
+        };
+        let recipient = [0x42u8; 32];
+
+        // Zero lamports withdrawal must be rejected
+        match prove_withdraw_to_fresh(&pk, sk, blinding, note_pubkey, 0, &membership, &recipient) {
+            Err(TransactSubmitError::InvalidAmount(0)) => {}
+            other => panic!("expected InvalidAmount(0), got {:?}", other),
+        }
+
+        // u64::MAX must be rejected
+        match prove_withdraw_to_fresh(
+            &pk,
+            sk,
+            blinding,
+            note_pubkey,
+            u64::MAX,
+            &membership,
+            &recipient,
+        ) {
+            Err(TransactSubmitError::InvalidAmount(amt)) if amt == u64::MAX => {}
+            other => panic!("expected InvalidAmount(u64::MAX), got {:?}", other),
+        }
+
+        // 0x8000_0000_0000_0000 (i64::MIN as u64) must be rejected without negation overflow panic
+        let i64_min_as_u64 = 1u64 << 63;
+        match prove_withdraw_to_fresh(
+            &pk,
+            sk,
+            blinding,
+            note_pubkey,
+            i64_min_as_u64,
+            &membership,
+            &recipient,
+        ) {
+            Err(TransactSubmitError::InvalidAmount(amt)) if amt == i64_min_as_u64 => {}
+            other => panic!("expected InvalidAmount(1 << 63), got {:?}", other),
+        }
+
+        // i64::MAX + 1 must be rejected
+        let just_over_max = (i64::MAX as u64) + 1;
+        match prove_withdraw_to_fresh(
+            &pk,
+            sk,
+            blinding,
+            note_pubkey,
+            just_over_max,
+            &membership,
+            &recipient,
+        ) {
+            Err(TransactSubmitError::InvalidAmount(amt)) if amt == just_over_max => {}
+            other => panic!("expected InvalidAmount(i64::MAX + 1), got {:?}", other),
+        }
     }
 }
