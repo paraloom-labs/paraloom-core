@@ -142,7 +142,7 @@ impl Coordinator {
         }
 
         let mut sequence_slot = self.heartbeat_sequence.lock().await;
-        if request.sequence <= *sequence_slot && *sequence_slot != 0 {
+        if request.sequence <= *sequence_slot || request.sequence == 0 {
             return HeartbeatResponse {
                 accepted: false,
                 last_applied_sequence: *sequence_slot,
@@ -151,23 +151,18 @@ impl Coordinator {
         *sequence_slot = request.sequence;
         drop(sequence_slot);
 
-        // Replace local state with the primary's snapshot. Each
-        // mutex is taken in turn and released immediately so the
-        // window during which the standby is mid-mirror is short.
+        // Replace local state with the primary's snapshot atomically.
+        // Locks are acquired in canonical order and held together to
+        // prevent concurrent readers on the standby from observing torn state.
         {
             let mut validators = self.validators.lock().await;
-            *validators = request.snapshot.validators;
-        }
-        {
             let mut active_tasks = self.active_tasks.lock().await;
-            *active_tasks = request.snapshot.active_tasks;
-        }
-        {
             let mut parent_tasks = self.parent_tasks.lock().await;
-            *parent_tasks = request.snapshot.parent_tasks;
-        }
-        {
             let mut results = self.results.lock().await;
+
+            *validators = request.snapshot.validators;
+            *active_tasks = request.snapshot.active_tasks;
+            *parent_tasks = request.snapshot.parent_tasks;
             *results = request.snapshot.results;
         }
 
@@ -645,15 +640,15 @@ impl Coordinator {
     /// and promotion logic on top of this surface is tracked under
     /// #66; this method is the data foothold those PRs build on.
     pub async fn snapshot(&self) -> CoordinatorSnapshot {
-        let validators = self.validators.lock().await.clone();
-        let active_tasks = self.active_tasks.lock().await.clone();
-        let parent_tasks = self.parent_tasks.lock().await.clone();
-        let results = self.results.lock().await.clone();
+        let validators = self.validators.lock().await;
+        let active_tasks = self.active_tasks.lock().await;
+        let parent_tasks = self.parent_tasks.lock().await;
+        let results = self.results.lock().await;
         CoordinatorSnapshot {
-            validators,
-            active_tasks,
-            parent_tasks,
-            results,
+            validators: validators.clone(),
+            active_tasks: active_tasks.clone(),
+            parent_tasks: parent_tasks.clone(),
+            results: results.clone(),
         }
     }
 }
@@ -780,6 +775,45 @@ mod tests {
         let resp2 = standby.apply_heartbeat(&NodeId(vec![0x01]), req1).await;
         assert!(!resp2.accepted);
         assert_eq!(resp2.last_applied_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_zero_and_decreasing_sequences() {
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+
+        // Heartbeat with sequence 0 must be rejected
+        let zero_req = HeartbeatRequest {
+            primary: NodeId(vec![0x01]),
+            sequence: 0,
+            snapshot: CoordinatorSnapshot::default(),
+        };
+        let resp = standby.apply_heartbeat(&NodeId(vec![0x01]), zero_req).await;
+        assert!(!resp.accepted, "sequence 0 must be rejected");
+        assert_eq!(resp.last_applied_sequence, 0);
+
+        // Sequence 2 is accepted
+        let req2 = HeartbeatRequest {
+            primary: NodeId(vec![0x01]),
+            sequence: 2,
+            snapshot: CoordinatorSnapshot::default(),
+        };
+        let resp2 = standby.apply_heartbeat(&NodeId(vec![0x01]), req2).await;
+        assert!(resp2.accepted);
+        assert_eq!(resp2.last_applied_sequence, 2);
+
+        // Lower sequence 1 must be rejected
+        let req1 = HeartbeatRequest {
+            primary: NodeId(vec![0x01]),
+            sequence: 1,
+            snapshot: CoordinatorSnapshot::default(),
+        };
+        let resp1 = standby.apply_heartbeat(&NodeId(vec![0x01]), req1).await;
+        assert!(!resp1.accepted, "lower sequence must be rejected");
+        assert_eq!(resp1.last_applied_sequence, 2);
     }
 
     #[tokio::test]
