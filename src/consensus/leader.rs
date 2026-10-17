@@ -170,7 +170,9 @@ impl LeaderSelector {
     /// # Returns
     /// Selected leader's NodeId
     pub fn select_leader(&self, seed: &[u8]) -> Result<NodeId> {
-        let active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
+        let mut active_validators: Vec<_> =
+            self.validators.values().filter(|v| v.is_active).collect();
+        active_validators.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
 
         if active_validators.is_empty() {
             return Err(anyhow!("No active validators available"));
@@ -188,7 +190,7 @@ impl LeaderSelector {
 
         // Select validator based on weighted random
         let mut cumulative_weight = 0u128;
-        for validator in active_validators {
+        for validator in &active_validators {
             cumulative_weight += validator.selection_weight();
             if random_value < cumulative_weight {
                 log::debug!(
@@ -202,10 +204,7 @@ impl LeaderSelector {
         }
 
         // Fallback to last validator (should never happen due to cumulative math)
-        Ok(self
-            .validators
-            .values()
-            .filter(|v| v.is_active)
+        Ok(active_validators
             .last()
             .ok_or_else(|| anyhow!("No active validators"))?
             .node_id
@@ -491,5 +490,35 @@ mod tests {
         selector.unregister_validator(&NodeId(vec![1]));
 
         assert_eq!(selector.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn select_leader_is_independent_of_validator_insertion_order() {
+        let mut selector_a = LeaderSelector::new();
+        let mut selector_b = LeaderSelector::new();
+
+        let validators = [
+            ValidatorInfo::new(NodeId(vec![1]), 10_000_000_000, 1000),
+            ValidatorInfo::new(NodeId(vec![2]), 20_000_000_000, 1500),
+            ValidatorInfo::new(NodeId(vec![3]), 30_000_000_000, 2000),
+            ValidatorInfo::new(NodeId(vec![4]), 15_000_000_000, 1200),
+        ];
+
+        for v in &validators {
+            selector_a.register_validator(v.clone());
+        }
+        for v in validators.iter().rev() {
+            selector_b.register_validator(v.clone());
+        }
+
+        for i in 0..100 {
+            let seed = format!("settlement_request_{}", i);
+            assert_eq!(
+                selector_a.select_leader(seed.as_bytes()).unwrap(),
+                selector_b.select_leader(seed.as_bytes()).unwrap(),
+                "all validator nodes must select the exact same leader for seed {}",
+                seed
+            );
+        }
     }
 }
