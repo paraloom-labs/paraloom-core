@@ -1883,7 +1883,7 @@ pub struct ResetValidatorRegistry<'info> {
 #[derive(Accounts)]
 #[instruction(nullifiers: [[u8; 32]; 2])]
 pub struct TransactSpl<'info> {
-    #[account(mut, seeds = [b"bridge_state"], bump, has_one = authority)]
+    #[account(mut, seeds = [b"bridge_state"], bump)]
     pub bridge_state: Account<'info, BridgeState>,
 
     #[account(mut, seeds = [b"merkle_tree"], bump)]
@@ -1956,13 +1956,10 @@ pub struct TransactSpl<'info> {
 #[derive(Accounts)]
 #[instruction(nullifiers: [[u8; 32]; 2])]
 pub struct Transact<'info> {
-    // `has_one = authority` binds settlement to the bridge authority /
-    // consensus leader, exactly as `Withdraw` does (#178).
     #[account(
         mut,
         seeds = [b"bridge_state"],
-        bump,
-        has_one = authority
+        bump
     )]
     pub bridge_state: Account<'info, BridgeState>,
 
