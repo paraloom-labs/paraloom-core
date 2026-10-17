@@ -150,6 +150,23 @@ fn public_amount_bytes(ext_amount: i64) -> [u8; 32] {
     out
 }
 
+/// Compute `(gross, fee, payout)` for a withdrawal (`ext_amount < 0`) using
+/// `u128` intermediate multiplication so valid withdrawals with
+/// `|ext_amount| > u64::MAX / WITHDRAWAL_FEE_BPS` (`737,869,762,948,382,064`)
+/// do not overflow `u64::checked_mul(25)` before dividing by `10_000`.
+/// Rejects `ext_amount >= 0` and `ext_amount == i64::MIN` (whose magnitude
+/// `1 << 63` exceeds `i64::MAX as u64`).
+fn withdrawal_gross_fee_and_payout(ext_amount: i64) -> Result<(u64, u64, u64)> {
+    require!(
+        ext_amount < 0 && ext_amount != i64::MIN,
+        BridgeError::InvalidAmount
+    );
+    let gross = ext_amount.unsigned_abs();
+    let fee = ((gross as u128 * WITHDRAWAL_FEE_BPS as u128) / 10_000) as u64;
+    let payout = gross - fee;
+    Ok((gross, fee, payout))
+}
+
 #[program]
 pub mod paraloom_program {
     use super::*;
@@ -207,7 +224,10 @@ pub mod paraloom_program {
         blinding: [u8; 32],
     ) -> Result<()> {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
+        require!(
+            amount > 0 && amount <= i64::MAX as u64,
+            BridgeError::InvalidAmount
+        );
 
         // The commitment is a Poseidon hash of `pubkey`/`blinding`, and the
         // syscall reduces any input >= the field modulus mod p. A non-canonical
@@ -309,7 +329,10 @@ pub mod paraloom_program {
 
         // Deposits are public and go through `deposit_note`; `transact` only
         // spends existing notes (withdraw or internal transfer).
-        require!(ext_amount <= 0, BridgeError::InvalidAmount);
+        require!(
+            ext_amount <= 0 && ext_amount != i64::MIN,
+            BridgeError::InvalidAmount
+        );
 
         // Both nullifiers must be canonical field elements and distinct. The
         // circuit already enforces distinctness, and the two nullifier PDAs
@@ -424,12 +447,8 @@ pub mod paraloom_program {
 
         let mut fee = 0u64;
         if ext_amount < 0 {
-            let gross = ext_amount.unsigned_abs();
-            fee = gross
-                .checked_mul(WITHDRAWAL_FEE_BPS)
-                .and_then(|v| v.checked_div(10_000))
-                .ok_or(BridgeError::InvalidAmount)?;
-            let payout = gross - fee;
+            let (gross, computed_fee, payout) = withdrawal_gross_fee_and_payout(ext_amount)?;
+            fee = computed_fee;
 
             // The vault is a system account and must stay rent-exempt after the
             // payout. Guard on `payout + rent_floor`, not `gross`: only `payout`
@@ -538,7 +557,10 @@ pub mod paraloom_program {
 
         // Deposits are public and go through `deposit_note_spl`; `transact_spl`
         // only spends existing notes (withdraw or internal transfer).
-        require!(ext_amount <= 0, BridgeError::InvalidAmount);
+        require!(
+            ext_amount <= 0 && ext_amount != i64::MIN,
+            BridgeError::InvalidAmount
+        );
 
         require_canonical_nullifier(&nullifiers[0])?;
         require_canonical_nullifier(&nullifiers[1])?;
@@ -624,12 +646,8 @@ pub mod paraloom_program {
 
         let mut fee = 0u64;
         if ext_amount < 0 {
-            let gross = ext_amount.unsigned_abs();
-            fee = gross
-                .checked_mul(WITHDRAWAL_FEE_BPS)
-                .and_then(|v| v.checked_div(10_000))
-                .ok_or(BridgeError::InvalidAmount)?;
-            let payout = gross - fee;
+            let (gross, computed_fee, payout) = withdrawal_gross_fee_and_payout(ext_amount)?;
+            fee = computed_fee;
 
             // Token accounts are independently rent-exempt, so unlike the native
             // vault there is no rent floor to reserve; the vault just needs the
@@ -1311,7 +1329,10 @@ pub mod paraloom_program {
         blinding: [u8; 32],
     ) -> Result<()> {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
+        require!(
+            amount > 0 && amount <= i64::MAX as u64,
+            BridgeError::InvalidAmount
+        );
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
 
@@ -2916,4 +2937,36 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawal_fee_does_not_overflow_above_u64_max_div_fee_bps() {
+        // Any withdrawal with |ext_amount| > u64::MAX / 25 (737_869_762_948_382_064)
+        // previously overflowed `gross.checked_mul(WITHDRAWAL_FEE_BPS)` in u64.
+        let large_withdraw = -1_000_000_000_000_000_000i64; // 1e18 (> u64::MAX / 25)
+        let (gross, fee, payout) = withdrawal_gross_fee_and_payout(large_withdraw).unwrap();
+        assert_eq!(gross, 1_000_000_000_000_000_000u64);
+        assert_eq!(fee, 2_500_000_000_000_000u64);
+        assert_eq!(payout, gross - fee);
+
+        // Maximum valid signed withdrawal magnitude (`-i64::MAX`).
+        let (max_gross, max_fee, max_payout) = withdrawal_gross_fee_and_payout(-i64::MAX).unwrap();
+        assert_eq!(max_gross, i64::MAX as u64);
+        assert_eq!(
+            max_fee,
+            ((i64::MAX as u128 * WITHDRAWAL_FEE_BPS as u128) / 10_000) as u64
+        );
+        assert_eq!(max_payout, max_gross - max_fee);
+    }
+
+    #[test]
+    fn withdrawal_fee_rejects_i64_min_and_non_negative() {
+        assert!(withdrawal_gross_fee_and_payout(i64::MIN).is_err());
+        assert!(withdrawal_gross_fee_and_payout(0).is_err());
+        assert!(withdrawal_gross_fee_and_payout(100).is_err());
+    }
 }
