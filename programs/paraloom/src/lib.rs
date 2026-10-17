@@ -565,10 +565,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -1100,7 +1098,10 @@ pub mod paraloom_program {
             // the validator: registration requires `stake >= minimum_stake`, so
             // a validator below that bar must stop settling and stop counting
             // toward the BFT quorum.
-            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
+                || validator_account.token_stake_amount
+                    < ctx.accounts.validator_registry.min_token_stake
+            {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
@@ -1647,6 +1648,12 @@ pub mod paraloom_program {
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            // The token half unbonds in lockstep with the SOL half: it stays in the
+            // vault, slashable through the same window, and is released by
+            // `withdraw_unbonded_stake` when `unbonding_slot` elapses.
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
