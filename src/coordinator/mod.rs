@@ -412,16 +412,35 @@ impl Coordinator {
                 end,
                 algorithm,
             } => {
+                if end < start {
+                    return Err(anyhow::anyhow!(
+                        "invalid hash range: end ({end}) < start ({start})"
+                    ));
+                }
+                if algorithm != "sha256" {
+                    return Err(anyhow::anyhow!("Unsupported algorithm: {algorithm}"));
+                }
+                let total = (end - start)
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("hash range overflow in split_task"))?;
+
                 let validators = self.validators.lock().await;
                 let num_validators = validators.len().max(1);
-                let total = end - start + 1;
                 let chunk_size = total.div_ceil(num_validators as u64);
+
+                if chunk_size > crate::validator::MAX_HASH_TASK_ITEMS {
+                    return Err(anyhow::anyhow!(
+                        "chunk size {chunk_size} exceeds maximum hash task limit {}",
+                        crate::validator::MAX_HASH_TASK_ITEMS
+                    ));
+                }
 
                 let mut chunks = Vec::new();
                 let mut current_start = *start;
 
                 for i in 0..num_validators {
-                    let chunk_end = (current_start + chunk_size - 1).min(*end);
+                    let chunk_end =
+                        (current_start.saturating_add(chunk_size).saturating_sub(1)).min(*end);
 
                     if current_start <= *end {
                         let mut chunk = Task::new(TaskType::HashCalculation {
@@ -432,6 +451,10 @@ impl Coordinator {
                         chunk.id = format!("{}-chunk-{}", task.id, i);
 
                         chunks.push(chunk);
+
+                        if chunk_end == *end {
+                            break;
+                        }
                         current_start = chunk_end + 1;
                     }
                 }
@@ -461,9 +484,12 @@ impl Coordinator {
                     result.task_id
                 ));
             }
-            if matches!(task.status, TaskStatus::Completed) {
+            if matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Failed { .. }
+            ) {
                 return Err(anyhow::anyhow!(
-                    "result for {} already recorded",
+                    "result for {} already recorded or task in terminal state",
                     result.task_id
                 ));
             }
@@ -543,8 +569,17 @@ impl Coordinator {
                 .map(|(_, result)| result.clone())
                 .collect();
 
-            // Sort by task_id to ensure consistent ordering
-            chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            // Sort by numeric chunk index parsed from "-chunk-{i}", falling back to task_id
+            chunk_results.sort_by(|a, b| {
+                let parse_chunk_idx = |id: &str| -> Option<u64> {
+                    id.rsplit_once("-chunk-")
+                        .and_then(|(_, idx)| idx.parse().ok())
+                };
+                match (parse_chunk_idx(&a.task_id), parse_chunk_idx(&b.task_id)) {
+                    (Some(idx_a), Some(idx_b)) => idx_a.cmp(&idx_b),
+                    _ => a.task_id.cmp(&b.task_id),
+                }
+            });
             chunk_results
         }; // Locks are dropped here
 
@@ -625,14 +660,37 @@ impl Coordinator {
     }
 
     /// Handle task error
-    pub async fn handle_task_error(&self, task_id: String, error: String) -> Result<()> {
-        info!("Task error: {} - {}", task_id, error);
+    pub async fn handle_task_error(
+        &self,
+        source: &NodeId,
+        task_id: String,
+        error: String,
+    ) -> Result<()> {
+        info!("Task error: {} from {:?} - {}", task_id, source, error);
 
         let mut active = self.active_tasks.lock().await;
-        if let Some(task) = active.get_mut(&task_id) {
-            task.status = TaskStatus::Failed { error };
+        let task = active
+            .get_mut(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("error for unknown or inactive task {}", task_id))?;
+
+        if task.assigned_to.as_deref() != Some(format!("{:?}", source).as_str()) {
+            return Err(anyhow::anyhow!(
+                "error for {} from a peer it was not assigned to",
+                task_id
+            ));
         }
 
+        if matches!(
+            task.status,
+            TaskStatus::Completed | TaskStatus::Failed { .. }
+        ) {
+            return Err(anyhow::anyhow!(
+                "task {} is already in terminal state",
+                task_id
+            ));
+        }
+
+        task.status = TaskStatus::Failed { error };
         Ok(())
     }
 
@@ -1016,5 +1074,168 @@ mod tests {
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
         );
+    }
+
+    #[tokio::test]
+    async fn split_task_enforces_range_and_algorithm_bounds() {
+        let coordinator = Coordinator::new(make_test_network());
+
+        // Inverted range
+        let inverted = Task::new(TaskType::HashCalculation {
+            start: 10,
+            end: 5,
+            algorithm: "sha256".to_string(),
+        });
+        assert!(coordinator.split_task(&inverted).await.is_err());
+
+        // Full range overflow (u64::MAX)
+        let overflow = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: u64::MAX,
+            algorithm: "sha256".to_string(),
+        });
+        assert!(coordinator.split_task(&overflow).await.is_err());
+
+        // Unsupported algorithm
+        let bad_algo = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "md5".to_string(),
+        });
+        assert!(coordinator.split_task(&bad_algo).await.is_err());
+
+        // Chunk size exceeding limit
+        let huge = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: crate::validator::MAX_HASH_TASK_ITEMS + 1,
+            algorithm: "sha256".to_string(),
+        });
+        assert!(coordinator.split_task(&huge).await.is_err());
+
+        // Valid split with 1 validator
+        let valid = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 9,
+            algorithm: "sha256".to_string(),
+        });
+        let chunks = coordinator.split_task(&valid).await.expect("valid split");
+        assert_eq!(chunks.len(), 1);
+        let TaskType::HashCalculation { start, end, .. } = &chunks[0].task_type;
+        assert_eq!(*start, 0);
+        assert_eq!(*end, 9);
+
+        // Valid split with multiple validators terminates when chunk_end == end
+        coordinator.register_validator(NodeId(vec![0x01])).await;
+        coordinator.register_validator(NodeId(vec![0x02])).await;
+        coordinator.register_validator(NodeId(vec![0x03])).await;
+        coordinator.register_validator(NodeId(vec![0x04])).await;
+        let small = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 1,
+            algorithm: "sha256".to_string(),
+        });
+        let small_chunks = coordinator.split_task(&small).await.expect("small split");
+        // total = 2 items, 4 validators => chunk_size = 1, exactly 2 chunks needed
+        assert_eq!(small_chunks.len(), 2);
+        assert_eq!(small_chunks[0].id, format!("{}-chunk-0", small.id));
+        assert_eq!(small_chunks[1].id, format!("{}-chunk-1", small.id));
+    }
+
+    #[tokio::test]
+    async fn task_error_authentication_and_terminal_state_handling() {
+        let coordinator = Coordinator::new(make_test_network());
+        let assignee = NodeId(vec![0xAA]);
+        let attacker = NodeId(vec![0xEE]);
+
+        // 1. Error for non-existent task is rejected
+        assert!(coordinator
+            .handle_task_error(&assignee, "ghost".to_string(), "err".to_string())
+            .await
+            .is_err());
+
+        // 2. Setup active task assigned to `assignee`
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 5,
+            algorithm: "sha256".to_string(),
+        });
+        task.id = "t_err".to_string();
+        task.assigned_to = Some(format!("{:?}", assignee));
+        task.status = TaskStatus::Assigned;
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert("t_err".to_string(), task);
+
+        // 3. Error from unauthorized peer is rejected
+        assert!(coordinator
+            .handle_task_error(&attacker, "t_err".to_string(), "spoofed".to_string())
+            .await
+            .is_err());
+
+        // 4. Legitimate error from assignee transitions status to Failed
+        assert!(coordinator
+            .handle_task_error(
+                &assignee,
+                "t_err".to_string(),
+                "hardware failure".to_string()
+            )
+            .await
+            .is_ok());
+
+        {
+            let active = coordinator.active_tasks.lock().await;
+            let current = active.get("t_err").unwrap();
+            assert!(matches!(current.status, TaskStatus::Failed { .. }));
+        }
+
+        // 5. Subsequent error rejected because task is already in terminal Failed state
+        assert!(coordinator
+            .handle_task_error(&assignee, "t_err".to_string(), "again".to_string())
+            .await
+            .is_err());
+
+        // 6. Result for task in Failed state is rejected
+        let result = TaskResult {
+            task_id: "t_err".to_string(),
+            execution_time_ms: 10,
+            data: ResultData::Hashes {
+                hashes: vec![],
+                count: 0,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, result)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn aggregate_results_sorts_chunks_numerically() {
+        let coordinator = Coordinator::new(make_test_network());
+        let parent_id = "test_parent";
+
+        for i in 0..12 {
+            let chunk_id = format!("{parent_id}-chunk-{i}");
+            coordinator
+                .parent_tasks
+                .lock()
+                .await
+                .insert(chunk_id.clone(), parent_id.to_string());
+            coordinator.results.lock().await.insert(
+                chunk_id.clone(),
+                TaskResult {
+                    task_id: chunk_id,
+                    execution_time_ms: 5,
+                    data: ResultData::Hashes {
+                        hashes: vec![(i, format!("hash_{i}"))],
+                        count: 1,
+                    },
+                },
+            );
+        }
+
+        assert!(coordinator.aggregate_results(parent_id).await.is_ok());
     }
 }
