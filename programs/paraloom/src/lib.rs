@@ -181,6 +181,7 @@ pub mod paraloom_program {
         // uncapped (which would be the exact unbounded-loss risk the cap
         // exists to remove).
         bridge_state.deposit_cap = 0;
+        bridge_state.total_pending_rewards = 0;
 
         msg!(
             "Bridge initialized with merkle root, program_version={}",
@@ -224,10 +225,14 @@ pub mod paraloom_program {
         // Checked against the live vault balance (not cumulative deposits) and
         // before moving funds, so a rejected deposit never touches the vault.
         // Cap starts at 0 (deposits closed) until the cold authority raises it.
-        let projected_vault_balance = ctx
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        let shielded_vault_balance = ctx
             .accounts
             .bridge_vault
             .lamports()
+            .saturating_sub(rent_floor)
+            .saturating_sub(ctx.accounts.bridge_state.total_pending_rewards);
+        let projected_vault_balance = shielded_vault_balance
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
         require!(
@@ -440,8 +445,11 @@ pub mod paraloom_program {
             // (paraloom-core#761).
             let vault_balance = ctx.accounts.bridge_vault.lamports();
             let rent_floor = Rent::get()?.minimum_balance(0);
+            let reserved = rent_floor
+                .saturating_add(bridge_state.total_pending_rewards)
+                .saturating_add(fee);
             require!(
-                vault_balance >= payout.saturating_add(rent_floor),
+                vault_balance >= payout.saturating_add(reserved),
                 BridgeError::InsufficientFunds
             );
 
@@ -461,6 +469,10 @@ pub mod paraloom_program {
             )?;
             validator_account.pending_rewards = validator_account
                 .pending_rewards
+                .checked_add(fee)
+                .ok_or(BridgeError::InvalidAmount)?;
+            bridge_state.total_pending_rewards = bridge_state
+                .total_pending_rewards
                 .checked_add(fee)
                 .ok_or(BridgeError::InvalidAmount)?;
 
@@ -1016,6 +1028,20 @@ pub mod paraloom_program {
         );
 
         let reward_amount = validator_account.pending_rewards;
+        let vault_balance = ctx.accounts.bridge_vault.lamports();
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        let shielded_tvl = ctx
+            .accounts
+            .bridge_state
+            .total_deposited
+            .saturating_sub(ctx.accounts.bridge_state.total_withdrawn);
+        require!(
+            vault_balance
+                >= reward_amount
+                    .saturating_add(rent_floor)
+                    .saturating_add(shielded_tvl),
+            BridgeError::InsufficientFunds
+        );
 
         let vault_bump = ctx.bumps.bridge_vault;
         let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
@@ -1034,6 +1060,11 @@ pub mod paraloom_program {
         )?;
 
         validator_account.pending_rewards = 0;
+        ctx.accounts.bridge_state.total_pending_rewards = ctx
+            .accounts
+            .bridge_state
+            .total_pending_rewards
+            .saturating_sub(reward_amount);
         validator_account.total_earnings = validator_account
             .total_earnings
             .checked_add(reward_amount)
@@ -1504,11 +1535,16 @@ pub mod paraloom_program {
         expected_active_validators: u64,
     ) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        require!(stake_mint != Pubkey::default(), BridgeError::InvalidAmount);
 
         let registry_ai = ctx.accounts.validator_registry.to_account_info();
 
         // Confirm the pinned PDA actually is a ValidatorRegistry, so a wrong
-        // account cannot be reshaped into one.
+        // account cannot be reshaped into one. If the registry already has a
+        // non-default `stake_mint` pinned (layout >= 8 + ValidatorRegistry::INIT_SPACE),
+        // refuse to overwrite it with a different mint because the singleton
+        // `stake_token_vault` (`seeds = [b"stake_token_vault"]`) has its SPL
+        // mint permanently fixed at initialization.
         {
             let data = registry_ai.try_borrow_data()?;
             require!(data.len() >= 8, BridgeError::UnauthorizedInit);
@@ -1516,6 +1552,16 @@ pub mod paraloom_program {
                 data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
                 BridgeError::UnauthorizedInit
             );
+            if data.len() >= 8 + ValidatorRegistry::INIT_SPACE {
+                if let Ok(existing) = ValidatorRegistry::try_deserialize(&mut &data[..]) {
+                    if existing.stake_mint != Pubkey::default() {
+                        require!(
+                            existing.stake_mint == stake_mint,
+                            BridgeError::InvalidAmount
+                        );
+                    }
+                }
+            }
         }
 
         // Grow to the current layout, topping up rent for the extra bytes.
@@ -2477,7 +2523,7 @@ pub struct UpdateReputation<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimRewards<'info> {
-    #[account(seeds = [b"bridge_state"], bump)]
+    #[account(mut, seeds = [b"bridge_state"], bump)]
     pub bridge_state: Account<'info, BridgeState>,
 
     #[account(
@@ -2677,6 +2723,11 @@ pub struct BridgeState {
     /// to a chosen ceiling via `set_deposit_cap`. Appended last to keep the
     /// fixed `program_version` offset the L2 reads unchanged.
     pub deposit_cap: u64,
+    /// Aggregate unclaimed validator settlement fees currently retained inside
+    /// `bridge_vault` (`#974`). Excluded from user TVL when checking
+    /// `deposit_cap` in `deposit_note` and reserved alongside `rent_floor` in
+    /// `transact` withdrawals.
+    pub total_pending_rewards: u64,
 }
 
 /// Per-asset SPL shielding config (#779): one PDA per enabled mint, holding a
