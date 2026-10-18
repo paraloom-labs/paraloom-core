@@ -405,7 +405,7 @@ impl Coordinator {
     }
 
     /// Split a task into chunks
-    async fn split_task(&self, task: &Task) -> Result<Vec<Task>> {
+    pub async fn split_task(&self, task: &Task) -> Result<Vec<Task>> {
         match &task.task_type {
             TaskType::HashCalculation {
                 start,
@@ -1016,5 +1016,56 @@ mod tests {
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
         );
+    }
+
+    #[tokio::test]
+    async fn split_task_empty_validators_falls_back_to_single_chunk() {
+        let coordinator = Coordinator::new(make_test_network());
+        let task = Task::new(TaskType::HashCalculation {
+            start: 1,
+            end: 1000,
+            algorithm: "sha256".to_string(),
+        });
+
+        // With 0 registered validators, `validators.len().max(1)` prevents
+        // `div_ceil(0)` panic and produces a single chunk covering the full range.
+        let chunks = coordinator.split_task(&task).await.expect("split_task");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, format!("{}-chunk-0", task.id));
+        match &chunks[0].task_type {
+            TaskType::HashCalculation {
+                start,
+                end,
+                algorithm,
+            } => {
+                assert_eq!((*start, *end), (1, 1000));
+                assert_eq!(algorithm, "sha256");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_task_partitions_contiguous_non_overlapping_ranges() {
+        let coordinator = Coordinator::new(make_test_network());
+        for id in [0x01u8, 0x02, 0x03] {
+            coordinator.register_validator(NodeId(vec![id])).await;
+        }
+
+        let task = Task::new(TaskType::HashCalculation {
+            start: 1,
+            end: 1000,
+            algorithm: "sha256".to_string(),
+        });
+
+        let chunks = coordinator.split_task(&task).await.expect("split_task");
+        assert_eq!(chunks.len(), 3);
+
+        let ranges: Vec<(u64, u64)> = chunks
+            .iter()
+            .map(|c| match &c.task_type {
+                TaskType::HashCalculation { start, end, .. } => (*start, *end),
+            })
+            .collect();
+        assert_eq!(ranges, vec![(1, 334), (335, 668), (669, 1000)]);
     }
 }

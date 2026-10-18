@@ -296,36 +296,126 @@ mod tests {
         );
     }
 
+    fn make_deposit_proof(
+        pk: &ark_groth16::ProvingKey<Bn254>,
+        rng: &mut StdRng,
+        value: u64,
+        blinding_seed: u8,
+    ) -> (Vec<Fr>, Proof<Bn254>) {
+        use crate::privacy::poseidon::poseidon_commit_spend;
+        use ark_ff::{BigInteger, PrimeField};
+
+        let blinding = [blinding_seed; 32];
+        let recipient_pubkey = [3u8; 32];
+        let asset = [0u8; 32];
+        let asset_fr = Fr::from_le_bytes_mod_order(&asset);
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&recipient_pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            asset_fr,
+        );
+        let bytes = commitment_fr.into_bigint().to_bytes_le();
+        let mut commitment = [0u8; 32];
+        let len = bytes.len().min(32);
+        commitment[..len].copy_from_slice(&bytes[..len]);
+
+        let circuit =
+            DepositCircuitV2::with_witness(commitment, value, blinding, recipient_pubkey, asset);
+        let proof = Groth16ProofSystem::prove(pk, circuit, rng).unwrap();
+        (vec![commitment_fr, asset_fr], proof)
+    }
+
     #[test]
     fn test_adaptive_batch_verifier() {
         let verifier = AdaptiveBatchVerifier::new();
 
         let mut rng = StdRng::seed_from_u64(0u64);
         let circuit = DepositCircuitV2::new();
-        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+        let (pk, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
-        // Test with empty batch
-        let result = verifier.verify(&vk, &[], &[]);
-        assert_eq!(result, BatchVerificationResult::AllValid);
+        // Empty batch (0)
+        assert_eq!(
+            verifier.verify(&vk, &[], &[]),
+            BatchVerificationResult::AllValid
+        );
+
+        let (pi0, p0) = make_deposit_proof(&pk, &mut rng, 100, 1);
+        let (pi1, p1) = make_deposit_proof(&pk, &mut rng, 200, 2);
+        let (pi2, p2) = make_deposit_proof(&pk, &mut rng, 300, 3);
+
+        // 1..=2 branch (individual verification)
+        assert_eq!(
+            verifier.verify(&vk, &[pi0.clone(), pi1.clone()], &[p0.clone(), p1.clone()]),
+            BatchVerificationResult::AllValid
+        );
+
+        // >= 3 branch (prepared-VK batch verification)
+        assert_eq!(
+            verifier.verify(&vk, &[pi0, pi1, pi2], &[p0, p1, p2]),
+            BatchVerificationResult::AllValid
+        );
     }
 
     #[test]
     fn test_batch_size_threshold() {
-        // Verify that small batches use individual verification
-        // and large batches use batch verification
-
+        // Verify that small batches (< 3) exercise individual verification
+        // and large batches (>= 3) exercise prepared-VK batch verification,
+        // and that both paths detect invalid proofs at their exact indices.
         let verifier = BatchVerifier::new();
-        let mut rng = StdRng::seed_from_u64(0u64);
+        let mut rng = StdRng::seed_from_u64(42u64);
 
         let circuit = DepositCircuitV2::new();
-        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+        let (pk, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
 
-        // Small batch (< 3) should work
-        let result = verifier.verify_batch(&vk, &[], &[]);
-        assert_eq!(result, BatchVerificationResult::AllValid);
+        let (pi0, p0) = make_deposit_proof(&pk, &mut rng, 100, 10);
+        let (pi1, p1) = make_deposit_proof(&pk, &mut rng, 250, 20);
+        let (pi2, p2) = make_deposit_proof(&pk, &mut rng, 500, 30);
+        let wrong_inputs = vec![Fr::from(999_999u64), Fr::from(0u64)];
 
-        // Large batch should also work
-        let result = verifier.verify_batch(&vk, &[], &[]);
-        assert_eq!(result, BatchVerificationResult::AllValid);
+        // Small batch (2 proofs < 3 threshold -> individual verification path)
+        let small_valid =
+            verifier.verify_batch(&vk, &[pi0.clone(), pi1.clone()], &[p0.clone(), p1.clone()]);
+        assert_eq!(small_valid, BatchVerificationResult::AllValid);
+
+        let small_invalid = verifier.verify_batch(
+            &vk,
+            &[pi0.clone(), wrong_inputs.clone()],
+            &[p0.clone(), p1.clone()],
+        );
+        assert_eq!(
+            small_invalid,
+            BatchVerificationResult::SomeInvalid {
+                invalid_indices: vec![1]
+            }
+        );
+
+        // Large batch (3 proofs >= 3 threshold -> prepared-VK batch verification path)
+        let large_valid = verifier.verify_batch(
+            &vk,
+            &[pi0.clone(), pi1.clone(), pi2.clone()],
+            &[p0.clone(), p1.clone(), p2.clone()],
+        );
+        assert_eq!(large_valid, BatchVerificationResult::AllValid);
+
+        let large_invalid = verifier.verify_batch(
+            &vk,
+            &[pi0.clone(), pi1.clone(), wrong_inputs],
+            &[p0.clone(), p1.clone(), p2.clone()],
+        );
+        assert_eq!(
+            large_invalid,
+            BatchVerificationResult::SomeInvalid {
+                invalid_indices: vec![2]
+            }
+        );
+
+        // Prepared-VK constructor path on >= 3 batch
+        let cached_verifier = BatchVerifier::with_prepared_vk(&vk);
+        assert!(cached_verifier.pvk.is_some());
+        assert_eq!(
+            cached_verifier.verify_batch(&vk, &[pi0, pi1, pi2], &[p0, p1, p2]),
+            BatchVerificationResult::AllValid
+        );
     }
 }

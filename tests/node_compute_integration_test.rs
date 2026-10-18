@@ -2,7 +2,7 @@
 //!
 //! Tests the full integration of compute layer into the Node infrastructure.
 
-use paraloom::compute::{ComputeJob, ResourceLimits};
+use paraloom::compute::{ComputeJob, JobStatus, ResourceLimits};
 use paraloom::config::Settings;
 use paraloom::node::Node;
 
@@ -33,21 +33,29 @@ async fn test_resource_provider_node_can_execute_jobs() {
     let executor = node.compute_executor().unwrap();
     executor.start().await.expect("Failed to start executor");
 
-    // Create a simple WASM job
-    // This is a minimal valid WASM module that exports an "execute" function
+    // Create a valid WASM job matching WasmEngine's contract:
+    // exported "memory" and `execute(input_ptr: i32, input_len: i32) -> output_ptr: i32`
     let wasm_code = wat::parse_str(
         r#"
         (module
-            (func (export "execute")
-                ;; Simple function that just returns
-                nop
+            (memory (export "memory") 1)
+            (func (export "execute") (param i32 i32) (result i32)
+                ;; Add the first two input bytes and write the sum at offset 0
+                (i32.store8
+                    (i32.const 0)
+                    (i32.add
+                        (i32.load8_u (local.get 0))
+                        (i32.load8_u (i32.add (local.get 0) (i32.const 1)))
+                    )
+                )
+                (i32.const 0)
             )
         )
         "#,
     )
     .expect("Failed to compile WAT to WASM");
 
-    let input_data = vec![5, 10]; // Will add 5 + 10
+    let input_data = vec![5u8, 10]; // Will add 5 + 10 = 15
     let limits = ResourceLimits::default();
 
     let job = ComputeJob::new(wasm_code, input_data, limits);
@@ -56,26 +64,40 @@ async fn test_resource_provider_node_can_execute_jobs() {
     // Submit job to executor
     node.submit_compute_job(job).expect("Failed to submit job");
 
-    // Wait a bit for execution
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Poll for execution completion with bounded retries (up to 2s)
+    for _ in 0..20 {
+        if let Some(res) = node.get_compute_job_result(&job_id) {
+            if res.status == JobStatus::Completed || matches!(res.status, JobStatus::Failed { .. }) {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     // Query job result
-    let result = node.get_compute_job_result(&job_id);
-    assert!(result.is_some(), "Job result should be available");
-
-    let result = result.unwrap();
-    println!("Job execution result: {:?}", result);
+    let result = node
+        .get_compute_job_result(&job_id)
+        .expect("Job result should be available");
+    assert_eq!(result.job_id, job_id);
+    assert_eq!(
+        result.status,
+        JobStatus::Completed,
+        "Job should complete successfully, got {:?}",
+        result.status
+    );
+    let output = result
+        .output_data
+        .as_ref()
+        .expect("Completed job should have output data");
+    assert_eq!(output[0], 15, "Output should contain 5 + 10 = 15");
 
     // Check executor stats
     let stats = node
         .get_compute_stats()
         .expect("Should have executor stats");
     assert_eq!(stats.active_jobs, 0, "No jobs should be active");
-    assert!(
-        stats.completed_jobs > 0 || stats.failed_jobs > 0,
-        "Should have at least one completed or failed job"
-    );
-    println!("Executor stats: {:?}", stats);
+    assert_eq!(stats.completed_jobs, 1, "Should have 1 completed job");
+    assert_eq!(stats.failed_jobs, 0, "Should have 0 failed jobs");
 }
 
 #[tokio::test]

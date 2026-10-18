@@ -268,32 +268,49 @@ impl WasmEngine {
         timeout: Duration,
     ) -> Result<i32> {
         // Set epoch deadline for timeout
-        // Deadline is current epoch + timeout in ticks (1 tick = 1ms approximately)
-        let timeout_ticks = timeout.as_millis() as u64;
+        // Deadline is current epoch + timeout in ticks (1 tick = 1ms of elapsed wall-clock time)
+        let timeout_ticks = (timeout.as_millis() as u64).max(1);
         store.set_epoch_deadline(timeout_ticks);
 
-        // Start epoch incrementing in background
+        // Start epoch incrementing in background, stopped and joined as soon as call finishes
         let engine_handle = self.engine.clone();
-        let timeout_duration = timeout;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let max_ticks = timeout_ticks.saturating_add(1);
         let epoch_thread = std::thread::spawn(move || {
             let start = Instant::now();
-            while start.elapsed() < timeout_duration {
-                engine_handle.increment_epoch();
+            let mut ticks = 0u64;
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) && ticks < max_ticks {
                 std::thread::sleep(Duration::from_millis(1));
+                if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed_ticks = (start.elapsed().as_millis() as u64).min(max_ticks);
+                while ticks < elapsed_ticks
+                    && !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    engine_handle.increment_epoch();
+                    ticks += 1;
+                }
             }
         });
 
         // Execute the function
-        let result = func.call(store, (input_ptr, input_len)).map_err(|e| {
-            if e.to_string().contains("epoch") {
+        let call_res = func.call(store, (input_ptr, input_len));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = epoch_thread.join();
+
+        let result = call_res.map_err(|e| {
+            let is_interrupt_trap = e.chain().any(|cause| {
+                cause.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt)
+            });
+            let full_err = format!("{:#}", e);
+            if is_interrupt_trap || full_err.contains("epoch deadline") {
                 anyhow!("WASM execution timeout after {:?}", timeout)
             } else {
-                anyhow!("WASM execution error: {}", e)
+                anyhow!("WASM execution error: {:#}", e)
             }
         });
-
-        // Clean up epoch thread (it will finish naturally)
-        drop(epoch_thread);
 
         result
     }

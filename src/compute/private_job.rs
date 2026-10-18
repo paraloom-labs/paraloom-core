@@ -201,11 +201,18 @@ impl PrivateJobResult {
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
 
-        // Create commitment to output
+        // Create Poseidon commitment to output matching ComputeCircuit public input
         let data_hash = PrivateComputeJob::hash_data(&output_data);
         let randomness = crate::privacy::pedersen::generate_randomness();
+        let output_data_hash = crate::compute::ComputeCircuit::hash_data_to_field(&output_data);
+        let dummy_owner = [0u8; 32];
+        let output_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+            output_data_hash,
+            &randomness,
+            &dummy_owner,
+        );
         let output_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+            Commitment::from_bytes(crate::privacy::types::fr_to_bytes_32(output_commitment_fr));
 
         // Encrypt output
         let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address)?;
@@ -244,8 +251,75 @@ impl PrivateJobResult {
         pk_path.exists() && vk_path.exists()
     }
 
-    /// Load compute proving key from disk
+    #[cfg(test)]
+    fn test_groth16_keys() -> &'static (
+        ark_groth16::ProvingKey<ark_bn254::Bn254>,
+        ark_groth16::VerifyingKey<ark_bn254::Bn254>,
+    ) {
+        use ark_groth16::Groth16;
+        use ark_snark::SNARK;
+        use std::sync::OnceLock;
+
+        static KEYS: OnceLock<(
+            ark_groth16::ProvingKey<ark_bn254::Bn254>,
+            ark_groth16::VerifyingKey<ark_bn254::Bn254>,
+        )> = OnceLock::new();
+
+        KEYS.get_or_init(|| {
+            let dummy_code_hash = [0u8; 32];
+            let dummy_input = vec![0u8];
+            let dummy_input_randomness = [0u8; 32];
+            let dummy_output = vec![0u8];
+            let dummy_output_randomness = [0u8; 32];
+            let dummy_owner = [0u8; 32];
+            let dummy_spending_key = [0u8; 32];
+
+            let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
+            let dummy_input_commitment = crate::compute::ComputeCircuit::compute_commitment(
+                dummy_input_hash,
+                &dummy_input_randomness,
+                &dummy_owner,
+            );
+            let dummy_output_hash =
+                crate::compute::ComputeCircuit::hash_data_to_field(&dummy_output);
+            let dummy_output_commitment = crate::compute::ComputeCircuit::compute_commitment(
+                dummy_output_hash,
+                &dummy_output_randomness,
+                &dummy_owner,
+            );
+            let dummy_nullifier = crate::compute::ComputeCircuit::compute_nullifier(
+                dummy_input_commitment,
+                &dummy_spending_key,
+            );
+
+            let setup_circuit = crate::compute::ComputeCircuit::with_witness(
+                dummy_code_hash,
+                dummy_input_commitment,
+                dummy_output_commitment,
+                dummy_nullifier,
+                dummy_input,
+                dummy_input_randomness,
+                dummy_output,
+                dummy_output_randomness,
+                dummy_owner,
+                dummy_spending_key,
+            );
+
+            let mut rng = ark_std::rand::thread_rng();
+            Groth16::<ark_bn254::Bn254>::circuit_specific_setup(setup_circuit, &mut rng)
+                .expect("compute circuit Groth16 setup should succeed")
+        })
+    }
+
+    /// Load compute proving key from disk (or cached test setup under `cfg(test)`)
     fn load_proving_key() -> Result<ark_groth16::ProvingKey<ark_bn254::Bn254>> {
+        if !Self::compute_keys_exist() {
+            #[cfg(test)]
+            {
+                return Ok(Self::test_groth16_keys().0.clone());
+            }
+        }
+
         use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
@@ -256,8 +330,15 @@ impl PrivateJobResult {
             .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))
     }
 
-    /// Load compute verifying key from disk
+    /// Load compute verifying key from disk (or cached test setup under `cfg(test)`)
     fn load_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bn254::Bn254>> {
+        if !Self::compute_keys_exist() {
+            #[cfg(test)]
+            {
+                return Ok(Self::test_groth16_keys().1.clone());
+            }
+        }
+
         use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
@@ -286,7 +367,7 @@ impl PrivateJobResult {
         use sha2::{Digest, Sha256};
 
         // Check if real keys are available
-        if Self::compute_keys_exist() {
+        if Self::compute_keys_exist() || cfg!(test) {
             log::info!("Generating real Groth16 proof for output commitment");
 
             // Load proving key
@@ -380,7 +461,7 @@ impl PrivateJobResult {
     /// Verify zkSNARK execution proof
     ///
     /// - If verifying keys exist: Verify real Groth16 proof
-    /// - If keys don't exist: Basic format check (for testing/dev)
+    /// - If keys don't exist: Fail closed outside tests; in tests use cached setup keypair
     ///
     /// Takes the full `PrivateJobResult` so the verifier has access to
     /// the public-input material that the v0.4 commitment scheme
@@ -392,18 +473,28 @@ impl PrivateJobResult {
         let proof_bytes = &result.execution_proof;
 
         // Check if real keys are available
-        if Self::compute_keys_exist() {
+        if Self::compute_keys_exist() || cfg!(test) {
             log::info!("Verifying real Groth16 proof");
+
+            if proof_bytes.is_empty() {
+                log::warn!("Empty execution proof rejected");
+                return Ok(false);
+            }
 
             // Load verifying key
             let vk = Self::load_verifying_key()?;
 
-            // Deserialize proof
+            // Deserialize proof; malformed proof bytes are an invalid proof, not a verifier outage
             use ark_serialize::CanonicalDeserialize;
-            let proof = ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed(
+            let proof = match ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed(
                 proof_bytes.as_slice(),
-            )
-            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            ) {
+                Ok(proof) => proof,
+                Err(e) => {
+                    log::warn!("Proof deserialization failed: {:?}", e);
+                    return Ok(false);
+                }
+            };
 
             // Public inputs for the v0.4 ComputeCircuit shape:
             //   [code_hash_fr, input_commitment, output_commitment, input_nullifier]
@@ -466,35 +557,16 @@ impl PrivateJobResult {
         // No verifying key on disk. Real Groth16 verification is impossible
         // here, so fail CLOSED: a missing cryptographic artifact must never
         // silently downgrade "prove correct execution" to a byte-length check
-        // that any 32- or 192-byte buffer would pass (#652). The permissive
-        // placeholder path is compiled ONLY under `cargo test`, where the
-        // compute unit tests exercise the pipeline without a ceremony key;
-        // release/dev binaries reject the result outright.
-        #[cfg(test)]
-        {
-            log::warn!("Compute verifying key not found — TEST-ONLY placeholder verification");
-            if proof_bytes.len() != 32 && proof_bytes.len() != 192 {
-                log::warn!(
-                    "Invalid proof format (expected 32 or 192 bytes, got {})",
-                    proof_bytes.len()
-                );
-                return Ok(false);
-            }
-            Ok(true)
-        }
-
-        #[cfg(not(test))]
-        {
-            log::error!(
-                "Compute verifying key not found (keys/compute_verifying.key) — \
-                 refusing to accept execution proof. \
-                 Run: cargo run --bin setup_compute_ceremony"
-            );
-            Err(anyhow!(
-                "compute verifying key unavailable: refusing to verify \
-                 execution proof (fail-closed)"
-            ))
-        }
+        // that any 32- or 128-byte buffer would pass (#652).
+        log::error!(
+            "Compute verifying key not found (keys/compute_verifying.key) — \
+             refusing to accept execution proof. \
+             Run: cargo run --bin setup_compute_ceremony"
+        );
+        Err(anyhow!(
+            "compute verifying key unavailable: refusing to verify \
+             execution proof (fail-closed)"
+        ))
     }
 }
 
@@ -696,10 +768,20 @@ mod tests {
         let private_result =
             PrivateJobResult::from_job_result(job_id, job_result, &owner_address).unwrap();
 
-        // Verify result
+        // Compressed BN254 Groth16 proof is 128 bytes
+        assert_eq!(private_result.execution_proof.len(), 128);
+
+        // Verify result via real Groth16 pairing check
         let verified = coordinator.verify_result(&private_result).await;
         assert!(verified.is_ok());
-        assert!(verified.unwrap()); // Should pass with valid proof
+        assert!(verified.unwrap());
+
+        // Tampering with the public output commitment must cause Groth16 verification to fail
+        let mut tampered_result = private_result.clone();
+        tampered_result.output_commitment.0[0] ^= 0x01;
+        let tampered_verified = coordinator.verify_result(&tampered_result).await;
+        assert!(tampered_verified.is_ok());
+        assert!(!tampered_verified.unwrap());
 
         // Test finalize
         let finalized = coordinator.finalize_result(private_result).await;
@@ -708,6 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_result_verification_invalid_proof() {
+        use crate::compute::{JobResult, JobStatus};
+
         let pool = Arc::new(ShieldedPool::new());
         let coordinator = PrivateJobCoordinator::new(pool);
 
@@ -724,20 +808,55 @@ mod tests {
             completed_at: 0,
         };
 
-        // Should fail verification
+        // Empty proof must fail verification
         let verified = coordinator.verify_result(&result).await;
         assert!(verified.is_ok());
-        assert!(!verified.unwrap()); // Should fail with empty proof
+        assert!(!verified.unwrap());
 
-        // Test finalize with invalid result
+        // Finalize with invalid result must error
         let finalized = coordinator.finalize_result(result.clone()).await;
-        assert!(finalized.is_err()); // Should error on finalize
+        assert!(finalized.is_err());
 
-        // Fix proof and retry
+        // A 32-byte zero buffer (the old length-only placeholder) must also be rejected
         result.execution_proof = vec![0u8; 32];
-        let verified2 = coordinator.verify_result(&result).await;
-        assert!(verified2.is_ok());
-        assert!(verified2.unwrap()); // Should pass now
+        let verified_placeholder = coordinator.verify_result(&result).await;
+        assert!(verified_placeholder.is_ok());
+        assert!(!verified_placeholder.unwrap());
+        assert!(coordinator.finalize_result(result.clone()).await.is_err());
+
+        // A 128-byte zero buffer (matching BN254 proof length) must also be rejected
+        result.execution_proof = vec![0u8; 128];
+        let verified_zero_128 = coordinator.verify_result(&result).await;
+        assert!(verified_zero_128.is_ok());
+        assert!(!verified_zero_128.unwrap());
+
+        // A real Groth16 proof generated for a valid job result must pass,
+        // and fail if bound to the wrong output commitment
+        let valid_job_result = JobResult {
+            job_id: "test-job".to_string(),
+            status: JobStatus::Completed,
+            output_data: Some(vec![10, 20, 30, 40]),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1024,
+            instructions_executed: 50000,
+        };
+        let valid_private = PrivateJobResult::from_job_result(
+            "test-job".to_string(),
+            valid_job_result,
+            &ShieldedAddress([42u8; 32]),
+        )
+        .unwrap();
+
+        result.execution_proof = valid_private.execution_proof.clone();
+        let verified_mismatched_commitment = coordinator.verify_result(&result).await;
+        assert!(verified_mismatched_commitment.is_ok());
+        assert!(!verified_mismatched_commitment.unwrap());
+
+        result.output_commitment = valid_private.output_commitment;
+        let verified_valid = coordinator.verify_result(&result).await;
+        assert!(verified_valid.is_ok());
+        assert!(verified_valid.unwrap());
     }
 
     // Integration Tests
@@ -788,11 +907,11 @@ mod tests {
 
         // Verify output is encrypted
         assert_ne!(private_result.encrypted_output, mock_output);
-        // Proof can be either placeholder (32 bytes) or real Groth16 (192 bytes)
-        assert!(
-            private_result.execution_proof.len() == 32
-                || private_result.execution_proof.len() == 192,
-            "Proof size should be 32 or 192 bytes, got {}",
+        // Compressed BN254 Groth16 proof is 128 bytes
+        assert_eq!(
+            private_result.execution_proof.len(),
+            128,
+            "Compressed BN254 Groth16 proof size should be 128 bytes, got {}",
             private_result.execution_proof.len()
         );
 
@@ -900,16 +1019,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate validators disagreeing: 2 agree, 1 disagrees
-        let output_correct = vec![1, 2, 3, 4];
-        let output_wrong = vec![4, 3, 2, 1];
-
-        // Validator 1 and 2 agree
-        for validator_id in validators.iter().take(2) {
+        // Simulate 1/1/1 split across all 3 validators so no output reaches CONSENSUS_THRESHOLD (2)
+        let distinct_outputs = [vec![1, 2, 3, 4], vec![4, 3, 2, 1], vec![9, 9, 9, 9]];
+        for (validator_id, output) in validators.iter().zip(distinct_outputs.iter()) {
             let result = JobResult {
                 job_id: job_id.clone(),
                 status: JobStatus::Completed,
-                output_data: Some(output_correct.clone()),
+                output_data: Some(output.clone()),
                 error: None,
                 execution_time_ms: 100,
                 memory_used_bytes: 1024,
@@ -921,26 +1037,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Validator 3 disagrees
-        let result_wrong = JobResult {
-            job_id: job_id.clone(),
-            status: JobStatus::Completed,
-            output_data: Some(output_wrong.clone()),
-            error: None,
-            execution_time_ms: 100,
-            memory_used_bytes: 1024,
-            instructions_executed: 50000,
-        };
-        verifier
-            .submit_result(&job_id, validators[2].clone(), result_wrong)
-            .await
-            .unwrap();
-
-        // Create private result with correct output
+        // Create private result with a valid proof for one of the outputs
         let job_result = JobResult {
             job_id: job_id.clone(),
             status: JobStatus::Completed,
-            output_data: Some(output_correct.clone()),
+            output_data: Some(distinct_outputs[0].clone()),
             error: None,
             execution_time_ms: 100,
             memory_used_bytes: 1024,
@@ -949,10 +1050,14 @@ mod tests {
         let private_result =
             PrivateJobResult::from_job_result(job_id.clone(), job_result, &owner_address).unwrap();
 
-        // Verify - should still pass with 2/3 consensus
+        // Verify - must be rejected because validators disagreed (1/1/1 split < threshold 2)
         let verified = coordinator.verify_result(&private_result).await;
         assert!(verified.is_ok());
-        assert!(verified.unwrap()); // Should pass with 2/3 agreement
+        assert!(!verified.unwrap());
+
+        // Finalize must also reject a disagreed result
+        let finalized = coordinator.finalize_result(private_result).await;
+        assert!(finalized.is_err());
     }
 
     #[tokio::test]

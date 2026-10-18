@@ -1,90 +1,141 @@
-// Test for coordinator task distribution logic
+// Integration tests for Coordinator::split_task chunk distribution logic
 
-#[test]
-fn test_task_chunk_distribution() {
-    // Test case 1: Even distribution
-    let total_range = 100u64;
-    let num_validators = 4;
-    let chunk_size = total_range.div_ceil(num_validators);
+use paraloom::config::Settings;
+use paraloom::coordinator::Coordinator;
+use paraloom::network::NetworkManager;
+use paraloom::task::{Task, TaskType};
+use paraloom::types::NodeId;
+use std::sync::Arc;
 
-    assert_eq!(chunk_size, 25);
-
-    // Test case 2: Uneven distribution
-    let total_range = 100u64;
-    let num_validators = 3;
-    let chunk_size = total_range.div_ceil(num_validators);
-
-    assert_eq!(chunk_size, 34); // ceil(100/3) = 34
-
-    // Test case 3: More validators than tasks
-    let total_range = 5u64;
-    let num_validators = 10;
-    let chunk_size = total_range.div_ceil(num_validators);
-
-    assert_eq!(chunk_size, 1);
+async fn coordinator_with_validators(count: usize) -> Coordinator {
+    let network = Arc::new(NetworkManager::new(&Settings::development()).expect("test network"));
+    let coordinator = Coordinator::new(network);
+    for i in 0..count {
+        coordinator
+            .register_validator(NodeId(vec![(i + 1) as u8]))
+            .await;
+    }
+    coordinator
 }
 
-#[test]
-fn test_chunk_boundaries() {
-    // Simulate chunk creation logic
+fn chunk_ranges(chunks: &[Task]) -> Vec<(u64, u64)> {
+    chunks
+        .iter()
+        .map(|chunk| match &chunk.task_type {
+            TaskType::HashCalculation { start, end, .. } => (*start, *end),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_task_chunk_distribution() {
+    // Case 1: Even distribution (1..=100 across 4 validators -> 4 chunks of 25)
+    let coord_even = coordinator_with_validators(4).await;
+    let task_100 = Task::new(TaskType::HashCalculation {
+        start: 1,
+        end: 100,
+        algorithm: "sha256".to_string(),
+    });
+    let chunks_even = coord_even.split_task(&task_100).await.unwrap();
+    assert_eq!(
+        chunk_ranges(&chunks_even),
+        vec![(1, 25), (26, 50), (51, 75), (76, 100)]
+    );
+
+    // Case 2: Uneven distribution (1..=100 across 3 validators -> 34, 34, 32)
+    let coord_uneven = coordinator_with_validators(3).await;
+    let chunks_uneven = coord_uneven.split_task(&task_100).await.unwrap();
+    assert_eq!(
+        chunk_ranges(&chunks_uneven),
+        vec![(1, 34), (35, 68), (69, 100)]
+    );
+
+    // Case 3: More validators than tasks (1..=5 across 10 validators -> 5 chunks of 1)
+    let coord_many = coordinator_with_validators(10).await;
+    let task_5 = Task::new(TaskType::HashCalculation {
+        start: 1,
+        end: 5,
+        algorithm: "sha256".to_string(),
+    });
+    let chunks_many = coord_many.split_task(&task_5).await.unwrap();
+    assert_eq!(
+        chunk_ranges(&chunks_many),
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+    );
+}
+
+#[tokio::test]
+async fn test_chunk_boundaries() {
     let start = 1u64;
     let end = 100u64;
-    let num_validators = 4;
     let total = end - start + 1;
-    let chunk_size = total.div_ceil(num_validators as u64);
 
-    let mut chunks = Vec::new();
-    let mut current_start = start;
+    let coordinator = coordinator_with_validators(4).await;
+    let task = Task::new(TaskType::HashCalculation {
+        start,
+        end,
+        algorithm: "sha256".to_string(),
+    });
 
-    for _ in 0..num_validators {
-        let chunk_end = (current_start + chunk_size - 1).min(end);
-        chunks.push((current_start, chunk_end));
-        current_start = chunk_end + 1;
-        if current_start > end {
-            break;
-        }
+    let chunks = coordinator.split_task(&task).await.unwrap();
+    let ranges = chunk_ranges(&chunks);
+
+    assert_eq!(ranges.len(), 4);
+    assert_eq!(ranges[0].0, start);
+    assert_eq!(ranges.last().unwrap().1, end);
+
+    // Verify chunk IDs and contiguous non-overlapping coverage
+    for (i, chunk) in chunks.iter().enumerate() {
+        assert_eq!(chunk.id, format!("{}-chunk-{}", task.id, i));
+    }
+    for i in 0..ranges.len() - 1 {
+        assert_eq!(ranges[i].1 + 1, ranges[i + 1].0);
     }
 
-    // Verify we created chunks
-    assert!(!chunks.is_empty());
-
-    // Verify first chunk starts at beginning
-    assert_eq!(chunks[0].0, start);
-
-    // Verify last chunk ends at end
-    assert_eq!(chunks.last().unwrap().1, end);
-
-    // Verify no gaps between chunks
-    for i in 0..chunks.len() - 1 {
-        assert_eq!(chunks[i].1 + 1, chunks[i + 1].0);
-    }
-
-    // Verify total coverage
-    let total_covered: u64 = chunks.iter().map(|(s, e)| e - s + 1).sum();
+    let total_covered: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
     assert_eq!(total_covered, total);
 }
 
-#[test]
-fn test_single_validator() {
-    // When there's only one validator, it should get the entire range
-    let start = 1u64;
-    let end = 1000u64;
-    let num_validators = 1;
-    let total = end - start + 1;
-    let chunk_size = total.div_ceil(num_validators as u64);
+#[tokio::test]
+async fn test_single_validator() {
+    // When there is only one validator, it must receive the entire range in a single chunk
+    let coordinator = coordinator_with_validators(1).await;
+    let task = Task::new(TaskType::HashCalculation {
+        start: 1,
+        end: 1000,
+        algorithm: "sha256".to_string(),
+    });
 
-    assert_eq!(chunk_size, 1000);
+    let chunks = coordinator.split_task(&task).await.unwrap();
+    assert_eq!(chunk_ranges(&chunks), vec![(1, 1000)]);
 }
 
-#[test]
-fn test_edge_case_small_range() {
-    // Test with a very small range
-    let start = 1u64;
-    let end = 1u64;
-    let num_validators = 5;
-    let total = end - start + 1;
-    let chunk_size = total.div_ceil(num_validators as u64);
+#[tokio::test]
+async fn test_empty_validators_guard() {
+    // When no validators are registered yet, `validators.len().max(1)` must guard
+    // against `div_ceil(0)` and produce a single chunk covering the entire range.
+    let coordinator = coordinator_with_validators(0).await;
+    let task = Task::new(TaskType::HashCalculation {
+        start: 1,
+        end: 1000,
+        algorithm: "sha256".to_string(),
+    });
 
-    // Should still have a chunk size of 1
-    assert_eq!(chunk_size, 1);
+    let chunks = coordinator.split_task(&task).await.unwrap();
+    assert_eq!(chunk_ranges(&chunks), vec![(1, 1000)]);
+}
+
+#[tokio::test]
+async fn test_edge_case_small_range() {
+    // Single-element range (1..=1) with 5 validators must emit only 1 chunk (1, 1)
+    // and skip the remaining 4 iterations where `current_start > end`.
+    let coordinator = coordinator_with_validators(5).await;
+    let task = Task::new(TaskType::HashCalculation {
+        start: 1,
+        end: 1,
+        algorithm: "sha256".to_string(),
+    });
+
+    let chunks = coordinator.split_task(&task).await.unwrap();
+    assert_eq!(chunk_ranges(&chunks), vec![(1, 1)]);
 }

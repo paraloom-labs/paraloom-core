@@ -57,7 +57,8 @@ async fn test_simple_wasm_execution() {
 
 #[tokio::test]
 async fn test_wasm_memory_read_write() {
-    // WASM module that reads input from memory and writes output
+    // WASM module that reads input bytes from memory, sums them, writes the sum
+    // back to linear memory at offset 0, and returns the output pointer (0).
     let wat = r#"
         (module
             (memory (export "memory") 1)
@@ -88,8 +89,9 @@ async fn test_wasm_memory_read_write() {
                     )
                 )
 
-                ;; Return sum
-                (local.get $sum)
+                ;; Write sum to linear memory at offset 0 and return output pointer 0
+                (i32.store (i32.const 0) (local.get $sum))
+                (i32.const 0)
             )
         )
     "#;
@@ -108,8 +110,18 @@ async fn test_wasm_memory_read_write() {
     // Wait for completion
     let result = wait_for_result(&executor, &job_id).await;
 
-    // Verify execution succeeded
+    // Verify execution succeeded and output memory contains the computed sum (100)
     assert_eq!(result.status, JobStatus::Completed);
+    let output = result
+        .output_data
+        .as_ref()
+        .expect("Completed job must return output_data");
+    assert!(
+        output.len() >= 4,
+        "Output buffer must contain at least 4 bytes"
+    );
+    let sum = i32::from_le_bytes(output[..4].try_into().unwrap());
+    assert_eq!(sum, 100, "Expected sum of [10, 20, 30, 40] to be 100");
     assert!(result.execution_time_ms > 0);
     assert!(result.memory_used_bytes > 0);
     assert!(result.instructions_executed > 0);
@@ -117,13 +129,14 @@ async fn test_wasm_memory_read_write() {
 
 #[tokio::test]
 async fn test_wasm_resource_limit_memory() {
-    // Create a WASM module that tries to use excessive memory
+    // WASM module that attempts to grow memory by 50 pages (~3.2MB) beyond the 1MB limit
+    // and writes the `memory.grow` return code (-1 when denied by the limiter) to offset 0.
     let wat = r#"
         (module
             (memory (export "memory") 1 100)  ;; Request up to 100 pages (6.4MB)
             (func (export "execute") (param i32 i32) (result i32)
-                ;; Try to grow memory beyond limit
-                (drop (memory.grow (i32.const 50)))
+                ;; Try to grow memory beyond limit and record the return value at offset 0
+                (i32.store (i32.const 0) (memory.grow (i32.const 50)))
                 i32.const 0
             )
         )
@@ -131,14 +144,14 @@ async fn test_wasm_resource_limit_memory() {
 
     let wasm_bytes = wat::parse_str(wat).unwrap();
 
-    // Set very low memory limit (1MB)
+    // Set very low memory limit (1MB = 16 WASM pages)
     let limits = ResourceLimits {
         max_memory_bytes: 1024 * 1024, // 1MB
         max_instructions: 1_000_000,
         timeout_secs: 5,
     };
 
-    let job = ComputeJob::new(wasm_bytes, vec![], limits);
+    let job = ComputeJob::new(wasm_bytes, vec![], limits.clone());
     let job_id = job.id.clone();
 
     let executor = JobExecutor::new().unwrap();
@@ -148,15 +161,26 @@ async fn test_wasm_resource_limit_memory() {
     // Wait for completion
     let result = wait_for_result(&executor, &job_id).await;
 
-    // Should either fail or complete with low memory usage
-    // (depends on Wasmtime's memory management)
+    // ResourceLimiter denies `memory.grow(50)` by returning -1 while keeping memory at 1 page (64KB)
+    assert_eq!(result.status, JobStatus::Completed);
     assert!(
-        matches!(
-            result.status,
-            JobStatus::Completed | JobStatus::Failed { .. }
-        ),
-        "Expected Completed or Failed, got {:?}",
-        result.status
+        result.memory_used_bytes <= limits.max_memory_bytes,
+        "Memory used ({} bytes) exceeded limit ({} bytes)",
+        result.memory_used_bytes,
+        limits.max_memory_bytes
+    );
+    assert_eq!(
+        result.memory_used_bytes, 65_536,
+        "Memory should remain at 1 initial page (65536 bytes) after denied grow"
+    );
+    let output = result
+        .output_data
+        .as_ref()
+        .expect("Completed job must return output_data");
+    let grow_result = i32::from_le_bytes(output[..4].try_into().unwrap());
+    assert_eq!(
+        grow_result, -1,
+        "memory.grow beyond limit must be denied with -1"
     );
 }
 
@@ -241,11 +265,11 @@ async fn test_wasm_timeout_enforcement() {
 
     let wasm_bytes = wat::parse_str(wat).unwrap();
 
-    // Set very short timeout (1 second)
+    // Set 1-second timeout with unbounded fuel so only the epoch timeout can terminate execution
     let limits = ResourceLimits {
         max_memory_bytes: 10 * 1024 * 1024,
-        max_instructions: 10_000_000_000, // Very high limit (timeout should hit first)
-        timeout_secs: 1,                  // 1 second timeout
+        max_instructions: u64::MAX,
+        timeout_secs: 1,
     };
 
     let job = ComputeJob::new(wasm_bytes, vec![], limits);
@@ -258,13 +282,17 @@ async fn test_wasm_timeout_enforcement() {
     // Wait for completion (with longer timeout since we expect failure)
     let result = wait_for_result(&executor, &job_id).await;
 
-    // Should fail due to timeout OR instruction limit
-    // (Both are acceptable as the loop is infinite)
-    assert!(
-        matches!(result.status, JobStatus::Failed { .. }),
-        "Expected Failed due to timeout or instruction limit, got {:?}",
-        result.status
-    );
+    // Must fail specifically due to epoch timeout, not fuel exhaustion
+    match &result.status {
+        JobStatus::Failed { error } => {
+            assert!(
+                error.contains("timeout"),
+                "Expected timeout failure message, got: {}",
+                error
+            );
+        }
+        other => panic!("Expected Failed with timeout error, got {:?}", other),
+    }
 }
 
 #[tokio::test]

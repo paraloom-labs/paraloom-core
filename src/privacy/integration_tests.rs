@@ -60,42 +60,80 @@ mod tests {
         println!("Total supply: {}", total_supply);
     }
 
-    /// Test privacy guarantees
+    /// Test privacy guarantees: single-field commitment binding and pool state updates
     #[tokio::test]
     async fn test_privacy_guarantees() {
-        println!("\n=== Testing Privacy Guarantees ===");
-
         let pool = ShieldedPool::new();
 
-        // Alice and Bob deposit same amount
         let alice_addr = ShieldedAddress([0xA1u8; 32]);
         let bob_addr = ShieldedAddress([0xB0u8; 32]);
 
-        let alice_rand = pedersen::generate_randomness();
-        let bob_rand = pedersen::generate_randomness();
+        let rand_1 = [0x11u8; 32];
+        let rand_2 = [0x22u8; 32];
 
-        let alice_deposit = DepositTx::new(vec![0x42; 32], 1000, alice_addr, alice_rand, 10);
-        let bob_deposit = DepositTx::new(vec![0x43; 32], 1000, bob_addr, bob_rand, 10);
+        // 1. Determinism: identical (recipient, amount, randomness) produces identical commitment
+        let alice_tx_a = DepositTx::new(vec![0x42; 32], 1000, alice_addr.clone(), rand_1, 10);
+        let alice_tx_b = DepositTx::new(vec![0x42; 32], 1000, alice_addr.clone(), rand_1, 10);
+        assert_eq!(
+            alice_tx_a.output_commitment, alice_tx_b.output_commitment,
+            "Identical note inputs must yield the same commitment"
+        );
+
+        // 2. Randomness binding (hiding): same recipient and amount, different randomness -> different commitment
+        let alice_diff_rand = DepositTx::new(vec![0x42; 32], 1000, alice_addr.clone(), rand_2, 10);
+        assert_ne!(
+            alice_tx_a.output_commitment, alice_diff_rand.output_commitment,
+            "Commitment must bind randomness so repeated deposits by the same user are unlinkable"
+        );
+
+        // 3. Recipient binding: same amount and randomness, different recipient -> different commitment
+        let bob_same_rand = DepositTx::new(vec![0x43; 32], 1000, bob_addr.clone(), rand_1, 10);
+        assert_ne!(
+            alice_tx_a.output_commitment, bob_same_rand.output_commitment,
+            "Commitment must bind recipient address"
+        );
+
+        // 4. Value binding: same recipient and randomness, different net amount -> different commitment
+        let alice_diff_amount =
+            DepositTx::new(vec![0x42; 32], 2000, alice_addr.clone(), rand_1, 10);
+        assert_ne!(
+            alice_tx_a.output_commitment, alice_diff_amount.output_commitment,
+            "Commitment must bind note value"
+        );
+
+        // 5. Deposit both notes into the pool and verify returned commitments and pool state
+        let alice_deposit = alice_tx_a;
+        let bob_deposit = DepositTx::new(vec![0x43; 32], 1000, bob_addr.clone(), rand_2, 10);
 
         let alice_commitment = alice_deposit.output_commitment.clone();
         let bob_commitment = bob_deposit.output_commitment.clone();
 
-        // Commitments should be different even for same amount
-        assert_ne!(
-            alice_commitment, bob_commitment,
-            "Commitments should hide identity"
-        );
+        let credited_alice = pool
+            .deposit(alice_deposit.output_note.clone(), 990)
+            .await
+            .expect("Alice deposit should succeed");
+        let credited_bob = pool
+            .deposit(bob_deposit.output_note.clone(), 990)
+            .await
+            .expect("Bob deposit should succeed");
 
-        pool.deposit(alice_deposit.output_note, 990).await.unwrap();
-        pool.deposit(bob_deposit.output_note, 990).await.unwrap();
+        assert_eq!(credited_alice, alice_commitment);
+        assert_eq!(credited_bob, bob_commitment);
+        assert_eq!(pool.commitment_count().await, 2);
+        assert_eq!(pool.total_supply().await, 1980);
 
-        println!("Same amount, different commitments");
-        println!("Alice: {:?}", &alice_commitment.as_bytes()[..8]);
-        println!("Bob:   {:?}", &bob_commitment.as_bytes()[..8]);
-
-        // Observer can't tell who has how much
-        println!("\nPrivacy guaranteed");
-        println!("Observer sees: 2 commitments, total supply 1980");
-        println!("Observer CANNOT see: Who has what amount");
+        let stored_alice = pool
+            .get_note(&alice_commitment)
+            .await
+            .expect("Alice note must be stored in pool");
+        let stored_bob = pool
+            .get_note(&bob_commitment)
+            .await
+            .expect("Bob note must be stored in pool");
+        assert_eq!(stored_alice.recipient, alice_addr);
+        assert_eq!(stored_alice.amount, 990);
+        assert_eq!(stored_bob.recipient, bob_addr);
+        assert_eq!(stored_bob.amount, 990);
+        assert!(pool.verify_consistency().await.is_ok());
     }
 }

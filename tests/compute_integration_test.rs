@@ -115,14 +115,16 @@ fn test_distributed_compute_workflow() {
 fn test_load_balancing_priority() {
     let manager = JobManager::new();
 
-    // Register validators with different capacities
-    manager
-        .register_validator(ValidatorCapacity::new("small".to_string(), 2, 4096, 1))
-        .unwrap();
+    // Register two validators that BOTH have spare capacity, but distinct non-zero load factors:
+    // - "small": 1/2 active jobs (load_factor = 0.50, spare capacity = 1)
+    // - "large": 1/8 active jobs (load_factor = 0.125, spare capacity = 7)
+    let mut small = ValidatorCapacity::new("small".to_string(), 2, 4096, 2);
+    small.active_jobs = 1;
+    manager.register_validator(small).unwrap();
 
-    manager
-        .register_validator(ValidatorCapacity::new("large".to_string(), 16, 32768, 8))
-        .unwrap();
+    let mut large = ValidatorCapacity::new("large".to_string(), 16, 32768, 8);
+    large.active_jobs = 1;
+    manager.register_validator(large).unwrap();
 
     // Submit 2 jobs
     let job1 = ComputeJob::new(vec![1], vec![1], ResourceLimits::default());
@@ -131,19 +133,28 @@ fn test_load_balancing_priority() {
     manager.submit_job(job1).unwrap();
     manager.submit_job(job2).unwrap();
 
-    // Assign jobs
+    // Assign jobs: least-loaded-first must pick "large" for job1 (0.125 < 0.50)
+    // and "large" again for job2 (2/8 = 0.25 < 0.50), even though "small" can accept a job.
     let assignments = manager.assign_jobs().unwrap();
     assert_eq!(assignments.len(), 2);
 
-    // Both should go to "large" initially (lowest load factor)
-    // But after first assignment, second might go to small
     let large_jobs = assignments
         .iter()
         .filter(|a| a.validator_id == "large")
         .count();
+    let small_jobs = assignments
+        .iter()
+        .filter(|a| a.validator_id == "small")
+        .count();
 
-    // At least one should go to large validator
-    assert!(large_jobs >= 1);
+    assert_eq!(
+        large_jobs, 2,
+        "Both jobs must go to the least-loaded validator"
+    );
+    assert_eq!(
+        small_jobs, 0,
+        "More-loaded validator must not be chosen while large has lower load"
+    );
 }
 
 #[test]
@@ -203,40 +214,80 @@ fn test_job_status_tracking() {
     assert_eq!(manager.get_job_status(&job_id), Some(JobStatus::Completed));
 }
 
-#[test]
-fn test_multiple_validator_failover() {
+#[tokio::test]
+async fn test_multiple_validator_failover() {
     let manager = JobManager::new();
 
-    // Register 2 validators
-    manager
-        .register_validator(ValidatorCapacity::new("v1".to_string(), 4, 8192, 2))
-        .unwrap();
+    // Register v1 with a stale heartbeat (simulating a dead validator) and v2 as healthy
+    let mut v1_stale = ValidatorCapacity::new("v1".to_string(), 4, 8192, 4);
+    v1_stale.last_heartbeat = 0;
+    manager.register_validator(v1_stale).unwrap();
 
     manager
-        .register_validator(ValidatorCapacity::new("v2".to_string(), 4, 8192, 2))
+        .register_validator(ValidatorCapacity::new("v2".to_string(), 4, 8192, 4))
         .unwrap();
 
-    // Submit 4 jobs (fill both validators)
-    for i in 0..4 {
+    let initial_stats = manager.get_stats();
+    assert_eq!(initial_stats.total_validators, 2);
+    assert_eq!(initial_stats.active_validators, 1);
+
+    // Submit 2 jobs: JobManager must skip dead v1 (`!v.is_alive()`) and route all jobs to v2
+    for i in 0..2 {
         let job = ComputeJob::new(vec![i], vec![i], ResourceLimits::default());
         manager.submit_job(job).unwrap();
     }
 
     let assignments = manager.assign_jobs().unwrap();
-    assert_eq!(assignments.len(), 4);
+    assert_eq!(assignments.len(), 2);
+    assert!(
+        assignments.iter().all(|a| a.validator_id == "v2"),
+        "All jobs must fail over to alive validator v2"
+    );
 
-    // Jobs should be distributed
-    let v1_jobs = assignments
-        .iter()
-        .filter(|a| a.validator_id == "v1")
-        .count();
-    let v2_jobs = assignments
-        .iter()
-        .filter(|a| a.validator_id == "v2")
-        .count();
+    // Cleanup must evict the stale validator v1
+    let removed = manager.cleanup_stale_validators();
+    assert_eq!(removed, 1);
+    assert_eq!(manager.get_stats().total_validators, 1);
 
-    assert_eq!(v1_jobs + v2_jobs, 4);
-    assert!(v1_jobs == 2 && v2_jobs == 2); // Should be balanced
+    // Also verify multi-validator cascading failover in JobCoordinator:
+    // 3 validators take 3 jobs -> v1 and v2 both fail -> all 3 jobs fail over to v3
+    let coordinator = JobCoordinator::new();
+    for id in ["v1", "v2", "v3"] {
+        let cap = ValidatorCapacity::new(id.to_string(), 4, 8192, 4);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(cap, 0))
+            .await;
+    }
+
+    for i in 0..3 {
+        coordinator
+            .assign_job(format!("failover-job-{}", i))
+            .await
+            .unwrap();
+    }
+
+    coordinator
+        .handle_validator_failure(&"v1".to_string())
+        .await
+        .unwrap();
+    coordinator
+        .handle_validator_failure(&"v2".to_string())
+        .await
+        .unwrap();
+
+    let v1_remaining = coordinator
+        .get_pending_jobs_for_validator(&"v1".to_string())
+        .await;
+    let v2_remaining = coordinator
+        .get_pending_jobs_for_validator(&"v2".to_string())
+        .await;
+    let v3_remaining = coordinator
+        .get_pending_jobs_for_validator(&"v3".to_string())
+        .await;
+
+    assert_eq!(v1_remaining.len(), 0);
+    assert_eq!(v2_remaining.len(), 0);
+    assert_eq!(v3_remaining.len(), 3);
 }
 
 #[tokio::test]
