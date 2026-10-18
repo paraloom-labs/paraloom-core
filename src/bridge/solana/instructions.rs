@@ -622,10 +622,14 @@ pub fn create_transact_instruction(
 /// pays the settling validator's fee in the same token to `fee_token_account`.
 ///
 /// Account order must match the on-chain `TransactSpl` accounts struct exactly:
-/// bridge_state, merkle_tree, mint, asset_vault, asset_vault_authority,
-/// recipient_token_account, fee_token_account, nullifier_0, nullifier_1,
-/// validator_account, validator_registry, authority, token_program,
-/// system_program, then the quorum `(wallet, PDA)` pairs.
+/// bridge_state, merkle_tree, mint, asset_vault, asset_config,
+/// asset_vault_authority, recipient_token_account, fee_token_account,
+/// nullifier_0, nullifier_1, validator_account, validator_registry, authority,
+/// token_program, system_program, then the quorum `(wallet, PDA)` pairs.
+///
+/// `asset_config` sits right after `asset_vault` because the on-chain struct
+/// declares it there (#1000); Anchor validates accounts positionally, so a
+/// mismatch fails the instruction before the handler runs.
 #[allow(clippy::too_many_arguments)]
 pub fn create_transact_spl_instruction(
     program_id: &Pubkey,
@@ -650,6 +654,8 @@ pub fn create_transact_spl_instruction(
     let (validator_pda, _) = derive_validator_account(program_id, authority);
     let (asset_vault_pda, _) =
         Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id);
+    let (asset_config_pda, _) =
+        Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id);
     let (asset_vault_authority_pda, _) =
         Pubkey::find_program_address(&[b"asset_vault_authority"], program_id);
 
@@ -670,6 +676,7 @@ pub fn create_transact_spl_instruction(
         AccountMeta::new(merkle_tree_pda, false),
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(asset_vault_pda, false),
+        AccountMeta::new(asset_config_pda, false),
         AccountMeta::new_readonly(asset_vault_authority_pda, false),
         AccountMeta::new(*recipient_token_account, false),
         AccountMeta::new(*fee_token_account, false),
