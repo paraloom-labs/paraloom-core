@@ -2353,9 +2353,32 @@ impl Node {
 
         let mut store = self.delivered_notes.lock().await;
         for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
+            // Validate and canonicalize each ciphertext before recording (#196):
+            // P2P `Message::TransactVerificationRequest` bypasses HTTP ingress, so
+            // enforcing `hex::decode` + `note_crypto::check_relayable` + lowercase
+            // `hex::encode` here guarantees that `/transact/scan` only serves
+            // canonical, relayable hex and deduplicates `0x`-prefixed or uppercase
+            // encodings of the same envelope bytes.
+            let trimmed = ciphertext
+                .strip_prefix("0x")
+                .or_else(|| ciphertext.strip_prefix("0X"))
+                .unwrap_or(ciphertext.as_str());
+            let bytes = match hex::decode(trimmed) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("dropping delivered note with non-hex ciphertext: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = crate::privacy::note_crypto::check_relayable(&bytes) {
+                log::warn!("dropping non-relayable delivered note ciphertext: {e}");
+                continue;
+            }
+            let canonical_ciphertext = hex::encode(&bytes);
+
             let note = transact_ingress::DeliveredNote {
                 output_commitment: hex::encode(commitment),
-                ciphertext: ciphertext.clone(),
+                ciphertext: canonical_ciphertext,
                 mint: mint.clone(),
             };
             if store.iter().any(|d| {
@@ -3633,5 +3656,65 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_delivered_notes_canonicalizes_and_deduplicates_hex_encodings() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[0x11u8; 32], [0x22u8; 32]];
+        let canonical_a = format!("01{}", "ab".repeat(72));
+        let canonical_b = format!("01{}", "cd".repeat(72));
+
+        // Record first with `0x`/`0X` prefixes and uppercase hex.
+        node.record_delivered_notes(
+            &commitments,
+            &[
+                format!("0x{}", canonical_a.to_uppercase()),
+                format!("0X{}", canonical_b.to_uppercase()),
+            ],
+            None,
+        )
+        .await;
+
+        // Re-record the exact same note bytes as bare lowercase and bare uppercase:
+        // canonicalization must deduplicate all of them to the original 2 notes.
+        node.record_delivered_notes(
+            &commitments,
+            &[canonical_a.clone(), canonical_b.to_uppercase()],
+            None,
+        )
+        .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, canonical_a);
+        assert_eq!(delivered[1].ciphertext, canonical_b);
+    }
+
+    #[tokio::test]
+    async fn record_delivered_notes_drops_non_relayable_or_non_hex_ciphertexts() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[0x33u8; 32], [0x44u8; 32]];
+
+        // Reserved tag `0x00` and truncated v1 (`0x01` < 73 bytes) must be rejected.
+        node.record_delivered_notes(
+            &commitments,
+            &["00".repeat(80), "01ab".to_string()],
+            None,
+        )
+        .await;
+        // Non-hex and empty strings must also be rejected.
+        node.record_delivered_notes(
+            &commitments,
+            &["not-valid-hex!!".to_string(), String::new()],
+            None,
+        )
+        .await;
+
+        let delivered = node.delivered_notes().await;
+        assert!(
+            delivered.is_empty(),
+            "non-relayable or non-hex ciphertexts must not enter the scan feed"
+        );
     }
 }

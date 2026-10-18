@@ -121,8 +121,12 @@ struct SubmitResponse {
 
 /// Parse a 32-byte field from hex, tolerating a `0x` prefix; 400 on any
 /// malformed input.
+fn strip_0x(s: &str) -> &str {
+    s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
+}
+
 fn parse_hex32(label: &str, s: &str) -> Result<[u8; 32], (StatusCode, String)> {
-    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    let trimmed = strip_0x(s);
     let bytes = hex::decode(trimmed).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -178,7 +182,7 @@ async fn submit_handler(
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
 
-    let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
+    let proof_hex = strip_0x(&req.proof);
     let proof = hex::decode(proof_hex)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("proof: invalid hex: {e}")))?;
     if proof.is_empty() {
@@ -191,15 +195,20 @@ async fn submit_handler(
     // The ciphertexts stay opaque to the node: it relays them and never opens
     // them. Validation is limited to what is invalid under every envelope
     // version — see `note_crypto::check_relayable`, which documents why an
-    // unknown version is forwarded rather than rejected here.
+    // unknown version is forwarded rather than rejected here. Each validated
+    // ciphertext is re-encoded as canonical lowercase bare hex (`hex::encode`)
+    // so `0x`/`0X`-prefixed or uppercase inputs match `output_commitment` and
+    // `mint` on `/transact/scan` and cannot break wallet hex decoding or bypass
+    // `record_delivered_notes` deduplication.
     if req.ciphertexts.len() != 2 {
         return Err((
             StatusCode::BAD_REQUEST,
             "ciphertexts must have exactly 2 entries".to_string(),
         ));
     }
+    let mut canonical_ciphertexts = [String::new(), String::new()];
     for (i, c) in req.ciphertexts.iter().enumerate() {
-        let trimmed = c.strip_prefix("0x").unwrap_or(c);
+        let trimmed = strip_0x(c);
         let bytes = hex::decode(trimmed).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
@@ -208,8 +217,9 @@ async fn submit_handler(
         })?;
         crate::privacy::note_crypto::check_relayable(&bytes)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("ciphertexts[{i}]: {e}")))?;
+        canonical_ciphertexts[i] = hex::encode(&bytes);
     }
-    let ciphertexts = [req.ciphertexts[0].clone(), req.ciphertexts[1].clone()];
+    let ciphertexts = canonical_ciphertexts;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -557,5 +567,27 @@ mod tests {
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn prefixed_and_uppercase_ciphertexts_are_canonicalized_to_lowercase_bare_hex() {
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let ct0_expected = v1_ciphertext_hex(0xab);
+        let ct1_expected = v1_ciphertext_hex(0xcd);
+        let ct0_prefixed_upper = format!("0x{}", ct0_expected.to_uppercase());
+        let ct1_prefixed_upper = format!("0X{}", ct1_expected.to_uppercase());
+
+        let body = well_formed_body()
+            .replace(&ct0_expected, &ct0_prefixed_upper)
+            .replace(&ct1_expected, &ct1_prefixed_upper);
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = stub.seen.lock().await.clone().expect("request forwarded");
+        assert_eq!(seen.ciphertexts[0], ct0_expected);
+        assert_eq!(seen.ciphertexts[1], ct1_expected);
     }
 }
