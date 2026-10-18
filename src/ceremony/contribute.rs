@@ -15,6 +15,7 @@ use ark_ff::UniformRand;
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::{CryptoRng, RngCore};
+use sha2::{Digest, Sha512};
 
 use crate::types::NodeId;
 
@@ -40,6 +41,30 @@ pub enum ContributeError {
 
     #[error("transcript chain rejected the new contribution: {0}")]
     Transcript(#[from] TranscriptError),
+
+    #[error(
+        "prior transcript circuit `{transcript_circuit}` does not match requested circuit `{requested_circuit}`"
+    )]
+    CircuitMismatch {
+        transcript_circuit: &'static str,
+        requested_circuit: &'static str,
+    },
+
+    #[error(
+        "prior transcript initial_srs_hash does not match the caller-supplied initial_srs_hash"
+    )]
+    InitialSrsHashMismatch,
+}
+
+/// Compute the SHA-512 digest of a `ProvingKey<Bn254>` in compressed canonical form.
+pub fn hash_proving_key(pk: &ProvingKey<Bn254>) -> Result<TranscriptHash, ContributeError> {
+    let mut bytes = Vec::new();
+    pk.serialize_compressed(&mut bytes)
+        .map_err(|e| ContributeError::Serialize(format!("ProvingKey hash: {}", e)))?;
+    let digest = Sha512::digest(&bytes);
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&digest[..]);
+    Ok(out)
 }
 
 /// Apply one contribution and return the updated proving key plus
@@ -69,6 +94,22 @@ pub fn contribute<R: RngCore + CryptoRng>(
     attestation: String,
     rng: &mut R,
 ) -> Result<(ProvingKey<Bn254>, Phase2Transcript), ContributeError> {
+    let mut transcript = match prior_transcript {
+        Some(prior) => {
+            if prior.circuit != circuit {
+                return Err(ContributeError::CircuitMismatch {
+                    transcript_circuit: prior.circuit.label(),
+                    requested_circuit: circuit.label(),
+                });
+            }
+            if initial_srs_hash != [0u8; 64] && prior.initial_srs_hash != initial_srs_hash {
+                return Err(ContributeError::InitialSrsHashMismatch);
+            }
+            prior
+        }
+        None => Phase2Transcript::new(circuit, initial_srs_hash),
+    };
+
     let delta_i = Fr::rand(rng);
     let proof = apply_contribution(&mut prior_pk, delta_i, rng)?;
 
@@ -84,8 +125,6 @@ pub fn contribute<R: RngCore + CryptoRng>(
         .serialize_compressed(&mut delta_after_g2)
         .map_err(|e| ContributeError::Serialize(format!("delta_after_g2: {}", e)))?;
 
-    let mut transcript = prior_transcript
-        .unwrap_or_else(|| Phase2Transcript::new(circuit.clone(), initial_srs_hash));
     let prior_hash = match transcript.contributions.last() {
         Some(prev) => super::transcript::hash_contribution(prev),
         None => transcript.initial_srs_hash,
@@ -102,6 +141,7 @@ pub fn contribute<R: RngCore + CryptoRng>(
         attestation,
     };
     transcript.append(contribution)?;
+    transcript.final_srs_hash = hash_proving_key(&prior_pk)?;
 
     Ok((prior_pk, transcript))
 }
@@ -238,7 +278,72 @@ mod tests {
 
         assert_eq!(transcript_2.len(), 2);
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
+        assert_eq!(
+            transcript_2.final_srs_hash,
+            hash_proving_key(&after_pk_2).unwrap()
+        );
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    #[test]
+    fn contribute_rejects_circuit_mismatch_with_prior_transcript() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+        let (after_pk_1, transcript_1) = contribute(
+            initial_pk,
+            None,
+            CircuitId::Deposit,
+            [0x11u8; 64],
+            NodeId(vec![0x01]),
+            "first contributor".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        match contribute(
+            after_pk_1,
+            Some(transcript_1),
+            CircuitId::Withdraw,
+            [0x11u8; 64],
+            NodeId(vec![0x02]),
+            "second contributor".to_string(),
+            &mut rng,
+        ) {
+            Err(ContributeError::CircuitMismatch {
+                transcript_circuit: "deposit",
+                requested_circuit: "withdraw",
+            }) => {}
+            other => panic!("expected CircuitMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn contribute_rejects_initial_srs_hash_mismatch_with_prior_transcript() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+        let (after_pk_1, transcript_1) = contribute(
+            initial_pk,
+            None,
+            CircuitId::Deposit,
+            [0x11u8; 64],
+            NodeId(vec![0x01]),
+            "first contributor".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        match contribute(
+            after_pk_1,
+            Some(transcript_1),
+            CircuitId::Deposit,
+            [0x22u8; 64],
+            NodeId(vec![0x02]),
+            "second contributor".to_string(),
+            &mut rng,
+        ) {
+            Err(ContributeError::InitialSrsHashMismatch) => {}
+            other => panic!("expected InitialSrsHashMismatch, got {:?}", other),
+        }
     }
 }

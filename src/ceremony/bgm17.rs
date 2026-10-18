@@ -116,25 +116,24 @@ pub fn apply_contribution<R: RngCore>(
     delta_i: Fr,
     rng: &mut R,
 ) -> Result<DleqProof, BgmError> {
-    if delta_i.is_zero() {
+    if delta_i.is_zero() || pk.delta_g1.is_zero() || pk.vk.delta_g2.is_zero() {
         return Err(BgmError::ZeroContribution);
     }
     let delta_inv = delta_i.inverse().ok_or(BgmError::ZeroContribution)?;
 
+    let k = Fr::rand(rng);
+    if k.is_zero() {
+        return Err(BgmError::ZeroContribution);
+    }
+
     let delta_before_g1 = pk.delta_g1;
     let delta_before_g2 = pk.vk.delta_g2;
 
-    pk.delta_g1 = (pk.delta_g1 * delta_i).into_affine();
-    pk.vk.delta_g2 = (pk.vk.delta_g2 * delta_i).into_affine();
-    apply_scalar_to_g1_vec(&mut pk.h_query, delta_inv);
-    apply_scalar_to_g1_vec(&mut pk.l_query, delta_inv);
-
-    let delta_after_g1 = pk.delta_g1;
-    let delta_after_g2 = pk.vk.delta_g2;
-
-    let k = Fr::rand(rng);
     let r_g1 = (delta_before_g1 * k).into_affine();
     let r_g2 = (delta_before_g2 * k).into_affine();
+    let delta_after_g1 = (delta_before_g1 * delta_i).into_affine();
+    let delta_after_g2 = (delta_before_g2 * delta_i).into_affine();
+
     let c = fiat_shamir_challenge(
         &delta_before_g1,
         &delta_after_g1,
@@ -144,6 +143,14 @@ pub fn apply_contribution<R: RngCore>(
         &r_g2,
     );
     let s = k + c * delta_i;
+    if r_g1.is_zero() || r_g2.is_zero() || s.is_zero() {
+        return Err(BgmError::MalformedDleqProof);
+    }
+
+    pk.delta_g1 = delta_after_g1;
+    pk.vk.delta_g2 = delta_after_g2;
+    apply_scalar_to_g1_vec(&mut pk.h_query, delta_inv);
+    apply_scalar_to_g1_vec(&mut pk.l_query, delta_inv);
 
     Ok(DleqProof { r_g1, r_g2, s })
 }
@@ -184,8 +191,15 @@ pub fn verify_contribution_deltas(
     delta_after_g2: &G2Affine,
     proof: &DleqProof,
 ) -> Result<(), BgmError> {
-    if delta_after_g1.is_zero() || delta_after_g2.is_zero() {
+    if delta_before_g1.is_zero()
+        || delta_before_g2.is_zero()
+        || delta_after_g1.is_zero()
+        || delta_after_g2.is_zero()
+    {
         return Err(BgmError::ZeroContribution);
+    }
+    if proof.r_g1.is_zero() || proof.r_g2.is_zero() || proof.s.is_zero() {
+        return Err(BgmError::MalformedDleqProof);
     }
 
     let c = fiat_shamir_challenge(
@@ -448,6 +462,56 @@ mod tests {
         {
             let expected = (*before * delta_inv).into_affine();
             assert_eq!(*after, expected, "l_query[{}] mismatch", i);
+        }
+    }
+
+    #[test]
+    fn zero_nonce_dleq_proof_leaking_delta_i_is_rejected() {
+        let pk_before = fresh_pk();
+        let mut rng = test_rng();
+        let delta_i = Fr::rand(&mut rng);
+        let delta_after_g1 = (pk_before.delta_g1 * delta_i).into_affine();
+        let delta_after_g2 = (pk_before.vk.delta_g2 * delta_i).into_affine();
+
+        // With k = 0, r_g1 = 0 and r_g2 = 0, s = c * delta_i satisfies the raw
+        // Schnorr equation while publicly leaking delta_i = s * c^-1.
+        let r_g1 = G1Affine::identity();
+        let r_g2 = G2Affine::identity();
+        let c = fiat_shamir_challenge(
+            &pk_before.delta_g1,
+            &delta_after_g1,
+            &pk_before.vk.delta_g2,
+            &delta_after_g2,
+            &r_g1,
+            &r_g2,
+        );
+        let leaky_proof = DleqProof {
+            r_g1,
+            r_g2,
+            s: c * delta_i,
+        };
+
+        match verify_contribution_deltas(
+            &pk_before.delta_g1,
+            &delta_after_g1,
+            &pk_before.vk.delta_g2,
+            &delta_after_g2,
+            &leaky_proof,
+        ) {
+            Err(BgmError::MalformedDleqProof) => {}
+            other => panic!("expected MalformedDleqProof, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn zero_delta_before_is_rejected_by_apply_and_verify() {
+        let mut pk_before = fresh_pk();
+        pk_before.delta_g1 = G1Affine::identity();
+        let mut rng = test_rng();
+        let delta_i = Fr::rand(&mut rng);
+        match apply_contribution(&mut pk_before, delta_i, &mut rng) {
+            Err(BgmError::ZeroContribution) => {}
+            other => panic!("expected ZeroContribution, got {:?}", other),
         }
     }
 }

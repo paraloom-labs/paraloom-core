@@ -17,8 +17,8 @@
 
 use ark_bn254::{Bn254, Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::pairing::Pairing;
-use ark_ec::{CurveGroup, VariableBaseMSM};
-use ark_ff::{One, PrimeField};
+use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
+use ark_ff::{One, PrimeField, Zero};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use sha2::{Digest, Sha512};
@@ -225,7 +225,7 @@ pub fn verify_final_pk_consistency(
     }
 
     // 2. The δ-dependent vectors must keep their length (an extra or missing
-    //    element would otherwise be silently dropped by the zip in step 3).
+    //    element would otherwise be silently dropped by the zip in step 4).
     if final_pk.h_query.len() != initial_pk.h_query.len() {
         return Err(VerifyError::QueryLengthMismatch { field: "h_query" });
     }
@@ -233,7 +233,22 @@ pub fn verify_final_pk_consistency(
         return Err(VerifyError::QueryLengthMismatch { field: "l_query" });
     }
 
-    // 3. Pairing consistency, batched per vector.
+    // 3. Reject degenerate identity deltas and enforce that final_pk.delta_g1
+    //    was scaled by the exact same cumulative δ ratio as final_pk.vk.delta_g2.
+    if initial_pk.delta_g1.is_zero()
+        || initial_pk.vk.delta_g2.is_zero()
+        || final_pk.delta_g1.is_zero()
+        || final_pk.vk.delta_g2.is_zero()
+    {
+        return Err(VerifyError::QueryInconsistent { field: "delta_g1" });
+    }
+    if Bn254::pairing(final_pk.delta_g1, initial_pk.vk.delta_g2)
+        != Bn254::pairing(initial_pk.delta_g1, final_pk.vk.delta_g2)
+    {
+        return Err(VerifyError::QueryInconsistent { field: "delta_g1" });
+    }
+
+    // 4. Pairing consistency, batched per vector.
     check_query_consistency(
         "h_query",
         &initial_pk.h_query,
@@ -268,12 +283,17 @@ fn check_query_consistency(
     initial_delta_g2: &G2Affine,
     final_delta_g2: &G2Affine,
 ) -> Result<(), VerifyError> {
+    if initial_delta_g2.is_zero() || final_delta_g2.is_zero() {
+        return Err(VerifyError::QueryInconsistent { field });
+    }
+
     // Empty vectors carry no δ-dependent data and are trivially consistent.
     if initial.is_empty() {
         return Ok(());
     }
 
     let rho = fiat_shamir_rho(field, initial, final_, initial_delta_g2, final_delta_g2);
+    let rho = if rho.is_zero() { Fr::one() } else { rho };
     let scalars = scalar_powers(rho, initial.len());
 
     // Σ ρ^j · P[j] over each vector. msm only errors on a length mismatch,
@@ -613,6 +633,29 @@ mod tests {
         match verify_final_pk(&initial_pk, &transcript, &other_pk) {
             Err(VerifyError::FinalPkDeltaMismatch) => {}
             other => panic!("expected FinalPkDeltaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unscaled_final_pk_delta_g1_is_rejected_by_consistency_check() {
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(2);
+        // Leave final_pk.delta_g1 at initial_pk.delta_g1 while final_pk.vk.delta_g2
+        // and queries reflect the 2 contributions.
+        final_pk.delta_g1 = initial_pk.delta_g1;
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::QueryInconsistent { field: "delta_g1" }) => {}
+            other => panic!("expected QueryInconsistent(delta_g1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn zero_delta_g2_pairing_bypass_is_rejected() {
+        let (mut initial_pk, _transcript, mut final_pk) = build_real_transcript(1);
+        initial_pk.vk.delta_g2 = G2Affine::identity();
+        final_pk.vk.delta_g2 = G2Affine::identity();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::QueryInconsistent { field: "delta_g1" }) => {}
+            other => panic!("expected QueryInconsistent(delta_g1), got {:?}", other),
         }
     }
 }

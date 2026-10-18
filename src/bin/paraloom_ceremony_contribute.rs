@@ -44,10 +44,12 @@ struct Args {
     #[arg(long)]
     output_transcript: PathBuf,
 
-    /// Which circuit this transcript covers. Only used when
-    /// --prior-transcript is omitted.
-    #[arg(long, default_value = "deposit")]
-    circuit: String,
+    /// Which circuit this transcript covers. Defaults to `deposit` when
+    /// seeding a fresh transcript, or inherits from `--prior-transcript`
+    /// when omitted. If specified alongside `--prior-transcript`, must
+    /// match the transcript's recorded circuit.
+    #[arg(long)]
+    circuit: Option<String>,
 
     /// Hex-encoded SHA-512 of the initial SRS. Only meaningful when
     /// --prior-transcript is omitted; the value is committed to the
@@ -73,8 +75,6 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    let circuit =
-        CircuitId::from_str(&args.circuit).map_err(|e| anyhow::anyhow!("--circuit: {}", e))?;
     let initial_srs_hash = match args.initial_srs_hash.as_deref() {
         Some(hex) => {
             try_hash_from_hex(hex).map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?
@@ -88,6 +88,11 @@ fn main() -> Result<()> {
     let prior_transcript = match &args.prior_transcript {
         Some(path) => Some(read_transcript(path)?),
         None => None,
+    };
+    let circuit = match (&args.circuit, &prior_transcript) {
+        (Some(c), _) => CircuitId::from_str(c).map_err(|e| anyhow::anyhow!("--circuit: {}", e))?,
+        (None, Some(t)) => t.circuit.clone(),
+        (None, None) => CircuitId::Deposit,
     };
 
     let mut rng = OsRng;

@@ -38,6 +38,7 @@
 use ark_bn254::Bn254;
 use ark_groth16::ProvingKey;
 
+use super::contribute::hash_proving_key;
 use super::transcript::{hash_contribution, Phase2Transcript, TranscriptHash};
 
 /// Operator-supplied requirements a transcript must meet before
@@ -69,6 +70,12 @@ pub enum PolicyError {
     TooFewContributions { got: usize, min: usize },
 
     #[error(
+        "the initial SRS hash is the all-zero testnet placeholder; \
+         production finalization requires a pinned non-zero SHA-512 digest"
+    )]
+    UnpinnedInitialSrsHash,
+
+    #[error(
         "the transcript's recorded initial SRS hash does not match the pinned hash; \
          this transcript was not started from the pinned initial key"
     )]
@@ -85,6 +92,11 @@ pub enum PolicyError {
          applied no effective contribution"
     )]
     FinalKeyUnchanged,
+
+    #[error(
+        "the transcript's recorded final_srs_hash does not match the final proving key"
+    )]
+    FinalSrsHashMismatch,
 
     #[error(
         "the transcript's last contribution does not match the pinned chain-tip \
@@ -118,6 +130,9 @@ pub fn enforce_finalize_policy(
         });
     }
 
+    if policy.initial_srs_hash == [0u8; 64] || transcript.initial_srs_hash == [0u8; 64] {
+        return Err(PolicyError::UnpinnedInitialSrsHash);
+    }
     if transcript.initial_srs_hash != policy.initial_srs_hash {
         return Err(PolicyError::TranscriptSrsHashMismatch);
     }
@@ -127,6 +142,14 @@ pub fn enforce_finalize_policy(
 
     if final_pk.delta_g1 == initial_pk.delta_g1 && final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
         return Err(PolicyError::FinalKeyUnchanged);
+    }
+
+    if transcript.final_srs_hash != [0u8; 64] {
+        let computed_final_hash =
+            hash_proving_key(final_pk).map_err(|_| PolicyError::FinalSrsHashMismatch)?;
+        if transcript.final_srs_hash != computed_final_hash {
+            return Err(PolicyError::FinalSrsHashMismatch);
+        }
     }
 
     if let Some(pinned_tail) = &policy.final_contribution_hash {
@@ -299,5 +322,34 @@ mod tests {
         let tail = hash_contribution(t.contributions.last().unwrap());
         enforce_finalize_policy(&policy(4, Some(tail)), &PINNED, &initial, &final_pk, &t)
             .expect("exact-count policy with the true tail pin passes");
+    }
+
+    #[test]
+    fn unpinned_zero_initial_srs_hash_is_rejected() {
+        let initial = pk_from_seed(1);
+        let final_pk = pk_from_seed(2);
+        let zero_hash = [0u8; 64];
+        let t = dummy_transcript(zero_hash, 2);
+        let zero_policy = FinalizePolicy {
+            min_contributions: 2,
+            initial_srs_hash: zero_hash,
+            final_contribution_hash: None,
+        };
+        match enforce_finalize_policy(&zero_policy, &zero_hash, &initial, &final_pk, &t) {
+            Err(PolicyError::UnpinnedInitialSrsHash) => {}
+            other => panic!("expected UnpinnedInitialSrsHash, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mismatched_final_srs_hash_is_rejected() {
+        let initial = pk_from_seed(1);
+        let final_pk = pk_from_seed(2);
+        let mut t = dummy_transcript(PINNED, 2);
+        t.final_srs_hash = [0xAAu8; 64];
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::FinalSrsHashMismatch) => {}
+            other => panic!("expected FinalSrsHashMismatch, got {:?}", other),
+        }
     }
 }
