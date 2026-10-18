@@ -16,7 +16,7 @@ use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::transact_spl_fixture_data as fx;
-use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
+use paraloom_program::{accounts, instruction, AssetConfig, BridgeState, NullifierAccount};
 use solana_program_test::{tokio, ProgramTest};
 use solana_sdk::{
     account::Account,
@@ -399,6 +399,7 @@ async fn transact_spl_settles_a_token_withdrawal() {
                 merkle_tree: tree_pda,
                 mint: asset_mint,
                 asset_vault,
+                asset_config,
                 asset_vault_authority,
                 recipient_token_account: recipient_token,
                 fee_token_account: fee_token,
@@ -467,4 +468,18 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+
+    // Regression for #1000: the settled SPL withdrawal must land on the
+    // per-asset withdrawal ledger, mirroring the native `transact` path.
+    // Before the fix this read 0 forever while real tokens left the vault.
+    let cfg_raw = banks.get_account(asset_config).await.unwrap().unwrap();
+    let cfg = AssetConfig::try_deserialize(&mut cfg_raw.data.as_slice()).unwrap();
+    let gross = fx::SPL_FIXTURE_EXT_AMOUNT.unsigned_abs();
+    assert_eq!(
+        cfg.total_withdrawn, gross,
+        "settled SPL withdrawal must be recorded on the per-asset ledger"
+    );
+    assert_eq!(cfg.withdraw_count, 1, "one SPL withdrawal recorded");
+    // The deposit side must be untouched by a withdrawal.
+    assert_eq!(cfg.total_deposited, fx::SPL_FIXTURE_DEPOSIT_AMOUNT);
 }

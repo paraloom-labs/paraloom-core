@@ -681,6 +681,27 @@ pub mod paraloom_program {
             }
         }
 
+        // Record the settled withdrawal volume on the per-mint ledger. The
+        // native path has always done this via `BridgeState.total_withdrawn`;
+        // the SPL path never did, so every volume aggregate for SPL assets read
+        // zero while real tokens left the vault (#1000). `gross` is scoped to
+        // the branch above, so recompute it from `ext_amount` here.
+        if ext_amount < 0 {
+            let withdrawn = ext_amount.unsigned_abs();
+            let config = &mut ctx.accounts.asset_config;
+            config.total_withdrawn = config
+                .total_withdrawn
+                .checked_add(withdrawn)
+                .ok_or(BridgeError::InvalidAmount)?;
+            config.withdraw_count = config.withdraw_count.saturating_add(1);
+            msg!(
+                "SPL withdrawal recorded: mint {}, gross {}, asset total_withdrawn {}",
+                ctx.accounts.mint.key(),
+                withdrawn,
+                config.total_withdrawn
+            );
+        }
+
         validator_account.total_tasks_verified =
             validator_account.total_tasks_verified.saturating_add(1);
         validator_account.successful_verifications =
@@ -1448,6 +1469,61 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Resize an already-deployed `AssetConfig` to carry the withdrawal ledger
+    /// added in #1000. Existing mints were created before those fields existed,
+    /// so without this every `transact_spl` for them would fail deserialization.
+    ///
+    /// The new bytes are zero-filled, which is the correct starting value: a
+    /// config that predates the ledger recorded no withdrawals by definition.
+    pub fn migrate_asset_config(ctx: Context<MigrateAssetConfig>) -> Result<()> {
+        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let config_ai = ctx.accounts.asset_config.to_account_info();
+
+        // Confirm the pinned PDA really is an AssetConfig before reshaping it.
+        {
+            let data = config_ai.try_borrow_data()?;
+            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(
+                data[0..8] == *AssetConfig::DISCRIMINATOR,
+                BridgeError::UnauthorizedInit
+            );
+        }
+
+        let new_len = AssetConfig::SPACE;
+        let old_len = config_ai.data_len();
+        require!(new_len >= old_len, BridgeError::InvalidAmount);
+        if old_len < new_len {
+            let rent = Rent::get()?;
+            let min_balance = rent.minimum_balance(new_len);
+            let current = config_ai.lamports();
+            if min_balance > current {
+                let delta = min_balance - current;
+                let ix = anchor_lang::solana_program::system_instruction::transfer(
+                    &ctx.accounts.authority.key(),
+                    &config_ai.key(),
+                    delta,
+                );
+                anchor_lang::solana_program::program::invoke(
+                    &ix,
+                    &[
+                        ctx.accounts.authority.to_account_info(),
+                        config_ai.clone(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                )?;
+            }
+            config_ai.resize(new_len)?;
+        }
+
+        msg!(
+            "AssetConfig migrated from {} to {} bytes (withdrawal ledger starts 0)",
+            old_len,
+            new_len
+        );
+        Ok(())
+    }
+
     /// Initialize the on-chain commitment Merkle tree (circuit v3, #350).
     ///
     /// Creates the program-owned tree account and seeds it with the empty-tree
@@ -1906,6 +1982,12 @@ pub struct TransactSpl<'info> {
     )]
     pub asset_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    /// Per-mint accounting config. Needed so a settled SPL withdrawal lands on
+    /// the withdrawal ledger instead of vanishing (#1000). Seed-checked against
+    /// `mint` so it cannot be swapped for another asset's config.
+    #[account(mut, seeds = [b"asset_config", mint.key().as_ref()], bump = asset_config.bump)]
+    pub asset_config: Account<'info, AssetConfig>,
+
     /// PDA authority that signs the vault outflow.
     ///
     /// CHECK: address pinned by seeds; only used as the vault's token authority.
@@ -2337,6 +2419,33 @@ pub struct DepositNoteSpl<'info> {
 /// is that the short account no longer deserializes; the handler checks the
 /// discriminator by hand before resizing, like `reset_validator_registry`.
 #[derive(Accounts)]
+pub struct MigrateAssetConfig<'info> {
+    /// CHECK: discriminator-checked and resized in the handler; cannot be
+    /// `Account<AssetConfig>` because the pre-migration account is too short to
+    /// deserialize once the withdrawal ledger fields are added.
+    #[account(mut, seeds = [b"asset_config", mint.key().as_ref()], bump)]
+    pub asset_config: UncheckedAccount<'info>,
+
+    /// CHECK: only used to derive the `asset_config` seed.
+    pub mint: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// Upgrade-authority gate (#204), same as the other migrations.
+    ///
+    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    #[account(
+        seeds = [crate::ID.as_ref()],
+        bump,
+        seeds::program = bpf_loader_upgradeable::id(),
+    )]
+    pub program_data: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct MigrateBridgeState<'info> {
     /// CHECK: discriminator-checked and resized in the handler; cannot be
     /// `Account<BridgeState>` because the pre-migration account is too short to
@@ -2693,12 +2802,21 @@ pub struct AssetConfig {
     /// Cumulative shielded into this asset (informational, like the native one).
     pub total_deposited: u64,
     pub deposit_count: u64,
+    /// Cumulative gross withdrawn from this asset, mirroring the native
+    /// `BridgeState.total_withdrawn`. Without it the deposit side of the SPL
+    /// ledger was tracked per asset while the withdrawal side was tracked at no
+    /// scope at all, so every volume aggregate for SPL assets read zero.
+    pub total_withdrawn: u64,
+    /// Number of settled withdrawals for this asset, mirroring
+    /// `BridgeState.withdrawal_count` (which counts the native path only).
+    pub withdraw_count: u64,
     pub bump: u8,
 }
 
 impl AssetConfig {
-    /// 8 discriminator + 32 mint + 8 cap + 8 total + 8 count + 1 bump.
-    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 1;
+    /// 8 discriminator + 32 mint + 8 cap + 8 total_deposited + 8 deposit_count
+    /// + 8 total_withdrawn + 8 withdraw_count + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1;
 }
 
 #[account]
