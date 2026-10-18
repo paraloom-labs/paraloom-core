@@ -7,15 +7,15 @@
 //! `withdraw` path was removed in favour of the program-owned-tree `transact`.
 
 use anchor_lang::prelude::*;
-use anchor_lang::{InstructionData, ToAccountMetas};
+use anchor_lang::{AccountSerialize, InstructionData, ToAccountMetas};
 use paraloom_program::transact_fixture_data as fx;
-use paraloom_program::{accounts, instruction, ValidatorAccount};
-use solana_program_test::{processor, tokio, ProgramTest};
+use paraloom_program::{accounts, instruction, BridgeError, ValidatorAccount};
+use solana_program_test::{processor, tokio, BanksClientError, ProgramTest};
 use solana_sdk::{
     account::Account,
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
     signature::{Keypair, Signer},
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 
 mod common;
@@ -381,4 +381,133 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.pending_rewards, 0);
     assert_eq!(acc.total_earnings, EXPECTED_FEE);
+}
+
+#[tokio::test]
+async fn claim_rewards_rejects_when_vault_drops_below_rent_floor() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (_program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator = Keypair::new();
+    pt.add_account(
+        validator.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    // Pre-seed an active bridge_state (paused = false)
+    let bridge_state = paraloom_program::BridgeState {
+        program_version: 0x0004_0000,
+        authority: upgrade_authority.pubkey(),
+        total_deposited: 0,
+        total_withdrawn: 0,
+        deposit_count: 0,
+        withdrawal_count: 0,
+        paused: false,
+        merkle_root: [0u8; 32],
+        deposit_cap: 1_000_000_000,
+    };
+    let mut state_data = Vec::new();
+    bridge_state
+        .try_serialize(&mut state_data)
+        .expect("serialize bridge_state");
+    pt.add_account(
+        state_pda,
+        Account {
+            lamports: 10_000_000,
+            data: state_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // Pre-seed validator with 1_000_000 lamports in pending_rewards
+    let reward_amount = 1_000_000;
+    let seeded_validator = ValidatorAccount {
+        validator: validator.pubkey(),
+        stake_amount: 1_000_000_000,
+        reputation_score: 1000,
+        total_tasks_verified: 0,
+        successful_verifications: 0,
+        registered_at: 0,
+        last_active: 0,
+        is_active: true,
+        pending_rewards: reward_amount,
+        total_earnings: 0,
+        times_slashed: 0,
+        unbonding_amount: 0,
+        unbonding_slot: 0,
+        token_stake_amount: 0,
+        token_unbonding_amount: 0,
+    };
+    let mut val_data = Vec::new();
+    seeded_validator
+        .try_serialize(&mut val_data)
+        .expect("serialize validator");
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: 2_000_000_000,
+            data: val_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // Seed bridge_vault with enough to cover the reward amount, but BELOW rent_floor + reward_amount.
+    // For a 0-byte system account, rent_floor is ~890_880 lamports.
+    // If vault has exactly reward_amount (1_000_000) lamports, vault_balance (1_000_000) < reward_amount (1_000_000) + rent_floor (~890_880).
+    pt.add_account(
+        vault_pda,
+        Account {
+            lamports: reward_amount,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    let ix = Instruction {
+        program_id,
+        data: instruction::ClaimRewards {}.data(),
+        accounts: accounts::ClaimRewards {
+            bridge_state: state_pda,
+            validator_account: validator_pda,
+            bridge_vault: vault_pda,
+            validator: validator.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&validator.pubkey()));
+    tx.sign(&[&validator], recent_blockhash);
+    let result = banks_client.process_transaction(tx).await;
+
+    let err = result.expect_err("claim_rewards must fail when vault cannot cover rent floor");
+    let tx_err = match err {
+        BanksClientError::TransactionError(e) => e,
+        BanksClientError::SimulationError { err, .. } => err,
+        other => panic!("expected a transaction error, got {other:?}"),
+    };
+    let code = match tx_err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => code,
+        other => panic!("expected a custom instruction error, got {other:?}"),
+    };
+    assert_eq!(code, BridgeError::InsufficientFunds.into());
 }
