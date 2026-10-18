@@ -807,10 +807,9 @@ pub mod paraloom_program {
         stake_amount: u64,
         token_stake_amount: u64,
     ) -> Result<()> {
-        require!(
-            stake_amount >= MIN_VALIDATOR_STAKE,
-            BridgeError::InsufficientStake
-        );
+        let min_sol_stake =
+            effective_minimum_sol_stake(ctx.accounts.validator_registry.minimum_stake);
+        require!(stake_amount >= min_sol_stake, BridgeError::InsufficientStake);
         // Dual-stake: a validator slot requires locking the token half too
         // (tokenomics.mdx). The token floor is the registry's configurable
         // `min_token_stake` (set by the cold/DAO authority so it tracks the
@@ -2916,4 +2915,31 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+/// Compute the effective minimum SOL stake enforced by `register_validator`,
+/// honoring both the registry's configured `minimum_stake` and the protocol floor
+/// [`MIN_VALIDATOR_STAKE`].
+pub const fn effective_minimum_sol_stake(registry_minimum_stake: u64) -> u64 {
+    if registry_minimum_stake > MIN_VALIDATOR_STAKE {
+        registry_minimum_stake
+    } else {
+        MIN_VALIDATOR_STAKE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_minimum_sol_stake_honors_higher_registry_floor() {
+        assert_eq!(effective_minimum_sol_stake(0), MIN_VALIDATOR_STAKE);
+        assert_eq!(
+            effective_minimum_sol_stake(MIN_VALIDATOR_STAKE),
+            MIN_VALIDATOR_STAKE
+        );
+        let raised = 5 * MIN_VALIDATOR_STAKE;
+        assert_eq!(effective_minimum_sol_stake(raised), raised);
+    }
 }

@@ -52,44 +52,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read registry state to extract minimum_stake, stake_mint, and min_token_stake.
     let registry_data = client.get_account_data(&validator_registry_pda)?;
-    if registry_data.len() < 112 {
-        return Err(
-            "Validator registry data too short (< 112 bytes); predates dual-stake layout".into(),
-        );
-    }
+    let (reg_min_stake, stake_mint, reg_min_token_stake) =
+        parse_validator_registry_config(&registry_data)?;
 
-    // Registry layout after the 8-byte discriminator:
-    // authority [8..40]
-    // total_validators [40..48]
-    // active_validators [48..56]
-    // minimum_stake [56..64]
-    // total_active_stake [64..72]
-    // stake_mint [72..104]
-    // min_token_stake [104..112]
-    let reg_min_stake = u64::from_le_bytes(
-        registry_data[56..64]
-            .try_into()
-            .map_err(|_| "invalid minimum_stake slice")?,
-    );
-    // The program pins `stake_mint` to the registry's, so there is no override.
-    let stake_mint = Pubkey::new_from_array(
-        registry_data[72..104]
-            .try_into()
-            .map_err(|_| "invalid stake_mint slice")?,
-    );
-    let reg_min_token_stake = u64::from_le_bytes(
-        registry_data[104..112]
-            .try_into()
-            .map_err(|_| "invalid min_token_stake slice")?,
-    );
-
+    let min_sol_stake = reg_min_stake.max(LAMPORTS_PER_SOL);
     let stake_amount = match std::env::var("STAKE_AMOUNT") {
-        Ok(val) => val.parse::<u64>()?,
-        Err(_) => reg_min_stake.max(LAMPORTS_PER_SOL),
+        Ok(val) => {
+            let parsed = val.parse::<u64>()?;
+            if parsed < min_sol_stake {
+                return Err(format!(
+                    "STAKE_AMOUNT ({parsed} lamports) is below registry minimum stake ({min_sol_stake} lamports)"
+                )
+                .into());
+            }
+            parsed
+        }
+        Err(_) => min_sol_stake,
     };
 
     let token_stake_amount = match std::env::var("TOKEN_STAKE_AMOUNT") {
-        Ok(val) => val.parse::<u64>()?,
+        Ok(val) => {
+            let parsed = val.parse::<u64>()?;
+            if parsed < reg_min_token_stake {
+                return Err(format!(
+                    "TOKEN_STAKE_AMOUNT ({parsed}) is below registry min_token_stake ({reg_min_token_stake})"
+                )
+                .into());
+            }
+            parsed
+        }
         Err(_) => reg_min_token_stake,
     };
 
@@ -152,4 +143,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  solana confirm -v {}", signature);
 
     Ok(())
+}
+
+/// `sha256("account:ValidatorRegistry")[..8]` — the Anchor discriminator every
+/// on-chain `ValidatorRegistry` carries in its first 8 bytes.
+const VALIDATOR_REGISTRY_DISCRIMINATOR: [u8; 8] = [135, 198, 225, 159, 60, 129, 98, 43];
+
+/// Parse `(minimum_stake, stake_mint, min_token_stake)` from raw
+/// `ValidatorRegistry` account data after verifying its 8-byte Anchor
+/// discriminator and 112-byte dual-stake layout length.
+fn parse_validator_registry_config(
+    registry_data: &[u8],
+) -> Result<(u64, Pubkey, u64), Box<dyn std::error::Error>> {
+    if registry_data.len() < 112 {
+        return Err(
+            "Validator registry data too short (< 112 bytes); predates dual-stake layout".into(),
+        );
+    }
+    if registry_data[0..8] != VALIDATOR_REGISTRY_DISCRIMINATOR {
+        return Err("Account discriminator mismatch: not a ValidatorRegistry account".into());
+    }
+    let reg_min_stake = u64::from_le_bytes(
+        registry_data[56..64]
+            .try_into()
+            .map_err(|_| "invalid minimum_stake slice")?,
+    );
+    let stake_mint = Pubkey::new_from_array(
+        registry_data[72..104]
+            .try_into()
+            .map_err(|_| "invalid stake_mint slice")?,
+    );
+    let reg_min_token_stake = u64::from_le_bytes(
+        registry_data[104..112]
+            .try_into()
+            .map_err(|_| "invalid min_token_stake slice")?,
+    );
+    Ok((reg_min_stake, stake_mint, reg_min_token_stake))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_registry_config_validates_discriminator_and_extracts_fields() {
+        let mut data = vec![0u8; 112];
+        data[0..8].copy_from_slice(&VALIDATOR_REGISTRY_DISCRIMINATOR);
+        let expected_min_stake = 2_500_000_000u64;
+        let expected_mint = Pubkey::new_unique();
+        let expected_min_token = 1_000_000_000_000u64;
+        data[56..64].copy_from_slice(&expected_min_stake.to_le_bytes());
+        data[72..104].copy_from_slice(expected_mint.as_ref());
+        data[104..112].copy_from_slice(&expected_min_token.to_le_bytes());
+
+        let (min_stake, mint, min_token) =
+            parse_validator_registry_config(&data).expect("valid registry");
+        assert_eq!(min_stake, expected_min_stake);
+        assert_eq!(mint, expected_mint);
+        assert_eq!(min_token, expected_min_token);
+
+        let mut bad_disc = data.clone();
+        bad_disc[0] ^= 0xFF;
+        assert!(
+            parse_validator_registry_config(&bad_disc).is_err(),
+            "wrong discriminator must be rejected"
+        );
+        assert!(
+            parse_validator_registry_config(&data[..111]).is_err(),
+            "short registry data must be rejected"
+        );
+    }
 }

@@ -503,13 +503,8 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     balance as f64 / LAMPORTS_PER_SOL as f64
                 );
 
-                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
-                if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
-                    anyhow::bail!(
-                        "Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)",
-                        amount
-                    );
-                }
+                let deposit_lamports =
+                    validate_sol_amount_to_lamports(amount, balance, LAMPORTS_PER_SOL / 100)?;
 
                 // Derive bridge vault PDA
                 let (bridge_vault, _vault_bump) = derive_bridge_vault(&program_id);
@@ -597,6 +592,9 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         }
 
         WalletCommands::Transfer { to, amount, memo } => {
+            if !amount.is_finite() || amount <= 0.0 {
+                anyhow::bail!("Invalid transfer amount: must be a positive finite SOL value");
+            }
             println!("Initiating private transfer...\n");
             println!("Recipient: {}", to);
             println!("Amount: {} SOL (hidden)", amount);
@@ -1312,6 +1310,78 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 #[cfg(feature = "solana-bridge")]
 const VALIDATOR_ACCOUNT_DISCRIMINATOR: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
 
+/// `sha256("account:ValidatorRegistry")[..8]` — the Anchor discriminator every
+/// on-chain `ValidatorRegistry` carries in its first 8 bytes.
+#[cfg(feature = "solana-bridge")]
+const VALIDATOR_REGISTRY_DISCRIMINATOR: [u8; 8] = [135, 198, 225, 159, 60, 129, 98, 43];
+
+/// Validate a user-supplied SOL amount, round to exact lamports (avoiding
+/// IEEE-754 truncation on values such as `0.29 SOL`), and verify that
+/// `balance_lamports >= deposit_lamports + fee_reserve_lamports` without
+/// integer addition overflow.
+#[cfg_attr(not(feature = "solana-bridge"), allow(dead_code))]
+fn validate_sol_amount_to_lamports(
+    amount: f64,
+    balance_lamports: u64,
+    fee_reserve_lamports: u64,
+) -> Result<u64> {
+    const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
+    anyhow::ensure!(
+        amount.is_finite() && amount > 0.0,
+        "Invalid deposit amount: must be a positive finite SOL value"
+    );
+    let scaled = (amount * LAMPORTS_PER_SOL_F64).round();
+    anyhow::ensure!(
+        scaled >= 1.0,
+        "Deposit amount is below 1 lamport (minimum 0.000000001 SOL)"
+    );
+    // Max exact u64 threshold representable in f64 without rounding to 2^64.
+    anyhow::ensure!(
+        scaled < (u64::MAX as f64),
+        "Deposit amount overflows u64 lamports"
+    );
+    let deposit_lamports = scaled as u64;
+    let required = deposit_lamports
+        .checked_add(fee_reserve_lamports)
+        .ok_or_else(|| anyhow::anyhow!("Deposit amount + fee reserve overflows u64 lamports"))?;
+    if balance_lamports < required {
+        anyhow::bail!(
+            "Insufficient balance. Need at least {} SOL (+ {} SOL for fees)",
+            amount,
+            fee_reserve_lamports as f64 / LAMPORTS_PER_SOL_F64
+        );
+    }
+    Ok(deposit_lamports)
+}
+
+/// Decode `(minimum_stake, stake_mint, min_token_stake)` from an on-chain
+/// `ValidatorRegistry` account after verifying its 8-byte Anchor discriminator
+/// and 112-byte dual-stake layout length.
+#[cfg(feature = "solana-bridge")]
+fn decode_validator_registry_config(data: &[u8]) -> Result<(u64, Pubkey, u64)> {
+    anyhow::ensure!(
+        data.len() >= 112,
+        "validator registry predates the dual-stake layout — redeploy the program first"
+    );
+    anyhow::ensure!(
+        data[0..8] == VALIDATOR_REGISTRY_DISCRIMINATOR,
+        "account discriminator mismatch: not a ValidatorRegistry account"
+    );
+    let minimum_stake =
+        u64::from_le_bytes(data[56..64].try_into().expect("8-byte minimum_stake slice"));
+    let stake_mint = Pubkey::new_from_array(
+        data[72..104]
+            .try_into()
+            .expect("32-byte stake_mint slice"),
+    );
+    let min_token_stake = u64::from_le_bytes(
+        data[104..112]
+            .try_into()
+            .expect("8-byte min_token_stake slice"),
+    );
+    Ok((minimum_stake, stake_mint, min_token_stake))
+}
+
 /// Decode an on-chain `ValidatorAccount` into
 /// (validator, SOL stake, PARALOOM token stake base units, reputation, is_active).
 ///
@@ -1389,7 +1459,6 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             #[cfg(feature = "solana-bridge")]
             {
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
-                const STAKE_LAMPORTS: u64 = LAMPORTS_PER_SOL; // 1 SOL minimum stake
 
                 let rpc_url = rpc_url
                     .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
@@ -1429,13 +1498,6 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     "Validator Balance: {} SOL\n",
                     balance as f64 / LAMPORTS_PER_SOL as f64
                 );
-                if balance < 2 * LAMPORTS_PER_SOL {
-                    anyhow::bail!(
-                        "Insufficient balance. Need at least 2 SOL (1 to stake + fees). \
-                         Airdrop with: solana airdrop 2 {} --url devnet",
-                        validator.pubkey()
-                    );
-                }
 
                 let (validator_account_pda, _bump) = Pubkey::find_program_address(
                     &[b"validator", validator.pubkey().as_ref()],
@@ -1447,31 +1509,25 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Dual-stake: read the registry's pinned stake mint and derive
-                // this validator's token account (the token half is transferred
-                // from it). ValidatorRegistry layout after the 8-byte
-                // discriminator: authority[8..40], three u64 counters [40..64],
-                // total_active_stake[64..72], stake_mint[72..104].
+                // Dual-stake: read the registry's minimum SOL stake, pinned stake
+                // mint, and minimum token stake after verifying its Anchor
+                // discriminator.
                 let registry_data = client
                     .get_account_data(&validator_registry_pda)
                     .context("Failed to read validator registry (is it initialized?)")?;
-                anyhow::ensure!(
-                    registry_data.len() >= 112,
-                    "validator registry predates the dual-stake layout — redeploy the program first"
-                );
-                // Registry layout after the 8-byte discriminator: authority
-                // [8..40], three u64 counters [40..64], total_active_stake
-                // [64..72], stake_mint [72..104], min_token_stake [104..112].
-                let stake_mint = Pubkey::new_from_array(
-                    registry_data[72..104]
-                        .try_into()
-                        .expect("32-byte stake_mint slice"),
-                );
-                let min_token_stake = u64::from_le_bytes(
-                    registry_data[104..112]
-                        .try_into()
-                        .expect("8-byte min_token_stake slice"),
-                );
+                let (reg_min_stake, stake_mint, min_token_stake) =
+                    decode_validator_registry_config(&registry_data)?;
+                let stake_lamports = reg_min_stake.max(LAMPORTS_PER_SOL);
+                let required_balance = stake_lamports.saturating_add(LAMPORTS_PER_SOL);
+                if balance < required_balance {
+                    anyhow::bail!(
+                        "Insufficient balance. Need at least {} SOL ({} to stake + 1 SOL for rent/fees). \
+                         Airdrop with: solana airdrop 2 {} --url devnet",
+                        required_balance as f64 / LAMPORTS_PER_SOL as f64,
+                        stake_lamports as f64 / LAMPORTS_PER_SOL as f64,
+                        validator.pubkey()
+                    );
+                }
                 // The dual-stake mint may live under classic SPL Token or
                 // Token-2022; the ATA derivation and the on-chain
                 // `transfer_checked` both key off whichever program owns the
@@ -1486,15 +1542,14 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                // Stake exactly the registry's current token floor (0 while the
-                // token gate is still closed).
+                // Stake the registry's required SOL and token floors.
                 let ix = create_register_validator_instruction(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
                     &validator_token,
                     &token_program,
-                    STAKE_LAMPORTS,
+                    stake_lamports,
                     min_token_stake,
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
@@ -1509,7 +1564,10 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     blockhash,
                 );
 
-                println!("Staking 1 SOL and registering...");
+                println!(
+                    "Staking {} SOL and registering...",
+                    stake_lamports as f64 / LAMPORTS_PER_SOL as f64
+                );
                 let signature = client
                     .send_and_confirm_transaction(&tx)
                     .context("Failed to send transaction")?;
@@ -1517,7 +1575,10 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("\n[OK] Validator registered!");
                 println!("  Transaction: {}", signature);
                 println!("  Validator:   {}", validator.pubkey());
-                println!("  Stake:       1 SOL");
+                println!(
+                    "  Stake:       {} SOL",
+                    stake_lamports as f64 / LAMPORTS_PER_SOL as f64
+                );
                 println!("\nVerify with: paraloom validator list");
             }
 
@@ -1573,29 +1634,15 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-                let (validator_account_pda, _bump) = Pubkey::find_program_address(
-                    &[b"validator", validator.pubkey().as_ref()],
-                    &program_id,
-                );
+                let (validator_account_pda, _bump) =
+                    derive_validator_account(&program_id, &validator.pubkey());
                 let (validator_registry_pda, _registry_bump) =
-                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+                    derive_validator_registry(&program_id);
 
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Anchor discriminator for `unregister_validator` (no args).
-                let discriminator: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
-                let data = discriminator.to_vec();
-
-                let ix = solana_sdk::instruction::Instruction {
-                    program_id,
-                    accounts: vec![
-                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
-                    ],
-                    data,
-                };
+                let ix = create_unregister_validator_instruction(&program_id, &validator.pubkey());
 
                 let blockhash = client
                     .get_latest_blockhash()
@@ -1680,15 +1727,8 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 let registry_data = client
                     .get_account_data(&validator_registry_pda)
                     .context("Failed to read validator registry (is it initialized?)")?;
-                anyhow::ensure!(
-                    registry_data.len() >= 104,
-                    "validator registry predates the dual-stake layout"
-                );
-                let stake_mint = Pubkey::new_from_array(
-                    registry_data[72..104]
-                        .try_into()
-                        .expect("32-byte stake_mint slice"),
-                );
+                let (_reg_min_stake, stake_mint, _min_token_stake) =
+                    decode_validator_registry_config(&registry_data)?;
                 let token_program = client
                     .get_account(&stake_mint)
                     .context("Failed to read stake mint account")?
@@ -2178,4 +2218,62 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_sol_amount_rounds_and_rejects_invalid_or_overflowing_inputs() {
+        let fee = 10_000_000u64; // 0.01 SOL
+
+        // IEEE-754 representation of 0.29 * 1e9 is 289_999_999.99999994; must
+        // round to 290_000_000 lamports rather than truncating to 289_999_999.
+        let lamports = validate_sol_amount_to_lamports(0.29, 500_000_000, fee).expect("0.29 SOL");
+        assert_eq!(lamports, 290_000_000);
+
+        // Zero, negative, NaN, infinite, and sub-lamport values must fail closed.
+        assert!(validate_sol_amount_to_lamports(0.0, u64::MAX, fee).is_err());
+        assert!(validate_sol_amount_to_lamports(-1.0, u64::MAX, fee).is_err());
+        assert!(validate_sol_amount_to_lamports(f64::NAN, u64::MAX, fee).is_err());
+        assert!(validate_sol_amount_to_lamports(f64::INFINITY, u64::MAX, fee).is_err());
+        assert!(validate_sol_amount_to_lamports(1e-10, u64::MAX, fee).is_err());
+
+        // Huge SOL value that would saturate `as u64` and overflow `+ fee` must fail closed.
+        assert!(validate_sol_amount_to_lamports(1e12, u64::MAX, fee).is_err());
+
+        // Insufficient balance when fee reserve is included must fail closed.
+        assert!(validate_sol_amount_to_lamports(1.0, 1_000_000_000, fee).is_err());
+    }
+
+    #[cfg(feature = "solana-bridge")]
+    #[test]
+    fn decode_validator_registry_config_verifies_discriminator_and_fields() {
+        let mut data = vec![0u8; 112];
+        data[0..8].copy_from_slice(&VALIDATOR_REGISTRY_DISCRIMINATOR);
+        let expected_min_stake = 3_000_000_000u64;
+        let expected_mint = Pubkey::new_unique();
+        let expected_min_token = 500_000_000_000u64;
+        data[56..64].copy_from_slice(&expected_min_stake.to_le_bytes());
+        data[72..104].copy_from_slice(expected_mint.as_ref());
+        data[104..112].copy_from_slice(&expected_min_token.to_le_bytes());
+
+        let (min_stake, mint, min_token) =
+            decode_validator_registry_config(&data).expect("valid registry config");
+        assert_eq!(min_stake, expected_min_stake);
+        assert_eq!(mint, expected_mint);
+        assert_eq!(min_token, expected_min_token);
+
+        let mut wrong_disc = data.clone();
+        wrong_disc[0] ^= 1;
+        assert!(
+            decode_validator_registry_config(&wrong_disc).is_err(),
+            "wrong discriminator must be rejected"
+        );
+        assert!(
+            decode_validator_registry_config(&data[..111]).is_err(),
+            "short registry account must be rejected"
+        );
+    }
 }

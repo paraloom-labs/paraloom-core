@@ -39,6 +39,52 @@ use super::req_resp::{create_result_protocol, ResultCodec, ResultRequest, Result
 // Global topic for all paraloom messages
 const PARALOOM_TOPIC: &str = "paraloom/v1";
 
+/// Maximum Gossipsub frame size (1 MiB, #69 follow-up to audit #10).
+pub const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 1024 * 1024;
+
+/// Serialize a [`Message`] for Gossipsub publication, enforcing the
+/// [`GOSSIPSUB_MAX_TRANSMIT_SIZE`] ceiling before handing bytes to the swarm.
+pub fn serialize_gossip_message(message: &Message) -> Result<Vec<u8>> {
+    use bincode::Options;
+    let bytes = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(GOSSIPSUB_MAX_TRANSMIT_SIZE as u64)
+        .serialize(message)
+        .map_err(|e| anyhow!("Failed to serialize gossipsub message: {}", e))?;
+    if bytes.len() > GOSSIPSUB_MAX_TRANSMIT_SIZE {
+        return Err(anyhow!(
+            "Serialized gossipsub message ({} bytes) exceeds maximum ({} bytes)",
+            bytes.len(),
+            GOSSIPSUB_MAX_TRANSMIT_SIZE
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Deserialize an untrusted Gossipsub payload into a [`Message`] with a strict
+/// [`GOSSIPSUB_MAX_TRANSMIT_SIZE`] allocation limit and trailing-byte rejection.
+///
+/// Using `bincode::deserialize` directly runs with an unbounded (`Infinite`)
+/// allocation budget, allowing a 24-byte Gossipsub packet carrying a crafted
+/// `u64::MAX` length prefix to trigger a multi-gigabyte heap allocation and
+/// crash every subscribed node with an OOM abort.
+pub fn deserialize_gossip_message(bytes: &[u8]) -> Result<Message> {
+    use bincode::Options;
+    if bytes.len() > GOSSIPSUB_MAX_TRANSMIT_SIZE {
+        return Err(anyhow!(
+            "Gossipsub payload ({} bytes) exceeds maximum ({} bytes)",
+            bytes.len(),
+            GOSSIPSUB_MAX_TRANSMIT_SIZE
+        ));
+    }
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(GOSSIPSUB_MAX_TRANSMIT_SIZE as u64)
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("Failed to deserialize gossipsub message: {}", e))
+}
+
 /// Extract the trailing `/p2p/<peer_id>` component from a
 /// multiaddr if present. Used by bootstrap registration to learn
 /// the PeerId without dialling first; if the operator gives us a
@@ -268,7 +314,6 @@ impl NetworkManager {
         // verification-request notifications, all well under 1 MiB.
         // A tighter cap shrinks the DoS surface; revisit only if real
         // measurements show a legitimate use case bumping the ceiling.
-        const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 1024 * 1024;
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
             // Flood-publish so a message is sent to every peer subscribed to the
@@ -713,8 +758,8 @@ impl NetworkManager {
                                             } = gossip_event {
                                                 info!("Received gossipsub message from peer: {}", peer_id);
 
-                                                // Deserialize the message
-                                                match bincode::deserialize::<Message>(&message.data) {
+                                                // Deserialize the message with bounded bincode options
+                                                match deserialize_gossip_message(&message.data) {
                                                     Ok(msg) => {
                                                         // Gossipsub runs in Signed mode, so `message.source`
                                                         // is the authenticated original publisher. Prefer it
@@ -1056,8 +1101,8 @@ impl NetworkManager {
                 } => {
                     match message {
                         Some((_target, message)) => {
-                            // Serialize the message
-                            match bincode::serialize(&message) {
+                            // Serialize the message with bounded size checks
+                            match serialize_gossip_message(&message) {
                                 Ok(data) => {
                                     let topic = IdentTopic::new(PARALOOM_TOPIC);
                                     let mut swarm_lock = swarm.lock().await;
@@ -1375,5 +1420,65 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn gossip_message_rejects_oversized_length_prefix_without_oom() {
+        // Variant index 6 = Message::TaskError { task_id: String, error: String }.
+        // A 20-byte frame claiming a u64::MAX string length would trigger a
+        // multi-exabyte allocation under unbounded bincode::deserialize.
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(&6u32.to_le_bytes());
+        crafted.extend_from_slice(&u64::MAX.to_le_bytes());
+        crafted.extend_from_slice(&0u64.to_le_bytes());
+
+        let err = deserialize_gossip_message(&crafted).expect_err("must reject length prefix");
+        assert!(
+            err.to_string()
+                .contains("Failed to deserialize gossipsub message"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn gossip_message_roundtrips_and_rejects_trailing_or_oversized_frames() {
+        let msg = Message::TaskError {
+            task_id: "job-42".to_string(),
+            error: "execution failed".to_string(),
+        };
+        let encoded = serialize_gossip_message(&msg).expect("serialize");
+        assert_eq!(
+            encoded,
+            bincode::serialize(&msg).expect("default bincode wire format")
+        );
+
+        let decoded = deserialize_gossip_message(&encoded).expect("deserialize");
+        match decoded {
+            Message::TaskError { task_id, error } => {
+                assert_eq!(task_id, "job-42");
+                assert_eq!(error, "execution failed");
+            }
+            other => panic!("unexpected decoded variant: {:?}", other),
+        }
+
+        let mut with_trailing = encoded.clone();
+        with_trailing.push(0xAA);
+        assert!(
+            deserialize_gossip_message(&with_trailing).is_err(),
+            "trailing bytes must be rejected"
+        );
+
+        let oversized_msg = Message::ComputeJobRequest {
+            job_id: "oversized".to_string(),
+            wasm_code: vec![0u8; GOSSIPSUB_MAX_TRANSMIT_SIZE + 1],
+            input_data: Vec::new(),
+            max_memory_bytes: 1024,
+            max_instructions: 1024,
+            timeout_secs: 10,
+        };
+        assert!(
+            serialize_gossip_message(&oversized_msg).is_err(),
+            "outbound gossip message exceeding GOSSIPSUB_MAX_TRANSMIT_SIZE must be rejected"
+        );
     }
 }
