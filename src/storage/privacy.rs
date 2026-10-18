@@ -115,6 +115,40 @@ impl PrivacyStorage {
         Ok(())
     }
 
+    /// Atomically insert a commitment into `CF_MERKLE_TREE` and update the
+    /// corresponding asset supply in `CF_POOL_STATE` in a single fsync'd
+    /// `WriteBatch`.
+    ///
+    /// Prevents torn persistence on crash where `CF_MERKLE_TREE` records the
+    /// commitment (marking the deposit idempotent on restart) while
+    /// `CF_POOL_STATE` misses the asset supply increment.
+    pub fn insert_commitment_with_supply(
+        &self,
+        index: u64,
+        commitment: &Commitment,
+        asset_id: &AssetId,
+        supply: u64,
+    ) -> Result<()> {
+        let cf_merkle = self
+            .db
+            .cf_handle(CF_MERKLE_TREE)
+            .ok_or_else(|| anyhow!("Merkle tree CF not found"))?;
+        let cf_pool = self
+            .db
+            .cf_handle(CF_POOL_STATE)
+            .ok_or_else(|| anyhow!("Pool state CF not found"))?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(cf_merkle, index.to_le_bytes(), commitment.as_bytes());
+        if asset_id == &NATIVE_SOL_ASSET {
+            batch.put_cf(cf_pool, b"total_supply", supply.to_le_bytes());
+        } else {
+            batch.put_cf(cf_pool, asset_supply_key(asset_id), supply.to_le_bytes());
+        }
+        self.db.write_opt(batch, &durable_write_options())?;
+        Ok(())
+    }
+
     /// Get a commitment by index
     pub fn get_commitment(&self, index: u64) -> Result<Option<Commitment>> {
         let cf = self
@@ -155,7 +189,11 @@ impl PrivacyStorage {
 
         let mut batch = rocksdb::WriteBatch::default();
         for (i, commitment) in commitments.iter().enumerate() {
-            let index = start_index + i as u64;
+            let offset = u64::try_from(i)
+                .map_err(|_| anyhow!("Commitment batch index conversion overflow"))?;
+            let index = start_index
+                .checked_add(offset)
+                .ok_or_else(|| anyhow!("Commitment batch leaf index overflow"))?;
             let key = index.to_le_bytes();
             batch.put_cf(cf, key, commitment.as_bytes());
         }
@@ -213,6 +251,15 @@ impl PrivacyStorage {
         }
 
         indexed.sort_by_key(|(index, _)| *index);
+        for (pos, (index, _)) in indexed.iter().enumerate() {
+            if *index != pos as u64 {
+                return Err(anyhow!(
+                    "Non-contiguous merkle-tree leaf index in storage: expected {}, found {}",
+                    pos,
+                    index
+                ));
+            }
+        }
         Ok(indexed.into_iter().map(|(_, c)| c).collect())
     }
 
@@ -437,8 +484,17 @@ impl PrivacyStorage {
                 break;
             }
             let id_bytes = &key[SUPPLY_PREFIX.len()..];
-            if id_bytes.len() != 32 || value.len() != 8 {
-                continue;
+            if id_bytes.len() != 32 {
+                return Err(anyhow!(
+                    "Invalid asset supply key size in storage: {}",
+                    id_bytes.len()
+                ));
+            }
+            if value.len() != 8 {
+                return Err(anyhow!(
+                    "Invalid asset supply size in storage: {}",
+                    value.len()
+                ));
             }
             let mut asset = [0u8; 32];
             asset.copy_from_slice(id_bytes);
@@ -700,5 +756,55 @@ mod tests {
                  follow numeric index order, not RocksDB bytewise key order"
             );
         }
+    }
+
+    #[test]
+    fn get_all_commitments_rejects_leaf_index_gap() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        storage.insert_commitment(0, &Commitment([1u8; 32])).unwrap();
+        storage.insert_commitment(2, &Commitment([2u8; 32])).unwrap();
+
+        let err = storage
+            .get_all_commitments()
+            .expect_err("non-contiguous leaf index gap must be rejected");
+        assert!(err.to_string().contains("Non-contiguous merkle-tree leaf index"));
+    }
+
+    #[test]
+    fn insert_commitment_with_supply_persists_both_atomically() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        let sol_commit = Commitment([11u8; 32]);
+        storage
+            .insert_commitment_with_supply(0, &sol_commit, &NATIVE_SOL_ASSET, 2_500)
+            .unwrap();
+        assert_eq!(storage.get_commitment(0).unwrap(), Some(sol_commit));
+        assert_eq!(storage.get_total_supply().unwrap(), 2_500);
+
+        let spl_asset: AssetId = [22u8; 32];
+        let spl_commit = Commitment([33u8; 32]);
+        storage
+            .insert_commitment_with_supply(1, &spl_commit, &spl_asset, 9_000)
+            .unwrap();
+        assert_eq!(storage.get_commitment(1).unwrap(), Some(spl_commit));
+        assert_eq!(storage.get_asset_supply(&spl_asset).unwrap(), 9_000);
+    }
+
+    #[test]
+    fn get_all_asset_supplies_rejects_corrupted_supply_entry() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        let cf = storage.db.cf_handle(CF_POOL_STATE).unwrap();
+        let bad_key = asset_supply_key(&[9u8; 32]);
+        storage.db.put_cf(cf, bad_key, [1u8, 2, 3]).unwrap();
+
+        let err = storage
+            .get_all_asset_supplies()
+            .expect_err("corrupted asset supply value length must error");
+        assert!(err.to_string().contains("Invalid asset supply size"));
     }
 }

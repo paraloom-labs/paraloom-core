@@ -110,6 +110,39 @@ impl MerkleTree {
         Ok(index)
     }
 
+    /// Insert a commitment as a leaf and atomically persist the updated
+    /// `supply` for `asset_id` in the same RocksDB `WriteBatch` when
+    /// persistent storage is configured.
+    pub async fn insert_with_supply(
+        &self,
+        commitment: &Commitment,
+        asset_id: &crate::privacy::types::AssetId,
+        supply: u64,
+    ) -> Result<usize, anyhow::Error> {
+        let mut leaves = self.leaves.write().await;
+        let index = leaves.len();
+
+        if let Some(storage) = &self.storage {
+            storage
+                .insert_commitment_with_supply(index as u64, commitment, asset_id, supply)
+                .map_err(|e| {
+                    log::error!(
+                        target: "paraloom::privacy::merkle",
+                        "failed to persist commitment and supply at index {}: {} — in-memory state not advanced",
+                        index, e
+                    );
+                    e
+                })?;
+        }
+
+        leaves.push(*commitment.as_bytes());
+
+        let mut cached_root = self.cached_root.write().await;
+        *cached_root = None;
+
+        Ok(index)
+    }
+
     /// Batch insert multiple commitments. Same crash-consistency
     /// contract as [`MerkleTree::insert`]: persist first, mutate
     /// memory only if persistence succeeded.

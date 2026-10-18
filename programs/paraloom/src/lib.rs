@@ -230,6 +230,11 @@ pub mod paraloom_program {
             .lamports()
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        require!(
+            projected_vault_balance >= rent_floor,
+            BridgeError::InvalidAmount
+        );
         require!(
             projected_vault_balance <= ctx.accounts.bridge_state.deposit_cap,
             BridgeError::DepositCapExceeded
@@ -808,7 +813,12 @@ pub mod paraloom_program {
         token_stake_amount: u64,
     ) -> Result<()> {
         require!(
-            stake_amount >= MIN_VALIDATOR_STAKE,
+            stake_amount
+                >= ctx
+                    .accounts
+                    .validator_registry
+                    .minimum_stake
+                    .max(MIN_VALIDATOR_STAKE),
             BridgeError::InsufficientStake
         );
         // Dual-stake: a validator slot requires locking the token half too
@@ -1081,7 +1091,31 @@ pub mod paraloom_program {
         } else {
             validator_account.unbonding_amount
         };
-        let slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
+        let raw_slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
+        // `slashed_funds_vault` is a 0-byte system PDA that starts at 0 lamports.
+        // If `slashed_funds_vault.lamports() + raw_slash_amount` falls in
+        // `1..rent_floor` (e.g. a small percentage slash on a partially-slashed
+        // unbonding balance before the vault has been seeded), the Solana
+        // runtime aborts the entire transaction with `InsufficientFundsForRent`
+        // — blocking both the validator deactivation/accounting update and the
+        // `token_slash` SPL collateral burn below. Promote the SOL slash up to
+        // the rent floor when `old_stake` covers the gap, or defer the sub-rent
+        // SOL transfer until the vault is rent-exempt while still burning the
+        // slashed token collateral.
+        let vault_rent_floor = Rent::get()?.minimum_balance(0);
+        let current_vault_lamports = ctx.accounts.slashed_funds_vault.lamports();
+        let slash_amount = if raw_slash_amount > 0
+            && current_vault_lamports.saturating_add(raw_slash_amount) < vault_rent_floor
+        {
+            let needed = vault_rent_floor.saturating_sub(current_vault_lamports);
+            if old_stake >= needed {
+                needed
+            } else {
+                0
+            }
+        } else {
+            raw_slash_amount
+        };
         // Slash the token half in the same proportion, off the at-risk token
         // balance (active stake for a live validator, unbonding balance once it
         // has left the set).

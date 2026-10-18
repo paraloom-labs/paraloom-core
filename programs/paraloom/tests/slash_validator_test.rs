@@ -496,3 +496,114 @@ async fn slash_rent_only_ghost_does_not_underflow() {
     assert_eq!(acc.unbonding_amount, 0, "still nothing unbonding");
     assert_eq!(acc.times_slashed, 1, "the slash was recorded");
 }
+
+#[tokio::test]
+async fn slash_sub_rent_into_empty_vault_does_not_abort_for_rent() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+
+    // Seed a second unbonding validator whose remaining SOL unbonding balance
+    // (50_000_000 lamports = 0.05 SOL) yields a 1% raw slash of 500_000 lamports
+    // (< 890_880 rent floor for a 0-byte account) while `slashed_funds_vault` is
+    // still at 0 lamports.
+    let validator_wallet = Keypair::new().pubkey();
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator_wallet.as_ref()], &program_id);
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
+
+    let unbonding_sol: u64 = 50_000_000;
+    let acct_len = 8 + ValidatorAccount::INIT_SPACE;
+    let mut data = ValidatorAccount::DISCRIMINATOR.to_vec();
+    data.resize(acct_len, 0);
+    // Offsets: validator [8..40], is_active [88], unbonding_amount [113..121],
+    // token_unbonding_amount [129..137].
+    data[8..40].copy_from_slice(validator_wallet.as_ref());
+    data[88] = 0;
+    data[113..121].copy_from_slice(&unbonding_sol.to_le_bytes());
+    data[129..137].copy_from_slice(&TOKEN_STAKE.to_le_bytes());
+    let rent_only = Rent::default().minimum_balance(acct_len);
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: rent_only + unbonding_sol,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+
+    // Register `validator` so `stake_token_vault` holds enough tokens for the
+    // 1% burn on `validator_wallet`.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await;
+
+    // 1% slash on `validator_wallet`: raw_slash_amount = 500_000 lamports (< rent_floor),
+    // which promotes to `rent_floor` so `slashed_funds_vault` is rent-exempt and the
+    // transaction succeeds instead of aborting with `InsufficientFundsForRent`.
+    let res = send_result(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator_wallet,
+            stake_mint,
+            upgrade_authority.pubkey(),
+            1,
+        ),
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "sub-rent slash into empty slashed_funds_vault must not abort with InsufficientFundsForRent: {res:?}"
+    );
+
+    let rent_floor = Rent::default().minimum_balance(0);
+    let vault = banks_client
+        .get_account(vault_pda)
+        .await
+        .unwrap()
+        .expect("slashed_funds_vault must exist and be rent-exempt");
+    assert_eq!(vault.lamports, rent_floor);
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(acc.unbonding_amount, unbonding_sol - rent_floor);
+    assert_eq!(acc.token_unbonding_amount, TOKEN_STAKE * 99 / 100);
+    assert_eq!(acc.times_slashed, 1);
+}

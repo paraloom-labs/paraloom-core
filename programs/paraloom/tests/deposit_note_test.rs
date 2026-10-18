@@ -439,3 +439,62 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         "cap must be unchanged after a rejected set"
     );
 }
+
+#[tokio::test]
+async fn deposit_note_rejects_sub_rent_first_deposit_cleanly() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        AMOUNT,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    let sub_rent_amount = solana_sdk::rent::Rent::default().minimum_balance(0) - 1;
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 7;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 9;
+
+    let deposit = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: sub_rent_amount,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deposit], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    let result = banks.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "a deposit that leaves bridge_vault below rent exemption must be rejected"
+    );
+
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 0, "no leaf appended on sub-rent deposit");
+}

@@ -134,32 +134,37 @@ impl ShieldedPool {
         // rather than by anything built fresh at construction. The note carries
         // fresh randomness per deposit, so an equal commitment means the same
         // deposit, not a distinct one.
-        if self.deposited.read().await.contains(&commitment) {
+        let mut deposited = self.deposited.write().await;
+        if deposited.contains(&commitment) {
             return Ok(commitment);
         }
 
-        // Add to commitment tree (auto-persists if storage available).
-        // Storage failure leaves the tree's in-memory state untouched
-        // and propagates here so the deposit fails atomically.
-        let _index = self.commitment_tree.insert(&commitment).await?;
+        let mut supplies = self.supplies.write().await;
+        let current_supply = supplies.get(&asset_id).copied().unwrap_or(0);
+        let new_supply = current_supply
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("Shielded pool asset supply overflow"))?;
+
+        // Add to commitment tree and atomically persist both the leaf and the
+        // updated asset supply in a single fsync'd RocksDB WriteBatch if
+        // storage is available. Storage failure leaves in-memory state
+        // untouched so a crash or error never records the commitment without
+        // its supply increment.
+        let _index = self
+            .commitment_tree
+            .insert_with_supply(&commitment, &asset_id, new_supply)
+            .await?;
 
         // Mark it credited before anything else reads the pool, in the same
         // place the tree is appended.
-        self.deposited.write().await.insert(commitment.clone());
+        deposited.insert(commitment.clone());
+        supplies.insert(asset_id, new_supply);
+        drop(supplies);
+        drop(deposited);
 
         // Store note
         let mut notes = self.notes.write().await;
         notes.insert(commitment.clone(), note);
-
-        // Credit this asset's supply
-        let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
-
-        // Persist the asset's supply to storage if available
-        if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
-        }
 
         Ok(commitment)
     }
@@ -487,5 +492,25 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn deposit_rejects_supply_overflow_without_mutating_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("privacy.db");
+        let storage = Arc::new(PrivacyStorage::open(&db).unwrap());
+        let pool = ShieldedPool::with_storage(storage.clone()).await.unwrap();
+
+        let addr = ShieldedAddress([4u8; 32]);
+        let note1 = Note::new_native(addr.clone(), u64::MAX - 10, [1u8; 32]);
+        pool.deposit(note1, u64::MAX - 10).await.unwrap();
+
+        let note2 = Note::new_native(addr, 20, [2u8; 32]);
+        let err = pool.deposit(note2, 20).await;
+        assert!(err.is_err(), "supply overflow must be rejected");
+        assert_eq!(pool.commitment_count().await, 1);
+        assert_eq!(pool.total_supply().await, u64::MAX - 10);
+        assert_eq!(storage.commitment_count().unwrap(), 1);
+        assert_eq!(storage.get_total_supply().unwrap(), u64::MAX - 10);
     }
 }
