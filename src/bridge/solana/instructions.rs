@@ -108,6 +108,21 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:init_asset_vault")[..8]` (#779). Initializes a per-asset
+    /// SPL vault PDA and fail-closed `AssetConfig` PDA (`deposit_cap = 0`).
+    pub const INIT_ASSET_VAULT: [u8; 8] = [178, 96, 79, 76, 25, 81, 167, 109];
+    /// `sha256("global:set_asset_deposit_cap")[..8]` (#779). Sets the per-asset
+    /// SPL deposit cap on `AssetConfig`.
+    pub const SET_ASSET_DEPOSIT_CAP: [u8; 8] = [209, 129, 220, 235, 236, 193, 22, 135];
+    /// `sha256("global:set_min_token_stake")[..8]`. Sets the dual-stake token
+    /// floor (`ValidatorRegistry.min_token_stake`).
+    pub const SET_MIN_TOKEN_STAKE: [u8; 8] = [13, 125, 2, 121, 78, 212, 10, 46];
+    /// `sha256("global:slash_validator")[..8]`. Slashes a validator's SOL stake
+    /// into `slashed_funds_vault` and burns the proportional token stake.
+    pub const SLASH_VALIDATOR: [u8; 8] = [238, 57, 244, 40, 132, 82, 78, 5];
+    /// `sha256("global:update_reputation")[..8]`. Updates a validator's
+    /// on-chain reputation score.
+    pub const UPDATE_REPUTATION: [u8; 8] = [194, 220, 43, 201, 54, 209, 49, 178];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -855,6 +870,173 @@ pub fn create_set_deposit_cap_instruction(
     }
 }
 
+/// Create an `init_asset_vault` instruction (#779, upgrade-authority-gated).
+///
+/// Initializes the per-mint `asset_vault` token account PDA and `asset_config`
+/// PDA (`deposit_cap = 0`, fail-closed). Account order matches the on-chain
+/// `InitAssetVault` context: authority (mut signer), mint (readonly),
+/// asset_vault (mut), asset_vault_authority (readonly), asset_config (mut),
+/// program_data (readonly), token_program (readonly), system_program (readonly),
+/// rent (readonly).
+pub fn create_init_asset_vault_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let (asset_vault, _) = derive_asset_vault(program_id, mint);
+    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
+    let (asset_config, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(asset_vault, false),
+            AccountMeta::new_readonly(asset_vault_authority, false),
+            AccountMeta::new(asset_config, false),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
+        ],
+        data: discriminators::INIT_ASSET_VAULT.to_vec(),
+    }
+}
+
+/// Create a `set_asset_deposit_cap` instruction (#779, upgrade-authority-gated).
+///
+/// Sets `asset_config.deposit_cap = new_cap` for `mint`. Account order matches
+/// the on-chain `SetAssetDepositCap` context: asset_config (mut), authority
+/// (mut signer), program_data (readonly).
+pub fn create_set_asset_deposit_cap_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    new_cap: u64,
+) -> Instruction {
+    let (asset_config, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    let mut data = discriminators::SET_ASSET_DEPOSIT_CAP.to_vec();
+    data.extend_from_slice(&new_cap.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(asset_config, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+        ],
+        data,
+    }
+}
+
+/// Create a `set_min_token_stake` instruction (registry-authority-gated).
+///
+/// Sets `validator_registry.min_token_stake = new_min`. Account order matches
+/// the on-chain `SetMinTokenStake` context: validator_registry (mut),
+/// authority (readonly signer).
+pub fn create_set_min_token_stake_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    new_min: u64,
+) -> Instruction {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    let mut data = discriminators::SET_MIN_TOKEN_STAKE.to_vec();
+    data.extend_from_slice(&new_min.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    }
+}
+
+/// Create a `slash_validator` instruction (registry-authority-gated).
+///
+/// Slashes `slash_percentage` (`1..=100`) of `validator_wallet`'s at-risk SOL
+/// stake into `slashed_funds_vault` and burns the proportional token stake from
+/// `stake_token_vault`. Account order matches the on-chain `SlashValidator`
+/// context: validator_account (mut), slashed_funds_vault (mut),
+/// validator_registry (mut), stake_mint (mut), stake_token_vault (mut),
+/// stake_vault_authority (readonly), token_program (readonly), authority (signer).
+pub fn create_slash_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator_wallet: &Pubkey,
+    stake_mint: &Pubkey,
+    token_program: &Pubkey,
+    slash_percentage: u8,
+) -> Result<Instruction> {
+    if slash_percentage == 0 || slash_percentage > 100 {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "slash_percentage must be in 1..=100, got {}",
+            slash_percentage
+        )));
+    }
+
+    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
+    let (slashed_funds_vault, _) = derive_slashed_funds_vault(program_id);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
+    let (stake_vault_authority, _) = derive_stake_vault_authority(program_id);
+
+    let mut data = discriminators::SLASH_VALIDATOR.to_vec();
+    data.extend_from_slice(&validator_wallet.to_bytes());
+    data.push(slash_percentage);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(slashed_funds_vault, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*stake_mint, false),
+            AccountMeta::new(stake_token_vault, false),
+            AccountMeta::new_readonly(stake_vault_authority, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    })
+}
+
+/// Create an `update_reputation` instruction (registry-authority-gated).
+///
+/// Updates `validator_account.reputation_score = new_reputation`. Account order
+/// matches the on-chain `UpdateReputation` context: validator_account (mut),
+/// validator_registry (readonly), authority (signer).
+pub fn create_update_reputation_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator_wallet: &Pubkey,
+    new_reputation: u64,
+) -> Instruction {
+    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    let mut data = discriminators::UPDATE_REPUTATION.to_vec();
+    data.extend_from_slice(&validator_wallet.to_bytes());
+    data.extend_from_slice(&new_reputation.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    }
+}
+
 /// Derive bridge vault PDA
 pub fn derive_bridge_vault(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"bridge_vault"], program_id)
@@ -873,6 +1055,11 @@ pub fn derive_validator_account(program_id: &Pubkey, validator: &Pubkey) -> (Pub
 /// Derive the validator registry PDA.
 pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"validator_registry"], program_id)
+}
+
+/// Derive the dead-end slashed-funds vault PDA (`seeds = [b"slashed_funds_vault"]`, #728).
+pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
 }
 
 /// Derive the on-chain incremental Merkle tree PDA (circuit v3, #350).
@@ -906,6 +1093,11 @@ pub fn derive_asset_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
 /// (`seeds = [b"asset_vault", mint]`). Custody for one SPL asset.
 pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
+}
+
+/// Derive the per-asset config PDA for `mint` (`seeds = [b"asset_config", mint]`).
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
 }
 
 /// Derive the canonical Associated Token Account address for `owner` + `mint`,
@@ -1310,5 +1502,142 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_init_asset_vault_and_set_asset_deposit_cap_instructions() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_2022_PROGRAM_ID;
+
+        let init_ix =
+            create_init_asset_vault_instruction(&program_id, &authority, &mint, &token_program);
+        assert_eq!(init_ix.program_id, program_id);
+        assert_eq!(init_ix.accounts.len(), 9);
+        assert_eq!(init_ix.accounts[0].pubkey, authority);
+        assert!(init_ix.accounts[0].is_signer);
+        assert!(init_ix.accounts[0].is_writable);
+        assert_eq!(init_ix.accounts[1].pubkey, mint);
+        assert_eq!(
+            init_ix.accounts[2].pubkey,
+            derive_asset_vault(&program_id, &mint).0
+        );
+        assert!(init_ix.accounts[2].is_writable);
+        assert_eq!(
+            init_ix.accounts[3].pubkey,
+            derive_asset_vault_authority(&program_id).0
+        );
+        assert_eq!(
+            init_ix.accounts[4].pubkey,
+            derive_asset_config(&program_id, &mint).0
+        );
+        assert!(init_ix.accounts[4].is_writable);
+        assert_eq!(init_ix.accounts[5].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(init_ix.accounts[6].pubkey, token_program);
+        assert_eq!(init_ix.accounts[7].pubkey, SYSTEM_PROGRAM_ID);
+        assert_eq!(init_ix.accounts[8].pubkey, RENT_SYSVAR_ID);
+        assert_eq!(init_ix.data, discriminators::INIT_ASSET_VAULT.to_vec());
+
+        let cap_ix =
+            create_set_asset_deposit_cap_instruction(&program_id, &authority, &mint, 50_000_000);
+        assert_eq!(cap_ix.accounts.len(), 3);
+        assert_eq!(
+            cap_ix.accounts[0].pubkey,
+            derive_asset_config(&program_id, &mint).0
+        );
+        assert!(cap_ix.accounts[0].is_writable);
+        assert_eq!(cap_ix.accounts[1].pubkey, authority);
+        assert!(cap_ix.accounts[1].is_signer);
+        assert_eq!(cap_ix.accounts[2].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(&cap_ix.data[..8], &discriminators::SET_ASSET_DEPOSIT_CAP);
+        assert_eq!(&cap_ix.data[8..16], &50_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_set_min_token_stake_slash_validator_and_update_reputation_instructions() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+
+        let min_ix = create_set_min_token_stake_instruction(&program_id, &authority, 250_000);
+        assert_eq!(min_ix.accounts.len(), 2);
+        assert_eq!(
+            min_ix.accounts[0].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(min_ix.accounts[0].is_writable);
+        assert_eq!(min_ix.accounts[1].pubkey, authority);
+        assert!(min_ix.accounts[1].is_signer);
+        assert_eq!(&min_ix.data[..8], &discriminators::SET_MIN_TOKEN_STAKE);
+        assert_eq!(&min_ix.data[8..16], &250_000u64.to_le_bytes());
+
+        // Out-of-range slash percentages (0 or > 100) must be rejected.
+        assert!(create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &SPL_TOKEN_PROGRAM_ID,
+            0,
+        )
+        .is_err());
+        assert!(create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &SPL_TOKEN_PROGRAM_ID,
+            101,
+        )
+        .is_err());
+
+        let slash_ix = create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &SPL_TOKEN_PROGRAM_ID,
+            25,
+        )
+        .expect("valid slash instruction");
+        assert_eq!(slash_ix.accounts.len(), 8);
+        assert_eq!(
+            slash_ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(slash_ix.accounts[0].is_writable);
+        assert_eq!(
+            slash_ix.accounts[1].pubkey,
+            derive_slashed_funds_vault(&program_id).0
+        );
+        assert!(slash_ix.accounts[1].is_writable);
+        assert_eq!(
+            slash_ix.accounts[2].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert_eq!(slash_ix.accounts[3].pubkey, stake_mint);
+        assert!(slash_ix.accounts[3].is_writable);
+        assert_eq!(
+            slash_ix.accounts[4].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert_eq!(
+            slash_ix.accounts[5].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert_eq!(slash_ix.accounts[6].pubkey, SPL_TOKEN_PROGRAM_ID);
+        assert_eq!(slash_ix.accounts[7].pubkey, authority);
+        assert!(slash_ix.accounts[7].is_signer);
+        assert_eq!(&slash_ix.data[..8], &discriminators::SLASH_VALIDATOR);
+        assert_eq!(&slash_ix.data[8..40], &validator.to_bytes());
+        assert_eq!(slash_ix.data[40], 25);
+
+        let rep_ix = create_update_reputation_instruction(&program_id, &authority, &validator, 900);
+        assert_eq!(rep_ix.accounts.len(), 3);
+        assert_eq!(&rep_ix.data[..8], &discriminators::UPDATE_REPUTATION);
+        assert_eq!(&rep_ix.data[8..40], &validator.to_bytes());
+        assert_eq!(&rep_ix.data[40..48], &900u64.to_le_bytes());
     }
 }

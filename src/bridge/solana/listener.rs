@@ -73,6 +73,11 @@ pub struct EventListener {
     /// Last slot number observed on a processed deposit. Reported via
     /// [`BridgeStats::last_block`] for operator visibility.
     last_processed_slot: Arc<RwLock<u64>>,
+
+    /// Active background poller task handle, if running. Stored so repeated
+    /// `start()` calls are idempotent and `stop()` can abort an in-flight poll
+    /// promptly.
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// State shared with the spawned poller task. Grouping it keeps the
@@ -116,6 +121,7 @@ impl EventListener {
             last_signature: Arc::new(RwLock::new(None)),
             seen_signatures: Arc::new(RwLock::new(HashSet::new())),
             last_processed_slot: Arc::new(RwLock::new(0)),
+            task_handle: None,
         }
     }
 
@@ -130,6 +136,17 @@ impl EventListener {
                 self.config.program_id, e
             ))
         })?;
+
+        if *self.running.read().await {
+            if let Some(ref handle) = self.task_handle {
+                if !handle.is_finished() {
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(prev) = self.task_handle.take() {
+            prev.abort();
+        }
 
         *self.running.write().await = true;
 
@@ -162,9 +179,11 @@ impl EventListener {
             cursor_path: self.config.cursor_path.clone(),
         };
         let running = Arc::clone(&self.running);
-        let poll_interval = self.config.poll_interval_secs;
+        // Clamp to at least 1 second so `tokio::time::interval` never panics on
+        // `Duration::ZERO` when `poll_interval_secs == 0`.
+        let poll_interval = self.config.poll_interval_secs.max(1);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(poll_interval));
 
             while *running.read().await {
@@ -190,6 +209,7 @@ impl EventListener {
                 }
             }
         });
+        self.task_handle = Some(handle);
 
         Ok(())
     }
@@ -197,6 +217,9 @@ impl EventListener {
     /// Stop listening
     pub async fn stop(&mut self) -> Result<()> {
         *self.running.write().await = false;
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
         Ok(())
     }
 
@@ -1545,5 +1568,31 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn start_clamps_zero_poll_interval_and_is_idempotent() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mut cfg = BridgeConfig::default();
+        cfg.program_id = Pubkey::new_unique().to_string();
+        cfg.poll_interval_secs = 0;
+        let mock = Arc::new(MockBridgeRpc::new());
+        let pool = Arc::new(ShieldedPool::new());
+        let stats = Arc::new(RwLock::new(BridgeStats::default()));
+        let mut listener = EventListener::new(cfg, mock, pool, stats);
+
+        listener.start().await.expect("start with 0 poll interval");
+        assert!(listener.task_handle.is_some());
+        // Yield once so the spawned task executes `interval(...)` without panicking.
+        tokio::task::yield_now().await;
+        assert!(
+            !listener.task_handle.as_ref().unwrap().is_finished(),
+            "poller task must stay alive and not panic on poll_interval_secs == 0"
+        );
+
+        // Second start() while running is a no-op and does not spawn a second task.
+        listener.start().await.expect("idempotent second start");
+        listener.stop().await.expect("stop");
+        assert!(listener.task_handle.is_none());
     }
 }

@@ -106,6 +106,21 @@ where
     }
 }
 
+/// Build the `RpcTransactionConfig` used by [`RealBridgeRpc::get_transaction`].
+///
+/// Explicitly pins `CommitmentConfig::finalized()` alongside
+/// `max_supported_transaction_version: Some(0)`: `SolanaBridge::new` constructs
+/// the shared `RpcClient` at `confirmed` commitment, so leaving `commitment:
+/// None` here would let `getTransaction` return optimistic (`confirmed`)
+/// transactions that have not yet reached finality.
+fn transaction_config(encoding: UiTransactionEncoding) -> RpcTransactionConfig {
+    RpcTransactionConfig {
+        encoding: Some(encoding),
+        commitment: Some(solana_sdk::commitment_config::CommitmentConfig::finalized()),
+        max_supported_transaction_version: Some(0),
+    }
+}
+
 #[async_trait]
 impl BridgeRpc for RealBridgeRpc {
     async fn get_signatures_for_address_with_config(
@@ -131,15 +146,7 @@ impl BridgeRpc for RealBridgeRpc {
     ) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
         let rpc = Arc::clone(&self.client);
         let sig = *signature;
-        // Request v0 (versioned) transaction support. Without
-        // `max_supported_transaction_version`, a versioned deposit tx makes
-        // `getTransaction` fail, which (since the fetch error now propagates)
-        // aborts the poll and wedges the listener cursor indefinitely.
-        let config = RpcTransactionConfig {
-            encoding: Some(encoding),
-            commitment: None,
-            max_supported_transaction_version: Some(0),
-        };
+        let config = transaction_config(encoding);
         blocking("getTransaction", move || {
             rpc_err(
                 "getTransaction",
@@ -216,6 +223,17 @@ impl BridgeRpc for RealBridgeRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_config_pins_finalized_commitment_and_v0_support() {
+        let cfg = transaction_config(UiTransactionEncoding::Json);
+        assert_eq!(cfg.encoding, Some(UiTransactionEncoding::Json));
+        assert_eq!(
+            cfg.commitment,
+            Some(solana_sdk::commitment_config::CommitmentConfig::finalized())
+        );
+        assert_eq!(cfg.max_supported_transaction_version, Some(0));
+    }
 
     #[tokio::test]
     async fn blocking_timed_errors_promptly_when_the_call_stalls() {

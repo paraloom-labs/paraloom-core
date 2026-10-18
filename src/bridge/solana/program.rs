@@ -130,8 +130,8 @@ impl ProgramInterface {
         ))
     }
 
-    /// Verify a deposit transaction exists on Solana
-    /// Confirm a deposit transaction landed on-chain without error.
+    /// Verify a deposit transaction exists on Solana and contains a valid
+    /// Paraloom deposit instruction targeting `self.program_id`.
     ///
     /// This is NOT an amount gate. `deposit_note` binds the deposited amount
     /// into the note commitment on-chain — the commitment is derived from the
@@ -139,7 +139,8 @@ impl ProgramInterface {
     /// no off-chain amount verification here, and this must not be used to gate
     /// funds. It previously took an `expected_amount` it never read and logged
     /// it as "verified"; that misleading parameter is removed (#623). Returns
-    /// whether the transaction succeeded.
+    /// whether the transaction succeeded on-chain AND decoded at least one
+    /// deposit instruction for `self.program_id`.
     pub async fn verify_deposit(&self, signature: &str) -> Result<bool> {
         log::debug!("Checking deposit transaction: {}", signature);
 
@@ -160,8 +161,20 @@ impl ProgramInterface {
             .is_some();
         if failed {
             log::warn!("Deposit transaction failed on-chain: {}", signature);
+            return Ok(false);
         }
-        Ok(!failed)
+
+        let events = super::decoder::extract_deposit_events(signature, &tx, &self.program_id);
+        if events.is_empty() {
+            log::warn!(
+                "Transaction {} succeeded on-chain but contains no Paraloom deposit instruction for program {}",
+                signature,
+                self.program_id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     /// Get account balance
@@ -184,21 +197,28 @@ impl ProgramInterface {
     }
 
     /// Whether a nullifier has already been spent on chain, i.e. whether its
-    /// PDA exists (#703).
+    /// `NullifierAccount` PDA exists and is validly initialized (#703).
     ///
-    /// This is how a losing submitter learns that the settlement it raced for
-    /// actually landed. Asking the chain is the only reliable way: the submit
-    /// failure surfaces from Anchor's `init` on an existing account, and its
-    /// text belongs to the runtime rather than to this program, so classifying
-    /// it by message means guessing at a string somebody else owns.
+    /// Layout: `discriminator[0..8]` (`sha256("account:NullifierAccount")[..8]`),
+    /// `nullifier[8..40]`, `used_at[40..48]`, `withdrawal_id[48..56]` (56 bytes).
     ///
-    /// A `get_account` failure is reported as "not spent" rather than as an
-    /// error: the caller uses this to decide whether a retry is pointless, and
-    /// an unreachable RPC is exactly when a retry is worth attempting.
+    /// A `get_account` failure or an uninitialized/mismatched account is
+    /// reported as "not spent" rather than as an error: the caller uses this to
+    /// decide whether a retry is pointless, and an unreachable or inconsistent
+    /// RPC response must never falsely abort settlement retries.
     pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
+        // sha256("account:NullifierAccount")[..8]
+        const NULLIFIER_ACCOUNT_DISC: [u8; 8] = [250, 31, 238, 177, 213, 98, 48, 172];
+        const NULLIFIER_ACCOUNT_MIN_LEN: usize = 8 + 32 + 8 + 8;
+
         let (pda, _) = Pubkey::find_program_address(&[b"nullifier", nullifier], &self.program_id);
         match self.rpc.get_account(&pda).await {
-            Ok(account) => account.owner == self.program_id,
+            Ok(account) => {
+                account.owner == self.program_id
+                    && account.data.len() >= NULLIFIER_ACCOUNT_MIN_LEN
+                    && account.data[0..8] == NULLIFIER_ACCOUNT_DISC
+                    && account.data[8..40] == *nullifier
+            }
             Err(_) => false,
         }
     }
@@ -226,7 +246,7 @@ impl ProgramInterface {
     /// `BridgeState` PDA. The version sits at byte offset 8..12 of the
     /// account data — Anchor prepends an 8-byte discriminator and the
     /// `program_version` field is intentionally placed first so this
-    /// read does not require deserialising the rest of the struct.
+    /// read does not require deserialising the struct.
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
         let account = self.rpc.get_account(&state_pda).await?;
@@ -274,29 +294,16 @@ mod tests {
         }
     }
 
-    // `test_program_interface_creation` used to sit here asserting
-    // `result.is_err() || result.is_ok()`, which is a logical constant. Its
-    // real property — construction succeeds for a well-formed program id — is
-    // exercised by every test below through `program_with_mock`, which
-    // `unwrap`s it.
-
-    /// `verify_deposit` reports whether the transaction succeeded on chain.
-    ///
-    /// Both arms, because the previous test with this name never called it: it
-    /// constructed a `ProgramInterface` and asserted that construction worked,
-    /// leaving `verify_deposit` at zero executed lines behind a green test
-    /// bearing its name. That matters here more than most — this is the helper
-    /// whose own doc records #623, where it took an `expected_amount` it never
-    /// read and logged it as "verified".
     #[tokio::test]
     async fn verify_deposit_distinguishes_a_succeeded_from_a_failed_transaction() {
         use crate::bridge::solana::test_support::synth_deposit_tx;
 
         let sig = Signature::new_unique();
-        let program_id = Pubkey::new_unique();
+        // Matches `program_with_mock`'s configured `"11111111111111111111111111111111"` program ID.
+        let program_id = Pubkey::default();
         let depositor = Pubkey::new_unique();
 
-        // A transaction with no `meta.err` is a landed deposit.
+        // A transaction targeting `program_id` with a deposit instruction and no `meta.err` verifies.
         let mock = Arc::new(MockBridgeRpc::new());
         *mock.next_get_transaction.lock().unwrap() = Some(Ok(synth_deposit_tx(
             sig,
@@ -312,14 +319,30 @@ mod tests {
                 .verify_deposit(&sig.to_string())
                 .await
                 .expect("rpc ok"),
-            "a transaction without meta.err must verify"
+            "a deposit transaction targeting the bridge program without meta.err must verify"
+        );
+
+        // A succeeded transaction targeting an unrelated program must NOT verify as a deposit.
+        let mock = Arc::new(MockBridgeRpc::new());
+        let wrong_program = Pubkey::new_unique();
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(synth_deposit_tx(
+            sig,
+            7,
+            &wrong_program,
+            &depositor,
+            1_000,
+            [9u8; 32],
+            [11u8; 32],
+        )));
+        assert!(
+            !program_with_mock(mock)
+                .verify_deposit(&sig.to_string())
+                .await
+                .expect("rpc ok"),
+            "a succeeded transaction that does not invoke the bridge deposit instruction must not verify"
         );
 
         // The same transaction carrying an on-chain error must not.
-        // `synth_deposit_tx` leaves `meta: None`, so the error has to be
-        // attached deliberately — the first version of this test mutated a meta
-        // that was never there and panicked, which is how it should fail, but it
-        // meant the branch went unexercised until this landed.
         let mock = Arc::new(MockBridgeRpc::new());
         let failed = crate::bridge::solana::test_support::with_tx_error(
             synth_deposit_tx(
@@ -341,6 +364,78 @@ mod tests {
                 .expect("rpc ok"),
             "a transaction whose meta carries an error must not verify"
         );
+    }
+
+    #[tokio::test]
+    async fn is_nullifier_spent_validates_owner_discriminator_length_and_nullifier_bytes() {
+        let nf = [0x42u8; 32];
+        let program_id = Pubkey::default();
+        let disc: [u8; 8] = [250, 31, 238, 177, 213, 98, 48, 172];
+
+        let mut valid_data = Vec::with_capacity(56);
+        valid_data.extend_from_slice(&disc);
+        valid_data.extend_from_slice(&nf);
+        valid_data.extend_from_slice(&123i64.to_le_bytes());
+        valid_data.extend_from_slice(&1u64.to_le_bytes());
+
+        // 1. Valid NullifierAccount -> true.
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data.clone(),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(program_with_mock(mock).is_nullifier_spent(&nf).await);
+
+        // 2. Truncated account (< 56 bytes) -> false.
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data[..40].to_vec(),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program_with_mock(mock).is_nullifier_spent(&nf).await);
+
+        // 3. Wrong discriminator -> false.
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut wrong_disc = valid_data.clone();
+        wrong_disc[0] ^= 0xFF;
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: wrong_disc,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program_with_mock(mock).is_nullifier_spent(&nf).await);
+
+        // 4. Stored nullifier mismatch -> false.
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut wrong_nf = valid_data.clone();
+        wrong_nf[8] ^= 0xFF;
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: wrong_nf,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program_with_mock(mock).is_nullifier_spent(&nf).await);
+
+        // 5. Wrong owner -> false.
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data,
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program_with_mock(mock).is_nullifier_spent(&nf).await);
     }
 
     /// An unparsable signature is rejected before any RPC call.
