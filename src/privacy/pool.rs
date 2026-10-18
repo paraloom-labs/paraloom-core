@@ -138,28 +138,27 @@ impl ShieldedPool {
             return Ok(commitment);
         }
 
-        // Add to commitment tree (auto-persists if storage available).
-        // Storage failure leaves the tree's in-memory state untouched
-        // and propagates here so the deposit fails atomically.
-        let _index = self.commitment_tree.insert(&commitment).await?;
+        // Calculate new supply before updating state or storage
+        let mut supplies = self.supplies.write().await;
+        let supply = supplies.entry(asset_id).or_insert(0);
+        let new_supply = supply
+            .checked_add(amount)
+            .ok_or_else(|| anyhow::anyhow!("supply overflow for asset {:?}", asset_id))?;
 
-        // Mark it credited before anything else reads the pool, in the same
-        // place the tree is appended.
+        // Atomically persist commitment to CF_MERKLE_TREE and new supply to CF_POOL_STATE.
+        // Storage failure leaves tree and pool in-memory state untouched and fails atomically.
+        let _index = self
+            .commitment_tree
+            .insert_with_supply(&commitment, &asset_id, new_supply)
+            .await?;
+
+        // In-memory state is only mutated after successful persistence
+        *supply = new_supply;
         self.deposited.write().await.insert(commitment.clone());
 
         // Store note
         let mut notes = self.notes.write().await;
         notes.insert(commitment.clone(), note);
-
-        // Credit this asset's supply
-        let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
-
-        // Persist the asset's supply to storage if available
-        if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
-        }
 
         Ok(commitment)
     }

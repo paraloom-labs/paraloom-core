@@ -230,6 +230,11 @@ pub mod paraloom_program {
             .lamports()
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        require!(
+            projected_vault_balance >= rent_floor,
+            BridgeError::InsufficientFunds
+        );
         require!(
             projected_vault_balance <= ctx.accounts.bridge_state.deposit_cap,
             BridgeError::DepositCapExceeded
@@ -807,8 +812,13 @@ pub mod paraloom_program {
         stake_amount: u64,
         token_stake_amount: u64,
     ) -> Result<()> {
+        let effective_min_stake = ctx
+            .accounts
+            .validator_registry
+            .minimum_stake
+            .max(MIN_VALIDATOR_STAKE);
         require!(
-            stake_amount >= MIN_VALIDATOR_STAKE,
+            stake_amount >= effective_min_stake,
             BridgeError::InsufficientStake
         );
         // Dual-stake: a validator slot requires locking the token half too
@@ -1081,7 +1091,27 @@ pub mod paraloom_program {
         } else {
             validator_account.unbonding_amount
         };
-        let slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
+        let raw_slash_amount = (old_stake as u128 * slash_percentage as u128 / 100) as u64;
+
+        // Rent-floor guard for slashed_funds_vault:
+        // slashed_funds_vault is an uninitialized 0-byte system PDA. If the post-transfer
+        // balance would end in 1..rent_floor, the Solana runtime aborts with InsufficientFundsForRent.
+        // Promote slash_amount to meet rent_floor if old_stake can cover it, or 0 if old_stake
+        // cannot cover it, preserving the token burn and validator slashing state transitions.
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        let vault_lamports = ctx.accounts.slashed_funds_vault.lamports();
+        let projected_vault_lamports = vault_lamports.saturating_add(raw_slash_amount);
+        let slash_amount = if projected_vault_lamports > 0 && projected_vault_lamports < rent_floor {
+            let needed = rent_floor.saturating_sub(vault_lamports);
+            if old_stake >= needed {
+                needed
+            } else {
+                0
+            }
+        } else {
+            raw_slash_amount
+        };
+
         // Slash the token half in the same proportion, off the at-risk token
         // balance (active stake for a live validator, unbonding balance once it
         // has left the set).
@@ -1119,8 +1149,9 @@ pub mod paraloom_program {
                     .token_unbonding_amount
                     .saturating_add(token_residual);
                 validator_account.token_stake_amount = 0;
+                let task_slot = Clock::get()?.slot;
                 validator_account.unbonding_slot =
-                    Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
+                    task_slot.saturating_add(UNBONDING_SLOTS);
             } else {
                 // Still active: only the slashed portion leaves the total.
                 let registry = &mut ctx.accounts.validator_registry;
@@ -1142,14 +1173,16 @@ pub mod paraloom_program {
         // vault's live balance, so routing forfeited SOL there would permanently
         // eat deposit headroom with no way back out. The slashed token half is
         // burned just below; this is the SOL parallel to that.
-        **validator_account
-            .to_account_info()
-            .try_borrow_mut_lamports()? -= slash_amount;
-        **ctx
-            .accounts
-            .slashed_funds_vault
-            .to_account_info()
-            .try_borrow_mut_lamports()? += slash_amount;
+        if slash_amount > 0 {
+            **validator_account
+                .to_account_info()
+                .try_borrow_mut_lamports()? -= slash_amount;
+            **ctx
+                .accounts
+                .slashed_funds_vault
+                .to_account_info()
+                .try_borrow_mut_lamports()? += slash_amount;
+        }
 
         // Burn the slashed token half from the vault, signed by the vault
         // authority. Burning is the strongest deterrent, needs no destination

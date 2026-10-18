@@ -7,6 +7,7 @@
 use crate::privacy::poseidon::poseidon_merkle_pair;
 use crate::privacy::types::{Commitment, MerklePath};
 use crate::storage::PrivacyStorage;
+use crate::types::AssetId;
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use std::sync::Arc;
@@ -100,6 +101,38 @@ impl MerkleTree {
                 );
                 e
             })?;
+        }
+
+        leaves.push(*commitment.as_bytes());
+
+        let mut cached_root = self.cached_root.write().await;
+        *cached_root = None;
+
+        Ok(index)
+    }
+
+    /// Insert a commitment as a leaf while atomically updating the asset's
+    /// supply in storage.
+    pub async fn insert_with_supply(
+        &self,
+        commitment: &Commitment,
+        asset_id: &AssetId,
+        supply: u64,
+    ) -> Result<usize, anyhow::Error> {
+        let mut leaves = self.leaves.write().await;
+        let index = leaves.len();
+
+        if let Some(storage) = &self.storage {
+            storage
+                .insert_commitment_with_supply(index as u64, commitment, asset_id, supply)
+                .map_err(|e| {
+                    log::error!(
+                        target: "paraloom::privacy::merkle",
+                        "failed to persist commitment and supply at index {}: {} — in-memory state not advanced",
+                        index, e
+                    );
+                    e
+                })?;
         }
 
         leaves.push(*commitment.as_bytes());
