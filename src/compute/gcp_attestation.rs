@@ -32,18 +32,38 @@ const CS_SWNAME: &str = "CONFIDENTIAL_SPACE";
 const CS_OIDC_CONFIG: &str =
     "https://confidentialcomputing.googleapis.com/.well-known/openid-configuration";
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EatNonceClaim {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl EatNonceClaim {
+    fn as_single_str(&self) -> Option<&str> {
+        match self {
+            Self::Single(s) => Some(s.as_str()),
+            Self::Multiple(items) if items.len() == 1 => Some(items[0].as_str()),
+            Self::Multiple(_) => None,
+        }
+    }
+}
+
 /// The claims we read out of the token. Registered claims (`iss`, `aud`, `exp`,
 /// `nbf`) are validated separately by [`Validation`]; this struct only carries
 /// the Confidential Space fields we additionally check.
 #[derive(Debug, Deserialize)]
 struct CsClaims {
     /// Hex of the value the workload bound into the token — our channel pubkey.
-    eat_nonce: String,
+    eat_nonce: EatNonceClaim,
     /// Software running the workload; must be `CONFIDENTIAL_SPACE`.
     swname: String,
     /// `"enabled"` on a debug image, `"disabled"` on a hardened one.
     #[serde(default)]
     dbgstat: String,
+    /// Secure boot status of the enclave VM, when present in the token.
+    #[serde(default)]
+    secboot: Option<bool>,
     submods: Submods,
 }
 
@@ -92,6 +112,9 @@ impl GcpConfidentialSpaceVerifier {
 
 impl AttestationVerifier for GcpConfidentialSpaceVerifier {
     fn verify(&self, attestation: &[u8], channel_pubkey: &[u8; 32]) -> bool {
+        if self.audience.trim().is_empty() || self.expected_image_digest.trim().is_empty() {
+            return false;
+        }
         let Ok(token) = std::str::from_utf8(attestation) else {
             return false;
         };
@@ -116,7 +139,10 @@ impl AttestationVerifier for GcpConfidentialSpaceVerifier {
         let claims = data.claims;
 
         // The binding: the token must vouch for exactly this channel key.
-        if claims.eat_nonce.to_lowercase() != hex::encode(channel_pubkey) {
+        let Some(eat_nonce) = claims.eat_nonce.as_single_str() else {
+            return false;
+        };
+        if eat_nonce.to_lowercase() != hex::encode(channel_pubkey) {
             return false;
         }
         // The enclave must be running exactly the workload we expect.
@@ -126,9 +152,15 @@ impl AttestationVerifier for GcpConfidentialSpaceVerifier {
         if claims.swname != CS_SWNAME {
             return false;
         }
-        // In production, refuse a debug image (its memory is inspectable).
-        if self.require_production && claims.dbgstat != "disabled" {
-            return false;
+        // In production, refuse a debug image (its memory is inspectable) or a
+        // VM with secure boot disabled.
+        if self.require_production {
+            if claims.dbgstat != "disabled" {
+                return false;
+            }
+            if claims.secboot == Some(false) {
+                return false;
+            }
         }
         true
     }
@@ -295,5 +327,54 @@ mod tests {
         let token = signed_token(|_| {});
         let empty = GcpConfidentialSpaceVerifier::new(HashMap::new(), AUDIENCE, IMAGE, true);
         assert!(!empty.verify(token.as_bytes(), &pubkey()));
+    }
+
+    #[test]
+    fn accepts_single_element_array_eat_nonce_and_rejects_multi_nonce_or_secboot_disabled() {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_string());
+        let enc_key = EncodingKey::from_rsa_pem(TEST_PRIV.as_bytes()).unwrap();
+
+        let mut single_arr_claims = serde_json::json!({
+            "iss": CS_ISSUER,
+            "aud": AUDIENCE,
+            "exp": 4_102_444_800u64,
+            "eat_nonce": [hex::encode(pubkey())],
+            "swname": CS_SWNAME,
+            "dbgstat": "disabled",
+            "secboot": true,
+            "submods": { "container": { "image_digest": IMAGE } }
+        });
+        let single_arr_tok = encode(&header, &single_arr_claims, &enc_key).unwrap();
+        assert!(verifier(true).verify(single_arr_tok.as_bytes(), &pubkey()));
+        single_arr_claims["eat_nonce"] = serde_json::json!([]);
+        let empty_nonce_tok = encode(&header, &single_arr_claims, &enc_key).unwrap();
+        assert!(!verifier(true).verify(empty_nonce_tok.as_bytes(), &pubkey()));
+
+
+        let multi_arr_claims = serde_json::json!({
+            "iss": CS_ISSUER,
+            "aud": AUDIENCE,
+            "exp": 4_102_444_800u64,
+            "eat_nonce": [hex::encode(pubkey()), "00".repeat(32)],
+            "swname": CS_SWNAME,
+            "dbgstat": "disabled",
+            "submods": { "container": { "image_digest": IMAGE } }
+        });
+        let multi_arr_tok = encode(&header, &multi_arr_claims, &enc_key).unwrap();
+        assert!(!verifier(true).verify(multi_arr_tok.as_bytes(), &pubkey()));
+
+        let no_secboot_claims = serde_json::json!({
+            "iss": CS_ISSUER,
+            "aud": AUDIENCE,
+            "exp": 4_102_444_800u64,
+            "eat_nonce": hex::encode(pubkey()),
+            "swname": CS_SWNAME,
+            "dbgstat": "disabled",
+            "secboot": false,
+            "submods": { "container": { "image_digest": IMAGE } }
+        });
+        let no_secboot_tok = encode(&header, &no_secboot_claims, &enc_key).unwrap();
+        assert!(!verifier(true).verify(no_secboot_tok.as_bytes(), &pubkey()));
     }
 }

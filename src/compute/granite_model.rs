@@ -82,10 +82,35 @@ impl ModelRunner for GraniteModelRunner {
         stream.read_to_end(&mut raw)?;
 
         let response = String::from_utf8_lossy(&raw);
-        let json_body = response
+        Self::parse_completion_http_response(&response)
+    }
+}
+
+impl GraniteModelRunner {
+    fn parse_completion_http_response(response: &str) -> Result<Vec<u8>> {
+        let (headers, json_body) = response
             .split_once("\r\n\r\n")
-            .map(|(_, body)| body)
             .ok_or_else(|| anyhow!("llama-server response had no body"))?;
+        let status_line = headers.lines().next().unwrap_or_default();
+        let mut status_parts = status_line.split_whitespace();
+        let version = status_parts.next();
+        let status_code = status_parts
+            .next()
+            .filter(|code| {
+                matches!(version, Some("HTTP/1.0" | "HTTP/1.1"))
+                    && code.len() == 3
+                    && code.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| {
+                anyhow!("llama-server returned malformed HTTP status line: {status_line}")
+            })?;
+        if !(200..300).contains(&status_code) {
+            return Err(anyhow!(
+                "llama-server returned HTTP {status_code}: {}",
+                json_body.trim()
+            ));
+        }
         let parsed: serde_json::Value = serde_json::from_str(json_body.trim())
             .map_err(|e| anyhow!("llama-server returned invalid JSON: {e}"))?;
         let content = parsed
@@ -114,6 +139,20 @@ mod tests {
         assert!(runner.run(b"hello").is_err());
     }
 
+    #[test]
+    fn rejects_non_2xx_http_status_from_llama_server() {
+        let err_resp =
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{\"content\":\"error text\"}";
+        assert!(GraniteModelRunner::parse_completion_http_response(err_resp).is_err());
+
+        let ok_resp =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"content\":\" ready \"}";
+        assert_eq!(
+            GraniteModelRunner::parse_completion_http_response(ok_resp).unwrap(),
+            b"ready"
+        );
+    }
+
     /// End-to-end against a real `llama-server`. Ignored by default — run locally
     /// with a server up, e.g.:
     /// `GRANITE_ENDPOINT=http://127.0.0.1:8080 cargo test -- --ignored real_granite`
@@ -128,4 +167,17 @@ mod tests {
             .expect("model ran");
         assert!(!out.is_empty());
     }
+    #[test]
+    fn rejects_malformed_or_empty_http_responses() {
+        for response in [
+            "",
+            "HTTP/1.1 200 OK",
+            "garbage 200 OK\r\n\r\n{}",
+            "HTTP/1.1 +200 OK\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n\r\n",
+        ] {
+            assert!(GraniteModelRunner::parse_completion_http_response(response).is_err(), "accepted {response:?}");
+        }
+    }
+
 }

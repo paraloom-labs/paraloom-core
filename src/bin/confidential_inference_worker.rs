@@ -128,12 +128,36 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
         }
     }
 
-    let resp = String::from_utf8_lossy(&resp);
-    let token = resp
+    parse_attestation_http_response(&resp)
+}
+
+fn parse_attestation_http_response(resp: &[u8]) -> Result<Vec<u8>> {
+    let resp = String::from_utf8_lossy(resp);
+    let (headers, body) = resp
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| anyhow!("attestation response had no token body"))?;
+        .ok_or_else(|| anyhow!("attestation response had no HTTP body"))?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts.next();
+    let status_code = status_parts
+        .next()
+        .filter(|code| {
+            matches!(version, Some("HTTP/1.0" | "HTTP/1.1"))
+                && code.len() == 3
+                && code.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("attestation response had malformed status line: {status_line}"))?;
+    if !(200..300).contains(&status_code) {
+        return Err(anyhow!(
+            "TEE launcher returned HTTP {status_code}: {}",
+            body.trim()
+        ));
+    }
+    let token = body.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("attestation response had no token body"));
+    }
     Ok(token.into_bytes())
 }
 
@@ -176,4 +200,34 @@ async fn main() -> Result<()> {
         .serve(app.into_make_service())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_2xx_launcher_attestation_response() {
+        let err = b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"bad nonce\"}";
+        assert!(parse_attestation_http_response(err).is_err());
+
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\neyJhbGciOiJSUzI1NiJ9.payload.sig\n";
+        assert_eq!(
+            parse_attestation_http_response(ok).unwrap(),
+            b"eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        );
+    }
+    #[test]
+    fn rejects_malformed_or_empty_http_responses() {
+        for response in [
+            "",
+            "HTTP/1.1 200 OK",
+            "garbage 200 OK\r\n\r\n{}",
+            "HTTP/1.1 +200 OK\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n\r\n",
+        ] {
+            assert!(parse_attestation_http_response(response.as_bytes()).is_err(), "accepted {response:?}");
+        }
+    }
+
 }

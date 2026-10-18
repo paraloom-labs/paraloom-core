@@ -100,6 +100,15 @@ impl VerificationCoordinator {
         job_id: JobId,
         validators: Vec<ValidatorId>,
     ) -> Result<VerificationRequest> {
+        let unique_validators: std::collections::HashSet<&ValidatorId> =
+            validators.iter().collect();
+        if unique_validators.len() != validators.len() {
+            return Err(anyhow!(
+                "Duplicate validator IDs in verification request for job {}",
+                job_id
+            ));
+        }
+
         if validators.len() < VERIFICATION_VALIDATOR_COUNT {
             return Err(anyhow!(
                 "Insufficient validators: need {}, got {}",
@@ -129,6 +138,15 @@ impl VerificationCoordinator {
         validator_id: ValidatorId,
         result: JobResult,
     ) -> Result<()> {
+        if &result.job_id != job_id {
+            return Err(anyhow!(
+                "Result job_id {} does not match target job {}; result from {} rejected",
+                result.job_id,
+                job_id,
+                validator_id
+            ));
+        }
+
         // Bind the result to the job's assigned validator set: only a validator
         // this job was actually assigned to may contribute a result. Without
         // this, any peer could inject results toward the consensus tally for a
@@ -201,49 +219,51 @@ impl VerificationCoordinator {
             });
         }
 
-        // Group results by output hash (for deterministic WASM)
+        // Group completed results by output bytes (deterministic WASM should produce same output).
+        // Failed or timed-out runs must never form an `Agreed` quorum or collide with a legitimate
+        // 0-byte `Some(vec![])` output.
         let mut result_groups: HashMap<Vec<u8>, Vec<&ValidatorResult>> = HashMap::new();
 
         for validator_result in job_results {
-            // Use output data as key (deterministic WASM should produce same output)
-            let key = match &validator_result.result.output_data {
-                Some(data) => data.clone(),
-                None => vec![], // Failed results group together
-            };
-
-            result_groups.entry(key).or_default().push(validator_result);
+            if validator_result.result.status == super::job::JobStatus::Completed {
+                if let Some(data) = &validator_result.result.output_data {
+                    result_groups
+                        .entry(data.clone())
+                        .or_default()
+                        .push(validator_result);
+                }
+            }
         }
 
-        // Find largest group (majority)
-        let (_majority_output, majority_results) = result_groups
+        // Find largest group of completed results (if any)
+        let max_completed = result_groups
             .iter()
-            .max_by_key(|(_, validators)| validators.len())
-            .ok_or_else(|| anyhow!("No results to compare"))?;
+            .max_by_key(|(_, validators)| validators.len());
 
-        // Check if majority reaches consensus threshold
-        if majority_results.len() >= CONSENSUS_THRESHOLD {
-            info!(
-                "Consensus reached for job {}: {}/{} validators agree",
-                job_id,
-                majority_results.len(),
-                job_results.len()
-            );
+        if let Some((_majority_output, majority_results)) = max_completed {
+            if majority_results.len() >= CONSENSUS_THRESHOLD {
+                info!(
+                    "Consensus reached for job {}: {}/{} validators agree",
+                    job_id,
+                    majority_results.len(),
+                    job_results.len()
+                );
 
-            // Return the first result from the majority group (they're all the same)
-            let consensus_result = majority_results[0].result.clone();
-            Ok(ConsensusResult::Agreed(consensus_result))
-        } else {
-            warn!(
-                "No consensus for job {}: largest group has {}/{} validators",
-                job_id,
-                majority_results.len(),
-                CONSENSUS_THRESHOLD
-            );
-
-            Ok(ConsensusResult::Disagreed {
-                results: job_results.clone(),
-            })
+                // Return the first result from the majority group (they're all the same)
+                let consensus_result = majority_results[0].result.clone();
+                return Ok(ConsensusResult::Agreed(consensus_result));
+            }
         }
+
+        let largest_len = max_completed.map(|(_, v)| v.len()).unwrap_or(0);
+        warn!(
+            "No consensus for job {}: largest completed group has {}/{} validators",
+            job_id, largest_len, CONSENSUS_THRESHOLD
+        );
+
+        Ok(ConsensusResult::Disagreed {
+            results: job_results.clone(),
+        })
     }
 
     /// Get verification request for a job
@@ -287,15 +307,12 @@ impl VerificationCoordinator {
                 continue;
             }
 
-            // Check if we have consensus (simplified check)
+            // Check if we have consensus over completed outputs
             let output_hashes: Vec<_> = validator_results
                 .iter()
+                .filter(|r| r.result.status == super::job::JobStatus::Completed)
                 .filter_map(|r| r.result.output_data.as_ref().cloned())
                 .collect();
-
-            if output_hashes.is_empty() {
-                continue;
-            }
 
             // Count matching outputs
             let mut hash_counts: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -564,5 +581,69 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_failed_results_do_not_form_agreed_consensus_or_collide_with_empty_output() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job-fail".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        let failed1 = JobResult::failure(job_id.clone(), "oom".to_string(), 10);
+        let failed2 = JobResult::failure(job_id.clone(), "timeout".to_string(), 20);
+        let empty_ok = JobResult::success(job_id.clone(), vec![], 15, 512, 1000);
+
+        coordinator
+            .submit_result(&job_id, "v1".to_string(), failed1)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job_id, "v2".to_string(), empty_ok)
+            .await
+            .unwrap();
+
+        // 1 failed (`None`) + 1 completed with `Some(vec![])` must not collide as `Agreed`
+        let c1 = coordinator.check_consensus(&job_id).await.unwrap();
+        assert!(matches!(c1, ConsensusResult::Disagreed { .. }));
+
+        // Adding a 2nd failed result must still be `Disagreed`, never `Agreed` on failure
+        coordinator
+            .submit_result(&job_id, "v3".to_string(), failed2)
+            .await
+            .unwrap();
+        let c2 = coordinator.check_consensus(&job_id).await.unwrap();
+        assert!(matches!(c2, ConsensusResult::Disagreed { .. }));
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.consensus_agreements, 0);
+        assert_eq!(stats.consensus_disagreements, 1);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_validators_and_mismatched_result_job_id_are_rejected() {
+        let coordinator = VerificationCoordinator::new();
+        let dup = vec!["v1".to_string(), "v1".to_string(), "v2".to_string()];
+        assert!(coordinator
+            .create_verification_request("job-dup".to_string(), dup)
+            .await
+            .is_err());
+
+        let job_id = "job-valid".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        let wrong_job_res = JobResult::success("other-job".to_string(), vec![1], 10, 128, 100);
+        assert!(coordinator
+            .submit_result(&job_id, "v1".to_string(), wrong_job_res)
+            .await
+            .is_err());
     }
 }

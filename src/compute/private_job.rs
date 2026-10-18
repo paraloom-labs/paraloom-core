@@ -80,15 +80,26 @@ impl PrivateComputeJob {
     ) -> Result<Self> {
         use sha2::{Digest, Sha256};
 
+        if input_data.len() > crate::compute::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Input data size {} exceeds maximum circuit capacity {}",
+                input_data.len(),
+                crate::compute::MAX_DATA_SIZE
+            ));
+        }
+
         // Compute code hash
         let code_hash: [u8; 32] = Sha256::digest(&wasm_code).into();
 
-        // Create commitment to input data
-        // Hash the data first to get a u64 value
-        let data_hash = Self::hash_data(&input_data);
+        // Create Poseidon commitment to input data matching ComputeCircuit
         let randomness = crate::privacy::pedersen::generate_randomness();
-        let input_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+        let input_hash_fr = crate::compute::ComputeCircuit::hash_data_to_field(&input_data);
+        let input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+            input_hash_fr,
+            &randomness,
+            &owner_address.0,
+        );
+        let input_commitment = Self::fr_to_commitment(input_commitment_fr);
 
         // Seal the input to the owner's X25519 public key with crypto_box
         // (X25519 + XSalsa20-Poly1305, via note_crypto::seal). Only the holder
@@ -110,6 +121,16 @@ impl PrivateComputeJob {
                 .unwrap()
                 .as_secs(),
         })
+    }
+
+    /// Convert a BN254 scalar field element into a canonical 32-byte little-endian `Commitment`.
+    fn fr_to_commitment(fe: ark_bn254::Fr) -> Commitment {
+        use ark_ff::BigInteger;
+        let bytes = fe.into_bigint().to_bytes_le();
+        let mut out = [0u8; 32];
+        let len = bytes.len().min(32);
+        out[..len].copy_from_slice(&bytes[..len]);
+        Commitment(out)
     }
 
     /// Convert to standard compute job (for execution)
@@ -191,6 +212,17 @@ pub struct PrivateJobResult {
 }
 
 impl PrivateJobResult {
+    /// Bind commitment randomness to the job and freshly randomized encrypted envelope.
+    fn derive_commitment_randomness(job_id: &str, encrypted_output: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"paraloom.private_job.output_commitment_randomness.v1");
+        hasher.update(job_id.as_bytes());
+        hasher.update(encrypted_output);
+        hasher.finalize().into()
+    }
+
     /// Create a private result from standard job result
     pub fn from_job_result(
         job_id: JobId,
@@ -201,18 +233,31 @@ impl PrivateJobResult {
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
 
-        // Create commitment to output
-        let data_hash = PrivateComputeJob::hash_data(&output_data);
-        let randomness = crate::privacy::pedersen::generate_randomness();
-        let output_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+        if output_data.len() > crate::compute::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Output data size {} exceeds maximum circuit capacity {}",
+                output_data.len(),
+                crate::compute::MAX_DATA_SIZE
+            ));
+        }
 
-        // Encrypt output
+        // Encrypt first so commitment randomness binds the output to its envelope.
         let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address)?;
+
+        // Create Poseidon commitment to output matching ComputeCircuit public input
+        let data_hash = PrivateComputeJob::hash_data(&output_data);
+        let randomness = Self::derive_commitment_randomness(&job_id, &encrypted_output);
+        let output_data_hash_fr = crate::compute::ComputeCircuit::hash_data_to_field(&output_data);
+        let output_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+            output_data_hash_fr,
+            &randomness,
+            &[0u8; 32],
+        );
+        let output_commitment = PrivateComputeJob::fr_to_commitment(output_commitment_fr);
 
         // Generate zkSNARK proof
         let execution_proof =
-            Self::generate_execution_proof(&result.job_id, &output_data, data_hash, &randomness)?;
+            Self::generate_execution_proof(&job_id, &output_data, data_hash, &randomness)?;
 
         Ok(Self {
             job_id,
@@ -569,7 +614,50 @@ impl PrivateJobCoordinator {
         // Step 3: Check multi-validator consensus (if enabled)
         if let Some(coordinator) = &self.verification_coordinator {
             match coordinator.check_consensus(&result.job_id).await? {
-                crate::compute::ConsensusResult::Agreed(_) => {
+                crate::compute::ConsensusResult::Agreed(agreed_result) => {
+                    if agreed_result.status != crate::compute::JobStatus::Completed {
+                        log::warn!(
+                            "Consensus result for job {} is not Completed: {:?}",
+                            result.job_id,
+                            agreed_result.status
+                        );
+                        return Ok(false);
+                    }
+                    let Some(agreed_output) = agreed_result.output_data.as_ref() else {
+                        log::warn!(
+                            "Consensus result for job {} is missing output data",
+                            result.job_id
+                        );
+                        return Ok(false);
+                    };
+                    let agreed_hash = PrivateComputeJob::hash_data(agreed_output);
+                    if agreed_hash != result.output_hash {
+                        log::warn!(
+                            "PrivateJobResult output_hash {} does not match validator consensus hash {} for job {}",
+                            result.output_hash,
+                            agreed_hash,
+                            result.job_id
+                        );
+                        return Ok(false);
+                    }
+                    let expected_randomness = PrivateJobResult::derive_commitment_randomness(
+                        &result.job_id,
+                        &result.encrypted_output,
+                    );
+                    let expected_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+                        crate::compute::ComputeCircuit::hash_data_to_field(agreed_output),
+                        &expected_randomness,
+                        &[0u8; 32],
+                    );
+                    let expected_commitment =
+                        PrivateComputeJob::fr_to_commitment(expected_commitment_fr);
+                    if result.output_commitment != expected_commitment {
+                        log::warn!(
+                            "PrivateJobResult output_commitment does not match validator consensus output and encrypted envelope for job {}",
+                            result.job_id
+                        );
+                        return Ok(false);
+                    }
                     log::info!(
                         "Multi-validator consensus reached for job {}",
                         result.job_id
@@ -1078,4 +1166,81 @@ mod tests {
             "Wrong key should fail decryption (authenticated encryption)"
         );
     }
+
+    #[tokio::test]
+    async fn test_verify_result_rejects_mismatched_consensus_output() {
+        use crate::compute::{JobResult, VerificationCoordinator};
+
+        let pool = Arc::new(ShieldedPool::new());
+        let verifier = Arc::new(VerificationCoordinator::new());
+        let coordinator = PrivateJobCoordinator::with_verification(pool, verifier.clone());
+
+        let job_id = "test-forged-output".to_string();
+        let owner_address = ShieldedAddress([66u8; 32]);
+        let validators = vec![
+            "validator-1".to_string(),
+            "validator-2".to_string(),
+            "validator-3".to_string(),
+        ];
+        verifier
+            .create_verification_request(job_id.clone(), validators.clone())
+            .await
+            .unwrap();
+
+        let agreed_output = vec![1, 2, 3, 4];
+        for v in &validators {
+            let res = JobResult::success(job_id.clone(), agreed_output.clone(), 100, 1024, 50000);
+            verifier.submit_result(&job_id, v.clone(), res).await.unwrap();
+        }
+
+        // Construct a PrivateJobResult claiming a DIFFERENT output for the same job_id
+        let forged_job_result =
+            JobResult::success(job_id.clone(), vec![9, 9, 9, 9], 100, 1024, 50000);
+        let mut forged_private =
+            PrivateJobResult::from_job_result(job_id, forged_job_result, &owner_address).unwrap();
+
+        assert!(!coordinator.verify_result(&forged_private).await.unwrap());
+        // Replacing the public hash cannot rebind the proven commitment to consensus.
+        forged_private.output_hash = PrivateComputeJob::hash_data(&agreed_output);
+        assert!(!coordinator.verify_result(&forged_private).await.unwrap());
+        assert!(coordinator.finalize_result(forged_private).await.is_err());
+    }
+
+    #[test]
+    fn test_poseidon_output_commitment_matches_circuit_public_input() {
+        let output_data = vec![11u8, 22, 33, 44];
+        let randomness = [7u8; 32];
+        let output_hash_fr = crate::compute::ComputeCircuit::hash_data_to_field(&output_data);
+        let expected_fr = crate::compute::ComputeCircuit::compute_commitment(
+            output_hash_fr,
+            &randomness,
+            &[0u8; 32],
+        );
+        let commitment = PrivateComputeJob::fr_to_commitment(expected_fr);
+        let recovered_fr = ark_bn254::Fr::from_le_bytes_mod_order(commitment.as_bytes());
+        assert_eq!(recovered_fr, expected_fr);
+    }
+    #[test]
+    fn private_data_capacity_boundaries() {
+        let owner = ShieldedAddress([42; 32]);
+        for size in [
+            0,
+            crate::compute::MAX_DATA_SIZE,
+            crate::compute::MAX_DATA_SIZE + 1,
+        ] {
+            let expected = size <= crate::compute::MAX_DATA_SIZE;
+            assert_eq!(
+                PrivateComputeJob::new(
+                    vec![], vec![1; size], owner.clone(), ResourceLimits::default()
+                ).is_ok(),
+                expected
+            );
+            let result = JobResult::success("capacity".into(), vec![1; size], 0, 0, 0);
+            assert_eq!(
+                PrivateJobResult::from_job_result("capacity".into(), result, &owner).is_ok(),
+                expected
+            );
+        }
+    }
+
 }
