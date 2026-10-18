@@ -412,28 +412,45 @@ impl Coordinator {
                 end,
                 algorithm,
             } => {
+                if end < start {
+                    return Err(anyhow::anyhow!(
+                        "invalid task range: start ({}) > end ({})",
+                        start,
+                        end
+                    ));
+                }
+
                 let validators = self.validators.lock().await;
                 let num_validators = validators.len().max(1);
-                let total = end - start + 1;
-                let chunk_size = total.div_ceil(num_validators as u64);
+
+                // Use u128 arithmetic to prevent overflow when start == 0 and end == u64::MAX
+                let total = (*end as u128) - (*start as u128) + 1;
+                let chunk_size = total.div_ceil(num_validators as u128);
 
                 let mut chunks = Vec::new();
                 let mut current_start = *start;
 
                 for i in 0..num_validators {
-                    let chunk_end = (current_start + chunk_size - 1).min(*end);
-
-                    if current_start <= *end {
-                        let mut chunk = Task::new(TaskType::HashCalculation {
-                            start: current_start,
-                            end: chunk_end,
-                            algorithm: algorithm.clone(),
-                        });
-                        chunk.id = format!("{}-chunk-{}", task.id, i);
-
-                        chunks.push(chunk);
-                        current_start = chunk_end + 1;
+                    if current_start > *end {
+                        break;
                     }
+
+                    let potential_end = (current_start as u128) + chunk_size - 1;
+                    let chunk_end = (potential_end.min(*end as u128)) as u64;
+
+                    let mut chunk = Task::new(TaskType::HashCalculation {
+                        start: current_start,
+                        end: chunk_end,
+                        algorithm: algorithm.clone(),
+                    });
+                    chunk.id = format!("{}-chunk-{}", task.id, i);
+
+                    chunks.push(chunk);
+
+                    if chunk_end == u64::MAX {
+                        break;
+                    }
+                    current_start = chunk_end + 1;
                 }
 
                 Ok(chunks)
@@ -624,14 +641,28 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Handle task error
-    pub async fn handle_task_error(&self, task_id: String, error: String) -> Result<()> {
-        info!("Task error: {} - {}", task_id, error);
+    /// Handle task error from validator
+    pub async fn handle_task_error(
+        &self,
+        source: &NodeId,
+        task_id: String,
+        error: String,
+    ) -> Result<()> {
+        info!("Task error: {} - {} from {:?}", task_id, error, source);
 
         let mut active = self.active_tasks.lock().await;
-        if let Some(task) = active.get_mut(&task_id) {
-            task.status = TaskStatus::Failed { error };
+        let task = active.get_mut(&task_id).ok_or_else(|| {
+            anyhow::anyhow!("error for unknown or inactive task {}", task_id)
+        })?;
+
+        if task.assigned_to.as_deref() != Some(format!("{:?}", source).as_str()) {
+            return Err(anyhow::anyhow!(
+                "task error for {} from a peer it was not assigned to",
+                task_id
+            ));
         }
+
+        task.status = TaskStatus::Failed { error };
 
         Ok(())
     }
@@ -1017,4 +1048,86 @@ mod tests {
             "parent_tasks lost across promotion"
         );
     }
+
+    #[tokio::test]
+    async fn split_task_rejects_inverted_range() {
+        let coordinator = Coordinator::new(make_test_network());
+        let task = Task::new(TaskType::HashCalculation {
+            start: 100,
+            end: 50,
+            algorithm: "sha256".to_string(),
+        });
+        let result = coordinator.split_task(&task).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid task range"));
+    }
+
+    #[tokio::test]
+    async fn split_task_u64_max_boundary_does_not_overflow() {
+        let coordinator = Coordinator::new(make_test_network());
+        let task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: u64::MAX,
+            algorithm: "sha256".to_string(),
+        });
+        let chunks = coordinator
+            .split_task(&task)
+            .await
+            .expect("should split without overflow");
+        assert!(!chunks.is_empty());
+        let last_chunk = chunks.last().unwrap();
+        match &last_chunk.task_type {
+            TaskType::HashCalculation { end, .. } => {
+                assert_eq!(*end, u64::MAX);
+            }
+            _ => panic!("unexpected task type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_task_error_requires_assigned_validator() {
+        let coordinator = Coordinator::new(make_test_network());
+        let assignee = NodeId(vec![0x42]);
+        let attacker = NodeId(vec![0xEE]);
+
+        // Error for unknown task rejected
+        assert!(coordinator
+            .handle_task_error(&assignee, "nonexistent".to_string(), "err".to_string())
+            .await
+            .is_err());
+
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "sha256".to_string(),
+        });
+        task.id = "t_err".to_string();
+        task.assigned_to = Some(format!("{:?}", assignee));
+        task.status = TaskStatus::Assigned;
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert("t_err".to_string(), task);
+
+        // Error from unassigned peer rejected
+        assert!(coordinator
+            .handle_task_error(&attacker, "t_err".to_string(), "err".to_string())
+            .await
+            .is_err());
+
+        // Error from assigned peer accepted
+        assert!(coordinator
+            .handle_task_error(&assignee, "t_err".to_string(), "err".to_string())
+            .await
+            .is_ok());
+
+        let active = coordinator.active_tasks.lock().await;
+        let stored = active.get("t_err").unwrap();
+        match &stored.status {
+            TaskStatus::Failed { error } => assert_eq!(error, "err"),
+            _ => panic!("expected failed status"),
+        }
+    }
 }
+
