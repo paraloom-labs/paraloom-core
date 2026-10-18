@@ -9,8 +9,8 @@
 use crate::privacy::types::Commitment;
 use ark_bn254::{Fq, Fr, G1Affine};
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::PrimeField;
-use ark_serialize::CanonicalSerialize;
+use ark_ff::{PrimeField, Zero};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::UniformRand;
 use sha2::{Digest, Sha256};
 
@@ -134,8 +134,26 @@ impl PedersenCommitment {
         Commitment(commitment_bytes)
     }
 
+    /// Check whether `randomness` reduces to a non-zero BN254 scalar.
+    ///
+    /// A zero scalar (`[0u8; 32]` or a multiple of `Fr::MODULUS`) annihilates
+    /// the blinding term `r * H`, leaving `C = value * G` completely unblinded
+    /// and collapsing `C` to the point at infinity when `value == 0`.
+    pub fn is_valid_randomness(randomness: &[u8; 32]) -> bool {
+        !Fr::from_le_bytes_mod_order(randomness).is_zero()
+    }
+
     /// Verify that a commitment opens to a specific value
     pub fn verify(&self, commitment: &Commitment, value: u64, randomness: &[u8; 32]) -> bool {
+        if !Self::is_valid_randomness(randomness) {
+            return false;
+        }
+        let Ok(point) = G1Affine::deserialize_compressed(&commitment.0[..]) else {
+            return false;
+        };
+        if point.is_zero() {
+            return false;
+        }
         let recomputed = self.commit(value, randomness);
         commitment == &recomputed
     }
@@ -143,13 +161,18 @@ impl PedersenCommitment {
     /// Generate cryptographically secure randomness
     pub fn generate_randomness() -> [u8; 32] {
         let mut rng = ark_std::rand::thread_rng();
-        let random_field = Fr::rand(&mut rng);
-        let mut bytes = [0u8; 32];
-        random_field
-            .into_bigint()
-            .serialize_compressed(&mut bytes[..])
-            .unwrap();
-        bytes
+        loop {
+            let random_field = Fr::rand(&mut rng);
+            if random_field.is_zero() {
+                continue;
+            }
+            let mut bytes = [0u8; 32];
+            random_field
+                .into_bigint()
+                .serialize_compressed(&mut bytes[..])
+                .unwrap();
+            return bytes;
+        }
     }
 }
 
@@ -374,6 +397,41 @@ mod tests {
         assert!(
             !pedersen.verify(&commitment, forged_value, &r_forged_bytes),
             "binding broken: commitment re-opened to a forged value"
+        );
+    }
+
+    #[test]
+    fn test_zero_and_modulus_randomness_and_identity_point_rejected() {
+        use ark_ff::BigInteger;
+
+        let pedersen = PedersenCommitment::new();
+
+        // 1. All-zero randomness reduces to Fr::ZERO (unblinded C = v*G) and must be rejected.
+        let zero_rand = [0u8; 32];
+        assert!(!PedersenCommitment::is_valid_randomness(&zero_rand));
+        let unblinded = pedersen.commit(1000, &zero_rand);
+        assert!(
+            !pedersen.verify(&unblinded, 1000, &zero_rand),
+            "unblinded zero-randomness commitment must not verify"
+        );
+
+        // 2. Non-zero byte array equal to Fr::MODULUS also reduces to Fr::ZERO and must be rejected.
+        let mod_le = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus_rand = [0u8; 32];
+        modulus_rand[..mod_le.len().min(32)].copy_from_slice(&mod_le[..mod_le.len().min(32)]);
+        assert_ne!(modulus_rand, zero_rand);
+        assert!(!PedersenCommitment::is_valid_randomness(&modulus_rand));
+        let mod_unblinded = pedersen.commit(1000, &modulus_rand);
+        assert!(
+            !pedersen.verify(&mod_unblinded, 1000, &modulus_rand),
+            "modulus-multiple randomness reducing to 0 mod Fr must not verify"
+        );
+
+        // 3. Identity point commitment (value = 0, randomness = 0 mod Fr) must not verify.
+        let identity_commitment = pedersen.commit(0, &zero_rand);
+        assert!(
+            !pedersen.verify(&identity_commitment, 0, &zero_rand),
+            "identity point commitment must not verify"
         );
     }
 }

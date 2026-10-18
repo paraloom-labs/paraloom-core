@@ -71,6 +71,9 @@ impl CommitmentBuilder {
     pub fn build(self) -> Result<Commitment, &'static str> {
         let value = self.value.ok_or("Value not set")?;
         let randomness = self.randomness.ok_or("Randomness not set")?;
+        if !pedersen::PedersenCommitment::is_valid_randomness(&randomness) {
+            return Err("Randomness must be non-zero scalar");
+        }
 
         Ok(CommitmentGenerator::commit(value, &randomness))
     }
@@ -204,5 +207,26 @@ mod tests {
 
         // Random blinding should produce different commitments
         assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn test_commitment_builder_rejects_zero_and_modulus_randomness() {
+        use ark_bn254::Fr;
+        use ark_ff::{BigInteger, PrimeField};
+
+        let zero_res = CommitmentBuilder::new()
+            .value(1000)
+            .randomness([0u8; 32])
+            .build();
+        assert_eq!(zero_res, Err("Randomness must be non-zero scalar"));
+
+        let mod_le = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus_rand = [0u8; 32];
+        modulus_rand[..mod_le.len().min(32)].copy_from_slice(&mod_le[..mod_le.len().min(32)]);
+        let mod_res = CommitmentBuilder::new()
+            .value(1000)
+            .randomness(modulus_rand)
+            .build();
+        assert_eq!(mod_res, Err("Randomness must be non-zero scalar"));
     }
 }

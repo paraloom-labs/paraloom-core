@@ -67,9 +67,13 @@ pub fn circom_poseidon_gadget(
     _cs: ConstraintSystemRef<Fr>,
     inputs: &[FpVar<Fr>],
 ) -> Result<FpVar<Fr>, SynthesisError> {
+    if inputs.is_empty() || inputs.len() > 12 {
+        return Err(SynthesisError::Unsatisfiable);
+    }
     let width = inputs.len() + 1;
+    let width_u8 = u8::try_from(width).map_err(|_| SynthesisError::Unsatisfiable)?;
     let params =
-        get_poseidon_parameters::<Fr>(width as u8).expect("circom Poseidon supports 1..=12 inputs");
+        get_poseidon_parameters::<Fr>(width_u8).map_err(|_| SynthesisError::Unsatisfiable)?;
 
     // state = [capacity=0, in0, in1, ...]
     let mut state: Vec<FpVar<Fr>> = Vec::with_capacity(width);
@@ -388,5 +392,41 @@ mod tests {
                 ins.len()
             );
         }
+    }
+
+    #[test]
+    fn circom_poseidon_gadget_rejects_invalid_widths_without_panicking() {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        assert!(
+            matches!(
+                circom_poseidon_gadget(cs.clone(), &[]),
+                Err(SynthesisError::Unsatisfiable)
+            ),
+            "empty input slice must return Err(SynthesisError::Unsatisfiable)"
+        );
+
+        let too_many: Vec<FpVar<Fr>> = (0..13)
+            .map(|i| FpVar::new_witness(cs.clone(), || Ok(Fr::from(i as u64))).unwrap())
+            .collect();
+        assert!(
+            matches!(
+                circom_poseidon_gadget(cs.clone(), &too_many),
+                Err(SynthesisError::Unsatisfiable)
+            ),
+            "arity > 12 must return Err(SynthesisError::Unsatisfiable)"
+        );
+
+        // Width 258 (inputs.len() == 257) previously truncated `width as u8` to 2
+        // and panicked with an index-out-of-bounds inside the round loop.
+        let wrap_u8: Vec<FpVar<Fr>> = (0..257)
+            .map(|i| FpVar::new_witness(cs.clone(), || Ok(Fr::from(i as u64))).unwrap())
+            .collect();
+        assert!(
+            matches!(
+                circom_poseidon_gadget(cs, &wrap_u8),
+                Err(SynthesisError::Unsatisfiable)
+            ),
+            "u8-wrapping arity must return Err(SynthesisError::Unsatisfiable)"
+        );
     }
 }

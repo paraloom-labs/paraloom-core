@@ -47,20 +47,39 @@ const SECTION_WIRE2LABEL: u32 = 3;
 /// Terms that repeat a wire are summed rather than emitted twice, and terms
 /// that cancel to zero are dropped — a duplicate wire index is not something
 /// the readers agree on how to handle.
-fn write_lc(out: &mut Vec<u8>, row: &[(Fr, usize)]) {
+fn write_lc(out: &mut Vec<u8>, row: &[(Fr, usize)], num_wires: usize) -> io::Result<()> {
     let mut terms: BTreeMap<usize, Fr> = BTreeMap::new();
     for (coeff, wire) in row {
+        if *wire >= num_wires {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "wire index {} is out of bounds for declared wire count {}",
+                    wire, num_wires
+                ),
+            ));
+        }
         *terms.entry(*wire).or_insert_with(Fr::zero) += coeff;
     }
     terms.retain(|_, coeff| !coeff.is_zero());
 
-    out.extend_from_slice(&(terms.len() as u32).to_le_bytes());
+    let term_count = u32::try_from(terms.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "linear combination term count overflows u32",
+        )
+    })?;
+    out.extend_from_slice(&term_count.to_le_bytes());
     for (wire, coeff) in terms {
-        out.extend_from_slice(&(wire as u32).to_le_bytes());
+        let wire_u32 = u32::try_from(wire).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "wire index overflows u32")
+        })?;
+        out.extend_from_slice(&wire_u32.to_le_bytes());
         let mut bytes = coeff.into_bigint().to_bytes_le();
         bytes.resize(FIELD_SIZE as usize, 0);
         out.extend_from_slice(&bytes);
     }
+    Ok(())
 }
 
 fn section(out: &mut impl Write, kind: u32, body: &[u8]) -> io::Result<()> {
@@ -72,8 +91,43 @@ fn section(out: &mut impl Write, kind: u32, body: &[u8]) -> io::Result<()> {
 /// Write `matrices` to `out` as a circom `.r1cs` file.
 pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io::Result<()> {
     let num_instance = matrices.num_instance_variables;
+    if num_instance == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "constraint matrices must include at least the constant-one instance wire",
+        ));
+    }
     let num_witness = matrices.num_witness_variables;
-    let num_wires = num_instance + num_witness;
+    let num_wires = num_instance.checked_add(num_witness).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "total wire count overflows usize",
+        )
+    })?;
+    let num_wires_u32 = u32::try_from(num_wires).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "total wire count overflows u32",
+        )
+    })?;
+    let num_pub_in_u32 = u32::try_from(num_instance - 1).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "public input count overflows u32",
+        )
+    })?;
+    let num_witness_u32 = u32::try_from(num_witness).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "witness variable count overflows u32",
+        )
+    })?;
+    let num_constraints_u32 = u32::try_from(matrices.num_constraints).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "constraint count overflows u32",
+        )
+    })?;
 
     out.write_all(MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
@@ -87,23 +141,23 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     let mut modulus = Fr::MODULUS.to_bytes_le();
     modulus.resize(FIELD_SIZE as usize, 0);
     header.extend_from_slice(&modulus);
-    header.extend_from_slice(&(num_wires as u32).to_le_bytes());
+    header.extend_from_slice(&num_wires_u32.to_le_bytes());
     header.extend_from_slice(&0u32.to_le_bytes());
-    header.extend_from_slice(&((num_instance - 1) as u32).to_le_bytes());
-    header.extend_from_slice(&(num_witness as u32).to_le_bytes());
+    header.extend_from_slice(&num_pub_in_u32.to_le_bytes());
+    header.extend_from_slice(&num_witness_u32.to_le_bytes());
     // Labels are a circom debugging aid mapping wires back to signal names in
     // the source. There is no source to map back to, so the map is the
     // identity and the count is simply the wire count.
     header.extend_from_slice(&(num_wires as u64).to_le_bytes());
-    header.extend_from_slice(&(matrices.num_constraints as u32).to_le_bytes());
+    header.extend_from_slice(&num_constraints_u32.to_le_bytes());
     section(out, SECTION_HEADER, &header)?;
 
     let mut constraints = Vec::new();
     let rows = |m: &Matrix<Fr>, i: usize| m.get(i).cloned().unwrap_or_default();
     for i in 0..matrices.num_constraints {
-        write_lc(&mut constraints, &rows(&matrices.a, i));
-        write_lc(&mut constraints, &rows(&matrices.b, i));
-        write_lc(&mut constraints, &rows(&matrices.c, i));
+        write_lc(&mut constraints, &rows(&matrices.a, i), num_wires)?;
+        write_lc(&mut constraints, &rows(&matrices.b, i), num_wires)?;
+        write_lc(&mut constraints, &rows(&matrices.c, i), num_wires)?;
     }
     section(out, SECTION_CONSTRAINTS, &constraints)?;
 
@@ -283,5 +337,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn write_r1cs_rejects_zero_instance_wires_and_out_of_bounds_wires() {
+        let zero_instance = ConstraintMatrices::<Fr> {
+            num_instance_variables: 0,
+            num_witness_variables: 1,
+            num_constraints: 0,
+            a_num_non_zero: 0,
+            b_num_non_zero: 0,
+            c_num_non_zero: 0,
+            a: Vec::new(),
+            b: Vec::new(),
+            c: Vec::new(),
+        };
+        let mut out = Vec::new();
+        let err = write_r1cs(&mut out, &zero_instance)
+            .expect_err("zero instance variables must return InvalidInput instead of underflowing");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let out_of_bounds_wire = ConstraintMatrices::<Fr> {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 0,
+            c_num_non_zero: 0,
+            a: vec![vec![(Fr::from(1u64), 2)]], // wire 2 >= num_wires (2)
+            b: vec![Vec::new()],
+            c: vec![Vec::new()],
+        };
+        let mut out2 = Vec::new();
+        let err2 = write_r1cs(&mut out2, &out_of_bounds_wire)
+            .expect_err("wire index >= num_wires must be rejected");
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidInput);
     }
 }

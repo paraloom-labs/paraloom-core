@@ -101,9 +101,11 @@ pub fn poseidon_hash_bytes(data: &[u8]) -> Fr {
     let config = get_poseidon_config();
     let mut sponge = PoseidonSponge::<Fr>::new(config);
 
-    // Convert bytes to field elements
-    // Pack bytes into field elements (31 bytes per element for safety)
-    let mut field_elements = Vec::new();
+    // Prepend byte-length framing before 31-byte chunk absorption so
+    // variable-length inputs that differ only by trailing zero bytes or
+    // sponge rate-padding chunks can never collide.
+    let mut field_elements = Vec::with_capacity(1 + data.len().div_ceil(31));
+    field_elements.push(Fr::from(data.len() as u64));
     for chunk in data.chunks(31) {
         let mut bytes = [0u8; 32];
         bytes[..chunk.len()].copy_from_slice(chunk);
@@ -144,6 +146,9 @@ pub fn poseidon_hash_field(input: &Fr) -> Fr {
 
 /// Hash multiple field elements
 pub fn poseidon_hash_fields(inputs: &[Fr]) -> Fr {
+    if inputs.is_empty() {
+        return Fr::from(0u64);
+    }
     let config = get_poseidon_config();
     let mut sponge = PoseidonSponge::<Fr>::new(config);
     let inputs_vec = inputs.to_vec();
@@ -948,5 +953,52 @@ mod tests {
         assert_eq!(domain::COMMITMENT, 1, "COMMITMENT tag changed");
         assert_eq!(domain::NULLIFIER, 2, "NULLIFIER tag changed");
         assert_eq!(domain::MERKLE_PAIR, 3, "MERKLE_PAIR tag changed");
+    }
+
+    #[test]
+    fn test_poseidon_hash_bytes_rejects_trailing_zero_and_rate_padding_collisions() {
+        // Partial chunk trailing zeros must not collide with shorter prefixes.
+        assert_ne!(
+            poseidon_hash(b"A"),
+            poseidon_hash(b"A\x00"),
+            "trailing zero byte must change digest"
+        );
+        assert_ne!(
+            poseidon_hash(b""),
+            poseidon_hash(&[0u8; 1]),
+            "empty slice must not collide with single zero byte"
+        );
+        assert_ne!(
+            poseidon_hash(b""),
+            poseidon_hash(&[0u8; 31]),
+            "empty slice must not collide with 31 zero bytes"
+        );
+        assert_ne!(
+            poseidon_hash(b""),
+            poseidon_hash(&[0u8; 62]),
+            "empty slice must not collide with 62 zero bytes"
+        );
+
+        // Appending a full 31-byte zero chunk (sponge rate padding boundary)
+        // must also produce a distinct digest.
+        let one_chunk = [1u8; 31];
+        let mut two_chunks = Vec::from(one_chunk);
+        two_chunks.extend_from_slice(&[0u8; 31]);
+        assert_ne!(
+            poseidon_hash(&one_chunk),
+            poseidon_hash(&two_chunks),
+            "appending a 31-byte zero chunk must change digest"
+        );
+    }
+
+    #[test]
+    fn test_poseidon_hash_fields_empty_matches_gadget() {
+        let native = poseidon_hash_fields(&[]);
+        let circuit = hash_gadget_value(&[]);
+        assert_eq!(native, Fr::from(0u64));
+        assert_eq!(
+            native, circuit,
+            "empty-input native poseidon_hash_fields must match poseidon_hash_gadget"
+        );
     }
 }
