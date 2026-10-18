@@ -5,6 +5,8 @@
 
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::*;
 
@@ -156,12 +158,33 @@ impl WasmEngine {
             }
         };
 
-        // Write input data to WASM memory (starting at offset 0)
+        // Write input data to WASM memory (starting at offset 0).
+        // If the module's initial memory is too small to hold `input_data`,
+        // fail cleanly with `JobResult::failure` instead of bubbling an `Err`
+        // out of `execute_job`.
         let input_ptr = 0i32;
-        let input_len = job.input_data.len() as i32;
+        let Ok(input_len) = i32::try_from(job.input_data.len()) else {
+            return Ok(JobResult::failure(
+                job.id.clone(),
+                format!("Input data length {} exceeds i32::MAX", job.input_data.len()),
+                start_time.elapsed().as_millis() as u64,
+            ));
+        };
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                warn!(
+                    "Failed to write {} bytes of input into WASM memory for job {}: {}",
+                    job.input_data.len(),
+                    job.id,
+                    e
+                );
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("Input data exceeds WASM linear memory capacity: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
@@ -269,17 +292,26 @@ impl WasmEngine {
     ) -> Result<i32> {
         // Set epoch deadline for timeout
         // Deadline is current epoch + timeout in ticks (1 tick = 1ms approximately)
-        let timeout_ticks = timeout.as_millis() as u64;
+        let timeout_ticks = std::cmp::max(1, timeout.as_millis() as u64);
         store.set_epoch_deadline(timeout_ticks);
 
-        // Start epoch incrementing in background
+        // Start epoch incrementing in background, and signal it to stop as soon
+        // as `func.call` finishes so short jobs do not leave a background thread
+        // incrementing the shared `Engine` epoch for `timeout_duration` (leaving
+        // it running would prematurely interrupt subsequent concurrent/sequential
+        // jobs sharing `self.engine`).
         let engine_handle = self.engine.clone();
         let timeout_duration = timeout;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
         let epoch_thread = std::thread::spawn(move || {
             let start = Instant::now();
-            while start.elapsed() < timeout_duration {
-                engine_handle.increment_epoch();
+            while !stop_clone.load(Ordering::Relaxed) && start.elapsed() < timeout_duration {
                 std::thread::sleep(Duration::from_millis(1));
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                engine_handle.increment_epoch();
             }
         });
 
@@ -292,8 +324,9 @@ impl WasmEngine {
             }
         });
 
-        // Clean up epoch thread (it will finish naturally)
-        drop(epoch_thread);
+        // Stop and join the epoch thread before returning
+        stop_flag.store(true, Ordering::Relaxed);
+        let _ = epoch_thread.join();
 
         result
     }
@@ -391,5 +424,25 @@ mod tests {
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn test_oversized_input_returns_failed_job_result_instead_of_err() {
+        let engine = WasmEngine::new().unwrap();
+
+        // Module with 0 initial memory pages (0 bytes capacity)
+        let wat = r#"
+            (module
+                (memory (export "memory") 0)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let job = ComputeJob::new(wasm_bytes, vec![1, 2, 3, 4], ResourceLimits::default());
+
+        let result = engine.execute_job(&job).expect("must return Ok(JobResult)");
+        assert!(matches!(result.status, JobStatus::Failed { .. }));
     }
 }
