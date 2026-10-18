@@ -67,9 +67,12 @@ pub fn circom_poseidon_gadget(
     _cs: ConstraintSystemRef<Fr>,
     inputs: &[FpVar<Fr>],
 ) -> Result<FpVar<Fr>, SynthesisError> {
+    if inputs.is_empty() || inputs.len() > 12 {
+        return Err(SynthesisError::Unsatisfiable);
+    }
     let width = inputs.len() + 1;
-    let params =
-        get_poseidon_parameters::<Fr>(width as u8).expect("circom Poseidon supports 1..=12 inputs");
+    let params = get_poseidon_parameters::<Fr>(width as u8)
+        .ok_or(SynthesisError::Unsatisfiable)?;
 
     // state = [capacity=0, in0, in1, ...]
     let mut state: Vec<FpVar<Fr>> = Vec::with_capacity(width);
@@ -388,5 +391,16 @@ mod tests {
                 ins.len()
             );
         }
+    }
+
+    #[test]
+    fn circom_poseidon_gadget_rejects_invalid_widths_without_panicking() {
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        assert!(circom_poseidon_gadget(cs.clone(), &[]).is_err());
+
+        let too_many: Vec<FpVar<Fr>> = (0..13)
+            .map(|i| FpVar::constant(Fr::from(i as u64)))
+            .collect();
+        assert!(circom_poseidon_gadget(cs.clone(), &too_many).is_err());
     }
 }

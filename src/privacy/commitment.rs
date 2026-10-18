@@ -72,7 +72,15 @@ impl CommitmentBuilder {
         let value = self.value.ok_or("Value not set")?;
         let randomness = self.randomness.ok_or("Randomness not set")?;
 
-        Ok(CommitmentGenerator::commit(value, &randomness))
+        if !pedersen::is_valid_randomness(&randomness) {
+            return Err("Randomness must be a valid non-zero blinding scalar");
+        }
+
+        let commitment = CommitmentGenerator::commit(value, &randomness);
+        if commitment.as_bytes() == &[0u8; 32] {
+            return Err("Commitment cannot be identity point");
+        }
+        Ok(commitment)
     }
 }
 
@@ -204,5 +212,25 @@ mod tests {
 
         // Random blinding should produce different commitments
         assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn test_commitment_builder_rejects_zero_and_modulus_randomness() {
+        use ark_ff::BigInteger;
+
+        let zero_res = CommitmentBuilder::new()
+            .value(100)
+            .randomness([0u8; 32])
+            .build();
+        assert!(zero_res.is_err());
+
+        let modulus_bytes = ark_bn254::Fr::MODULUS.to_bytes_le();
+        let mut modulus_randomness = [0u8; 32];
+        modulus_randomness.copy_from_slice(&modulus_bytes[..32]);
+        let mod_res = CommitmentBuilder::new()
+            .value(100)
+            .randomness(modulus_randomness)
+            .build();
+        assert!(mod_res.is_err());
     }
 }

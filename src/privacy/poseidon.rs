@@ -104,6 +104,9 @@ pub fn poseidon_hash_bytes(data: &[u8]) -> Fr {
     // Convert bytes to field elements
     // Pack bytes into field elements (31 bytes per element for safety)
     let mut field_elements = Vec::new();
+    // Prepend input byte length as framing to prevent trailing-zero & rate padding collisions
+    field_elements.push(Fr::from(data.len() as u64));
+
     for chunk in data.chunks(31) {
         let mut bytes = [0u8; 32];
         bytes[..chunk.len()].copy_from_slice(chunk);
@@ -144,6 +147,9 @@ pub fn poseidon_hash_field(input: &Fr) -> Fr {
 
 /// Hash multiple field elements
 pub fn poseidon_hash_fields(inputs: &[Fr]) -> Fr {
+    if inputs.is_empty() {
+        return Fr::from(0u64);
+    }
     let config = get_poseidon_config();
     let mut sponge = PoseidonSponge::<Fr>::new(config);
     let inputs_vec = inputs.to_vec();
@@ -948,5 +954,22 @@ mod tests {
         assert_eq!(domain::COMMITMENT, 1, "COMMITMENT tag changed");
         assert_eq!(domain::NULLIFIER, 2, "NULLIFIER tag changed");
         assert_eq!(domain::MERKLE_PAIR, 3, "MERKLE_PAIR tag changed");
+    }
+
+    #[test]
+    fn test_poseidon_hash_bytes_rejects_trailing_zero_and_rate_padding_collisions() {
+        let h1 = poseidon_hash(b"A");
+        let h2 = poseidon_hash(b"A\x00");
+        assert_ne!(h1, h2, "trailing zero collision detected");
+
+        let h_empty = poseidon_hash(b"");
+        let h_zero = poseidon_hash(&[0u8; 1]);
+        assert_ne!(h_empty, h_zero, "empty input collides with zero byte");
+    }
+
+    #[test]
+    fn test_poseidon_hash_fields_empty_matches_gadget() {
+        let native = poseidon_hash_fields(&[]);
+        assert_eq!(native, Fr::from(0u64));
     }
 }

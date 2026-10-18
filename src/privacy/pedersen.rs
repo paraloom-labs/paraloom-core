@@ -134,22 +134,41 @@ impl PedersenCommitment {
         Commitment(commitment_bytes)
     }
 
+    /// Check whether a randomness byte array produces a non-zero blinding scalar.
+    ///
+    /// Randomness of [0u8; 32] or multiples of Fr::MODULUS reduce to Fr::ZERO,
+    /// annihilating the blinding factor and allowing trivial brute-force recovery.
+    pub fn is_valid_randomness(randomness: &[u8; 32]) -> bool {
+        let scalar = Fr::from_le_bytes_mod_order(randomness);
+        !scalar.is_zero()
+    }
+
     /// Verify that a commitment opens to a specific value
     pub fn verify(&self, commitment: &Commitment, value: u64, randomness: &[u8; 32]) -> bool {
+        if !Self::is_valid_randomness(randomness) {
+            return false;
+        }
         let recomputed = self.commit(value, randomness);
+        if recomputed.as_bytes() == &[0u8; 32] {
+            return false;
+        }
         commitment == &recomputed
     }
 
     /// Generate cryptographically secure randomness
     pub fn generate_randomness() -> [u8; 32] {
         let mut rng = ark_std::rand::thread_rng();
-        let random_field = Fr::rand(&mut rng);
-        let mut bytes = [0u8; 32];
-        random_field
-            .into_bigint()
-            .serialize_compressed(&mut bytes[..])
-            .unwrap();
-        bytes
+        loop {
+            let random_field = Fr::rand(&mut rng);
+            if !random_field.is_zero() {
+                let mut bytes = [0u8; 32];
+                random_field
+                    .into_bigint()
+                    .serialize_compressed(&mut bytes[..])
+                    .unwrap();
+                return bytes;
+            }
+        }
     }
 }
 
@@ -171,6 +190,11 @@ pub fn commit(value: u64, randomness: &[u8; 32]) -> Commitment {
 /// Verify a commitment using the global Pedersen instance
 pub fn verify(commitment: &Commitment, value: u64, randomness: &[u8; 32]) -> bool {
     PEDERSEN.verify(commitment, value, randomness)
+}
+
+/// Validate randomness scalar
+pub fn is_valid_randomness(randomness: &[u8; 32]) -> bool {
+    PedersenCommitment::is_valid_randomness(randomness)
 }
 
 /// Generate secure randomness
@@ -375,5 +399,24 @@ mod tests {
             !pedersen.verify(&commitment, forged_value, &r_forged_bytes),
             "binding broken: commitment re-opened to a forged value"
         );
+    }
+
+    #[test]
+    fn test_zero_and_modulus_randomness_and_identity_point_rejected() {
+        let pedersen = PedersenCommitment::new();
+        let zero_randomness = [0u8; 32];
+        assert!(!PedersenCommitment::is_valid_randomness(&zero_randomness));
+
+        let modulus_bytes = Fr::MODULUS.to_bytes_le();
+        let mut modulus_randomness = [0u8; 32];
+        modulus_randomness.copy_from_slice(&modulus_bytes[..32]);
+        assert!(!PedersenCommitment::is_valid_randomness(&modulus_randomness));
+
+        let valid_randomness = [5u8; 32];
+        assert!(PedersenCommitment::is_valid_randomness(&valid_randomness));
+
+        let c = pedersen.commit(100, &valid_randomness);
+        assert!(!pedersen.verify(&c, 100, &zero_randomness));
+        assert!(!pedersen.verify(&c, 100, &modulus_randomness));
     }
 }
