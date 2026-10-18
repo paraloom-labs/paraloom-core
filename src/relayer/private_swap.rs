@@ -401,33 +401,10 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
-        // Step 1: withdraw the spent note to the fresh address via a v3
-        // transact. The submitter takes the note's v3 spend witness, proves the
-        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
-        // the nullifier burn severs the deposit -> fresh-address link on-chain.
-        let withdraw_leg = self
-            .submitter
-            .submit_withdraw_to_fresh(
-                in_leg,
-                amount_in,
-                request.in_sk,
-                request.in_blinding,
-                request.in_note_pubkey,
-                request.in_leaf_index,
-                fresh_address,
-            )
-            .await?;
-
-        // Step 2: swap on public liquidity from the fresh address. The provider
-        // signs and submits the public trade from `ephemeral`, so the trade
-        // originates at the unlinkable fresh address.
-        //
-        // The on-chain withdraw deducts the protocol withdrawal fee
-        // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
-        // fresh address holds `amount_in - fee`, not the gross note value.
-        // Swapping the gross amount would exceed the fresh address's balance and
-        // fail *after* the nullifier is already burned, stranding the funds —
-        // so the swap trades the realized post-fee amount.
+        // Pre-validate that amount_in covers the protocol withdrawal fee and native
+        // swap overhead BEFORE withdrawing to fresh address. If validation fails post-
+        // withdrawal, the note's nullifier is already permanently burned on-chain and
+        // the ephemeral keypair is discarded, leaving user funds irrecoverably stranded.
         let withdrawal_fee = amount_in
             .checked_mul(WITHDRAWAL_FEE_BPS)
             .map(|x| x / 10_000)
@@ -449,6 +426,27 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         } else {
             withdrawn
         };
+
+        // Step 1: withdraw the spent note to the fresh address via a v3
+        // transact. The submitter takes the note's v3 spend witness, proves the
+        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
+        // the nullifier burn severs the deposit -> fresh-address link on-chain.
+        let withdraw_leg = self
+            .submitter
+            .submit_withdraw_to_fresh(
+                in_leg,
+                amount_in,
+                request.in_sk,
+                request.in_blinding,
+                request.in_note_pubkey,
+                request.in_leaf_index,
+                fresh_address,
+            )
+            .await?;
+
+        // Step 2: swap on public liquidity from the fresh address. The provider
+        // signs and submits the public trade from `ephemeral`, so the trade
+        // originates at the unlinkable fresh address.
         let swap = self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
@@ -742,6 +740,19 @@ mod tests {
             .await
             .expect_err("overhead consuming the whole note must fail, not swap 0");
         assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+        // Confirm no on-chain withdrawal was submitted when pre-flight validation fails
+        assert_eq!(relayer.submitter.recorded().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn insufficient_amount_rejects_before_nullifier_burn() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let err = relayer
+            .execute(request(native_note(0), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("zero amount must fail");
+        assert!(matches!(err, RelayerError::InvalidAmount(0)));
+        assert_eq!(relayer.submitter.recorded().len(), 0);
     }
 
     #[tokio::test]
