@@ -55,7 +55,9 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
 
-use crate::privacy::poseidon::{poseidon_commit_gadget, poseidon_nullifier_gadget};
+use crate::privacy::poseidon::{
+    poseidon_commit_gadget, poseidon_nullifier_gadget, poseidon_pubkey, poseidon_pubkey_gadget,
+};
 
 /// Maximum data size for circuit (in bytes)
 pub const MAX_DATA_SIZE: usize = 1024;
@@ -177,6 +179,25 @@ impl ComputeCircuit {
         Fr::from_le_bytes_mod_order(&hash)
     }
 
+    /// Derive the canonical owner address field element from a 32-byte
+    /// spending key: `Poseidon(domain::PUBKEY, Fr::from_le_bytes_mod_order(spending_key))`.
+    pub fn derive_owner_address(spending_key: &[u8; 32]) -> Fr {
+        let secret = Fr::from_le_bytes_mod_order(spending_key);
+        poseidon_pubkey(secret)
+    }
+
+    /// Derive the canonical 32-byte owner address encoding from a 32-byte
+    /// spending key so host-side commitments match the in-circuit ownership
+    /// constraint `owner_address == Poseidon(PUBKEY, spending_key)`.
+    pub fn derive_owner_address_bytes(spending_key: &[u8; 32]) -> [u8; 32] {
+        use ark_ff::BigInteger;
+        let owner_fr = Self::derive_owner_address(spending_key);
+        let bytes = owner_fr.into_bigint().to_bytes_le();
+        let mut out = [0u8; 32];
+        out[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
+        out
+    }
+
     /// Host-side commitment used by the privacy layer's `Note` shape:
     /// `Poseidon(COMMITMENT_TAG, data_hash, randomness, owner, asset_id)`.
     /// Mirrors `Note::commitment` exactly so a note minted by a
@@ -210,34 +231,26 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
         // Public input 1: code hash.
         //
-        // Structurally allocated as a single `FpVar<Fr>` (was previously
-        // 32 UInt8 slots), matching the rest of the shielded-pool
-        // circuits post-Poseidon-migration. Currently unused in
-        // constraints — the slot is reserved so that, once a
-        // code-authentication constraint is added, the public-input
-        // layout does not shift under existing verifiers. Callers must
-        // pass `Fr::from_le_bytes_mod_order(&code_hash_bytes)`.
-        let _code_hash_var = FpVar::new_input(cs.clone(), || {
+        // Structurally allocated as a single `FpVar<Fr>` and bound into R1CS via
+        // a quadratic gate so Groth16 setup/proving cannot leave the public-input
+        // wire unconstrained.
+        let code_hash_var = FpVar::new_input(cs.clone(), || {
             Ok(self
                 .code_hash
                 .map(|b| Fr::from_le_bytes_mod_order(&b))
-                .unwrap_or_else(|| Fr::from(0u64)))
+                .unwrap_or_default())
         })?;
+        let _code_hash_sq = &code_hash_var * &code_hash_var;
 
-        let input_commitment_var = FpVar::new_input(cs.clone(), || {
-            self.input_commitment
-                .ok_or(SynthesisError::AssignmentMissing)
-        })?;
+        let input_commitment_var =
+            FpVar::new_input(cs.clone(), || Ok(self.input_commitment.unwrap_or_default()))?;
 
         let output_commitment_var = FpVar::new_input(cs.clone(), || {
-            self.output_commitment
-                .ok_or(SynthesisError::AssignmentMissing)
+            Ok(self.output_commitment.unwrap_or_default())
         })?;
 
-        let input_nullifier_var = FpVar::new_input(cs.clone(), || {
-            self.input_nullifier
-                .ok_or(SynthesisError::AssignmentMissing)
-        })?;
+        let input_nullifier_var =
+            FpVar::new_input(cs.clone(), || Ok(self.input_nullifier.unwrap_or_default()))?;
 
         // ── Private witnesses ──
         let input_data = self.input_data.unwrap_or_default();
@@ -245,8 +258,10 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
 
         let input_randomness = self.input_randomness.unwrap_or([0u8; 32]);
         let output_randomness = self.output_randomness.unwrap_or([0u8; 32]);
-        let owner_address = self.owner_address.unwrap_or([0u8; 32]);
         let spending_key = self.spending_key.unwrap_or([0u8; 32]);
+        let owner_address = self
+            .owner_address
+            .unwrap_or_else(|| Self::derive_owner_address_bytes(&spending_key));
 
         let input_hash_var =
             FpVar::new_witness(cs.clone(), || Ok(Self::hash_data_to_field(&input_data)))?;
@@ -266,23 +281,15 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
             Ok(Fr::from_le_bytes_mod_order(&spending_key))
         })?;
 
+        // CONSTRAINT 0: spending_key must derive owner_address via Poseidon(PUBKEY, spending_key).
+        // Prevents an attacker from pairing a victim's owner_address with an arbitrary
+        // attacker-chosen spending_key to forge a valid proof and distinct nullifier.
+        let derived_owner_var = poseidon_pubkey_gadget(cs.clone(), &spending_key_var)?;
+        derived_owner_var.enforce_equal(&owner_address_var)?;
+
         // CONSTRAINT 1: input commitment is well-formed against the
         // (data_hash, randomness, owner) Poseidon commitment scheme
         // shared with the privacy layer's `Note::commitment`.
-        //
-        // The audit (#63) called for "Pedersen commitment gadget"; the
-        // architectural decision documented in this PR is to use the
-        // privacy layer's Poseidon scheme everywhere — implementing a
-        // BN254-G1 Pedersen gadget inside an Fr-based circuit is
-        // impractical (non-native field arithmetic), and the privacy
-        // layer's v0.2 Poseidon migration already replaced Pedersen on
-        // the host side for the same reason. Aligning the compute
-        // commitment with `Note::commitment` makes notes
-        // interchangeable across the deposit / transfer / compute
-        // paths.
-        // Compute notes are native-SOL: bind the sentinel asset_id (all-zero)
-        // as the 5th commitment input, matching `compute_commitment` and the
-        // deposit/withdraw native path (#235).
         let asset_id_var = FpVar::constant(Fr::from(0u64));
         let computed_input_commitment = poseidon_commit_gadget(
             cs.clone(),
@@ -407,8 +414,8 @@ mod tests {
     async fn test_compute_circuit_native_circuit_equivalence() {
         use ark_relations::r1cs::ConstraintSystem;
 
-        let owner = [0xA1u8; 32];
         let spending_key = [0xA5u8; 32];
+        let owner = ComputeCircuit::derive_owner_address_bytes(&spending_key);
         let input_data = b"deadbeef".to_vec();
         let input_randomness = [0x11u8; 32];
         let output_data = b"cafebabe".to_vec();
@@ -429,9 +436,9 @@ mod tests {
             input_commitment,
             output_commitment,
             input_nullifier,
-            input_data,
+            input_data.clone(),
             input_randomness,
-            output_data,
+            output_data.clone(),
             output_randomness,
             owner,
             spending_key,
@@ -445,11 +452,42 @@ mod tests {
             cs.is_satisfied().expect("cs query"),
             "compute circuit must be satisfied by host-aligned witnesses"
         );
+
+        // Regression test (#1071): pairing a victim's owner_address with an
+        // unrelated attacker spending_key must NOT satisfy the circuit.
+        let attacker_spending_key = [0xEEu8; 32];
+        let forged_nullifier =
+            ComputeCircuit::compute_nullifier(input_commitment, &attacker_spending_key);
+        let forged_circuit = ComputeCircuit::with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            forged_nullifier,
+            input_data,
+            input_randomness,
+            output_data,
+            output_randomness,
+            owner,
+            attacker_spending_key,
+        );
+        let forged_cs = ConstraintSystem::<Fr>::new_ref();
+        forged_circuit
+            .generate_constraints(forged_cs.clone())
+            .expect("forged constraint synthesis");
+        assert!(
+            !forged_cs.is_satisfied().expect("forged cs query"),
+            "mismatched spending_key and owner_address must fail R1CS constraints"
+        );
     }
 
-    // The proof-generation smoke test that previously sat here was
-    // commented out with "TODO: Fix RNG version conflict". Untangling
-    // the `rand` major-version mismatch between arkworks 0.4 and the
-    // workspace dependency tree is a separate concern from #63 and
-    // covered under the broader operational hardening epic (#69).
+    #[test]
+    fn test_empty_setup_circuit_synthesizes_cleanly() {
+        use ark_relations::r1cs::{ConstraintSystem, SynthesisMode};
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        cs.set_mode(SynthesisMode::Setup);
+        ComputeCircuit::new()
+            .generate_constraints(cs)
+            .expect("empty setup circuit must synthesize without AssignmentMissing");
+    }
 }

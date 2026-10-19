@@ -302,8 +302,9 @@ impl PrivateJobResult {
             let dummy_code_hash = [0u8; 32];
             let dummy_input = vec![0u8];
             let dummy_input_randomness = [0u8; 32];
-            let dummy_owner = [0u8; 32];
             let dummy_spending_key = [0u8; 32];
+            let dummy_owner =
+                crate::compute::ComputeCircuit::derive_owner_address_bytes(&dummy_spending_key);
 
             let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
             let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
@@ -416,8 +417,9 @@ impl PrivateJobResult {
 
             let dummy_input = vec![0u8];
             let dummy_input_randomness = [0u8; 32];
-            let dummy_owner = [0u8; 32];
             let dummy_spending_key = [0u8; 32];
+            let dummy_owner =
+                crate::compute::ComputeCircuit::derive_owner_address_bytes(&dummy_spending_key);
 
             let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
             let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
