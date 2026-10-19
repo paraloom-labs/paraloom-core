@@ -240,6 +240,25 @@ impl VoteTally {
         }
         out
     }
+
+    /// The `(wallet_pubkey, NodeId)` pairs that voted `Valid` **and** are in
+    /// `eligible_wallets`. Returning both the vote-bound wallet key and the
+    /// authenticated `node_id` ensures settlement co-signing uses the exact
+    /// wallet that signed the vote rather than re-looking up a mutable
+    /// `leader_selector` entry.
+    pub async fn valid_voter_peers(
+        &self,
+        eligible_wallets: &HashSet<String>,
+    ) -> Vec<(String, NodeId)> {
+        let votes = self.votes.read().await;
+        let mut out = Vec::new();
+        for (wallet, rec) in votes.iter() {
+            if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
+                out.push((wallet.clone(), rec.node_id.clone()));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

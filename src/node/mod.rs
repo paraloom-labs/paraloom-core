@@ -2417,21 +2417,23 @@ impl Node {
         let (vault, _) = derive_bridge_vault(&program_id);
 
         // The validators that approved this transact become the co-signer
-        // quorum, mapped to their advertised settlement wallets; the leader
-        // signs as itself and is excluded from the peers it requests from.
+        // quorum, mapped directly from their vote-bound settlement wallets;
+        // the leader signs as itself and is excluded by both NodeId and pubkey.
         let self_id = self.node_info.id.clone();
+        let leader_pubkey = leader.pubkey();
         let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&request.request_id).await {
+        for (wallet, voter) in coordinator.valid_voter_peers(&request.request_id).await {
             if voter == self_id {
                 continue;
             }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
+            if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                if pubkey == leader_pubkey || peers.iter().any(|(w, _)| *w == pubkey) {
+                    continue;
                 }
+                peers.push((pubkey, voter));
             }
         }
-        let mut quorum_wallets = vec![leader.pubkey()];
+        let mut quorum_wallets = vec![leader_pubkey];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
         let threshold = quorum_wallets.len();
 

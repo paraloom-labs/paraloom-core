@@ -520,10 +520,40 @@ impl TransactVerificationCoordinator {
     /// The eligibility basis for counting: the staked on-chain co-sign wallets
     /// minus any banned for equivocation. Replaces the flap-prone
     /// `active_snapshot()` NodeId set at every tally call site.
+    ///
+    /// When `onchain_wallets` is still empty (pre-first-snapshot / unit tests),
+    /// falls back to the registered validator wallets and recorded tally wallets
+    /// minus equivocators, matching the fail-open behavior of `submit_result`,
+    /// `register_validator_with_wallet`, and `source_is_onchain_validator`.
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
         let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        if !onchain.is_empty() {
+            return onchain.difference(&equivocators).cloned().collect();
+        }
+        let mut fallback = HashSet::new();
+        {
+            let sel = self.leader_selector.read().await;
+            for v in sel.get_validators_by_weight() {
+                if let Some(w) = &v.wallet_pubkey {
+                    if !equivocators.contains(w) {
+                        fallback.insert(w.clone());
+                    }
+                }
+            }
+        }
+        {
+            let pending = self.pending.read().await;
+            for c in pending.values() {
+                let votes = c.tally.votes.read().await;
+                for w in votes.keys() {
+                    if !equivocators.contains(w) {
+                        fallback.insert(w.clone());
+                    }
+                }
+            }
+        }
+        fallback
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -740,6 +770,23 @@ impl TransactVerificationCoordinator {
             Some(consensus) => {
                 let eligible = self.eligible_wallets().await;
                 consensus.tally.valid_voters(&eligible).await
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The `(wallet_pubkey, NodeId)` pairs that voted `Valid` on a transact and
+    /// are in `eligible_wallets`. Returning the vote-bound wallet directly from
+    /// the tally prevents `cosign_settlement_transact_tx` from re-resolving via
+    /// `leader_selector.get_validator(node_id)`, which can be clobbered by an
+    /// unauthenticated Discovery announcement or missing for a voter that voted
+    /// before local discovery registration.
+    pub async fn valid_voter_peers(&self, request_id: &str) -> Vec<(String, NodeId)> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => {
+                let eligible = self.eligible_wallets().await;
+                consensus.tally.valid_voter_peers(&eligible).await
             }
             None => Vec::new(),
         }
@@ -1571,5 +1618,60 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn pre_snapshot_eligible_wallets_falls_back_to_registered_and_voted_wallets() {
+        let (c, mut approvals) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c.with_local_node_id(NodeId(vec![0]));
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+
+        assert_eq!(
+            c.check_consensus(&id).await.unwrap(),
+            Some(VerificationVote::Valid),
+            "unconfigured/pre-snapshot coordinator must reach consensus when onchain_wallets is empty"
+        );
+        assert!(
+            approvals.try_recv().is_ok(),
+            "pre-snapshot coordinator with local_wallet=None must emit approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_voter_peers_returns_vote_bound_wallet_despite_leader_selector_clobber() {
+        let (coord, _approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+
+        // Simulate an unauthenticated Discovery announcement clobbering NodeId(1)'s
+        // wallet_pubkey in leader_selector after the vote was recorded.
+        {
+            let mut sel = coord.leader_selector.write().await;
+            let existing = sel.get_validator(&NodeId(vec![1])).cloned().unwrap();
+            sel.update_validator(existing.with_wallet(Some("ATTACKER_WALLET".to_string())));
+        }
+        assert_eq!(
+            coord.validator_wallet(&NodeId(vec![1])).await.as_deref(),
+            Some("ATTACKER_WALLET")
+        );
+
+        let peers = coord.valid_voter_peers(&id).await;
+        assert!(
+            peers.contains(&("W1".to_string(), NodeId(vec![1]))),
+            "valid_voter_peers must return the vote-bound wallet W1, not the clobbered leader_selector wallet"
+        );
     }
 }
