@@ -1090,17 +1090,22 @@ pub mod paraloom_program {
         } else {
             validator_account.token_unbonding_amount
         };
+        require!(old_stake > 0 || old_token > 0, BridgeError::InvalidAmount);
         let token_slash = (old_token as u128 * slash_percentage as u128 / 100) as u64;
         validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
         if was_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
             validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
-            // A slash that drops stake below the registry minimum deactivates
-            // the validator: registration requires `stake >= minimum_stake`, so
-            // a validator below that bar must stop settling and stop counting
-            // toward the BFT quorum.
-            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+            // A slash that drops either collateral below the registry minimum
+            // deactivates the validator: registration requires both
+            // `stake_amount >= minimum_stake` and
+            // `token_stake_amount >= min_token_stake`, so a validator below
+            // either bar must stop settling and stop counting toward the BFT quorum.
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
+                || validator_account.token_stake_amount
+                    < ctx.accounts.validator_registry.min_token_stake
+            {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
@@ -1172,12 +1177,17 @@ pub mod paraloom_program {
             )?;
         }
 
+        let new_stake = if was_active {
+            validator_account.stake_amount
+        } else {
+            validator_account.unbonding_amount
+        };
         emit!(ValidatorSlashedEvent {
             validator,
             slash_amount,
             slash_percentage,
             old_stake,
-            new_stake: validator_account.stake_amount,
+            new_stake,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
