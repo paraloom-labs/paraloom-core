@@ -397,12 +397,14 @@ impl TransactVerificationCoordinator {
         }
     }
 
-    /// Remove `request_id` from the emitted set so a re-proved identical
-    /// canonical id can be approved again — called on final settlement failure
-    /// and on timeout sweep, so a content-bound id is never permanently
-    /// un-approvable (a wedged-until-restart hazard otherwise).
+    /// Remove `request_id` from the emitted and pending sets so a re-proved
+    /// identical canonical id starts a fresh round and can be approved again —
+    /// called on final settlement failure and on timeout sweep, so a
+    /// content-bound id is never permanently un-approvable or wedged on stale
+    /// pre-failure votes.
     pub async fn clear_emitted(&self, request_id: &str) {
         self.emitted.write().await.remove(request_id);
+        self.pending.write().await.remove(request_id);
     }
 
     /// Whether the `Valid`-voting co-signers hold enough stake for the on-chain
@@ -817,16 +819,23 @@ impl TransactVerificationCoordinator {
             self.total_validators,
         );
 
-        // Insert-if-absent: a duplicate start for an already in-flight canonical
-        // id (a client retry or a re-broadcast) must not discard the votes
-        // already collected for this round. The id is content-bound
-        // (`canonical_id`), so an existing entry is the same settlement — keep
-        // collecting on it rather than resetting the tally.
-        self.pending
-            .write()
-            .await
-            .entry(request_id.clone())
-            .or_insert(consensus);
+        // Insert-if-absent for an active in-flight round, but replace any entry
+        // whose VoteTally has already timed out so a client retry after timeout
+        // starts a fresh round instead of remaining permanently wedged.
+        {
+            let mut pending = self.pending.write().await;
+            let replace_timed_out = pending
+                .get(&request_id)
+                .map(|c| c.tally.is_timed_out())
+                .unwrap_or(false);
+            if replace_timed_out {
+                pending.insert(request_id.clone(), consensus);
+                drop(pending);
+                self.emitted.write().await.remove(&request_id);
+            } else {
+                pending.entry(request_id.clone()).or_insert(consensus);
+            }
+        }
 
         log::info!("Started transact verification: {}", request_id);
         Ok(request_id)
@@ -841,6 +850,10 @@ impl TransactVerificationCoordinator {
         let consensus = pending
             .get(&result.request_id)
             .ok_or_else(|| anyhow!("Request not found: {}", result.request_id))?;
+
+        if consensus.tally.is_timed_out() {
+            return Err(anyhow!("Verification timed out: {}", result.request_id));
+        }
 
         // REPLAY invariant on the counting path: the id we count under must be
         // the content-bound canonical id of the settlement in flight. (Signed
@@ -921,6 +934,7 @@ impl TransactVerificationCoordinator {
             let eligible = self.eligible_wallets().await;
             let mut emitted = self.emitted.write().await;
             if !emitted.contains(&result.request_id)
+                && !consensus.tally.is_timed_out()
                 && consensus.tally.has_consensus(&eligible).await
                 && self.stake_quorum_met(&consensus.tally).await
                 && matches!(
@@ -1571,5 +1585,30 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn clear_emitted_evicts_stale_pending_entry_so_retry_starts_fresh_round() {
+        let (mut coordinator, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        coordinator.set_consensus_thresholds(2, 2);
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2".to_string()))
+            .await;
+
+        let req = sample_request("placeholder");
+        let id = coordinator.start_verification(req.clone()).await.unwrap();
+        assert!(coordinator.pending.read().await.contains_key(&id));
+
+        // After final settlement failure or timeout sweep, clear_emitted must evict
+        // the stale pending consensus entry so a retry starts a fresh tally:
+        coordinator.clear_emitted(&id).await;
+        assert!(!coordinator.pending.read().await.contains_key(&id));
+
+        let restarted_id = coordinator.start_verification(req).await.unwrap();
+        assert_eq!(restarted_id, id);
+        assert!(coordinator.pending.read().await.contains_key(&id));
     }
 }
