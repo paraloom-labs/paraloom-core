@@ -126,13 +126,20 @@ impl Submitter for OnChainSubmitter {
             transact_submit::post_transact(&ingress, &fresh_address, &w, [ct0, ct1])?;
 
             let recipient_pk = Pubkey::new_from_array(fresh_address);
-            transact_submit::wait_for_settlement(
+            let realized_bal = transact_submit::wait_for_settlement(
                 &client,
                 &program_id,
                 &recipient_pk,
                 &w.nullifiers[0],
                 SETTLEMENT_TIMEOUT,
             )?;
+            let expected_fee = amount.saturating_mul(25) / 10_000;
+            let expected_net = amount.saturating_sub(expected_fee);
+            if realized_bal < expected_net {
+                return Err(transact_submit::TransactSubmitError::Rpc(format!(
+                    "settled balance {realized_bal} at {recipient_pk} is below expected post-fee withdrawal {expected_net}"
+                )));
+            }
             // Settlement lands via the quorum, not a single tx we hold — return
             // the fresh address as the leg's on-chain reference.
             Ok(recipient_pk.to_string())

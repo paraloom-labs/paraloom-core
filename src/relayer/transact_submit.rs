@@ -248,6 +248,45 @@ pub fn prove_withdraw_to_fresh(
     })
 }
 
+/// Anchor discriminator `sha256("account:NullifierAccount")[..8]`.
+const NULLIFIER_ACCOUNT_DISC: [u8; 8] = [250, 31, 238, 177, 213, 98, 48, 172];
+
+/// Anchor discriminator `sha256("account:ValidatorRegistry")[..8]`.
+const VALIDATOR_REGISTRY_DISC: [u8; 8] = [168, 113, 195, 186, 62, 121, 163, 230];
+
+/// Verify that `account` is a canonical, initialized `NullifierAccount` owned
+/// by `program_id` recording `nf0` (`8` discriminator + `32` nullifier + `8`
+/// spent_at + `8` spent_slot = 56 bytes). Rejects pre-funded system accounts
+/// (`owner != *program_id` or empty data) so an attacker cannot dust-fund
+/// `recipient` and `nf_pda` to spoof `wait_for_settlement`.
+pub fn is_valid_nullifier_account(
+    account: &solana_sdk::account::Account,
+    program_id: &Pubkey,
+    nf0: &[u8; 32],
+) -> bool {
+    account.owner == *program_id
+        && account.data.len() >= 56
+        && account.data[0..8] == NULLIFIER_ACCOUNT_DISC
+        && account.data[8..40] == nf0[..]
+}
+
+/// Verify that `account` is a canonical, initialized `ValidatorRegistry` owned
+/// by `program_id` with `>= 2` active validators and positive active stake.
+pub fn is_valid_registry_quorum(
+    account: &solana_sdk::account::Account,
+    program_id: &Pubkey,
+) -> bool {
+    if account.owner != *program_id
+        || account.data.len() < 72
+        || account.data[0..8] != VALIDATOR_REGISTRY_DISC
+    {
+        return false;
+    }
+    let active_validators = u64::from_le_bytes(account.data[48..56].try_into().unwrap_or([0; 8]));
+    let total_active_stake = u64::from_le_bytes(account.data[64..72].try_into().unwrap_or([0; 8]));
+    active_validators >= 2 && total_active_stake > 0
+}
+
 /// POST a withdraw-to-fresh transact to the public ingress. `ciphertexts` must
 /// be exactly two well-formed `EncryptedNote` envelopes. Returns the ingress
 /// `request_id`.
@@ -270,8 +309,13 @@ pub fn post_transact(
         "proof": hex::encode(&w.proof),
         "ciphertexts": [hex::encode(&ciphertexts[0]), hex::encode(&ciphertexts[1])],
     });
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+    let base = ingress.trim_end_matches('/');
+    let resp = client
+        .post(format!("{base}/transact/submit"))
         .json(&body)
         .send()
         .map_err(|e| TransactSubmitError::Http(e.to_string()))?;
@@ -284,6 +328,11 @@ pub fn post_transact(
             status: status.as_u16(),
             body: text,
         });
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(req_id) = v.get("request_id").and_then(|s| s.as_str()) {
+            return Ok(req_id.to_string());
+        }
     }
     Ok(text)
 }
@@ -304,8 +353,12 @@ pub fn wait_for_settlement(
     while std::time::Instant::now() < deadline {
         std::thread::sleep(step);
         let bal = client.get_balance(recipient).unwrap_or(0);
-        if bal > 0 && client.get_account(&nf_pda).is_ok() {
-            return Ok(bal);
+        if bal > 0 {
+            if let Ok(acct) = client.get_account(&nf_pda) {
+                if is_valid_nullifier_account(&acct, program_id, nf0) {
+                    return Ok(bal);
+                }
+            }
         }
     }
     Err(TransactSubmitError::SettlementTimeout(timeout))
@@ -316,9 +369,99 @@ pub fn wait_for_settlement(
 /// with a clear reason rather than after a 60s+ settlement wait.
 pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
     let (registry, _) = derive_validator_registry(program_id);
-    match client.get_account_data(&registry) {
-        // active_validators is the u64 at [48..56] after the 8-byte discriminator.
-        Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
-        _ => false,
+    match client.get_account(&registry) {
+        Ok(acct) => is_valid_registry_quorum(&acct, program_id),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::account::Account;
+
+    #[test]
+    fn nullifier_account_check_rejects_system_prefunded_and_accepts_canonical() {
+        let program_id = Pubkey::new_from_array([0x11; 32]);
+        let nf0 = [0xAA; 32];
+
+        // Pre-funded system account (1 lamport, empty data, owned by System Program)
+        // must be rejected so dust-funding nf_pda cannot spoof wait_for_settlement.
+        let system_prefunded = Account {
+            lamports: 1,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(!is_valid_nullifier_account(
+            &system_prefunded,
+            &program_id,
+            &nf0
+        ));
+
+        // Wrong owner with valid-looking payload must also be rejected.
+        let mut valid_data = Vec::with_capacity(56);
+        valid_data.extend_from_slice(&NULLIFIER_ACCOUNT_DISC);
+        valid_data.extend_from_slice(&nf0);
+        valid_data.extend_from_slice(&123i64.to_le_bytes());
+        valid_data.extend_from_slice(&456u64.to_le_bytes());
+        let wrong_owner = Account {
+            lamports: 1_000_000,
+            data: valid_data.clone(),
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(!is_valid_nullifier_account(&wrong_owner, &program_id, &nf0));
+
+        // Canonical program-owned NullifierAccount with matching nf0 passes.
+        let canonical = Account {
+            lamports: 1_000_000,
+            data: valid_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(is_valid_nullifier_account(&canonical, &program_id, &nf0));
+        assert!(!is_valid_nullifier_account(
+            &canonical,
+            &program_id,
+            &[0xBB; 32]
+        ));
+    }
+
+    #[test]
+    fn registry_quorum_check_verifies_owner_discriminator_and_stake() {
+        let program_id = Pubkey::new_from_array([0x22; 32]);
+        let mut data = vec![0u8; 72];
+        data[0..8].copy_from_slice(&VALIDATOR_REGISTRY_DISC);
+        data[48..56].copy_from_slice(&2u64.to_le_bytes()); // active_validators = 2
+        data[64..72].copy_from_slice(&2_000_000_000u64.to_le_bytes()); // total_active_stake > 0
+
+        let valid = Account {
+            lamports: 1_000_000,
+            data: data.clone(),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(is_valid_registry_quorum(&valid, &program_id));
+
+        // Zero active stake must return false even if active_validators >= 2.
+        let mut zero_stake_data = data.clone();
+        zero_stake_data[64..72].copy_from_slice(&0u64.to_le_bytes());
+        let zero_stake = Account {
+            data: zero_stake_data,
+            ..valid.clone()
+        };
+        assert!(!is_valid_registry_quorum(&zero_stake, &program_id));
+
+        // Wrong owner must return false.
+        let wrong_owner = Account {
+            owner: solana_sdk::system_program::id(),
+            ..valid
+        };
+        assert!(!is_valid_registry_quorum(&wrong_owner, &program_id));
     }
 }
