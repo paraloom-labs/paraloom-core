@@ -178,10 +178,11 @@ impl JobManager {
         // Sort by load factor (least loaded first)
         available_validators.sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
 
-        // Assign jobs to validators
+        // Assign jobs to validators without dropping remaining queued jobs when capacity fills
         let jobs_to_assign: Vec<_> = pending.drain(..).collect();
         drop(pending); // Release lock
 
+        let mut remaining_jobs = Vec::new();
         for job in jobs_to_assign {
             if let Some(validator) = available_validators.first() {
                 let assignment = JobAssignment {
@@ -223,12 +224,14 @@ impl JobManager {
                 available_validators
                     .sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
             } else {
-                // No available validators, put job back in queue
+                // No available validators, retain this job and all remaining jobs in queue
                 warn!("No available validators for job {}", job.id);
-                let mut pending = self.pending_jobs.lock().unwrap();
-                pending.push(job);
-                break;
+                remaining_jobs.push(job);
             }
+        }
+        if !remaining_jobs.is_empty() {
+            let mut pending = self.pending_jobs.lock().unwrap();
+            pending.extend(remaining_jobs);
         }
 
         Ok(assignments_made)
@@ -243,13 +246,18 @@ impl JobManager {
             job_id, result.status
         );
 
-        // Update validator active jobs
-        let assignments = self.assignments.lock().unwrap();
-        if let Some(assignment) = assignments.get(&job_id) {
+        // Require and remove active assignment to prevent duplicate/unassigned result overwrites
+        let mut assignments = self.assignments.lock().unwrap();
+        if let Some(assignment) = assignments.remove(&job_id) {
             let mut validators = self.validators.lock().unwrap();
             if let Some(validator) = validators.get_mut(&assignment.validator_id) {
                 validator.active_jobs = validator.active_jobs.saturating_sub(1);
             }
+        } else {
+            return Err(anyhow::anyhow!(
+                "No active assignment found for job {}",
+                job_id
+            ));
         }
         drop(assignments);
 

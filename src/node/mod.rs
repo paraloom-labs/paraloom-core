@@ -647,7 +647,8 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         return Ok(());
                     }
 
-                    let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
+                    let job =
+                        crate::compute::ComputeJob::with_id(job_id, wasm_code, input_data, limits);
                     let actual_job_id = job.id.clone();
 
                     // Store coordinator for result reporting
@@ -2022,7 +2023,7 @@ impl Node {
                     // Get all job results
                     let _stats = executor_clone.get_stats();
 
-                    // Check for completed jobs
+                    let mut newly_reported = Vec::new();
                     let coordinators = coordinators_clone.lock().await;
                     for (job_id, coordinator_id) in coordinators.iter() {
                         // Skip if already reported
@@ -2054,6 +2055,7 @@ impl Node {
                                 Ok(_) => {
                                     info!("Successfully reported job {} result", job_id);
                                     reported_jobs.insert(job_id.clone());
+                                    newly_reported.push(job_id.clone());
                                 }
                                 Err(e) => {
                                     log::error!("Failed to send job result: {}", e);
@@ -2062,6 +2064,12 @@ impl Node {
                         }
                     }
                     drop(coordinators);
+                    if !newly_reported.is_empty() {
+                        let mut coordinators = coordinators_clone.lock().await;
+                        for jid in newly_reported {
+                            coordinators.remove(&jid);
+                        }
+                    }
 
                     // Clean up old reported jobs
                     if reported_jobs.len() > 1000 {

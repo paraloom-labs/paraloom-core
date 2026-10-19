@@ -116,7 +116,16 @@ impl Default for ResourceLimits {
 impl ComputeJob {
     /// Create a new compute job
     pub fn new(wasm_code: Vec<u8>, input_data: Vec<u8>, limits: ResourceLimits) -> Self {
-        let id = uuid::Uuid::new_v4().to_string();
+        Self::with_id(uuid::Uuid::new_v4().to_string(), wasm_code, input_data, limits)
+    }
+
+    /// Create a compute job with an explicit coordinator-assigned job ID
+    pub fn with_id(
+        id: JobId,
+        wasm_code: Vec<u8>,
+        input_data: Vec<u8>,
+        limits: ResourceLimits,
+    ) -> Self {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
