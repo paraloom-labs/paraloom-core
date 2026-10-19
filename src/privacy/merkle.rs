@@ -62,23 +62,32 @@ impl MerkleTree {
         // Load existing commitments from storage
         let commitments = storage.get_all_commitments()?;
         let leaves: Vec<[u8; 32]> = commitments.iter().map(|c| *c.as_bytes()).collect();
+        let has_leaves = !leaves.is_empty();
 
-        // Load cached root if available
-        let cached_root = storage.get_merkle_root()?;
-
-        // Seed the recent-roots window with the reloaded tip so a proof built
-        // against the just-restored root verifies immediately after a restart.
-        let recent_roots = match cached_root {
+        // Seed the recent-roots window with the previously persisted root (if any)
+        // before recomputing from the authoritative leaf list. If leaves were
+        // inserted without a subsequent `root()` call before restart, the stored
+        // `merkle_root` is an older root; keeping it in `recent_roots` while
+        // recomputing `cached_root` ensures `root()` returns the current tip and
+        // `knows_root()` recognizes both the prior and current roots.
+        let recent_roots = match storage.get_merkle_root()? {
             Some(r) => std::collections::VecDeque::from([r]),
             None => std::collections::VecDeque::new(),
         };
-        Ok(MerkleTree {
+
+        let tree = MerkleTree {
             depth: DEFAULT_TREE_DEPTH,
             leaves: Arc::new(RwLock::new(leaves)),
-            cached_root: Arc::new(RwLock::new(cached_root)),
+            cached_root: Arc::new(RwLock::new(None)),
             recent_roots: Arc::new(RwLock::new(recent_roots)),
             storage: Some(storage),
-        })
+        };
+
+        if has_leaves {
+            let _ = tree.root().await;
+        }
+
+        Ok(tree)
     }
 
     /// Insert a commitment as a leaf, returning the index it was placed
@@ -634,5 +643,31 @@ mod tests {
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
         );
+    }
+
+    #[tokio::test]
+    async fn with_storage_recomputes_root_when_leaves_advanced_past_stored_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(PrivacyStorage::open(dir.path().join("privacy.db")).unwrap());
+
+        let tree = MerkleTree::with_storage(Arc::clone(&storage)).await.unwrap();
+        tree.insert(&Commitment([1u8; 32])).await.unwrap();
+        let r1 = tree.root().await;
+
+        // Insert a second commitment without calling root() before restart.
+        tree.insert(&Commitment([2u8; 32])).await.unwrap();
+        drop(tree);
+
+        let reloaded = MerkleTree::with_storage(Arc::clone(&storage)).await.unwrap();
+        let expected = {
+            let ref_tree = MerkleTree::new();
+            ref_tree.insert(&Commitment([1u8; 32])).await.unwrap();
+            ref_tree.insert(&Commitment([2u8; 32])).await.unwrap();
+            ref_tree.root().await
+        };
+
+        assert_eq!(reloaded.root().await, expected);
+        assert!(reloaded.knows_root(&expected).await);
+        assert!(reloaded.knows_root(&r1).await);
     }
 }

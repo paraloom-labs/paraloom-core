@@ -151,15 +151,18 @@ impl ShieldedPool {
         let mut notes = self.notes.write().await;
         notes.insert(commitment.clone(), note);
 
-        // Credit this asset's supply
+        // Credit this asset's supply (persist first, then mutate in-memory state)
         let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
+        let current_supply = supplies.get(&asset_id).copied().unwrap_or(0);
+        let updated_supply = current_supply
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("asset supply overflow"))?;
 
-        // Persist the asset's supply to storage if available
         if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
+            storage.set_asset_supply(&asset_id, updated_supply)?;
         }
+
+        supplies.insert(asset_id, updated_supply);
 
         Ok(commitment)
     }
@@ -487,5 +490,22 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn deposit_rejects_supply_overflow_without_mutating_supply() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([5u8; 32]);
+
+        pool.deposit(Note::new_native(addr.clone(), u64::MAX - 10, [1u8; 32]), u64::MAX - 10)
+            .await
+            .unwrap();
+        assert_eq!(pool.total_supply().await, u64::MAX - 10);
+
+        let res = pool
+            .deposit(Note::new_native(addr, 20, [2u8; 32]), 20)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(pool.total_supply().await, u64::MAX - 10);
     }
 }
