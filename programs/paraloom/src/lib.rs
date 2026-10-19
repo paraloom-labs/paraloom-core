@@ -1100,7 +1100,10 @@ pub mod paraloom_program {
             // the validator: registration requires `stake >= minimum_stake`, so
             // a validator below that bar must stop settling and stop counting
             // toward the BFT quorum.
-            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake
+                || validator_account.token_stake_amount
+                    < ctx.accounts.validator_registry.min_token_stake
+            {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
@@ -1639,14 +1642,18 @@ pub mod paraloom_program {
             let now_slot = Clock::get()?.slot;
             let v = &mut ctx.accounts.validator_account;
             v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
+            // Route BOTH collaterals into unbonding rather than stranding them: a
             // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
-            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
-            // the delay, same as unregister.
+            // is_active), so without this its SOL and SPL stake tokens would have
+            // no exit and be frozen forever when `withdraw_unbonded_stake` closes
+            // the PDA. Reclaimable via `withdraw_unbonded_stake` after the delay,
+            // same as unregister and deactivating slash (#1129).
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            let token_stake = v.token_stake_amount;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            v.token_stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
