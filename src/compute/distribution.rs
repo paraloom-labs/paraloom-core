@@ -178,10 +178,37 @@ impl JobCoordinator {
         validators.values().cloned().collect()
     }
 
-    /// Calculate actual load for a validator based on assignments
+    /// Helper to compute a validator's effective live load from its announced base load
+    /// plus in-flight coordinator assignments (`pending` + `active`).
+    fn count_live_load(
+        validator: &CapacityAnnouncement,
+        pending: &HashMap<JobId, JobAssignment>,
+        active: &HashMap<JobId, JobAssignment>,
+    ) -> usize {
+        let pending_count = pending
+            .values()
+            .filter(|a| a.validator_id == validator.validator_id)
+            .count();
+        let active_count = active
+            .values()
+            .filter(|a| a.validator_id == validator.validator_id)
+            .count();
+        validator
+            .current_load
+            .saturating_add(pending_count)
+            .saturating_add(active_count)
+    }
+
+    /// Calculate actual load for a validator based on announced load + assignments
     pub async fn get_validator_load(&self, validator_id: &ValidatorId) -> usize {
+        let validators = self.validators.read().await;
         let pending = self.pending_assignments.read().await;
         let active = self.active_assignments.read().await;
+
+        let base_load = validators
+            .get(validator_id)
+            .map(|v| v.current_load)
+            .unwrap_or(0);
 
         let pending_count = pending
             .values()
@@ -193,7 +220,7 @@ impl JobCoordinator {
             .filter(|a| &a.validator_id == validator_id)
             .count();
 
-        pending_count + active_count
+        base_load + pending_count + active_count
     }
 
     /// Check if validator has available capacity based on actual assignments
@@ -203,31 +230,43 @@ impl JobCoordinator {
     }
 
     /// Assign a job to the best available validator
+    ///
+    /// Canonical lock acquisition order across `JobCoordinator`:
+    /// `validators` -> `pending_assignments` -> `active_assignments`
     pub async fn assign_job(&self, job_id: JobId) -> Result<Option<JobAssignment>> {
         let validators = self.validators.read().await;
+        let mut pending = self.pending_assignments.write().await;
+        let active = self.active_assignments.read().await;
 
-        // Find validator with lowest load factor and available capacity
+        // Find validator with lowest live load factor and available live capacity
         let best_validator = validators
             .values()
-            .filter(|v| v.available_capacity() > 0)
+            .filter(|v| {
+                v.max_concurrent_jobs > 0
+                    && Self::count_live_load(v, &pending, &active) < v.max_concurrent_jobs
+            })
             .min_by(|a, b| {
-                a.load_factor()
-                    .partial_cmp(&b.load_factor())
+                let load_a = Self::count_live_load(a, &pending, &active) as f64
+                    / a.max_concurrent_jobs as f64;
+                let load_b = Self::count_live_load(b, &pending, &active) as f64
+                    / b.max_concurrent_jobs as f64;
+                load_a
+                    .partial_cmp(&load_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
         if let Some(validator) = best_validator {
+            let live_load = Self::count_live_load(validator, &pending, &active);
             let assignment = JobAssignment::new(job_id.clone(), validator.validator_id.clone());
 
             // Store as pending assignment
-            let mut pending = self.pending_assignments.write().await;
             pending.insert(job_id.clone(), assignment.clone());
 
             debug!(
                 "Assigned job {} to validator {} (load: {:.1}%)",
                 job_id,
                 validator.validator_id,
-                validator.load_factor() * 100.0
+                (live_load as f64 / validator.max_concurrent_jobs as f64) * 100.0
             );
 
             Ok(Some(assignment))
@@ -280,141 +319,121 @@ impl JobCoordinator {
     pub async fn handle_timeouts(&self) -> Result<Vec<JobId>> {
         let mut reassigned_jobs = Vec::new();
 
+        // Acquire locks in canonical order: validators -> pending_assignments -> active_assignments
+        let validators = self.validators.read().await;
+        let mut pending = self.pending_assignments.write().await;
+        let mut active = self.active_assignments.write().await;
+
         // Check pending assignments
-        {
-            let mut pending = self.pending_assignments.write().await;
-            let timed_out: Vec<_> = pending
-                .iter()
-                .filter(|(_, assignment)| assignment.is_timed_out())
-                .map(|(id, _)| id.clone())
-                .collect();
+        let timed_out_pending: Vec<_> = pending
+            .iter()
+            .filter(|(_, assignment)| assignment.is_timed_out())
+            .map(|(id, _)| id.clone())
+            .collect();
 
-            for job_id in timed_out {
-                if let Some(old_assignment) = pending.remove(&job_id) {
-                    warn!(
-                        "Job {} timed out (assigned to {}), retry count: {}",
-                        job_id, old_assignment.validator_id, old_assignment.retry_count
-                    );
+        for job_id in timed_out_pending {
+            if let Some(old_assignment) = pending.remove(&job_id) {
+                warn!(
+                    "Job {} timed out (assigned to {}), retry count: {}",
+                    job_id, old_assignment.validator_id, old_assignment.retry_count
+                );
 
-                    // Try to reassign if under retry limit
-                    if old_assignment.retry_count < MAX_JOB_RETRIES {
-                        // Find best validator with available capacity
-                        let validators = self.validators.read().await;
-                        let mut best_validator: Option<&CapacityAnnouncement> = None;
-                        let mut best_load = usize::MAX;
+                // Try to reassign if under retry limit
+                if old_assignment.retry_count < MAX_JOB_RETRIES {
+                    let mut best_validator: Option<&CapacityAnnouncement> = None;
+                    let mut best_load = usize::MAX;
 
-                        for validator in validators.values() {
-                            let current_load = {
-                                let pending_count = pending
-                                    .values()
-                                    .filter(|a| a.validator_id == validator.validator_id)
-                                    .count();
-                                pending_count
-                            };
+                    for validator in validators.values() {
+                        let current_load = Self::count_live_load(validator, &pending, &active);
 
-                            if current_load < validator.max_concurrent_jobs
-                                && current_load < best_load
-                            {
-                                best_load = current_load;
-                                best_validator = Some(validator);
-                            }
+                        if current_load < validator.max_concurrent_jobs && current_load < best_load
+                        {
+                            best_load = current_load;
+                            best_validator = Some(validator);
                         }
+                    }
 
-                        if let Some(validator) = best_validator {
-                            // Create retried assignment with incremented retry count
-                            let new_assignment =
-                                old_assignment.retry(validator.validator_id.clone());
-                            pending.insert(job_id.clone(), new_assignment);
-                            reassigned_jobs.push(job_id.clone());
+                    if let Some(validator) = best_validator {
+                        let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                        pending.insert(job_id.clone(), new_assignment);
+                        reassigned_jobs.push(job_id.clone());
 
-                            info!(
-                                "Reassigned job {} to validator {} (retry {})",
-                                job_id,
-                                validator.validator_id,
-                                old_assignment.retry_count + 1
-                            );
-                        } else {
-                            warn!("No available validators to reassign job {}", job_id);
-                        }
+                        info!(
+                            "Reassigned job {} to validator {} (retry {})",
+                            job_id,
+                            validator.validator_id,
+                            old_assignment.retry_count + 1
+                        );
                     } else {
                         warn!(
-                            "Job {} exceeded max retries ({}), giving up",
-                            job_id, MAX_JOB_RETRIES
+                            "No available validators to reassign job {}, retaining in pending queue",
+                            job_id
                         );
+                        let deferred = old_assignment.retry(old_assignment.validator_id.clone());
+                        pending.insert(job_id.clone(), deferred);
                     }
+                } else {
+                    warn!(
+                        "Job {} exceeded max retries ({}), giving up",
+                        job_id, MAX_JOB_RETRIES
+                    );
                 }
             }
         }
 
         // Check active assignments
-        {
-            let mut active = self.active_assignments.write().await;
-            let timed_out: Vec<_> = active
-                .iter()
-                .filter(|(_, assignment)| assignment.is_timed_out())
-                .map(|(id, _)| id.clone())
-                .collect();
+        let timed_out_active: Vec<_> = active
+            .iter()
+            .filter(|(_, assignment)| assignment.is_timed_out())
+            .map(|(id, _)| id.clone())
+            .collect();
 
-            for job_id in timed_out {
-                if let Some(old_assignment) = active.remove(&job_id) {
-                    warn!(
-                        "Active job {} timed out (validator {}), retry count: {}",
-                        job_id, old_assignment.validator_id, old_assignment.retry_count
-                    );
+        for job_id in timed_out_active {
+            if let Some(old_assignment) = active.remove(&job_id) {
+                warn!(
+                    "Active job {} timed out (validator {}), retry count: {}",
+                    job_id, old_assignment.validator_id, old_assignment.retry_count
+                );
 
-                    // Try to reassign if under retry limit
-                    if old_assignment.retry_count < MAX_JOB_RETRIES {
-                        // Find best validator with available capacity
-                        let validators = self.validators.read().await;
-                        let pending = self.pending_assignments.read().await;
-                        let mut best_validator: Option<&CapacityAnnouncement> = None;
-                        let mut best_load = usize::MAX;
+                // Try to reassign if under retry limit
+                if old_assignment.retry_count < MAX_JOB_RETRIES {
+                    let mut best_validator: Option<&CapacityAnnouncement> = None;
+                    let mut best_load = usize::MAX;
 
-                        for validator in validators.values() {
-                            let current_load = {
-                                let pending_count = pending
-                                    .values()
-                                    .filter(|a| a.validator_id == validator.validator_id)
-                                    .count();
-                                let active_count = active
-                                    .values()
-                                    .filter(|a| a.validator_id == validator.validator_id)
-                                    .count();
-                                pending_count + active_count
-                            };
+                    for validator in validators.values() {
+                        let current_load = Self::count_live_load(validator, &pending, &active);
 
-                            if current_load < validator.max_concurrent_jobs
-                                && current_load < best_load
-                            {
-                                best_load = current_load;
-                                best_validator = Some(validator);
-                            }
+                        if current_load < validator.max_concurrent_jobs && current_load < best_load
+                        {
+                            best_load = current_load;
+                            best_validator = Some(validator);
                         }
+                    }
 
-                        if let Some(validator) = best_validator {
-                            // Create retried assignment and add to pending
-                            let new_assignment =
-                                old_assignment.retry(validator.validator_id.clone());
-                            drop(pending); // Release pending read lock
-                            let mut pending_write = self.pending_assignments.write().await;
-                            pending_write.insert(job_id.clone(), new_assignment);
-                            reassigned_jobs.push(job_id.clone());
+                    if let Some(validator) = best_validator {
+                        let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                        pending.insert(job_id.clone(), new_assignment);
+                        reassigned_jobs.push(job_id.clone());
 
-                            info!(
-                                "Reassigned active job {} to validator {} (retry {})",
-                                job_id,
-                                validator.validator_id,
-                                old_assignment.retry_count + 1
-                            );
-                        } else {
-                            warn!("No available validators to reassign active job {}", job_id);
-                        }
+                        info!(
+                            "Reassigned active job {} to validator {} (retry {})",
+                            job_id,
+                            validator.validator_id,
+                            old_assignment.retry_count + 1
+                        );
                     } else {
                         warn!(
-                            "Active job {} exceeded max retries ({}), giving up",
-                            job_id, MAX_JOB_RETRIES
+                            "No available validators to reassign active job {}, retaining in pending queue",
+                            job_id
                         );
+                        let deferred = old_assignment.retry(old_assignment.validator_id.clone());
+                        pending.insert(job_id.clone(), deferred);
                     }
+                } else {
+                    warn!(
+                        "Active job {} exceeded max retries ({}), giving up",
+                        job_id, MAX_JOB_RETRIES
+                    );
                 }
             }
         }
@@ -433,139 +452,119 @@ impl JobCoordinator {
         // Remove validator from registry
         self.remove_validator(validator_id).await;
 
+        // Acquire locks in canonical order: validators -> pending_assignments -> active_assignments
+        let validators = self.validators.read().await;
+        let mut pending = self.pending_assignments.write().await;
+        let mut active = self.active_assignments.write().await;
+
         // Reassign pending jobs
-        {
-            let mut pending = self.pending_assignments.write().await;
-            let failed_jobs: Vec<_> = pending
-                .iter()
-                .filter(|(_, assignment)| &assignment.validator_id == validator_id)
-                .map(|(id, _)| id.clone())
-                .collect();
+        let failed_pending: Vec<_> = pending
+            .iter()
+            .filter(|(_, assignment)| &assignment.validator_id == validator_id)
+            .map(|(id, _)| id.clone())
+            .collect();
 
-            for job_id in failed_jobs {
-                if let Some(old_assignment) = pending.remove(&job_id) {
-                    warn!(
-                        "Reassigning job {} from failed validator {}, retry count: {}",
-                        job_id, validator_id, old_assignment.retry_count
-                    );
+        for job_id in failed_pending {
+            if let Some(old_assignment) = pending.remove(&job_id) {
+                warn!(
+                    "Reassigning job {} from failed validator {}, retry count: {}",
+                    job_id, validator_id, old_assignment.retry_count
+                );
 
-                    if old_assignment.retry_count < MAX_JOB_RETRIES {
-                        // Find best validator with available capacity
-                        let validators = self.validators.read().await;
-                        let mut best_validator: Option<&CapacityAnnouncement> = None;
-                        let mut best_load = usize::MAX;
+                if old_assignment.retry_count < MAX_JOB_RETRIES {
+                    let mut best_validator: Option<&CapacityAnnouncement> = None;
+                    let mut best_load = usize::MAX;
 
-                        for validator in validators.values() {
-                            let current_load = {
-                                let pending_count = pending
-                                    .values()
-                                    .filter(|a| a.validator_id == validator.validator_id)
-                                    .count();
-                                pending_count
-                            };
+                    for validator in validators.values() {
+                        let current_load = Self::count_live_load(validator, &pending, &active);
 
-                            if current_load < validator.max_concurrent_jobs
-                                && current_load < best_load
-                            {
-                                best_load = current_load;
-                                best_validator = Some(validator);
-                            }
+                        if current_load < validator.max_concurrent_jobs && current_load < best_load
+                        {
+                            best_load = current_load;
+                            best_validator = Some(validator);
                         }
+                    }
 
-                        if let Some(validator) = best_validator {
-                            // Create retried assignment with incremented retry count
-                            let new_assignment =
-                                old_assignment.retry(validator.validator_id.clone());
-                            pending.insert(job_id.clone(), new_assignment);
-                            reassigned_count += 1;
+                    if let Some(validator) = best_validator {
+                        let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                        pending.insert(job_id.clone(), new_assignment);
+                        reassigned_count += 1;
 
-                            info!(
-                                "Reassigned job {} to validator {} (retry {})",
-                                job_id,
-                                validator.validator_id,
-                                old_assignment.retry_count + 1
-                            );
-                        } else {
-                            warn!("No available validators to reassign job {}", job_id);
-                        }
+                        info!(
+                            "Reassigned job {} to validator {} (retry {})",
+                            job_id,
+                            validator.validator_id,
+                            old_assignment.retry_count + 1
+                        );
                     } else {
                         warn!(
-                            "Job {} exceeded max retries ({}), giving up",
-                            job_id, MAX_JOB_RETRIES
+                            "No available validators to reassign job {}, retaining in pending queue",
+                            job_id
                         );
+                        let deferred = old_assignment.retry(old_assignment.validator_id.clone());
+                        pending.insert(job_id.clone(), deferred);
                     }
+                } else {
+                    warn!(
+                        "Job {} exceeded max retries ({}), giving up",
+                        job_id, MAX_JOB_RETRIES
+                    );
                 }
             }
         }
 
         // Reassign active jobs
-        {
-            let mut active = self.active_assignments.write().await;
-            let failed_jobs: Vec<_> = active
-                .iter()
-                .filter(|(_, assignment)| &assignment.validator_id == validator_id)
-                .map(|(id, _)| id.clone())
-                .collect();
+        let failed_active: Vec<_> = active
+            .iter()
+            .filter(|(_, assignment)| &assignment.validator_id == validator_id)
+            .map(|(id, _)| id.clone())
+            .collect();
 
-            for job_id in failed_jobs {
-                if let Some(old_assignment) = active.remove(&job_id) {
-                    warn!(
-                        "Reassigning active job {} from failed validator {}, retry count: {}",
-                        job_id, validator_id, old_assignment.retry_count
-                    );
+        for job_id in failed_active {
+            if let Some(old_assignment) = active.remove(&job_id) {
+                warn!(
+                    "Reassigning active job {} from failed validator {}, retry count: {}",
+                    job_id, validator_id, old_assignment.retry_count
+                );
 
-                    if old_assignment.retry_count < MAX_JOB_RETRIES {
-                        // Find best validator with available capacity
-                        let validators = self.validators.read().await;
-                        let pending = self.pending_assignments.read().await;
-                        let mut best_validator: Option<&CapacityAnnouncement> = None;
-                        let mut best_load = usize::MAX;
+                if old_assignment.retry_count < MAX_JOB_RETRIES {
+                    let mut best_validator: Option<&CapacityAnnouncement> = None;
+                    let mut best_load = usize::MAX;
 
-                        for validator in validators.values() {
-                            let current_load = {
-                                let pending_count = pending
-                                    .values()
-                                    .filter(|a| a.validator_id == validator.validator_id)
-                                    .count();
-                                let active_count = active
-                                    .values()
-                                    .filter(|a| a.validator_id == validator.validator_id)
-                                    .count();
-                                pending_count + active_count
-                            };
+                    for validator in validators.values() {
+                        let current_load = Self::count_live_load(validator, &pending, &active);
 
-                            if current_load < validator.max_concurrent_jobs
-                                && current_load < best_load
-                            {
-                                best_load = current_load;
-                                best_validator = Some(validator);
-                            }
+                        if current_load < validator.max_concurrent_jobs && current_load < best_load
+                        {
+                            best_load = current_load;
+                            best_validator = Some(validator);
                         }
+                    }
 
-                        if let Some(validator) = best_validator {
-                            // Create retried assignment and add to pending
-                            let new_assignment =
-                                old_assignment.retry(validator.validator_id.clone());
-                            drop(pending); // Release pending read lock
-                            let mut pending_write = self.pending_assignments.write().await;
-                            pending_write.insert(job_id.clone(), new_assignment);
-                            reassigned_count += 1;
+                    if let Some(validator) = best_validator {
+                        let new_assignment = old_assignment.retry(validator.validator_id.clone());
+                        pending.insert(job_id.clone(), new_assignment);
+                        reassigned_count += 1;
 
-                            info!(
-                                "Reassigned active job {} to validator {} (retry {})",
-                                job_id,
-                                validator.validator_id,
-                                old_assignment.retry_count + 1
-                            );
-                        } else {
-                            warn!("No available validators to reassign active job {}", job_id);
-                        }
+                        info!(
+                            "Reassigned active job {} to validator {} (retry {})",
+                            job_id,
+                            validator.validator_id,
+                            old_assignment.retry_count + 1
+                        );
                     } else {
                         warn!(
-                            "Active job {} exceeded max retries ({}), giving up",
-                            job_id, MAX_JOB_RETRIES
+                            "No available validators to reassign active job {}, retaining in pending queue",
+                            job_id
                         );
+                        let deferred = old_assignment.retry(old_assignment.validator_id.clone());
+                        pending.insert(job_id.clone(), deferred);
                     }
+                } else {
+                    warn!(
+                        "Active job {} exceeded max retries ({}), giving up",
+                        job_id, MAX_JOB_RETRIES
+                    );
                 }
             }
         }
@@ -612,7 +611,7 @@ impl JobCoordinator {
             total_validators: validators.len(),
             available_validators: validators
                 .values()
-                .filter(|v| v.available_capacity() > 0)
+                .filter(|v| Self::count_live_load(v, &pending, &active) < v.max_concurrent_jobs)
                 .count(),
             total_capacity: validators.values().map(|v| v.max_concurrent_jobs).sum(),
             current_load: validators.values().map(|v| v.current_load).sum(),
@@ -917,5 +916,70 @@ mod tests {
         // Job should be removed from pending
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.pending_assignments, 0);
+    }
+
+    #[tokio::test]
+    async fn test_assign_job_respects_live_pending_and_active_load() {
+        let coordinator = JobCoordinator::new();
+
+        // Register two validators with max_concurrent_jobs = 1 each and current_load = 0
+        let cap1 = ValidatorCapacity::new("v1".to_string(), 4, 8192, 1);
+        let cap2 = ValidatorCapacity::new("v2".to_string(), 4, 8192, 1);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(cap1, 0))
+            .await;
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(cap2, 0))
+            .await;
+
+        let a1 = coordinator
+            .assign_job("job1".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let a2 = coordinator
+            .assign_job("job2".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            a1.validator_id, a2.validator_id,
+            "second job must be routed to the idle validator, not stacked on the first"
+        );
+
+        // Third job must return None because both validators are now at max live capacity (1/1)
+        let a3 = coordinator.assign_job("job3".to_string()).await.unwrap();
+        assert!(
+            a3.is_none(),
+            "assign_job must not exceed max_concurrent_jobs when pending assignments fill capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_retains_job_when_all_validators_busy() {
+        let coordinator = JobCoordinator::new();
+
+        // Single validator already at full base capacity
+        let cap = ValidatorCapacity::new("v1".to_string(), 4, 8192, 1);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(cap, 1))
+            .await;
+
+        let job_id = "job_retryable".to_string();
+        let assignment = JobAssignment::with_timeout(job_id.clone(), "v1".to_string(), 0);
+        {
+            let mut pending = coordinator.pending_assignments.write().await;
+            pending.insert(job_id.clone(), assignment);
+        }
+
+        // Timeout handling when no validator has free capacity must retain the job in pending
+        let reassigned = coordinator.handle_timeouts().await.unwrap();
+        assert!(reassigned.is_empty());
+
+        let pending = coordinator.pending_assignments.read().await;
+        let retained = pending
+            .get(&job_id)
+            .expect("retryable job must not be dropped when capacity is temporarily full");
+        assert_eq!(retained.retry_count, 1);
     }
 }
