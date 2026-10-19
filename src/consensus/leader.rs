@@ -237,6 +237,16 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// Return all known validator co-sign wallets registered in the selector (#1030).
+    /// Used as the fail-open eligibility basis when `onchain_wallets` is empty
+    /// (pre-first-snapshot or unit test bootstrap).
+    pub fn registered_wallets(&self) -> std::collections::HashSet<String> {
+        self.validators
+            .values()
+            .filter_map(|v| v.wallet_pubkey.clone())
+            .collect()
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self

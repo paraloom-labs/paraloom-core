@@ -520,10 +520,17 @@ impl TransactVerificationCoordinator {
     /// The eligibility basis for counting: the staked on-chain co-sign wallets
     /// minus any banned for equivocation. Replaces the flap-prone
     /// `active_snapshot()` NodeId set at every tally call site.
+    /// When `onchain_wallets` is empty (pre-first-snapshot / tests), falls back
+    /// to registered validator wallets in `leader_selector` (#1030).
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
         let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        let base = if onchain.is_empty() {
+            self.leader_selector.read().await.registered_wallets()
+        } else {
+            onchain.clone()
+        };
+        base.difference(&equivocators).cloned().collect()
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -744,6 +751,20 @@ impl TransactVerificationCoordinator {
             None => Vec::new(),
         }
     }
+
+    /// The authenticated `(NodeId, wallet_pubkey)` pairs of validators that voted
+    /// `Valid` on a transact and are in `eligible_wallets` (#1030).
+    pub async fn valid_voter_wallets(&self, request_id: &str) -> Vec<(NodeId, String)> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => {
+                let eligible = self.eligible_wallets().await;
+                consensus.tally.valid_voter_wallets(&eligible).await
+            }
+            None => Vec::new(),
+        }
+    }
+
 
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
     /// flap-surviving driver-auth check (replaces `is_registered_validator`,
@@ -1571,5 +1592,39 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn pre_snapshot_eligible_wallets_fails_open_and_binds_vote_wallet() {
+        let (c, mut approvals) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 2, "W2", true)).await.unwrap();
+
+        assert!(
+            approvals.try_recv().is_ok(),
+            "pre-snapshot rounds must fail-open using registered validator wallets"
+        );
+
+        // Even if node 1 later re-registers with a different wallet, valid_voter_wallets
+        // remains bound to the wallet recorded in the vote tally ("W1").
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W_SWAPPED".to_string()))
+            .await;
+        let voter_wallets = c.valid_voter_wallets(&id).await;
+        assert!(
+            voter_wallets.contains(&(NodeId(vec![1]), "W1".to_string())),
+            "co-sign must use the vote-bound wallet rather than mutable leader_selector state"
+        );
     }
 }

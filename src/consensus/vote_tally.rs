@@ -240,6 +240,24 @@ impl VoteTally {
         }
         out
     }
+
+    /// Returns the authenticated `(NodeId, wallet_pubkey)` pairs of the validators
+    /// that voted `Valid` and are in `eligible_wallets` (#1030). Binding the wallet
+    /// directly from the signed `VoteTally` record prevents TOCTOU drift if
+    /// `leader_selector` is mutated before `cosign_settlement_transact_tx` runs.
+    pub async fn valid_voter_wallets(
+        &self,
+        eligible_wallets: &HashSet<String>,
+    ) -> Vec<(NodeId, String)> {
+        let votes = self.votes.read().await;
+        let mut out = Vec::new();
+        for (wallet, rec) in votes.iter() {
+            if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
+                out.push((rec.node_id.clone(), wallet.clone()));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
