@@ -2416,24 +2416,21 @@ impl Node {
             .map_err(|e| anyhow!("invalid program id: {e}"))?;
         let (vault, _) = derive_bridge_vault(&program_id);
 
-        // The validators that approved this transact become the co-signer
-        // quorum, mapped to their advertised settlement wallets; the leader
-        // signs as itself and is excluded from the peers it requests from.
+        // Select the deterministic BFT co-signer set and threshold (#1032),
+        // excluding any peer that declined an earlier attempt on this request.
         let self_id = self.node_info.id.clone();
+        let (raw_peers, raw_threshold) = coordinator
+            .select_cosign_quorum(&request.request_id, &self_id)
+            .await;
         let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&request.request_id).await {
-            if voter == self_id {
-                continue;
-            }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
-                }
+        for (wallet, voter) in raw_peers {
+            if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                peers.push((pubkey, voter));
             }
         }
         let mut quorum_wallets = vec![leader.pubkey()];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
+        let threshold = raw_threshold.min(quorum_wallets.len()).max(1);
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
         // wire form; strip the L2 suite tag and convert the compressed body.
@@ -2475,6 +2472,8 @@ impl Node {
         };
 
         let network = self.network.clone();
+        let coord_for_decline = coordinator.clone();
+        let req_id_for_decline = request.request_id.clone();
         cosign_round::run_cosign_round(
             leader,
             program_id,
@@ -2488,7 +2487,15 @@ impl Node {
             threshold,
             |peer, request| {
                 let network = network.clone();
-                async move { network.send_cosign_request(peer, request).await.ok() }
+                let coord = coord_for_decline.clone();
+                let req_id = req_id_for_decline.clone();
+                async move {
+                    let resp = network.send_cosign_request(peer.clone(), request).await.ok();
+                    if resp.as_ref().and_then(|r| r.signature.as_ref()).is_none() {
+                        coord.record_cosign_decline(&req_id, peer).await;
+                    }
+                    resp
+                }
             },
         )
         .await

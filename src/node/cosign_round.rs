@@ -58,43 +58,115 @@ where
     S: Fn(NodeId, CoSignRequest) -> Fut,
     Fut: Future<Output = Option<CoSignResponse>>,
 {
-    let payload = CoSignPayload {
-        program_id: program_id.to_bytes(),
-        authority: leader.pubkey().to_bytes(),
-        bridge_vault: bridge_vault.to_bytes(),
-        blockhash,
-        quorum_validators: quorum_wallets.iter().map(|p| p.to_bytes()).collect(),
-        params,
-    };
+    let needed_peers = threshold.saturating_sub(1);
+    let mut remaining_peers: Vec<(Pubkey, NodeId)> = peers.to_vec();
 
-    let message = build_settlement_message(&payload)?;
-    let own_sig = leader.sign_message(&message.serialize()).as_ref().to_vec();
-
-    let request = CoSignRequest {
-        request_id: request_id.to_string(),
-        kind,
-        message: payload.to_bytes()?,
-    };
-
-    let collected = gather_signatures(
-        &message,
-        (leader.pubkey(), own_sig),
-        peers,
-        threshold,
-        |peer| {
-            let send = &send;
-            let request = request.clone();
-            async move {
-                let response = send(peer, request).await?;
-                let sig = response.signature?;
-                let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
-                Some((wallet, sig))
+    loop {
+        let cohort_peers: Vec<(Pubkey, NodeId)> = remaining_peers
+            .iter()
+            .take(needed_peers)
+            .cloned()
+            .collect();
+        let mut cohort_wallets = Vec::with_capacity(1 + cohort_peers.len());
+        cohort_wallets.push(leader.pubkey());
+        for (w, _) in &cohort_peers {
+            if !cohort_wallets.contains(w) {
+                cohort_wallets.push(*w);
             }
-        },
-    )
-    .await?;
+        }
+        // If `peers` is empty but caller passed extra `quorum_wallets`, preserve
+        // up to `threshold` wallets so existing error paths behave identically.
+        for w in &quorum_wallets {
+            if cohort_wallets.len() >= threshold {
+                break;
+            }
+            if !cohort_wallets.contains(w) {
+                cohort_wallets.push(*w);
+            }
+        }
 
-    assemble_transaction(message, &collected)
+        let payload = CoSignPayload {
+            program_id: program_id.to_bytes(),
+            authority: leader.pubkey().to_bytes(),
+            bridge_vault: bridge_vault.to_bytes(),
+            blockhash,
+            quorum_validators: cohort_wallets.iter().map(|p| p.to_bytes()).collect(),
+            params: params.clone(),
+        };
+
+        let message = build_settlement_message(&payload)?;
+        let message_bytes = message.serialize();
+        let own_sig = leader.sign_message(&message_bytes).as_ref().to_vec();
+
+        let request = CoSignRequest {
+            request_id: request_id.to_string(),
+            kind,
+            message: payload.to_bytes()?,
+        };
+
+        let failed_peer: std::sync::Mutex<Option<NodeId>> = std::sync::Mutex::new(None);
+        match gather_signatures(
+            &message,
+            (leader.pubkey(), own_sig),
+            &cohort_peers,
+            threshold,
+            |peer| {
+                let send = &send;
+                let request = request.clone();
+                let failed_peer = &failed_peer;
+                let message_bytes = &message_bytes;
+                let expected_wallet = cohort_peers
+                    .iter()
+                    .find(|(_, id)| *id == peer)
+                    .map(|(w, _)| *w);
+                async move {
+                    // Abort remaining requests in this cohort as soon as one
+                    // required signer declines, avoiding wasted co-sign budget
+                    // on a message whose header includes the declining signer.
+                    if failed_peer.lock().unwrap().is_some() {
+                        return None;
+                    }
+                    let record_failure = || {
+                        *failed_peer.lock().unwrap() = Some(peer.clone());
+                        None
+                    };
+                    let Some(response) = send(peer.clone(), request).await else {
+                        return record_failure();
+                    };
+                    let Some(sig) = response.signature else {
+                        return record_failure();
+                    };
+                    let Ok(wallet) = response.wallet_pubkey.parse::<Pubkey>() else {
+                        return record_failure();
+                    };
+                    if expected_wallet.is_some_and(|exp| exp != wallet) {
+                        return record_failure();
+                    }
+                    if !crate::bridge::solana::cosign_assembly::signature_is_valid(
+                        &wallet,
+                        &sig,
+                        message_bytes,
+                    ) {
+                        return record_failure();
+                    }
+                    Some((wallet, sig))
+                }
+            },
+        )
+        .await
+        {
+            Ok(collected) => return assemble_transaction(message, &collected),
+            Err(e) => {
+                if let Some(bad) = failed_peer.into_inner().unwrap() {
+                    remaining_peers.retain(|(_, id)| *id != bad);
+                    if 1 + remaining_peers.len() >= threshold {
+                        continue;
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +267,55 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn single_declining_voter_does_not_break_bft_supermajority_round() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+        let p3 = Keypair::new();
+        let p4_byzantine = Keypair::new();
+
+        // Put the Byzantine voter first to exercise cohort eviction + retry
+        // without wasting the honest peers' co-sign budget on the failed cohort.
+        let peers = vec![
+            (p4_byzantine.pubkey(), NodeId(vec![4])),
+            (p1.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+            (p3.pubkey(), NodeId(vec![3])),
+        ];
+        let mut quorum_wallets = vec![leader.pubkey()];
+        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+        let threshold = 4; // BFT supermajority of 5 validators: floor(2*5/3) + 1 = 4
+
+        let tx = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-bft",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            threshold,
+            |peer, request| {
+                let (p1, p2, p3) = (&p1, &p2, &p3);
+                async move {
+                    match peer.0.as_slice() {
+                        [1] => Some(honest_response(p1, &request)),
+                        [2] => Some(honest_response(p2, &request)),
+                        [3] => Some(honest_response(p3, &request)),
+                        _ => None, // Byzantine voter withholds CoSignResponse
+                    }
+                }
+            },
+        )
+        .await
+        .expect("4-of-5 BFT supermajority succeeds despite 1 declining voter");
+
+        assert!(tx.verify().is_ok());
+        assert_eq!(tx.signatures.len(), 4);
     }
 }

@@ -322,6 +322,10 @@ pub struct TransactVerificationCoordinator {
     /// Where the equivocator ban set is persisted (sibling of reputation.json).
     /// `None` = in-memory only (unit/unconfigured case).
     equivocators_path: Option<std::path::PathBuf>,
+
+    /// Per-request peers that declined or timed out during a co-sign round
+    /// (#1032), so subsequent retry subsets exclude them up front.
+    cosign_declines: Arc<RwLock<HashMap<String, HashSet<NodeId>>>>,
 }
 
 impl TransactVerificationCoordinator {
@@ -345,6 +349,7 @@ impl TransactVerificationCoordinator {
             local_wallet: None,
             equivocators: Arc::new(RwLock::new(HashSet::new())),
             equivocators_path: None,
+            cosign_declines: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -745,6 +750,89 @@ impl TransactVerificationCoordinator {
         }
     }
 
+    /// Record that `peer` declined or timed out during a co-signing round for
+    /// `request_id` (#1032), excluding it from subsequent retry subsets.
+    pub async fn record_cosign_decline(&self, request_id: &str, peer: NodeId) {
+        self.cosign_declines
+            .write()
+            .await
+            .entry(request_id.to_string())
+            .or_default()
+            .insert(peer);
+    }
+
+    /// Select the deterministic ordered co-signer peer list `(wallet_pubkey, node_id)`
+    /// (excluding `self_id` and any peers that declined earlier attempts) and
+    /// the BFT quorum signature `threshold` (including the leader) required to
+    /// settle `request_id` (#1032).
+    pub async fn select_cosign_quorum(
+        &self,
+        request_id: &str,
+        self_id: &NodeId,
+    ) -> (Vec<(String, NodeId)>, usize) {
+        let voters = self.valid_voters(request_id).await;
+        let declined = self
+            .cosign_declines
+            .read()
+            .await
+            .get(request_id)
+            .cloned()
+            .unwrap_or_default();
+        let onchain_stakes = self.onchain_stakes.read().await;
+
+        let mut peers: Vec<(String, NodeId)> = Vec::new();
+        for voter in voters {
+            if &voter == self_id || declined.contains(&voter) {
+                continue;
+            }
+            if let Some(wallet) = self.validator_wallet(&voter).await {
+                peers.push((wallet, voter));
+            }
+        }
+
+        // Deterministic ordering: highest on-chain stake first, then wallet lexical order.
+        peers.sort_by(|(wa, _), (wb, _)| {
+            let sa = onchain_stakes.get(wa).copied().unwrap_or(0);
+            let sb = onchain_stakes.get(wb).copied().unwrap_or(0);
+            sb.cmp(&sa).then_with(|| wa.cmp(wb))
+        });
+
+        let total_available = 1 + peers.len();
+        let registry_total = *self.onchain_registry_total.read().await;
+        let authority_stake = self
+            .local_wallet
+            .as_ref()
+            .and_then(|w| onchain_stakes.get(w))
+            .copied()
+            .unwrap_or(0);
+        let eligible_stake = registry_total.saturating_sub(authority_stake);
+
+        let stake_peers_needed = if eligible_stake > 0 {
+            let stake_threshold = eligible_stake.saturating_mul(2) / 3 + 1;
+            let mut counted = 0u64;
+            let mut count = 0usize;
+            for (w, _) in &peers {
+                counted = counted.saturating_add(onchain_stakes.get(w).copied().unwrap_or(0));
+                count += 1;
+                if counted >= stake_threshold {
+                    break;
+                }
+            }
+            count
+        } else {
+            0
+        };
+
+        let bft_headcount = (total_available * 2) / 3 + 1;
+        let threshold = (1 + stake_peers_needed)
+            .max(self.min_validators_for_consensus.min(total_available))
+            .max(bft_headcount.min(total_available))
+            .min(total_available)
+            .max(1);
+
+        (peers, threshold)
+    }
+
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
     /// flap-surviving driver-auth check (replaces `is_registered_validator`,
     /// which used the flap-prone `self.validators`). The leader_selector entry
@@ -984,6 +1072,7 @@ impl TransactVerificationCoordinator {
     /// Remove a completed verification's state.
     pub async fn cleanup(&self, request_id: &str) -> Result<()> {
         self.pending.write().await.remove(request_id);
+        self.cosign_declines.write().await.remove(request_id);
         log::debug!("Cleaned up transact verification: {}", request_id);
         Ok(())
     }
@@ -1004,6 +1093,7 @@ impl TransactVerificationCoordinator {
             // A content-bound canonical id that timed out must be re-approvable
             // if the client re-proves it, so drop any stale emitted mark too.
             self.emitted.write().await.remove(&id);
+            self.cosign_declines.write().await.remove(&id);
             log::warn!("Cleaned up timed out transact verification: {}", id);
         }
         Ok(count)
