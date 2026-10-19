@@ -213,9 +213,10 @@ pub trait SwapSubmitter: Send + Sync {
 }
 
 /// Lamports left at the ephemeral address when re-depositing a native-SOL swap
-/// output, to cover the re-deposit transaction's own fee. The realized balance
-/// minus this reserve is what gets re-shielded.
-const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 10_000;
+/// output, to cover the 0-byte system account rent-exempt floor (890,880 lamports)
+/// plus the re-deposit transaction's own fee. The realized balance minus this
+/// reserve is what gets re-shielded.
+const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 890_880 + 10_000;
 
 /// Production [`JupiterHttpClient`] over `reqwest`, talking to a configurable
 /// base URL.
@@ -366,20 +367,26 @@ impl SwapSubmitter for RpcSwapSubmitter {
         use solana_sdk::commitment_config::CommitmentConfig;
 
         let rpc_url = self.rpc_url.clone();
-        // Jupiter's swap output tokens are classic SPL Token accounts.
-        let ata = crate::bridge::solana::derive_associated_token_address(
-            owner,
-            mint,
-            &crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
-        );
+        let owner = *owner;
+        let mint = *mint;
         tokio::task::spawn_blocking(move || {
             let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-            // A missing/unreadable ATA yields None, not an error: the caller then
-            // falls back to the quote estimate rather than aborting the swap.
-            match client.get_token_account_balance(&ata) {
-                Ok(bal) => Ok(Some(bal.amount.parse::<u64>().unwrap_or(0))),
-                Err(_) => Ok(None),
+            // Check both classic SPL Token and Token-2022 ATAs; a missing/unreadable
+            // ATA yields None so the caller falls back to the quote estimate.
+            for program_id in [
+                crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
+                crate::bridge::solana::SPL_TOKEN_2022_PROGRAM_ID,
+            ] {
+                let ata = crate::bridge::solana::derive_associated_token_address(
+                    &owner,
+                    &mint,
+                    &program_id,
+                );
+                if let Ok(bal) = client.get_token_account_balance(&ata) {
+                    return Ok(Some(bal.amount.parse::<u64>().unwrap_or(0)));
+                }
             }
+            Ok(None)
         })
         .await
         .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
@@ -636,7 +643,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             // only when the balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
                 Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
-                None => out_amount,
+                None => out_amount.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
             }
         } else {
             let mint = Pubkey::from_str(&output_mint)
@@ -974,4 +981,16 @@ mod tests {
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
     }
+
+    #[test]
+    fn native_output_reserve_does_not_leave_sub_rent_exempt_dust() {
+        let rent_min = solana_sdk::rent::Rent::default().minimum_balance(0);
+        let tx_fee = 5_000u64;
+        let remaining_after_tx = NATIVE_DEPOSIT_RESERVE_LAMPORTS.saturating_sub(tx_fee);
+        assert!(
+            remaining_after_tx == 0 || remaining_after_tx >= rent_min,
+            "post-deposit ephemeral balance ({remaining_after_tx} lamports) is in the forbidden (0, {rent_min}) sub-rent-exempt range"
+        );
+    }
 }
+
