@@ -503,8 +503,16 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     balance as f64 / LAMPORTS_PER_SOL as f64
                 );
 
-                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
-                if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
+                anyhow::ensure!(
+                    amount.is_finite() && amount > 0.0,
+                    "Deposit amount must be a positive finite number of SOL"
+                );
+                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64).round() as u64;
+                anyhow::ensure!(
+                    deposit_lamports >= 1_000_000,
+                    "Deposit amount must be at least 0.001 SOL (1,000,000 lamports)"
+                );
+                if balance < deposit_lamports.saturating_add(LAMPORTS_PER_SOL / 100) {
                     anyhow::bail!(
                         "Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)",
                         amount
@@ -817,17 +825,17 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         WalletCommands::NewAddress { label } => {
             println!("Generating new shielded address...\n");
 
-            // Generate random keypair (32 bytes for private key)
-            let private_key: [u8; 32] = rand::random();
+            let seed: [u8; 32] = rand::random();
+            let note_sk = Fr::from_le_bytes_mod_order(&seed);
+            let mut private_key = [0u8; 32];
+            let sk_le = note_sk.into_bigint().to_bytes_le();
+            private_key[..sk_le.len().min(32)].copy_from_slice(&sk_le[..sk_le.len().min(32)]);
 
-            // Generate public key (in production, this would be derived from private key)
-            // For now, we'll use a simple hash as placeholder
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(private_key);
-            let public_key = hasher.finalize();
+            let note_pk = v3_pubkey(note_sk);
+            let mut public_key = [0u8; 32];
+            let pk_le = note_pk.into_bigint().to_bytes_le();
+            public_key[..pk_le.len().min(32)].copy_from_slice(&pk_le[..pk_le.len().min(32)]);
 
-            // Create address (paraloom1 + hex encoded public key)
             let address = format!("paraloom1{}", hex::encode(&public_key[..]));
 
             println!("[OK] New address created!");
@@ -851,7 +859,18 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             }
 
             let filename = if let Some(label_text) = &label {
-                format!("{}.key", label_text.replace(" ", "_"))
+                let sanitized = label_text.trim().replace(' ', "_");
+                anyhow::ensure!(
+                    !sanitized.is_empty()
+                        && sanitized != "."
+                        && sanitized != ".."
+                        && sanitized
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                    "Invalid --label '{}': only ASCII alphanumeric, '_', and '-' are allowed",
+                    label_text
+                );
+                format!("{}.key", sanitized)
             } else {
                 format!("key_{}.key", hex::encode(&public_key[..4]))
             };
@@ -1467,6 +1486,17 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                         .try_into()
                         .expect("32-byte stake_mint slice"),
                 );
+                let reg_min_stake = u64::from_le_bytes(
+                    registry_data[56..64]
+                        .try_into()
+                        .expect("8-byte minimum_stake slice"),
+                );
+                let stake_lamports = reg_min_stake.max(STAKE_LAMPORTS);
+                anyhow::ensure!(
+                    balance >= stake_lamports.saturating_add(LAMPORTS_PER_SOL / 100),
+                    "Insufficient balance for registry minimum stake ({} lamports + fees)",
+                    stake_lamports
+                );
                 let min_token_stake = u64::from_le_bytes(
                     registry_data[104..112]
                         .try_into()
@@ -1494,7 +1524,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &stake_mint,
                     &validator_token,
                     &token_program,
-                    STAKE_LAMPORTS,
+                    stake_lamports,
                     min_token_stake,
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
