@@ -79,12 +79,12 @@ impl BatchVerifier {
             return self.verify_individually(vk, public_inputs, proofs);
         }
 
-        // Prepare verifying key if not cached
+        // Prepare verifying key if not cached or if cached pvk belongs to a different vk
         use ark_groth16::Groth16;
         let owned_pvk;
         let pvk = match &self.pvk {
-            Some(pvk) => pvk,
-            None => {
+            Some(pvk) if &pvk.vk == vk => pvk,
+            _ => {
                 owned_pvk = match Groth16::<Bn254>::process_vk(vk) {
                     Ok(pvk) => pvk,
                     Err(_) => {
@@ -97,12 +97,19 @@ impl BatchVerifier {
             }
         };
 
+        let expected_inputs = vk.gamma_abc_g1.len().saturating_sub(1);
+
         // Batch verification using prepared VK
         // This is faster than individual verification for large batches
         let mut all_valid = true;
         let mut invalid_indices = Vec::new();
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
+            if inputs.len() != expected_inputs {
+                all_valid = false;
+                invalid_indices.push(i);
+                continue;
+            }
             match self.verify_single_with_prepared(pvk, inputs, proof) {
                 Ok(true) => continue,
                 Ok(false) => {
@@ -110,9 +117,8 @@ impl BatchVerifier {
                     invalid_indices.push(i);
                 }
                 Err(_) => {
-                    return BatchVerificationResult::Error {
-                        reason: format!("Verification error at index {}", i),
-                    }
+                    all_valid = false;
+                    invalid_indices.push(i);
                 }
             }
         }
@@ -132,16 +138,16 @@ impl BatchVerifier {
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
         let mut invalid_indices = Vec::new();
+        let expected_inputs = vk.gamma_abc_g1.len().saturating_sub(1);
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
+            if inputs.len() != expected_inputs {
+                invalid_indices.push(i);
+                continue;
+            }
             match crate::privacy::circuits::Groth16ProofSystem::verify(vk, inputs, proof) {
                 Ok(true) => continue,
-                Ok(false) => invalid_indices.push(i),
-                Err(_) => {
-                    return BatchVerificationResult::Error {
-                        reason: format!("Verification error at index {}", i),
-                    }
-                }
+                Ok(false) | Err(_) => invalid_indices.push(i),
             }
         }
 
