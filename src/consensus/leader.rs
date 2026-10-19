@@ -170,11 +170,15 @@ impl LeaderSelector {
     /// # Returns
     /// Selected leader's NodeId
     pub fn select_leader(&self, seed: &[u8]) -> Result<NodeId> {
-        let active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
+        let mut active_validators: Vec<_> =
+            self.validators.values().filter(|v| v.is_active).collect();
 
         if active_validators.is_empty() {
             return Err(anyhow!("No active validators available"));
         }
+
+        // Canonical ordering by NodeId bytes so HashMap iteration order never diverges across nodes
+        active_validators.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
 
         // Calculate total weight
         let total_weight: u128 = active_validators.iter().map(|v| v.selection_weight()).sum();
@@ -188,25 +192,27 @@ impl LeaderSelector {
 
         // Select validator based on weighted random
         let mut cumulative_weight = 0u128;
-        for validator in active_validators {
-            cumulative_weight += validator.selection_weight();
+        for validator in &active_validators {
+            let weight = validator.selection_weight();
+            if weight == 0 {
+                continue;
+            }
+            cumulative_weight += weight;
             if random_value < cumulative_weight {
                 log::debug!(
                     "Selected leader: {:?} (weight: {}/{})",
                     validator.node_id,
-                    validator.selection_weight(),
+                    weight,
                     total_weight
                 );
                 return Ok(validator.node_id.clone());
             }
         }
 
-        // Fallback to last validator (should never happen due to cumulative math)
-        Ok(self
-            .validators
-            .values()
-            .filter(|v| v.is_active)
-            .last()
+        // Fallback to last non-zero weight validator in canonical order
+        Ok(active_validators
+            .iter()
+            .rfind(|v| v.selection_weight() > 0)
             .ok_or_else(|| anyhow!("No active validators"))?
             .node_id
             .clone())
@@ -237,7 +243,7 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
-    /// Get all active validators sorted by weight (descending)
+    /// Get all active validators sorted by weight (descending) with canonical NodeId tie-breaker
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self
             .validators
@@ -246,7 +252,11 @@ impl LeaderSelector {
             .cloned()
             .collect();
 
-        validators.sort_by_key(|b| std::cmp::Reverse(b.selection_weight()));
+        validators.sort_by(|a, b| {
+            b.selection_weight()
+                .cmp(&a.selection_weight())
+                .then_with(|| a.node_id.0.cmp(&b.node_id.0))
+        });
         validators
     }
 
