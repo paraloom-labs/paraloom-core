@@ -168,6 +168,17 @@ pub fn prove_withdraw_to_fresh(
     membership: &Membership,
     recipient: &[u8; 32],
 ) -> Result<WithdrawToFresh> {
+    if amount == 0 || amount > i64::MAX as u64 {
+        return Err(TransactSubmitError::Prove(format!(
+            "invalid withdraw amount: {amount}"
+        )));
+    }
+    if note_pubkey != v3_pubkey(sk) {
+        return Err(TransactSubmitError::Prove(
+            "note_pubkey does not match v3_pubkey(sk)".to_string(),
+        ));
+    }
+
     let root = Fr::from_le_bytes_mod_order(&membership.root);
     let commitment = v3_commit(Fr::from(amount), note_pubkey, blinding, Fr::from(0u64));
     let leaf_index = membership.leaf_index;
@@ -175,7 +186,10 @@ pub fn prove_withdraw_to_fresh(
     let sig0 = v3_signature(sk, commitment, Fr::from(leaf_index));
     let nf0 = v3_nullifier(commitment, Fr::from(leaf_index), sig0);
     // Zero-value dummy input (membership skipped in-circuit for a zero note).
-    let dsk = rand_fr();
+    let mut dsk = rand_fr();
+    while dsk == sk {
+        dsk = rand_fr();
+    }
     let dbl = rand_fr();
     let dc = v3_commit(Fr::from(0u64), v3_pubkey(dsk), dbl, Fr::from(0u64));
     let dsig = v3_signature(dsk, dc, Fr::from(0u64));
@@ -270,8 +284,9 @@ pub fn post_transact(
         "proof": hex::encode(&w.proof),
         "ciphertexts": [hex::encode(&ciphertexts[0]), hex::encode(&ciphertexts[1])],
     });
+    let base = ingress.trim_end_matches('/');
     let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
+        .post(format!("{base}/transact/submit"))
         .json(&body)
         .send()
         .map_err(|e| TransactSubmitError::Http(e.to_string()))?;
