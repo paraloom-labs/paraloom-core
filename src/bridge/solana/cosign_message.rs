@@ -164,7 +164,15 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         .map(Pubkey::new_from_array)
         .collect();
 
-    let instruction = match &payload.params {
+    // Both settlement paths verify a Groth16 proof on-chain and need the raised
+    // compute-unit ceiling prepended (SPL additionally does two token CPIs);
+    // every co-signer builds the same message, so the extra instruction stays
+    // part of what they all sign over.
+    let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(
+        TRANSACT_COMPUTE_UNIT_LIMIT,
+    )];
+
+    match &payload.params {
         SettlementParams::Transact {
             recipient,
             nullifiers,
@@ -174,7 +182,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
             proof,
         } => {
             let vault = Pubkey::new_from_array(payload.bridge_vault);
-            create_transact_instruction(
+            instructions.push(create_transact_instruction(
                 &program_id,
                 &authority,
                 &vault,
@@ -185,7 +193,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 *ext_amount,
                 proof.clone(),
                 &quorum,
-            )?
+            )?);
         }
         SettlementParams::TransactSpl {
             recipient_token_account,
@@ -205,7 +213,25 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &super::instructions::SPL_TOKEN_PROGRAM_ID,
             );
-            super::instructions::create_transact_spl_instruction(
+            // When the withdrawal pays a non-zero fee (#1033), idempotently
+            // initialize the settling authority's ATA in the same transaction
+            // so SPL withdrawals succeed without manual ATA pre-provisioning.
+            let fee = if *ext_amount < 0 {
+                ext_amount.unsigned_abs().saturating_mul(25) / 10_000
+            } else {
+                0
+            };
+            if fee > 0 {
+                instructions.push(
+                    super::instructions::create_associated_token_account_idempotent_instruction(
+                        &authority,
+                        &authority,
+                        &mint_pk,
+                        &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                    ),
+                );
+            }
+            instructions.push(super::instructions::create_transact_spl_instruction(
                 &program_id,
                 &authority,
                 &mint_pk,
@@ -218,18 +244,9 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 *ext_amount,
                 proof.clone(),
                 &quorum,
-            )?
+            )?);
         }
-    };
-
-    // Both settlement paths verify a Groth16 proof on-chain and need the raised
-    // compute-unit ceiling prepended (SPL additionally does two token CPIs);
-    // every co-signer builds the same message, so the extra instruction stays
-    // part of what they all sign over.
-    let instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(TRANSACT_COMPUTE_UNIT_LIMIT),
-        instruction,
-    ];
+    }
 
     let blockhash = Hash::new_from_array(payload.blockhash);
     Ok(Message::new_with_blockhash(
@@ -325,5 +342,33 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    #[test]
+    fn transact_spl_prepends_idempotent_ata_init_only_when_fee_is_positive() {
+        let mut payload = sample_transact_payload();
+        // Zero-fee SPL transfer (ext_amount == 0): only compute-budget + transact_spl (2 instructions).
+        payload.params = SettlementParams::TransactSpl {
+            recipient_token_account: [6u8; 32],
+            mint: [7u8; 32],
+            nullifiers: [[8u8; 32], [9u8; 32]],
+            output_commitments: [[10u8; 32], [11u8; 32]],
+            root: [12u8; 32],
+            ext_amount: 0,
+            proof: vec![0u8; 256],
+        };
+        let zero_fee_msg = build_settlement_message(&payload).expect("zero-fee SPL message");
+        assert_eq!(zero_fee_msg.instructions.len(), 2);
+
+        // Fee-bearing SPL withdrawal (ext_amount == -1_000, fee == 2): prepends CreateIdempotent (3 instructions).
+        if let SettlementParams::TransactSpl {
+            ref mut ext_amount, ..
+        } = payload.params
+        {
+            *ext_amount = -1_000;
+        }
+        let fee_msg = build_settlement_message(&payload).expect("fee-bearing SPL message");
+        assert_eq!(fee_msg.instructions.len(), 3);
+        assert_eq!(fee_msg.instructions[1].data, vec![1]);
     }
 }

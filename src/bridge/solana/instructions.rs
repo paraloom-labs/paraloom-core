@@ -927,6 +927,30 @@ pub fn derive_associated_token_address(
     .0
 }
 
+/// Create an idempotent Associated Token Account instruction
+/// (`CreateIdempotent`, discriminator `1`) under
+/// [`SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID`] (#1033).
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(wallet, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*wallet, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -150,6 +150,25 @@ fn public_amount_bytes(ext_amount: i64) -> [u8; 32] {
     out
 }
 
+/// Validate `fee_token_account` as an initialized `TokenAccount` matching
+/// `expected_mint` and `expected_authority` (#1033). Called in `transact_spl`
+/// only when `fee > 0` so zero-fee SPL settlements do not require an
+/// initialized validator ATA.
+pub fn validate_fee_token_account<'info>(
+    fee_token_account: &AccountInfo<'info>,
+    expected_mint: &Pubkey,
+    expected_authority: &Pubkey,
+) -> Result<()> {
+    let fee_ta = InterfaceAccount::<TokenAccount>::try_from(fee_token_account)?;
+    require_keys_eq!(fee_ta.mint, *expected_mint, ErrorCode::ConstraintTokenMint);
+    require_keys_eq!(
+        fee_ta.owner,
+        *expected_authority,
+        ErrorCode::ConstraintTokenOwner
+    );
+    Ok(())
+}
+
 #[program]
 pub mod paraloom_program {
     use super::*;
@@ -660,10 +679,16 @@ pub mod paraloom_program {
             )?;
 
             // Settling-validator fee, paid in the withdrawn asset to the
-            // validator's own token account (constrained to `authority` in the
-            // accounts struct). The native path credits lamport `pending_rewards`
-            // for a later claim; here the token fee is paid inline.
+            // validator's own token account (constrained to `authority` via
+            // `validate_fee_token_account` when `fee > 0`, #1033). The native
+            // path credits lamport `pending_rewards` for a later claim; here
+            // the token fee is paid inline.
             if fee > 0 {
+                validate_fee_token_account(
+                    &ctx.accounts.fee_token_account.to_account_info(),
+                    &ctx.accounts.mint.key(),
+                    &ctx.accounts.authority.key(),
+                )?;
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -1918,9 +1943,14 @@ pub struct TransactSpl<'info> {
     pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid when `ext_amount < 0` and `fee > 0`. Validated via
+    /// [`validate_fee_token_account`] only when `fee > 0` (#1033), so zero-fee
+    /// SPL transfers and sub-400 base-unit withdrawals do not require an
+    /// initialized authority ATA.
+    ///
+    /// CHECK: deserialized and constrained (`mint` + `authority`) in `transact_spl` when `fee > 0`.
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
@@ -2916,4 +2946,38 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+#[cfg(test)]
+mod fee_token_account_tests {
+    use super::*;
+
+    #[test]
+    fn uninitialized_authority_ata_is_accepted_when_fee_is_zero_and_rejected_when_fee_is_nonzero() {
+        let uninitialized_ata_key = Pubkey::new_unique();
+        let mint_key = Pubkey::new_unique();
+        let authority_key = Pubkey::new_unique();
+        let system_program = anchor_lang::solana_program::system_program::ID;
+
+        let mut lamports = 0u64;
+        let mut data = [];
+        let fee_token_account_info = AccountInfo::new(
+            &uninitialized_ata_key,
+            false,
+            true,
+            &mut lamports,
+            &mut data,
+            &system_program,
+            false,
+            0,
+        );
+
+        // `UncheckedAccount` in `TransactSpl::try_accounts` accepts the uninitialized
+        // ATA when `fee == 0`, whereas `validate_fee_token_account` rejects it when `fee > 0`.
+        let _unchecked = UncheckedAccount::try_from(&fee_token_account_info);
+        assert!(
+            validate_fee_token_account(&fee_token_account_info, &mint_key, &authority_key).is_err(),
+            "fee > 0 must still reject an uninitialized fee_token_account"
+        );
+    }
 }
