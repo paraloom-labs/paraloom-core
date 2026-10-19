@@ -1443,10 +1443,21 @@ impl Node {
         // is a follow-up once the cursor is durable.
         let runs_bridge = settings.bridge.enabled
             && matches!(node_type, NodeType::ResourceProvider | NodeType::Bridge);
-        let shielded_pool = if runs_bridge {
-            Some(Arc::new(ShieldedPool::new()))
+        let (privacy_storage, shielded_pool) = if runs_bridge {
+            let privacy_dir = format!("{}/privacy", settings.storage.data_dir);
+            match PrivacyStorage::open(&privacy_dir) {
+                Ok(storage) => {
+                    let storage = Arc::new(storage);
+                    let pool = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(ShieldedPool::with_storage(storage.clone()))
+                    })
+                    .unwrap_or_else(|_| ShieldedPool::new());
+                    (Some(storage), Some(Arc::new(pool)))
+                }
+                Err(_) => (None, Some(Arc::new(ShieldedPool::new()))),
+            }
         } else {
-            None
+            (None, None)
         };
         let bridge = if runs_bridge {
             // Persist the deposit listener's scan cursor under the node's data
@@ -1512,7 +1523,7 @@ impl Node {
             resource_monitor: Arc::new(resource_monitor),
             coordinator,
             validator,
-            privacy_storage: None,
+            privacy_storage,
             shielded_pool,
             bridge,
             compute_executor,
