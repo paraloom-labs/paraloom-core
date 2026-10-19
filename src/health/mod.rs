@@ -192,7 +192,11 @@ async fn readiness_handler(Extension(state): Extension<HealthServerState>) -> im
 async fn metrics_handler(Extension(state): Extension<HealthServerState>) -> impl IntoResponse {
     let uptime = state.uptime_seconds();
     let peers = state.current_peer_count();
-    let ready = if state.is_ready() { 1u8 } else { 0 };
+    let ready = if state.is_ready() && peers >= state.min_peers_for_ready {
+        1u8
+    } else {
+        0
+    };
     let body = format!(
         "# HELP paraloom_uptime_seconds Process uptime in seconds.\n\
          # TYPE paraloom_uptime_seconds gauge\n\
@@ -422,5 +426,25 @@ mod tests {
         assert!(!state.is_ready());
         assert_eq!(state.current_peer_count(), 0);
         assert_eq!(state.min_peers_for_ready, DEFAULT_MIN_PEERS_FOR_READY);
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_not_ready_when_peers_below_threshold() {
+        let state = HealthServerState::with_min_peers(2);
+        state.mark_ready();
+        state.set_peer_count(1);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("paraloom_ready 0"));
     }
 }
