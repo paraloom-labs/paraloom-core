@@ -94,6 +94,50 @@ where
     )
     .await?;
 
+    if collected.len() < quorum_wallets.len() {
+        let responsive_peers: Vec<(Pubkey, NodeId)> = peers
+            .iter()
+            .filter(|(pk, _)| collected.iter().any(|(w, _)| w == pk))
+            .cloned()
+            .collect();
+        let mut shrunk_wallets = vec![leader.pubkey()];
+        shrunk_wallets.extend(responsive_peers.iter().map(|(pk, _)| *pk));
+
+        let shrunk_payload = CoSignPayload {
+            program_id: program_id.to_bytes(),
+            authority: leader.pubkey().to_bytes(),
+            bridge_vault: bridge_vault.to_bytes(),
+            blockhash,
+            quorum_validators: shrunk_wallets.iter().map(|p| p.to_bytes()).collect(),
+            params,
+        };
+        let shrunk_message = build_settlement_message(&shrunk_payload)?;
+        let shrunk_own_sig = leader.sign_message(&shrunk_message.serialize()).as_ref().to_vec();
+        let shrunk_request = CoSignRequest {
+            request_id: request_id.to_string(),
+            kind,
+            message: shrunk_payload.to_bytes()?,
+        };
+        let shrunk_collected = gather_signatures(
+            &shrunk_message,
+            (leader.pubkey(), shrunk_own_sig),
+            &responsive_peers,
+            threshold,
+            |peer| {
+                let send = &send;
+                let request = shrunk_request.clone();
+                async move {
+                    let response = send(peer, request).await?;
+                    let sig = response.signature?;
+                    let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
+                    Some((wallet, sig))
+                }
+            },
+        )
+        .await?;
+        return assemble_transaction(shrunk_message, &shrunk_collected);
+    }
+
     assemble_transaction(message, &collected)
 }
 
