@@ -96,19 +96,23 @@ impl ComputeAuthPolicy {
                 return Err(ComputeAuthError::UnauthorizedSubmitter(submitter.clone()));
             }
         }
-        if requested.max_memory_bytes > self.max_limits.max_memory_bytes {
+        if requested.max_memory_bytes == 0
+            || requested.max_memory_bytes > self.max_limits.max_memory_bytes
+        {
             return Err(ComputeAuthError::MemoryTooHigh {
                 requested: requested.max_memory_bytes,
                 max: self.max_limits.max_memory_bytes,
             });
         }
-        if requested.max_instructions > self.max_limits.max_instructions {
+        if requested.max_instructions == 0
+            || requested.max_instructions > self.max_limits.max_instructions
+        {
             return Err(ComputeAuthError::InstructionsTooHigh {
                 requested: requested.max_instructions,
                 max: self.max_limits.max_instructions,
             });
         }
-        if requested.timeout_secs > self.max_limits.timeout_secs {
+        if requested.timeout_secs == 0 || requested.timeout_secs > self.max_limits.timeout_secs {
             return Err(ComputeAuthError::TimeoutTooHigh {
                 requested: requested.timeout_secs,
                 max: self.max_limits.timeout_secs,

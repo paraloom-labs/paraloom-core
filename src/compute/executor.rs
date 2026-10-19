@@ -65,11 +65,27 @@ impl JobExecutor {
 
     /// Submit a new job for execution
     pub fn submit_job(&self, job: ComputeJob) -> Result<JobId> {
+        self.drain_results();
         let job_id = job.id.clone();
 
         info!("Submitting job {} to execution queue", job_id);
 
         let mut pending = self.pending_jobs.lock().unwrap();
+        let active = self.active_jobs.lock().unwrap();
+        let completed = self.completed_results.lock().unwrap();
+
+        if pending.iter().any(|j| j.id == job_id)
+            || active.contains_key(&job_id)
+            || completed.contains_key(&job_id)
+        {
+            return Err(anyhow::anyhow!(
+                "job {} already exists in executor",
+                job_id
+            ));
+        }
+        drop(completed);
+        drop(active);
+
         // Bound the pending queue: a peer whose per-job limits are authorized
         // could otherwise enqueue unique jobs faster than the (fixed
         // concurrency) executor drains them, growing memory without bound
@@ -101,6 +117,8 @@ impl JobExecutor {
 
     /// Get job status
     pub fn get_job_status(&self, job_id: &JobId) -> Option<JobStatus> {
+        self.drain_results();
+
         // Check pending jobs
         {
             let pending = self.pending_jobs.lock().unwrap();
@@ -130,12 +148,14 @@ impl JobExecutor {
 
     /// Get job result (if completed)
     pub fn get_job_result(&self, job_id: &JobId) -> Option<JobResult> {
+        self.drain_results();
         let completed = self.completed_results.lock().unwrap();
         completed.get(job_id).cloned()
     }
 
     /// Get all completed job results
     pub fn get_all_results(&self) -> Vec<JobResult> {
+        self.drain_results();
         let completed = self.completed_results.lock().unwrap();
         completed.values().cloned().collect()
     }
@@ -227,10 +247,13 @@ impl JobExecutor {
         Ok(())
     }
 
-    /// Process completed job results
-    async fn process_results(
-        result_rx: Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
-        completed_results: Arc<Mutex<HashMap<JobId, JobResult>>>,
+    fn drain_results(&self) {
+        Self::drain_results_inner(&self.result_rx, &self.completed_results);
+    }
+
+    fn drain_results_inner(
+        result_rx: &Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
+        completed_results: &Arc<Mutex<HashMap<JobId, JobResult>>>,
     ) {
         let mut rx = result_rx.lock().unwrap();
 
@@ -250,8 +273,17 @@ impl JobExecutor {
         }
     }
 
+    /// Process completed job results
+    async fn process_results(
+        result_rx: Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
+        completed_results: Arc<Mutex<HashMap<JobId, JobResult>>>,
+    ) {
+        Self::drain_results_inner(&result_rx, &completed_results);
+    }
+
     /// Get statistics
     pub fn get_stats(&self) -> ExecutorStats {
+        self.drain_results();
         let pending_count = self.pending_jobs.lock().unwrap().len();
         let active_count = self.active_jobs.lock().unwrap().len();
         let completed = self.completed_results.lock().unwrap();
