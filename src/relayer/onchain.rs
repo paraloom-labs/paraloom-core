@@ -99,9 +99,19 @@ impl Submitter for OnChainSubmitter {
                     body: "no validator quorum (need >= 2 active validators)".to_string(),
                 });
             }
+            if amount == 0 || amount > i64::MAX as u64 {
+                return Err(transact_submit::TransactSubmitError::Prove(format!(
+                    "invalid withdraw amount: {amount}"
+                )));
+            }
             let sk_fr = Fr::from_le_bytes_mod_order(&sk);
             let blinding_fr = Fr::from_le_bytes_mod_order(&blinding);
             let note_pk_fr = Fr::from_le_bytes_mod_order(&note_pubkey);
+            if note_pk_fr != crate::privacy::poseidon_circom::v3_pubkey(sk_fr) {
+                return Err(transact_submit::TransactSubmitError::Prove(
+                    "note_pubkey does not match v3_pubkey(sk)".to_string(),
+                ));
+            }
             let commitment = v3_commit(Fr::from(amount), note_pk_fr, blinding_fr, Fr::from(0u64));
             let membership =
                 transact_submit::read_membership(&client, &program_id, leaf_index, commitment)?;

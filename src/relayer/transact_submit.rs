@@ -168,6 +168,17 @@ pub fn prove_withdraw_to_fresh(
     membership: &Membership,
     recipient: &[u8; 32],
 ) -> Result<WithdrawToFresh> {
+    if amount == 0 || amount > i64::MAX as u64 {
+        return Err(TransactSubmitError::Prove(format!(
+            "invalid withdraw amount: {amount}"
+        )));
+    }
+    if note_pubkey != v3_pubkey(sk) {
+        return Err(TransactSubmitError::Prove(
+            "note_pubkey does not match v3_pubkey(sk)".to_string(),
+        ));
+    }
+
     let root = Fr::from_le_bytes_mod_order(&membership.root);
     let commitment = v3_commit(Fr::from(amount), note_pubkey, blinding, Fr::from(0u64));
     let leaf_index = membership.leaf_index;
@@ -175,7 +186,10 @@ pub fn prove_withdraw_to_fresh(
     let sig0 = v3_signature(sk, commitment, Fr::from(leaf_index));
     let nf0 = v3_nullifier(commitment, Fr::from(leaf_index), sig0);
     // Zero-value dummy input (membership skipped in-circuit for a zero note).
-    let dsk = rand_fr();
+    let mut dsk = rand_fr();
+    while dsk == sk {
+        dsk = rand_fr();
+    }
     let dbl = rand_fr();
     let dc = v3_commit(Fr::from(0u64), v3_pubkey(dsk), dbl, Fr::from(0u64));
     let dsig = v3_signature(dsk, dc, Fr::from(0u64));
@@ -270,8 +284,9 @@ pub fn post_transact(
         "proof": hex::encode(&w.proof),
         "ciphertexts": [hex::encode(&ciphertexts[0]), hex::encode(&ciphertexts[1])],
     });
+    let base = ingress.trim_end_matches('/');
     let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
+        .post(format!("{base}/transact/submit"))
         .json(&body)
         .send()
         .map_err(|e| TransactSubmitError::Http(e.to_string()))?;
@@ -320,5 +335,75 @@ pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
         // active_validators is the u64 at [48..56] after the 8-byte discriminator.
         Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_groth16::Groth16;
+    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+    use ark_snark::SNARK;
+
+    #[derive(Clone)]
+    struct TrivialCircuit;
+
+    impl ConstraintSynthesizer<Fr> for TrivialCircuit {
+        fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+            let a = cs.new_witness_variable(|| Ok(Fr::from(3u32)))?;
+            let b = cs.new_witness_variable(|| Ok(Fr::from(5u32)))?;
+            let c = cs.new_input_variable(|| Ok(Fr::from(15u32)))?;
+            cs.enforce_constraint(ark_relations::lc!() + a, ark_relations::lc!() + b, ark_relations::lc!() + c)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_prove_withdraw_to_fresh_validation() {
+        let mut rng = ark_std::rand::thread_rng();
+        let (pk, _) = Groth16::<ark_bn254::Bn254>::circuit_specific_setup(TrivialCircuit, &mut rng).unwrap();
+
+        let sk = rand_fr();
+        let correct_pk = v3_pubkey(sk);
+        let wrong_pk = rand_fr();
+        let blinding = rand_fr();
+        let membership = Membership {
+            leaf_index: 0,
+            root: [0u8; 32],
+            path: vec![[0u8; 32]; TX_LEVELS],
+        };
+        let recipient = [1u8; 32];
+
+        // 1. Amount == 0 rejected
+        let res = prove_withdraw_to_fresh(
+            &pk, sk, blinding, correct_pk, 0, &membership, &recipient,
+        );
+        assert!(matches!(res, Err(TransactSubmitError::Prove(msg)) if msg.contains("invalid withdraw amount")));
+
+        // 2. Amount > i64::MAX rejected
+        let res = prove_withdraw_to_fresh(
+            &pk, sk, blinding, correct_pk, (i64::MAX as u64) + 1, &membership, &recipient,
+        );
+        assert!(matches!(res, Err(TransactSubmitError::Prove(msg)) if msg.contains("invalid withdraw amount")));
+
+        // 3. Pubkey mismatch rejected
+        let res = prove_withdraw_to_fresh(
+            &pk, sk, blinding, wrong_pk, 1000, &membership, &recipient,
+        );
+        assert!(matches!(res, Err(TransactSubmitError::Prove(msg)) if msg.contains("note_pubkey does not match")));
+    }
+
+    #[test]
+    fn test_post_transact_url_normalization() {
+        let ingress1 = "https://relayer.paraloom.network";
+        let ingress2 = "https://relayer.paraloom.network/";
+        assert_eq!(
+            format!("{}/transact/submit", ingress1.trim_end_matches('/')),
+            "https://relayer.paraloom.network/transact/submit"
+        );
+        assert_eq!(
+            format!("{}/transact/submit", ingress2.trim_end_matches('/')),
+            "https://relayer.paraloom.network/transact/submit"
+        );
     }
 }
