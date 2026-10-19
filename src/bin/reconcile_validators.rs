@@ -83,6 +83,7 @@ struct ValidatorRow {
     data_len: usize,
     is_active: bool,
     stake_amount: u64,
+    token_stake_amount: u64,
 }
 
 fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
@@ -93,12 +94,18 @@ fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
     let wallet = Pubkey::new_from_array(d[8..40].try_into().ok()?);
     let stake_amount = u64::from_le_bytes(d[40..48].try_into().ok()?);
     let is_active = d[88] != 0; // offset: disc(8)+pubkey(32)+5*u64/i64(40)+... = byte 88
+    let token_stake_amount = if d.len() >= 137 {
+        u64::from_le_bytes(d[129..137].try_into().ok()?)
+    } else {
+        0
+    };
     Some(ValidatorRow {
         wallet,
         pda,
         data_len: d.len(),
         is_active,
         stake_amount,
+        token_stake_amount,
     })
 }
 
@@ -193,6 +200,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keep.iter().collect::<Vec<_>>()
     );
 
+    let (registry_pda, _) = derive_validator_registry(&program_id);
+    let reg_before = client.get_account(&registry_pda)?;
+    if reg_before.data.len() < 72 {
+        return Err("ValidatorRegistry account data too short".into());
+    }
+    let reg_authority = Pubkey::new_from_array(reg_before.data[8..40].try_into()?);
+    let reg_min_stake = u64::from_le_bytes(reg_before.data[56..64].try_into()?);
+    let reg_min_token_stake = if reg_before.data.len() >= 112 {
+        u64::from_le_bytes(reg_before.data[104..112].try_into()?)
+    } else {
+        0
+    };
+
     // Enumerate every ValidatorAccount PDA (both 113 and 129 byte).
     let mut rows: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
@@ -204,12 +224,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Found {} ValidatorAccount PDAs:", rows.len());
     for r in &rows {
         println!(
-            "  {}  pda={} len={} active={} stake={} SOL  keep={}",
+            "  {}  pda={} len={} active={} stake={} SOL token_stake={}  keep={}",
             r.wallet,
             r.pda,
             r.data_len,
             r.is_active,
             r.stake_amount as f64 / 1e9,
+            r.token_stake_amount,
             keep.contains(&r.wallet)
         );
     }
@@ -228,6 +249,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{w} (no on-chain ValidatorAccount — register it first)"
             )),
             Some(r) if !r.is_active => bad_keep.push(format!("{w} (inactive — reset would abort)")),
+            Some(r) if r.stake_amount < reg_min_stake || r.token_stake_amount < reg_min_token_stake => {
+                bad_keep.push(format!(
+                    "{w} (stake={} lamports / token_stake={} below minimums {} / {})",
+                    r.stake_amount, r.token_stake_amount, reg_min_stake, reg_min_token_stake
+                ))
+            }
             Some(_) => {}
         }
     }
@@ -245,6 +272,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter(|r| r.is_active && !keep.contains(&r.wallet))
         .collect();
+    if !to_deactivate.is_empty() && reg_authority != authority.pubkey() {
+        return Err(format!(
+            "validator_registry.authority ({reg_authority}) != signer ({}); deactivate_validator would fail",
+            authority.pubkey()
+        )
+        .into());
+    }
     let keep_wallets: Vec<Pubkey> = rows
         .iter()
         .filter(|r| keep.contains(&r.wallet))
