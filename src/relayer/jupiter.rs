@@ -92,6 +92,13 @@ pub fn asset_to_mint(asset: AssetId) -> String {
 /// so a caller asking for wrapped SOL routes through the native leg; every other
 /// mint decodes to its 32 raw bytes. Returns an error string on a malformed or
 /// wrong-length mint.
+///
+/// Note: in the relayer layer (`JupiterSwapProvider`, `PrivateSwapRequest`), an
+/// SPL token's [`AssetId`] is its 32 raw mint pubkey bytes so [`asset_to_mint`]
+/// can recover the base58 mint address for Jupiter's `/quote` and `/swap` APIs.
+/// To derive the one-way circuit-v3 Poseidon field element bound inside on-chain
+/// SPL note commitments (`merkle_tree::mint_to_asset` / `poseidon_circom::mint_to_asset`),
+/// use [`shielded_asset_id`].
 pub fn mint_to_asset(mint: &str) -> std::result::Result<AssetId, String> {
     if mint == WRAPPED_SOL_MINT || mint.eq_ignore_ascii_case("SOL") {
         return Ok(NATIVE_SOL_ASSET);
@@ -102,6 +109,23 @@ pub fn mint_to_asset(mint: &str) -> std::result::Result<AssetId, String> {
     bytes
         .try_into()
         .map_err(|_| format!("mint '{mint}' is not 32 bytes"))
+}
+
+/// Map a relayer [`AssetId`] (either [`NATIVE_SOL_ASSET`] or 32 raw SPL mint
+/// pubkey bytes from [`mint_to_asset`]) to the canonical circuit-v3 shielded
+/// asset field element (`[0u8; 32]` for native SOL, or `Poseidon(2)(lo_16, hi_16)`
+/// via [`crate::privacy::poseidon_circom::mint_to_asset`] for SPL tokens).
+///
+/// If `asset` is already a canonical v3 Poseidon asset id derived from `raw_mint`,
+/// callers holding the raw mint should pass the raw mint bytes here (or use
+/// [`Note::v3_commitment`]) so the note commitment matches the on-chain
+/// `deposit_note` / `deposit_note_spl` leaf bit-for-bit.
+pub fn shielded_asset_id(asset: &AssetId) -> AssetId {
+    if *asset == NATIVE_SOL_ASSET {
+        NATIVE_SOL_ASSET
+    } else {
+        crate::privacy::poseidon_circom::mint_to_asset(asset)
+    }
 }
 
 /// The fields we read out of a Jupiter v6 quote. Jupiter returns more, but the
@@ -973,5 +997,23 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn shielded_asset_id_preserves_native_and_hashes_spl_mint_to_v3_poseidon_asset() {
+        assert_eq!(shielded_asset_id(&NATIVE_SOL_ASSET), NATIVE_SOL_ASSET);
+
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let raw_mint = mint_to_asset(usdc).expect("valid base58 mint");
+        // relayer::jupiter::mint_to_asset keeps the reversible 32-byte pubkey for Jupiter routing...
+        assert_eq!(asset_to_mint(raw_mint), usdc);
+        // ...while shielded_asset_id derives the canonical v3 Poseidon(2)(lo, hi) field element
+        // matching poseidon_circom::mint_to_asset and on-chain merkle_tree::mint_to_asset.
+        let v3_asset = shielded_asset_id(&raw_mint);
+        assert_eq!(
+            v3_asset,
+            crate::privacy::poseidon_circom::mint_to_asset(&raw_mint)
+        );
+        assert_ne!(v3_asset, raw_mint);
     }
 }

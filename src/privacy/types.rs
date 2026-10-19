@@ -260,6 +260,54 @@ impl Note {
         let digest = poseidon_commit_spend(amount_fr, pubkey_fr, blinding_fr, asset_id_fr);
         Commitment(fr_to_bytes_32(digest))
     }
+
+    /// Compute the circuit-v3 (circom Poseidon) note commitment (#350, #779):
+    /// `v3_commit(amount, pubkey, blinding, v3_asset_id)`.
+    ///
+    /// Matches the leaf appended on-chain by `deposit_note` / `deposit_note_spl`
+    /// (`programs/paraloom/src/merkle_tree.rs::commitment`) and verified by
+    /// `OnChainSubmitter::submit_withdraw_to_fresh` (`src/relayer/onchain.rs:105`).
+    /// For [`NATIVE_SOL_ASSET`] the asset input is `0`; for an SPL note carrying
+    /// raw 32-byte mint pubkey bytes in `self.asset_id` (as produced by
+    /// `relayer::jupiter::mint_to_asset` and `PrivateSwapRelayer::execute`), use
+    /// [`Self::v3_commitment_for_raw_mint`] so the mint is hashed via
+    /// [`crate::privacy::poseidon_circom::mint_to_asset`] before committing.
+    pub fn v3_commitment(&self) -> Commitment {
+        let amount_fr = Fr::from(self.amount);
+        let pubkey_fr = Fr::from_le_bytes_mod_order(self.recipient.as_bytes());
+        let blinding_fr = Fr::from_le_bytes_mod_order(&self.randomness);
+        let asset_id_fr = Fr::from_le_bytes_mod_order(&self.asset_id);
+        let digest = crate::privacy::poseidon_circom::v3_commit(
+            amount_fr,
+            pubkey_fr,
+            blinding_fr,
+            asset_id_fr,
+        );
+        Commitment(fr_to_bytes_32(digest))
+    }
+
+    /// Compute the circuit-v3 commitment when `self.asset_id` holds raw SPL mint
+    /// pubkey bytes (or [`NATIVE_SOL_ASSET`]), converting non-native mints with
+    /// [`crate::privacy::poseidon_circom::mint_to_asset`] so the resulting leaf
+    /// matches `deposit_note_spl` and `transact_spl` on-chain.
+    pub fn v3_commitment_for_raw_mint(&self) -> Commitment {
+        let canonical_asset = if self.asset_id == NATIVE_SOL_ASSET {
+            NATIVE_SOL_ASSET
+        } else {
+            crate::privacy::poseidon_circom::mint_to_asset(&self.asset_id)
+        };
+        let amount_fr = Fr::from(self.amount);
+        let pubkey_fr = Fr::from_le_bytes_mod_order(self.recipient.as_bytes());
+        let blinding_fr = Fr::from_le_bytes_mod_order(&self.randomness);
+        let asset_id_fr = Fr::from_le_bytes_mod_order(&canonical_asset);
+        let digest = crate::privacy::poseidon_circom::v3_commit(
+            amount_fr,
+            pubkey_fr,
+            blinding_fr,
+            asset_id_fr,
+        );
+        Commitment(fr_to_bytes_32(digest))
+    }
 }
 
 /// Merkle tree path for proving commitment inclusion
@@ -696,5 +744,39 @@ mod tests {
         // place.
         let other = SpendKeypair::from_privkey([8u8; 32]);
         assert_ne!(n0, other.nullifier(&commitment, 0));
+    }
+
+    #[test]
+    fn v3_commitment_matches_circom_poseidon_and_normalizes_raw_spl_mint() {
+        let recipient = ShieldedAddress([9u8; 32]);
+        let randomness = [5u8; 32];
+        let amount = 997_500u64;
+
+        let native_note = Note::new_native(recipient.clone(), amount, randomness);
+        let expected_native = crate::privacy::poseidon_circom::v3_commit(
+            Fr::from(amount),
+            Fr::from_le_bytes_mod_order(recipient.as_bytes()),
+            Fr::from_le_bytes_mod_order(&randomness),
+            Fr::from(0u64),
+        );
+        assert_eq!(
+            native_note.v3_commitment(),
+            Commitment(fr_to_bytes_32(expected_native))
+        );
+        assert_eq!(
+            native_note.v3_commitment_for_raw_mint(),
+            native_note.v3_commitment()
+        );
+        // Legacy v2 arkworks sponge commitment is distinct from v3 circom Poseidon.
+        assert_ne!(native_note.commitment(), native_note.v3_commitment());
+
+        let raw_mint = [0xFFu8; 32]; // non-canonical (> BN254 Fr modulus) raw mint pubkey
+        let spl_note_raw = Note::new(recipient.clone(), amount, randomness, raw_mint);
+        let hashed_asset = crate::privacy::poseidon_circom::mint_to_asset(&raw_mint);
+        let spl_note_hashed = Note::new(recipient, amount, randomness, hashed_asset);
+        assert_eq!(
+            spl_note_raw.v3_commitment_for_raw_mint(),
+            spl_note_hashed.v3_commitment()
+        );
     }
 }
