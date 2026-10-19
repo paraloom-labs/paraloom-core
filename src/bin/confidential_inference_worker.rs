@@ -36,10 +36,19 @@ use paraloom::privacy::EncryptedNote;
 use std::sync::Arc;
 
 const TEE_TOKEN_SOCKET: &str = "/run/container_launcher/teeserver.sock";
+const ATTESTATION_REFRESH_SECS: u64 = 2700;
+
+struct CachedAttestation {
+    token: Vec<u8>,
+    fetched_at: std::time::Instant,
+}
 
 struct AppState {
     worker: Arc<ConfidentialWorker<GraniteModelRunner>>,
-    attested_key: AttestedChannelKey,
+    channel_pubkey: [u8; 32],
+    nonce_hex: String,
+    audience: String,
+    attestation: tokio::sync::RwLock<CachedAttestation>,
 }
 
 #[derive(serde::Serialize)]
@@ -52,9 +61,30 @@ struct AttestedKeyResponse {
 
 /// Publish the channel key and its attestation for clients to verify.
 async fn get_attested_key(State(state): State<Arc<AppState>>) -> Json<AttestedKeyResponse> {
+    let token_bytes = {
+        let guard = state.attestation.read().await;
+        if guard.fetched_at.elapsed().as_secs() < ATTESTATION_REFRESH_SECS {
+            Some(guard.token.clone())
+        } else {
+            None
+        }
+    };
+    let token_bytes = match token_bytes {
+        Some(t) => t,
+        None => {
+            let mut guard = state.attestation.write().await;
+            if guard.fetched_at.elapsed().as_secs() >= ATTESTATION_REFRESH_SECS {
+                if let Ok(fresh) = fetch_attestation(&state.nonce_hex, &state.audience).await {
+                    guard.token = fresh;
+                    guard.fetched_at = std::time::Instant::now();
+                }
+            }
+            guard.token.clone()
+        }
+    };
     Json(AttestedKeyResponse {
-        channel_pubkey: hex::encode(state.attested_key.channel_pubkey),
-        attestation: String::from_utf8_lossy(&state.attested_key.attestation).into_owned(),
+        channel_pubkey: hex::encode(state.channel_pubkey),
+        attestation: String::from_utf8_lossy(&token_bytes).into_owned(),
     })
 }
 
@@ -106,10 +136,14 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
             anyhow!("no TEE attestation socket at {TEE_TOKEN_SOCKET} (set TEE_ATTESTATION_TOKEN for local dev): {e}")
         })?;
 
-    let body =
-        format!(r#"{{"audience":"{audience}","token_type":"OIDC","nonces":["{nonce_hex}"]}}"#);
+    let body = serde_json::json!({
+        "audience": audience,
+        "token_type": "OIDC",
+        "nonces": [nonce_hex],
+    })
+    .to_string();
     let request = format!(
-        "POST /v1/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+        "POST /v1/token HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -129,11 +163,19 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
     }
 
     let resp = String::from_utf8_lossy(&resp);
-    let token = resp
+    let (headers, body_str) = resp
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| anyhow!("attestation response had no token body"))?;
+        .ok_or_else(|| anyhow!("attestation response had no HTTP header/body separator"))?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+        return Err(anyhow!(
+            "TEE attestation server returned non-200 status: {status_line}"
+        ));
+    }
+    let token = body_str.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("attestation response had no token body"));
+    }
     Ok(token.into_bytes())
 }
 
@@ -163,7 +205,13 @@ async fn main() -> Result<()> {
     let model = GraniteModelRunner::new(llama_endpoint).with_max_tokens(max_tokens);
     let state = Arc::new(AppState {
         worker: Arc::new(ConfidentialWorker::new(channel, model)),
-        attested_key,
+        channel_pubkey: attested_key.channel_pubkey,
+        nonce_hex,
+        audience,
+        attestation: tokio::sync::RwLock::new(CachedAttestation {
+            token: attested_key.attestation,
+            fetched_at: std::time::Instant::now(),
+        }),
     });
 
     let app = Router::new()

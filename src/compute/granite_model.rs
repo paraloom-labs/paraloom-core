@@ -57,10 +57,16 @@ impl ModelRunner for GraniteModelRunner {
 
         // A blocking loopback request keeps `run` synchronous, so it composes
         // with the worker whether it is called from an async task or not.
-        let addr = self
+        let stripped = self
             .endpoint
             .trim_start_matches("http://")
+            .trim_start_matches("https://")
             .trim_end_matches('/');
+        let (addr, base_path) = match stripped.split_once('/') {
+            Some((host_port, path)) => (host_port, format!("/{}", path.trim_matches('/'))),
+            None => (stripped, String::new()),
+        };
+        let path = format!("{base_path}/completion");
         let body = serde_json::json!({
             "prompt": prompt,
             "n_predict": self.max_tokens,
@@ -69,7 +75,7 @@ impl ModelRunner for GraniteModelRunner {
         })
         .to_string();
         let request = format!(
-            "POST /completion HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+            "POST {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
@@ -77,15 +83,21 @@ impl ModelRunner for GraniteModelRunner {
         let mut stream = TcpStream::connect(addr)
             .map_err(|e| anyhow!("cannot reach llama-server at {addr}: {e}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(180)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         stream.write_all(request.as_bytes())?;
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw)?;
 
         let response = String::from_utf8_lossy(&raw);
-        let json_body = response
+        let (headers, json_body) = response
             .split_once("\r\n\r\n")
-            .map(|(_, body)| body)
             .ok_or_else(|| anyhow!("llama-server response had no body"))?;
+        let status_line = headers.lines().next().unwrap_or_default();
+        if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+            return Err(anyhow!(
+                "llama-server returned non-200 status: {status_line}"
+            ));
+        }
         let parsed: serde_json::Value = serde_json::from_str(json_body.trim())
             .map_err(|e| anyhow!("llama-server returned invalid JSON: {e}"))?;
         let content = parsed
