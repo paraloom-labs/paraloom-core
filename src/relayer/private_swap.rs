@@ -261,6 +261,39 @@ pub trait Submitter: Send + Sync {
         recipient: ShieldedAddress,
         randomness: [u8; 32],
     ) -> Result<SubmittedLeg>;
+
+    /// Pre-validate that the submitter can settle the re-shield deposit leg for
+    /// `leg`, `recipient`, and `randomness` BEFORE the withdraw leg burns the
+    /// input note's nullifier on-chain.
+    fn validate_deposit_leg(
+        &self,
+        _leg: WithdrawLeg,
+        recipient: &ShieldedAddress,
+        randomness: &[u8; 32],
+    ) -> Result<()> {
+        if !is_canonical_bn254_le(&recipient.0) {
+            return Err(RelayerError::SubmissionFailed(
+                "reshield_recipient is not a canonical BN254 field element".to_string(),
+            ));
+        }
+        if !is_canonical_bn254_le(randomness) {
+            return Err(RelayerError::SubmissionFailed(
+                "reshield_randomness is not a canonical BN254 field element".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// True iff `b` is a canonical little-endian BN254 scalar field element (`< p`).
+pub(crate) fn is_canonical_bn254_le(b: &[u8; 32]) -> bool {
+    use ark_bn254::Fr;
+    use ark_ff::{BigInteger, PrimeField};
+    let le = Fr::from_le_bytes_mod_order(b).into_bigint().to_bytes_le();
+    let mut canonical = [0u8; 32];
+    let n = le.len().min(32);
+    canonical[..n].copy_from_slice(&le[..n]);
+    &canonical == b
 }
 
 /// One private-swap order.
@@ -495,6 +528,14 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let ephemeral = Keypair::new();
         let fresh_address = ephemeral.pubkey().to_bytes();
         let out_leg = WithdrawLeg::for_asset(request.asset_out);
+
+        // Pre-validate the re-shield leg and canonical BN254 encodings BEFORE
+        // burning the input note's nullifier on-chain in `withdraw_then_swap`.
+        self.submitter.validate_deposit_leg(
+            out_leg,
+            &request.reshield_recipient,
+            &request.reshield_randomness,
+        )?;
 
         let (withdraw_leg, gross_out_amount) =
             self.withdraw_then_swap(&request, &ephemeral).await?;
@@ -977,5 +1018,21 @@ mod tests {
         );
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_canonical_reshield_fields_before_withdraw() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let mut req = request(native_note(1_000_000), NATIVE_SOL_ASSET, 0);
+        req.reshield_recipient = ShieldedAddress::from_bytes([0xFFu8; 32]);
+        let err = relayer
+            .execute(req)
+            .await
+            .expect_err("non-canonical reshield_recipient must fail before withdraw");
+        assert!(matches!(err, RelayerError::SubmissionFailed(_)));
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "withdraw leg must not execute when re-shield validation fails"
+        );
     }
 }

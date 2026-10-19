@@ -213,9 +213,12 @@ pub trait SwapSubmitter: Send + Sync {
 }
 
 /// Lamports left at the ephemeral address when re-depositing a native-SOL swap
-/// output, to cover the re-deposit transaction's own fee. The realized balance
-/// minus this reserve is what gets re-shielded.
-const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 10_000;
+/// output, to cover the re-deposit transaction's own fee (5,000 lamports for a
+/// single-signature transaction). Reserving exactly 5,000 lamports drains the
+/// 0-byte ephemeral account to 0 lamports upon `deposit_note`, whereas leaving a
+/// positive balance below the 890,880-lamport 0-byte rent-exemption threshold
+/// is rejected by the Solana runtime with `InsufficientFundsForRent`.
+pub const NATIVE_DEPOSIT_RESERVE_LAMPORTS: u64 = 5_000;
 
 /// Production [`JupiterHttpClient`] over `reqwest`, talking to a configurable
 /// base URL.

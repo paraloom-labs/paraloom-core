@@ -22,9 +22,11 @@ use solana_sdk::{
 use std::sync::Arc;
 
 use crate::bridge::solana::{create_deposit_note_instruction, derive_bridge_vault};
-use crate::privacy::poseidon_circom::v3_commit;
+use crate::privacy::poseidon_circom::{v3_commit, v3_pubkey};
 use crate::privacy::types::ShieldedAddress;
-use crate::relayer::private_swap::{RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg};
+use crate::relayer::private_swap::{
+    is_canonical_bn254_le, RelayerError, Result, SubmittedLeg, Submitter, WithdrawLeg,
+};
 use crate::relayer::transact_submit;
 
 /// Default settlement poll timeout (matches the demo's 120s window).
@@ -85,6 +87,14 @@ impl Submitter for OnChainSubmitter {
                 "SPL withdraw is unavailable on the native-only v3 program".to_string(),
             ));
         }
+        let sk_fr = Fr::from_le_bytes_mod_order(&sk);
+        let note_pk_fr = Fr::from_le_bytes_mod_order(&note_pubkey);
+        if v3_pubkey(sk_fr) != note_pk_fr {
+            return Err(RelayerError::SubmissionFailed(
+                "in_sk does not match in_note_pubkey (v3_pubkey(in_sk) != in_note_pubkey)"
+                    .to_string(),
+            ));
+        }
         let program_id = self.program_id;
         let rpc_url = self.rpc_url.clone();
         let ingress = self.ingress_url.clone();
@@ -99,9 +109,7 @@ impl Submitter for OnChainSubmitter {
                     body: "no validator quorum (need >= 2 active validators)".to_string(),
                 });
             }
-            let sk_fr = Fr::from_le_bytes_mod_order(&sk);
             let blinding_fr = Fr::from_le_bytes_mod_order(&blinding);
-            let note_pk_fr = Fr::from_le_bytes_mod_order(&note_pubkey);
             let commitment = v3_commit(Fr::from(amount), note_pk_fr, blinding_fr, Fr::from(0u64));
             let membership =
                 transact_submit::read_membership(&client, &program_id, leaf_index, commitment)?;
@@ -157,12 +165,7 @@ impl Submitter for OnChainSubmitter {
         recipient: ShieldedAddress,
         randomness: [u8; 32],
     ) -> Result<SubmittedLeg> {
-        if !matches!(leg, WithdrawLeg::Native) {
-            return Err(RelayerError::SubmissionFailed(
-                "SPL re-shield is unavailable on the native-only v3 program (needs a redeploy)"
-                    .to_string(),
-            ));
-        }
+        self.validate_deposit_leg(leg, &recipient, &randomness)?;
         let program_id = self.program_id;
         let fresh_address = signer.pubkey().to_bytes();
         let signer = signer.insecure_clone();
@@ -197,5 +200,30 @@ impl Submitter for OnChainSubmitter {
             fresh_address,
             signature: sig,
         })
+    }
+
+    fn validate_deposit_leg(
+        &self,
+        leg: WithdrawLeg,
+        recipient: &ShieldedAddress,
+        randomness: &[u8; 32],
+    ) -> Result<()> {
+        if !matches!(leg, WithdrawLeg::Native) {
+            return Err(RelayerError::SubmissionFailed(
+                "SPL re-shield is unavailable on the native-only v3 program (needs a redeploy)"
+                    .to_string(),
+            ));
+        }
+        if !is_canonical_bn254_le(&recipient.0) {
+            return Err(RelayerError::SubmissionFailed(
+                "reshield_recipient is not a canonical BN254 field element".to_string(),
+            ));
+        }
+        if !is_canonical_bn254_le(randomness) {
+            return Err(RelayerError::SubmissionFailed(
+                "reshield_randomness is not a canonical BN254 field element".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
