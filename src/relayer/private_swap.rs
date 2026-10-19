@@ -398,6 +398,11 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
 
         let asset_in = request.asset_in;
         let asset_out = request.asset_out;
+        if asset_in == asset_out {
+            return Err(RelayerError::SwapFailed(
+                "asset_in and asset_out must differ".into(),
+            ));
+        }
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
@@ -468,6 +473,9 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
                     min_out,
                 });
             }
+        }
+        if swap.out_amount == 0 {
+            return Err(RelayerError::InvalidAmount(0));
         }
         Ok((withdraw_leg, swap.out_amount))
     }

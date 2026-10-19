@@ -451,8 +451,19 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
                 "platform_fee_bps > 0 requires a fee_account".into(),
             ));
         }
-        if platform_fee_bps > 10_000 {
+        if platform_fee_bps >= 10_000 {
             return Err(RelayerError::FeeTooHigh(platform_fee_bps));
+        }
+        if slippage_bps > 10_000 {
+            return Err(RelayerError::SwapFailed(format!(
+                "slippage_bps {} exceeds 10_000",
+                slippage_bps
+            )));
+        }
+        if let Some(ref acct) = fee_account {
+            Pubkey::from_str(acct).map_err(|e| {
+                RelayerError::SwapFailed(format!("invalid fee_account pubkey '{}': {e}", acct))
+            })?;
         }
         Ok(Self {
             http,
@@ -636,7 +647,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             // only when the balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
                 Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
-                None => out_amount,
+                None => out_amount.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
             }
         } else {
             let mint = Pubkey::from_str(&output_mint)
