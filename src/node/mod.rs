@@ -1703,9 +1703,11 @@ impl Node {
                 let mut tick = tokio::time::interval(DISCOVERY_REANNOUNCE_INTERVAL);
                 loop {
                     tick.tick().await;
-                    let msg = Message::Discovery {
-                        node_info: me.node_info.clone(),
-                    };
+                    let mut node_info = me.node_info.clone();
+                    if matches!(node_info.node_type, NodeType::ResourceProvider) {
+                        node_info.resources = me.resource_monitor.get_contribution();
+                    }
+                    let msg = Message::Discovery { node_info };
                     if let Err(e) = me.network.send_message(NodeId(vec![]), msg).await {
                         log::debug!("periodic discovery re-announce failed: {e}");
                     }

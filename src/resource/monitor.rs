@@ -24,11 +24,20 @@ impl ResourceMonitor {
         let mut system = System::new_all();
         system.refresh_all();
 
+        let total_memory_mb = system.total_memory() / (1024 * 1024);
+        let memory_mb = (total_memory_mb * max_memory_usage.min(100) as u64) / 100;
+        let total_available_mb: u64 = system
+            .disks()
+            .iter()
+            .map(|disk| disk.available_space() / (1024 * 1024))
+            .sum();
+        let storage_mb = std::cmp::min(total_available_mb, max_storage_usage);
+
         let contribution = ResourceContribution {
-            cpu_cores: system.cpus().len() as u8,
-            memory_mb: 0,      // Will be updated later
-            storage_mb: 0,     // Will be updated later
-            bandwidth_kbps: 0, // Will be measured later
+            cpu_cores: u8::try_from(system.cpus().len()).unwrap_or(u8::MAX),
+            memory_mb,
+            storage_mb,
+            bandwidth_kbps: 10000,
         };
 
         ResourceMonitor {
@@ -103,12 +112,11 @@ impl ResourceMonitor {
         let mut contrib = contribution.lock().unwrap();
 
         // CPU information
-        contrib.cpu_cores = sys.cpus().len() as u8;
+        contrib.cpu_cores = u8::try_from(sys.cpus().len()).unwrap_or(u8::MAX);
 
-        // RAM information - Calculate based on total memory and max usage percentage
-        let total_memory_kb = sys.total_memory();
-        let memory_limit_kb = (total_memory_kb as f64 * (max_memory_usage as f64 / 100.0)) as u64;
-        contrib.memory_mb = memory_limit_kb / 1024; // KB to MB conversion
+        // RAM information - sysinfo 0.29 total_memory() returns bytes; convert to MB
+        let total_memory_mb = sys.total_memory() / (1024 * 1024);
+        contrib.memory_mb = (total_memory_mb * max_memory_usage.min(100) as u64) / 100;
 
         // Disk information - Calculate based on available space and max usage limit
         let mut total_available_mb = 0;
