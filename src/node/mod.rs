@@ -215,6 +215,18 @@ async fn cache_verified<V>(cache: &Arc<Mutex<HashMap<String, V>>>, request_id: S
     map.insert(request_id, value);
 }
 
+async fn evict_verified_by_nullifiers(
+    cache: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    spent: &[[u8; 32]; 2],
+) {
+    let mut map = cache.lock().await;
+    map.retain(|_, req| {
+        !req.nullifiers
+            .iter()
+            .any(|nf| nf == &spent[0] || nf == &spent[1])
+    });
+}
+
 #[async_trait]
 impl crate::network::protocol::NetworkEventHandler for Node {
     // Previous implementation...
@@ -504,7 +516,9 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 
                 // Remember a transact we verified Valid so we can later co-sign
                 // its settlement against the exact parameters we saw (#260).
-                if matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid) {
+                if !already_verified
+                    && matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid)
+                {
                     cache_verified(
                         &self.verified_transacts,
                         request.request_id.clone(),
@@ -923,6 +937,26 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 });
             }
         };
+        if let Some(pool) = &self.shielded_pool {
+            let cached_nfs = self
+                .verified_transacts
+                .lock()
+                .await
+                .get(&request.request_id)
+                .map(|r| r.nullifiers);
+            if let Some(nfs) = cached_nfs {
+                if pool.is_spent(&crate::privacy::types::Nullifier(nfs[0])).await
+                    || pool.is_spent(&crate::privacy::types::Nullifier(nfs[1])).await
+                {
+                    evict_verified_by_nullifiers(&self.verified_transacts, &nfs).await;
+                    return Ok(CoSignResponse {
+                        request_id: request.request_id,
+                        wallet_pubkey: String::new(),
+                        signature: None,
+                    });
+                }
+            }
+        }
         Ok(cosign_settlement(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
@@ -2544,6 +2578,11 @@ impl Node {
             if let Some(pool) = &self.shielded_pool {
                 pool.record_spent(approved.request.nullifiers).await;
             }
+            evict_verified_by_nullifiers(
+                &self.verified_transacts,
+                &approved.request.nullifiers,
+            )
+            .await;
         }
 
         match result {
@@ -3633,5 +3672,47 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn settled_nullifiers_evict_conflicting_verified_transacts_and_decline_cosign() {
+        let kp = Arc::new(Keypair::new());
+        let verified = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nf_a = [[0xAA; 32], [0xBB; 32]];
+        let nf_b = [[0xAA; 32], [0xCC; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+
+        let req_a = ta_request("req_a", recipient, nf_a, outputs, root, -1_000_000);
+        let req_b = ta_request("req_b", recipient, nf_b, outputs, root, -2_000_000);
+
+        cache_verified(&verified, req_a.request_id.clone(), req_a.clone()).await;
+        cache_verified(&verified, req_b.request_id.clone(), req_b.clone()).await;
+        assert_eq!(verified.lock().await.len(), 2);
+
+        // Once req_a settles, evicting by its spent nullifiers removes both req_a and req_b.
+        evict_verified_by_nullifiers(&verified, &req_a.nullifiers).await;
+        assert!(verified.lock().await.is_empty());
+
+        let payload_b = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nf_b,
+            outputs,
+            root,
+            -2_000_000,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &verified,
+            &counts,
+            cosign_req("req_b", SettlementKind::Transact, &payload_b),
+        )
+        .await;
+        assert!(resp.signature.is_none());
     }
 }
