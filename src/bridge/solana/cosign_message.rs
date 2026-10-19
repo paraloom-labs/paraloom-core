@@ -173,6 +173,14 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
             ext_amount,
             proof,
         } => {
+            if payload.bridge_vault == payload.authority
+                || payload.quorum_validators.contains(&payload.bridge_vault)
+            {
+                return Err(BridgeError::InvalidTransaction(
+                    "bridge_vault must not collide with authority or quorum co-signers"
+                        .to_string(),
+                ));
+            }
             let vault = Pubkey::new_from_array(payload.bridge_vault);
             create_transact_instruction(
                 &program_id,
@@ -326,4 +334,14 @@ mod tests {
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
     }
+
+    #[test]
+    fn bridge_vault_colliding_with_cosigner_is_rejected() {
+        let mut payload = sample_transact_payload();
+        payload.bridge_vault = [5u8; 32];
+        let err = build_settlement_message(&payload)
+            .expect_err("bridge_vault colliding with a co-signer must be rejected");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+    }
 }
+

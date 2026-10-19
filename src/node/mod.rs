@@ -991,6 +991,7 @@ async fn cosign_settlement(
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -2983,6 +2984,43 @@ mod tests {
         assert!(
             sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
             "the returned signature must be valid over the rebuilt settlement message"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_native_transact_declines_when_verified_request_is_spl() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        let mut req = ta_request("t_spl", recipient, nullifiers, outputs, root, ext_amount);
+        req.mint = Some([42u8; 32]);
+        tas.lock().await.insert("t_spl".to_string(), req);
+
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t_spl", SettlementKind::Transact, &payload),
+        )
+        .await;
+
+        assert_eq!(
+            resp.signature, None,
+            "must decline native Transact co-sign when verified request was SPL"
         );
     }
 
