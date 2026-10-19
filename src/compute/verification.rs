@@ -100,6 +100,16 @@ impl VerificationCoordinator {
         job_id: JobId,
         validators: Vec<ValidatorId>,
     ) -> Result<VerificationRequest> {
+        let mut unique_validators = std::collections::HashSet::new();
+        for v in &validators {
+            if !unique_validators.insert(v.clone()) {
+                return Err(anyhow!(
+                    "Duplicate validator {} in verification request for job {}",
+                    v,
+                    job_id
+                ));
+            }
+        }
         if validators.len() < VERIFICATION_VALIDATOR_COUNT {
             return Err(anyhow!(
                 "Insufficient validators: need {}, got {}",
@@ -205,13 +215,22 @@ impl VerificationCoordinator {
         let mut result_groups: HashMap<Vec<u8>, Vec<&ValidatorResult>> = HashMap::new();
 
         for validator_result in job_results {
-            // Use output data as key (deterministic WASM should produce same output)
-            let key = match &validator_result.result.output_data {
-                Some(data) => data.clone(),
-                None => vec![], // Failed results group together
+            if validator_result.result.status != super::job::JobStatus::Completed {
+                continue;
+            }
+            let Some(data) = &validator_result.result.output_data else {
+                continue;
             };
+            result_groups
+                .entry(data.clone())
+                .or_default()
+                .push(validator_result);
+        }
 
-            result_groups.entry(key).or_default().push(validator_result);
+        if result_groups.is_empty() {
+            return Ok(ConsensusResult::Disagreed {
+                results: job_results.clone(),
+            });
         }
 
         // Find largest group (majority)

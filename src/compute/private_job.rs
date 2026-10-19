@@ -569,7 +569,17 @@ impl PrivateJobCoordinator {
         // Step 3: Check multi-validator consensus (if enabled)
         if let Some(coordinator) = &self.verification_coordinator {
             match coordinator.check_consensus(&result.job_id).await? {
-                crate::compute::ConsensusResult::Agreed(_) => {
+                crate::compute::ConsensusResult::Agreed(agreed) => {
+                    let Some(agreed_output) = &agreed.output_data else {
+                        return Ok(false);
+                    };
+                    if PrivateComputeJob::hash_data(agreed_output) != result.output_hash {
+                        log::warn!(
+                            "Agreed output hash mismatch for job {}",
+                            result.job_id
+                        );
+                        return Ok(false);
+                    }
                     log::info!(
                         "Multi-validator consensus reached for job {}",
                         result.job_id
