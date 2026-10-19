@@ -83,12 +83,13 @@ impl PrivateComputeJob {
         // Compute code hash
         let code_hash: [u8; 32] = Sha256::digest(&wasm_code).into();
 
-        // Create commitment to input data
-        // Hash the data first to get a u64 value
-        let data_hash = Self::hash_data(&input_data);
+        // Create Poseidon commitment to input data aligned with ComputeCircuit
         let randomness = crate::privacy::pedersen::generate_randomness();
-        let input_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+        let input_commitment = crate::compute::ComputeCircuit::data_commitment(
+            &input_data,
+            &randomness,
+            &owner_address.0,
+        );
 
         // Seal the input to the owner's X25519 public key with crypto_box
         // (X25519 + XSalsa20-Poly1305, via note_crypto::seal). Only the holder
@@ -201,11 +202,15 @@ impl PrivateJobResult {
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
 
-        // Create commitment to output
+        // Create Poseidon commitment to output aligned with ComputeCircuit
         let data_hash = PrivateComputeJob::hash_data(&output_data);
         let randomness = crate::privacy::pedersen::generate_randomness();
-        let output_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+        let dummy_owner = [0u8; 32];
+        let output_commitment = crate::compute::ComputeCircuit::data_commitment(
+            &output_data,
+            &randomness,
+            &dummy_owner,
+        );
 
         // Encrypt output
         let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address)?;

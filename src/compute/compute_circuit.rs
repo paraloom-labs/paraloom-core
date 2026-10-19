@@ -57,8 +57,8 @@ use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::privacy::poseidon::{poseidon_commit_gadget, poseidon_nullifier_gadget};
 
-/// Maximum data size for circuit (in bytes)
-pub const MAX_DATA_SIZE: usize = 1024;
+/// Maximum data size for circuit (in bytes), aligned with MAX_WASM_OUTPUT_SIZE
+pub const MAX_DATA_SIZE: usize = 65_536;
 
 /// Compute execution circuit
 ///
@@ -189,6 +189,23 @@ impl ComputeCircuit {
         poseidon_commit(data_hash, r, o, Fr::from(0u64))
     }
 
+    /// Computes the Poseidon field commitment over `hash_data_to_field(data)`
+    /// and serializes it into a 32-byte little-endian [`crate::privacy::Commitment`].
+    pub fn data_commitment(
+        data: &[u8],
+        randomness: &[u8; 32],
+        owner: &[u8; 32],
+    ) -> crate::privacy::Commitment {
+        use ark_ff::BigInteger;
+        let data_hash = Self::hash_data_to_field(data);
+        let comm_fr = Self::compute_commitment(data_hash, randomness, owner);
+        let le_bytes = comm_fr.into_bigint().to_bytes_le();
+        let mut bytes = [0u8; 32];
+        let copy_len = le_bytes.len().min(32);
+        bytes[..copy_len].copy_from_slice(&le_bytes[..copy_len]);
+        crate::privacy::Commitment(bytes)
+    }
+
     /// Host-side nullifier matching the shielded-pool spend pattern:
     /// `Poseidon(NULLIFIER_TAG, commitment, spending_key)`. Identical
     /// to `Nullifier::derive` on the privacy side so a compute job
@@ -225,18 +242,21 @@ impl ConstraintSynthesizer<Fr> for ComputeCircuit {
         })?;
 
         let input_commitment_var = FpVar::new_input(cs.clone(), || {
-            self.input_commitment
-                .ok_or(SynthesisError::AssignmentMissing)
+            Ok(self
+                .input_commitment
+                .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
         let output_commitment_var = FpVar::new_input(cs.clone(), || {
-            self.output_commitment
-                .ok_or(SynthesisError::AssignmentMissing)
+            Ok(self
+                .output_commitment
+                .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
         let input_nullifier_var = FpVar::new_input(cs.clone(), || {
-            self.input_nullifier
-                .ok_or(SynthesisError::AssignmentMissing)
+            Ok(self
+                .input_nullifier
+                .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
         // ── Private witnesses ──
