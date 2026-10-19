@@ -240,6 +240,24 @@ impl VoteTally {
         }
         out
     }
+
+    /// The `(wallet_pubkey, NodeId)` pairs of the wallets that voted `Valid`
+    /// **and** are in `eligible_wallets`, taken directly from the verified
+    /// vote records so co-sign assembly does not depend on unauthenticated
+    /// `Discovery` messages having populated `leader_selector` first.
+    pub async fn valid_voter_wallets(
+        &self,
+        eligible_wallets: &HashSet<String>,
+    ) -> Vec<(String, NodeId)> {
+        let votes = self.votes.read().await;
+        let mut out = Vec::new();
+        for (wallet, rec) in votes.iter() {
+            if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
+                out.push((wallet.clone(), rec.node_id.clone()));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

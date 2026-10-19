@@ -237,6 +237,24 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// True if `wallet` is already bound to a different active validator `NodeId`.
+    pub fn has_wallet_claimed_by_other(&self, wallet: &str, node_id: &NodeId) -> bool {
+        self.validators.values().any(|v| {
+            v.is_active && &v.node_id != node_id && v.wallet_pubkey.as_deref() == Some(wallet)
+        })
+    }
+
+    /// Clear `wallet` from any validator entry other than `authentic_node_id` once
+    /// a cryptographically verified vote proves `authentic_node_id` owns `wallet`.
+    pub fn evict_conflicting_wallet_claims(&mut self, wallet: &str, authentic_node_id: &NodeId) {
+        for v in self.validators.values_mut() {
+            if &v.node_id != authentic_node_id && v.wallet_pubkey.as_deref() == Some(wallet) {
+                v.wallet_pubkey = None;
+                v.stake_amount = 0;
+            }
+        }
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self

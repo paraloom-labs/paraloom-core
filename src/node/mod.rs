@@ -227,6 +227,14 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 info!("Received Pong from {}", source);
             }
             Message::Discovery { node_info } => {
+                if node_info.id != source {
+                    log::warn!(
+                        "Dropping Discovery from {} with mismatched node_info.id {}",
+                        source,
+                        node_info.id
+                    );
+                    return Ok(());
+                }
                 info!("Discovered node {}: {:?}", source, node_info);
 
                 // If we're a coordinator, register this validator
@@ -249,7 +257,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // bridge-enabled validator node has the former without being a
                 // compute Coordinator.
                 if let Some(transact) = &self.transact_coordinator {
-                    if node_info.node_type == NodeType::ResourceProvider {
+                    if matches!(
+                        node_info.node_type,
+                        NodeType::ResourceProvider | NodeType::Bridge
+                    ) {
                         transact
                             .register_validator_with_wallet(
                                 source.clone(),
@@ -2421,14 +2432,12 @@ impl Node {
         // signs as itself and is excluded from the peers it requests from.
         let self_id = self.node_info.id.clone();
         let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&request.request_id).await {
+        for (wallet, voter) in coordinator.valid_voter_wallets(&request.request_id).await {
             if voter == self_id {
                 continue;
             }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
-                }
+            if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                peers.push((pubkey, voter));
             }
         }
         let mut quorum_wallets = vec![leader.pubkey()];
