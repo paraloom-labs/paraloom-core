@@ -78,7 +78,7 @@ pub fn extract_deposit_events(
         }
     };
 
-    let account_keys = match parse_account_keys(&raw.account_keys) {
+    let mut account_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
         Err(bad) => {
             log::warn!(
@@ -90,6 +90,28 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    if let Some(meta) = &confirmed.transaction.meta {
+        if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+            match parse_account_keys(&loaded.writable)
+                .and_then(|mut w| {
+                    let r = parse_account_keys(&loaded.readonly)?;
+                    w.extend(r);
+                    Ok(w)
+                }) {
+                Ok(loaded_keys) => account_keys.extend(loaded_keys),
+                Err(bad) => {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "tx {} has unparsable loaded_addresses key '{}'; skipping",
+                        signature,
+                        bad
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
 
     let mut events = Vec::new();
 
@@ -516,4 +538,82 @@ mod tests {
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
     }
+
+    #[test]
+    fn v0_deposit_with_alt_loaded_addresses_is_decoded() {
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiLoadedAddresses, UiRawMessage, UiTransaction,
+            UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let payer_and_depositor = Pubkey::new_unique();
+        let bridge_state = Pubkey::new_unique();
+        let merkle_tree = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        let system_program = solana_sdk::system_program::id();
+
+        let recipient = [0x11u8; 32];
+        let randomness = [0x22u8; 32];
+        let amount = 500_000_000u64;
+
+        let compiled = UiCompiledInstruction {
+            program_id_index: 5,
+            accounts: vec![1, 2, 0, 3, 4],
+            data: encode_deposit_data(amount, recipient, randomness),
+            stack_height: None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            err: None,
+            status: Ok(()),
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::None,
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::Some(UiLoadedAddresses {
+                writable: vec![vault.to_string()],
+                readonly: vec![system_program.to_string(), program_id.to_string()],
+            }),
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+        };
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 100,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig1".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: solana_sdk::message::MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 0,
+                        },
+                        account_keys: vec![
+                            payer_and_depositor.to_string(),
+                            bridge_state.to_string(),
+                            merkle_tree.to_string(),
+                        ],
+                        recent_blockhash: String::new(),
+                        instructions: vec![compiled],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(meta),
+                version: Some(solana_transaction_status::TransactionVersion::Number(0)),
+            },
+            block_time: Some(1_700_000_000),
+        };
+
+        let events = extract_deposit_events("sig1", &confirmed, &program_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, amount);
+        assert_eq!(events[0].from, payer_and_depositor.to_bytes());
+    }
 }
+
