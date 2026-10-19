@@ -161,7 +161,14 @@ impl WasmEngine {
         let input_len = job.input_data.len() as i32;
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                warn!("Input data exceeds initial WASM memory for job {}: {}", job.id, e);
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("Input data exceeds WASM linear memory size: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
@@ -267,23 +274,24 @@ impl WasmEngine {
         input_len: i32,
         timeout: Duration,
     ) -> Result<i32> {
-        // Set epoch deadline for timeout
-        // Deadline is current epoch + timeout in ticks (1 tick = 1ms approximately)
-        let timeout_ticks = timeout.as_millis() as u64;
+        let timeout_ticks = (timeout.as_millis() as u64).max(1);
         store.set_epoch_deadline(timeout_ticks);
 
-        // Start epoch incrementing in background
         let engine_handle = self.engine.clone();
-        let timeout_duration = timeout;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_Bg = stop.clone();
         let epoch_thread = std::thread::spawn(move || {
-            let start = Instant::now();
-            while start.elapsed() < timeout_duration {
-                engine_handle.increment_epoch();
+            let mut ticks = 0u64;
+            while !stop_Bg.load(std::sync::atomic::Ordering::Relaxed) && ticks <= timeout_ticks {
                 std::thread::sleep(Duration::from_millis(1));
+                if stop_Bg.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                engine_handle.increment_epoch();
+                ticks += 1;
             }
         });
 
-        // Execute the function
         let result = func.call(store, (input_ptr, input_len)).map_err(|e| {
             if e.to_string().contains("epoch") {
                 anyhow!("WASM execution timeout after {:?}", timeout)
@@ -292,8 +300,8 @@ impl WasmEngine {
             }
         });
 
-        // Clean up epoch thread (it will finish naturally)
-        drop(epoch_thread);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = epoch_thread.join();
 
         result
     }
