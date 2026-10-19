@@ -451,7 +451,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
                 "platform_fee_bps > 0 requires a fee_account".into(),
             ));
         }
-        if platform_fee_bps > 10_000 {
+        if slippage_bps == 0 || slippage_bps > 10_000 {
+            return Err(RelayerError::SwapFailed(format!(
+                "invalid slippage_bps {slippage_bps}: must be in 1..=10_000"
+            )));
+        }
+        if platform_fee_bps >= 10_000 {
             return Err(RelayerError::FeeTooHigh(platform_fee_bps));
         }
         Ok(Self {
@@ -514,9 +519,13 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if quote.route_plan.is_empty() {
             return Err(RelayerError::NoRoute("empty routePlan".into()));
         }
-        quote.out_amount.parse::<u64>().map_err(|e| {
+        let out_amount = quote.out_amount.parse::<u64>().map_err(|e| {
             RelayerError::SwapFailed(format!("bad outAmount '{}': {e}", quote.out_amount))
-        })
+        })?;
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed("zero outAmount in quote".into()));
+        }
+        Ok(out_amount)
     }
 
     /// Decode Jupiter's base64 `swapTransaction` into a [`VersionedTransaction`].
@@ -550,6 +559,11 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         }
         let input_mint = asset_to_mint(asset_in);
         let output_mint = asset_to_mint(asset_out);
+        if asset_in == asset_out || input_mint == output_mint {
+            return Err(RelayerError::SwapFailed(
+                "asset_in and asset_out must differ".into(),
+            ));
+        }
 
         let query = self.quote_query(&input_mint, &output_mint, amount);
         let quote_raw = self.http.get_quote(&query).await?;
@@ -585,6 +599,14 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         let (out_amount, swap_raw) = self
             .quote_and_swap_raw(asset_in, asset_out, amount, user)
             .await?;
+        let tx = Self::decode_swap_tx(&swap_raw)?;
+        if tx.message.header().num_required_signatures == 0
+            || tx.message.static_account_keys().first() != Some(user)
+        {
+            return Err(RelayerError::SwapFailed(
+                "swap transaction fee payer does not match user".into(),
+            ));
+        }
         let resp: SwapTxResponse = serde_json::from_value(swap_raw)
             .map_err(|e| RelayerError::SwapFailed(format!("malformed swap response: {e}")))?;
         Ok(SwapQuote {
