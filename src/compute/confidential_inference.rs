@@ -76,6 +76,9 @@ impl AttestedChannelKey {
     /// when verification fails, so a caller can never accidentally seal to an
     /// unattested key.
     pub fn verify<V: AttestationVerifier>(&self, verifier: &V) -> Option<[u8; 32]> {
+        if self.channel_pubkey == [0u8; 32] {
+            return None;
+        }
         if verifier.verify(&self.attestation, &self.channel_pubkey) {
             Some(self.channel_pubkey)
         } else {
@@ -101,6 +104,9 @@ pub fn seal_prompt<V: AttestationVerifier>(
     verifier: &V,
     prompt: &[u8],
 ) -> Option<EncryptedNote> {
+    if prompt.is_empty() {
+        return None;
+    }
     let pubkey = key.verify(verifier)?;
     Some(seal(&pubkey, prompt))
 }
@@ -138,11 +144,14 @@ impl InferencePayload {
     }
 
     fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() < 32 {
+        if b.len() <= 32 {
             return None;
         }
         let mut reply_to = [0u8; 32];
         reply_to.copy_from_slice(&b[..32]);
+        if reply_to == [0u8; 32] {
+            return None;
+        }
         Some(Self {
             reply_to,
             prompt: b[32..].to_vec(),
@@ -158,6 +167,9 @@ pub fn seal_request<V: AttestationVerifier>(
     verifier: &V,
     payload: &InferencePayload,
 ) -> Option<EncryptedNote> {
+    if payload.prompt.is_empty() || payload.reply_to == [0u8; 32] {
+        return None;
+    }
     let pubkey = key.verify(verifier)?;
     Some(seal(&pubkey, &payload.to_bytes()))
 }

@@ -32,18 +32,41 @@ const CS_SWNAME: &str = "CONFIDENTIAL_SPACE";
 const CS_OIDC_CONFIG: &str =
     "https://confidentialcomputing.googleapis.com/.well-known/openid-configuration";
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EatNonce {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl EatNonce {
+    fn matches_hex(&self, expected_hex: &str) -> bool {
+        match self {
+            EatNonce::Single(s) => s.to_lowercase() == expected_hex,
+            EatNonce::Multiple(v) => v.len() == 1 && v[0].to_lowercase() == expected_hex,
+        }
+    }
+}
+
+fn default_secboot() -> bool {
+    true
+}
+
 /// The claims we read out of the token. Registered claims (`iss`, `aud`, `exp`,
 /// `nbf`) are validated separately by [`Validation`]; this struct only carries
 /// the Confidential Space fields we additionally check.
 #[derive(Debug, Deserialize)]
 struct CsClaims {
     /// Hex of the value the workload bound into the token — our channel pubkey.
-    eat_nonce: String,
+    eat_nonce: EatNonce,
     /// Software running the workload; must be `CONFIDENTIAL_SPACE`.
     swname: String,
     /// `"enabled"` on a debug image, `"disabled"` on a hardened one.
     #[serde(default)]
     dbgstat: String,
+    /// Whether Secure Boot is enabled on the TEE instance.
+    #[serde(default = "default_secboot")]
+    secboot: bool,
     submods: Submods,
 }
 
@@ -92,6 +115,9 @@ impl GcpConfidentialSpaceVerifier {
 
 impl AttestationVerifier for GcpConfidentialSpaceVerifier {
     fn verify(&self, attestation: &[u8], channel_pubkey: &[u8; 32]) -> bool {
+        if channel_pubkey == &[0u8; 32] {
+            return false;
+        }
         let Ok(token) = std::str::from_utf8(attestation) else {
             return false;
         };
@@ -106,8 +132,9 @@ impl AttestationVerifier for GcpConfidentialSpaceVerifier {
             return false;
         };
 
-        // Verify signature + issuer + audience + expiry in one step.
+        // Verify signature + issuer + audience + expiry + nbf in one step.
         let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_nbf = true;
         validation.set_issuer(&[CS_ISSUER]);
         validation.set_audience(&[self.audience.as_str()]);
         let Ok(data) = decode::<CsClaims>(token, key, &validation) else {
@@ -116,7 +143,7 @@ impl AttestationVerifier for GcpConfidentialSpaceVerifier {
         let claims = data.claims;
 
         // The binding: the token must vouch for exactly this channel key.
-        if claims.eat_nonce.to_lowercase() != hex::encode(channel_pubkey) {
+        if !claims.eat_nonce.matches_hex(&hex::encode(channel_pubkey)) {
             return false;
         }
         // The enclave must be running exactly the workload we expect.
@@ -126,8 +153,8 @@ impl AttestationVerifier for GcpConfidentialSpaceVerifier {
         if claims.swname != CS_SWNAME {
             return false;
         }
-        // In production, refuse a debug image (its memory is inspectable).
-        if self.require_production && claims.dbgstat != "disabled" {
+        // In production, refuse a debug image or disabled Secure Boot.
+        if self.require_production && (claims.dbgstat != "disabled" || !claims.secboot) {
             return false;
         }
         true
@@ -142,8 +169,19 @@ pub async fn fetch_google_signing_keys() -> anyhow::Result<HashMap<String, Decod
     struct Oidc {
         jwks_uri: String,
     }
-    let oidc: Oidc = reqwest::get(CS_OIDC_CONFIG).await?.json().await?;
-    let jwks: jsonwebtoken::jwk::JwkSet = reqwest::get(&oidc.jwks_uri).await?.json().await?;
+    let oidc: Oidc = reqwest::get(CS_OIDC_CONFIG)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if !oidc.jwks_uri.starts_with("https://") {
+        anyhow::bail!("refusing non-HTTPS jwks_uri: {}", oidc.jwks_uri);
+    }
+    let jwks: jsonwebtoken::jwk::JwkSet = reqwest::get(&oidc.jwks_uri)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
     let mut keys = HashMap::new();
     for jwk in &jwks.keys {
@@ -152,6 +190,9 @@ pub async fn fetch_google_signing_keys() -> anyhow::Result<HashMap<String, Decod
                 keys.insert(kid, key);
             }
         }
+    }
+    if keys.is_empty() {
+        anyhow::bail!("no usable Google Confidential Space signing keys in JWKS");
     }
     Ok(keys)
 }
