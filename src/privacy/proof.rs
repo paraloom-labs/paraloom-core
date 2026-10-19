@@ -298,6 +298,16 @@ impl ProofVerifier {
                 reason: "non-canonical root encoding".to_string(),
             };
         }
+        if !is_canonical_le(asset_id) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical asset_id encoding".to_string(),
+            };
+        }
+        if nullifiers[0] == nullifiers[1] {
+            return VerificationResult::Invalid {
+                reason: "duplicate input nullifiers".to_string(),
+            };
+        }
         for nullifier in nullifiers {
             if !is_canonical_le(nullifier) {
                 return VerificationResult::Invalid {

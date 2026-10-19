@@ -2522,37 +2522,34 @@ impl Node {
         // recorded either way. Previously only the winner recorded it, so a
         // losing node's off-chain nullifier set drifted from the chain it is
         // meant to pre-filter against (#703).
-        let settled = match &result {
-            Ok(_) => true,
-            // Only ask the chain on failure, and only about the first
-            // nullifier: the pair is spent atomically in one instruction, so
-            // either both PDAs exist or neither does.
+        let (nf0_spent, nf1_spent) = match &result {
+            Ok(_) => (true, true),
             Err(_) => {
-                bridge
-                    .lock()
-                    .await
-                    .is_nullifier_spent(&approved.request.nullifiers[0])
-                    .await
+                let b = bridge.lock().await;
+                let s0 = b.is_nullifier_spent(&approved.request.nullifiers[0]).await;
+                let s1 = b.is_nullifier_spent(&approved.request.nullifiers[1]).await;
+                (s0, s1)
             }
         };
+        let settled = nf0_spent && nf1_spent;
 
         if settled {
-            // Mark the input nullifiers spent in the off-chain set so this
-            // node's `check_batch` pre-filters replays before consensus,
-            // matching the on-chain nullifier PDAs that are the authoritative
-            // double-spend gate (#624).
             if let Some(pool) = &self.shielded_pool {
                 pool.record_spent(approved.request.nullifiers).await;
+            }
+        } else if nf0_spent || nf1_spent {
+            if let Some(pool) = &self.shielded_pool {
+                let spent_nf = if nf0_spent {
+                    approved.request.nullifiers[0]
+                } else {
+                    approved.request.nullifiers[1]
+                };
+                pool.record_spent([spent_nf, spent_nf]).await;
             }
         }
 
         match result {
             Ok(sig) => Ok(sig),
-            // Report a lost race as what it is. Classifying it by the submit
-            // error's text is what #703 was: the message comes from Anchor's
-            // `init` on an existing account, so it is not ours to predict, and
-            // the old `contains("already spent")` check matched nothing outside
-            // its own test.
             Err(_) if settled => Err(crate::bridge::BridgeError::AlreadySettled),
             Err(e) => Err(e),
         }
