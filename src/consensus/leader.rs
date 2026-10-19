@@ -170,11 +170,14 @@ impl LeaderSelector {
     /// # Returns
     /// Selected leader's NodeId
     pub fn select_leader(&self, seed: &[u8]) -> Result<NodeId> {
-        let active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
+        let mut active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
 
         if active_validators.is_empty() {
             return Err(anyhow!("No active validators available"));
         }
+
+        // Canonical sorting by NodeId to ensure deterministic iteration across all distributed nodes
+        active_validators.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
 
         // Calculate total weight
         let total_weight: u128 = active_validators.iter().map(|v| v.selection_weight()).sum();
@@ -188,8 +191,12 @@ impl LeaderSelector {
 
         // Select validator based on weighted random
         let mut cumulative_weight = 0u128;
-        for validator in active_validators {
-            cumulative_weight += validator.selection_weight();
+        for validator in &active_validators {
+            let weight = validator.selection_weight();
+            if weight == 0 {
+                continue;
+            }
+            cumulative_weight += weight;
             if random_value < cumulative_weight {
                 log::debug!(
                     "Selected leader: {:?} (weight: {}/{})",
@@ -201,15 +208,13 @@ impl LeaderSelector {
             }
         }
 
-        // Fallback to last validator (should never happen due to cumulative math)
-        Ok(self
-            .validators
-            .values()
-            .filter(|v| v.is_active)
+        // Fallback to last validator with positive weight (should never happen due to cumulative math)
+        active_validators
+            .into_iter()
+            .filter(|v| v.selection_weight() > 0)
             .last()
-            .ok_or_else(|| anyhow!("No active validators"))?
-            .node_id
-            .clone())
+            .map(|v| v.node_id.clone())
+            .ok_or_else(|| anyhow!("All validators have zero weight"))
     }
 
     /// Generate deterministic random number in range [0, max)
@@ -237,7 +242,7 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
-    /// Get all active validators sorted by weight (descending)
+    /// Get all active validators sorted by weight (descending) with deterministic NodeId tie-breaker
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self
             .validators
@@ -246,7 +251,11 @@ impl LeaderSelector {
             .cloned()
             .collect();
 
-        validators.sort_by_key(|b| std::cmp::Reverse(b.selection_weight()));
+        validators.sort_by(|a, b| {
+            b.selection_weight()
+                .cmp(&a.selection_weight())
+                .then_with(|| a.node_id.0.cmp(&b.node_id.0))
+        });
         validators
     }
 
@@ -491,5 +500,35 @@ mod tests {
         selector.unregister_validator(&NodeId(vec![1]));
 
         assert_eq!(selector.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn test_select_leader_deterministic_across_different_insertion_orders() {
+        let seed = b"deterministic_seed_123";
+
+        let mut s1 = LeaderSelector::new();
+        s1.register_validator(ValidatorInfo::new(NodeId(vec![0xAA]), 10_000_000_000, 1000));
+        s1.register_validator(ValidatorInfo::new(NodeId(vec![0xBB]), 20_000_000_000, 1000));
+        s1.register_validator(ValidatorInfo::new(NodeId(vec![0xCC]), 30_000_000_000, 1000));
+
+        let mut s2 = LeaderSelector::new();
+        s2.register_validator(ValidatorInfo::new(NodeId(vec![0xCC]), 30_000_000_000, 1000));
+        s2.register_validator(ValidatorInfo::new(NodeId(vec![0xAA]), 10_000_000_000, 1000));
+        s2.register_validator(ValidatorInfo::new(NodeId(vec![0xBB]), 20_000_000_000, 1000));
+
+        let l1 = s1.select_leader(seed).unwrap();
+        let l2 = s2.select_leader(seed).unwrap();
+        assert_eq!(l1, l2, "Different nodes must select the exact same leader");
+    }
+
+    #[test]
+    fn test_get_validators_by_weight_tie_breaker() {
+        let mut selector = LeaderSelector::new();
+        selector.register_validator(ValidatorInfo::new(NodeId(vec![0xBB]), 10_000_000_000, 1000));
+        selector.register_validator(ValidatorInfo::new(NodeId(vec![0xAA]), 10_000_000_000, 1000));
+
+        let sorted = selector.get_validators_by_weight();
+        assert_eq!(sorted[0].node_id, NodeId(vec![0xAA]));
+        assert_eq!(sorted[1].node_id, NodeId(vec![0xBB]));
     }
 }
