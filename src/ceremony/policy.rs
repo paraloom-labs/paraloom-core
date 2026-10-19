@@ -125,7 +125,20 @@ pub fn enforce_finalize_policy(
         return Err(PolicyError::InitialKeyHashMismatch);
     }
 
-    if final_pk.delta_g1 == initial_pk.delta_g1 && final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
+    let distinct_contributors: std::collections::HashSet<_> = transcript
+        .contributions
+        .iter()
+        .filter(|c| !c.contributor.0.is_empty())
+        .map(|c| &c.contributor.0)
+        .collect();
+    if distinct_contributors.len() < min {
+        return Err(PolicyError::TooFewContributions {
+            got: distinct_contributors.len(),
+            min,
+        });
+    }
+
+    if final_pk.delta_g1 == initial_pk.delta_g1 || final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
         return Err(PolicyError::FinalKeyUnchanged);
     }
 

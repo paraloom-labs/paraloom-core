@@ -287,6 +287,9 @@ impl Phase2Transcript {
     /// DLEQ proof and signature is the verifier module's job; this
     /// method only checks the data-layer chain integrity.
     pub fn verify_chain(&self) -> Result<(), TranscriptError> {
+        if self.version != TRANSCRIPT_VERSION {
+            return Err(TranscriptError::ChainBroken { position: 0 });
+        }
         let mut expected = self.initial_srs_hash;
         for (i, contribution) in self.contributions.iter().enumerate() {
             if contribution.prior_hash != expected {

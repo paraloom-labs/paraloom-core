@@ -116,7 +116,7 @@ pub fn apply_contribution<R: RngCore>(
     delta_i: Fr,
     rng: &mut R,
 ) -> Result<DleqProof, BgmError> {
-    if delta_i.is_zero() {
+    if delta_i.is_zero() || delta_i == Fr::from(1u64) {
         return Err(BgmError::ZeroContribution);
     }
     let delta_inv = delta_i.inverse().ok_or(BgmError::ZeroContribution)?;
@@ -132,7 +132,10 @@ pub fn apply_contribution<R: RngCore>(
     let delta_after_g1 = pk.delta_g1;
     let delta_after_g2 = pk.vk.delta_g2;
 
-    let k = Fr::rand(rng);
+    let mut k = Fr::rand(rng);
+    while k.is_zero() {
+        k = Fr::rand(rng);
+    }
     let r_g1 = (delta_before_g1 * k).into_affine();
     let r_g2 = (delta_before_g2 * k).into_affine();
     let c = fiat_shamir_challenge(
@@ -184,7 +187,16 @@ pub fn verify_contribution_deltas(
     delta_after_g2: &G2Affine,
     proof: &DleqProof,
 ) -> Result<(), BgmError> {
-    if delta_after_g1.is_zero() || delta_after_g2.is_zero() {
+    if delta_before_g1.is_zero()
+        || delta_before_g2.is_zero()
+        || delta_after_g1.is_zero()
+        || delta_after_g2.is_zero()
+        || delta_after_g1 == delta_before_g1
+        || delta_after_g2 == delta_before_g2
+        || proof.r_g1.is_zero()
+        || proof.r_g2.is_zero()
+        || proof.s.is_zero()
+    {
         return Err(BgmError::ZeroContribution);
     }
 
