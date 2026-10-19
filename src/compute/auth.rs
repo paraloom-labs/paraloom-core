@@ -35,6 +35,9 @@ pub enum ComputeAuthError {
     /// The requested timeout exceeds the per-job ceiling.
     #[error("requested timeout {requested}s exceeds the {max}s ceiling")]
     TimeoutTooHigh { requested: u64, max: u64 },
+    /// A requested resource limit is zero.
+    #[error("requested limit for {0} cannot be zero")]
+    ZeroLimit(&'static str),
 }
 
 /// Who may submit compute jobs, and the per-job resource ceiling. Pure policy;
@@ -95,6 +98,15 @@ impl ComputeAuthPolicy {
             if !allowed.contains(submitter) {
                 return Err(ComputeAuthError::UnauthorizedSubmitter(submitter.clone()));
             }
+        }
+        if requested.max_memory_bytes == 0 {
+            return Err(ComputeAuthError::ZeroLimit("max_memory_bytes"));
+        }
+        if requested.max_instructions == 0 {
+            return Err(ComputeAuthError::ZeroLimit("max_instructions"));
+        }
+        if requested.timeout_secs == 0 {
+            return Err(ComputeAuthError::ZeroLimit("timeout_secs"));
         }
         if requested.max_memory_bytes > self.max_limits.max_memory_bytes {
             return Err(ComputeAuthError::MemoryTooHigh {
@@ -225,6 +237,32 @@ mod tests {
         assert!(matches!(
             policy.authorize(&node(1), &over),
             Err(ComputeAuthError::UnauthorizedSubmitter(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_resource_limits() {
+        let policy = ComputeAuthPolicy::open();
+
+        let mut zero_mem = small_request();
+        zero_mem.max_memory_bytes = 0;
+        assert!(matches!(
+            policy.authorize(&node(1), &zero_mem),
+            Err(ComputeAuthError::ZeroLimit("max_memory_bytes"))
+        ));
+
+        let mut zero_fuel = small_request();
+        zero_fuel.max_instructions = 0;
+        assert!(matches!(
+            policy.authorize(&node(1), &zero_fuel),
+            Err(ComputeAuthError::ZeroLimit("max_instructions"))
+        ));
+
+        let mut zero_time = small_request();
+        zero_time.timeout_secs = 0;
+        assert!(matches!(
+            policy.authorize(&node(1), &zero_time),
+            Err(ComputeAuthError::ZeroLimit("timeout_secs"))
         ));
     }
 }

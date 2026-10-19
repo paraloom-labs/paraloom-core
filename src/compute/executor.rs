@@ -63,13 +63,60 @@ impl JobExecutor {
         })
     }
 
+    fn drain_internal(
+        result_rx: &Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
+        completed_results: &Arc<Mutex<HashMap<JobId, JobResult>>>,
+    ) {
+        let mut rx = result_rx.lock().unwrap();
+        let mut completed = completed_results.lock().unwrap();
+
+        while let Ok(result) = rx.try_recv() {
+            debug!("Processing result for job {}", result.job_id);
+
+            // Bound the retained results so they cannot grow without limit as
+            // jobs finish (#610): evict an arbitrary older result before adding
+            // a new job id past the ceiling.
+            if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
+                if let Some(victim) = completed.keys().next().cloned() {
+                    completed.remove(&victim);
+                }
+            }
+            completed.insert(result.job_id.clone(), result);
+        }
+    }
+
+    /// Drain any pending results from the result channel into completed_results.
+    pub fn drain_results(&self) {
+        Self::drain_internal(&self.result_rx, &self.completed_results);
+    }
+
     /// Submit a new job for execution
     pub fn submit_job(&self, job: ComputeJob) -> Result<JobId> {
+        self.drain_results();
+
         let job_id = job.id.clone();
+
+        {
+            let active = self.active_jobs.lock().unwrap();
+            if active.contains_key(&job_id) {
+                return Err(anyhow::anyhow!("duplicate job id: {}", job_id));
+            }
+        }
+
+        {
+            let completed = self.completed_results.lock().unwrap();
+            if completed.contains_key(&job_id) {
+                return Err(anyhow::anyhow!("duplicate job id: {}", job_id));
+            }
+        }
 
         info!("Submitting job {} to execution queue", job_id);
 
         let mut pending = self.pending_jobs.lock().unwrap();
+        if pending.iter().any(|j| j.id == job_id) {
+            return Err(anyhow::anyhow!("duplicate job id: {}", job_id));
+        }
+
         // Bound the pending queue: a peer whose per-job limits are authorized
         // could otherwise enqueue unique jobs faster than the (fixed
         // concurrency) executor drains them, growing memory without bound
@@ -101,6 +148,8 @@ impl JobExecutor {
 
     /// Get job status
     pub fn get_job_status(&self, job_id: &JobId) -> Option<JobStatus> {
+        self.drain_results();
+
         // Check pending jobs
         {
             let pending = self.pending_jobs.lock().unwrap();
@@ -130,12 +179,14 @@ impl JobExecutor {
 
     /// Get job result (if completed)
     pub fn get_job_result(&self, job_id: &JobId) -> Option<JobResult> {
+        self.drain_results();
         let completed = self.completed_results.lock().unwrap();
         completed.get(job_id).cloned()
     }
 
     /// Get all completed job results
     pub fn get_all_results(&self) -> Vec<JobResult> {
+        self.drain_results();
         let completed = self.completed_results.lock().unwrap();
         completed.values().cloned().collect()
     }
@@ -232,26 +283,12 @@ impl JobExecutor {
         result_rx: Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
         completed_results: Arc<Mutex<HashMap<JobId, JobResult>>>,
     ) {
-        let mut rx = result_rx.lock().unwrap();
-
-        while let Ok(result) = rx.try_recv() {
-            debug!("Processing result for job {}", result.job_id);
-
-            let mut completed = completed_results.lock().unwrap();
-            // Bound the retained results so they cannot grow without limit as
-            // jobs finish (#610): evict an arbitrary older result before adding
-            // a new job id past the ceiling.
-            if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
-                if let Some(victim) = completed.keys().next().cloned() {
-                    completed.remove(&victim);
-                }
-            }
-            completed.insert(result.job_id.clone(), result);
-        }
+        Self::drain_internal(&result_rx, &completed_results);
     }
 
     /// Get statistics
     pub fn get_stats(&self) -> ExecutorStats {
+        self.drain_results();
         let pending_count = self.pending_jobs.lock().unwrap().len();
         let active_count = self.active_jobs.lock().unwrap().len();
         let completed = self.completed_results.lock().unwrap();
@@ -406,5 +443,52 @@ mod tests {
         // bound (#610).
         let overflow = ComputeJob::new(vec![], vec![], ResourceLimits::default());
         assert!(executor.submit_job(overflow).is_err());
+    }
+
+    #[tokio::test]
+    async fn submit_job_rejects_duplicate_job_id() {
+        let executor = JobExecutor::new().unwrap();
+        let job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+
+        assert!(executor.submit_job(job.clone()).is_ok());
+        // Duplicate in pending queue
+        assert!(executor.submit_job(job.clone()).is_err());
+
+        // Duplicate in active jobs
+        let active_job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+        executor
+            .active_jobs
+            .lock()
+            .unwrap()
+            .insert(active_job.id.clone(), active_job.clone());
+        assert!(executor.submit_job(active_job).is_err());
+
+        // Duplicate in completed results
+        let completed_job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+        executor
+            .completed_results
+            .lock()
+            .unwrap()
+            .insert(
+                completed_job.id.clone(),
+                JobResult::success(completed_job.id.clone(), vec![], 10, 100, 1000),
+            );
+        assert!(executor.submit_job(completed_job).is_err());
+    }
+
+    #[tokio::test]
+    async fn reads_drain_pending_results_synchronously() {
+        let executor = JobExecutor::new().unwrap();
+        let job_id = "test-drain-job".to_string();
+        let result = JobResult::success(job_id.clone(), vec![1, 2, 3], 5, 50, 500);
+
+        executor.result_tx.send(result.clone()).unwrap();
+
+        // Reading status immediately drains without waiting for background tick
+        let status = executor.get_job_status(&job_id);
+        assert_eq!(status, Some(JobStatus::Completed));
+
+        let res = executor.get_job_result(&job_id);
+        assert_eq!(res, Some(result));
     }
 }
