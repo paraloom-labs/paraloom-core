@@ -1508,15 +1508,21 @@ pub mod paraloom_program {
         let registry_ai = ctx.accounts.validator_registry.to_account_info();
 
         // Confirm the pinned PDA actually is a ValidatorRegistry, so a wrong
-        // account cannot be reshaped into one.
-        {
+        // account cannot be reshaped into one, and preserve its cold authority.
+        let preserved_authority = {
             let data = registry_ai.try_borrow_data()?;
-            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(data.len() >= 40, BridgeError::UnauthorizedInit);
             require!(
                 data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
                 BridgeError::UnauthorizedInit
             );
-        }
+            let existing = Pubkey::new_from_array(data[8..40].try_into().unwrap());
+            if existing == Pubkey::default() {
+                ctx.accounts.authority.key()
+            } else {
+                existing
+            }
+        };
 
         // Grow to the current layout, topping up rent for the extra bytes.
         let new_len = 8 + ValidatorRegistry::INIT_SPACE;
@@ -1561,6 +1567,14 @@ pub mod paraloom_program {
             );
             require!(&expected == acc.key, BridgeError::UnauthorizedInit);
             require!(validator.is_active, BridgeError::UnauthorizedInit);
+            require!(
+                validator.stake_amount >= MIN_VALIDATOR_STAKE,
+                BridgeError::InsufficientStake
+            );
+            require!(
+                validator.token_stake_amount >= RECOMMENDED_MIN_TOKEN_STAKE,
+                BridgeError::InsufficientTokenStake
+            );
             // Reject a PDA passed twice so it cannot double-count into the stake
             // total and inflate the quorum denominator.
             require!(!seen.contains(acc.key), BridgeError::UnauthorizedInit);
@@ -1581,7 +1595,7 @@ pub mod paraloom_program {
 
         // Write the rebuilt registry.
         let registry = ValidatorRegistry {
-            authority: ctx.accounts.authority.key(),
+            authority: preserved_authority,
             total_validators: active,
             active_validators: active,
             minimum_stake: MIN_VALIDATOR_STAKE,
@@ -1632,25 +1646,29 @@ pub mod paraloom_program {
     /// stale-low quorum denominator. It does not move the staked lamports; those
     /// are returned through `unregister_validator`.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
-        let was_active = ctx.accounts.validator_account.is_active;
+        require!(
+            ctx.accounts.validator_account.is_active,
+            BridgeError::ValidatorNotActive
+        );
         let stake = ctx.accounts.validator_account.stake_amount;
+        let token_stake = ctx.accounts.validator_account.token_stake_amount;
         let who = ctx.accounts.validator_account.validator;
-        if was_active {
-            let now_slot = Clock::get()?.slot;
-            let v = &mut ctx.accounts.validator_account;
-            v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
-            // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
-            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
-            // the delay, same as unregister.
-            v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
-            v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
-            v.stake_amount = 0;
-            let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
-        }
+        let now_slot = Clock::get()?.slot;
+        let v = &mut ctx.accounts.validator_account;
+        v.is_active = false;
+        // Route both SOL and token stake into unbonding rather than stranding
+        // them: a deactivated validator can't `unregister` (that requires
+        // is_active), so without this its lamports and staked tokens would be
+        // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
+        // the delay, same as unregister.
+        v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+        v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+        v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+        v.stake_amount = 0;
+        v.token_stake_amount = 0;
+        let registry = &mut ctx.accounts.validator_registry;
+        registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+        registry.active_validators = registry.active_validators.saturating_sub(1);
         msg!("Validator deactivated: {}", who);
         Ok(())
     }
