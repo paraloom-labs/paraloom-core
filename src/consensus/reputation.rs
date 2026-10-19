@@ -110,18 +110,22 @@ impl ValidatorMetrics {
 
         // Decay formula: reputation * (1 - decay_rate)^days
         // decay_rate = REPUTATION_DECAY_PER_DAY / 10000 (basis points to percentage)
+        let old_reputation = self.reputation;
         let decay_rate = REPUTATION_DECAY_PER_DAY as f64 / 10000.0;
         let multiplier = (1.0 - decay_rate).powi(days_inactive as i32);
 
         let new_reputation = (self.reputation as f64 * multiplier) as u64;
         self.reputation = new_reputation.max(MIN_REPUTATION);
+        self.last_active = self
+            .last_active
+            .saturating_add(days_inactive.saturating_mul(SECONDS_PER_DAY));
 
         log::debug!(
             "Applied {} days decay to {:?}: {} -> {}",
             days_inactive,
             self.node_id,
-            self.reputation,
-            new_reputation
+            old_reputation,
+            self.reputation
         );
     }
 
@@ -325,6 +329,10 @@ impl ReputationTracker {
             if validator.reputation != old_reputation {
                 count += 1;
             }
+        }
+
+        if count > 0 {
+            self.persist_locked(&metrics);
         }
 
         log::debug!("Applied decay to {} validators", count);
@@ -598,5 +606,37 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+        let after_first = metrics.reputation;
+
+        // Immediate second decay sweep on the same day must be a no-op
+        metrics.apply_decay();
+        assert_eq!(metrics.reputation, after_first);
+    }
+
+    #[tokio::test]
+    async fn test_apply_decay_all_persists_decayed_scores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reputation.json");
+        let tracker = ReputationTracker::with_persistence(path.clone());
+        let validator = NodeId(vec![42]);
+
+        tracker.register_validator(validator.clone()).await;
+        {
+            let mut metrics = tracker.metrics.write().await;
+            let m = metrics.get_mut(&validator).unwrap();
+            m.last_active = m.last_active.saturating_sub(2 * SECONDS_PER_DAY + 100);
+        }
+
+        let decayed_count = tracker.apply_decay_all().await;
+        assert_eq!(decayed_count, 1);
+        let after_first = tracker.get_reputation(&validator).await.unwrap();
+
+        let second_count = tracker.apply_decay_all().await;
+        assert_eq!(second_count, 0);
+        assert_eq!(tracker.get_reputation(&validator).await, Some(after_first));
+
+        let reloaded = ReputationTracker::with_persistence(path);
+        assert_eq!(reloaded.get_reputation(&validator).await, Some(after_first));
     }
 }
+
