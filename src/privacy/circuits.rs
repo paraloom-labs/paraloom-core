@@ -43,7 +43,7 @@ fn alloc_u64_witness(
     cs: ConstraintSystemRef<Fr>,
     value: Option<u64>,
 ) -> Result<(UInt64<Fr>, FpVar<Fr>), SynthesisError> {
-    let uint = UInt64::new_witness(cs, || value.ok_or(SynthesisError::AssignmentMissing))?;
+    let uint = UInt64::new_witness(cs, || Ok(value.unwrap_or(0)))?;
     let fp = Boolean::le_bits_to_fp_var(&uint.to_bits_le())?;
     Ok((uint, fp))
 }
@@ -52,6 +52,8 @@ fn alloc_u64_witness(
 pub const MAX_INPUTS: usize = 2;
 /// Maximum number of outputs in a transfer
 pub const MAX_OUTPUTS: usize = 2;
+/// Default Merkle tree depth for circuit setup
+pub const DEFAULT_MERKLE_DEPTH: usize = 20;
 
 /// Merkle path element: (hash, is_left)
 type MerklePathElement = ([u8; 32], bool);
@@ -100,7 +102,7 @@ impl WithdrawCircuitV2 {
             blinding: None,
             privkey: None,
             asset_id: None,
-            input_path: None,
+            input_path: Some(vec![([0u8; 32], false); DEFAULT_MERKLE_DEPTH]),
         }
     }
 }
@@ -127,9 +129,7 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
         let withdraw_amount_var = FpVar::new_input(cs.clone(), || {
-            self.withdraw_amount
-                .map(Fr::from)
-                .ok_or(SynthesisError::AssignmentMissing)
+            Ok(Fr::from(self.withdraw_amount.unwrap_or(0)))
         })?;
         let (_withdraw_bits, withdraw_amount_range_var) =
             alloc_u64_witness(cs.clone(), self.withdraw_amount)?;
@@ -201,27 +201,30 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
         // path's position — derived from the direction bits so it cannot be
         // chosen inconsistently with the path. `is_left` = current node is the
         // left child, so the index bit at that level is `!is_left`.
+        let path = self
+            .input_path
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .ok_or(SynthesisError::Unsatisfiable)?;
         let mut current_hash = commitment.clone();
         let mut leaf_index = FpVar::<Fr>::zero();
         let mut place = Fr::from(1u64);
-        if let Some(path) = &self.input_path {
-            for (sibling_hash, is_left) in path {
-                let sibling_var = FpVar::new_witness(cs.clone(), || {
-                    Ok(Fr::from_le_bytes_mod_order(sibling_hash))
-                })?;
-                let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
+        for (sibling_hash, is_left) in path {
+            let sibling_var = FpVar::new_witness(cs.clone(), || {
+                Ok(Fr::from_le_bytes_mod_order(sibling_hash))
+            })?;
+            let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
 
-                let l = is_left_var.select(&current_hash, &sibling_var)?;
-                let r = is_left_var.select(&sibling_var, &current_hash)?;
-                current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
+            let l = is_left_var.select(&current_hash, &sibling_var)?;
+            let r = is_left_var.select(&sibling_var, &current_hash)?;
+            current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
 
-                // Add `place` to the index iff this node is the right child.
-                let bit_contrib = is_left_var
-                    .not()
-                    .select(&FpVar::constant(place), &FpVar::<Fr>::zero())?;
-                leaf_index += &bit_contrib;
-                place = place + place;
-            }
+            // Add `place` to the index iff this node is the right child.
+            let bit_contrib = is_left_var
+                .not()
+                .select(&FpVar::constant(place), &FpVar::<Fr>::zero())?;
+            leaf_index += &bit_contrib;
+            place = place + place;
         }
         current_hash.enforce_equal(&merkle_root_var)?;
 
@@ -272,7 +275,7 @@ impl TransferCircuitV2 {
             input_values: vec![None; num_inputs],
             input_blindings: vec![None; num_inputs],
             input_privkeys: vec![None; num_inputs],
-            input_paths: vec![None; num_inputs],
+            input_paths: vec![Some(vec![([0u8; 32], false); DEFAULT_MERKLE_DEPTH]); num_inputs],
             output_values: vec![None; num_outputs],
             output_blindings: vec![None; num_outputs],
             output_pubkeys: vec![None; num_outputs],
@@ -312,6 +315,19 @@ impl TransferCircuitV2 {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let num_inputs = self.nullifiers.len();
+        let num_outputs = self.output_commitments.len();
+        if self.input_values.len() != num_inputs
+            || self.input_blindings.len() != num_inputs
+            || self.input_privkeys.len() != num_inputs
+            || self.input_paths.len() != num_inputs
+            || self.output_values.len() != num_outputs
+            || self.output_blindings.len() != num_outputs
+            || self.output_pubkeys.len() != num_outputs
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+
         // --- Public inputs ---
         let merkle_root_var = FpVar::new_input(cs.clone(), || {
             Ok(self
@@ -399,7 +415,20 @@ impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
 
         // CONSTRAINT 2: each input is a spend-authorized note in the tree, and
         // its nullifier binds the key and the (path-derived) leaf index.
+        let mut expected_depth: Option<usize> = None;
         for i in 0..input_value_vars.len() {
+            let path = self.input_paths[i]
+                .as_ref()
+                .filter(|p| !p.is_empty())
+                .ok_or(SynthesisError::Unsatisfiable)?;
+            if let Some(depth) = expected_depth {
+                if path.len() != depth {
+                    return Err(SynthesisError::Unsatisfiable);
+                }
+            } else {
+                expected_depth = Some(path.len());
+            }
+
             let pubkey = poseidon_pubkey_gadget(cs.clone(), &input_privkey_vars[i])?;
             let commitment = poseidon_commit_spend_gadget(
                 cs.clone(),
@@ -412,21 +441,19 @@ impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
             let mut current_hash = commitment.clone();
             let mut leaf_index = FpVar::<Fr>::zero();
             let mut place = Fr::from(1u64);
-            if let Some(path) = &self.input_paths[i] {
-                for (sibling_hash, is_left) in path {
-                    let sibling_var = FpVar::new_witness(cs.clone(), || {
-                        Ok(Fr::from_le_bytes_mod_order(sibling_hash))
-                    })?;
-                    let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
-                    let l = is_left_var.select(&current_hash, &sibling_var)?;
-                    let r = is_left_var.select(&sibling_var, &current_hash)?;
-                    current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
-                    let bit_contrib = is_left_var
-                        .not()
-                        .select(&FpVar::constant(place), &FpVar::<Fr>::zero())?;
-                    leaf_index += &bit_contrib;
-                    place = place + place;
-                }
+            for (sibling_hash, is_left) in path {
+                let sibling_var = FpVar::new_witness(cs.clone(), || {
+                    Ok(Fr::from_le_bytes_mod_order(sibling_hash))
+                })?;
+                let is_left_var = Boolean::new_witness(cs.clone(), || Ok(*is_left))?;
+                let l = is_left_var.select(&current_hash, &sibling_var)?;
+                let r = is_left_var.select(&sibling_var, &current_hash)?;
+                current_hash = poseidon_merkle_pair_gadget(cs.clone(), &l, &r)?;
+                let bit_contrib = is_left_var
+                    .not()
+                    .select(&FpVar::constant(place), &FpVar::<Fr>::zero())?;
+                leaf_index += &bit_contrib;
+                place = place + place;
             }
             current_hash.enforce_equal(&merkle_root_var)?;
 
@@ -1873,5 +1900,31 @@ mod r1cs_shape {
         let domain_input = cs.num_constraints() + cs.num_instance_variables();
         assert_eq!(domain_input, 18_486);
         assert_eq!(domain_input.next_power_of_two(), 32_768);
+    }
+
+    #[test]
+    fn v2_circuits_setup_and_reject_empty_or_mismatched_merkle_paths() {
+        let cs_w = ConstraintSystem::<Fr>::new_ref();
+        cs_w.set_mode(SynthesisMode::Setup);
+        assert!(WithdrawCircuitV2::new().generate_constraints(cs_w).is_ok());
+
+        let cs_t = ConstraintSystem::<Fr>::new_ref();
+        cs_t.set_mode(SynthesisMode::Setup);
+        assert!(TransferCircuitV2::new(2, 2).generate_constraints(cs_t).is_ok());
+
+        // Empty Merkle path in WithdrawCircuitV2 must be rejected.
+        let mut empty_w = WithdrawCircuitV2::new();
+        empty_w.input_path = Some(vec![]);
+        let cs_bad_w = ConstraintSystem::<Fr>::new_ref();
+        assert!(empty_w.generate_constraints(cs_bad_w).is_err());
+
+        // Mismatched Merkle path depths across inputs in TransferCircuitV2 must be rejected.
+        let mut bad_t = TransferCircuitV2::new(2, 2);
+        bad_t.input_paths = vec![
+            Some(vec![([0u8; 32], false); 1]),
+            Some(vec![([0u8; 32], false); 3]),
+        ];
+        let cs_bad_t = ConstraintSystem::<Fr>::new_ref();
+        assert!(bad_t.generate_constraints(cs_bad_t).is_err());
     }
 }
