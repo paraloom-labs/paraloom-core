@@ -85,6 +85,13 @@ struct PollerState {
     last_signature: Arc<RwLock<Option<Signature>>>,
     seen_signatures: Arc<RwLock<HashSet<Signature>>>,
     last_processed_slot: Arc<RwLock<u64>>,
+    /// Pagination resume point when a single poll hits [`MAX_SIGNATURE_PAGES`]
+    /// before reaching `last_signature`. Holds `last_signature` in place until
+    /// subsequent polls finish walking the older pages down to the cursor.
+    backlog_before: Arc<RwLock<Option<Signature>>>,
+    /// Newest contiguous signature from the first page of a multi-poll backlog
+    /// catch-up, promoted to `last_signature` once the oldest page reaches the cursor.
+    backlog_head: Arc<RwLock<Option<Signature>>>,
     /// Slot count above which the listener emits a warning each poll —
     /// pulled from [`BridgeConfig::event_lag_warn_threshold_slots`].
     lag_warn_threshold_slots: u64,
@@ -157,6 +164,8 @@ impl EventListener {
             last_signature: Arc::clone(&self.last_signature),
             seen_signatures: Arc::clone(&self.seen_signatures),
             last_processed_slot: Arc::clone(&self.last_processed_slot),
+            backlog_before: Arc::new(RwLock::new(None)),
+            backlog_head: Arc::new(RwLock::new(None)),
             lag_warn_threshold_slots: self.config.event_lag_warn_threshold_slots,
             batch_limit: SIGNATURE_BATCH_LIMIT,
             cursor_path: self.config.cursor_path.clone(),
@@ -304,7 +313,11 @@ impl EventListener {
                 frozen = true;
             }
             if frozen {
-                if !*ok {
+                // Evict both the failed signature and any subsequent signatures in
+                // the same batch from `seen_signatures` so the retry poll
+                // re-evaluates them and can advance `last_signature` past them
+                // once the earlier failure recovers.
+                if failed.last() != Some(sig) {
                     failed.push(*sig);
                 }
             } else if *ok {
@@ -363,24 +376,41 @@ impl EventListener {
 
         let (cursor_advance, failed) = Self::contiguous_cursor(&outcomes);
 
-        // Un-see the failed signatures so the next poll re-fetches and retries
-        // them. The cursor stays below the first failure, so the re-fetch's
-        // `until` boundary actually returns them; re-processing is idempotent at
-        // the pool, so the successes after a failure are no-ops on retry.
+        // Un-see the failed signatures (and any post-failure signatures in the
+        // batch) so the next poll re-fetches and retries them. The cursor stays
+        // below the first failure, so the re-fetch's `until` boundary actually
+        // returns them; re-processing is idempotent at the pool, so the successes
+        // after a failure are no-ops on retry.
         if !failed.is_empty() {
             let mut seen = state.seen_signatures.write().await;
             for sig in &failed {
                 seen.remove(sig);
             }
+            *state.backlog_before.write().await = None;
+            *state.backlog_head.write().await = None;
         }
 
-        if let Some(sig) = cursor_advance {
-            *state.last_signature.write().await = Some(sig);
-            // Persist the advanced cursor so a restart resumes here. Best-effort:
-            // a write failure is logged but does not fail the poll — the
-            // in-memory cursor still drives this run.
-            if let Some(path) = &state.cursor_path {
-                Self::persist_cursor(path, &sig).await;
+        let has_remaining_backlog = state.backlog_before.read().await.is_some();
+        if has_remaining_backlog {
+            if failed.is_empty() {
+                if let Some(sig) = cursor_advance {
+                    state.backlog_head.write().await.get_or_insert(sig);
+                }
+            }
+        } else {
+            let effective_advance = if failed.is_empty() {
+                state.backlog_head.write().await.take().or(cursor_advance)
+            } else {
+                cursor_advance
+            };
+            if let Some(sig) = effective_advance {
+                *state.last_signature.write().await = Some(sig);
+                // Persist the advanced cursor so a restart resumes here. Best-effort:
+                // a write failure is logged but does not fail the poll — the
+                // in-memory cursor still drives this run.
+                if let Some(path) = &state.cursor_path {
+                    Self::persist_cursor(path, &sig).await;
+                }
             }
         }
         if latest_slot > 0 {
@@ -473,7 +503,8 @@ impl EventListener {
         // so take only the newest page and begin scanning from now rather than
         // replaying the program's entire history.
         let mut signatures = Vec::new();
-        let mut before: Option<Signature> = None;
+        let mut before: Option<Signature> = *state.backlog_before.read().await;
+        *state.backlog_before.write().await = None;
         let mut pages = 0usize;
         // The cursor is the `until` boundary. If it ages out of the RPC's
         // queryable history (some providers retain devnet signatures only
@@ -514,6 +545,8 @@ impl EventListener {
                         e
                     );
                     Self::clear_cursor(state).await;
+                    *state.backlog_before.write().await = None;
+                    *state.backlog_head.write().await = None;
                     effective_cursor = None;
                     before = None;
                     pages = 0;
@@ -546,10 +579,11 @@ impl EventListener {
             if pages >= MAX_SIGNATURE_PAGES {
                 log::warn!(
                     target: "paraloom::bridge::solana",
-                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
+                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; holding cursor and resuming older pages on next poll",
                     MAX_SIGNATURE_PAGES,
                     MAX_SIGNATURE_PAGES * state.batch_limit
                 );
+                *state.backlog_before.write().await = oldest;
                 break;
             }
             match oldest {
@@ -836,6 +870,8 @@ mod tests {
             last_signature: Arc::new(RwLock::new(None)),
             seen_signatures: Arc::new(RwLock::new(HashSet::new())),
             last_processed_slot: Arc::new(RwLock::new(0)),
+            backlog_before: Arc::new(RwLock::new(None)),
+            backlog_head: Arc::new(RwLock::new(None)),
             lag_warn_threshold_slots: 100,
             batch_limit: SIGNATURE_BATCH_LIMIT,
             cursor_path: None,
@@ -1387,16 +1423,17 @@ mod tests {
 
         // A failure in the middle freezes the cursor at the last success before
         // it; the later success must NOT carry the cursor past the failure, and
-        // the failure is reported for retry.
+        // both the failure and post-failure signatures are reported for retry so
+        // `seen_signatures` does not strand `last_signature` on the retry poll.
         let (cursor, failed) =
             EventListener::contiguous_cursor(&[(a, true), (b, false), (c, true)]);
         assert_eq!(cursor, Some(a));
-        assert_eq!(failed, vec![b]);
+        assert_eq!(failed, vec![b, c]);
 
         // A failure first leaves the cursor unmoved.
         let (cursor, failed) = EventListener::contiguous_cursor(&[(a, false), (b, true)]);
         assert_eq!(cursor, None);
-        assert_eq!(failed, vec![a]);
+        assert_eq!(failed, vec![a, b]);
 
         // Nothing processed → no movement.
         let (cursor, failed) = EventListener::contiguous_cursor(&[]);
