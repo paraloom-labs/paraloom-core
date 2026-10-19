@@ -57,17 +57,11 @@ impl MerkleTree {
         }
     }
 
-    /// Create a Merkle tree with persistent storage
-    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
-        // Load existing commitments from storage
+    /// Create a Merkle tree with persistent storage (synchronous)
+    pub fn from_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
         let commitments = storage.get_all_commitments()?;
         let leaves: Vec<[u8; 32]> = commitments.iter().map(|c| *c.as_bytes()).collect();
-
-        // Load cached root if available
         let cached_root = storage.get_merkle_root()?;
-
-        // Seed the recent-roots window with the reloaded tip so a proof built
-        // against the just-restored root verifies immediately after a restart.
         let recent_roots = match cached_root {
             Some(r) => std::collections::VecDeque::from([r]),
             None => std::collections::VecDeque::new(),
@@ -79,6 +73,11 @@ impl MerkleTree {
             recent_roots: Arc::new(RwLock::new(recent_roots)),
             storage: Some(storage),
         })
+    }
+
+    /// Create a Merkle tree with persistent storage
+    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
+        Self::from_storage(storage)
     }
 
     /// Insert a commitment as a leaf, returning the index it was placed

@@ -26,9 +26,8 @@ impl NullifierSet {
         }
     }
 
-    /// Create a nullifier set with persistent storage
-    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
-        // Load existing nullifiers from storage
+    /// Create a nullifier set with persistent storage (synchronous)
+    pub fn from_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
         let nullifiers_vec = storage.get_all_nullifiers()?;
         let nullifiers_set: HashSet<Nullifier> = nullifiers_vec.into_iter().collect();
 
@@ -36,6 +35,11 @@ impl NullifierSet {
             nullifiers: Arc::new(RwLock::new(nullifiers_set)),
             storage: Some(storage),
         })
+    }
+
+    /// Create a nullifier set with persistent storage
+    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self, anyhow::Error> {
+        Self::from_storage(storage)
     }
 
     /// Check if a nullifier has been revealed (spent)

@@ -60,20 +60,11 @@ impl ShieldedPool {
         }
     }
 
-    /// Create a shielded pool with persistent storage
-    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self> {
-        // Load Merkle tree from storage
-        let commitment_tree = MerkleTree::with_storage(storage.clone()).await?;
-
-        // Load nullifier set from storage
-        let nullifier_set = NullifierSet::with_storage(storage.clone()).await?;
-
-        // Load per-asset supplies from storage (native SOL + any SPL assets)
+    /// Create a shielded pool with persistent storage (synchronous)
+    pub fn from_storage(storage: Arc<PrivacyStorage>) -> Result<Self> {
+        let commitment_tree = MerkleTree::from_storage(storage.clone())?;
+        let nullifier_set = NullifierSet::from_storage(storage.clone())?;
         let supplies = storage.get_all_asset_supplies()?;
-
-        // Seed the idempotency set from the same persisted record the tree is
-        // rebuilt from, so a deposit credited before a restart is still
-        // recognised after one.
         let deposited: HashSet<Commitment> = storage.get_all_commitments()?.into_iter().collect();
 
         Ok(ShieldedPool {
@@ -84,6 +75,11 @@ impl ShieldedPool {
             supplies: Arc::new(RwLock::new(supplies)),
             storage: Some(storage),
         })
+    }
+
+    /// Create a shielded pool with persistent storage
+    pub async fn with_storage(storage: Arc<PrivacyStorage>) -> Result<Self> {
+        Self::from_storage(storage)
     }
 
     /// Deposit native SOL into the shielded pool.

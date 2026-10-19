@@ -1443,8 +1443,32 @@ impl Node {
         // is a follow-up once the cursor is durable.
         let runs_bridge = settings.bridge.enabled
             && matches!(node_type, NodeType::ResourceProvider | NodeType::Bridge);
+        let privacy_storage = if runs_bridge {
+            let storage_path = format!("{}/privacy", settings.storage.data_dir);
+            match PrivacyStorage::open(&storage_path) {
+                Ok(storage) => {
+                    info!("Privacy storage initialized at {}", storage_path);
+                    Some(Arc::new(storage))
+                }
+                Err(e) => {
+                    log::warn!("Failed to open privacy storage: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let shielded_pool = if runs_bridge {
-            Some(Arc::new(ShieldedPool::new()))
+            let pool = match &privacy_storage {
+                Some(storage) => {
+                    ShieldedPool::from_storage(storage.clone()).unwrap_or_else(|e| {
+                        log::warn!("Failed to restore shielded pool from storage: {}", e);
+                        ShieldedPool::new()
+                    })
+                }
+                None => ShieldedPool::new(),
+            };
+            Some(Arc::new(pool))
         } else {
             None
         };
@@ -1453,8 +1477,10 @@ impl Node {
             // directory so a restart resumes where it left off instead of
             // re-scanning from the chain tip and losing deposits taken while down.
             let mut bridge_cfg = settings.bridge.clone();
-            bridge_cfg.cursor_path =
-                Some(format!("{}/bridge_cursor", settings.storage.data_dir).into());
+            if privacy_storage.is_some() {
+                bridge_cfg.cursor_path =
+                    Some(format!("{}/bridge_cursor", settings.storage.data_dir).into());
+            }
             Some(Arc::new(Mutex::new(Bridge::new(bridge_cfg))))
         } else {
             None
@@ -1512,7 +1538,7 @@ impl Node {
             resource_monitor: Arc::new(resource_monitor),
             coordinator,
             validator,
-            privacy_storage: None,
+            privacy_storage,
             shielded_pool,
             bridge,
             compute_executor,
@@ -3634,4 +3660,33 @@ mod tests {
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
     }
+
+    #[tokio::test]
+    async fn restarted_bridge_node_preserves_shielded_pool_alongside_bridge_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        settings.storage.data_dir = dir.path().to_string_lossy().into_owned();
+
+        let note = crate::privacy::types::Note::new_native(
+            crate::privacy::types::ShieldedAddress([7u8; 32]),
+            1_000_000,
+            [9u8; 32],
+        );
+
+        let (commitment, root_before) = {
+            let node = Node::new(settings.clone()).expect("construct node 1");
+            let pool = node.shielded_pool.as_ref().expect("pool present");
+            let c = pool.deposit(note, 1_000_000).await.expect("deposit");
+            (c, pool.root().await)
+        };
+
+        let node2 = Node::new(settings).expect("construct node 2");
+        let pool2 = node2.shielded_pool.as_ref().expect("pool present");
+        assert_eq!(pool2.commitment_count().await, 1);
+        assert_eq!(pool2.total_supply().await, 1_000_000);
+        assert_eq!(pool2.root().await, root_before);
+        assert!(pool2.path(&commitment).await.is_ok());
+    }
 }
+
