@@ -784,6 +784,33 @@ impl TransactVerificationCoordinator {
             .insert(validator.clone(), 0);
     }
 
+    /// Record a co-sign decline or timeout for a peer validator during a settlement round (#1032).
+    /// Increments the validator's timeout streak so repeated unresponsiveness is tracked.
+    pub async fn record_cosign_failure(&self, validator: &NodeId) {
+        let mut streaks = self.timeout_streaks.write().await;
+        let streak = streaks.entry(validator.clone()).or_insert(0);
+        *streak = streak.saturating_add(1);
+        log::warn!(
+            "Recorded co-sign decline/timeout for validator {:?} (streak={})",
+            validator,
+            *streak
+        );
+    }
+
+    /// Minimum validators required for BFT consensus (#1032).
+    pub fn min_validators_for_consensus(&self) -> usize {
+        self.min_validators_for_consensus
+    }
+
+    /// Calculate the BFT supermajority threshold for a co-signing round (#1032).
+    /// Returns the minimum number of co-signers required: max(min_validators_for_consensus, floor(2 * N / 3) + 1).
+    pub fn calculate_cosign_threshold(&self, total_voters: usize) -> usize {
+        let bft_supermajority = total_voters.saturating_mul(2) / 3 + 1;
+        self.min_validators_for_consensus
+            .max(bft_supermajority)
+            .min(total_voters)
+    }
+
     /// Start verification for a transact request. Errors if there are not
     /// enough registered validators to reach the configured quorum.
     pub async fn start_verification(&self, request: TransactVerificationRequest) -> Result<String> {
