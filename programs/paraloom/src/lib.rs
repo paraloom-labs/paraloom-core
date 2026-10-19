@@ -660,10 +660,25 @@ pub mod paraloom_program {
             )?;
 
             // Settling-validator fee, paid in the withdrawn asset to the
-            // validator's own token account (constrained to `authority` in the
-            // accounts struct). The native path credits lamport `pending_rewards`
+            // validator's own token account (constrained to `authority`).
+            // The native path credits lamport `pending_rewards`
             // for a later claim; here the token fee is paid inline.
             if fee > 0 {
+                // Dynamically deserialize and validate the fee_token_account
+                let fee_account = TokenAccount::try_deserialize(
+                    &mut &ctx.accounts.fee_token_account.data.borrow()[..],
+                )?;
+                require_keys_eq!(
+                    fee_account.mint,
+                    ctx.accounts.mint.key(),
+                    BridgeError::InvalidAmount
+                );
+                require_keys_eq!(
+                    fee_account.owner,
+                    ctx.accounts.authority.key(),
+                    BridgeError::InvalidValidator
+                );
+
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -1918,9 +1933,12 @@ pub struct TransactSpl<'info> {
     pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid. Checked dynamically when `fee > 0` so zero-fee settlements (pure transfers
+    /// or sub-400 base unit withdrawals) do not fail when the authority has no pre-created ATA.
+    ///
+    /// CHECK: Validated inside `transact_spl` if and only if `fee > 0` (mint == mint, owner == authority).
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
