@@ -576,6 +576,19 @@ impl Coordinator {
                         total_time += result.execution_time_ms;
                     }
 
+                    let aggregated = TaskResult {
+                        task_id: parent_id.to_string(),
+                        status: TaskStatus::Completed,
+                        data: ResultData::Hashes {
+                            hashes: all_hashes.clone(),
+                        },
+                        execution_time_ms: max_time,
+                    };
+                    self.results
+                        .lock()
+                        .await
+                        .insert(parent_id.to_string(), aggregated);
+
                     info!("");
                     info!("TASK COMPLETED SUCCESSFULLY!");
                     info!("Total hashes computed: {}", all_hashes.len());
@@ -622,6 +635,53 @@ impl Coordinator {
         }
 
         Ok(())
+    }
+
+    /// Query the status and human-readable message for a parent or chunk task.
+    pub async fn get_task_status(&self, task_id: &str) -> Option<(String, String)> {
+        {
+            let results = self.results.lock().await;
+            if let Some(res) = results.get(task_id) {
+                return Some((
+                    "completed".to_string(),
+                    format!("Task completed in {}ms", res.execution_time_ms),
+                ));
+            }
+        }
+        let active = self.active_tasks.lock().await;
+        if let Some(task) = active.get(task_id) {
+            return Some(match &task.status {
+                TaskStatus::Pending => ("pending".to_string(), "Task is pending".to_string()),
+                TaskStatus::Assigned | TaskStatus::Running => (
+                    "processing".to_string(),
+                    "Task is being processed".to_string(),
+                ),
+                TaskStatus::Completed => ("completed".to_string(), "Task completed".to_string()),
+                TaskStatus::Failed { error } => {
+                    ("failed".to_string(), format!("Task failed: {}", error))
+                }
+            });
+        }
+        let parent_tasks = self.parent_tasks.lock().await;
+        let chunk_ids: Vec<&TaskId> = parent_tasks
+            .iter()
+            .filter(|(_, pid)| pid.as_str() == task_id)
+            .map(|(cid, _)| cid)
+            .collect();
+        if chunk_ids.is_empty() {
+            return None;
+        }
+        for cid in &chunk_ids {
+            if let Some(chunk) = active.get(*cid) {
+                if let TaskStatus::Failed { error } = &chunk.status {
+                    return Some(("failed".to_string(), format!("Task failed: {}", error)));
+                }
+            }
+        }
+        Some((
+            "processing".to_string(),
+            "Task is being processed".to_string(),
+        ))
     }
 
     /// Handle task error

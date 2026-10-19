@@ -45,11 +45,22 @@ async fn submit_task(
 ) -> Result<Json<SubmitTaskResponse>, StatusCode> {
     log::info!("API: Received task submission request: {:?}", req);
 
+    if !matches!(
+        req.task_type.trim().to_ascii_lowercase().as_str(),
+        "hash_calculation" | "hashcalculation" | "hash"
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let task_type = TaskType::HashCalculation {
         start: req.start,
         end: req.end,
         algorithm: req.algorithm,
     };
+
+    if crate::task::Task::new(task_type.clone()).validate().is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // Submit task synchronously (sequential chunk sending has timeout protection)
     match state.coordinator.submit_task(task_type).await {
@@ -69,16 +80,21 @@ async fn submit_task(
 
 async fn get_task_status(
     Path(task_id): Path<String>,
-    Extension(_state): Extension<ApiState>,
-) -> Json<TaskStatusResponse> {
+    Extension(state): Extension<ApiState>,
+) -> Result<Json<TaskStatusResponse>, StatusCode> {
     log::info!("API: Task status request: {}", task_id);
 
-    // For now, return a simple response
-    Json(TaskStatusResponse {
-        task_id: task_id.clone(),
-        status: "processing".to_string(),
-        message: "Task is being processed".to_string(),
-    })
+    let (status, message) = state
+        .coordinator
+        .get_task_status(&task_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(TaskStatusResponse {
+        task_id,
+        status,
+        message,
+    }))
 }
 
 pub fn create_api_router(coordinator: Arc<Coordinator>) -> Router {
