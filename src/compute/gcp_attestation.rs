@@ -108,6 +108,7 @@ impl AttestationVerifier for GcpConfidentialSpaceVerifier {
 
         // Verify signature + issuer + audience + expiry in one step.
         let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_nbf = true;
         validation.set_issuer(&[CS_ISSUER]);
         validation.set_audience(&[self.audience.as_str()]);
         let Ok(data) = decode::<CsClaims>(token, key, &validation) else {

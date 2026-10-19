@@ -61,6 +61,13 @@ impl ModelRunner for GraniteModelRunner {
             .endpoint
             .trim_start_matches("http://")
             .trim_end_matches('/');
+        let host = addr.split(':').next().unwrap_or("");
+        if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
+            return Err(anyhow!(
+                "GraniteModelRunner refuses non-loopback endpoint '{}' to keep plaintext prompts inside the enclave",
+                self.endpoint
+            ));
+        }
         let body = serde_json::json!({
             "prompt": prompt,
             "n_predict": self.max_tokens,
@@ -79,13 +86,15 @@ impl ModelRunner for GraniteModelRunner {
         stream.set_read_timeout(Some(Duration::from_secs(180)))?;
         stream.write_all(request.as_bytes())?;
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
+        stream.take(4 * 1024 * 1024).read_to_end(&mut raw)?;
 
         let response = String::from_utf8_lossy(&raw);
-        let json_body = response
+        let (headers, json_body) = response
             .split_once("\r\n\r\n")
-            .map(|(_, body)| body)
             .ok_or_else(|| anyhow!("llama-server response had no body"))?;
+        if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+            return Err(anyhow!("llama-server returned non-200 HTTP status"));
+        }
         let parsed: serde_json::Value = serde_json::from_str(json_body.trim())
             .map_err(|e| anyhow!("llama-server returned invalid JSON: {e}"))?;
         let content = parsed

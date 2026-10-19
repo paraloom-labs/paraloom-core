@@ -58,6 +58,15 @@ impl EnclaveChannel {
     }
 }
 
+impl Drop for EnclaveChannel {
+    fn drop(&mut self) {
+        for b in &mut self.secret {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// An enclave channel public key together with the attestation report that
 /// vouches for it. A client must never seal to `channel_pubkey` without first
 /// verifying the attestation — that binding is the whole trust anchor.
@@ -76,6 +85,9 @@ impl AttestedChannelKey {
     /// when verification fails, so a caller can never accidentally seal to an
     /// unattested key.
     pub fn verify<V: AttestationVerifier>(&self, verifier: &V) -> Option<[u8; 32]> {
+        if self.channel_pubkey.iter().all(|&b| b == 0) {
+            return None;
+        }
         if verifier.verify(&self.attestation, &self.channel_pubkey) {
             Some(self.channel_pubkey)
         } else {
@@ -143,6 +155,9 @@ impl InferencePayload {
         }
         let mut reply_to = [0u8; 32];
         reply_to.copy_from_slice(&b[..32]);
+        if reply_to.iter().all(|&x| x == 0) {
+            return None;
+        }
         Some(Self {
             reply_to,
             prompt: b[32..].to_vec(),
