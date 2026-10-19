@@ -178,33 +178,49 @@ fn decode_compiled_deposit(
     // asset. `deposit_note` and `deposit_note_spl` are the two the program
     // still exposes; the two legacy arms stay so historical deposits made
     // before `8830226` removed them still decode.
+    let (expected_bridge_state, _) =
+        crate::bridge::solana::instructions::derive_bridge_state(program_id);
+    let (expected_merkle_tree, _) =
+        crate::bridge::solana::instructions::derive_merkle_tree(program_id);
+    let bs_idx = *compiled.accounts.first()? as usize;
+    if account_keys.get(bs_idx)? != &expected_bridge_state {
+        return None;
+    }
+
     let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT_NOTE {
+        let vault_idx = *compiled.accounts.get(1)? as usize;
+        let tree_idx = *compiled.accounts.get(2)? as usize;
+        let (expected_vault, _) =
+            crate::bridge::solana::instructions::derive_bridge_vault(program_id);
+        if account_keys.get(vault_idx)? != &expected_vault
+            || account_keys.get(tree_idx)? != &expected_merkle_tree
+        {
+            return None;
+        }
         (
             DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
             crate::privacy::types::NATIVE_SOL_ASSET,
         )
     } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
+        let cfg_idx = *compiled.accounts.get(1)? as usize;
         let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
+        let vault_idx = *compiled.accounts.get(3)? as usize;
+        let tree_idx = *compiled.accounts.get(5)? as usize;
         let mint = account_keys.get(mint_index)?;
-        // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
-        // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
-        // the leaf, and `process_deposit` reduces this field into the same
-        // `v3_commit` the program computed. Feeding it raw bytes would credit a
-        // commitment the chain never appended — blind is recoverable, a wrong
-        // leaf in the pool is not.
+        let (expected_cfg, _) =
+            crate::bridge::solana::instructions::derive_asset_config(program_id, mint);
+        let (expected_vault, _) =
+            crate::bridge::solana::instructions::derive_asset_vault(program_id, mint);
+        if account_keys.get(cfg_idx)? != &expected_cfg
+            || account_keys.get(vault_idx)? != &expected_vault
+            || account_keys.get(tree_idx)? != &expected_merkle_tree
+        {
+            return None;
+        }
         (
             DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
             crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
         )
-    } else if raw_data[..8] == discriminators::DEPOSIT {
-        (
-            DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::types::NATIVE_SOL_ASSET,
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
-        let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
-        let mint = account_keys.get(mint_index)?;
-        (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes())
     } else {
         return None;
     };
