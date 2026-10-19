@@ -708,18 +708,39 @@ impl TransactVerificationCoordinator {
         // allowlist/stakes — that would fail-open the gate; keep the previous
         // set (and the previous registry total, updated only alongside a
         // non-empty snapshot so numerator and denominator move together).
-        if !stakes.is_empty() {
-            *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
-            *self.onchain_registry_total.write().await = registry_total_active_stake;
-            *self.onchain_stakes.write().await = stakes.clone();
+        if stakes.is_empty() && registry_total_active_stake > 0 {
+            log::warn!(
+                "Ignoring empty getProgramAccounts stake snapshot while registry_total={}; \
+                 preserving existing allowlist, stakes, and leader weights",
+                registry_total_active_stake
+            );
+            return;
         }
 
-        let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.apply_onchain_stakes(&stakes);
+        *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
+        *self.onchain_registry_total.write().await = registry_total_active_stake;
+        *self.onchain_stakes.write().await = stakes.clone();
+
+        let pruned = {
+            let mut leader_selector = self.leader_selector.write().await;
+            leader_selector.apply_onchain_stakes(&stakes);
+            if !stakes.is_empty() {
+                leader_selector.retain_onchain_wallets(&stakes)
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !pruned.is_empty() {
+            let mut validators = self.validators.write().await;
+            validators.retain(|v| !pruned.contains(v));
+        }
+
         log::debug!(
-            "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
+            "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={}, pruned={})",
             stakes.len(),
-            registry_total_active_stake
+            registry_total_active_stake,
+            pruned.len()
         );
     }
 
@@ -1571,5 +1592,50 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn sync_onchain_stakes_preserves_on_rpc_blip_prunes_deregistered_and_clears_on_zero_registry() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2".to_string()))
+            .await;
+
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1", 1_000_000_000), ("VAL2", 1_000_000_000)]),
+                2_000_000_000,
+            )
+            .await;
+
+        // 1. Transient empty GPA snapshot while registry_total > 0 must NOT zero leader_selector stakes:
+        coordinator
+            .sync_onchain_stakes(std::collections::HashMap::new(), 2_000_000_000)
+            .await;
+        {
+            let sel = coordinator.leader_selector.read().await;
+            assert_eq!(
+                sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+                1_000_000_000
+            );
+            assert!(sel.select_leader(b"seed-1").is_ok());
+        }
+
+        // 2. VAL2 deregisters on-chain (non-empty snapshot contains only VAL1): VAL2 is pruned:
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1", 1_000_000_000)]), 1_000_000_000)
+            .await;
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![1])).await);
+
+        // 3. Genuine total deactivation (stakes empty AND registry_total == 0) clears stale state:
+        coordinator
+            .sync_onchain_stakes(std::collections::HashMap::new(), 0)
+            .await;
+        assert_eq!(*coordinator.onchain_registry_total.read().await, 0);
+        assert!(coordinator.onchain_stakes.read().await.is_empty());
     }
 }

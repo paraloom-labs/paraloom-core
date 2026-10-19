@@ -154,6 +154,25 @@ impl LeaderSelector {
         }
     }
 
+    /// Prune validators whose co-sign wallet is absent from a non-empty
+    /// authoritative on-chain snapshot so deregistered peers do not remain in
+    /// the consensus or leader-selection set indefinitely.
+    pub fn retain_onchain_wallets(&mut self, active_wallets: &HashMap<String, u64>) -> Vec<NodeId> {
+        let mut pruned = Vec::new();
+        self.validators.retain(|node_id, v| {
+            let keep = v
+                .wallet_pubkey
+                .as_ref()
+                .map(|w| active_wallets.contains_key(w))
+                .unwrap_or(false);
+            if !keep {
+                pruned.push(node_id.clone());
+            }
+            keep
+        });
+        pruned
+    }
+
     /// Get number of active validators
     pub fn active_validator_count(&self) -> usize {
         self.validators.values().filter(|v| v.is_active).count()
