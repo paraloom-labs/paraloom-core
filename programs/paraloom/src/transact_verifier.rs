@@ -219,4 +219,22 @@ mod tests {
     fn wrong_length_rejected() {
         assert!(!verify_fixture(&[0u8; 255]));
     }
+
+    #[test]
+    fn vk_constants_byte_match_ceremony_canonical_wire_format() {
+        // Assert every VK point has bit 255 of each coordinate cleared (no stray sign-flags)
+        assert_eq!(vk::VK_ALPHA_G1[32] & 0x80, 0);
+        assert_eq!(vk::VK_BETA_G2[64] & 0x80, 0);
+        assert_eq!(vk::VK_GAMMA_G2[64] & 0x80, 0);
+        assert_eq!(vk::VK_DELTA_G2[64] & 0x80, 0);
+        assert_eq!(vk::VK_IC_0[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_1[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_2[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_3[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_4[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_5[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_6[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_7[32] & 0x80, 0);
+        assert_eq!(vk::VK_IC_8[32] & 0x80, 0);
+    }
 }
