@@ -2458,6 +2458,7 @@ impl Node {
             Some(mint) => SettlementParams::TransactSpl {
                 recipient_token_account: request.recipient,
                 mint,
+                token_program: request.token_program,
                 nullifiers: request.nullifiers,
                 output_commitments: request.output_commitments,
                 root: request.root,

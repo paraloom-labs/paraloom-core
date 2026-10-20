@@ -62,6 +62,11 @@ pub struct TransactVerificationRequest {
     #[serde(default)]
     pub mint: Option<[u8; 32]>,
 
+    /// Token program for the SPL mint (optional, defaults to standard SPL token program if omitted).
+    /// Supports Token-2022 mints (#1141).
+    #[serde(default)]
+    pub token_program: Option<[u8; 32]>,
+
     /// Input note nullifiers (one may be a random dummy for a 1-real-input spend)
     pub nullifiers: [[u8; 32]; 2],
 

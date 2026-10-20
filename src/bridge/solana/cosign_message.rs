@@ -59,6 +59,8 @@ pub enum SettlementParams {
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        #[serde(default)]
+        token_program: Option<[u8; 32]>,
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +192,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -198,12 +201,15 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            let token_program_pk = token_program
+                .map(Pubkey::new_from_array)
+                .unwrap_or(super::instructions::SPL_TOKEN_PROGRAM_ID);
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +217,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
