@@ -159,12 +159,13 @@ async fn submit_handler(
     check_bearer(&headers, &token)?;
 
     // Deposits (`ext_amount > 0`) go through `deposit_note`, never this
-    // ingress; the on-chain program rejects them anyway, so fail fast at the
-    // door instead of burning a consensus round on a doomed request.
-    if req.ext_amount > 0 {
+    // ingress, and `i64::MIN` overflows negation when computing the payout;
+    // fail fast at the door instead of burning a consensus round on a doomed
+    // request.
+    if req.ext_amount > 0 || req.ext_amount == i64::MIN {
         return Err((
             StatusCode::BAD_REQUEST,
-            "ext_amount must be <= 0 (deposits go through deposit_note)".to_string(),
+            "ext_amount must be in (i64::MIN, 0] (deposits go through deposit_note)".to_string(),
         ));
     }
 
@@ -175,6 +176,12 @@ async fn submit_handler(
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers must be distinct".to_string(),
+        ));
+    }
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
 
@@ -556,6 +563,21 @@ mod tests {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn i64_min_ext_amount_and_duplicate_nullifiers_are_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let resp = app
+            .oneshot(post_json(&body_with_ext_amount(i64::MIN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let dup_nf_body = well_formed_body().replace(&"22".repeat(32), &"11".repeat(32));
+        let resp = app.oneshot(post_json(&dup_nf_body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -991,6 +991,7 @@ async fn cosign_settlement(
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -1086,14 +1087,15 @@ async fn cosign_settlement(
         {
             return declined("co-sign count limit reached for an input nullifier");
         }
+        let sibling_keys = cap_nullifiers.clone();
         for nf in cap_nullifiers {
             // Bound the map so it cannot grow without limit as settlements
             // accumulate (#626): if a new nullifier would exceed the ceiling,
-            // drop an arbitrary existing entry first. An evicted entry belongs
-            // to an older spend whose nullifiers have almost certainly settled
-            // on chain, so resetting its budget is harmless.
+            // drop an arbitrary existing entry first (excluding either nullifier
+            // of the current settlement so inserting the second cannot evict the
+            // first).
             if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
-                if let Some(victim) = counts.keys().next().cloned() {
+                if let Some(victim) = counts.keys().find(|k| !sibling_keys.contains(k)).cloned() {
                     counts.remove(&victim);
                 }
             }
@@ -2359,7 +2361,9 @@ impl Node {
                 mint: mint.clone(),
             };
             if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
+                d.output_commitment == note.output_commitment
+                    && d.ciphertext == note.ciphertext
+                    && d.mint == note.mint
             }) {
                 continue;
             }
@@ -2693,6 +2697,21 @@ impl Node {
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
     ) -> Result<bool> {
+        // Pre-filter against the off-chain spent-nullifier set populated by
+        // `settle_transact_via_cosign` (#624) so a replay of an already-settled
+        // nullifier is rejected before consensus and co-signing.
+        if let Some(pool) = &self.shielded_pool {
+            for nf in &request.nullifiers {
+                if pool.is_spent(&crate::privacy::types::Nullifier(*nf)).await {
+                    log::warn!(
+                        "transact proof rejected for {}: input nullifier already spent",
+                        request.request_id
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
@@ -3633,5 +3652,72 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_native_transact_payload_for_spl_verified_request() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        let mut spl_req = ta_request("t-spl", recipient, nullifiers, outputs, root, ext_amount);
+        spl_req.mint = Some([0x42; 32]);
+        tas.lock().await.insert("t-spl".to_string(), spl_req);
+
+        // Native SOL payload with identical recipient/nullifiers/outputs/root/ext_amount
+        // must be declined when the cached request was verified for an SPL mint.
+        let native_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t-spl", SettlementKind::Transact, &native_payload),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "native SettlementParams::Transact must be declined when cached request has an SPL mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_transact_proof_rejects_already_spent_nullifiers() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings)
+            .expect("construct node")
+            .with_transact_proof_verifier(|_| true);
+
+        let req = ta_request(
+            "t-spent",
+            [9u8; 32],
+            [[7u8; 32], [8u8; 32]],
+            [[5u8; 32], [6u8; 32]],
+            [2u8; 32],
+            -100,
+        );
+        assert!(node.verify_transact_proof(&req).await.unwrap());
+
+        node.shielded_pool
+            .as_ref()
+            .unwrap()
+            .record_spent([[7u8; 32], [99u8; 32]])
+            .await;
+        assert!(
+            !node.verify_transact_proof(&req).await.unwrap(),
+            "already-spent input nullifier in shielded_pool must be rejected by verify_transact_proof"
+        );
     }
 }
