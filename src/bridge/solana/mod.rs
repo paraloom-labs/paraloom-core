@@ -15,19 +15,21 @@ pub use cosign_assembly::{assemble_transaction, gather_signatures};
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,
-    create_deposit_note_instruction, create_init_stake_token_vault_instruction,
-    create_initialize_instruction, create_initialize_merkle_tree_instruction,
-    create_initialize_validator_registry_instruction, create_migrate_bridge_state_instruction,
-    create_migrate_validator_account_instruction, create_pause_instruction,
-    create_register_validator_instruction, create_reset_validator_registry_instruction,
-    create_set_bridge_authority_instruction, create_set_deposit_cap_instruction,
-    create_transact_instruction, create_unpause_instruction,
+    create_deposit_note_instruction, create_deposit_note_spl_instruction,
+    create_init_stake_token_vault_instruction, create_initialize_instruction,
+    create_initialize_merkle_tree_instruction, create_initialize_validator_registry_instruction,
+    create_migrate_bridge_state_instruction, create_migrate_validator_account_instruction,
+    create_pause_instruction, create_register_validator_instruction,
+    create_reset_validator_registry_instruction, create_set_bridge_authority_instruction,
+    create_set_deposit_cap_instruction, create_transact_instruction, create_unpause_instruction,
     create_unregister_validator_instruction, create_withdraw_unbonded_stake_instruction,
-    derive_asset_vault, derive_asset_vault_authority, derive_associated_token_address,
-    derive_bridge_state, derive_bridge_vault, derive_nullifier_account, derive_program_data,
-    derive_stake_token_vault, derive_stake_vault_authority, derive_validator_account,
-    derive_validator_registry, DepositInstructionData, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
-    SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+    derive_asset_config, derive_asset_vault, derive_asset_vault_authority,
+    derive_associated_token_address, derive_bridge_state, derive_bridge_vault,
+    derive_nullifier_account, derive_program_data, derive_stake_token_vault,
+    derive_stake_vault_authority, derive_validator_account, derive_validator_registry,
+    ensure_canonical_bn254_field_element, is_canonical_bn254_field_element, mask_bn254_blinding,
+    sample_canonical_blinding, DepositInstructionData, BN254_FR_MODULUS_LE,
+    SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
 pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;

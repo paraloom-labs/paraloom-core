@@ -690,6 +690,47 @@ pub fn create_transact_spl_instruction(
     })
 }
 
+/// BN254 scalar field modulus `p` in little-endian byte order:
+/// `0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001`.
+/// On-chain `deposit_note` and `deposit_note_spl` feed `pubkey` and `blinding`
+/// into `solana_poseidon::hashv(Bn254X5, Endianness::LittleEndian, ...)` which
+/// rejects any 32-byte little-endian integer `>= p` with `InvalidFieldElement` (#1131).
+pub const BN254_FR_MODULUS_LE: [u8; 32] = [
+    0x01, 0x00, 0x00, 0xf0, 0x93, 0xf5, 0xe1, 0x43, 0x91, 0x70, 0xb9, 0x79, 0x48, 0xe8, 0x33, 0x28,
+    0x5d, 0x58, 0x81, 0x81, 0xb6, 0x45, 0x50, 0xb8, 0x29, 0xa0, 0x31, 0xe1, 0x72, 0x4e, 0x64, 0x30,
+];
+
+/// Returns `true` iff `bytes` (interpreted as a 32-byte little-endian integer)
+/// is strictly less than the BN254 scalar field modulus `p`.
+pub fn is_canonical_bn254_field_element(bytes: &[u8; 32]) -> bool {
+    bytes.iter().rev().lt(BN254_FR_MODULUS_LE.iter().rev())
+}
+
+/// Validates that `bytes` is a canonical BN254 field element (`< p` in little-endian).
+pub fn ensure_canonical_bn254_field_element(bytes: &[u8; 32], field_name: &str) -> Result<()> {
+    if !is_canonical_bn254_field_element(bytes) {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "{field_name} is not a canonical BN254 field element (< modulus p)"
+        )));
+    }
+    Ok(())
+}
+
+/// Masks the high 3 bits of a 32-byte little-endian random buffer (`b[31] &= 0x1f`)
+/// so the value is `< 2^253 < p` and guaranteed to be accepted as a canonical
+/// BN254 field element by `solana_poseidon::hashv` (#1131).
+pub fn mask_bn254_blinding(mut bytes: [u8; 32]) -> [u8; 32] {
+    bytes[31] &= 0x1f;
+    bytes
+}
+
+/// Samples a fresh 32-byte random blinding in canonical BN254 little-endian form (`< p`).
+pub fn sample_canonical_blinding() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    mask_bn254_blinding(bytes)
+}
+
 /// Create the `deposit_note` instruction (circuit v3, #350).
 ///
 /// Permissionless: the depositor moves their own lamports into the vault and
@@ -703,6 +744,9 @@ pub fn create_deposit_note_instruction(
     pubkey: [u8; 32],
     blinding: [u8; 32],
 ) -> Result<Instruction> {
+    ensure_canonical_bn254_field_element(&pubkey, "pubkey")?;
+    ensure_canonical_bn254_field_element(&blinding, "blinding")?;
+
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
 
@@ -725,6 +769,60 @@ pub fn create_deposit_note_instruction(
             AccountMeta::new(merkle_tree_pda, false),
             AccountMeta::new(*depositor, true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create the `deposit_note_spl` instruction (#779, #1131).
+///
+/// Account order matches the on-chain `DepositNoteSpl` accounts struct:
+/// `bridge_state`, `asset_config`, `mint`, `asset_vault`,
+/// `depositor_token_account`, `merkle_tree`, `depositor`, `token_program`.
+/// Both `pubkey` and `blinding` must be canonical BN254 field elements (`< p`
+/// in little-endian), or the on-chain `solana_poseidon::hashv` rejects the
+/// instruction with `InvalidFieldElement`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_deposit_note_spl_instruction(
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    mint: &Pubkey,
+    depositor_token_account: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+    pubkey: [u8; 32],
+    blinding: [u8; 32],
+) -> Result<Instruction> {
+    ensure_canonical_bn254_field_element(&pubkey, "pubkey")?;
+    ensure_canonical_bn254_field_element(&blinding, "blinding")?;
+
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_config_pda, _) = derive_asset_config(program_id, mint);
+    let (asset_vault_pda, _) = derive_asset_vault(program_id, mint);
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+
+    let data = DepositNoteInstructionData {
+        amount,
+        pubkey,
+        blinding,
+    };
+
+    let mut instruction_data = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(bridge_state_pda, false),
+            AccountMeta::new(asset_config_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(asset_vault_pda, false),
+            AccountMeta::new(*depositor_token_account, false),
+            AccountMeta::new(merkle_tree_pda, false),
+            AccountMeta::new(*depositor, true),
+            AccountMeta::new_readonly(*token_program, false),
         ],
         data: instruction_data,
     })
@@ -900,6 +998,11 @@ pub fn derive_nullifier_account(program_id: &Pubkey, nullifier: &[u8; 32]) -> (P
 /// all asset vaults on the SPL withdraw path.
 pub fn derive_asset_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"asset_vault_authority"], program_id)
+}
+
+/// Derive the per-asset config PDA for `mint` (`seeds = [b"asset_config", mint]`).
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
 }
 
 /// Derive the per-asset vault token account PDA for `mint`
@@ -1163,6 +1266,94 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE);
         // amount immediately follows the discriminator (borsh u64 LE).
         assert_eq!(&ix.data[8..16], &1_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_deposit_note_spl_and_canonical_bn254_blinding_validation() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor_token = Pubkey::new_unique();
+
+        // Sampled blindings must always be strictly below the BN254 modulus p.
+        for _ in 0..256 {
+            let blinding = sample_canonical_blinding();
+            assert_eq!(blinding[31] & 0xe0, 0);
+            assert!(is_canonical_bn254_field_element(&blinding));
+        }
+
+        // Masking an all-0xff draw brings it into canonical range.
+        let masked = mask_bn254_blinding([0xffu8; 32]);
+        assert_eq!(masked[31], 0x1f);
+        assert!(is_canonical_bn254_field_element(&masked));
+
+        // Exact modulus p - 1 is canonical; p and [0xff; 32] are non-canonical.
+        let mut p_minus_one = BN254_FR_MODULUS_LE;
+        p_minus_one[0] -= 1;
+        assert!(is_canonical_bn254_field_element(&p_minus_one));
+        assert!(!is_canonical_bn254_field_element(&BN254_FR_MODULUS_LE));
+        assert!(!is_canonical_bn254_field_element(&[0xffu8; 32]));
+
+        let ix = create_deposit_note_spl_instruction(
+            &program_id,
+            &depositor,
+            &mint,
+            &depositor_token,
+            &SPL_TOKEN_PROGRAM_ID,
+            500_000,
+            [7u8; 32],
+            p_minus_one,
+        )
+        .expect("canonical blinding accepted");
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_asset_config(&program_id, &mint).0
+        );
+        assert_eq!(ix.accounts[2].pubkey, mint);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_asset_vault(&program_id, &mint).0
+        );
+        assert_eq!(ix.accounts[4].pubkey, depositor_token);
+        assert_eq!(ix.accounts[5].pubkey, derive_merkle_tree(&program_id).0);
+        assert_eq!(ix.accounts[6].pubkey, depositor);
+        assert!(ix.accounts[6].is_signer);
+        assert_eq!(ix.accounts[7].pubkey, SPL_TOKEN_PROGRAM_ID);
+        assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE_SPL);
+        assert_eq!(&ix.data[8..16], &500_000u64.to_le_bytes());
+        assert_eq!(&ix.data[16..48], &[7u8; 32]);
+        assert_eq!(&ix.data[48..80], &p_minus_one);
+
+        // Non-canonical blinding (>= p) must be rejected before transaction construction.
+        let err = create_deposit_note_spl_instruction(
+            &program_id,
+            &depositor,
+            &mint,
+            &depositor_token,
+            &SPL_TOKEN_PROGRAM_ID,
+            500_000,
+            [7u8; 32],
+            BN254_FR_MODULUS_LE,
+        )
+        .expect_err("blinding == p must be rejected");
+        assert!(err
+            .to_string()
+            .contains("blinding is not a canonical BN254 field element"));
+
+        let err_unreduced = create_deposit_note_instruction(
+            &program_id,
+            &depositor,
+            &Pubkey::new_unique(),
+            500_000,
+            [7u8; 32],
+            [0xffu8; 32],
+        )
+        .expect_err("unreduced 32-byte blinding must be rejected");
+        assert!(err_unreduced
+            .to_string()
+            .contains("blinding is not a canonical BN254 field element"));
     }
 
     #[test]
