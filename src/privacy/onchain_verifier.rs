@@ -17,10 +17,10 @@
 //! exercised off-chain first. The program (#165) reuses the identical
 //! encoding.
 
-use ark_bn254::{Fr, G1Affine, G2Affine};
+use ark_bn254::{Fq, Fr, G1Affine, G2Affine};
+use ark_ec::AffineRepr;
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
-use ark_serialize::CanonicalSerialize;
 use num_bigint::BigUint;
 use solana_bn254::prelude::{alt_bn128_addition, alt_bn128_multiplication, alt_bn128_pairing};
 use std::ops::Neg;
@@ -29,39 +29,41 @@ use std::ops::Neg;
 // arkworks → alt_bn128 wire encoding
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Reverse a 32-byte coordinate in place (little-endian ↔ big-endian).
-fn rev32(src: &[u8]) -> [u8; 32] {
+/// Base-field coordinate (`Fq`) → canonical 32-byte big-endian (`< q`), with no
+/// arkworks `SWFlags` sign/infinity bit set in the most-significant byte (#1133).
+fn fq_to_be(f: &Fq) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (i, b) in src.iter().take(32).rev().enumerate() {
-        out[i] = *b;
+    let be = f.into_bigint().to_bytes_be();
+    out[32 - be.len()..].copy_from_slice(&be);
+    out
+}
+
+/// G1 point → 64-byte big-endian `[x_be || y_be]`.
+///
+/// Built directly from the canonical `Fq` coordinates rather than
+/// `CanonicalSerialize::serialize_uncompressed`, which sets an arkworks
+/// `SWFlags` sign bit in the top byte of `y` (#1133).
+pub fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    if let Some((x, y)) = p.xy() {
+        out[..32].copy_from_slice(&fq_to_be(&x));
+        out[32..].copy_from_slice(&fq_to_be(&y));
     }
     out
 }
 
-/// G1 point → 64-byte big-endian `[x || y]`.
-fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
-    // arkworks uncompressed G1 = `x_le(32) || y_le(32)`.
-    let mut le = Vec::with_capacity(64);
-    p.serialize_uncompressed(&mut le)
-        .expect("G1 serialize_uncompressed is infallible for a valid point");
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&rev32(&le[..32])); // x big-endian
-    out[32..].copy_from_slice(&rev32(&le[32..64])); // y big-endian
-    out
-}
-
-/// G2 point → 128-byte big-endian `[x.c1 || x.c0 || y.c1 || y.c0]`.
-fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
-    // arkworks uncompressed G2 = `x.c0_le || x.c1_le || y.c0_le || y.c1_le`.
-    // alt_bn128 wants `x.c1_be || x.c0_be || y.c1_be || y.c0_be`.
-    let mut le = Vec::with_capacity(128);
-    p.serialize_uncompressed(&mut le)
-        .expect("G2 serialize_uncompressed is infallible for a valid point");
+/// G2 point → 128-byte big-endian `[x.c1_be || x.c0_be || y.c1_be || y.c0_be]`.
+///
+/// Built directly from the canonical `Fq2` coordinates `(c0, c1)` so no
+/// arkworks `SWFlags` sign bit is set in `y.c1_be[0]` (#1133).
+pub fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
     let mut out = [0u8; 128];
-    out[..32].copy_from_slice(&rev32(&le[32..64])); // x.c1
-    out[32..64].copy_from_slice(&rev32(&le[..32])); // x.c0
-    out[64..96].copy_from_slice(&rev32(&le[96..128])); // y.c1
-    out[96..].copy_from_slice(&rev32(&le[64..96])); // y.c0
+    if let Some((x, y)) = p.xy() {
+        out[..32].copy_from_slice(&fq_to_be(&x.c1));
+        out[32..64].copy_from_slice(&fq_to_be(&x.c0));
+        out[64..96].copy_from_slice(&fq_to_be(&y.c1));
+        out[96..].copy_from_slice(&fq_to_be(&y.c0));
+    }
     out
 }
 
@@ -501,5 +503,118 @@ mod tests {
         rust_bytes("FIXTURE_PROOF_A", &wp.a);
         rust_bytes("FIXTURE_PROOF_B", &wp.b);
         rust_bytes("FIXTURE_PROOF_C", &wp.c);
+    }
+
+    #[test]
+    fn wire_encoding_never_sets_swflags_and_vk_constants_byte_match_ceremony_key() {
+        use ark_ec::CurveGroup;
+        use std::str::FromStr;
+
+        // Check both y and -y for G1 and G2 generators so at least one orientation
+        // has y > -y (where ark-serialize's serialize_uncompressed sets SWFlags::YIsPositive
+        // bit 0x80 on the top byte of y).
+        let g1 = G1Affine::generator();
+        let neg_g1 = (-g1.into_group()).into_affine();
+        for pt in [g1, neg_g1] {
+            let wire = g1_to_wire(&pt);
+            assert_eq!(wire[0] & 0xc0, 0, "G1 x MSB must not carry SWFlags bits");
+            assert_eq!(wire[32] & 0xc0, 0, "G1 y MSB must not carry SWFlags bits");
+            assert!(BigUint::from_bytes_be(&wire[..32]) < Fq::MODULUS.into());
+            assert!(BigUint::from_bytes_be(&wire[32..]) < Fq::MODULUS.into());
+        }
+
+        let g2 = G2Affine::generator();
+        let neg_g2 = (-g2.into_group()).into_affine();
+        for pt in [g2, neg_g2] {
+            let wire = g2_to_wire(&pt);
+            for chunk in wire.chunks_exact(32) {
+                assert_eq!(
+                    chunk[0] & 0xc0,
+                    0,
+                    "G2 coordinate MSB must not carry SWFlags bits"
+                );
+                assert!(BigUint::from_bytes_be(chunk) < Fq::MODULUS.into());
+            }
+        }
+
+        // Also pin programs/paraloom/src/transact_vk_data.rs byte-for-byte against
+        // ceremony/transact/verification_key.json from the workspace test suite.
+        let vk_rs = include_str!("../../programs/paraloom/src/transact_vk_data.rs");
+        let parse_const_bytes = |name: &str| -> Vec<u8> {
+            let marker = format!("pub const {name}:");
+            let start = vk_rs
+                .find(&marker)
+                .expect("find constant in transact_vk_data.rs");
+            let rest = &vk_rs[start..];
+            let open = rest.find("= [").expect("opening bracket") + 3;
+            let body = &rest[open..];
+            let close = body.find("];").expect("closing bracket");
+            body[..close]
+                .split(',')
+                .filter_map(|tok| {
+                    let t = tok.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.parse::<u8>().expect("byte literal"))
+                    }
+                })
+                .collect()
+        };
+
+        let raw_json = include_str!("../../ceremony/transact/verification_key.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw_json).expect("parse ceremony verification_key.json");
+
+        let dec_fq = |s: &str| -> Fq {
+            let n = BigUint::from_str(s).expect("decimal coordinate");
+            assert!(n < Fq::MODULUS.into());
+            Fq::from(n)
+        };
+        let g1_from_json = |arr: &serde_json::Value| -> Vec<u8> {
+            let x = dec_fq(arr[0].as_str().unwrap());
+            let y = dec_fq(arr[1].as_str().unwrap());
+            let pt = G1Affine::new(x, y);
+            g1_to_wire(&pt).to_vec()
+        };
+        let g2_from_json = |arr: &serde_json::Value| -> Vec<u8> {
+            let x = ark_bn254::Fq2::new(
+                dec_fq(arr[0][0].as_str().unwrap()),
+                dec_fq(arr[0][1].as_str().unwrap()),
+            );
+            let y = ark_bn254::Fq2::new(
+                dec_fq(arr[1][0].as_str().unwrap()),
+                dec_fq(arr[1][1].as_str().unwrap()),
+            );
+            let pt = G2Affine::new(x, y);
+            g2_to_wire(&pt).to_vec()
+        };
+
+        assert_eq!(
+            parse_const_bytes("VK_ALPHA_G1"),
+            g1_from_json(&parsed["vk_alpha_1"])
+        );
+        assert_eq!(
+            parse_const_bytes("VK_BETA_G2"),
+            g2_from_json(&parsed["vk_beta_2"])
+        );
+        assert_eq!(
+            parse_const_bytes("VK_GAMMA_G2"),
+            g2_from_json(&parsed["vk_gamma_2"])
+        );
+        assert_eq!(
+            parse_const_bytes("VK_DELTA_G2"),
+            g2_from_json(&parsed["vk_delta_2"])
+        );
+
+        let ic_json = parsed["IC"].as_array().expect("IC array");
+        assert_eq!(ic_json.len(), 9);
+        for (i, expected_json) in ic_json.iter().enumerate() {
+            assert_eq!(
+                parse_const_bytes(&format!("VK_IC_{i}")),
+                g1_from_json(expected_json),
+                "VK_IC_{i} must byte-match ceremony/transact/verification_key.json"
+            );
+        }
     }
 }

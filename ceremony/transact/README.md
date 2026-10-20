@@ -116,3 +116,20 @@ nothing in the error pointing at why. `Groth16ProofSystem` in
 `src/privacy/circuits.rs` is the single place this is chosen, and
 `paraloom-prover-wasm` includes that same file by path so the browser cannot
 drift from it.
+
+## On-chain `alt_bn128` wire-form convention (`programs/paraloom/src/transact_vk_data.rs`)
+
+The on-chain verifier (`programs/paraloom/src/transact_verifier.rs`) embeds the
+verifying key from `verification_key.json` in Solana's `alt_bn128` uncompressed
+big-endian wire format (`src/privacy/onchain_verifier.rs`):
+
+- **Base-field elements (`Fq`)**: 32-byte canonical big-endian unsigned integers
+  strictly less than `q = 21888242871839275222246405745257275088696311157297823662689037894645226208583`
+  with **no arkworks `SWFlags` sign or infinity bits** set in the most-significant
+  byte (`byte[0] & 0xc0 == 0`).
+- **G1 points (`VK_ALPHA_G1`, `VK_IC_0..=VK_IC_8`)**: 64 bytes
+  `x_be(32) || y_be(32)`, corresponding to `[x, y, "1"]` in `verification_key.json`.
+- **G2 points (`VK_BETA_G2`, `VK_GAMMA_G2`, `VK_DELTA_G2`)**: 128 bytes
+  `x_c1_be(32) || x_c0_be(32) || y_c1_be(32) || y_c0_be(32)`, where
+  `verification_key.json` lists each `Fq2` coordinate pair as `[c0, c1]`.
+
