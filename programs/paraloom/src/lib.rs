@@ -440,8 +440,9 @@ pub mod paraloom_program {
             // (paraloom-core#761).
             let vault_balance = ctx.accounts.bridge_vault.lamports();
             let rent_floor = Rent::get()?.minimum_balance(0);
+            let pending_fee_reserve = ctx.accounts.validator_account.pending_rewards;
             require!(
-                vault_balance >= payout.saturating_add(rent_floor),
+                vault_balance >= payout.saturating_add(rent_floor).saturating_add(pending_fee_reserve),
                 BridgeError::InsufficientFunds
             );
 
@@ -1016,6 +1017,12 @@ pub mod paraloom_program {
         );
 
         let reward_amount = validator_account.pending_rewards;
+        let vault_balance = ctx.accounts.bridge_vault.lamports();
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        require!(
+            vault_balance >= reward_amount.saturating_add(rent_floor),
+            BridgeError::InsufficientFunds
+        );
 
         let vault_bump = ctx.bumps.bridge_vault;
         let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
