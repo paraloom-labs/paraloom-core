@@ -150,6 +150,62 @@ fn public_amount_bytes(ext_amount: i64) -> [u8; 32] {
     out
 }
 
+/// Reject withdrawal payouts directed back into the source vault (`bridge_vault`
+/// for native SOL or `asset_vault` for SPL tokens). A vault self-transfer burns
+/// the input notes while leaving the payout balance stranded inside the vault
+/// with no backing note, inflating `total_withdrawn` / `pending_rewards` and
+/// permanently eroding live `deposit_cap` headroom.
+fn validate_withdrawal_destination(recipient: &Pubkey, vault: &Pubkey) -> Result<()> {
+    require!(recipient != vault, BridgeError::InvalidAmount);
+    Ok(())
+}
+
+/// Compute the remaining stake after a slash (`old_stake - slash_amount`),
+/// independent of whether the residual was moved from `stake_amount` into
+/// `unbonding_amount` on a deactivating slash or deducted directly from
+/// `unbonding_amount` on an inactive slash.
+fn compute_post_slash_stake(old_stake: u64, slash_amount: u64) -> u64 {
+    old_stake.saturating_sub(slash_amount)
+}
+
+/// Validate that a `ValidatorAccount` is eligible for `withdraw_unbonded_stake`
+/// and account closure at `current_slot`.
+fn validate_unbonded_withdrawal(
+    validator_account: &ValidatorAccount,
+    current_slot: u64,
+) -> Result<()> {
+    // Never close an active validator PDA or one that still holds active stake:
+    // closing without unregistering/deactivating would leave registry counters
+    // permanently overstated and forfeit active collateral.
+    require!(
+        !validator_account.is_active
+            && validator_account.stake_amount == 0
+            && validator_account.token_stake_amount == 0,
+        BridgeError::InvalidValidator
+    );
+
+    let amount = validator_account.unbonding_amount;
+    let token_amount = validator_account.token_unbonding_amount;
+    let zero_amount_exit_close = amount == 0
+        && token_amount == 0
+        && !validator_account.is_active
+        && validator_account.stake_amount == 0
+        && validator_account.unbonding_slot > 0;
+    require!(
+        amount > 0 || token_amount > 0 || zero_amount_exit_close,
+        BridgeError::NothingUnbonding
+    );
+    require!(
+        current_slot >= validator_account.unbonding_slot,
+        BridgeError::UnbondingNotElapsed
+    );
+    require!(
+        validator_account.pending_rewards == 0,
+        BridgeError::PendingRewardsUnclaimed
+    );
+    Ok(())
+}
+
 #[program]
 pub mod paraloom_program {
     use super::*;
@@ -408,12 +464,11 @@ pub mod paraloom_program {
         nf1.used_at = now;
         nf1.withdrawal_id = settlement_id;
 
-        // Append both output commitments to the on-chain tree. `root` (the
-        // pre-append root the proof was checked against) is untouched; the new
-        // notes extend the tree for future spends.
+        // Append both output commitments to the on-chain tree atomically so the
+        // intermediate half-settled root is never recorded in `root_history` and
+        // only one history slot is consumed per settlement.
         let mut tree = ctx.accounts.merkle_tree.load_mut()?;
-        tree.append(output_commitments[0])?;
-        let new_root = tree.append(output_commitments[1])?;
+        let new_root = tree.append_pair(output_commitments[0], output_commitments[1])?;
         drop(tree);
 
         // Move external funds. `ext_amount < 0` withdraws from the vault; the
@@ -424,6 +479,10 @@ pub mod paraloom_program {
 
         let mut fee = 0u64;
         if ext_amount < 0 {
+            validate_withdrawal_destination(
+                &ctx.accounts.recipient.key(),
+                &ctx.accounts.bridge_vault.key(),
+            )?;
             let gross = ext_amount.unsigned_abs();
             fee = gross
                 .checked_mul(WITHDRAWAL_FEE_BPS)
@@ -616,14 +675,17 @@ pub mod paraloom_program {
         nf1.withdrawal_id = settlement_id;
 
         let mut tree = ctx.accounts.merkle_tree.load_mut()?;
-        tree.append(output_commitments[0])?;
-        let new_root = tree.append(output_commitments[1])?;
+        let new_root = tree.append_pair(output_commitments[0], output_commitments[1])?;
         drop(tree);
 
         let validator_account = &mut ctx.accounts.validator_account;
 
         let mut fee = 0u64;
         if ext_amount < 0 {
+            validate_withdrawal_destination(
+                &ctx.accounts.recipient_token_account.key(),
+                &ctx.accounts.asset_vault.key(),
+            )?;
             let gross = ext_amount.unsigned_abs();
             fee = gross
                 .checked_mul(WITHDRAWAL_FEE_BPS)
@@ -1172,12 +1234,13 @@ pub mod paraloom_program {
             )?;
         }
 
+        let new_stake = compute_post_slash_stake(old_stake, slash_amount);
         emit!(ValidatorSlashedEvent {
             validator,
             slash_amount,
             slash_percentage,
             old_stake,
-            new_stake: validator_account.stake_amount,
+            new_stake,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
@@ -1672,29 +1735,8 @@ pub mod paraloom_program {
     /// the same delayed withdraw path is still allowed so the PDA can close.
     pub fn withdraw_unbonded_stake(ctx: Context<WithdrawUnbondedStake>) -> Result<()> {
         let validator_account = &mut ctx.accounts.validator_account;
+        validate_unbonded_withdrawal(validator_account, Clock::get()?.slot)?;
         let amount = validator_account.unbonding_amount;
-        let zero_amount_exit_close = amount == 0
-            && !validator_account.is_active
-            && validator_account.stake_amount == 0
-            && validator_account.unbonding_slot > 0;
-        require!(
-            amount > 0 || zero_amount_exit_close,
-            BridgeError::NothingUnbonding
-        );
-        require!(
-            Clock::get()?.slot >= validator_account.unbonding_slot,
-            BridgeError::UnbondingNotElapsed
-        );
-        // The account is `close`d at the end of this instruction (its rent goes
-        // to the validator), which drops `pending_rewards` along with it. Refuse
-        // to close while rewards are unclaimed so the exit flow cannot silently
-        // forfeit earned settlement fees (#434) — `claim_rewards` is callable
-        // even for an inactive validator, so the exit order is: unregister →
-        // claim_rewards → withdraw_unbonded_stake.
-        require!(
-            validator_account.pending_rewards == 0,
-            BridgeError::PendingRewardsUnclaimed
-        );
         // The staked lamports live in the PDA itself; `unbonding_amount` is
         // always the delta above the account's rent-exempt minimum, so this
         // debit cannot drop the PDA below rent exemption.
@@ -2916,4 +2958,114 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_validator() -> ValidatorAccount {
+        ValidatorAccount {
+            validator: Pubkey::new_unique(),
+            stake_amount: 0,
+            reputation_score: 1000,
+            total_tasks_verified: 0,
+            successful_verifications: 0,
+            registered_at: 0,
+            last_active: 0,
+            is_active: false,
+            pending_rewards: 0,
+            total_earnings: 0,
+            times_slashed: 0,
+            unbonding_amount: MIN_VALIDATOR_STAKE,
+            unbonding_slot: UNBONDING_SLOTS,
+            token_stake_amount: 0,
+            token_unbonding_amount: RECOMMENDED_MIN_TOKEN_STAKE,
+        }
+    }
+
+    #[test]
+    fn withdrawal_destination_rejects_vault_self_transfer() {
+        let vault = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        assert!(validate_withdrawal_destination(&recipient, &vault).is_ok());
+        assert_eq!(
+            validate_withdrawal_destination(&vault, &vault).unwrap_err(),
+            BridgeError::InvalidAmount.into()
+        );
+    }
+
+    #[test]
+    fn post_slash_stake_reports_remaining_stake_across_deactivating_and_unbonding_slashes() {
+        // Deactivating slash: 10% slash on MIN_VALIDATOR_STAKE leaves 90% in
+        // unbonding_amount even though validator_account.stake_amount is zeroed.
+        let slash_10 = MIN_VALIDATOR_STAKE / 10;
+        assert_eq!(
+            compute_post_slash_stake(MIN_VALIDATOR_STAKE, slash_10),
+            MIN_VALIDATOR_STAKE - slash_10
+        );
+        // 100% slash leaves 0.
+        assert_eq!(
+            compute_post_slash_stake(MIN_VALIDATOR_STAKE, MIN_VALIDATOR_STAKE),
+            0
+        );
+    }
+
+    #[test]
+    fn unbonded_withdrawal_rejects_active_validator_or_residual_active_stake() {
+        let mut active = sample_validator();
+        active.is_active = true;
+        assert_eq!(
+            validate_unbonded_withdrawal(&active, UNBONDING_SLOTS).unwrap_err(),
+            BridgeError::InvalidValidator.into()
+        );
+
+        let mut residual_sol = sample_validator();
+        residual_sol.stake_amount = 1;
+        assert_eq!(
+            validate_unbonded_withdrawal(&residual_sol, UNBONDING_SLOTS).unwrap_err(),
+            BridgeError::InvalidValidator.into()
+        );
+
+        let mut residual_token = sample_validator();
+        residual_token.token_stake_amount = 1;
+        assert_eq!(
+            validate_unbonded_withdrawal(&residual_token, UNBONDING_SLOTS).unwrap_err(),
+            BridgeError::InvalidValidator.into()
+        );
+    }
+
+    #[test]
+    fn unbonded_withdrawal_allows_token_only_and_zero_amount_exit_after_delay() {
+        // Token-only unbonding (SOL unbonding_amount == 0) is accepted once elapsed.
+        let mut token_only = sample_validator();
+        token_only.unbonding_amount = 0;
+        token_only.token_unbonding_amount = RECOMMENDED_MIN_TOKEN_STAKE;
+        assert!(validate_unbonded_withdrawal(&token_only, UNBONDING_SLOTS).is_ok());
+
+        // 100%-slashed rent-only exit close (both unbonding balances 0, unbonding_slot > 0).
+        let mut rent_only = sample_validator();
+        rent_only.unbonding_amount = 0;
+        rent_only.token_unbonding_amount = 0;
+        assert_eq!(
+            validate_unbonded_withdrawal(&rent_only, UNBONDING_SLOTS - 1).unwrap_err(),
+            BridgeError::UnbondingNotElapsed.into()
+        );
+        assert!(validate_unbonded_withdrawal(&rent_only, UNBONDING_SLOTS).is_ok());
+
+        // Legacy ghost with unbonding_slot == 0 and 0 unbonding balances is rejected.
+        rent_only.unbonding_slot = 0;
+        assert_eq!(
+            validate_unbonded_withdrawal(&rent_only, UNBONDING_SLOTS).unwrap_err(),
+            BridgeError::NothingUnbonding.into()
+        );
+
+        // Unclaimed pending rewards block account closure.
+        let mut unclaimed = sample_validator();
+        unclaimed.pending_rewards = 500;
+        assert_eq!(
+            validate_unbonded_withdrawal(&unclaimed, UNBONDING_SLOTS).unwrap_err(),
+            BridgeError::PendingRewardsUnclaimed.into()
+        );
+    }
 }

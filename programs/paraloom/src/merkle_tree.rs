@@ -182,9 +182,9 @@ impl IncrementalMerkleTree {
         Ok(())
     }
 
-    /// Append one leaf, recomputing the root and recording it in the history
-    /// ring buffer. Returns the new root.
-    pub fn append(&mut self, leaf: [u8; 32]) -> Result<[u8; 32]> {
+    /// Advance the tree by one leaf and update `self.root` and `self.next_index`
+    /// without recording an entry in `self.root_history`.
+    fn insert_leaf(&mut self, leaf: [u8; 32]) -> Result<[u8; 32]> {
         require!(
             (self.next_index as u128) < (1u128 << TREE_DEPTH),
             BridgeError::InvalidProof
@@ -210,8 +210,39 @@ impl IncrementalMerkleTree {
             .next_index
             .checked_add(1)
             .ok_or(error!(BridgeError::InvalidProof))?;
+        Ok(current_hash)
+    }
+
+    /// Record a committed post-instruction root in the ring buffer.
+    fn record_root(&mut self, current_hash: [u8; 32]) {
         self.root_index = (self.root_index + 1) % (ROOT_HISTORY_SIZE as u64);
         self.root_history[self.root_index as usize] = current_hash;
+    }
+
+    /// Append one leaf, recomputing the root and recording it in the history
+    /// ring buffer. Returns the new root.
+    pub fn append(&mut self, leaf: [u8; 32]) -> Result<[u8; 32]> {
+        let current_hash = self.insert_leaf(leaf)?;
+        self.record_root(current_hash);
+        Ok(current_hash)
+    }
+
+    /// Atomically append a pair of output commitments (`leaf0`, `leaf1`) and
+    /// record only the committed post-pair root in `root_history`.
+    ///
+    /// `transact` and `transact_spl` always settle two output notes together.
+    /// Recording only the committed post-settlement root prevents the transient
+    /// half-settled intermediate root (after `leaf0` alone) from entering
+    /// `root_history` and preserves the full `ROOT_HISTORY_SIZE` settlement
+    /// window instead of consuming two history slots per settlement.
+    pub fn append_pair(&mut self, leaf0: [u8; 32], leaf1: [u8; 32]) -> Result<[u8; 32]> {
+        require!(
+            (self.next_index as u128).saturating_add(1) < (1u128 << TREE_DEPTH),
+            BridgeError::InvalidProof
+        );
+        self.insert_leaf(leaf0)?;
+        let current_hash = self.insert_leaf(leaf1)?;
+        self.record_root(current_hash);
         Ok(current_hash)
     }
 
@@ -221,7 +252,7 @@ impl IncrementalMerkleTree {
         if root == [0u8; 32] {
             return false;
         }
-        let start = self.root_index as usize;
+        let start = (self.root_index as usize) % ROOT_HISTORY_SIZE;
         let mut i = start;
         loop {
             if self.root_history[i] == root {
@@ -462,5 +493,70 @@ mod tests {
             t.append(leaf).is_err(),
             "append past 2^TREE_DEPTH must be rejected"
         );
+    }
+
+    #[test]
+    fn append_pair_records_only_committed_root_and_preserves_full_history_window() {
+        let mut t = empty();
+        let initial_root = t.root;
+        let leaves = pseudo_leaves(ROOT_HISTORY_SIZE * 2, 12345);
+
+        let mut committed_roots = Vec::with_capacity(ROOT_HISTORY_SIZE);
+        let mut intermediate_roots = Vec::with_capacity(ROOT_HISTORY_SIZE);
+        let mut shadow = empty();
+
+        for pair in leaves.chunks_exact(2) {
+            let mid = shadow.append(pair[0]).unwrap();
+            let end = shadow.append(pair[1]).unwrap();
+            let root = t.append_pair(pair[0], pair[1]).unwrap();
+            assert_eq!(root, end, "append_pair must reach the exact two-leaf root");
+            intermediate_roots.push(mid);
+            committed_roots.push(root);
+        }
+
+        // Neither any phantom half-settlement intermediate root nor the evicted
+        // initial root is accepted by `is_known_root`.
+        assert!(!t.is_known_root(initial_root));
+        for mid in &intermediate_roots {
+            assert!(
+                !t.is_known_root(*mid),
+                "phantom half-settlement intermediate root must never be known"
+            );
+        }
+
+        // All `ROOT_HISTORY_SIZE` (64) committed settlement roots remain known,
+        // rather than only 32 when each settlement consumed two history slots.
+        for r in &committed_roots {
+            assert!(
+                t.is_known_root(*r),
+                "all ROOT_HISTORY_SIZE committed settlement roots must remain in history"
+            );
+        }
+    }
+
+    #[test]
+    fn append_pair_rejects_atomically_when_fewer_than_two_slots_remain() {
+        let mut t = empty();
+        let before_root = t.root;
+        let before_subtrees = t.filled_subtrees;
+        // Only 1 leaf slot remaining before 2^TREE_DEPTH.
+        t.next_index = (1u64 << TREE_DEPTH) - 1;
+        let leaves = pseudo_leaves(2, 77);
+        assert!(
+            t.append_pair(leaves[0], leaves[1]).is_err(),
+            "append_pair must fail when only one leaf slot remains"
+        );
+        assert_eq!(t.next_index, (1u64 << TREE_DEPTH) - 1);
+        assert_eq!(t.root, before_root);
+        assert_eq!(t.filled_subtrees, before_subtrees);
+    }
+
+    #[test]
+    fn is_known_root_handles_out_of_bounds_root_index_without_panicking() {
+        let mut t = empty();
+        let expected = t.root;
+        t.root_index = (ROOT_HISTORY_SIZE as u64) + 5;
+        assert!(t.is_known_root(expected));
+        assert!(!t.is_known_root([0xAA; 32]));
     }
 }
