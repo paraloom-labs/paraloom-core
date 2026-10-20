@@ -121,13 +121,17 @@ impl PeerRegistry {
 
     /// Mark a peer as actively connected. If the peer was in
     /// backoff, the failure counter resets so a future disconnect
-    /// starts the backoff sequence from the beginning.
+    /// starts the backoff sequence from the beginning. A permanently
+    /// `Forgotten` peer remains `Forgotten`.
     pub fn mark_connected(&mut self, node_id: NodeId) {
         let now = (self.clock)();
         let entry = self.peers.entry(node_id).or_insert(PeerEntry {
             state: PeerState::Connected { last_seen: now },
             slow_responses: 0,
         });
+        if matches!(entry.state, PeerState::Forgotten) {
+            return;
+        }
         entry.state = PeerState::Connected { last_seen: now };
         entry.slow_responses = 0;
     }
@@ -148,6 +152,9 @@ impl PeerRegistry {
     /// per-peer summary; the connection state is not changed.
     pub fn record_response(&mut self, node_id: &NodeId, latency: Duration) {
         if let Some(entry) = self.peers.get_mut(node_id) {
+            if matches!(entry.state, PeerState::Forgotten) {
+                return;
+            }
             if let PeerState::Connected { ref mut last_seen } = entry.state {
                 *last_seen = (self.clock)();
             }
@@ -165,7 +172,9 @@ impl PeerRegistry {
     }
 
     /// Mark a peer as disconnected and schedule the next reconnect
-    /// attempt according to [`RECONNECT_BACKOFF`].
+    /// attempt according to [`RECONNECT_BACKOFF`]. A permanently
+    /// `Forgotten` peer remains `Forgotten` and is never scheduled
+    /// for reconnect.
     pub fn mark_disconnected(&mut self, node_id: NodeId) {
         let now = (self.clock)();
         let entry = self.peers.entry(node_id.clone()).or_insert(PeerEntry {
@@ -176,11 +185,12 @@ impl PeerRegistry {
             slow_responses: 0,
         });
         let next_failure_count = match &entry.state {
+            PeerState::Forgotten => return,
             PeerState::Backoff {
                 consecutive_failures,
                 ..
             } => consecutive_failures.saturating_add(1),
-            _ => 1,
+            PeerState::Connected { .. } => 1,
         };
         let backoff_idx = next_failure_count.min(RECONNECT_BACKOFF.len()) - 1;
         let retry_at = now + RECONNECT_BACKOFF[backoff_idx];
@@ -205,6 +215,7 @@ impl PeerRegistry {
             slow_responses: 0,
         });
         entry.state = PeerState::Forgotten;
+        entry.slow_responses = 0;
     }
 
     /// IDs of every peer in `Backoff` whose `retry_at` has elapsed.
@@ -443,6 +454,36 @@ mod tests {
         advance(&clock, Duration::from_secs(60 * 60));
         assert!(registry.peers_due_for_reconnect().is_empty());
         assert_eq!(registry.counts().forgotten, 1);
+    }
+
+    /// Late connection/disconnection events for a forgotten peer must not
+    /// resurrect it into `Connected` or `Backoff` state.
+    #[test]
+    fn forgotten_peer_stays_forgotten_across_disconnect_and_connect() {
+        let (mut registry, clock) = registry_with_fake_clock();
+        let peer = node(10);
+        registry.mark_connected(peer.clone());
+        registry.record_response(&peer, Duration::from_secs(5));
+        registry.forget(peer.clone());
+        assert_eq!(registry.summaries()[0].slow_responses, 0);
+
+        // Subsequent swarm disconnect/connect events must not overwrite Forgotten.
+        registry.mark_disconnected(peer.clone());
+        registry.mark_connected(peer.clone());
+        registry.record_response(&peer, Duration::from_secs(5));
+
+        advance(&clock, Duration::from_secs(60 * 60));
+        assert!(registry.peers_due_for_reconnect().is_empty());
+        assert_eq!(
+            registry.counts(),
+            PeerCounts {
+                connected: 0,
+                backoff: 0,
+                forgotten: 1,
+            }
+        );
+        assert_eq!(registry.summaries()[0].state, PeerState::Forgotten);
+        assert_eq!(registry.summaries()[0].slow_responses, 0);
     }
 
     /// A custom slow-response threshold is honoured.
