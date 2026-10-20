@@ -396,6 +396,14 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     );
                     return Ok(());
                 }
+                if let Err(e) = request.validate_token_program() {
+                    log::warn!(
+                        "Dropping transact request {} with invalid token_program: {}",
+                        request.request_id,
+                        e
+                    );
+                    return Ok(());
+                }
 
                 // Authenticate the requester before any expensive work (#726).
                 // Groth16 verification is the most expensive handler in the node;
@@ -990,7 +998,9 @@ async fn cosign_settlement(
         ) => {
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient
+                req.mint.is_none()
+                    && req.token_program.is_none()
+                    && req.recipient == *recipient
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -1017,13 +1027,15 @@ async fn cosign_settlement(
         }
         // SPL settlement (#779): the same binding check, but the payload's
         // recipient is the recipient token account and the asset is bound by
-        // `mint`, so a co-signer only signs an SPL spend it verified Valid for
-        // exactly this mint.
+        // `mint` and `token_program`, so a co-signer only signs an SPL spend it
+        // verified Valid for exactly this mint and token program (SPL Token vs
+        // Token-2022).
         (
             SettlementKind::Transact,
             SettlementParams::TransactSpl {
                 recipient_token_account,
                 mint,
+                token_program,
                 nullifiers,
                 output_commitments,
                 root,
@@ -1032,14 +1044,17 @@ async fn cosign_settlement(
             },
         ) => {
             let cache = verified_transacts.lock().await;
-            let approved = cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient_token_account
-                    && req.mint == Some(*mint)
-                    && req.nullifiers == *nullifiers
-                    && req.output_commitments == *output_commitments
-                    && req.root == *root
-                    && req.ext_amount == *ext_amount
-            });
+            let approved =
+                crate::consensus::transact::is_supported_spl_token_program(token_program)
+                    && cache.get(&request.request_id).is_some_and(|req| {
+                        req.recipient == *recipient_token_account
+                            && req.mint == Some(*mint)
+                            && req.resolved_token_program() == Some(*token_program)
+                            && req.nullifiers == *nullifiers
+                            && req.output_commitments == *output_commitments
+                            && req.root == *root
+                            && req.ext_amount == *ext_amount
+                    });
             let auth = hex::encode(payload.authority);
             let cap_nullifiers = [
                 format!("{}:{auth}", hex::encode(nullifiers[0])),
@@ -2453,11 +2468,16 @@ impl Node {
             }
         };
         // SPL settlement (#779) takes the transact_spl path; `recipient` is the
-        // recipient token account and the vault is the mint's asset vault.
+        // recipient token account, the vault is the mint's asset vault, and
+        // `token_program` is the SPL token program that owns `mint` (classic SPL
+        // Token or Token-2022).
         let params = match request.mint {
             Some(mint) => SettlementParams::TransactSpl {
                 recipient_token_account: request.recipient,
                 mint,
+                token_program: request
+                    .resolved_token_program()
+                    .unwrap_or(crate::consensus::transact::SPL_TOKEN_PROGRAM_ID_BYTES),
                 nullifiers: request.nullifiers,
                 output_commitments: request.output_commitments,
                 root: request.root,
@@ -2693,6 +2713,8 @@ impl Node {
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
     ) -> Result<bool> {
+        request.validate_token_program()?;
+
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
@@ -2907,6 +2929,7 @@ mod tests {
             request_id: id.to_string(),
             recipient,
             mint: None,
+            token_program: None,
             nullifiers,
             output_commitments,
             root,
@@ -3633,5 +3656,102 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_signs_token_2022_transact_spl_and_declines_substituted_token_program() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient_ta = [9u8; 32];
+        let mint = [0x42u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -500_000i64;
+
+        let mut verified_req =
+            ta_request("t22", recipient_ta, nullifiers, outputs, root, ext_amount);
+        verified_req.mint = Some(mint);
+        verified_req.token_program =
+            Some(crate::consensus::transact::SPL_TOKEN_2022_PROGRAM_ID_BYTES);
+        tas.lock().await.insert("t22".to_string(), verified_req);
+
+        // Leader builds a payload with classic SPL_TOKEN_PROGRAM_ID for a verified Token-2022 spend → declined.
+        let wrong_tp_payload = CoSignPayload {
+            program_id: [1u8; 32],
+            authority: kp.pubkey().to_bytes(),
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![kp.pubkey().to_bytes()],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: recipient_ta,
+                mint,
+                token_program: crate::consensus::transact::SPL_TOKEN_PROGRAM_ID_BYTES,
+                nullifiers,
+                output_commitments: outputs,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+        let declined_tp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t22", SettlementKind::Transact, &wrong_tp_payload),
+        )
+        .await;
+        assert_eq!(
+            declined_tp.signature, None,
+            "co-signer must decline when payload substitutes classic SPL for a verified Token-2022 spend"
+        );
+
+        // Leader tries to settle an SPL spend via native SettlementParams::Transact → declined.
+        let native_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient_ta,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let declined_native = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t22", SettlementKind::Transact, &native_payload),
+        )
+        .await;
+        assert_eq!(
+            declined_native.signature, None,
+            "co-signer must decline when payload substitutes native Transact for a verified SPL spend"
+        );
+
+        // Matching Token-2022 payload is signed and verifies against the rebuilt Token-2022 message.
+        let mut valid_t22_payload = wrong_tp_payload;
+        if let SettlementParams::TransactSpl {
+            ref mut token_program,
+            ..
+        } = valid_t22_payload.params
+        {
+            *token_program = crate::consensus::transact::SPL_TOKEN_2022_PROGRAM_ID_BYTES;
+        }
+        let signed = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t22", SettlementKind::Transact, &valid_t22_payload),
+        )
+        .await;
+        let sig_bytes = signed
+            .signature
+            .expect("must sign a verified Token-2022 TransactSpl settlement");
+        let message = build_settlement_message(&valid_t22_payload).expect("build message");
+        let sig = solana_sdk::signature::Signature::try_from(sig_bytes.as_slice()).expect("sig");
+        assert!(sig.verify(&kp.pubkey().to_bytes(), &message.serialize()));
     }
 }

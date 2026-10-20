@@ -112,6 +112,12 @@ struct SubmitRequest {
     /// and `recipient` is the recipient token account.
     #[serde(default)]
     mint: Option<String>,
+    /// Optional SPL token program owning `mint` (32-byte hex: either classic
+    /// SPL Token or Token-2022). Defaults to classic SPL Token when `mint` is
+    /// present and `token_program` is omitted; rejected if set when `mint` is
+    /// omitted.
+    #[serde(default)]
+    token_program: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +180,11 @@ async fn submit_handler(
         .as_ref()
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
+    let token_program = req
+        .token_program
+        .as_ref()
+        .map(|tp| parse_hex32("token_program", tp))
+        .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
@@ -222,6 +233,7 @@ async fn submit_handler(
         request_id: String::new(),
         recipient,
         mint,
+        token_program,
         nullifiers,
         output_commitments,
         root,
@@ -230,6 +242,9 @@ async fn submit_handler(
         ciphertexts,
         timestamp,
     };
+    request
+        .validate_token_program()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     request.request_id = request.canonical_id();
 
     let id = node
@@ -556,6 +571,57 @@ mod tests {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_2022_mint_and_token_program_are_accepted_and_forwarded() {
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let mint_hex = "77".repeat(32);
+        let tp_hex = hex::encode(crate::consensus::transact::SPL_TOKEN_2022_PROGRAM_ID_BYTES);
+        let body = well_formed_body().replacen(
+            r#""ext_amount":0,"#,
+            &format!(r#""mint":"{mint_hex}","token_program":"{tp_hex}","ext_amount":0,"#),
+            1,
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = stub.seen.lock().await.clone().expect("request forwarded");
+        assert_eq!(seen.mint, Some([0x77u8; 32]));
+        assert_eq!(
+            seen.token_program,
+            Some(crate::consensus::transact::SPL_TOKEN_2022_PROGRAM_ID_BYTES)
+        );
+        assert_eq!(seen.request_id, seen.canonical_id());
+    }
+
+    #[tokio::test]
+    async fn invalid_token_program_or_token_program_without_mint_is_400() {
+        let tp_hex = hex::encode(crate::consensus::transact::SPL_TOKEN_2022_PROGRAM_ID_BYTES);
+        // token_program without mint → 400
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body_no_mint = well_formed_body().replacen(
+            r#""ext_amount":0,"#,
+            &format!(r#""token_program":"{tp_hex}","ext_amount":0,"#),
+            1,
+        );
+        let resp = app.oneshot(post_json(&body_no_mint)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // unsupported token_program with mint → 400
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let mint_hex = "77".repeat(32);
+        let bad_tp_hex = "99".repeat(32);
+        let body_bad_tp = well_formed_body().replacen(
+            r#""ext_amount":0,"#,
+            &format!(r#""mint":"{mint_hex}","token_program":"{bad_tp_hex}","ext_amount":0,"#),
+            1,
+        );
+        let resp = app.oneshot(post_json(&body_bad_tp)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

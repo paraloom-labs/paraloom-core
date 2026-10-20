@@ -32,6 +32,32 @@ pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
 /// Default reputation floor for consensus participation. A validator below this
 /// may still submit a vote, but the result is computed as if it had not.
 pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
+
+/// Raw bytes of the classic SPL Token program id
+/// (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`). Mirrors
+/// `crate::bridge::solana::instructions::SPL_TOKEN_PROGRAM_ID` without pulling
+/// `solana_sdk` into `consensus`, so this module still compiles under
+/// `--no-default-features`.
+pub const SPL_TOKEN_PROGRAM_ID_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+];
+
+/// Raw bytes of the SPL Token-2022 program id
+/// (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). Mirrors
+/// `crate::bridge::solana::instructions::SPL_TOKEN_2022_PROGRAM_ID`.
+pub const SPL_TOKEN_2022_PROGRAM_ID_BYTES: [u8; 32] = [
+    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218, 182, 26, 252, 77,
+    131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252,
+];
+
+/// Whether `program_id` is one of the SPL token programs accepted by the
+/// on-chain `Interface<'info, TokenInterface>` (`SPL_TOKEN_PROGRAM_ID` or
+/// `SPL_TOKEN_2022_PROGRAM_ID`).
+pub fn is_supported_spl_token_program(program_id: &[u8; 32]) -> bool {
+    *program_id == SPL_TOKEN_PROGRAM_ID_BYTES || *program_id == SPL_TOKEN_2022_PROGRAM_ID_BYTES
+}
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -61,6 +87,14 @@ pub struct TransactVerificationRequest {
     /// vault. Defaulted so older native requests (no field) decode as `None`.
     #[serde(default)]
     pub mint: Option<[u8; 32]>,
+
+    /// The SPL token program (`SPL_TOKEN_PROGRAM_ID` or
+    /// `SPL_TOKEN_2022_PROGRAM_ID`) that owns `mint` when `mint` is `Some`.
+    /// `None` defaults to classic SPL Token (`SPL_TOKEN_PROGRAM_ID_BYTES`) for
+    /// backwards compatibility when `mint` is `Some`, and must be `None` when
+    /// `mint` is `None`.
+    #[serde(default)]
+    pub token_program: Option<[u8; 32]>,
 
     /// Input note nullifiers (one may be a random dummy for a 1-real-input spend)
     pub nullifiers: [[u8; 32]; 2],
@@ -99,6 +133,35 @@ pub struct TransactVerificationRequest {
 }
 
 impl TransactVerificationRequest {
+    /// Resolve the effective SPL token program for this request: `None` for a
+    /// native-SOL settlement (`mint` is `None`), or the configured token
+    /// program (defaulting to [`SPL_TOKEN_PROGRAM_ID_BYTES`]) when `mint` is
+    /// `Some`.
+    pub fn resolved_token_program(&self) -> Option<[u8; 32]> {
+        self.mint
+            .map(|_| self.token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID_BYTES))
+    }
+
+    /// Validate that `token_program` is consistent with `mint` and names a
+    /// supported SPL token program (`SPL_TOKEN_PROGRAM_ID` or
+    /// `SPL_TOKEN_2022_PROGRAM_ID`).
+    pub fn validate_token_program(&self) -> Result<()> {
+        if self.mint.is_none() && self.token_program.is_some() {
+            return Err(anyhow!(
+                "token_program must not be set when mint is None (native SOL settlement)"
+            ));
+        }
+        if let Some(tp) = self.token_program {
+            if !is_supported_spl_token_program(&tp) {
+                return Err(anyhow!(
+                    "unsupported token_program {}: must be SPL Token or Token-2022",
+                    hex::encode(tp)
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Canonical, content-bound request id: a domain-separated SHA-256 over the
     /// proof/settlement-defining fields (#383). Keying consensus state by this,
     /// rather than by a caller-chosen string, means a peer cannot pick an id to
@@ -127,6 +190,19 @@ impl TransactVerificationRequest {
         if let Some(mint) = self.mint {
             h.update(b"spl");
             h.update(mint);
+            // Bind a non-default token program (e.g. Token-2022) so two SPL
+            // requests differing only in token_program never collide on the
+            // same canonical request id, while keeping classic SPL (`None` or
+            // `Some(SPL_TOKEN_PROGRAM_ID_BYTES)`) byte-identical.
+            if let Some(tp) = self.token_program {
+                if tp != SPL_TOKEN_PROGRAM_ID_BYTES {
+                    h.update(b"token_program");
+                    h.update(tp);
+                }
+            }
+        } else if let Some(tp) = self.token_program {
+            h.update(b"invalid_native_token_program");
+            h.update(tp);
         }
         format!("transact-{}", hex::encode(h.finalize()))
     }
@@ -787,6 +863,8 @@ impl TransactVerificationCoordinator {
     /// Start verification for a transact request. Errors if there are not
     /// enough registered validators to reach the configured quorum.
     pub async fn start_verification(&self, request: TransactVerificationRequest) -> Result<String> {
+        request.validate_token_program()?;
+
         // The pending map (and every vote's counting id) is keyed by the
         // content-bound canonical id; refuse a request whose id is not its own
         // canonical id so a mis-keyed round can never collect uncountable votes.
@@ -1026,6 +1104,7 @@ mod tests {
             request_id: "attacker-chosen".to_string(),
             recipient: [1u8; 32],
             mint: None,
+            token_program: None,
             nullifiers: [[2u8; 32], [3u8; 32]],
             output_commitments: [[4u8; 32], [5u8; 32]],
             root: [6u8; 32],
@@ -1571,5 +1650,74 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[test]
+    fn canonical_id_binds_token_2022_program_and_preserves_classic_spl() {
+        let mint = [0x42u8; 32];
+        let spl_default = TransactVerificationRequest {
+            mint: Some(mint),
+            token_program: None,
+            ..sample_request()
+        };
+        let spl_explicit = TransactVerificationRequest {
+            mint: Some(mint),
+            token_program: Some(SPL_TOKEN_PROGRAM_ID_BYTES),
+            ..sample_request()
+        };
+        let token_2022 = TransactVerificationRequest {
+            mint: Some(mint),
+            token_program: Some(SPL_TOKEN_2022_PROGRAM_ID_BYTES),
+            ..sample_request()
+        };
+
+        assert_eq!(
+            spl_default.canonical_id(),
+            spl_explicit.canonical_id(),
+            "classic SPL canonical_id must stay identical whether token_program is omitted or explicit"
+        );
+        assert_ne!(
+            spl_default.canonical_id(),
+            token_2022.canonical_id(),
+            "Token-2022 SPL request must have a distinct canonical_id from classic SPL"
+        );
+        assert_eq!(
+            spl_default.resolved_token_program(),
+            Some(SPL_TOKEN_PROGRAM_ID_BYTES)
+        );
+        assert_eq!(
+            token_2022.resolved_token_program(),
+            Some(SPL_TOKEN_2022_PROGRAM_ID_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn start_verification_rejects_invalid_token_program_combinations() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(1, 1);
+        coordinator.register_validator(NodeId(vec![1])).await;
+
+        // Native SOL request (`mint: None`) with `token_program: Some(...)` must be rejected.
+        let mut native_with_tp = sample_request();
+        native_with_tp.token_program = Some(SPL_TOKEN_2022_PROGRAM_ID_BYTES);
+        native_with_tp.request_id = native_with_tp.canonical_id();
+        assert!(coordinator
+            .start_verification(native_with_tp)
+            .await
+            .is_err());
+
+        // SPL request (`mint: Some(...)`) with an arbitrary non-token program id must be rejected.
+        let mut bad_tp = sample_request();
+        bad_tp.mint = Some([0x42u8; 32]);
+        bad_tp.token_program = Some([0x99u8; 32]);
+        bad_tp.request_id = bad_tp.canonical_id();
+        assert!(coordinator.start_verification(bad_tp).await.is_err());
+
+        // Token-2022 SPL request is accepted.
+        let mut ok_2022 = sample_request();
+        ok_2022.mint = Some([0x42u8; 32]);
+        ok_2022.token_program = Some(SPL_TOKEN_2022_PROGRAM_ID_BYTES);
+        ok_2022.request_id = ok_2022.canonical_id();
+        assert!(coordinator.start_verification(ok_2022).await.is_ok());
     }
 }
