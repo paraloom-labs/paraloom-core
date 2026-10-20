@@ -194,10 +194,12 @@ impl IncrementalMerkleTree {
         let mut current_hash = leaf;
         for i in 0..TREE_DEPTH {
             if current_index % 2 == 0 {
-                // Even index: current node is a left child; record it and pair
-                // with the empty-subtree hash on the right.
+                // Even index: current node is a left child; pair with the
+                // empty-subtree hash on the right first so a rejected non-canonical
+                // `leaf` at level 0 fails before mutating `filled_subtrees`.
+                let next_hash = poseidon2(&current_hash, &ZERO_HASHES[i])?;
                 self.filled_subtrees[i] = current_hash;
-                current_hash = poseidon2(&current_hash, &ZERO_HASHES[i])?;
+                current_hash = next_hash;
             } else {
                 // Odd index: pair against the stored left sibling.
                 current_hash = poseidon2(&self.filled_subtrees[i], &current_hash)?;
@@ -221,7 +223,7 @@ impl IncrementalMerkleTree {
         if root == [0u8; 32] {
             return false;
         }
-        let start = self.root_index as usize;
+        let start = (self.root_index as usize) % ROOT_HISTORY_SIZE;
         let mut i = start;
         loop {
             if self.root_history[i] == root {
@@ -462,5 +464,25 @@ mod tests {
             t.append(leaf).is_err(),
             "append past 2^TREE_DEPTH must be rejected"
         );
+    }
+
+    #[test]
+    fn append_non_canonical_leaf_does_not_corrupt_filled_subtrees() {
+        let mut t = empty();
+        let before_subtrees = t.filled_subtrees;
+        let before_root = t.root;
+        // [0xff; 32] exceeds the BN254 scalar modulus and is rejected by poseidon2.
+        let non_canonical = [0xffu8; 32];
+        assert!(t.append(non_canonical).is_err());
+        assert_eq!(t.filled_subtrees, before_subtrees);
+        assert_eq!(t.root, before_root);
+        assert_eq!(t.next_index, 0);
+
+        // Subsequent valid appends must still match a clean tree.
+        let leaves = pseudo_leaves(4, 123);
+        for leaf in &leaves {
+            t.append(*leaf).unwrap();
+        }
+        assert_eq!(t.root, recompute_root(&leaves));
     }
 }
