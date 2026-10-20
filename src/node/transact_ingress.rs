@@ -167,6 +167,12 @@ async fn submit_handler(
             "ext_amount must be <= 0 (deposits go through deposit_note)".to_string(),
         ));
     }
+    if req.ext_amount == i64::MIN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ext_amount must not be i64::MIN".to_string(),
+        ));
+    }
 
     let recipient = parse_hex32("recipient", &req.recipient)?;
     let mint = req
@@ -175,7 +181,19 @@ async fn submit_handler(
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers must be distinct".to_string(),
+        ));
+    }
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
+    if output_commitments[0] == output_commitments[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "output_commitments must be distinct".to_string(),
+        ));
+    }
     let root = parse_hex32("root", &req.root)?;
 
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
@@ -556,6 +574,26 @@ mod tests {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn min_i64_ext_amount_and_duplicate_nullifiers_or_outputs_are_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let resp = app
+            .oneshot(post_json(&body_with_ext_amount(i64::MIN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let dup_nf = well_formed_body().replace(&"22".repeat(32), &"11".repeat(32));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let resp = app.oneshot(post_json(&dup_nf)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let dup_out = well_formed_body().replace(&"44".repeat(32), &"33".repeat(32));
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let resp = app.oneshot(post_json(&dup_out)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
