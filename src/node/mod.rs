@@ -2543,6 +2543,38 @@ impl Node {
             // double-spend gate (#624).
             if let Some(pool) = &self.shielded_pool {
                 pool.record_spent(approved.request.nullifiers).await;
+
+                // Record newly minted output commitments into the off-chain
+                // commitment tree so clients can fetch witness paths (#1136).
+                let output_commitments: Vec<crate::privacy::types::Commitment> = approved
+                    .request
+                    .output_commitments
+                    .iter()
+                    .map(|c| crate::privacy::types::Commitment::from_bytes(*c))
+                    .collect();
+
+                let already_recorded = if let Some(first) = output_commitments.first() {
+                    pool.has_commitment(first).await
+                } else {
+                    false
+                };
+
+                if let Err(e) = pool.record_outputs(&output_commitments).await {
+                    log::warn!("failed to record output commitments off-chain: {e}");
+                }
+
+                // Debit external withdrawal amount from the shielded supply (#1136).
+                if !already_recorded && approved.request.ext_amount < 0 {
+                    let asset_id = approved
+                        .request
+                        .mint
+                        .map(|m| crate::privacy::poseidon_circom::mint_to_asset(&m))
+                        .unwrap_or(crate::privacy::types::NATIVE_SOL_ASSET);
+                    let withdrawal_amount = approved.request.ext_amount.unsigned_abs();
+                    if let Err(e) = pool.debit_supply(withdrawal_amount, asset_id).await {
+                        log::warn!("failed to debit shielded supply for withdrawal off-chain: {e}");
+                    }
+                }
             }
         }
 
@@ -3633,5 +3665,81 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // A settled unified transact records output commitments into the commitment
+    // tree and debits external withdrawals from the shielded supply (#1136).
+    #[tokio::test]
+    async fn settle_transact_updates_pool_commitments_and_supply() {
+        use crate::privacy::types::{Commitment, Note, ShieldedAddress, NATIVE_SOL_ASSET};
+
+        let pool = Arc::new(ShieldedPool::new());
+        let addr = ShieldedAddress([1u8; 32]);
+        pool.deposit(Note::new_native(addr, 2_000_000_000, [1u8; 32]), 2_000_000_000)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.total_supply().await, 2_000_000_000);
+        assert_eq!(pool.commitment_count().await, 1);
+
+        let c0 = [10u8; 32];
+        let c1 = [20u8; 32];
+        let n0 = [30u8; 32];
+        let n1 = [40u8; 32];
+        let approved = ApprovedTransact {
+            request: TransactVerificationRequest {
+                request_id: "test-settle".to_string(),
+                recipient: [9u8; 32],
+                mint: None,
+                nullifiers: [n0, n1],
+                output_commitments: [c0, c1],
+                root: [2u8; 32],
+                ext_amount: -1_000_000_000,
+                proof: vec![0u8; 256],
+                ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
+                timestamp: 0,
+            },
+        };
+
+        // Execute post-settlement bookkeeping as in settle_transact_via_cosign
+        pool.record_spent(approved.request.nullifiers).await;
+
+        let output_commitments: Vec<Commitment> = approved
+            .request
+            .output_commitments
+            .iter()
+            .map(|c| Commitment::from_bytes(*c))
+            .collect();
+        let already_recorded = if let Some(first) = output_commitments.first() {
+            pool.has_commitment(first).await
+        } else {
+            false
+        };
+        assert!(!already_recorded);
+
+        pool.record_outputs(&output_commitments).await.unwrap();
+
+        if !already_recorded && approved.request.ext_amount < 0 {
+            let asset_id = approved
+                .request
+                .mint
+                .map(|m| crate::privacy::poseidon_circom::mint_to_asset(&m))
+                .unwrap_or(NATIVE_SOL_ASSET);
+            let withdrawal_amount = approved.request.ext_amount.unsigned_abs();
+            pool.debit_supply(withdrawal_amount, asset_id).await.unwrap();
+        }
+
+        // Output commitments exist in the tree and can be authenticated
+        assert_eq!(pool.commitment_count().await, 3);
+        let path0 = pool.path(&Commitment::from_bytes(c0)).await.unwrap();
+        let root = pool.root().await;
+        assert!(path0.verify(&c0, &root));
+
+        // Supply was decremented by 1 SOL
+        assert_eq!(pool.total_supply().await, 1_000_000_000);
+        assert_eq!(pool.supply_of(NATIVE_SOL_ASSET).await, 1_000_000_000);
+
+        // Consistency check passes
+        pool.verify_consistency().await.unwrap();
     }
 }

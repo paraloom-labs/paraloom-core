@@ -224,6 +224,85 @@ impl ShieldedPool {
         }
     }
 
+    /// Check whether a commitment has already been recorded or credited.
+    pub async fn has_commitment(&self, commitment: &Commitment) -> bool {
+        self.deposited.read().await.contains(commitment)
+    }
+
+    /// Insert a single commitment into the pool's tree and mark it recorded.
+    ///
+    /// If the commitment has already been recorded, returns its existing index.
+    pub async fn insert_commitment(&self, commitment: &Commitment) -> Result<usize> {
+        if self.deposited.read().await.contains(commitment) {
+            return self
+                .commitment_tree
+                .index_of(commitment)
+                .await
+                .ok_or_else(|| anyhow!("commitment marked as deposited but not found in tree"));
+        }
+        let index = self.commitment_tree.insert(commitment).await?;
+        self.deposited.write().await.insert(commitment.clone());
+        Ok(index)
+    }
+
+    /// Record newly created output commitments from a settled transact into the
+    /// Merkle tree (#1136).
+    ///
+    /// Skips commitments that are already recorded to guarantee idempotency on
+    /// retried settlements.
+    pub async fn record_outputs(&self, commitments: &[Commitment]) -> Result<()> {
+        let mut to_insert = Vec::new();
+        {
+            let deposited = self.deposited.read().await;
+            for c in commitments {
+                if !deposited.contains(c) {
+                    to_insert.push(c.clone());
+                }
+            }
+        }
+        if to_insert.is_empty() {
+            return Ok(());
+        }
+
+        self.commitment_tree.insert_batch(&to_insert).await?;
+        let mut deposited = self.deposited.write().await;
+        for c in to_insert {
+            deposited.insert(c);
+        }
+        Ok(())
+    }
+
+    /// Debit `amount` of `asset_id` from the shielded supply upon external withdrawal (#236, #1136).
+    ///
+    /// Decrements the supply for `asset_id` by `amount` and updates persistent
+    /// storage if available. Saturates at zero if the supply would underflow.
+    pub async fn debit_supply(&self, amount: u64, asset_id: AssetId) -> Result<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+
+        let mut supplies = self.supplies.write().await;
+        let supply = supplies.entry(asset_id).or_insert(0);
+        if *supply < amount {
+            log::warn!(
+                "shielded supply underflow for asset {}: current {}, debiting {}",
+                hex::encode(asset_id),
+                *supply,
+                amount
+            );
+            *supply = 0;
+        } else {
+            *supply -= amount;
+        }
+        let current_supply = *supply;
+
+        if let Some(storage) = &self.storage {
+            storage.set_asset_supply(&asset_id, current_supply)?;
+        }
+
+        Ok(())
+    }
+
     /// Get the native-SOL shielded supply.
     ///
     /// Back-compat accessor preserved from the single-asset pool; equivalent
@@ -487,5 +566,113 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn record_outputs_inserts_commitments_and_enables_path() {
+        let pool = ShieldedPool::new();
+        let c0 = Commitment::from_bytes([11u8; 32]);
+        let c1 = Commitment::from_bytes([22u8; 32]);
+
+        assert!(!pool.has_commitment(&c0).await);
+        assert!(!pool.has_commitment(&c1).await);
+        assert!(pool.path(&c0).await.is_err());
+
+        pool.record_outputs(&[c0.clone(), c1.clone()]).await.unwrap();
+
+        assert!(pool.has_commitment(&c0).await);
+        assert!(pool.has_commitment(&c1).await);
+        assert_eq!(pool.commitment_count().await, 2);
+
+        let root = pool.root().await;
+        let path0 = pool.path(&c0).await.expect("path for c0");
+        let path1 = pool.path(&c1).await.expect("path for c1");
+        assert!(path0.verify(c0.as_bytes(), &root));
+        assert!(path1.verify(c1.as_bytes(), &root));
+
+        // Idempotency: re-recording same commitments does not append duplicate leaves
+        pool.record_outputs(&[c0.clone(), c1.clone()]).await.unwrap();
+        assert_eq!(pool.commitment_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn debit_supply_decrements_native_and_spl_supplies() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([5u8; 32]);
+        let spl_asset: AssetId = [42u8; 32];
+
+        pool.deposit(Note::new_native(addr.clone(), 1_000, [1u8; 32]), 1_000)
+            .await
+            .unwrap();
+        pool.deposit_asset(Note::new(addr, 500, [2u8; 32], spl_asset), 500, spl_asset)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.total_supply().await, 1_000);
+        assert_eq!(pool.supply_of(spl_asset).await, 500);
+
+        // Debit native SOL
+        pool.debit_supply(300, NATIVE_SOL_ASSET).await.unwrap();
+        assert_eq!(pool.total_supply().await, 700);
+        assert_eq!(pool.supply_of(spl_asset).await, 500);
+
+        // Debit SPL asset
+        pool.debit_supply(200, spl_asset).await.unwrap();
+        assert_eq!(pool.total_supply().await, 700);
+        assert_eq!(pool.supply_of(spl_asset).await, 300);
+
+        // Debit exceeding supply saturates at zero without panic
+        pool.debit_supply(1_000, NATIVE_SOL_ASSET).await.unwrap();
+        assert_eq!(pool.total_supply().await, 0);
+    }
+
+    #[tokio::test]
+    async fn debit_supply_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("privacy.db");
+        let note = Note::new_native(ShieldedAddress([7u8; 32]), 1_000, [9u8; 32]);
+
+        {
+            let storage = Arc::new(PrivacyStorage::open(&db).unwrap());
+            let pool = ShieldedPool::with_storage(storage).await.unwrap();
+            pool.deposit(note, 1_000).await.unwrap();
+            assert_eq!(pool.total_supply().await, 1_000);
+
+            // Debit 400
+            pool.debit_supply(400, NATIVE_SOL_ASSET).await.unwrap();
+            assert_eq!(pool.total_supply().await, 600);
+        }
+
+        // Reopen from storage
+        let storage = Arc::new(PrivacyStorage::open(&db).unwrap());
+        let pool = ShieldedPool::with_storage(storage).await.unwrap();
+        assert_eq!(
+            pool.total_supply().await,
+            600,
+            "debited supply must persist across restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn transact_settlement_preserves_consistency() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([1u8; 32]);
+        pool.deposit(Note::new_native(addr, 1_000, [1u8; 32]), 1_000)
+            .await
+            .unwrap();
+
+        let n0 = [10u8; 32];
+        let n1 = [20u8; 32];
+        let c0 = Commitment::from_bytes([30u8; 32]);
+        let c1 = Commitment::from_bytes([40u8; 32]);
+
+        pool.record_spent([n0, n1]).await;
+        pool.record_outputs(&[c0, c1]).await.unwrap();
+        pool.debit_supply(200, NATIVE_SOL_ASSET).await.unwrap();
+
+        assert_eq!(pool.total_supply().await, 800);
+        assert_eq!(pool.commitment_count().await, 3);
+        assert_eq!(pool.spent_count().await, 2);
+        pool.verify_consistency().await.unwrap();
     }
 }
