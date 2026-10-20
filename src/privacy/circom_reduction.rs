@@ -49,6 +49,14 @@ impl R1CSToQAP for CircomReduction {
         num_constraints: usize,
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
+        if full_assignment.len() < num_inputs
+            || matrices.a.len() < num_constraints
+            || matrices.b.len() < num_constraints
+            || matrices.c.len() < num_constraints
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         let zero = F::zero();
         let domain =
             D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
@@ -74,13 +82,19 @@ impl R1CSToQAP for CircomReduction {
         }
 
         let mut c = vec![zero; domain_size];
-        c[..num_constraints]
+        for (((c_i, &a_i), &b_i), ct_i) in c[..num_constraints]
             .iter_mut()
             .zip(&a)
             .zip(&b)
-            .for_each(|((c_i, &a), &b)| {
-                *c_i = a * b;
-            });
+            .zip(matrices.c.iter())
+        {
+            let expected_c = evaluate_constraint(ct_i, full_assignment);
+            let prod = a_i * b_i;
+            if prod != expected_c {
+                return Err(SynthesisError::Unsatisfiable);
+            }
+            *c_i = prod;
+        }
 
         domain.ifft_in_place(&mut a);
         domain.ifft_in_place(&mut b);
@@ -276,5 +290,53 @@ mod tests {
                 .expect("verify runs"),
             "a ceremony-produced key must prove and verify our circuit"
         );
+    }
+
+    #[test]
+    fn witness_map_rejects_unsatisfied_c_matrix_and_short_assignment() {
+        use ark_poly::GeneralEvaluationDomain;
+
+        // 1 input (constant 1), 1 witness, 1 constraint: z[1] * 1 == z[0] (i.e. witness == 1)
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 1,
+            c_num_non_zero: 1,
+            a: vec![vec![(Fr::from(1u64), 1)]],
+            b: vec![vec![(Fr::from(1u64), 0)]],
+            c: vec![vec![(Fr::from(1u64), 0)]],
+        };
+
+        // Satisfied assignment: z = [1, 1] -> a=1, b=1, c=1
+        let ok = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            1,
+            1,
+            &[Fr::from(1u64), Fr::from(1u64)],
+        );
+        assert!(ok.is_ok(), "satisfied R1CS assignment must succeed");
+
+        // Unsatisfied assignment: z = [1, 2] -> a=2, b=1, a*b=2 != c=1
+        let err = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            1,
+            1,
+            &[Fr::from(1u64), Fr::from(2u64)],
+        );
+        assert!(
+            matches!(err, Err(SynthesisError::Unsatisfiable)),
+            "unsatisfied C-matrix constraint must return Err(SynthesisError::Unsatisfiable)"
+        );
+
+        // Short assignment (< num_inputs) must return AssignmentMissing rather than panic
+        let short = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            2,
+            1,
+            &[Fr::from(1u64)],
+        );
+        assert!(matches!(short, Err(SynthesisError::AssignmentMissing)));
     }
 }

@@ -98,7 +98,7 @@ impl DepositTx {
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
+        let output_note = Note::new(recipient, amount.saturating_sub(fee), randomness, asset_id);
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()
@@ -119,8 +119,8 @@ impl DepositTx {
 
     /// Verify deposit transaction
     pub fn verify(&self) -> bool {
-        // Check amount covers fee
-        if self.amount < self.fee {
+        // Check amount is non-zero and covers fee
+        if self.amount == 0 || self.amount < self.fee {
             return false;
         }
 
@@ -204,6 +204,20 @@ impl TransferTx {
             return false;
         }
 
+        // Input nullifiers must be pairwise distinct within the transaction
+        for (i, nf) in self.input_nullifiers.iter().enumerate() {
+            if self.input_nullifiers[i + 1..].contains(nf) {
+                return false;
+            }
+        }
+
+        // Output commitments must be pairwise distinct within the transaction
+        for (i, cm) in self.output_commitments.iter().enumerate() {
+            if self.output_commitments[i + 1..].contains(cm) {
+                return false;
+            }
+        }
+
         // Outputs and notes must match
         if self.output_commitments.len() != self.output_notes.len() {
             return false;
@@ -278,8 +292,8 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
-        // Amount must cover fee
-        if self.amount < self.fee {
+        // Amount must be non-zero and cover fee
+        if self.amount == 0 || self.amount < self.fee {
             return false;
         }
 
@@ -445,5 +459,41 @@ mod tests {
         );
 
         assert!(!tx.verify_structure());
+
+        // Duplicate input nullifiers must be rejected
+        let dup_nf = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([1u8; 32])],
+            vec![Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32])],
+            [0u8; 32],
+            10,
+        );
+        assert!(!dup_nf.verify_structure());
+
+        // Duplicate output commitments (identical notes) must be rejected
+        let same_note = Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
+        let dup_cm = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])],
+            vec![same_note.clone(), same_note],
+            [0u8; 32],
+            10,
+        );
+        assert!(!dup_cm.verify_structure());
+    }
+
+    #[test]
+    fn test_deposit_and_withdraw_edge_cases() {
+        // Constructing DepositTx with amount < fee must not panic on underflow,
+        // and verify() must reject it.
+        let underflow_deposit =
+            DepositTx::new(vec![1u8; 32], 5, ShieldedAddress([2u8; 32]), [3u8; 32], 10);
+        assert!(!underflow_deposit.verify());
+
+        // Zero-amount deposit and withdraw must be rejected
+        let zero_deposit =
+            DepositTx::new(vec![1u8; 32], 0, ShieldedAddress([2u8; 32]), [3u8; 32], 0);
+        assert!(!zero_deposit.verify());
+
+        let zero_withdraw = WithdrawTx::new(Nullifier([1u8; 32]), 0, vec![5u8; 32], [0u8; 32], 0);
+        assert!(!zero_withdraw.verify());
     }
 }
