@@ -11,7 +11,7 @@ pub mod rpc;
 #[cfg(test)]
 mod test_support;
 
-pub use cosign_assembly::{assemble_transaction, gather_signatures};
+pub use cosign_assembly::{assemble_transaction, gather_signatures, signature_is_valid};
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,

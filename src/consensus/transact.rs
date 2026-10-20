@@ -563,6 +563,11 @@ impl TransactVerificationCoordinator {
         self.total_validators = total_validators;
     }
 
+    /// Minimum eligible-vote count for the BFT quorum.
+    pub fn min_validators_for_consensus(&self) -> usize {
+        self.min_validators_for_consensus
+    }
+
     /// Reference to the slashing-evidence log (tests/pipelines read it).
     pub fn slashing_tracker(&self) -> &Arc<SlashingTracker> {
         &self.slashing_tracker
