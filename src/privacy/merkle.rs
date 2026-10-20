@@ -81,6 +81,18 @@ impl MerkleTree {
         })
     }
 
+    fn push_recent_root(
+        recent: &mut std::collections::VecDeque<[u8; 32]>,
+        root: [u8; 32],
+    ) {
+        if recent.back() != Some(&root) {
+            recent.push_back(root);
+            while recent.len() > ROOT_HISTORY_LEN {
+                recent.pop_front();
+            }
+        }
+    }
+
     /// Insert a commitment as a leaf, returning the index it was placed
     /// at. When persistent storage is configured, the on-disk write is
     /// performed *before* the in-memory mutation, so a storage failure
@@ -102,10 +114,40 @@ impl MerkleTree {
             })?;
         }
 
-        leaves.push(*commitment.as_bytes());
+        let pre_insert_root = {
+            let recent = self.recent_roots.read().await;
+            if recent.is_empty() {
+                Some(self.compute_root(&leaves))
+            } else {
+                None
+            }
+        };
 
-        let mut cached_root = self.cached_root.write().await;
-        *cached_root = None;
+        leaves.push(*commitment.as_bytes());
+        let root = self.compute_root(&leaves);
+
+        {
+            let mut cached_root = self.cached_root.write().await;
+            *cached_root = Some(root);
+        }
+
+        {
+            let mut recent = self.recent_roots.write().await;
+            if let Some(initial_root) = pre_insert_root {
+                Self::push_recent_root(&mut recent, initial_root);
+            }
+            Self::push_recent_root(&mut recent, root);
+        }
+
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.set_merkle_root(&root) {
+                log::warn!(
+                    target: "paraloom::privacy::merkle",
+                    "failed to persist Merkle root cache: {} — recomputation will trigger on next restart",
+                    e
+                );
+            }
+        }
 
         Ok(index)
     }
@@ -117,6 +159,10 @@ impl MerkleTree {
         &self,
         commitments: &[Commitment],
     ) -> Result<Vec<usize>, anyhow::Error> {
+        if commitments.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut leaves = self.leaves.write().await;
         let start_index = leaves.len();
         let indices: Vec<usize> = (start_index..start_index + commitments.len()).collect();
@@ -134,12 +180,48 @@ impl MerkleTree {
                 })?;
         }
 
+        let pre_insert_root = {
+            let recent = self.recent_roots.read().await;
+            if recent.is_empty() {
+                Some(self.compute_root(&leaves))
+            } else {
+                None
+            }
+        };
+
+        let mut intermediate_roots = Vec::with_capacity(commitments.len());
         for commitment in commitments {
             leaves.push(*commitment.as_bytes());
+            intermediate_roots.push(self.compute_root(&leaves));
+        }
+        let final_root = *intermediate_roots
+            .last()
+            .expect("commitments checked non-empty");
+
+        {
+            let mut cached_root = self.cached_root.write().await;
+            *cached_root = Some(final_root);
         }
 
-        let mut cached_root = self.cached_root.write().await;
-        *cached_root = None;
+        {
+            let mut recent = self.recent_roots.write().await;
+            if let Some(initial_root) = pre_insert_root {
+                Self::push_recent_root(&mut recent, initial_root);
+            }
+            for root in intermediate_roots {
+                Self::push_recent_root(&mut recent, root);
+            }
+        }
+
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.set_merkle_root(&final_root) {
+                log::warn!(
+                    target: "paraloom::privacy::merkle",
+                    "failed to persist Merkle root cache: {} — recomputation will trigger on next restart",
+                    e
+                );
+            }
+        }
 
         Ok(indices)
     }
@@ -150,6 +232,8 @@ impl MerkleTree {
         {
             let cached = self.cached_root.read().await;
             if let Some(root) = *cached {
+                let mut recent = self.recent_roots.write().await;
+                Self::push_recent_root(&mut recent, root);
                 return root;
             }
         }
@@ -168,12 +252,7 @@ impl MerkleTree {
         // [`ROOT_HISTORY_LEN`]). Skip consecutive duplicates.
         {
             let mut recent = self.recent_roots.write().await;
-            if recent.back() != Some(&root) {
-                recent.push_back(root);
-                while recent.len() > ROOT_HISTORY_LEN {
-                    recent.pop_front();
-                }
-            }
+            Self::push_recent_root(&mut recent, root);
         }
 
         // Persist root to storage if available. Unlike leaf inserts,
@@ -634,5 +713,55 @@ mod tests {
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
         );
+    }
+
+    #[tokio::test]
+    async fn knows_root_retains_intermediate_roots_across_unqueried_inserts_and_batches() {
+        let c1 = Commitment([1u8; 32]);
+        let c2 = Commitment([2u8; 32]);
+        let c3 = Commitment([3u8; 32]);
+
+        // Compute reference roots at each step using a reference tree.
+        let ref_tree = MerkleTree::with_depth(4);
+        let r0 = ref_tree.root().await;
+        ref_tree.insert(&c1).await.unwrap();
+        let r1 = ref_tree.root().await;
+        ref_tree.insert(&c2).await.unwrap();
+        let r2 = ref_tree.root().await;
+        ref_tree.insert(&c3).await.unwrap();
+        let r3 = ref_tree.root().await;
+
+        // 1. Multiple sequential inserts without calling `root()` in between
+        // (matching `ShieldedPool::credit_commitment` during back-to-back deposits).
+        let unqueried_tree = MerkleTree::with_depth(4);
+        unqueried_tree.insert(&c1).await.unwrap();
+        unqueried_tree.insert(&c2).await.unwrap();
+        unqueried_tree.insert(&c3).await.unwrap();
+
+        assert!(
+            unqueried_tree.knows_root(&r0).await,
+            "initial empty root must be retained even if root() was not called before first insert"
+        );
+        assert!(
+            unqueried_tree.knows_root(&r1).await,
+            "intermediate root after 1st insert must be retained when root() was not called"
+        );
+        assert!(
+            unqueried_tree.knows_root(&r2).await,
+            "intermediate root after 2nd insert must be retained when root() was not called"
+        );
+        assert!(
+            unqueried_tree.knows_root(&r3).await,
+            "final tip root after 3rd insert must be known"
+        );
+
+        // 2. Batch insert must also record intermediate roots in `recent_roots`.
+        let batch_tree = MerkleTree::with_depth(4);
+        batch_tree.insert_batch(&[c1, c2, c3]).await.unwrap();
+
+        assert!(batch_tree.knows_root(&r0).await);
+        assert!(batch_tree.knows_root(&r1).await);
+        assert!(batch_tree.knows_root(&r2).await);
+        assert!(batch_tree.knows_root(&r3).await);
     }
 }
