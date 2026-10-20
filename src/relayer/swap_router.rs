@@ -94,6 +94,12 @@ async fn route_handler(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("input_mint: {e}")))?;
     let asset_out = mint_to_asset(&req.output_mint)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("output_mint: {e}")))?;
+    if asset_in == asset_out {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input_mint and output_mint must differ".to_string(),
+        ));
+    }
     let user = Pubkey::from_str(&req.user_public_key)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("user_public_key: {e}")))?;
     if req.amount == 0 {
@@ -104,6 +110,14 @@ async fn route_handler(
         .quote_swap(asset_in, asset_out, req.amount, &user)
         .await
     {
+        Ok(quote) if quote.out_amount == 0 => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no route: quote returned zero out_amount".to_string(),
+        )),
+        Ok(quote) if quote.swap_transaction.trim().is_empty() => Err((
+            StatusCode::BAD_GATEWAY,
+            "empty swap_transaction in quote".to_string(),
+        )),
         Ok(quote) => Ok(Json(RouteResponse {
             out_amount: quote.out_amount,
             swap_transaction: quote.swap_transaction,
@@ -313,5 +327,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn same_input_and_output_mint_is_400() {
+        let mut b = valid_body();
+        b["output_mint"] = serde_json::json!("So11111111111111111111111111111111111111112");
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("differ"));
+    }
+
+    #[tokio::test]
+    async fn zero_out_amount_or_empty_swap_tx_is_rejected() {
+        let (status, _) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 0,
+                swap_transaction: "BASE64TX".into(),
+            })),
+            valid_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status2, _) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 100,
+                swap_transaction: "   ".into(),
+            })),
+            valid_body(),
+        )
+        .await;
+        assert_eq!(status2, StatusCode::BAD_GATEWAY);
     }
 }

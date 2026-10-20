@@ -389,11 +389,14 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         ephemeral: &Keypair,
     ) -> Result<(SubmittedLeg, u64)> {
         let amount_in = request.amount_in;
-        if amount_in == 0 {
-            return Err(RelayerError::InvalidAmount(0));
+        if amount_in == 0 || amount_in > i64::MAX as u64 {
+            return Err(RelayerError::InvalidAmount(amount_in));
         }
         if request.fee_bps > 10_000 {
             return Err(RelayerError::FeeTooHigh(request.fee_bps));
+        }
+        if request.min_out_amount == Some(0) {
+            return Err(RelayerError::InvalidAmount(0));
         }
 
         let asset_in = request.asset_in;
@@ -401,33 +404,12 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
-        // Step 1: withdraw the spent note to the fresh address via a v3
-        // transact. The submitter takes the note's v3 spend witness, proves the
-        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
-        // the nullifier burn severs the deposit -> fresh-address link on-chain.
-        let withdraw_leg = self
-            .submitter
-            .submit_withdraw_to_fresh(
-                in_leg,
-                amount_in,
-                request.in_sk,
-                request.in_blinding,
-                request.in_note_pubkey,
-                request.in_leaf_index,
-                fresh_address,
-            )
-            .await?;
-
-        // Step 2: swap on public liquidity from the fresh address. The provider
-        // signs and submits the public trade from `ephemeral`, so the trade
-        // originates at the unlinkable fresh address.
-        //
-        // The on-chain withdraw deducts the protocol withdrawal fee
-        // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
-        // fresh address holds `amount_in - fee`, not the gross note value.
-        // Swapping the gross amount would exceed the fresh address's balance and
-        // fail *after* the nullifier is already burned, stranding the funds —
-        // so the swap trades the realized post-fee amount.
+        // Validate that `amount_in` survives both the protocol withdrawal fee
+        // (`WITHDRAWAL_FEE_BPS`) and any native-SOL swap overhead reserve
+        // *before* submitting the on-chain withdrawal. Checking this after
+        // `submit_withdraw_to_fresh` would burn the user's shielded note
+        // nullifier on-chain and strand the withdrawn funds in the dropped
+        // ephemeral keypair whenever `swap_amount` is zero.
         let withdrawal_fee = amount_in
             .checked_mul(WITHDRAWAL_FEE_BPS)
             .map(|x| x / 10_000)
@@ -449,6 +431,27 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         } else {
             withdrawn
         };
+
+        // Step 1: withdraw the spent note to the fresh address via a v3
+        // transact. The submitter takes the note's v3 spend witness, proves the
+        // withdrawal to `fresh_address`, and waits for the quorum to settle it;
+        // the nullifier burn severs the deposit -> fresh-address link on-chain.
+        let withdraw_leg = self
+            .submitter
+            .submit_withdraw_to_fresh(
+                in_leg,
+                amount_in,
+                request.in_sk,
+                request.in_blinding,
+                request.in_note_pubkey,
+                request.in_leaf_index,
+                fresh_address,
+            )
+            .await?;
+
+        // Step 2: swap on public liquidity from the fresh address. The provider
+        // signs and submits the public trade from `ephemeral`, so the trade
+        // originates at the unlinkable fresh address.
         let swap = self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
@@ -468,6 +471,11 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
                     min_out,
                 });
             }
+        }
+        if swap.out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "swap produced zero output".to_string(),
+            ));
         }
         Ok((withdraw_leg, swap.out_amount))
     }
@@ -977,5 +985,56 @@ mod tests {
         );
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
+    }
+
+    #[tokio::test]
+    async fn under_overhead_rejects_before_withdrawing_note_onchain() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(1_000);
+        let err = relayer
+            .execute(request(native_note(1_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("overhead consuming the whole note must fail before withdrawal");
+        assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "shielded note must NOT be withdrawn on-chain when swap_amount would be 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn amount_exceeding_i64_max_or_zero_min_out_rejects_before_withdraw() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let over_i64 = (i64::MAX as u64) + 1;
+        let err = relayer
+            .execute(request(native_note(over_i64), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("amount > i64::MAX must be rejected before withdrawal");
+        assert!(matches!(err, RelayerError::InvalidAmount(a) if a == over_i64));
+        assert!(relayer.submitter.recorded().is_empty());
+
+        let req_zero_min = PrivateSwapRequest {
+            min_out_amount: Some(0),
+            ..request(native_note(1_000_000), NATIVE_SOL_ASSET, 0)
+        };
+        let err2 = relayer
+            .execute(req_zero_min)
+            .await
+            .expect_err("min_out_amount == Some(0) must be rejected before withdrawal");
+        assert!(matches!(err2, RelayerError::InvalidAmount(0)));
+        assert!(relayer.submitter.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_output_swap_is_rejected_before_redeposit_even_without_min_out() {
+        let relayer =
+            PrivateSwapRelayer::new(MockSwapProvider::with_rate(0, 1), MockSubmitter::new());
+        let err = relayer
+            .execute(request(native_note(1_000_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("zero-output swap must fail rather than re-depositing 0");
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
+        // Only the withdraw leg ran; the 0-value re-deposit leg was blocked.
+        assert_eq!(relayer.submitter.recorded().len(), 1);
     }
 }
