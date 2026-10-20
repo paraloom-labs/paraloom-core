@@ -79,6 +79,12 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
     }
 
     pub fn verify(&mut self) -> Result<bool, Groth16Error> {
+        if self.proof_a.iter().all(|&b| b == 0)
+            || self.proof_b.iter().all(|&b| b == 0)
+            || self.proof_c.iter().all(|&b| b == 0)
+        {
+            return Err(Groth16Error::ProofVerificationFailed);
+        }
         self.prepare_inputs()?;
         let pairing_input = [
             self.proof_a.as_slice(),
@@ -102,4 +108,98 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
 
 fn is_less_than_bn254_field_size_be(bytes: &[u8; 32]) -> bool {
     BigUint::from_bytes_be(bytes) < Fr::MODULUS.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transact_fixture_data as fx;
+    use crate::transact_vk_data as vk;
+
+    const VK_IC: [[u8; 64]; 9] = [
+        vk::VK_IC_0,
+        vk::VK_IC_1,
+        vk::VK_IC_2,
+        vk::VK_IC_3,
+        vk::VK_IC_4,
+        vk::VK_IC_5,
+        vk::VK_IC_6,
+        vk::VK_IC_7,
+        vk::VK_IC_8,
+    ];
+
+    fn test_vk() -> Groth16Verifyingkey<'static> {
+        Groth16Verifyingkey {
+            nr_pubinputs: 8,
+            vk_alpha_g1: vk::VK_ALPHA_G1,
+            vk_beta_g2: vk::VK_BETA_G2,
+            vk_gamme_g2: vk::VK_GAMMA_G2,
+            vk_delta_g2: vk::VK_DELTA_G2,
+            vk_ic: &VK_IC,
+        }
+    }
+
+    #[test]
+    fn verify_rejects_all_zero_proof_points_before_pairing() {
+        let vk = test_vk();
+        let inputs = [[0u8; 32]; 8];
+
+        let zero_g1 = [0u8; 64];
+        let zero_g2 = [0u8; 128];
+
+        let mut v_a = Groth16Verifier::new(
+            &zero_g1,
+            &fx::FIXTURE_PROOF_B,
+            &fx::FIXTURE_PROOF_C,
+            &inputs,
+            &vk,
+        )
+        .unwrap();
+        assert_eq!(v_a.verify(), Err(Groth16Error::ProofVerificationFailed));
+
+        let mut v_b = Groth16Verifier::new(
+            &fx::FIXTURE_PROOF_A,
+            &zero_g2,
+            &fx::FIXTURE_PROOF_C,
+            &inputs,
+            &vk,
+        )
+        .unwrap();
+        assert_eq!(v_b.verify(), Err(Groth16Error::ProofVerificationFailed));
+
+        let mut v_c = Groth16Verifier::new(
+            &fx::FIXTURE_PROOF_A,
+            &fx::FIXTURE_PROOF_B,
+            &zero_g1,
+            &inputs,
+            &vk,
+        )
+        .unwrap();
+        assert_eq!(v_c.verify(), Err(Groth16Error::ProofVerificationFailed));
+    }
+
+    #[test]
+    fn verify_rejects_public_input_at_or_above_modulus() {
+        let vk = test_vk();
+        let modulus: BigUint = Fr::MODULUS.into();
+        let modulus_be_vec = modulus.to_bytes_be();
+        let mut modulus_be = [0u8; 32];
+        modulus_be[32 - modulus_be_vec.len()..].copy_from_slice(&modulus_be_vec);
+
+        let mut inputs = [[0u8; 32]; 8];
+        inputs[0] = modulus_be;
+
+        let mut verifier = Groth16Verifier::new(
+            &fx::FIXTURE_PROOF_A,
+            &fx::FIXTURE_PROOF_B,
+            &fx::FIXTURE_PROOF_C,
+            &inputs,
+            &vk,
+        )
+        .unwrap();
+        assert_eq!(
+            verifier.verify(),
+            Err(Groth16Error::PublicInputGreaterThanFieldSize)
+        );
+    }
 }

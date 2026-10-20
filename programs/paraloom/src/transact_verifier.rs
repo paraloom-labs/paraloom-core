@@ -18,8 +18,6 @@
 
 use crate::groth16::{Groth16Verifier, Groth16Verifyingkey};
 use crate::transact_vk_data as vk;
-use ark_bn254::Fr;
-use ark_ff::{BigInteger, PrimeField};
 
 /// Transact circuit public-input count.
 const NUM_PUBLIC_INPUTS: usize = 8;
@@ -50,12 +48,13 @@ fn verifying_key() -> Groth16Verifyingkey<'static> {
     }
 }
 
-/// Field element → 32-byte big-endian, matching the prover's public-input
-/// encoding.
-fn fr_to_be(f: &Fr) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let be = f.into_bigint().to_bytes_be();
-    out[32 - be.len()..].copy_from_slice(&be);
+/// Convert a 32-byte little-endian public input into big-endian bytes without
+/// reducing modulo `Fr::MODULUS`, so `Groth16Verifier::prepare_inputs` can
+/// enforce canonical field membership (`< Fr::MODULUS`) via
+/// `PublicInputGreaterThanFieldSize`.
+fn le_to_be(b: &[u8; 32]) -> [u8; 32] {
+    let mut out = *b;
+    out.reverse();
     out
 }
 
@@ -89,16 +88,15 @@ pub fn verify_transact(
         Err(_) => return false,
     };
 
-    let le = |b: &[u8; 32]| fr_to_be(&Fr::from_le_bytes_mod_order(b));
     let public_inputs: [[u8; 32]; NUM_PUBLIC_INPUTS] = [
-        le(root),
-        le(public_amount),
-        le(ext_data_hash),
-        le(asset_id),
-        le(nullifier0),
-        le(nullifier1),
-        le(out_commitment0),
-        le(out_commitment1),
+        le_to_be(root),
+        le_to_be(public_amount),
+        le_to_be(ext_data_hash),
+        le_to_be(asset_id),
+        le_to_be(nullifier0),
+        le_to_be(nullifier1),
+        le_to_be(out_commitment0),
+        le_to_be(out_commitment1),
     ];
 
     let vk = verifying_key();
@@ -218,5 +216,86 @@ mod tests {
     #[test]
     fn wrong_length_rejected() {
         assert!(!verify_fixture(&[0u8; 255]));
+    }
+
+    #[test]
+    fn non_canonical_aliased_public_inputs_rejected() {
+        use ark_bn254::Fr;
+        use ark_ff::PrimeField;
+        use num_bigint::BigUint;
+
+        let modulus: BigUint = Fr::MODULUS.into();
+        let to_aliased_le = |canonical_le: &[u8; 32]| -> [u8; 32] {
+            let val = BigUint::from_bytes_le(canonical_le);
+            let aliased = &val + &modulus;
+            let bytes = aliased.to_bytes_le();
+            assert!(
+                bytes.len() <= 32,
+                "x + p must fit in 32 bytes to test in-range u256 aliasing"
+            );
+            let mut out = [0u8; 32];
+            out[..bytes.len()].copy_from_slice(&bytes);
+            out
+        };
+
+        let proof = fixture_proof();
+
+        // `FIXTURE_PUBLIC_AMOUNT` and `FIXTURE_ASSET_ID` are small enough that
+        // `x + Fr::MODULUS < 2^256`. Before the fix, `Fr::from_le_bytes_mod_order`
+        // silently reduced `x + p` back to `x` before `Groth16Verifier::prepare_inputs`,
+        // causing `verify_transact` to accept the aliased non-canonical input.
+        let aliased_pa = to_aliased_le(&fx::FIXTURE_PUBLIC_AMOUNT);
+        assert!(!verify_transact(
+            &fx::FIXTURE_ROOT,
+            &aliased_pa,
+            &fx::FIXTURE_EXT_DATA_HASH,
+            &fx::FIXTURE_ASSET_ID,
+            &fx::FIXTURE_NULLIFIER_0,
+            &fx::FIXTURE_NULLIFIER_1,
+            &fx::FIXTURE_COMMITMENT_0,
+            &fx::FIXTURE_COMMITMENT_1,
+            &proof,
+        ));
+
+        let aliased_asset = to_aliased_le(&fx::FIXTURE_ASSET_ID);
+        assert!(!verify_transact(
+            &fx::FIXTURE_ROOT,
+            &fx::FIXTURE_PUBLIC_AMOUNT,
+            &fx::FIXTURE_EXT_DATA_HASH,
+            &aliased_asset,
+            &fx::FIXTURE_NULLIFIER_0,
+            &fx::FIXTURE_NULLIFIER_1,
+            &fx::FIXTURE_COMMITMENT_0,
+            &fx::FIXTURE_COMMITMENT_1,
+            &proof,
+        ));
+
+        let max_bytes = [0xffu8; 32];
+        assert!(!verify_transact(
+            &max_bytes,
+            &fx::FIXTURE_PUBLIC_AMOUNT,
+            &fx::FIXTURE_EXT_DATA_HASH,
+            &fx::FIXTURE_ASSET_ID,
+            &fx::FIXTURE_NULLIFIER_0,
+            &fx::FIXTURE_NULLIFIER_1,
+            &fx::FIXTURE_COMMITMENT_0,
+            &fx::FIXTURE_COMMITMENT_1,
+            &proof,
+        ));
+    }
+
+    #[test]
+    fn all_zero_proof_components_rejected() {
+        let mut zero_a = fixture_proof();
+        zero_a[0..64].fill(0);
+        assert!(!verify_fixture(&zero_a));
+
+        let mut zero_b = fixture_proof();
+        zero_b[64..192].fill(0);
+        assert!(!verify_fixture(&zero_b));
+
+        let mut zero_c = fixture_proof();
+        zero_c[192..256].fill(0);
+        assert!(!verify_fixture(&zero_c));
     }
 }
