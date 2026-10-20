@@ -908,6 +908,12 @@ pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
 }
 
+/// Derive the canonical asset config PDA for an SPL mint (#779).
+/// (`seeds = [b"asset_config", mint]`).
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
+}
+
 /// Derive the canonical Associated Token Account address for `owner` + `mint`,
 /// mirroring `spl_associated_token_account::get_associated_token_address`
 /// without the dependency: it is the PDA of

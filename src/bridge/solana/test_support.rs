@@ -86,18 +86,21 @@ pub fn synth_deposit_tx(
         recipient,
         randomness,
     };
-    let mut data = discriminators::DEPOSIT.to_vec();
+    let mut data = discriminators::DEPOSIT_NOTE.to_vec();
     data.extend_from_slice(&borsh::to_vec(&payload).expect("borsh serialise"));
+    let (bridge_state, _) = crate::bridge::solana::instructions::derive_bridge_state(program_id);
+    let (bridge_vault, _) = crate::bridge::solana::instructions::derive_bridge_vault(program_id);
+    let (merkle_tree, _) = crate::bridge::solana::instructions::derive_merkle_tree(program_id);
     let instruction = UiCompiledInstruction {
-        program_id_index: 4,
-        accounts: vec![0, 1, 2, 3],
+        program_id_index: 5,
+        accounts: vec![0, 1, 2, 3, 4],
         data: bs58::encode(data).into_string(),
         stack_height: None,
     };
-    let dummy = Pubkey::default();
     let account_keys = vec![
-        dummy.to_string(),
-        dummy.to_string(),
+        bridge_state.to_string(),
+        bridge_vault.to_string(),
+        merkle_tree.to_string(),
         depositor.to_string(),
         solana_sdk::system_program::ID.to_string(),
         program_id.to_string(),

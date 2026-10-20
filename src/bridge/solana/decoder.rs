@@ -6,7 +6,10 @@
 //! [`DepositEvent`] type. Keeping the decoder pure and free of RPC I/O
 //! makes it directly unit-testable against synthetic instruction data.
 
-use crate::bridge::solana::instructions::{discriminators, DepositInstructionData};
+use crate::bridge::solana::instructions::{
+    derive_asset_config, derive_asset_vault, derive_bridge_state, derive_bridge_vault,
+    derive_merkle_tree, discriminators, DepositInstructionData,
+};
 use crate::bridge::DepositEvent;
 use borsh::BorshDeserialize;
 use solana_sdk::pubkey::Pubkey;
@@ -14,12 +17,6 @@ use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInstruction, UiMessage,
     UiTransactionEncoding,
 };
-
-/// Account-index position of the depositor (signer) in a legacy deposit
-/// instruction's account list `[bridge_state, bridge_vault, depositor,
-/// system_program]`. The legacy off-chain-root `deposit` builder was removed,
-/// but this decoder still reads historical deposits from that layout.
-const DEPOSITOR_ACCOUNT_INDEX: usize = 2;
 
 /// Recommended encoding to request from `getTransaction` for the
 /// listener. JSON encoding produces a `UiMessage::Raw` variant for
@@ -136,10 +133,6 @@ struct DecodedDeposit {
     asset_id: [u8; 32],
 }
 
-/// `deposit_spl` account layout: bridge_state(0), mint(1), …, depositor(5).
-const SPL_MINT_ACCOUNT_INDEX: usize = 1;
-const SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 5;
-
 /// `deposit_note` account layout: bridge_state(0), bridge_vault(1),
 /// merkle_tree(2), depositor(3), … — the tree account is what pushes the
 /// depositor one further along than the legacy `deposit`.
@@ -173,39 +166,67 @@ fn decode_compiled_deposit(
         return None;
     }
 
-    // All four deposit instructions share one borsh payload — a u64 amount and
-    // two 32-byte fields — and differ in discriminator, account layout and
-    // asset. `deposit_note` and `deposit_note_spl` are the two the program
-    // still exposes; the two legacy arms stay so historical deposits made
-    // before `8830226` removed them still decode.
+    let (expected_bridge_state, _) = derive_bridge_state(program_id);
+    let (expected_merkle_tree, _) = derive_merkle_tree(program_id);
+
     let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT_NOTE {
+        if compiled.accounts.len() < 4 {
+            return None;
+        }
+        let bridge_state_idx = *compiled.accounts.get(0)? as usize;
+        let bridge_vault_idx = *compiled.accounts.get(1)? as usize;
+        let merkle_tree_idx = *compiled.accounts.get(2)? as usize;
+
+        let bridge_state = account_keys.get(bridge_state_idx)?;
+        let bridge_vault = account_keys.get(bridge_vault_idx)?;
+        let merkle_tree = account_keys.get(merkle_tree_idx)?;
+
+        let (expected_bridge_vault, _) = derive_bridge_vault(program_id);
+
+        if bridge_state != &expected_bridge_state
+            || bridge_vault != &expected_bridge_vault
+            || merkle_tree != &expected_merkle_tree
+        {
+            return None;
+        }
+
         (
             DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
             crate::privacy::types::NATIVE_SOL_ASSET,
         )
     } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
+        if compiled.accounts.len() < 7 {
+            return None;
+        }
+        let bridge_state_idx = *compiled.accounts.get(0)? as usize;
+        let asset_config_idx = *compiled.accounts.get(1)? as usize;
         let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
+        let asset_vault_idx = *compiled.accounts.get(3)? as usize;
+        let merkle_tree_idx = *compiled.accounts.get(5)? as usize;
+
+        let bridge_state = account_keys.get(bridge_state_idx)?;
+        let asset_config = account_keys.get(asset_config_idx)?;
         let mint = account_keys.get(mint_index)?;
-        // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
-        // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
-        // the leaf, and `process_deposit` reduces this field into the same
-        // `v3_commit` the program computed. Feeding it raw bytes would credit a
-        // commitment the chain never appended — blind is recoverable, a wrong
-        // leaf in the pool is not.
+        let asset_vault = account_keys.get(asset_vault_idx)?;
+        let merkle_tree = account_keys.get(merkle_tree_idx)?;
+
+        let (expected_asset_config, _) = derive_asset_config(program_id, mint);
+        let (expected_asset_vault, _) = derive_asset_vault(program_id, mint);
+
+        if bridge_state != &expected_bridge_state
+            || asset_config != &expected_asset_config
+            || asset_vault != &expected_asset_vault
+            || merkle_tree != &expected_merkle_tree
+        {
+            return None;
+        }
+
         (
             DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
             crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
         )
-    } else if raw_data[..8] == discriminators::DEPOSIT {
-        (
-            DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::types::NATIVE_SOL_ASSET,
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
-        let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
-        let mint = account_keys.get(mint_index)?;
-        (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes())
     } else {
+        // Explicitly reject retired v2 DEPOSIT and DEPOSIT_SPL instructions, as well as unknown discriminators.
         return None;
     };
 
@@ -283,41 +304,44 @@ mod tests {
     }
 
     #[test]
-    fn decodes_a_well_formed_deposit() {
+    fn rejects_retired_v2_deposit() {
         let program_id = Pubkey::new_unique();
         let depositor = Pubkey::new_unique();
-        let extra = Pubkey::new_unique();
+        let (bridge_state, _) = derive_bridge_state(&program_id);
+        let (bridge_vault, _) = derive_bridge_vault(&program_id);
 
-        let account_keys = vec![extra, extra, depositor, program_id];
+        let account_keys = vec![bridge_state, bridge_vault, depositor, program_id];
 
         let amount = 1_000_000u64;
         let recipient = [7u8; 32];
         let randomness = [9u8; 32];
         let ix = make_compiled_ix(3, 2, encode_deposit_data(amount, recipient, randomness));
 
-        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
-            .expect("well-formed deposit must decode");
-        assert_eq!(decoded.data.amount, amount);
-        assert_eq!(decoded.data.recipient, recipient);
-        assert_eq!(decoded.data.randomness, randomness);
-        assert_eq!(decoded.depositor, depositor);
-        assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+        assert!(
+            decode_compiled_deposit(&ix, &account_keys, &program_id).is_none(),
+            "retired v2 deposit must be rejected"
+        );
     }
 
-    /// `deposit_note` is the only deposit instruction the program still
-    /// exposes — `8830226` removed the other two — so a decoder that cannot
-    /// read it cannot see any deposit at all. It went unread for nineteen
-    /// days; this is the test that would have caught it.
+    /// `deposit_note` is the only native deposit instruction the program still
+    /// exposes. Must target canonical PDAs.
     #[test]
     fn decodes_a_deposit_note() {
         let program_id = Pubkey::new_unique();
         let depositor = Pubkey::new_unique();
-        let other = Pubkey::new_unique();
+        let (bridge_state, _) = derive_bridge_state(&program_id);
+        let (bridge_vault, _) = derive_bridge_vault(&program_id);
+        let (merkle_tree, _) = derive_merkle_tree(&program_id);
 
         // deposit_note accounts: bridge_state(0), bridge_vault(1),
-        // merkle_tree(2), depositor(3) — one further along than the legacy
-        // layout, because of the tree account.
-        let account_keys = vec![other, other, other, depositor, program_id];
+        // merkle_tree(2), depositor(3).
+        let account_keys = vec![
+            bridge_state,
+            bridge_vault,
+            merkle_tree,
+            depositor,
+            program_id,
+        ];
 
         let amount = 2_500_000u64;
         let pubkey = [11u8; 32];
@@ -348,27 +372,69 @@ mod tests {
         assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
     }
 
-    /// `deposit_note_spl` is the SPL half of the v3 deposit surface, and it
-    /// went unread the same way `deposit_note` did (#689): the discriminator
-    /// simply had no arm, so every SPL deposit fell out of
-    /// `extract_deposit_events` and the pool never saw the leaf.
-    ///
-    /// The assert that matters is the last one. The legacy `deposit_spl` arm
-    /// keys the asset as the raw mint bytes, and reusing that here would decode
-    /// fine, credit a commitment, and be wrong — so this pins the asset to
-    /// `mint_to_asset` *and* to not being the raw bytes.
+    #[test]
+    fn rejects_deposit_note_with_non_canonical_pda() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let (bridge_state, _) = derive_bridge_state(&program_id);
+        let (bridge_vault, _) = derive_bridge_vault(&program_id);
+        let fake_merkle_tree = Pubkey::new_unique();
+
+        let account_keys = vec![
+            bridge_state,
+            bridge_vault,
+            fake_merkle_tree,
+            depositor,
+            program_id,
+        ];
+
+        let payload = DepositNoteInstructionData {
+            amount: 1_000,
+            pubkey: [1u8; 32],
+            blinding: [2u8; 32],
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        assert!(
+            decode_compiled_deposit(&ix, &account_keys, &program_id).is_none(),
+            "deposit_note with fake merkle tree PDA must be rejected"
+        );
+    }
+
+    /// `deposit_note_spl` is the SPL half of the v3 deposit surface.
+    /// Canonical PDAs are enforced for bridge_state, asset_config, asset_vault, and merkle_tree.
     #[test]
     fn decodes_a_deposit_note_spl() {
         let program_id = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let depositor = Pubkey::new_unique();
+        let (bridge_state, _) = derive_bridge_state(&program_id);
+        let (asset_config, _) = derive_asset_config(&program_id, &mint);
+        let (asset_vault, _) = derive_asset_vault(&program_id, &mint);
+        let (merkle_tree, _) = derive_merkle_tree(&program_id);
         let other = Pubkey::new_unique();
 
         // deposit_note_spl accounts: bridge_state(0), asset_config(1), mint(2),
         // asset_vault(3), depositor_token_account(4), merkle_tree(5),
         // depositor(6), token_program(7).
         let account_keys = vec![
-            other, other, mint, other, other, other, depositor, other, program_id,
+            bridge_state,
+            asset_config,
+            mint,
+            asset_vault,
+            other,
+            merkle_tree,
+            depositor,
+            other,
+            program_id,
         ];
 
         let amount = 5_000_000u64;
@@ -407,14 +473,55 @@ mod tests {
     }
 
     #[test]
-    fn decodes_a_well_formed_spl_deposit() {
-        // deposit_spl shares the payload but uses the SPL account layout
-        // (mint @ index 1, depositor @ index 5) and binds the mint as asset_id.
+    fn rejects_deposit_note_spl_with_non_canonical_pda() {
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let (bridge_state, _) = derive_bridge_state(&program_id);
+        let fake_asset_config = Pubkey::new_unique();
+        let (asset_vault, _) = derive_asset_vault(&program_id, &mint);
+        let (merkle_tree, _) = derive_merkle_tree(&program_id);
+        let other = Pubkey::new_unique();
+
+        let account_keys = vec![
+            bridge_state,
+            fake_asset_config,
+            mint,
+            asset_vault,
+            other,
+            merkle_tree,
+            depositor,
+            other,
+            program_id,
+        ];
+
+        let payload = DepositNoteInstructionData {
+            amount: 5_000,
+            pubkey: [11u8; 32],
+            blinding: [13u8; 32],
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 8,
+            accounts: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        assert!(
+            decode_compiled_deposit(&ix, &account_keys, &program_id).is_none(),
+            "deposit_note_spl with non-canonical asset_config must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_retired_v2_spl_deposit() {
         let program_id = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let depositor = Pubkey::new_unique();
         let other = Pubkey::new_unique();
-        // account_keys: program@0, mint@2, depositor@7.
         let account_keys = vec![
             program_id, other, mint, other, other, other, other, depositor,
         ];
@@ -431,17 +538,15 @@ mod tests {
         bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
         let ix = UiCompiledInstruction {
             program_id_index: 0,
-            // deposit_spl ix accounts: position 1 = mint(key 2), position 5 = depositor(key 7).
             accounts: vec![1, 2, 3, 4, 5, 7, 1, 1, 1],
             data: bs58::encode(bytes).into_string(),
             stack_height: None,
         };
 
-        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
-            .expect("well-formed SPL deposit must decode");
-        assert_eq!(decoded.data.amount, amount);
-        assert_eq!(decoded.depositor, depositor);
-        assert_eq!(decoded.asset_id, mint.to_bytes());
+        assert!(
+            decode_compiled_deposit(&ix, &account_keys, &program_id).is_none(),
+            "retired v2 deposit_spl must be rejected"
+        );
     }
 
     #[test]
