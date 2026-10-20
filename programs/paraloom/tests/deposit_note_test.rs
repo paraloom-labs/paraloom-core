@@ -439,3 +439,194 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         "cap must be unchanged after a rejected set"
     );
 }
+
+/// `set_min_deposit_amount` — re-price one append (#1132). Cold-authority
+/// (registry authority) signed.
+fn set_min_deposit_ix(program_id: Pubkey, authority: Pubkey, new_min: u64) -> Instruction {
+    let (bridge_state, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (validator_registry, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    Instruction {
+        program_id,
+        data: instruction::SetMinDepositAmount { new_min }.data(),
+        accounts: accounts::SetMinDepositAmount {
+            bridge_state,
+            validator_registry,
+            authority,
+        }
+        .to_account_metas(None),
+    }
+}
+
+/// An append has a price (#1132): `deposit_note` refuses an amount below the
+/// pool's `min_deposit_amount` before touching the vault or the tree, and a
+/// deposit for exactly the price goes through. `initialize` starts the price at
+/// `RECOMMENDED_MIN_DEPOSIT_LAMPORTS`, so evicting the 64-root window costs real
+/// money from the first deposit instead of 64 lamports.
+#[tokio::test]
+async fn deposit_note_rejects_a_deposit_below_the_append_price() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    let deposit = |amount: u64, k: u8| {
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 7;
+        let mut blinding = [0u8; 32];
+        blinding[0] = 100 + k;
+        Instruction {
+            program_id,
+            data: instruction::DepositNote {
+                amount,
+                pubkey,
+                blinding,
+            }
+            .data(),
+            accounts: accounts::DepositNote {
+                bridge_state: bridge_state_pda,
+                bridge_vault: bridge_vault_pda,
+                merkle_tree: tree_pda,
+                depositor: payer.pubkey(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        }
+    };
+
+    let price = paraloom_program::RECOMMENDED_MIN_DEPOSIT_LAMPORTS;
+    assert_eq!(price, 10_000_000, "recommended price is 0.01 SOL");
+
+    // One lamport short of the price: refused, nothing appended.
+    let mut tx = Transaction::new_with_payer(&[deposit(price - 1, 1)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "a deposit under the append price must be rejected"
+    );
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 0, "no leaf appended on a rejected deposit");
+
+    // Exactly the price: accepted, one leaf.
+    let mut tx = Transaction::new_with_payer(&[deposit(price, 2)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        tree.next_index, 1,
+        "a deposit at the price appends one leaf"
+    );
+}
+
+/// The append price is cold-authority config, not a constant (#1132): raising it
+/// refuses an amount the default price accepted, and lowering it to 0 unprices
+/// appends again — the escape hatch the proof-fixture tests use to replay a
+/// 1000-lamport note.
+#[tokio::test]
+async fn set_min_deposit_amount_re_prices_the_pool() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    // `k` keeps each deposit a distinct transaction: the same instruction bytes
+    // under the same blockhash would reuse the signature and replay the earlier
+    // result instead of reaching the program again.
+    let deposit_ix = |amount: u64, k: u8| {
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 11;
+        let mut blinding = [0u8; 32];
+        blinding[0] = 13 + k;
+        Instruction {
+            program_id,
+            data: instruction::DepositNote {
+                amount,
+                pubkey,
+                blinding,
+            }
+            .data(),
+            accounts: accounts::DepositNote {
+                bridge_state: bridge_state_pda,
+                bridge_vault: bridge_vault_pda,
+                merkle_tree: tree_pda,
+                depositor: payer.pubkey(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        }
+    };
+
+    // Raise the price above AMOUNT: the 1 SOL deposit the default price accepts
+    // becomes dust.
+    let mut tx = Transaction::new_with_payer(
+        &[set_min_deposit_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            AMOUNT + 1,
+        )],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let mut tx = Transaction::new_with_payer(&[deposit_ix(AMOUNT, 1)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "a raised price must refuse the same deposit"
+    );
+
+    // 0 unprices appends (fixture mode).
+    let mut tx = Transaction::new_with_payer(
+        &[set_min_deposit_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            0,
+        )],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let mut tx = Transaction::new_with_payer(&[deposit_ix(AMOUNT, 2)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 1, "the unpriced deposit appended one leaf");
+}

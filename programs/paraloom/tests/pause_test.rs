@@ -138,7 +138,7 @@ async fn pause_flips_flag_and_blocks_deposit() {
     let deposit_ix = Instruction {
         program_id,
         data: instruction::DepositNote {
-            amount: 1_000_000,
+            amount: paraloom_program::RECOMMENDED_MIN_DEPOSIT_LAMPORTS,
             pubkey: [1u8; 32],
             blinding: [2u8; 32],
         }

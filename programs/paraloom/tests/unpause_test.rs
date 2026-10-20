@@ -178,7 +178,7 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
         Instruction {
             program_id,
             data: instruction::DepositNote {
-                amount: 1_000_000,
+                amount: paraloom_program::RECOMMENDED_MIN_DEPOSIT_LAMPORTS,
                 pubkey: [1u8; 32],
                 blinding: [2u8; 32],
             }
@@ -198,6 +198,6 @@ async fn unpause_clears_flag_and_unblocks_deposit() {
     let raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut raw.data.as_slice()).unwrap();
     assert!(!state.paused);
-    assert_eq!(state.total_deposited, 1_000_000);
+    assert_eq!(state.total_deposited, paraloom_program::RECOMMENDED_MIN_DEPOSIT_LAMPORTS);
     assert_eq!(state.deposit_count, 1);
 }

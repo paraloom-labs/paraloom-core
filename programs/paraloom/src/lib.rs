@@ -8,6 +8,7 @@ use anchor_spl::token_interface::{
     self, Burn, Mint, TokenAccount, TokenInterface, TransferChecked,
 };
 
+mod deposit_limits;
 mod groth16;
 pub mod merkle_tree;
 mod quorum;
@@ -17,6 +18,8 @@ mod transact_verifier;
 mod transact_vk_data;
 
 declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
+
+pub use deposit_limits::{min_deposit_base_units, RECOMMENDED_MIN_DEPOSIT_LAMPORTS};
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
@@ -181,6 +184,10 @@ pub mod paraloom_program {
         // uncapped (which would be the exact unbounded-loss risk the cap
         // exists to remove).
         bridge_state.deposit_cap = 0;
+        // The price of one append (#1132): every deposit evicts a root from the
+        // 64-entry history ring, so the pool opens priced even while the cap is
+        // still 0. The cold authority re-prices it with `set_min_deposit_amount`.
+        bridge_state.min_deposit_amount = RECOMMENDED_MIN_DEPOSIT_LAMPORTS;
 
         msg!(
             "Bridge initialized with merkle root, program_version={}",
@@ -200,6 +207,11 @@ pub mod paraloom_program {
     /// emitted event carries the leaf index so the wallet learns where its note
     /// landed. Permissionless (the depositor's own funds), no proof or quorum —
     /// a deposit only *adds* value and creates a note the depositor controls.
+    ///
+    /// Permissionless is not free: an append evicts one root from the 64-entry
+    /// `is_known_root` window, so `amount` must carry the pool's price per
+    /// append, `BridgeState::min_deposit_amount` (#1132). Without it, 64 dust
+    /// deposits evict every in-flight prover's root and halt settlement.
     pub fn deposit_note(
         ctx: Context<DepositNote>,
         amount: u64,
@@ -207,7 +219,15 @@ pub mod paraloom_program {
         blinding: [u8; 32],
     ) -> Result<()> {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
+
+        // The price of an append (#1132). `deposit_note` is permissionless and
+        // each call advances the tree's root history ring by one, so a dust
+        // deposit is a liveness lever on every in-flight settlement proof. The
+        // price is a config field (`set_min_deposit_amount`) so it tracks the
+        // SOL market without a redeploy; `initialize` and `migrate_bridge_state`
+        // start it at `RECOMMENDED_MIN_DEPOSIT_LAMPORTS`.
+        let min_deposit = ctx.accounts.bridge_state.min_deposit_amount;
+        require!(amount >= min_deposit, BridgeError::DepositBelowMinimum);
 
         // The commitment is a Poseidon hash of `pubkey`/`blinding`, and the
         // syscall reduces any input >= the field modulus mod p. A non-canonical
@@ -780,6 +800,33 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Set the minimum value one `deposit_note` must carry
+    /// (`BridgeState::min_deposit_amount`), i.e. the price of an append (#1132).
+    ///
+    /// `deposit_note` is permissionless and every call advances the 64-entry
+    /// root history ring by one, evicting the oldest root, so the price of a
+    /// deposit is a liveness parameter of the whole settlement path: 64 dust
+    /// appends evict every in-flight prover's root. Config rather than a
+    /// compile-time constant so the price tracks the SOL market without a
+    /// redeploy — the same reasoning as `set_min_token_stake`.
+    ///
+    /// `0` is accepted (it unprices appends): the proof-fixture tests replay a
+    /// 1000-lamport note to pin the circuit root and price their pool at 0
+    /// explicitly. On a live pool the field starts at
+    /// [`RECOMMENDED_MIN_DEPOSIT_LAMPORTS`].
+    ///
+    /// Gated on the COLD registry authority (like `pause`/`set_deposit_cap`,
+    /// not the hot settlement key): a compromised settlement key must not be
+    /// able to re-price the pool to dust and open the griefing window.
+    pub fn set_min_deposit_amount(ctx: Context<SetMinDepositAmount>, new_min: u64) -> Result<()> {
+        let bridge_state = &mut ctx.accounts.bridge_state;
+        let previous = bridge_state.min_deposit_amount;
+        bridge_state.min_deposit_amount = new_min;
+
+        msg!("Min deposit amount set: {} -> {}", previous, new_min);
+        Ok(())
+    }
+
     /// Set the dual-stake token floor (`ValidatorRegistry.min_token_stake`): the
     /// minimum PARALOOM-token stake `register_validator` requires alongside the
     /// SOL stake.
@@ -1303,7 +1350,9 @@ pub mod paraloom_program {
     /// mint's `deposit_cap` (which starts at 0). Fee-on-transfer mints are
     /// rejected — the realized received amount must equal `amount`, or the
     /// committed note would out-value the vault and the wallet's client-side
-    /// commitment (which hashes `amount`) would not match the leaf.
+    /// commitment (which hashes `amount`) would not match the leaf. The append
+    /// is priced exactly like the native one (#1132): `amount` must be at least
+    /// [`min_deposit_base_units`] for this mint's decimals.
     pub fn deposit_note_spl(
         ctx: Context<DepositNoteSpl>,
         amount: u64,
@@ -1311,7 +1360,14 @@ pub mod paraloom_program {
         blinding: [u8; 32],
     ) -> Result<()> {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
+
+        // Same price per append as the native path (#1132), in the mint's own
+        // base units: 1 % of one whole token. Base units are not comparable
+        // across mints, so the floor follows the decimals; mints are curated
+        // (`init_asset_vault` is upgrade-authority gated), so an asset whose 1 %
+        // unit is worthless is never opened for shielding.
+        let min_deposit = min_deposit_base_units(ctx.accounts.mint.decimals);
+        require!(amount >= min_deposit, BridgeError::DepositBelowMinimum);
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
 
@@ -1402,6 +1458,12 @@ pub mod paraloom_program {
     /// The extra bytes are zero-filled, so `deposit_cap` starts at 0 — the
     /// closed, safe default (every deposit refused) that `initialize` also uses.
     /// Open it deliberately afterward with `set_deposit_cap`.
+    ///
+    /// `min_deposit_amount` is zero-filled the same way, which would leave the
+    /// append price (#1132) at 0 on a live pool — the one account that must not
+    /// be unpriced. A grown account is therefore stamped with
+    /// [`RECOMMENDED_MIN_DEPOSIT_LAMPORTS`] here; re-running the migration on an
+    /// already-current account is a no-op and keeps whatever the authority set.
     pub fn migrate_bridge_state(ctx: Context<MigrateBridgeState>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
@@ -1439,11 +1501,24 @@ pub mod paraloom_program {
                 )?;
             }
             bridge_ai.resize(new_len)?;
+
+            // Stamp the append price into the freshly grown bytes (#1132): a
+            // zero-filled `min_deposit_amount` would leave exactly the live pool
+            // unpriced. Round-trips the typed account so the field offset is
+            // never spelled out by hand.
+            let mut data = bridge_ai.try_borrow_mut_data()?;
+            let mut state = BridgeState::try_deserialize(&mut &data[..])?;
+            state.min_deposit_amount = RECOMMENDED_MIN_DEPOSIT_LAMPORTS;
+            let mut encoded = Vec::with_capacity(new_len);
+            state.try_serialize(&mut encoded)?;
+            require!(encoded.len() == data.len(), BridgeError::InvalidAmount);
+            data.copy_from_slice(&encoded);
         }
 
         msg!(
-            "BridgeState migrated to {} bytes (deposit_cap starts 0)",
-            new_len
+            "BridgeState migrated to {} bytes (deposit_cap starts 0, min deposit {})",
+            new_len,
+            RECOMMENDED_MIN_DEPOSIT_LAMPORTS
         );
         Ok(())
     }
@@ -2102,6 +2177,28 @@ pub struct SetDepositCap<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetMinDepositAmount<'info> {
+    #[account(
+        mut,
+        seeds = [b"bridge_state"],
+        bump
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+
+    // Cold-authority gated, exactly like `set_deposit_cap`: the price of an
+    // append is a liveness parameter of settlement, so the hot settlement key
+    // must not be able to lower it and reopen the griefing window (#1132).
+    #[account(
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SetMinTokenStake<'info> {
     // Gated on the registry authority (the cold key today, a DAO/governance PDA
     // once parameter control migrates to token holders).
@@ -2677,6 +2774,19 @@ pub struct BridgeState {
     /// to a chosen ceiling via `set_deposit_cap`. Appended last to keep the
     /// fixed `program_version` offset the L2 reads unchanged.
     pub deposit_cap: u64,
+    /// Minimum value one `deposit_note` must carry — the price of an append
+    /// (#1132). Every deposit appends one leaf and therefore evicts one root
+    /// from the 64-entry `is_known_root` history, so an unpriced append is a
+    /// lever on the liveness of every in-flight settlement proof: 64 dust
+    /// deposits halt the pool for dust. Raised/lowered by the cold authority
+    /// through `set_min_deposit_amount` so the price tracks the SOL market
+    /// without a redeploy (`set_min_token_stake`'s reasoning).
+    ///
+    /// [`RECOMMENDED_MIN_DEPOSIT_LAMPORTS`] is the starting value, set by
+    /// `initialize` and by `migrate_bridge_state` for a grown account; the cold
+    /// authority re-prices from there. Appended after `deposit_cap` to keep the
+    /// fixed `program_version` offset the L2 reads unchanged.
+    pub min_deposit_amount: u64,
 }
 
 /// Per-asset SPL shielding config (#779): one PDA per enabled mint, holding a
@@ -2916,4 +3026,7 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Deposit is below the minimum an append must carry")]
+    DepositBelowMinimum,
 }

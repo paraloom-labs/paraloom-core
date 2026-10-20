@@ -213,6 +213,27 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     )
     .await;
 
+    // 3c. price the pool per append (#1132) at 0: step 6 replays the fixture's
+    //     1000-lamport input note to pin the circuit root, far under the
+    //     recommended 0.01 SOL price `initialize` starts from. This test
+    //     exercises settlement, not the append price. Cold-authority signed.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetMinDepositAmount { new_min: 0 }.data(),
+            accounts: accounts::SetMinDepositAmount {
+                bridge_state: state_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
     // 4. register the settling authority as a validator (stakes 1 SOL).
     send(
         &mut banks_client,

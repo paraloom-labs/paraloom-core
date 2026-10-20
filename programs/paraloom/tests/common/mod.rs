@@ -107,6 +107,16 @@ use solana_sdk::pubkey::Pubkey;
 /// `mint_authority` is arbitrary — tests pre-fund token accounts directly
 /// rather than minting through it.
 pub fn add_stake_mint(pt: &mut ProgramTest, mint_authority: Pubkey) -> Pubkey {
+    add_mint_with_decimals(pt, mint_authority, 0)
+}
+
+/// Like [`add_stake_mint`] but with a chosen `decimals` — the per-mint deposit
+/// price (`min_deposit_base_units`) is derived from them.
+pub fn add_mint_with_decimals(
+    pt: &mut ProgramTest,
+    mint_authority: Pubkey,
+    decimals: u8,
+) -> Pubkey {
     let mint = Pubkey::new_unique();
     let mut data = vec![0u8; spl_token::state::Mint::LEN];
     spl_token::state::Mint {
@@ -114,7 +124,7 @@ pub fn add_stake_mint(pt: &mut ProgramTest, mint_authority: Pubkey) -> Pubkey {
         // Non-zero so a `slash` burn (which reduces supply) never underflows;
         // larger than any amount a test funds into token accounts.
         supply: 1_000_000_000_000_000,
-        decimals: 0,
+        decimals,
         is_initialized: true,
         freeze_authority: COption::None,
     }

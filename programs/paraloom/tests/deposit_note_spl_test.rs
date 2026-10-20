@@ -18,7 +18,7 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, add_stake_mint, add_token_account, program_test};
+use common::{add_mint_with_decimals, add_program_data, add_stake_mint, add_token_account, program_test};
 
 const DEPOSIT: u64 = 1_000_000;
 const DEPOSITOR_FUND: u64 = 10_000_000;
@@ -311,4 +311,70 @@ async fn deposit_note_spl_closed_until_cap_opened() {
     tx.sign(&[&depositor], blockhash);
     let result = banks.process_transaction(tx).await;
     assert!(result.is_err(), "deposits are closed at cap 0");
+}
+
+/// The SPL lane prices an append too (#1132): the leaf ring is shared with the
+/// native path, so `deposit_note_spl` refuses anything under 1 % of one whole
+/// token (derived from the mint's decimals) without appending a leaf, while
+/// exactly 1 % goes through.
+#[tokio::test]
+async fn deposit_note_spl_charges_one_percent_of_a_whole_token() {
+    let program_id = paraloom_program::ID;
+    let mut pt = program_test(program_id);
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    // 6 decimals: 1 % of one whole token is 10_000 base units (0.01 USDC).
+    let mint = add_mint_with_decimals(&mut pt, Pubkey::new_unique(), 6);
+
+    let depositor = Keypair::new();
+    pt.add_account(
+        depositor.pubkey(),
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let depositor_token = add_token_account(&mut pt, mint, depositor.pubkey(), DEPOSITOR_FUND);
+
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    init_spl_pool(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        mint,
+        DEPOSITOR_FUND,
+    )
+    .await;
+
+    let price = paraloom_program::min_deposit_base_units(6);
+    assert_eq!(price, 10_000, "1 % of a 6-decimal token");
+
+    // One base unit is refused, and nothing is appended.
+    let ix = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, 1);
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
+    tx.sign(&[&depositor], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "a 1-base-unit SPL deposit must be rejected"
+    );
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 0, "no leaf appended on a rejected deposit");
+
+    // Exactly 1 % of one token is accepted.
+    let ix = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, price);
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
+    tx.sign(&[&depositor], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        tree.next_index, 1,
+        "a deposit at the price appends one leaf"
+    );
 }

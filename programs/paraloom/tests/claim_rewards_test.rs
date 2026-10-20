@@ -190,6 +190,26 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
         },
     )
     .await;
+    // Price the pool per append (#1132) at 0: the fixture below replays a
+    // 1000-lamport input note to pin the circuit root, which is far under the
+    // recommended 0.01 SOL price `initialize` starts from. This test exercises
+    // rewards, not the append price.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetMinDepositAmount { new_min: 0 }.data(),
+            accounts: accounts::SetMinDepositAmount {
+                bridge_state: state_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
     send(
         &mut banks_client,
         recent_blockhash,
