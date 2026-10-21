@@ -28,6 +28,21 @@
 //!    The on-chain deposit shows the ephemeral fresh address as the depositor,
 //!    not the user.
 //!
+//! # Failure handling
+//!
+//! Step 1 is the point of no return: once the withdraw leg settles the note's
+//! nullifier is burned and the realized value sits at a throwaway ephemeral
+//! address. A later step failing must therefore never simply return its error —
+//! that would orphan the funds (the ephemeral keypair is local to the call) and
+//! every retry would withdraw yet another full note to yet another address. So
+//! a swap or slippage failure after the withdraw re-deposits the realized value
+//! back into the shielded pool ([`PrivateSwapRelayer::execute`]; the swap-out
+//! flow keeps the keypair with the caller, who can recover it themselves). When
+//! that compensating deposit is impossible — an SPL input, which has no
+//! `deposit_spl` path on the native-only v3 program — the error is upgraded to
+//! [`RelayerError::WithdrawOrphaned`] naming the exact amount and address,
+//! instead of reporting a plain swap failure and losing the funds silently.
+//!
 //! # Honest privacy limits
 //!
 //! This orchestration does NOT claim full trade privacy. Two limits are
@@ -93,6 +108,36 @@ pub enum RelayerError {
     /// check, which the provider setting alone did not give a single request.
     #[error("swap output {out_amount} is below the caller minimum {min_out}")]
     SlippageExceeded { out_amount: u64, min_out: u64 },
+
+    /// A swap failed **after** the withdraw leg had already settled, and the
+    /// realized value could not be swept back into the shielded pool, so it is
+    /// stranded at the per-swap ephemeral address. This is the one failure mode
+    /// that loses funds: the nullifier is burned on-chain, the ephemeral
+    /// keypair is dropped with the request, and nothing else can move the
+    /// value. Callers must surface this to the user (and to whatever recovery
+    /// scan they run) rather than treating it as an ordinary swap failure.
+    #[error(
+        "swap failed after the withdraw settled ({reason}); {orphaned} is stranded at fresh address {fresh_address}: {sweep_error}"
+    )]
+    WithdrawOrphaned {
+        /// The underlying swap/slippage failure that aborted the order.
+        reason: String,
+        /// Amount left at the ephemeral address, in the input asset's smallest
+        /// unit.
+        orphaned: u64,
+        /// Hex-encoded ephemeral address holding the stranded value.
+        fresh_address: String,
+        /// Why the compensating re-deposit could not be made.
+        sweep_error: String,
+    },
+
+    /// A swap for this input note is already in flight on this relayer. Two
+    /// concurrent orders over the same note would each burn the same nullifier
+    /// and each re-shield an output note, so the second is refused instead of
+    /// racing the first (the double-re-shield that mints a phantom, unspendable
+    /// shielded balance).
+    #[error("a private swap for note {note_pubkey} is already in flight")]
+    SwapAlreadyInFlight { note_pubkey: String },
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -354,6 +399,37 @@ pub struct PrivateSwapRelayer<S: SwapProvider, T: Submitter> {
     /// spend the very lamports it must keep to pay for itself. Default 0 (mock
     /// providers have no rent); real Solana submitters set the on-chain figure.
     native_swap_overhead_lamports: u64,
+    /// Whether a swap that fails *after* its withdraw leg settled re-deposits
+    /// the realized value straight back into the shielded pool instead of
+    /// leaving it at the throwaway ephemeral address. Default `true`: the
+    /// withdraw burned the note's nullifier, so nothing else can ever move that
+    /// value once the per-swap keypair is dropped. Only a caller that has its
+    /// own out-of-band recovery for the ephemeral address should turn it off.
+    sweep_failed_withdrawals: bool,
+    /// Input-note public keys currently mid-swap on this relayer. Guards
+    /// against two concurrent orders over the same note, which would each burn
+    /// the same nullifier and each re-shield an output — doubling the user's
+    /// displayed shielded balance with a phantom note the chain rejects.
+    in_flight: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+}
+
+/// Removes a note from the relayer's in-flight set when the order it guards
+/// finishes — on success *and* on every error path, since it is dropped rather
+/// than released by hand.
+struct InFlightGuard<'a, S: SwapProvider, T: Submitter> {
+    relayer: &'a PrivateSwapRelayer<S, T>,
+    note_pubkey: [u8; 32],
+}
+
+impl<S: SwapProvider, T: Submitter> Drop for InFlightGuard<'_, S, T> {
+    fn drop(&mut self) {
+        let mut set = self
+            .relayer
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.remove(&self.note_pubkey);
+    }
 }
 
 impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
@@ -363,7 +439,32 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             swap_provider,
             submitter,
             native_swap_overhead_lamports: 0,
+            sweep_failed_withdrawals: true,
+            in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Turn the post-withdraw sweep (see `sweep_failed_withdrawals`) off. Only
+    /// for callers that retain the per-swap ephemeral keypair themselves and
+    /// recover the stranded value out of band.
+    pub fn with_failed_withdraw_sweep(mut self, enabled: bool) -> Self {
+        self.sweep_failed_withdrawals = enabled;
+        self
+    }
+
+    /// Claim the input note for this order, or fail if another order already
+    /// holds it. The returned guard releases the claim on drop.
+    fn begin(&self, note_pubkey: [u8; 32]) -> Result<InFlightGuard<'_, S, T>> {
+        let mut set = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(note_pubkey) {
+            return Err(RelayerError::SwapAlreadyInFlight {
+                note_pubkey: hex::encode(note_pubkey),
+            });
+        }
+        Ok(InFlightGuard {
+            relayer: self,
+            note_pubkey,
+        })
     }
 
     /// Set the native-SOL swap overhead reserve (see the field docs). Real
@@ -387,6 +488,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         &self,
         request: &PrivateSwapRequest,
         ephemeral: &Keypair,
+        caller_holds_ephemeral: bool,
     ) -> Result<(SubmittedLeg, u64)> {
         let amount_in = request.amount_in;
         if amount_in == 0 {
@@ -449,10 +551,29 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         } else {
             withdrawn
         };
-        let swap = self
+        let swap = match self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
-            .await?;
+            .await
+        {
+            Ok(swap) => swap,
+            // The withdraw leg already settled: the note's nullifier is burned
+            // and `withdrawn` sits at the throwaway ephemeral address. Returning
+            // the provider error here would orphan it — the keypair dies with
+            // this call — so sweep it straight back into the shielded pool.
+            Err(reason) => {
+                return Err(self
+                    .recover_orphaned_withdraw(
+                        request,
+                        ephemeral,
+                        in_leg,
+                        withdrawn,
+                        caller_holds_ephemeral,
+                        reason,
+                    )
+                    .await)
+            }
+        };
 
         // Independent slippage floor. The provider enforces its own slippage
         // bound on-chain, but that is a single value fixed when the relayer is
@@ -461,15 +582,103 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // here, before the fee accounting and re-deposit/delivery downstream act
         // on it, so a bad fill aborts rather than being re-shielded or handed
         // over unchecked.
+        //
+        // This abort lands *after* the withdraw settled, so it takes the same
+        // recovery path: the realized input value goes back into the pool rather
+        // than being left at an address whose key nobody keeps.
         if let Some(min_out) = request.min_out_amount {
             if swap.out_amount < min_out {
-                return Err(RelayerError::SlippageExceeded {
-                    out_amount: swap.out_amount,
-                    min_out,
-                });
+                return Err(self
+                    .recover_orphaned_withdraw(
+                        request,
+                        ephemeral,
+                        in_leg,
+                        withdrawn,
+                        caller_holds_ephemeral,
+                        RelayerError::SlippageExceeded {
+                            out_amount: swap.out_amount,
+                            min_out,
+                        },
+                    )
+                    .await);
             }
         }
         Ok((withdraw_leg, swap.out_amount))
+    }
+
+    /// Compensate a swap that failed **after** its withdraw leg settled.
+    ///
+    /// The withdraw burned the input note's nullifier, so `withdrawn` now lives
+    /// at the per-swap ephemeral address and nothing but that keypair can move
+    /// it — and the keypair is local to the call that is unwinding. Leaving the
+    /// value there is a silent loss, and every retry would withdraw *another*
+    /// full note to yet another throwaway address. So this re-deposits the
+    /// realized value back into the shielded pool to the caller's re-shield
+    /// recipient, producing a note the user can spend again.
+    ///
+    /// The recovery note reuses `reshield_recipient` / `reshield_randomness`:
+    /// the *output* note this order would have produced is never created on the
+    /// failure path, so the commitment cannot collide.
+    ///
+    /// Returns the error the caller should see. The original failure is passed
+    /// through unchanged when the sweep succeeds (the order simply did not
+    /// happen, and the funds are home); when the sweep cannot be made the error
+    /// is upgraded to [`RelayerError::WithdrawOrphaned`], which names the exact
+    /// stranded amount and address so the caller can surface it and reconcile.
+    async fn recover_orphaned_withdraw(
+        &self,
+        request: &PrivateSwapRequest,
+        ephemeral: &Keypair,
+        in_leg: WithdrawLeg,
+        withdrawn: u64,
+        caller_holds_ephemeral: bool,
+        reason: RelayerError,
+    ) -> RelayerError {
+        if !self.sweep_failed_withdrawals {
+            return reason;
+        }
+
+        // The swap-out flow hands `fresh` to the caller, who keeps its keypair
+        // and therefore keeps control of whatever the failed swap left there —
+        // the funds are not orphaned and re-shielding them would contradict the
+        // caller's request to hold the output at `fresh`. Only the fire-and-
+        // forget `execute` path drops the key and needs the sweep.
+        if caller_holds_ephemeral {
+            return reason;
+        }
+
+        // Only the native leg can be re-deposited on the native-only v3 program;
+        // an SPL input has no `deposit_spl` path to sweep it back through.
+        if in_leg != WithdrawLeg::Native {
+            return RelayerError::WithdrawOrphaned {
+                reason: reason.to_string(),
+                orphaned: withdrawn,
+                fresh_address: hex::encode(ephemeral.pubkey().to_bytes()),
+                sweep_error: "input leg is SPL; the native-only v3 program has no \
+                              deposit_spl path to re-shield it"
+                    .to_string(),
+            };
+        }
+
+        match self
+            .submitter
+            .submit_deposit_from_fresh(
+                WithdrawLeg::Native,
+                withdrawn,
+                ephemeral,
+                request.reshield_recipient.clone(),
+                request.reshield_randomness,
+            )
+            .await
+        {
+            Ok(_sweep_leg) => reason,
+            Err(sweep_error) => RelayerError::WithdrawOrphaned {
+                reason: reason.to_string(),
+                orphaned: withdrawn,
+                fresh_address: hex::encode(ephemeral.pubkey().to_bytes()),
+                sweep_error: sweep_error.to_string(),
+            },
+        }
     }
 
     /// Execute one private swap end to end.
@@ -489,6 +698,12 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
     ///
     /// [`execute_swap_out`]: Self::execute_swap_out
     pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
+        // One order per input note at a time. Two concurrent orders over the
+        // same note would each withdraw it (the second nullifier burn reverts
+        // on-chain, but both could already have re-shielded) — the concurrent
+        // double re-shield that fabricates a phantom shielded balance. The
+        // guard releases on every exit path, including the error ones below.
+        let _in_flight = self.begin(request.in_note_pubkey)?;
         // A brand-new keypair per swap — nothing on-chain links it to the user.
         // This is the relayer-layer expression of the link-severing property
         // that the withdrawal nullifier enforces on-chain.
@@ -497,7 +712,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let out_leg = WithdrawLeg::for_asset(request.asset_out);
 
         let (withdraw_leg, gross_out_amount) =
-            self.withdraw_then_swap(&request, &ephemeral).await?;
+            self.withdraw_then_swap(&request, &ephemeral, false).await?;
 
         // Step 3: the swap output is ALREADY net of the relayer's fee — it is
         // realized inside the route by the swap provider (Jupiter's
@@ -562,7 +777,9 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         request: PrivateSwapRequest,
         fresh: &Keypair,
     ) -> Result<SwapOutResult> {
-        let (withdraw_leg, gross_out_amount) = self.withdraw_then_swap(&request, fresh).await?;
+        let _in_flight = self.begin(request.in_note_pubkey)?;
+        let (withdraw_leg, gross_out_amount) =
+            self.withdraw_then_swap(&request, fresh, true).await?;
         Ok(SwapOutResult {
             withdraw_leg,
             gross_out_amount,
@@ -838,7 +1055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_below_min_out_is_rejected_before_redeposit() {
+    async fn swap_below_min_out_is_rejected_and_the_withdraw_is_swept_back() {
         // 1:1 swap of 1_000_000: 997_500 reaches the fresh address after the
         // 25bps withdraw fee and is swapped 1:1, so the realized output is
         // 997_500. A caller minimum of 1_000_000 is above that, so the swap must
@@ -859,11 +1076,84 @@ mod tests {
                 min_out: 1_000_000
             }
         ));
-        // The withdraw leg settled, but the check fires before the re-deposit —
-        // so no deposit leg was ever submitted.
+        // The withdraw leg settled, so the realized value cannot be left at the
+        // throwaway ephemeral address: a compensating deposit of the *input*
+        // asset (997_500, not the rejected swap output) goes back to the user.
         let legs = relayer.submitter.recorded();
-        assert_eq!(legs.len(), 1);
+        assert_eq!(legs.len(), 2, "withdraw + compensating sweep");
         assert_eq!(legs[0].leg, WithdrawLeg::Native);
+        assert_eq!(legs[1].leg, WithdrawLeg::Native);
+        assert_eq!(legs[1].amount, 997_500);
+        // The sweep returns to the user's recipient, from the same ephemeral
+        // address the withdraw funded.
+        assert_eq!(legs[1].fresh_address, legs[0].fresh_address);
+    }
+
+    #[tokio::test]
+    async fn failed_swap_sweep_can_be_disabled_for_out_of_band_recovery() {
+        // A caller that keeps the ephemeral keypair itself can opt out; the
+        // abort then leaves the value where it was withdrawn to.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_failed_withdraw_sweep(false);
+        let req = PrivateSwapRequest {
+            min_out_amount: Some(1_000_000),
+            ..request(native_note(1_000_000), NATIVE_SOL_ASSET, 0)
+        };
+        relayer.execute(req).await.expect_err("still errors");
+        assert_eq!(relayer.submitter.recorded().len(), 1, "withdraw only");
+    }
+
+    #[tokio::test]
+    async fn failed_spl_input_swap_reports_the_orphan_instead_of_silently_losing_it() {
+        // No `deposit_spl` path exists on the native-only v3 program, so an SPL
+        // input that aborts after its withdraw cannot be swept. The error must
+        // name the stranded amount and address rather than masquerade as a
+        // plain swap failure.
+        let mint: AssetId = [0x77u8; 32];
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let req = PrivateSwapRequest {
+            min_out_amount: Some(10_000_000),
+            ..request(spl_note(mint, 5_000), mint, 0)
+        };
+        let err = relayer
+            .execute(req)
+            .await
+            .expect_err("below-min SPL fill must error");
+        match err {
+            RelayerError::WithdrawOrphaned {
+                orphaned,
+                fresh_address,
+                ..
+            } => {
+                // 5_000 minus the 25bps withdraw fee.
+                assert_eq!(orphaned, 4_988);
+                assert_eq!(fresh_address.len(), 64);
+            }
+            other => panic!("expected WithdrawOrphaned, got {other:?}"),
+        }
+        // Only the withdraw was submitted; no failed deposit attempt.
+        assert_eq!(relayer.submitter.recorded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_swaps_of_one_note_are_refused() {
+        // Two orders over the same note would each burn the same nullifier and
+        // each re-shield an output — the double-re-shield that fabricates a
+        // phantom shielded balance. The second is refused while the first holds
+        // the note.
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let req = request(native_note(1_000), NATIVE_SOL_ASSET, 0);
+        let guard = relayer
+            .begin(req.in_note_pubkey)
+            .expect("first order claims the note");
+        let err = relayer
+            .execute(req.clone())
+            .await
+            .expect_err("second concurrent order must be refused");
+        assert!(matches!(err, RelayerError::SwapAlreadyInFlight { .. }));
+        drop(guard);
+        // Once the first order finishes, the note is free again.
+        relayer.execute(req).await.expect("retry after release");
     }
 
     #[tokio::test]
