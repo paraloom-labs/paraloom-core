@@ -655,16 +655,28 @@ impl EventListener {
         // Create shielded address from recipient
         let recipient = ShieldedAddress(event.recipient);
 
-        // Create deposit transaction, indexed under the deposit's asset (#237):
+        // Create deposit transaction, indexed under the deposit's asset (#237, #1152):
         // an SPL deposit carries its mint, a native deposit NATIVE_SOL.
-        let deposit_tx = DepositTx::new_asset(
+        // Uses try_new_asset to guard against underflow panics if fee > amount.
+        let deposit_tx = match DepositTx::try_new_asset(
             event.from.to_vec(),
             event.amount,
             recipient,
             event.randomness,
             event.fee,
             event.asset_id,
-        );
+        ) {
+            Some(tx) => tx,
+            None => {
+                log::warn!(
+                    "Deposit rejected: fee ({}) exceeds deposit amount ({})",
+                    event.fee, event.amount
+                );
+                return Err(BridgeError::InvalidTransaction(
+                    "Deposit fee exceeds deposit amount".to_string(),
+                ));
+            }
+        };
 
         // Verify deposit transaction
         if !deposit_tx.verify() {

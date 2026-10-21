@@ -67,6 +67,56 @@ pub struct DepositTx {
 }
 
 impl DepositTx {
+    /// Create a new deposit transaction with checked fee subtraction (#1152).
+    /// Returns None if fee > amount.
+    pub fn try_new(
+        from_public: Vec<u8>,
+        amount: u64,
+        recipient: ShieldedAddress,
+        randomness: [u8; 32],
+        fee: u64,
+    ) -> Option<Self> {
+        Self::try_new_asset(
+            from_public,
+            amount,
+            recipient,
+            randomness,
+            fee,
+            crate::privacy::types::NATIVE_SOL_ASSET,
+        )
+    }
+
+    /// Asset-aware deposit with checked fee subtraction (#1152).
+    /// Returns None if fee > amount, avoiding underflow panics.
+    pub fn try_new_asset(
+        from_public: Vec<u8>,
+        amount: u64,
+        recipient: ShieldedAddress,
+        randomness: [u8; 32],
+        fee: u64,
+        asset_id: crate::privacy::types::AssetId,
+    ) -> Option<Self> {
+        let net_amount = amount.checked_sub(fee)?;
+        let tx_id = uuid::Uuid::new_v4().to_string();
+        let output_note = Note::new(recipient, net_amount, randomness, asset_id);
+        let output_commitment = output_note.commitment();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        Some(DepositTx {
+            tx_id,
+            from_public,
+            amount,
+            output_commitment,
+            output_note,
+            fee,
+            timestamp,
+        })
+    }
+
     /// Create a new deposit transaction
     pub fn new(
         from_public: Vec<u8>,
@@ -89,6 +139,9 @@ impl DepositTx {
     /// SPL mint's bytes, or `NATIVE_SOL_ASSET` for native SOL), so an SPL
     /// deposit is indexed into the pool under its asset and can later be
     /// withdrawn through `withdraw_spl`.
+    ///
+    /// Guarded against underflow panic (#1152): if `fee > amount`, constructs
+    /// a degraded deposit note with 0 amount so `verify()` rejects cleanly via `self.amount < self.fee`.
     pub fn new_asset(
         from_public: Vec<u8>,
         amount: u64,
@@ -97,10 +150,21 @@ impl DepositTx {
         fee: u64,
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
-        let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
-        let output_commitment = output_note.commitment();
+        if let Some(tx) = Self::try_new_asset(
+            from_public.clone(),
+            amount,
+            recipient.clone(),
+            randomness,
+            fee,
+            asset_id,
+        ) {
+            return tx;
+        }
 
+        // When fee > amount, construct a degraded deposit without panicking so verify() returns false cleanly.
+        let tx_id = uuid::Uuid::new_v4().to_string();
+        let output_note = Note::new(recipient, 0, randomness, asset_id);
+        let output_commitment = output_note.commitment();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -433,6 +497,20 @@ mod tests {
         // Make fee larger than amount
         tx.fee = 2000;
         assert!(!tx.verify());
+    }
+
+    #[test]
+    fn test_deposit_constructor_fee_exceeds_amount_no_panic() {
+        let from_public = vec![1u8; 32];
+        let recipient = ShieldedAddress([2u8; 32]);
+        let randomness = [3u8; 32];
+
+        // Direct constructor with fee > amount must not panic and verify() must return false (#1152)
+        let tx = DepositTx::new(from_public.clone(), 50, recipient.clone(), randomness, 100);
+        assert!(!tx.verify());
+
+        // Checked constructor must return None without panicking
+        assert!(DepositTx::try_new(from_public, 50, recipient, randomness, 100).is_none());
     }
 
     #[test]
