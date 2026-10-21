@@ -17,12 +17,17 @@ impl CommitmentGenerator {
         pedersen::commit(value, randomness)
     }
 
-    /// Create a commitment from a note
+    /// Create a commitment from a note (Poseidon note commitment)
     pub fn commit_note(note: &Note) -> Commitment {
         note.commitment()
     }
 
-    /// Verify a commitment opens to a specific value
+    /// Verify a note commitment opens to the given `Note` (Poseidon scheme)
+    pub fn verify_note_opening(commitment: &Commitment, note: &Note) -> bool {
+        *commitment == note.commitment()
+    }
+
+    /// Verify a Pedersen value commitment opens to a specific `(value, randomness)` pair
     pub fn verify_opening(commitment: &Commitment, value: u64, randomness: &[u8; 32]) -> bool {
         pedersen::verify(commitment, value, randomness)
     }
@@ -163,8 +168,12 @@ mod tests {
         let c1 = CommitmentGenerator::commit_note(&note);
         let c2 = note.commitment();
 
-        // Both methods should produce same result
+        // Both methods should produce same result and verify via verify_note_opening
         assert_eq!(c1, c2);
+        assert!(CommitmentGenerator::verify_note_opening(&c1, &note));
+
+        let tampered = Note::new_native(addr, 1001, [42u8; 32]);
+        assert!(!CommitmentGenerator::verify_note_opening(&c1, &tampered));
     }
 
     #[test]
