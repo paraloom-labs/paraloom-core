@@ -98,7 +98,7 @@ impl DepositTx {
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
+        let output_note = Note::new(recipient, amount.checked_sub(fee).ok_or(PrivacyError::FeeExceedsAmount)?, randomness, asset_id);
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()
