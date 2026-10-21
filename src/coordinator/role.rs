@@ -23,8 +23,8 @@ pub enum CoordinatorRole {
     /// Mirroring a remote primary's state and watching for liveness.
     /// Promotes itself if the primary appears stalled.
     Standby {
-        /// Identity of the primary being mirrored. Used as the
-        /// tiebreak basis when multiple standbys race to promote.
+        /// Identity of the primary being mirrored. Kept for
+        /// audit; the promotion tiebreak is the `rank` field.
         primary: NodeId,
         /// Wall-clock instant of the most recently observed
         /// heartbeat from `primary`. Initialised to construction
@@ -33,6 +33,13 @@ pub enum CoordinatorRole {
         /// How long the standby tolerates silence from the primary
         /// before declaring it stalled. Tunable per deployment.
         stall_threshold: Duration,
+        /// Deterministic promotion rank. A standby declares a stall
+        /// only once `stall_threshold + rank * PROMOTION_RANK_SLOT`
+        /// has elapsed, so standbys with different ranks promote at
+        /// different times instead of all at once (split-brain,
+        /// issue #1160 vulnerability 4). Rank 0 is the legacy
+        /// behaviour.
+        rank: u64,
     },
 }
 
@@ -46,8 +53,30 @@ impl CoordinatorRole {
             primary,
             last_heartbeat_at: now,
             stall_threshold,
+            rank: 0,
         }
     }
+
+    /// Construct a `Standby` role with an explicit promotion
+    /// `rank` (see the `rank` field). Higher ranks wait longer
+    /// before promoting.
+    pub fn standby_with_rank(
+        primary: NodeId,
+        stall_threshold: Duration,
+        now: Instant,
+        rank: u64,
+    ) -> Self {
+        CoordinatorRole::Standby {
+            primary,
+            last_heartbeat_at: now,
+            stall_threshold,
+            rank,
+        }
+    }
+
+    /// Extra silence a standby tolerates per unit of promotion
+    /// rank before it declares its primary stalled.
+    pub const PROMOTION_RANK_SLOT: Duration = Duration::from_secs(5);
 
     /// True if this role is `Primary`.
     pub fn is_primary(&self) -> bool {
@@ -72,8 +101,13 @@ impl CoordinatorRole {
             CoordinatorRole::Standby {
                 last_heartbeat_at,
                 stall_threshold,
+                rank,
                 ..
-            } => now.saturating_duration_since(*last_heartbeat_at) > *stall_threshold,
+            } => {
+                let effective_threshold =
+                    *stall_threshold + Self::PROMOTION_RANK_SLOT.saturating_mul(*rank as u32);
+                now.saturating_duration_since(*last_heartbeat_at) > effective_threshold
+            }
         }
     }
 
@@ -164,5 +198,26 @@ mod tests {
         let mut role = CoordinatorRole::Primary;
         role.record_heartbeat(Instant::now());
         assert!(role.is_primary());
+    }
+}
+
+
+#[cfg(test)]
+mod rank_backoff_tests {
+    use super::*;
+
+    fn nodeid(byte: u8) -> NodeId {
+        NodeId(vec![byte])
+    }
+
+    #[test]
+    fn ranked_standby_waits_longer_before_promoting() {
+        let t0 = Instant::now();
+        let rank0 = CoordinatorRole::standby_of(nodeid(1), Duration::from_secs(30), t0);
+        let rank2 = CoordinatorRole::standby_with_rank(nodeid(1), Duration::from_secs(30), t0, 2);
+        // Rank 2 waits 30s + 2*5s = 40s; at +36s only rank 0 stalled.
+        assert!(rank0.is_stalled(t0 + Duration::from_secs(36)));
+        assert!(!rank2.is_stalled(t0 + Duration::from_secs(36)));
+        assert!(rank2.is_stalled(t0 + Duration::from_secs(41)));
     }
 }

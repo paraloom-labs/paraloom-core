@@ -119,6 +119,11 @@ impl DepositTx {
 
     /// Verify deposit transaction
     pub fn verify(&self) -> bool {
+        // Amount must be positive
+        if self.amount == 0 {
+            return false;
+        }
+
         // Check amount covers fee
         if self.amount < self.fee {
             return false;
@@ -204,6 +209,28 @@ impl TransferTx {
             return false;
         }
 
+        // Reject duplicate or all-zero input nullifiers: listing
+        // the same nullifier twice would spend the same note twice
+        // in a single transfer, and the zero nullifier is the
+        // unspent sentinel value (issue #1160, vulnerability 3).
+        let mut seen_nullifiers = std::collections::HashSet::new();
+        for nullifier in &self.input_nullifiers {
+            if nullifier.0 == [0u8; 32] {
+                return false;
+            }
+            if !seen_nullifiers.insert(nullifier.0) {
+                return false;
+            }
+        }
+
+        // Reject duplicate output commitments.
+        let mut seen_commitments = std::collections::HashSet::new();
+        for commitment in &self.output_commitments {
+            if !seen_commitments.insert(commitment.0) {
+                return false;
+            }
+        }
+
         // Outputs and notes must match
         if self.output_commitments.len() != self.output_notes.len() {
             return false;
@@ -278,13 +305,20 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
-        // Amount must cover fee
-        if self.amount < self.fee {
+        // Amount must strictly exceed the fee: amount == fee is a
+        // zero-net payout and amount == 0 withdraws nothing
+        // (issue #1160, vulnerability 3).
+        if self.amount <= self.fee {
             return false;
         }
 
-        // Must have recipient
-        if self.to_public.is_empty() {
+        // Recipient must be a full 32-byte public address
+        if self.to_public.len() != 32 {
+            return false;
+        }
+
+        // Input nullifier must not be the all-zero sentinel value
+        if self.input_nullifier.0 == [0u8; 32] {
             return false;
         }
 
@@ -333,13 +367,20 @@ impl TrackedTransaction {
 
     /// Mark as verified
     pub fn mark_verified(&mut self) {
+        // Rejected is terminal: a rejected transaction must never
+        // be resurrected to Accepted (issue #1160, vulnerability 3).
+        if matches!(self.status, TransactionStatus::Rejected { .. }) {
+            return;
+        }
         self.status = TransactionStatus::Accepted;
-        self.confirmations += 1;
+        self.confirmations = self.confirmations.saturating_add(1);
     }
 
     /// Mark as rejected
     pub fn mark_rejected(&mut self, reason: String) {
         self.status = TransactionStatus::Rejected { reason };
+        // A rejected transaction reports no confirmations.
+        self.confirmations = 0;
     }
 }
 
@@ -445,5 +486,106 @@ mod tests {
         );
 
         assert!(!tx.verify_structure());
+    }
+}
+
+
+#[cfg(test)]
+mod issue_1160_tests {
+    use super::*;
+
+    fn note_with(seed: u8, amount: u64) -> Note {
+        Note::new_native(ShieldedAddress([seed; 32]), amount, [seed; 32])
+    }
+
+    #[test]
+    fn transfer_rejects_duplicate_input_nullifiers() {
+        let dup = Nullifier([9u8; 32]);
+        let tx = TransferTx::new(
+            vec![dup.clone(), dup],
+            vec![note_with(1, 500)],
+            [0u8; 32],
+            10,
+        );
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn transfer_rejects_zero_input_nullifier() {
+        let tx = TransferTx::new(
+            vec![Nullifier([0u8; 32])],
+            vec![note_with(1, 500)],
+            [0u8; 32],
+            10,
+        );
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn transfer_rejects_duplicate_output_commitments() {
+        let note = note_with(3, 500);
+        let same_note = note_with(3, 500);
+        let tx = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])],
+            vec![note, same_note],
+            [0u8; 32],
+            10,
+        );
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn transfer_accepts_well_formed_structure() {
+        let tx = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([2u8; 32])],
+            vec![note_with(1, 500), note_with(2, 300)],
+            [0u8; 32],
+            10,
+        );
+        assert!(tx.verify_structure());
+    }
+
+    #[test]
+    fn withdraw_rejects_zero_net_and_bad_recipient_and_zero_nullifier() {
+        // amount == fee -> zero net payout
+        let tx = WithdrawTx::new(Nullifier([1u8; 32]), 10, vec![5u8; 32], [0u8; 32], 10);
+        assert!(!tx.verify());
+        // recipient not 32 bytes
+        let tx = WithdrawTx::new(Nullifier([1u8; 32]), 100, vec![0xFF], [0u8; 32], 10);
+        assert!(!tx.verify());
+        // zero nullifier
+        let tx = WithdrawTx::new(Nullifier([0u8; 32]), 100, vec![5u8; 32], [0u8; 32], 10);
+        assert!(!tx.verify());
+        // zero amount, zero fee
+        let tx = WithdrawTx::new(Nullifier([1u8; 32]), 0, vec![5u8; 32], [0u8; 32], 0);
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn withdraw_accepts_well_formed() {
+        let tx = WithdrawTx::new(Nullifier([1u8; 32]), 100, vec![5u8; 32], [0u8; 32], 10);
+        assert!(tx.verify());
+    }
+
+    #[test]
+    fn deposit_rejects_zero_amount() {
+        let tx = DepositTx::new(vec![1u8; 32], 0, ShieldedAddress([2u8; 32]), [42u8; 32], 0);
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn tracked_rejected_is_terminal_and_resets_confirmations() {
+        let withdraw = WithdrawTx::new(Nullifier([1u8; 32]), 100, vec![5u8; 32], [0u8; 32], 10);
+        let mut tracked = TrackedTransaction::new(ShieldedTransaction::Withdraw(withdraw));
+        tracked.mark_verified();
+        assert_eq!(tracked.confirmations, 1);
+        tracked.mark_rejected("invalid proof".to_string());
+        assert_eq!(tracked.confirmations, 0, "rejection must reset confirmations");
+        tracked.mark_verified();
+        assert!(
+            matches!(tracked.status, TransactionStatus::Rejected { .. }),
+            "rejected transaction must not be resurrected"
+        );
+        assert_eq!(tracked.confirmations, 0);
     }
 }

@@ -44,6 +44,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+
     /// Create a new coordinator in the `Primary` role.
     pub fn new(network: Arc<NetworkManager>) -> Self {
         Coordinator {
@@ -74,6 +75,34 @@ impl Coordinator {
                 primary,
                 stall_threshold,
                 Instant::now(),
+            ))),
+            heartbeat_sequence: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Create a new coordinator in the `Standby` role with an
+    /// explicit promotion `rank` (see
+    /// `CoordinatorRole::standby_with_rank`). The node layer passes
+    /// the standby's position in the configured standby list so
+    /// promotions after a primary failure are staggered instead of
+    /// simultaneous (split-brain, issue #1160).
+    pub fn standby_with_rank(
+        network: Arc<NetworkManager>,
+        primary: NodeId,
+        stall_threshold: Duration,
+        rank: u64,
+    ) -> Self {
+        Coordinator {
+            validators: Arc::new(Mutex::new(Vec::new())),
+            active_tasks: Arc::new(Mutex::new(HashMap::new())),
+            results: Arc::new(Mutex::new(HashMap::new())),
+            parent_tasks: Arc::new(Mutex::new(HashMap::new())),
+            network,
+            role: Arc::new(Mutex::new(CoordinatorRole::standby_with_rank(
+                primary,
+                stall_threshold,
+                Instant::now(),
+                rank,
             ))),
             heartbeat_sequence: Arc::new(Mutex::new(0)),
         }
@@ -187,11 +216,28 @@ impl Coordinator {
     /// identity. Returns `None` if already primary or if the standby
     /// has not yet stalled.
     pub async fn try_promote_if_stalled(&self, now: Instant) -> Option<NodeId> {
-        let mut role = self.role.lock().await;
-        if !role.is_stalled(now) {
-            return None;
+        let previous = {
+            let mut role = self.role.lock().await;
+            if !role.is_stalled(now) {
+                return None;
+            }
+            role.promote()
+        };
+        if previous.is_some() {
+            // Failover: shards mirrored from the dead primary are
+            // still addressed to it, so validators would send their
+            // results back to the dead peer id and the parent tasks
+            // could never complete. Re-dispatch them under our own
+            // peer id (issue #1160, vulnerability 4).
+            let redispatched = self.redispatch_stranded_tasks().await;
+            if redispatched > 0 {
+                log::warn!(
+                    "re-dispatched {} mirrored Assigned shard(s) after promotion",
+                    redispatched
+                );
+            }
         }
-        role.promote()
+        previous
     }
 
     /// Spawn the primary-side heartbeat broadcast task.
@@ -265,6 +311,7 @@ impl Coordinator {
     pub fn start_stall_watchdog(
         self: Arc<Self>,
         check_interval: Duration,
+        on_promote_broadcast: Option<(NodeId, Vec<NodeId>, Duration)>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(check_interval);
@@ -281,6 +328,19 @@ impl Coordinator {
                         "primary {} appears stalled; promoted to Primary",
                         previous_primary
                     );
+                    // Behave as a primary immediately: the fleet
+                    // must hear heartbeats from the new primary,
+                    // or every other standby will also promote
+                    // (split-brain, issue #1160 vulnerability 4).
+                    if let Some((own_id, standbys, interval)) = &on_promote_broadcast {
+                        if !standbys.is_empty() {
+                            Arc::clone(&self).start_heartbeat_broadcast(
+                                own_id.clone(),
+                                standbys.clone(),
+                                *interval,
+                            );
+                        }
+                    }
                     break;
                 }
             }
@@ -294,6 +354,79 @@ impl Coordinator {
             validators.push(validator_id.clone());
             info!("Validator registered: {:?}", validator_id);
         }
+    }
+
+    /// Remove a validator from the dispatch pool, e.g. after the
+    /// node layer reports a sustained disconnect. Without this, a
+    /// dead validator stays in the pool forever and `submit_task`
+    /// keeps assigning it shards (issue #1160, vulnerability 4).
+    pub async fn remove_validator(&self, validator_id: &NodeId) {
+        let mut validators = self.validators.lock().await;
+        validators.retain(|v| v != validator_id);
+    }
+
+    /// Re-dispatch every mirrored shard still in `Assigned` state
+    /// under THIS coordinator's peer id. Called on promotion: the
+    /// shards were dispatched by the dead primary with its own
+    /// peer id embedded in the `TaskRequest`, so validators would
+    /// send results back to the dead peer and the parent task
+    /// could never complete (issue #1160, vulnerability 4).
+    ///
+    /// Returns the number of shards re-dispatched.
+    pub async fn redispatch_stranded_tasks(&self) -> usize {
+        // Dispatch pool: the registered validators; if a freshly
+        // promoted standby has none registered yet, fall back to
+        // currently connected peers (the same pool
+        // `register_connected_validators` seeds from).
+        let mut pool = self.validators.lock().await.clone();
+        if pool.is_empty() {
+            pool = self.network.connected_peers().await;
+        }
+        if pool.is_empty() {
+            return 0;
+        }
+
+        let stranded: Vec<Task> = {
+            let active = self.active_tasks.lock().await;
+            active
+                .values()
+                .filter(|t| matches!(t.status, TaskStatus::Assigned))
+                .cloned()
+                .collect()
+        };
+
+        let mut redispatched = 0;
+        for (i, mut chunk) in stranded.into_iter().enumerate() {
+            let validator_id = pool[i % pool.len()].clone();
+            chunk.assigned_to = Some(format!("{:?}", validator_id));
+            {
+                let mut active = self.active_tasks.lock().await;
+                if let Some(stored) = active.get_mut(&chunk.id) {
+                    stored.assigned_to = chunk.assigned_to.clone();
+                }
+            }
+            let msg = Message::TaskRequest {
+                task: chunk.clone(),
+                coordinator_id: self.network.local_peer_id(),
+            };
+            let send_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(1),
+                self.network.send_message(validator_id.clone(), msg),
+            )
+            .await;
+            match send_result {
+                Ok(Ok(_)) => redispatched += 1,
+                Ok(Err(e)) => log::error!(
+                    "re-dispatch of shard {} to {:?} failed: {}",
+                    chunk.id, validator_id, e
+                ),
+                Err(_) => log::error!(
+                    "re-dispatch of shard {} to {:?} timed out",
+                    chunk.id, validator_id
+                ),
+            }
+        }
+        redispatched
     }
 
     /// Register all connected peers as validators (workaround for p2p messaging)
@@ -382,19 +515,34 @@ impl Coordinator {
             )
             .await;
 
+            let mut send_failed = false;
             match send_result {
                 Ok(Ok(_)) => {
                     log::debug!("Successfully sent chunk {} to validator", chunk.id);
                 }
                 Ok(Err(e)) => {
+                    send_failed = true;
                     log::error!("Failed to send chunk {}: {}", chunk.id, e);
                 }
                 Err(_) => {
+                    send_failed = true;
                     log::error!(
                         "Timeout sending chunk {} to validator {:?}",
                         chunk.id,
                         validator_id
                     );
+                }
+            }
+
+            if send_failed {
+                // Do not leave the shard Assigned to a validator
+                // that never received it: roll it back to Pending
+                // so a later dispatch can pick it up (issue #1160,
+                // vulnerability 4).
+                let mut active = self.active_tasks.lock().await;
+                if let Some(stored) = active.get_mut(&chunk.id) {
+                    stored.status = TaskStatus::Pending;
+                    stored.assigned_to = None;
                 }
             }
         }
@@ -969,7 +1117,7 @@ mod tests {
         // latency is one poll interval.
         drop(primary);
         let kill_at = Instant::now();
-        let watchdog = Arc::clone(&standby).start_stall_watchdog(Duration::from_millis(25));
+        let watchdog = Arc::clone(&standby).start_stall_watchdog(Duration::from_millis(25), None);
 
         // The watchdog self-terminates on promotion; awaiting its
         // JoinHandle is the cleanest way to learn that promotion
@@ -1015,6 +1163,104 @@ mod tests {
             post_promotion.parent_tasks.len(),
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_redispatches_mirrored_assigned_shards() {
+        // Primary with one validator submits a task; the chunk is
+        // Assigned under the primary's dispatch.
+        let primary = Arc::new(Coordinator::new(make_test_network()));
+        primary.register_validator(NodeId(vec![0xAA])).await;
+        primary
+            .submit_task(TaskType::HashCalculation {
+                start: 0,
+                end: 0,
+                algorithm: "sha256".to_string(),
+            })
+            .await
+            .expect("submit task");
+
+        // Standby mirrors the primary's snapshot, and knows a
+        // DIFFERENT validator (the fleet from its own view).
+        let standby = Arc::new(Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(100),
+        ));
+        standby.register_validator(NodeId(vec![0xCC])).await;
+        let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = standby.apply_heartbeat(&NodeId(vec![0x01]), request).await;
+        assert!(response.accepted);
+
+        // Promote: the mirrored Assigned shard must be
+        // re-dispatched under the new primary, i.e. reassigned to
+        // the standby's validator instead of staying addressed to
+        // the dead primary's dispatch (issue #1160).
+        let previous = standby
+            .try_promote_if_stalled(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(previous, Some(NodeId(vec![0x01])));
+
+        let snapshot = standby.snapshot().await;
+        let chunk = snapshot
+            .active_tasks
+            .values()
+            .next()
+            .expect("mirrored chunk present");
+        assert!(matches!(chunk.status, TaskStatus::Assigned));
+        assert!(
+            chunk.assigned_to.is_some(),
+            "shard must stay assigned after promotion: try_promote \
+             re-dispatches it under the new primary (whose peer id is \
+             the TaskRequest coordinator_id), it is not dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn redispatch_reassigns_stranded_shards_to_live_pool() {
+        // A standby mirrors an Assigned shard addressed to validator
+        // 0xAA. The new primary's live dispatch pool no longer
+        // contains 0xAA and contains 0xCC instead: re-dispatch must
+        // reassign the shard to 0xCC and report the count
+        // (issue #1160, vulnerability 4).
+        let primary = Arc::new(Coordinator::new(make_test_network()));
+        primary.register_validator(NodeId(vec![0xAA])).await;
+        primary
+            .submit_task(TaskType::HashCalculation {
+                start: 0,
+                end: 0,
+                algorithm: "sha256".to_string(),
+            })
+            .await
+            .expect("submit task");
+
+        let standby = Arc::new(Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(100),
+        ));
+        let request = primary.next_heartbeat_request(NodeId(vec![0x01])).await;
+        let response = standby.apply_heartbeat(&NodeId(vec![0x01]), request).await;
+        assert!(response.accepted);
+
+        standby.remove_validator(&NodeId(vec![0xAA])).await;
+        standby.register_validator(NodeId(vec![0xCC])).await;
+
+        let redispatched = standby.redispatch_stranded_tasks().await;
+        assert_eq!(redispatched, 1);
+
+        let snapshot = standby.snapshot().await;
+        let chunk = snapshot
+            .active_tasks
+            .values()
+            .next()
+            .expect("mirrored chunk present");
+        assert!(matches!(chunk.status, TaskStatus::Assigned));
+        assert_eq!(
+            chunk.assigned_to,
+            Some(format!("{:?}", NodeId(vec![0xCC]))),
+            "shard must be reassigned to the live pool's validator"
         );
     }
 }

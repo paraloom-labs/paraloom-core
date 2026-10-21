@@ -21,8 +21,14 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(
+            "trailing bytes after proof".to_string(),
+        ));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,28 +42,36 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(
+            "trailing bytes after verifying key".to_string(),
+        ));
+    }
+    Ok(vk)
 }
 
-/// Convert field element to bytes (32 bytes, big-endian)
+/// Convert field element to bytes using arkworks compressed serialization (little-endian).
 pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    let mut buf = Vec::new();
     field
-        .serialize_compressed(&mut buf)
+        .serialize_compressed(&mut bytes.as_mut_slice())
         .expect("Field serialization failed");
-
-    let len = buf.len().min(32);
-    bytes[32 - len..].copy_from_slice(&buf[..len]);
     bytes
 }
 
 /// Convert bytes to field element
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(
+            "trailing bytes after field element".to_string(),
+        ));
+    }
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -195,6 +209,20 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_proof_rejects_trailing_bytes() {
+        let mut rng = ark_std::test_rng();
+        let proof = Groth16Proof {
+            a: ark_bn254::G1Affine::rand(&mut rng),
+            b: ark_bn254::G2Affine::rand(&mut rng),
+            c: ark_bn254::G1Affine::rand(&mut rng),
+        };
+        let mut bytes = Vec::new();
+        proof.serialize_compressed(&mut bytes).unwrap();
+        bytes.push(0);
+        assert!(deserialize_proof(&bytes).is_err());
+    }
+
+    #[test]
     fn deserialize_proof_short_buffer_errors() {
         for len in 0..64 {
             let buf = vec![0u8; len];
@@ -247,6 +275,22 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_vk_rejects_trailing_bytes() {
+        let mut rng = ark_std::test_rng();
+        let vk = Groth16VerifyingKey {
+            alpha_g1: ark_bn254::G1Affine::rand(&mut rng),
+            beta_g2: ark_bn254::G2Affine::rand(&mut rng),
+            gamma_g2: ark_bn254::G2Affine::rand(&mut rng),
+            delta_g2: ark_bn254::G2Affine::rand(&mut rng),
+            gamma_abc_g1: vec![ark_bn254::G1Affine::rand(&mut rng)],
+        };
+        let mut bytes = Vec::new();
+        vk.serialize_compressed(&mut bytes).unwrap();
+        bytes.push(0);
+        assert!(deserialize_vk(&bytes).is_err());
+    }
+
+    #[test]
     fn deserialize_vk_random_bytes_never_panic() {
         let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xCAFE_BABEu64);
         for size in [1usize, 31, 32, 96, 256, 1024] {
@@ -284,6 +328,14 @@ mod tests {
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    #[test]
+    fn bytes_to_field_rejects_trailing_bytes() {
+        let field = Fr::from(7u64);
+        let mut bytes = field_to_bytes(&field).to_vec();
+        bytes.push(0);
+        assert!(bytes_to_field(&bytes).is_err());
     }
 
     // ── Proof-suite envelope ──────────────────────────────────────────

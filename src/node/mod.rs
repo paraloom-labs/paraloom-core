@@ -1369,7 +1369,25 @@ impl Node {
                 let primary_id = NodeId::from_str(primary_hex)
                     .map_err(|e| anyhow!("invalid ha.primary hex {:?}: {}", primary_hex, e))?;
                 let stall = Duration::from_millis(settings.ha.stall_threshold_ms);
-                Coordinator::standby_of(network_arc.clone(), primary_id, stall)
+                // Promotion rank: this standby's position in the
+                // configured standby list (deployments list standbys
+                // in the same order on every node), so after a primary
+                // failure the standbys promote one at a time instead
+                // of all in the same tick (split-brain, issue #1160).
+                // A node not itself listed ranks last among the
+                // listed standbys; unlisted-only setups keep rank 0.
+                let own_id = network_arc.local_peer_id();
+                let mut fleet: Vec<NodeId> = settings
+                    .ha
+                    .standbys
+                    .iter()
+                    .filter_map(|s| NodeId::from_str(s).ok())
+                    .collect();
+                if !fleet.contains(&own_id) {
+                    fleet.push(own_id.clone());
+                }
+                let rank = fleet.iter().position(|id| *id == own_id).unwrap_or(0) as u64;
+                Coordinator::standby_with_rank(network_arc.clone(), primary_id, stall, rank)
             } else {
                 Coordinator::new(network_arc.clone())
             };
@@ -1756,6 +1774,7 @@ impl Node {
         if self.transact_coordinator.is_some() {
             let network = Arc::clone(&self.network);
             let transact = self.transact_coordinator.clone();
+            let coordinator = self.coordinator.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
                 // Deactivate a co-signer only after it has been absent for this
@@ -1786,6 +1805,14 @@ impl Node {
                     for peer in &drop_list {
                         if let Some(t) = &transact {
                             t.unregister_validator(peer).await;
+                        }
+                        // Also prune the peer from the compute
+                        // coordinator's dispatch pool: submit_task
+                        // must not keep assigning shards to a peer
+                        // that has sustained-disconnected (issue
+                        // #1160, vulnerability 4).
+                        if let Some(c) = &coordinator {
+                            c.remove_validator(peer).await;
                         }
                     }
                 }
@@ -1909,8 +1936,33 @@ impl Node {
         if let Some(coordinator) = &self.coordinator {
             let ha = &self.settings.ha;
             if ha.primary.is_some() {
-                let handle = Arc::clone(coordinator)
-                    .start_stall_watchdog(Duration::from_millis(ha.watchdog_interval_ms));
+                // This node is a standby: when its watchdog promotes
+                // it, it must immediately start broadcasting
+                // heartbeats like a primary, or the remaining
+                // standbys see continued silence and promote too
+                // (split-brain, issue #1160 vulnerability 4).
+                let own_id = self.network.local_peer_id();
+                let mut standby_ids = Vec::with_capacity(ha.standbys.len());
+                for hex in &ha.standbys {
+                    let id = NodeId::from_str(hex)
+                        .map_err(|e| anyhow!("invalid ha.standbys entry {:?}: {}", hex, e))?;
+                    if id != own_id {
+                        standby_ids.push(id);
+                    }
+                }
+                let on_promote = if standby_ids.is_empty() {
+                    None
+                } else {
+                    Some((
+                        own_id,
+                        standby_ids,
+                        Duration::from_millis(ha.heartbeat_interval_ms),
+                    ))
+                };
+                let handle = Arc::clone(coordinator).start_stall_watchdog(
+                    Duration::from_millis(ha.watchdog_interval_ms),
+                    on_promote,
+                );
                 *self.ha_watchdog.lock().await = Some(handle);
                 info!(
                     "HA stall watchdog spawned (interval {}ms, threshold {}ms)",
