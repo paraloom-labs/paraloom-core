@@ -44,14 +44,43 @@ const PARALOOM_TOPIC: &str = "paraloom/v1";
 /// the PeerId without dialling first; if the operator gives us a
 /// bare network multiaddr (no /p2p/ suffix) we fall back to dial
 /// only.
+///
+/// Only the **last** component counts. A circuit-relay v2 address
+/// such as `/ip4/…/tcp/…/p2p/<relay>/p2p-circuit/p2p/<target>`
+/// identifies `<target>`, not the relay: returning the relay would
+/// make callers consult the relay's liveness as if it were the
+/// target's (permanently suppressing co-validator redials while the
+/// relay link is up) and register the target's circuit address under
+/// the relay's PeerId in Kademlia. A bare
+/// `/<relay>/p2p-circuit` address carries no target PeerId at all
+/// and therefore yields `None`.
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-            Some(peer_id)
-        } else {
-            None
+    match addr.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Some(peer_id),
+        _ => None,
+    }
+}
+
+/// Truncate `addr` at its first `/p2p-circuit` component, returning
+/// the relay's own transport address (everything up to and including
+/// its `/p2p/<relay_peer_id>` suffix). Addresses without a
+/// `/p2p-circuit` component are returned unchanged.
+///
+/// Used to normalise an operator-supplied `relay_address`: a trailing
+/// `/p2p-circuit`, or a full relayed target address
+/// (`/…/p2p/<relay>/p2p-circuit/p2p/<target>`), must not be treated
+/// as the relay's own address — doing so poisons Kademlia with a
+/// circuit address and yields an invalid `/p2p-circuit/p2p-circuit`
+/// listener.
+fn strip_circuit_suffix(addr: Multiaddr) -> Multiaddr {
+    let mut out = Multiaddr::empty();
+    for proto in addr.iter() {
+        if matches!(proto, libp2p::multiaddr::Protocol::P2pCircuit) {
+            break;
         }
-    })
+        out.push(proto);
+    }
+    out
 }
 
 #[derive(NetworkBehaviour)]
@@ -551,9 +580,17 @@ impl NetworkManager {
     /// without it the relay client cannot identify the reservation
     /// target, so we reject the address rather than silently no-op.
     pub async fn listen_via_relay(&self, relay_addr: &str) -> Result<()> {
-        let relay_addr: Multiaddr = relay_addr
+        let raw: Multiaddr = relay_addr
             .parse()
             .with_context(|| format!("parsing relay address {}", relay_addr))?;
+
+        // Normalise to the relay's own transport address: drop a
+        // trailing `/p2p-circuit` and anything after it (e.g. a
+        // relayed target `/p2p/<peer_id>`). Registering or listening
+        // on the raw input would advertise `<relay>/p2p-circuit` as
+        // the relay's own address in Kademlia and append a second
+        // `/p2p-circuit` below, producing an invalid listener.
+        let relay_addr = strip_circuit_suffix(raw);
 
         let relay_peer = peer_id_from_multiaddr(&relay_addr).ok_or_else(|| {
             anyhow!(
@@ -1253,6 +1290,73 @@ mod tests {
     fn peer_id_returns_none_for_bare_multiaddr() {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("multiaddr parses");
         assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
+
+    #[test]
+    fn peer_id_on_circuit_addr_is_trailing_target_not_relay() {
+        let relay_key = identity::Keypair::generate_ed25519();
+        let relay = PeerId::from(relay_key.public());
+        let target_key = identity::Keypair::generate_ed25519();
+        let target = PeerId::from(target_key.public());
+
+        let addr: Multiaddr = format!(
+            "/ip4/203.0.113.10/tcp/9000/p2p/{}/p2p-circuit/p2p/{}",
+            relay, target
+        )
+        .parse()
+        .expect("multiaddr parses");
+
+        assert_eq!(
+            peer_id_from_multiaddr(&addr),
+            Some(target),
+            "circuit multiaddr must resolve to the trailing target PeerId, not the relay"
+        );
+    }
+
+    #[test]
+    fn peer_id_on_bare_circuit_addr_is_none() {
+        let relay_key = identity::Keypair::generate_ed25519();
+        let relay = PeerId::from(relay_key.public());
+        let addr: Multiaddr = format!("/ip4/203.0.113.10/tcp/9000/p2p/{}/p2p-circuit", relay)
+            .parse()
+            .expect("multiaddr parses");
+        assert_eq!(
+            peer_id_from_multiaddr(&addr),
+            None,
+            "a relay-circuit address with no trailing /p2p/<target> names no dial target"
+        );
+    }
+
+    #[test]
+    fn strip_circuit_suffix_normalises_relay_addresses() {
+        let relay_key = identity::Keypair::generate_ed25519();
+        let relay = PeerId::from(relay_key.public());
+        let target_key = identity::Keypair::generate_ed25519();
+        let target = PeerId::from(target_key.public());
+
+        let plain: Multiaddr = format!("/ip4/1.2.3.4/tcp/9000/p2p/{}", relay)
+            .parse()
+            .expect("multiaddr parses");
+        assert_eq!(strip_circuit_suffix(plain.clone()), plain);
+
+        let with_circuit: Multiaddr = format!("/ip4/1.2.3.4/tcp/9000/p2p/{}/p2p-circuit", relay)
+            .parse()
+            .expect("multiaddr parses");
+        assert_eq!(strip_circuit_suffix(with_circuit), plain);
+
+        let relayed_target: Multiaddr = format!(
+            "/ip4/1.2.3.4/tcp/9000/p2p/{}/p2p-circuit/p2p/{}",
+            relay, target
+        )
+        .parse()
+        .expect("multiaddr parses");
+        let normalised = strip_circuit_suffix(relayed_target);
+        assert_eq!(normalised, plain);
+        assert_eq!(
+            peer_id_from_multiaddr(&normalised),
+            Some(relay),
+            "normalising a relayed target address must yield the relay itself"
+        );
     }
 
     #[tokio::test]

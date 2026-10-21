@@ -19,10 +19,19 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 }
 
 /// Deserialize a Groth16 proof from bytes
+///
+/// The whole buffer must be consumed. `CanonicalDeserialize` happily stops
+/// after the fields it needs and ignores the rest, so without the explicit
+/// length check a valid 128-byte proof followed by arbitrary attacker-chosen
+/// bytes would be accepted — the same proof object with a malleable wire
+/// representation, which breaks strict framing for anything that hashes or
+/// deduplicates the blob.
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    ensure_fully_consumed(&cursor, bytes, "proof")?;
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -34,30 +43,75 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 }
 
 /// Deserialize a verifying key from bytes
+///
+/// As with [`deserialize_proof`], the buffer must be fully consumed: a
+/// verifying key with trailing junk is rejected rather than silently accepted.
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    ensure_fully_consumed(&cursor, bytes, "verifying key")?;
+    Ok(vk)
+}
+
+/// Reject a decode that did not consume every byte of the input.
+///
+/// arkworks' `CanonicalDeserialize` reads exactly the fields it needs and
+/// leaves the cursor wherever it stopped, so this check is the only thing
+/// standing between a strict wire format and an accepted-but-malleable one.
+fn ensure_fully_consumed(cursor: &Cursor<&[u8]>, bytes: &[u8], what: &str) -> Result<()> {
+    let consumed = cursor.position() as usize;
+    if consumed != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes after {what}: consumed {consumed} of {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
+///
+/// `ark-ff`'s `serialize_compressed` writes **little-endian**, so the buffer is
+/// reversed into the big-endian layout this function documents (and that
+/// `alt_bn128` public-input preparation expects, cf. `onchain_verifier::fr_to_be`).
 pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(32);
     field
         .serialize_compressed(&mut buf)
         .expect("Field serialization failed");
 
     let len = buf.len().min(32);
-    bytes[32 - len..].copy_from_slice(&buf[..len]);
+    // buf is little-endian (least significant byte first); place it so the
+    // least significant byte lands at `bytes[31]`.
+    for (i, byte) in buf[..len].iter().enumerate() {
+        bytes[31 - i] = *byte;
+    }
     bytes
 }
 
 /// Convert bytes to field element
+///
+/// Accepts exactly 32 big-endian bytes, the inverse of [`field_to_bytes`].
+/// Short, long and non-canonical (>= modulus) inputs are rejected.
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
-    let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    if bytes.len() != 32 {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "field element must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    // `deserialize_compressed` expects little-endian, so reverse first.
+    let mut le = [0u8; 32];
+    for (i, byte) in bytes.iter().enumerate() {
+        le[31 - i] = *byte;
+    }
+    let mut cursor = Cursor::new(&le[..]);
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    ensure_fully_consumed(&cursor, &le, "field element")?;
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -278,12 +332,59 @@ mod tests {
     }
 
     /// A buffer whose top bytes encode a value larger than the BN254
-    /// scalar prime must be rejected — \`Fr\` cannot represent such a
+    /// scalar prime must be rejected — `Fr` cannot represent such a
     /// value canonically.
     #[test]
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    /// `field_to_bytes` documents big-endian, and `ark-ff` serialises
+    /// little-endian. `1` must therefore land in the *last* byte, matching
+    /// `onchain_verifier::fr_to_be`, not the first.
+    #[test]
+    fn field_to_bytes_is_big_endian() {
+        let one = Fr::from(1u64);
+        let bytes = field_to_bytes(&one);
+
+        assert_eq!(bytes[31], 1, "LSB must be last in big-endian output");
+        assert!(
+            bytes[..31].iter().all(|b| *b == 0),
+            "no other byte of Fr::from(1) may be set"
+        );
+        assert_eq!(bytes_to_field(&bytes).unwrap(), one);
+    }
+
+    /// Trailing bytes must not be tolerated: a field element plus junk is not
+    /// a field element, or the wire encoding is malleable.
+    #[test]
+    fn bytes_to_field_rejects_trailing_bytes() {
+        let mut buf = field_to_bytes(&Fr::from(7u64)).to_vec();
+        buf.push(0u8);
+        assert!(
+            bytes_to_field(&buf).is_err(),
+            "33-byte input must not deserialise"
+        );
+    }
+
+    /// Same for proofs: padding a body with attacker-chosen bytes must not
+    /// yield the same proof object under a second, longer encoding.
+    #[test]
+    fn deserialize_proof_rejects_trailing_bytes() {
+        let mut body = vec![0u8; GROTH16_BN254_COMPRESSED_LEN];
+        body.push(0u8);
+        assert!(
+            deserialize_proof(&body).is_err(),
+            "a {GROTH16_BN254_COMPRESSED_LEN}+1-byte buffer must not deserialise"
+        );
+    }
+
+    #[test]
+    fn deserialize_vk_rejects_trailing_bytes() {
+        let mut body = vec![0u8; 1];
+        body.push(0u8);
+        assert!(deserialize_vk(&body).is_err());
     }
 
     // ── Proof-suite envelope ──────────────────────────────────────────

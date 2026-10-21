@@ -6,7 +6,7 @@ use log::info;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -141,7 +141,7 @@ pub struct Node {
     /// legitimate blockhash-expiry retries. Keyed on the nullifiers rather than
     /// the request id, so randomized proofs of the same spend cannot each claim
     /// a fresh budget.
-    cosign_counts: Arc<Mutex<HashMap<String, u32>>>,
+    cosign_counts: Arc<Mutex<HashMap<String, CosignCounter>>>,
 }
 
 /// Build the compute-job authorization policy (F3) from `[compute]` settings.
@@ -197,10 +197,42 @@ const MAX_COSIGNS_PER_SETTLEMENT: u32 = 4;
 /// Upper bound on the number of per-nullifier co-sign counters retained (#626).
 /// The counter map is never explicitly cleared, so without a ceiling it grows
 /// one entry per settled spend for the life of the process. This is a safety
-/// ceiling, not a working limit: entries are consumed within a co-sign round,
-/// and an evicted entry belongs to an older spend whose nullifiers have almost
-/// certainly settled on chain (a replay of it fails there regardless).
+/// ceiling, not a working limit: entries are consumed within a co-sign round.
+///
+/// Reaching the ceiling never evicts a live counter (#1154). Eviction used to
+/// drop an arbitrary entry, which let a peer reset *another* spend's budget by
+/// churning the map; stale counters are now expired on age and, if the map is
+/// still full, the request is declined instead.
 const MAX_COSIGN_COUNTS: usize = 1024;
+
+/// How many distinct `payload.authority` values may be counted against one input
+/// nullifier (#1154). The approval match in `cosign_settlement` binds the
+/// settlement's public parameters but not `payload.authority`, and only the
+/// on-chain bridge authority can actually land a settlement, so the per-nullifier
+/// budget is keyed on `(nullifier, authority)` to keep a forged authority from
+/// starving the real leader (#723). Without a ceiling on the number of
+/// authorities, though, one verified spend yields an unbounded number of fresh
+/// fee-payer signatures — 4 per dummy authority, forever — which is exactly what
+/// #593/#606 capped. Two authorities are all an honest round needs (the real one,
+/// plus room for an authority rotation on the leader side); the small margin
+/// keeps the total signatures one spend can ever yield bounded and small.
+const MAX_COSIGN_AUTHORITIES_PER_NULLIFIER: usize = 4;
+
+/// How long a co-sign counter is considered live (#1154). A settlement round
+/// completes in seconds, so a counter untouched for this long belongs to a spend
+/// that has either landed on chain (a replay fails there regardless) or been
+/// abandoned. Expiring on age — instead of evicting an arbitrary entry — is what
+/// keeps a peer from resetting a live budget by churning the counter map.
+const COSIGN_COUNT_TTL: Duration = Duration::from_secs(120);
+
+/// One per-`(nullifier, authority)` co-sign counter plus when it was last used
+/// (#1154). The timestamp lets the bounded map expire stale entries instead of
+/// evicting live ones, which is what a cache-eviction bypass needs.
+#[derive(Debug, Clone, Copy)]
+struct CosignCounter {
+    count: u32,
+    last_used: Instant,
+}
 
 /// Insert a verified settlement request into a bounded per-node cache (#260).
 /// The bound is a safety ceiling, not a working limit; if the map is somehow at
@@ -934,6 +966,30 @@ impl crate::network::protocol::NetworkEventHandler for Node {
     }
 }
 
+/// Whether a co-sign payload carries the same settlement proof as the request
+/// this node verified `Valid` (#1154). `cosign_settlement` used to ignore
+/// `payload.params.proof` entirely, so a peer could mutate it freely: the
+/// co-signer still signed and burned the per-nullifier budget on a settlement
+/// that is guaranteed to revert on chain with `BridgeError::InvalidProof`.
+///
+/// A byte comparison against `request.proof` would never match, because the
+/// leader converts the L2-tagged proof into the program's 256-byte alt_bn128
+/// wire form before putting it in the payload (see
+/// `cosign_settlement_transact_tx`), so the same conversion is applied here. An
+/// envelope we cannot convert cannot settle on chain either, so in that case
+/// the raw bytes must match instead.
+fn payload_proof_matches(verified_proof: &[u8], payload_proof: &[u8]) -> bool {
+    match crate::privacy::split_tagged_proof(verified_proof) {
+        Ok((crate::privacy::ProofSuite::Groth16Bn254TransactV3, body)) => {
+            match crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(body) {
+                Ok(onchain) => onchain.as_slice() == payload_proof,
+                Err(_) => false,
+            }
+        }
+        Err(_) => verified_proof == payload_proof,
+    }
+}
+
 /// Produce a co-sign response for `request` (#260): sign the rebuilt settlement
 /// message iff we hold a keypair and the payload matches — by request id and
 /// binding parameters — a settlement we verified `Valid`; otherwise decline
@@ -943,7 +999,7 @@ async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
-    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, CosignCounter>>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -985,7 +1041,7 @@ async fn cosign_settlement(
                 output_commitments,
                 root,
                 ext_amount,
-                ..
+                proof,
             },
         ) => {
             let cache = verified_transacts.lock().await;
@@ -995,6 +1051,7 @@ async fn cosign_settlement(
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
+                    && payload_proof_matches(&req.proof, proof)
             });
             // Cap keys = each input nullifier paired with the payload authority
             // (#723). The approval match above binds the settlement's public
@@ -1008,10 +1065,16 @@ async fn cosign_settlement(
             // forged-authority request can no longer starve the real leader,
             // while the cap still bounds the usable signatures one spend yields
             // (they all share the one on-chain authority).
+            //
+            // The number of authorities that may be counted per nullifier is
+            // itself capped (#1154), or a peer could rotate this unbound field
+            // to mint a fresh budget for every dummy authority.
             let auth = hex::encode(payload.authority);
+            let n0 = hex::encode(nullifiers[0]);
+            let n1 = hex::encode(nullifiers[1]);
             let cap_nullifiers = [
-                format!("{}:{auth}", hex::encode(nullifiers[0])),
-                format!("{}:{auth}", hex::encode(nullifiers[1])),
+                (n0.clone(), format!("{n0}:{auth}")),
+                (n1.clone(), format!("{n1}:{auth}")),
             ];
             (approved, cap_nullifiers)
         }
@@ -1028,7 +1091,7 @@ async fn cosign_settlement(
                 output_commitments,
                 root,
                 ext_amount,
-                ..
+                proof,
             },
         ) => {
             let cache = verified_transacts.lock().await;
@@ -1039,11 +1102,14 @@ async fn cosign_settlement(
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
+                    && payload_proof_matches(&req.proof, proof)
             });
             let auth = hex::encode(payload.authority);
+            let n0 = hex::encode(nullifiers[0]);
+            let n1 = hex::encode(nullifiers[1]);
             let cap_nullifiers = [
-                format!("{}:{auth}", hex::encode(nullifiers[0])),
-                format!("{}:{auth}", hex::encode(nullifiers[1])),
+                (n0.clone(), format!("{n0}:{auth}")),
+                (n1.clone(), format!("{n1}:{auth}")),
             ];
             (approved, cap_nullifiers)
         }
@@ -1080,24 +1146,63 @@ async fn cosign_settlement(
     // undecodable request is declined earlier and never spends the budget.
     {
         let mut counts = cosign_counts.lock().await;
+        let now = Instant::now();
+
+        // Expire counters untouched for a whole settlement window (#1154). The
+        // old code instead evicted an arbitrary entry when the map hit its
+        // ceiling, on the assumption that the victim belonged to an older spend
+        // that had already settled. That assumption does not hold once the cap
+        // key can be chosen by the requester: a peer holding one verified spend
+        // rotated `payload.authority` to insert fresh keys until the real
+        // authority's counter was evicted, resetting its budget and letting the
+        // single spend yield unlimited fee-payer signatures. Aging entries out
+        // — never evicting a live one — removes that primitive entirely.
+        counts.retain(|_, c| now.duration_since(c.last_used) < COSIGN_COUNT_TTL);
+
         if cap_nullifiers
             .iter()
-            .any(|nf| counts.get(nf).copied().unwrap_or(0) >= MAX_COSIGNS_PER_SETTLEMENT)
+            .any(|(_, key)| counts.get(key).is_some_and(|c| c.count >= MAX_COSIGNS_PER_SETTLEMENT))
         {
             return declined("co-sign count limit reached for an input nullifier");
         }
-        for nf in cap_nullifiers {
-            // Bound the map so it cannot grow without limit as settlements
-            // accumulate (#626): if a new nullifier would exceed the ceiling,
-            // drop an arbitrary existing entry first. An evicted entry belongs
-            // to an older spend whose nullifiers have almost certainly settled
-            // on chain, so resetting its budget is harmless.
-            if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
-                if let Some(victim) = counts.keys().next().cloned() {
-                    counts.remove(&victim);
-                }
+
+        // Bound how many distinct authorities may be counted for one input
+        // nullifier (#1154). `payload.authority` is not bound by the approval
+        // match above, so without this a peer could present the same verified
+        // spend under 512 dummy authorities and collect MAX_COSIGNS_PER_SETTLEMENT
+        // fresh signatures for each — the exact amplification #593/#606 capped.
+        // Declining further authorities is fail-closed and cannot starve the
+        // real leader: its own `(nullifier, authority)` key is already counted
+        // and is only ever consulted, never re-inserted.
+        for (nf, key) in &cap_nullifiers {
+            if counts.contains_key(key) {
+                continue;
             }
-            *counts.entry(nf).or_insert(0) += 1;
+            let prefix = format!("{nf}:");
+            let authorities = counts.keys().filter(|k| k.starts_with(&prefix)).count();
+            if authorities >= MAX_COSIGN_AUTHORITIES_PER_NULLIFIER {
+                return declined("co-sign authority limit reached for an input nullifier");
+            }
+        }
+
+        for (_, key) in cap_nullifiers {
+            // Bound the map so it cannot grow without limit as settlements
+            // accumulate (#626). Stale entries were pruned above, so anything
+            // still present is live; decline rather than evict one, because
+            // evicting a live counter is what reset a peer's budget (#1154).
+            if !counts.contains_key(&key) && counts.len() >= MAX_COSIGN_COUNTS {
+                return declined("co-sign counter table is full");
+            }
+            counts
+                .entry(key)
+                .and_modify(|c| {
+                    c.count += 1;
+                    c.last_used = now;
+                })
+                .or_insert(CosignCounter {
+                    count: 1,
+                    last_used: now,
+                });
         }
     }
 
@@ -2251,12 +2356,32 @@ impl Node {
 
         let request_id = coordinator.start_verification(request.clone()).await?;
 
+        // Short-circuit a request we already verified `Valid` (#726). The gossip
+        // path does this, and the initiator must too (#1154): `start_verification`
+        // deliberately keeps an in-flight round for a client retry, so without
+        // this every retry re-ran Groth16 on this node. Worse, a transient error
+        // on that redundant run made this node sign a `VerificationVote::Invalid`
+        // self-vote against its own earlier `Valid` vote on the same round, which
+        // the coordinator records as `SlashingEvidence::Equivocation` and bans
+        // this validator's own wallet for. `verified_transacts` only holds
+        // `Valid` results, so a cache hit is a proven-valid repeat.
+        let already_verified = self
+            .verified_transacts
+            .lock()
+            .await
+            .contains_key(&request_id);
+
         // The initiator does not receive its own gossip broadcast, so it must
         // self-verify and submit its own vote — the withdrawal/transfer twins do
         // the same. Without it a 2-node cohort only ever collects the remote vote
         // and never reaches the quorum. Still one vote toward the BFT threshold,
         // not a bypass of it.
-        let locally_valid = {
+        let locally_valid = if already_verified {
+            info!("transact {request_id} already verified Valid; reusing cached result");
+            // The `Valid` vote for this round was already cast when the cache
+            // entry was created, so re-voting would be redundant at best.
+            true
+        } else {
             let vote = match self.verify_transact_proof(&request).await {
                 Ok(true) => {
                     // Record the encrypted notes (#196) only AFTER the proof

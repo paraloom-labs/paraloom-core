@@ -198,6 +198,11 @@ impl TransferTx {
     }
 
     /// Verify transfer transaction structure
+    ///
+    /// Rejects the shapes that pass a naive "has inputs and outputs" check but
+    /// are unsound: a nullifier repeated inside one transaction (the same note
+    /// spent twice), an all-zero nullifier, and duplicate output commitments
+    /// (which would let one output be counted twice).
     pub fn verify_structure(&self) -> bool {
         // Must have inputs and outputs
         if self.input_nullifiers.is_empty() || self.output_commitments.is_empty() {
@@ -207,6 +212,27 @@ impl TransferTx {
         // Outputs and notes must match
         if self.output_commitments.len() != self.output_notes.len() {
             return false;
+        }
+
+        // Every input nullifier must be non-zero and unique within this
+        // transaction. Cross-transaction double-spend is the nullifier set's
+        // job, but an intra-transaction duplicate is structurally invalid and
+        // must never reach it.
+        for (i, nullifier) in self.input_nullifiers.iter().enumerate() {
+            if nullifier.0.iter().all(|b| *b == 0) {
+                return false;
+            }
+            if self.input_nullifiers[..i].contains(nullifier) {
+                return false;
+            }
+        }
+
+        // Output commitments must be distinct, so a single output cannot be
+        // presented (and later credited) more than once.
+        for (i, commitment) in self.output_commitments.iter().enumerate() {
+            if self.output_commitments[..i].contains(commitment) {
+                return false;
+            }
         }
 
         // Each commitment must match its note
@@ -277,14 +303,27 @@ impl WithdrawTx {
     }
 
     /// Verify withdraw transaction
+    ///
+    /// Rejects zero-amount withdrawals, withdrawals whose whole amount is
+    /// consumed by the fee (no net payout), malformed Solana recipients, and
+    /// all-zero input nullifiers.
     pub fn verify(&self) -> bool {
-        // Amount must cover fee
-        if self.amount < self.fee {
+        // Amount must be non-zero and must actually pay something out after
+        // the fee; `amount == fee` moves nothing and `amount == 0` is a no-op
+        // that would still consume a nullifier.
+        if self.amount == 0 || self.amount <= self.fee {
             return false;
         }
 
-        // Must have recipient
-        if self.to_public.is_empty() {
+        // Recipient must be a full 32-byte Solana public key — not merely
+        // non-empty, which would accept a 1-byte address.
+        if self.to_public.len() != 32 {
+            return false;
+        }
+
+        // A zero nullifier is not a valid spend marker and must not be able to
+        // enter the nullifier set.
+        if self.input_nullifier.0.iter().all(|b| *b == 0) {
             return false;
         }
 
@@ -332,14 +371,30 @@ impl TrackedTransaction {
     }
 
     /// Mark as verified
-    pub fn mark_verified(&mut self) {
+    ///
+    /// Returns `false` (and leaves the record untouched) if the transaction was
+    /// already rejected: a terminal rejection must not be silently upgraded to
+    /// `Accepted`. Confirmations saturate rather than overflowing.
+    pub fn mark_verified(&mut self) -> bool {
+        if matches!(self.status, TransactionStatus::Rejected { .. }) {
+            return false;
+        }
         self.status = TransactionStatus::Accepted;
-        self.confirmations += 1;
+        self.confirmations = self.confirmations.saturating_add(1);
+        true
     }
 
     /// Mark as rejected
-    pub fn mark_rejected(&mut self, reason: String) {
+    ///
+    /// Returns `false` (and leaves the record untouched) if the transaction was
+    /// already accepted, so an accepted transaction cannot be flipped back to
+    /// rejected by a late or duplicated message.
+    pub fn mark_rejected(&mut self, reason: String) -> bool {
+        if matches!(self.status, TransactionStatus::Accepted) {
+            return false;
+        }
         self.status = TransactionStatus::Rejected { reason };
+        true
     }
 }
 
@@ -385,6 +440,59 @@ mod tests {
         assert_eq!(tx.amount, 1000);
         assert_eq!(tx.fee, 10);
         assert!(tx.verify());
+    }
+
+    /// Degenerate withdrawals must not pass structural validation: a zero
+    /// amount, an amount entirely eaten by the fee, a short recipient key, or
+    /// an all-zero nullifier.
+    #[test]
+    fn test_withdraw_verify_rejects_degenerate_shapes() {
+        let nullifier = Nullifier([1u8; 32]);
+        let recipient = vec![5u8; 32];
+
+        // Zero amount.
+        assert!(!WithdrawTx::new(nullifier.clone(), 0, recipient.clone(), [0u8; 32], 0).verify());
+        // Amount == fee: no net payout.
+        assert!(!WithdrawTx::new(nullifier.clone(), 10, recipient.clone(), [0u8; 32], 10).verify());
+        // Recipient is not a 32-byte Solana key.
+        assert!(!WithdrawTx::new(nullifier.clone(), 100, vec![5u8; 1], [0u8; 32], 1).verify());
+        // Zero nullifier would poison the nullifier set.
+        assert!(
+            !WithdrawTx::new(Nullifier([0u8; 32]), 100, recipient.clone(), [0u8; 32], 1).verify()
+        );
+        // Well-formed withdrawal still passes.
+        assert!(WithdrawTx::new(nullifier, 100, recipient, [0u8; 32], 1).verify());
+    }
+
+    /// A terminal rejection must not be silently upgraded, and an accepted
+    /// transaction must not be flipped back.
+    #[test]
+    fn test_tracked_transaction_status_is_monotonic() {
+        let tx = ShieldedTransaction::Deposit(DepositTx::new(
+            vec![1u8; 32],
+            1000,
+            ShieldedAddress([2u8; 32]),
+            [3u8; 32],
+            10,
+        ));
+
+        let mut rejected = TrackedTransaction::new(tx.clone());
+        assert!(rejected.mark_rejected("bad proof".to_string()));
+        assert!(
+            !rejected.mark_verified(),
+            "rejected must not become accepted"
+        );
+        assert!(matches!(
+            rejected.status,
+            TransactionStatus::Rejected { .. }
+        ));
+        assert_eq!(rejected.confirmations, 0);
+
+        let mut accepted = TrackedTransaction::new(tx);
+        assert!(accepted.mark_verified());
+        assert_eq!(accepted.confirmations, 1);
+        assert!(!accepted.mark_rejected("late".to_string()));
+        assert_eq!(accepted.status, TransactionStatus::Accepted);
     }
 
     #[test]
