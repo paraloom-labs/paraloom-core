@@ -38,19 +38,24 @@ impl BatchVerificationResult {
 pub struct BatchVerifier {
     /// Prepared verifying key (cached for performance)
     pvk: Option<PreparedVerifyingKey<Bn254>>,
+    /// Verifying key corresponding to `pvk` (if created via `with_prepared_vk`)
+    vk: Option<VerifyingKey<Bn254>>,
 }
 
 impl BatchVerifier {
     /// Create a new batch verifier
     pub fn new() -> Self {
-        BatchVerifier { pvk: None }
+        BatchVerifier { pvk: None, vk: None }
     }
 
     /// Create a batch verifier with a prepared verifying key
     pub fn with_prepared_vk(vk: &VerifyingKey<Bn254>) -> Self {
         use ark_groth16::Groth16;
         let pvk = Groth16::<Bn254>::process_vk(vk).ok();
-        BatchVerifier { pvk }
+        BatchVerifier {
+            pvk,
+            vk: Some(vk.clone()),
+        }
     }
 
     /// Verify a batch of proofs with the same circuit
@@ -63,14 +68,24 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
-        if proofs.is_empty() {
-            return BatchVerificationResult::AllValid;
-        }
-
+        // Enforce length parity before checking for empty batch (#1151)
         if proofs.len() != public_inputs.len() {
             return BatchVerificationResult::Error {
                 reason: "Mismatched number of proofs and public inputs".to_string(),
             };
+        }
+
+        // Validate that supplied vk matches cached prepared vk if present (#1151)
+        if let Some(cached_vk) = &self.vk {
+            if cached_vk != vk {
+                return BatchVerificationResult::Error {
+                    reason: "Supplied verifying key does not match cached prepared verifying key".to_string(),
+                };
+            }
+        }
+
+        if proofs.is_empty() {
+            return BatchVerificationResult::AllValid;
         }
 
         // For small batches, verify individually
@@ -131,6 +146,14 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if let Some(cached_vk) = &self.vk {
+            if cached_vk != vk {
+                return BatchVerificationResult::Error {
+                    reason: "Supplied verifying key does not match cached prepared verifying key".to_string(),
+                };
+            }
+        }
+
         let mut invalid_indices = Vec::new();
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
@@ -196,8 +219,22 @@ impl AdaptiveBatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
         match proofs.len() {
-            0 => BatchVerificationResult::AllValid,
+            0 => {
+                if let Some(cached_vk) = &self.verifier.vk {
+                    if cached_vk != vk {
+                        return BatchVerificationResult::Error {
+                            reason: "Supplied verifying key does not match cached prepared verifying key".to_string(),
+                        };
+                    }
+                }
+                BatchVerificationResult::AllValid
+            }
             1..=2 => self.verifier.verify_individually(vk, public_inputs, proofs),
             _ => self.verifier.verify_batch(vk, public_inputs, proofs),
         }
@@ -221,6 +258,43 @@ mod tests {
     fn test_batch_verifier_creation() {
         let verifier = BatchVerifier::new();
         assert!(verifier.pvk.is_none());
+        assert!(verifier.vk.is_none());
+    }
+
+    #[test]
+    fn test_empty_batch_with_mismatched_inputs() {
+        let mut rng = StdRng::seed_from_u64(0u64);
+        let circuit = DepositCircuitV2::new();
+        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+
+        let verifier = BatchVerifier::new();
+        let result = verifier.verify_batch(&vk, &[vec![Fr::from(1u64)]], &[]);
+
+        assert!(
+            matches!(result, BatchVerificationResult::Error { .. }),
+            "empty batch with non-empty public inputs must return Error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cached_prepared_vk_mismatch() {
+        let mut rng1 = StdRng::seed_from_u64(10u64);
+        let circuit1 = DepositCircuitV2::new();
+        let (_, vk1) = Groth16ProofSystem::setup(circuit1, &mut rng1).unwrap();
+
+        let mut rng2 = StdRng::seed_from_u64(20u64);
+        let circuit2 = DepositCircuitV2::new();
+        let (_, vk2) = Groth16ProofSystem::setup(circuit2, &mut rng2).unwrap();
+
+        let verifier = BatchVerifier::with_prepared_vk(&vk1);
+        let result = verifier.verify_batch(&vk2, &[], &[]);
+
+        assert!(
+            matches!(result, BatchVerificationResult::Error { .. }),
+            "verify_batch with mismatched vk against cached prepared VK must return Error, got {:?}",
+            result
+        );
     }
 
     #[test]
