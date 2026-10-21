@@ -187,11 +187,80 @@ impl Coordinator {
     /// identity. Returns `None` if already primary or if the standby
     /// has not yet stalled.
     pub async fn try_promote_if_stalled(&self, now: Instant) -> Option<NodeId> {
-        let mut role = self.role.lock().await;
-        if !role.is_stalled(now) {
-            return None;
+        let promoted = {
+            let mut role = self.role.lock().await;
+            if !role.is_stalled(now) {
+                return None;
+            }
+            role.promote()
+        };
+        if promoted.is_some() {
+            let count = self.redispatch_inflight_tasks().await;
+            if count > 0 {
+                info!("re-dispatched {} mirrored in-flight task chunks after promotion", count);
+            }
         }
-        role.promote()
+        promoted
+    }
+
+    /// Re-dispatch mirrored in-flight (`TaskStatus::Assigned`) shards under
+    /// this coordinator's `local_peer_id()` after standby promotion so
+    /// validators route `ResultRequest` messages to the new primary.
+    pub async fn redispatch_inflight_tasks(&self) -> usize {
+        let validators = self.validators.lock().await.clone();
+        if validators.is_empty() {
+            return 0;
+        }
+        let assigned_chunks: Vec<Task> = {
+            let active = self.active_tasks.lock().await;
+            active
+                .values()
+                .filter(|t| matches!(t.status, TaskStatus::Assigned))
+                .cloned()
+                .collect()
+        };
+        let coordinator_id = self.network.local_peer_id();
+        let mut dispatched = 0usize;
+        for (i, chunk) in assigned_chunks.into_iter().enumerate() {
+            let target = chunk
+                .assigned_to
+                .as_ref()
+                .and_then(|label| {
+                    validators
+                        .iter()
+                        .find(|v| format!("{:?}", v) == *label)
+                        .cloned()
+                })
+                .unwrap_or_else(|| validators[i % validators.len()].clone());
+            let network = self.network.clone();
+            let chunk_id = chunk.id.clone();
+            let msg = Message::TaskRequest {
+                task: chunk,
+                coordinator_id: coordinator_id.clone(),
+            };
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    Duration::from_secs(1),
+                    network.send_message(target, msg),
+                )
+                .await
+                {
+                    Ok(Ok(())) => log::debug!("re-dispatched chunk {}", chunk_id),
+                    Ok(Err(e)) => log::warn!("failed to re-dispatch chunk {}: {}", chunk_id, e),
+                    Err(_) => log::warn!("timeout re-dispatching chunk {}", chunk_id),
+                }
+            });
+            dispatched += 1;
+        }
+        dispatched
+    }
+
+    /// Remove a disconnected validator from the active validator pool.
+    pub async fn unregister_validator(&self, validator_id: &NodeId) -> bool {
+        let mut validators = self.validators.lock().await;
+        let before = validators.len();
+        validators.retain(|v| v != validator_id);
+        validators.len() < before
     }
 
     /// Spawn the primary-side heartbeat broadcast task.

@@ -18,11 +18,19 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Deserialize a Groth16 proof from bytes
+/// Deserialize a Groth16 proof from bytes (rejects trailing unconsumed bytes)
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes in proof buffer: consumed {} of {} bytes",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -33,14 +41,22 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Deserialize a verifying key from bytes
+/// Deserialize a verifying key from bytes (rejects trailing unconsumed bytes)
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes in verifying key buffer: consumed {} of {} bytes",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(vk)
 }
 
-/// Convert field element to bytes (32 bytes, big-endian)
+/// Convert field element to canonical 32-byte little-endian arkworks representation
 pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     let mut buf = Vec::new();
@@ -49,15 +65,30 @@ pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
         .expect("Field serialization failed");
 
     let len = buf.len().min(32);
-    bytes[32 - len..].copy_from_slice(&buf[..len]);
+    bytes[..len].copy_from_slice(&buf[..len]);
     bytes
 }
 
-/// Convert bytes to field element
+/// Convert field element to 32-byte big-endian representation (for alt_bn128 / EVM wire compatibility)
+pub fn field_to_bytes_be(field: &Fr) -> [u8; 32] {
+    let mut bytes = field_to_bytes(field);
+    bytes.reverse();
+    bytes
+}
+
+/// Convert canonical 32-byte little-endian bytes to field element (rejects trailing bytes)
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes in field buffer: consumed {} of {} bytes",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -284,6 +315,19 @@ mod tests {
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    #[test]
+    fn bytes_to_field_rejects_trailing_bytes() {
+        let one = Fr::from(1u64);
+        let bytes = field_to_bytes(&one);
+        assert_eq!(bytes[0], 1);
+        let be = field_to_bytes_be(&one);
+        assert_eq!(be[31], 1);
+
+        let mut with_trailing = bytes.to_vec();
+        with_trailing.extend_from_slice(b"trailing");
+        assert!(bytes_to_field(&with_trailing).is_err());
     }
 
     // ── Proof-suite envelope ──────────────────────────────────────────

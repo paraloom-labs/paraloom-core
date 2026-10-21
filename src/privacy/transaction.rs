@@ -209,9 +209,27 @@ impl TransferTx {
             return false;
         }
 
-        // Each commitment must match its note
-        for (commitment, note) in self.output_commitments.iter().zip(self.output_notes.iter()) {
+        // Reject all-zero or duplicate input nullifiers
+        for (i, nf) in self.input_nullifiers.iter().enumerate() {
+            if nf.0 == [0u8; 32] {
+                return false;
+            }
+            if self.input_nullifiers[..i].contains(nf) {
+                return false;
+            }
+        }
+
+        // Each commitment must match its note and must not duplicate another output commitment
+        for (i, (commitment, note)) in self
+            .output_commitments
+            .iter()
+            .zip(self.output_notes.iter())
+            .enumerate()
+        {
             if commitment != &note.commitment() {
+                return false;
+            }
+            if self.output_commitments[..i].contains(commitment) {
                 return false;
             }
         }
@@ -278,13 +296,18 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
-        // Amount must cover fee
-        if self.amount < self.fee {
+        // Input nullifier must be non-zero
+        if self.input_nullifier.0 == [0u8; 32] {
             return false;
         }
 
-        // Must have recipient
-        if self.to_public.is_empty() {
+        // Amount must strictly exceed fee (positive net payout)
+        if self.amount <= self.fee {
+            return false;
+        }
+
+        // Recipient must be a canonical 32-byte Solana public key
+        if self.to_public.len() != 32 {
             return false;
         }
 
@@ -331,15 +354,19 @@ impl TrackedTransaction {
         }
     }
 
-    /// Mark as verified
+    /// Mark as verified (rejected transactions cannot be resurrected)
     pub fn mark_verified(&mut self) {
+        if matches!(self.status, TransactionStatus::Rejected { .. }) {
+            return;
+        }
         self.status = TransactionStatus::Accepted;
-        self.confirmations += 1;
+        self.confirmations = self.confirmations.saturating_add(1);
     }
 
-    /// Mark as rejected
+    /// Mark as rejected and clear confirmation count
     pub fn mark_rejected(&mut self, reason: String) {
         self.status = TransactionStatus::Rejected { reason };
+        self.confirmations = 0;
     }
 }
 
@@ -418,6 +445,29 @@ mod tests {
         tracked.mark_verified();
         assert_eq!(tracked.status, TransactionStatus::Accepted);
         assert_eq!(tracked.confirmations, 1);
+
+        tracked.mark_rejected("invalid proof".to_string());
+        assert_eq!(tracked.confirmations, 0);
+        assert!(matches!(tracked.status, TransactionStatus::Rejected { .. }));
+
+        // Rejected transaction must not be resurrected by mark_verified
+        tracked.mark_verified();
+        assert!(matches!(tracked.status, TransactionStatus::Rejected { .. }));
+        assert_eq!(tracked.confirmations, 0);
+    }
+
+    #[test]
+    fn test_transfer_and_withdraw_reject_malformed_inputs() {
+        let dup_nf = Nullifier([9u8; 32]);
+        let note = Note::new_native(ShieldedAddress([1u8; 32]), 500, [2u8; 32]);
+        let dup_tx = TransferTx::new(vec![dup_nf.clone(), dup_nf], vec![note], [0u8; 32], 10);
+        assert!(!dup_tx.verify_structure());
+
+        let short_recip_withdraw = WithdrawTx::new(Nullifier([1u8; 32]), 100, vec![5u8; 1], [0u8; 32], 10);
+        assert!(!short_recip_withdraw.verify());
+
+        let zero_net_withdraw = WithdrawTx::new(Nullifier([1u8; 32]), 10, vec![5u8; 32], [0u8; 32], 10);
+        assert!(!zero_net_withdraw.verify());
     }
 
     #[test]
