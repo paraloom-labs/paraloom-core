@@ -45,13 +45,10 @@ const PARALOOM_TOPIC: &str = "paraloom/v1";
 /// bare network multiaddr (no /p2p/ suffix) we fall back to dial
 /// only.
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-            Some(peer_id)
-        } else {
-            None
-        }
-    })
+    match addr.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Some(peer_id),
+        _ => None,
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -551,9 +548,26 @@ impl NetworkManager {
     /// without it the relay client cannot identify the reservation
     /// target, so we reject the address rather than silently no-op.
     pub async fn listen_via_relay(&self, relay_addr: &str) -> Result<()> {
-        let relay_addr: Multiaddr = relay_addr
+        let mut relay_addr: Multiaddr = relay_addr
             .parse()
             .with_context(|| format!("parsing relay address {}", relay_addr))?;
+
+        if matches!(
+            relay_addr.iter().last(),
+            Some(libp2p::multiaddr::Protocol::P2pCircuit)
+        ) {
+            relay_addr.pop();
+        }
+
+        if relay_addr
+            .iter()
+            .any(|proto| matches!(proto, libp2p::multiaddr::Protocol::P2pCircuit))
+        {
+            return Err(anyhow!(
+                "relay address {} must point directly to a relay server, not through /p2p-circuit",
+                relay_addr
+            ));
+        }
 
         let relay_peer = peer_id_from_multiaddr(&relay_addr).ok_or_else(|| {
             anyhow!(
@@ -1253,6 +1267,119 @@ mod tests {
     fn peer_id_returns_none_for_bare_multiaddr() {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("multiaddr parses");
         assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
+
+    #[test]
+    fn peer_id_extracted_from_relayed_multiaddr_returns_target_not_relay() {
+        let relay = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let target = PeerId::from(identity::Keypair::generate_ed25519().public());
+        assert_ne!(relay, target);
+
+        let relayed_target: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/9000/p2p/{}/p2p-circuit/p2p/{}",
+            relay, target
+        )
+        .parse()
+        .expect("relayed multiaddr parses");
+        assert_eq!(
+            peer_id_from_multiaddr(&relayed_target),
+            Some(target),
+            "must extract trailing target PeerId, not intermediate relay PeerId"
+        );
+
+        let bare_circuit: Multiaddr =
+            format!("/ip4/127.0.0.1/tcp/9000/p2p/{}/p2p-circuit", relay)
+                .parse()
+                .expect("bare circuit multiaddr parses");
+        assert_eq!(
+            peer_id_from_multiaddr(&bare_circuit),
+            None,
+            "bare /p2p-circuit listener address has no trailing target /p2p/<peer_id>"
+        );
+    }
+
+    #[tokio::test]
+    async fn redial_disconnected_co_validators_does_not_skip_relayed_peer_when_relay_is_connected()
+    {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let relay_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let coval_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+
+        // Simulate an active connection to the public relay server while the
+        // NATed co-validator reachable through that relay is disconnected.
+        mgr.connected_peers.lock().await.push(relay_peer);
+
+        let relayed_coval_addr = format!(
+            "/ip4/127.0.0.1/tcp/9000/p2p/{}/p2p-circuit/p2p/{}",
+            relay_peer, coval_peer
+        );
+        mgr.redial_disconnected_co_validators(std::slice::from_ref(&relayed_coval_addr))
+            .await;
+
+        let mut swarm = mgr.swarm.lock().await;
+        let mut coval_addrs = Vec::new();
+        let mut relay_addrs = Vec::new();
+        for bucket in swarm.behaviour_mut().kad.kbuckets() {
+            for entry in bucket.iter() {
+                if *entry.node.key.preimage() == coval_peer {
+                    coval_addrs.extend(entry.node.value.iter().cloned());
+                }
+                if *entry.node.key.preimage() == relay_peer {
+                    relay_addrs.extend(entry.node.value.iter().cloned());
+                }
+            }
+        }
+
+        let expected_addr: Multiaddr = relayed_coval_addr.parse().expect("valid multiaddr");
+        assert!(
+            coval_addrs.contains(&expected_addr),
+            "disconnected relayed co-validator must not be skipped when its relay server is connected"
+        );
+        assert!(
+            relay_addrs.is_empty(),
+            "relay server Kademlia entry must not be polluted with the co-validator's circuit address"
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_via_relay_normalizes_trailing_p2p_circuit_and_rejects_chained_circuit() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let relay_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let target_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+
+        let base_relay_addr = format!("/ip4/127.0.0.1/tcp/9000/p2p/{}", relay_peer);
+        let relay_addr_with_circuit = format!("{}/p2p-circuit", base_relay_addr);
+
+        mgr.listen_via_relay(&relay_addr_with_circuit)
+            .await
+            .expect("relay_addr with trailing /p2p-circuit should be normalized and accepted");
+
+        let mut swarm = mgr.swarm.lock().await;
+        let mut relay_kad_addrs = Vec::new();
+        for bucket in swarm.behaviour_mut().kad.kbuckets() {
+            for entry in bucket.iter() {
+                if *entry.node.key.preimage() == relay_peer {
+                    relay_kad_addrs.extend(entry.node.value.iter().cloned());
+                }
+            }
+        }
+        drop(swarm);
+
+        let expected_base: Multiaddr = base_relay_addr.parse().expect("base multiaddr");
+        assert_eq!(
+            relay_kad_addrs,
+            vec![expected_base],
+            "Kademlia must store the relay's direct transport address without /p2p-circuit"
+        );
+
+        let chained = format!(
+            "/ip4/127.0.0.1/tcp/9000/p2p/{}/p2p-circuit/p2p/{}",
+            relay_peer, target_peer
+        );
+        assert!(
+            mgr.listen_via_relay(&chained).await.is_err(),
+            "relayed target multiaddr must be rejected as a relay server address"
+        );
     }
 
     #[tokio::test]
