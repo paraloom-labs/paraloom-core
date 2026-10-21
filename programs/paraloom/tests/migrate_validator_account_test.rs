@@ -366,3 +366,411 @@ async fn migrate_staked_legacy_account_stays_withdrawable() {
         "PDA must be closed after withdraw"
     );
 }
+
+
+#[tokio::test]
+async fn migrated_legacy_113_and_129_byte_validators_withdraw_without_initialized_token_ata() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let new_len = 8 + ValidatorAccount::INIT_SPACE; // 145
+    let legacy_113_len = new_len - 32; // 113 (pre-#375, no unbonding or dual-stake fields)
+    let legacy_129_len = new_len - 16; // 129 (pre-#968, no dual-stake fields)
+
+    let validator_113 = Keypair::new();
+    let validator_129 = Keypair::new();
+    let (pda_113, _) =
+        Pubkey::find_program_address(&[b"validator", validator_113.pubkey().as_ref()], &program_id);
+    let (pda_129, _) =
+        Pubkey::find_program_address(&[b"validator", validator_129.pubkey().as_ref()], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    for (wallet, pda, len) in [
+        (&validator_113, pda_113, legacy_113_len),
+        (&validator_129, pda_129, legacy_129_len),
+    ] {
+        let mut data = ValidatorAccount::DISCRIMINATOR.to_vec();
+        data.resize(len, 0);
+        data[8..40].copy_from_slice(wallet.pubkey().as_ref());
+        data[40..48].copy_from_slice(&MIN_VALIDATOR_STAKE.to_le_bytes());
+        data[88] = 1; // is_active = true
+
+        let rent_old = Rent::default().minimum_balance(len);
+        pt.add_account(
+            pda,
+            Account {
+                lamports: rent_old + MIN_VALIDATOR_STAKE,
+                data,
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        pt.add_account(
+            wallet.pubkey(),
+            Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let mut ctx = pt.start_with_context().await;
+
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                stake_mint,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                stake_vault_authority: Pubkey::find_program_address(
+                    &[b"stake_vault_authority"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
+                rent: solana_sdk::sysvar::rent::ID,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("init registry");
+
+    for (wallet, pda, old_len) in [
+        (&validator_113, pda_113, legacy_113_len),
+        (&validator_129, pda_129, legacy_129_len),
+    ] {
+        let before_lamports = ctx.banks_client.get_balance(pda).await.unwrap();
+        send(
+            &mut ctx,
+            &upgrade_authority,
+            Instruction {
+                program_id,
+                data: instruction::MigrateValidatorAccount {
+                    _validator: wallet.pubkey(),
+                }
+                .data(),
+                accounts: accounts::MigrateValidatorAccount {
+                    validator_account: pda,
+                    authority: upgrade_authority.pubkey(),
+                    program_data: program_data_pda,
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await
+        .expect("migrate legacy validator");
+
+        let raw = ctx.banks_client.get_account(pda).await.unwrap().unwrap();
+        assert_eq!(raw.data.len(), new_len);
+        let expected_delta =
+            Rent::default().minimum_balance(new_len) - Rent::default().minimum_balance(old_len);
+        assert_eq!(raw.lamports - before_lamports, expected_delta);
+
+        send(
+            &mut ctx,
+            &upgrade_authority,
+            Instruction {
+                program_id,
+                data: instruction::DeactivateValidator {}.data(),
+                accounts: accounts::DeactivateValidator {
+                    validator_account: pda,
+                    validator_registry: registry_pda,
+                    authority: upgrade_authority.pubkey(),
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await
+        .expect("deactivate legacy validator");
+    }
+
+    let raw_113 = ctx.banks_client.get_account(pda_113).await.unwrap().unwrap();
+    let acc_113 = ValidatorAccount::try_deserialize(&mut raw_113.data.as_slice()).unwrap();
+    ctx.warp_to_slot(acc_113.unbonding_slot)
+        .expect("warp past unbonding window");
+
+    // Pre-dual-stake validators have `token_unbonding_amount == 0` and never
+    // created an Associated Token Account for `stake_mint`. Passing an
+    // uninitialized token account address (as `paraloom-cli validator
+    // withdraw-unbonded` does) must still allow withdrawing their SOL stake and
+    // closing the PDA.
+    for (wallet, pda) in [(&validator_113, pda_113), (&validator_129, pda_129)] {
+        let uninitialized_ata = Pubkey::new_unique();
+        let wallet_before = ctx.banks_client.get_balance(wallet.pubkey()).await.unwrap();
+        send(
+            &mut ctx,
+            wallet,
+            Instruction {
+                program_id,
+                data: instruction::WithdrawUnbondedStake {}.data(),
+                accounts: accounts::WithdrawUnbondedStake {
+                    stake_mint,
+                    validator_account: pda,
+                    validator: wallet.pubkey(),
+                    validator_token_account: uninitialized_ata,
+                    stake_token_vault: Pubkey::find_program_address(
+                        &[b"stake_token_vault"],
+                        &program_id,
+                    )
+                    .0,
+                    stake_vault_authority: Pubkey::find_program_address(
+                        &[b"stake_vault_authority"],
+                        &program_id,
+                    )
+                    .0,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await
+        .expect("legacy validator without stake_mint ATA must withdraw SOL stake and close PDA");
+
+        let wallet_after = ctx.banks_client.get_balance(wallet.pubkey()).await.unwrap();
+        assert!(
+            wallet_after >= wallet_before + MIN_VALIDATOR_STAKE,
+            "legacy validator must recover full unbonded SOL stake + rent"
+        );
+        let closed = ctx.banks_client.get_account(pda).await.unwrap();
+        assert!(closed.is_none() || closed.unwrap().lamports == 0);
+    }
+}
+
+#[tokio::test]
+async fn migrate_validator_account_rejects_wrong_owner_and_corrupted_lengths() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let new_len = 8 + ValidatorAccount::INIT_SPACE; // 145
+    let legacy_129_len = new_len - 16;
+
+    // 1. Account with valid discriminator and legacy length (129), but wrong owner.
+    let w_wrong_owner = Keypair::new().pubkey();
+    let (pda_wrong_owner, _) =
+        Pubkey::find_program_address(&[b"validator", w_wrong_owner.as_ref()], &program_id);
+    let mut d_wrong_owner = ValidatorAccount::DISCRIMINATOR.to_vec();
+    d_wrong_owner.resize(legacy_129_len, 0);
+    pt.add_account(
+        pda_wrong_owner,
+        Account {
+            lamports: 10_000_000,
+            data: d_wrong_owner,
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // 2. Truncated account (48 bytes < 113) with valid discriminator.
+    let w_truncated = Keypair::new().pubkey();
+    let (pda_truncated, _) =
+        Pubkey::find_program_address(&[b"validator", w_truncated.as_ref()], &program_id);
+    let mut d_truncated = ValidatorAccount::DISCRIMINATOR.to_vec();
+    d_truncated.resize(48, 0);
+    pt.add_account(
+        pda_truncated,
+        Account {
+            lamports: 10_000_000,
+            data: d_truncated,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // 3. Corrupted intermediate length (120 bytes: neither 113, 129, nor 145).
+    let w_corrupted = Keypair::new().pubkey();
+    let (pda_corrupted, _) =
+        Pubkey::find_program_address(&[b"validator", w_corrupted.as_ref()], &program_id);
+    let mut d_corrupted = ValidatorAccount::DISCRIMINATOR.to_vec();
+    d_corrupted.resize(120, 0);
+    pt.add_account(
+        pda_corrupted,
+        Account {
+            lamports: 10_000_000,
+            data: d_corrupted,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // 4. Oversized account (160 bytes > 145).
+    let w_oversized = Keypair::new().pubkey();
+    let (pda_oversized, _) =
+        Pubkey::find_program_address(&[b"validator", w_oversized.as_ref()], &program_id);
+    let mut d_oversized = ValidatorAccount::DISCRIMINATOR.to_vec();
+    d_oversized.resize(160, 0);
+    pt.add_account(
+        pda_oversized,
+        Account {
+            lamports: 10_000_000,
+            data: d_oversized,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+
+    for (label, wallet, pda) in [
+        ("wrong owner", w_wrong_owner, pda_wrong_owner),
+        ("truncated 48-byte", w_truncated, pda_truncated),
+        ("corrupted 120-byte", w_corrupted, pda_corrupted),
+        ("oversized 160-byte", w_oversized, pda_oversized),
+    ] {
+        let res = send(
+            &mut ctx,
+            &upgrade_authority,
+            Instruction {
+                program_id,
+                data: instruction::MigrateValidatorAccount { _validator: wallet }.data(),
+                accounts: accounts::MigrateValidatorAccount {
+                    validator_account: pda,
+                    authority: upgrade_authority.pubkey(),
+                    program_data: program_data_pda,
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "migrate_validator_account must reject {label} PDA"
+        );
+    }
+}
+
+#[tokio::test]
+async fn migrate_bridge_state_enforces_owner_exact_legacy_length_and_unconditional_rent_delta() {
+    use paraloom_program::BridgeState;
+
+    let program_id = paraloom_program::ID;
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let new_len = 8 + BridgeState::INIT_SPACE; // 117
+    let legacy_len = new_len - 8; // 109 (pre-#642, before deposit_cap: u64)
+
+    // Case 1: Truncated BridgeState (16 bytes < 109) must be rejected rather than
+    // zero-extended into a 117-byte BridgeState with a zeroed authority.
+    {
+        let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+        let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+        let mut truncated = BridgeState::DISCRIMINATOR.to_vec();
+        truncated.resize(16, 0);
+        pt.add_account(
+            bridge_state_pda,
+            Account {
+                lamports: 10_000_000,
+                data: truncated,
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        let mut ctx = pt.start_with_context().await;
+        let res = send(
+            &mut ctx,
+            &upgrade_authority,
+            Instruction {
+                program_id,
+                data: instruction::MigrateBridgeState {}.data(),
+                accounts: accounts::MigrateBridgeState {
+                    bridge_state: bridge_state_pda,
+                    authority: upgrade_authority.pubkey(),
+                    program_data: program_data_pda,
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "migrate_bridge_state must reject truncated 16-byte BridgeState instead of zero-filling authority"
+        );
+    }
+
+    // Case 2: Valid 109-byte legacy BridgeState with excess lamports must receive
+    // the full incremental rent delta `rent(117) - rent(109)` from authority.
+    {
+        let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+        let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+        let mut legacy = BridgeState::DISCRIMINATOR.to_vec();
+        legacy.resize(legacy_len, 0);
+        legacy[8..12].copy_from_slice(&0x0004_0000u32.to_le_bytes());
+        legacy[12..44].copy_from_slice(upgrade_authority.pubkey().as_ref());
+
+        let rent_old = Rent::default().minimum_balance(legacy_len);
+        let rent_new = Rent::default().minimum_balance(new_len);
+        let expected_delta = rent_new - rent_old;
+        let excess = 50_000u64;
+
+        pt.add_account(
+            bridge_state_pda,
+            Account {
+                lamports: rent_old + excess,
+                data: legacy,
+                owner: program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        let mut ctx = pt.start_with_context().await;
+        let before = ctx.banks_client.get_balance(bridge_state_pda).await.unwrap();
+        send(
+            &mut ctx,
+            &upgrade_authority,
+            Instruction {
+                program_id,
+                data: instruction::MigrateBridgeState {}.data(),
+                accounts: accounts::MigrateBridgeState {
+                    bridge_state: bridge_state_pda,
+                    authority: upgrade_authority.pubkey(),
+                    program_data: program_data_pda,
+                    system_program: solana_sdk::system_program::ID,
+                }
+                .to_account_metas(None),
+            },
+        )
+        .await
+        .expect("migrate valid 109-byte BridgeState");
+
+        let raw = ctx
+            .banks_client
+            .get_account(bridge_state_pda)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.data.len(), new_len);
+        assert_eq!(
+            raw.lamports - before,
+            expected_delta,
+            "migrate_bridge_state must top up the full incremental rent delta without consuming excess lamports"
+        );
+        let state = BridgeState::try_deserialize(&mut raw.data.as_slice()).unwrap();
+        assert_eq!(state.authority, upgrade_authority.pubkey());
+        assert_eq!(state.deposit_cap, 0);
+    }
+}

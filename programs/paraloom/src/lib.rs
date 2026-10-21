@@ -1407,27 +1407,36 @@ pub mod paraloom_program {
 
         let bridge_ai = ctx.accounts.bridge_state.to_account_info();
 
-        // Confirm the pinned PDA really is a BridgeState before reshaping it.
+        // Confirm the pinned PDA really is a program-owned legacy or current
+        // BridgeState before reshaping it.
+        require!(
+            bridge_ai.owner == &crate::ID,
+            BridgeError::UnauthorizedInit
+        );
+        let new_len = 8 + BridgeState::INIT_SPACE;
+        let old_len = bridge_ai.data_len();
+        require!(
+            old_len == new_len - 8 || old_len == new_len,
+            BridgeError::UnauthorizedInit
+        );
         {
             let data = bridge_ai.try_borrow_data()?;
-            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
             require!(
                 data[0..8] == *BridgeState::DISCRIMINATOR,
                 BridgeError::UnauthorizedInit
             );
         }
 
-        let new_len = 8 + BridgeState::INIT_SPACE;
-        if bridge_ai.data_len() < new_len {
+        if old_len < new_len {
             let rent = Rent::get()?;
-            let min_balance = rent.minimum_balance(new_len);
-            let current = bridge_ai.lamports();
-            if min_balance > current {
-                let delta = min_balance - current;
+            let extra_rent = rent
+                .minimum_balance(new_len)
+                .saturating_sub(rent.minimum_balance(old_len));
+            if extra_rent > 0 {
                 let ix = anchor_lang::solana_program::system_instruction::transfer(
                     &ctx.accounts.authority.key(),
                     &bridge_ai.key(),
-                    delta,
+                    extra_rent,
                 );
                 anchor_lang::solana_program::program::invoke(
                     &ix,
@@ -1714,6 +1723,49 @@ pub mod paraloom_program {
         let token_amount = validator_account.token_unbonding_amount;
         validator_account.token_unbonding_amount = 0;
         if token_amount > 0 {
+            use anchor_lang::CheckId;
+            let deserialize_token_account = |ai: &AccountInfo| -> Result<TokenAccount> {
+                if ai.owner == &anchor_lang::solana_program::system_program::ID
+                    && ai.lamports() == 0
+                {
+                    return Err(ErrorCode::AccountNotInitialized.into());
+                }
+                TokenInterface::check_id(ai.owner)?;
+                let mut data: &[u8] = &ai.try_borrow_data()?;
+                TokenAccount::try_deserialize(&mut data)
+            };
+            let deserialize_mint = |ai: &AccountInfo| -> Result<Mint> {
+                if ai.owner == &anchor_lang::solana_program::system_program::ID
+                    && ai.lamports() == 0
+                {
+                    return Err(ErrorCode::AccountNotInitialized.into());
+                }
+                TokenInterface::check_id(ai.owner)?;
+                let mut data: &[u8] = &ai.try_borrow_data()?;
+                Mint::try_deserialize(&mut data)
+            };
+
+            let stake_token_vault =
+                deserialize_token_account(&ctx.accounts.stake_token_vault.to_account_info())?;
+            let stake_mint = deserialize_mint(&ctx.accounts.stake_mint.to_account_info())?;
+            let validator_token_account =
+                deserialize_token_account(&ctx.accounts.validator_token_account.to_account_info())?;
+            require_keys_eq!(
+                ctx.accounts.stake_mint.key(),
+                stake_token_vault.mint,
+                ErrorCode::ConstraintAddress
+            );
+            require_keys_eq!(
+                validator_token_account.mint,
+                stake_token_vault.mint,
+                ErrorCode::ConstraintRaw
+            );
+            require_keys_eq!(
+                validator_token_account.owner,
+                ctx.accounts.validator.key(),
+                ErrorCode::ConstraintTokenOwner
+            );
+
             let auth_bump = ctx.bumps.stake_vault_authority;
             let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
             token_interface::transfer_checked(
@@ -1728,7 +1780,7 @@ pub mod paraloom_program {
                     signer_seeds,
                 ),
                 token_amount,
-                ctx.accounts.stake_mint.decimals,
+                stake_mint.decimals,
             )?;
         }
 
@@ -1756,16 +1808,20 @@ pub mod paraloom_program {
     ) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let ai = ctx.accounts.validator_account.to_account_info();
+        require!(ai.owner == &crate::ID, BridgeError::UnauthorizedInit);
+        let new_len = 8 + ValidatorAccount::INIT_SPACE;
+        let old_len = ai.data_len();
+        require!(
+            old_len == new_len - 32 || old_len == new_len - 16 || old_len == new_len,
+            BridgeError::UnauthorizedInit
+        );
         {
             let data = ai.try_borrow_data()?;
-            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
             require!(
                 data[0..8] == *ValidatorAccount::DISCRIMINATOR,
                 BridgeError::UnauthorizedInit
             );
         }
-        let new_len = 8 + ValidatorAccount::INIT_SPACE;
-        let old_len = ai.data_len();
         if old_len < new_len {
             let rent = Rent::get()?;
             // Top up the INCREMENTAL rent for the added bytes, unconditionally.
@@ -2535,26 +2591,25 @@ pub struct WithdrawUnbondedStake<'info> {
     #[account(mut)]
     pub validator: Signer<'info>,
 
-    /// The dual-stake mint (the vault's), needed for the `transfer_checked`
-    /// return.
-    #[account(address = stake_token_vault.mint)]
-    pub stake_mint: InterfaceAccount<'info, Mint>,
+    /// CHECK: The dual-stake mint (the vault's), deserialized and checked
+    /// against `stake_token_vault.mint` when `token_unbonding_amount > 0`.
+    pub stake_mint: UncheckedAccount<'info>,
 
-    /// Destination for the returned token stake — the validator's own token
-    /// account, of the same mint the vault holds.
-    #[account(
-        mut,
-        constraint = validator_token_account.mint == stake_token_vault.mint,
-        token::authority = validator,
-    )]
-    pub validator_token_account: InterfaceAccount<'info, TokenAccount>,
+    /// CHECK: Destination for the returned token stake — deserialized as a
+    /// `TokenAccount` and checked for mint + `validator` owner when
+    /// `token_unbonding_amount > 0`. Legacy SOL-only or zero-token-unbonding
+    /// validators can exit and close their PDA even without an initialized ATA.
+    #[account(mut)]
+    pub validator_token_account: UncheckedAccount<'info>,
 
+    /// CHECK: Shared stake token vault PDA; deserialized as a `TokenAccount`
+    /// when `token_unbonding_amount > 0`.
     #[account(
         mut,
         seeds = [b"stake_token_vault"],
         bump,
     )]
-    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub stake_token_vault: UncheckedAccount<'info>,
 
     /// CHECK: PDA that owns the vault; pinned by seeds, signs the token return.
     #[account(seeds = [b"stake_vault_authority"], bump)]
