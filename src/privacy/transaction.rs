@@ -209,6 +209,28 @@ impl TransferTx {
             return false;
         }
 
+        // Nullifiers must be unique and non-zero
+        let mut seen_nullifiers = std::collections::HashSet::new();
+        for nf in &self.input_nullifiers {
+            if nf.0 == [0u8; 32] {
+                return false;
+            }
+            if !seen_nullifiers.insert(nf.0) {
+                return false;
+            }
+        }
+
+        // Commitments must be unique and non-zero
+        let mut seen_commitments = std::collections::HashSet::new();
+        for cm in &self.output_commitments {
+            if cm.0 == [0u8; 32] {
+                return false;
+            }
+            if !seen_commitments.insert(cm.0) {
+                return false;
+            }
+        }
+
         // Each commitment must match its note
         for (commitment, note) in self.output_commitments.iter().zip(self.output_notes.iter()) {
             if commitment != &note.commitment() {
@@ -278,13 +300,18 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
-        // Amount must cover fee
-        if self.amount < self.fee {
+        // Amount must strictly exceed fee (net payout > 0)
+        if self.amount <= self.fee {
             return false;
         }
 
-        // Must have recipient
-        if self.to_public.is_empty() {
+        // Must have valid 32-byte recipient public key
+        if self.to_public.len() != 32 {
+            return false;
+        }
+
+        // Input nullifier must be non-zero
+        if self.input_nullifier.0 == [0u8; 32] {
             return false;
         }
 
@@ -333,6 +360,9 @@ impl TrackedTransaction {
 
     /// Mark as verified
     pub fn mark_verified(&mut self) {
+        if matches!(self.status, TransactionStatus::Rejected { .. }) {
+            return;
+        }
         self.status = TransactionStatus::Accepted;
         self.confirmations += 1;
     }
@@ -340,6 +370,7 @@ impl TrackedTransaction {
     /// Mark as rejected
     pub fn mark_rejected(&mut self, reason: String) {
         self.status = TransactionStatus::Rejected { reason };
+        self.confirmations = 0;
     }
 }
 

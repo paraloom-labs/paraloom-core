@@ -191,7 +191,19 @@ impl Coordinator {
         if !role.is_stalled(now) {
             return None;
         }
-        role.promote()
+        let promoted = role.promote();
+        if promoted.is_some() {
+            // Standby promoted to Primary: reset stranded assigned tasks to Pending
+            // so the new primary can re-dispatch them to available validators.
+            let mut active = self.active_tasks.lock().await;
+            for chunk in active.values_mut() {
+                if chunk.status == TaskStatus::Assigned {
+                    chunk.status = TaskStatus::Pending;
+                    chunk.assigned_to = None;
+                }
+            }
+        }
+        promoted
     }
 
     /// Spawn the primary-side heartbeat broadcast task.
@@ -388,6 +400,11 @@ impl Coordinator {
                 }
                 Ok(Err(e)) => {
                     log::error!("Failed to send chunk {}: {}", chunk.id, e);
+                    chunk.status = TaskStatus::Failed {
+                        error: format!("Failed to send to validator: {e}"),
+                    };
+                    let mut active = self.active_tasks.lock().await;
+                    active.insert(chunk.id.clone(), chunk.clone());
                 }
                 Err(_) => {
                     log::error!(
@@ -395,6 +412,11 @@ impl Coordinator {
                         chunk.id,
                         validator_id
                     );
+                    chunk.status = TaskStatus::Failed {
+                        error: format!("Timeout sending to validator {validator_id:?}"),
+                    };
+                    let mut active = self.active_tasks.lock().await;
+                    active.insert(chunk.id.clone(), chunk.clone());
                 }
             }
         }

@@ -2,6 +2,7 @@
 
 use crate::privacy::Result;
 use ark_bn254::{Bn254, Fr};
+use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Proof, VerifyingKey};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use std::io::Cursor;
@@ -21,8 +22,16 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing unconsumed bytes in proof buffer: consumed {}, total {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,28 +45,43 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing unconsumed bytes in verifying key buffer: consumed {}, total {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(vk)
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
 pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
     let mut bytes = [0u8; 32];
-    let mut buf = Vec::new();
-    field
-        .serialize_compressed(&mut buf)
-        .expect("Field serialization failed");
-
-    let len = buf.len().min(32);
-    bytes[32 - len..].copy_from_slice(&buf[..len]);
+    let be = field.into_bigint().to_bytes_be();
+    let len = be.len().min(32);
+    bytes[32 - len..].copy_from_slice(&be[..len]);
     bytes
 }
 
-/// Convert bytes to field element
+/// Convert bytes to field element (32 bytes, big-endian)
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
-    let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    if bytes.len() != 32 {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "invalid field byte length: expected 32, got {}",
+            bytes.len()
+        )));
+    }
+    // Reverse from big-endian wire format to arkworks little-endian format for CanonicalDeserialize
+    let mut le_bytes = [0u8; 32];
+    le_bytes.copy_from_slice(bytes);
+    le_bytes.reverse();
+    let mut cursor = Cursor::new(&le_bytes[..]);
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
