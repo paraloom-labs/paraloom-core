@@ -210,7 +210,11 @@ fn decode_compiled_deposit(
     };
 
     let payload = &raw_data[8..];
-    let data = DepositInstructionData::try_from_slice(payload).ok()?;
+    // Anchor's dispatcher decodes args with `deserialize(&mut &data[..])`,
+    // which ignores trailing bytes, so a deposit carrying extra bytes still
+    // executes on-chain. Decode with the same semantics: `try_from_slice`
+    // would reject it and leave the node blind to a leaf that exists (#1169).
+    let data = DepositInstructionData::deserialize(&mut &payload[..]).ok()?;
 
     let depositor_index = *compiled.accounts.get(depositor_index)? as usize;
     let depositor = account_keys.get(depositor_index)?;
@@ -485,6 +489,39 @@ mod tests {
         let ix = make_compiled_ix(3, 2, bs58::encode(bytes).into_string());
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    /// Anchor accepts instruction data with trailing bytes after the borsh
+    /// args, so the decoder must too, or it misses a deposit the program
+    /// executed (#1169).
+    #[test]
+    fn decodes_a_deposit_note_with_trailing_bytes() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let account_keys = vec![other, other, other, depositor, program_id];
+
+        let payload = DepositNoteInstructionData {
+            amount: 42,
+            pubkey: [3u8; 32],
+            blinding: [5u8; 32],
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        bytes.push(0x00);
+        let ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3, 0],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("deposit with trailing bytes executes on-chain and must decode");
+        assert_eq!(decoded.data.amount, 42);
+        assert_eq!(decoded.data.recipient, [3u8; 32]);
+        assert_eq!(decoded.data.randomness, [5u8; 32]);
+        assert_eq!(decoded.depositor, depositor);
     }
 
     #[test]
