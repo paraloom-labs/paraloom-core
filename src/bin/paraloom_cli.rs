@@ -50,7 +50,7 @@ use paraloom::node::Node;
 
 // Compute layer imports
 use once_cell::sync::Lazy;
-use paraloom::compute::{ComputeJob, JobExecutor, JobStatus, ResourceLimits};
+use paraloom::compute::{ComputeJob, JobExecutor, JobResult, JobStatus, ResourceLimits};
 use std::sync::Arc;
 
 // Privacy layer imports
@@ -62,6 +62,173 @@ static JOB_EXECUTOR: Lazy<Arc<JobExecutor>> = Lazy::new(|| {
     let executor = JobExecutor::new().expect("Failed to create job executor");
     Arc::new(executor)
 });
+
+static JOB_EXECUTOR_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+async fn ensure_job_executor_started() -> Result<()> {
+    let needs_start = {
+        let guard = JOB_EXECUTOR_TASK.lock().unwrap();
+        match guard.as_ref() {
+            Some(handle) => handle.is_finished(),
+            None => true,
+        }
+    };
+    if needs_start {
+        JOB_EXECUTOR
+            .start()
+            .await
+            .context("Failed to start job executor")?;
+        let handle = tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        });
+        *JOB_EXECUTOR_TASK.lock().unwrap() = Some(handle);
+    }
+    Ok(())
+}
+
+fn compute_results_store_path() -> PathBuf {
+    if let Ok(path) = std::env::var("PARALOOM_COMPUTE_STORE_PATH") {
+        return PathBuf::from(path);
+    }
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join("paraloom_cli_test_compute_jobs.json")
+    }
+    #[cfg(not(test))]
+    {
+        PathBuf::from(".paraloom/storage/compute_jobs.json")
+    }
+}
+
+fn load_persisted_job_results() -> std::collections::HashMap<String, JobResult> {
+    let path = compute_results_store_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn persist_job_result(result: &JobResult) -> Result<()> {
+    let path = compute_results_store_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .context("Failed to create compute job storage directory")?;
+    }
+    let mut all = load_persisted_job_results();
+    all.insert(result.job_id.clone(), result.clone());
+    let json = serde_json::to_vec_pretty(&all).context("Failed to serialize compute job store")?;
+    std::fs::write(&path, json).context("Failed to persist compute job store")?;
+    Ok(())
+}
+
+fn get_compute_job_result(job_id: &str) -> Option<JobResult> {
+    JOB_EXECUTOR
+        .get_job_result(&job_id.to_string())
+        .or_else(|| load_persisted_job_results().remove(job_id))
+}
+
+fn get_compute_job_status(job_id: &str) -> Option<JobStatus> {
+    JOB_EXECUTOR
+        .get_job_status(&job_id.to_string())
+        .or_else(|| get_compute_job_result(job_id).map(|r| r.status))
+}
+
+fn get_all_compute_job_results() -> Vec<JobResult> {
+    let mut merged = load_persisted_job_results();
+    for res in JOB_EXECUTOR.get_all_results() {
+        merged.insert(res.job_id.clone(), res);
+    }
+    let mut list: Vec<JobResult> = merged.into_values().collect();
+    list.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+    list
+}
+
+async fn wait_for_job_completion(job_id: &str, timeout_secs: u64) -> Option<JobResult> {
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(timeout_secs.max(1).saturating_add(2));
+    loop {
+        if let Some(result) = JOB_EXECUTOR.get_job_result(&job_id.to_string()) {
+            let _ = persist_job_result(&result);
+            return Some(result);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn resolve_validator_start_config(
+    global_config: Option<&std::path::Path>,
+    start_config: Option<&std::path::Path>,
+) -> PathBuf {
+    start_config
+        .or(global_config)
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("paraloom.toml"))
+}
+
+fn load_cli_settings(config_path: Option<&std::path::Path>) -> Result<Option<Settings>> {
+    let Some(path) = config_path else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        anyhow::bail!("Config file not found: {}", path.display());
+    }
+    let path_str = path.to_str().context("Config path is not valid UTF-8")?;
+    let settings = Settings::from_file(path_str)
+        .map_err(|e| anyhow::anyhow!("Failed to load settings from {}: {}", path.display(), e))?;
+    Ok(Some(settings))
+}
+
+#[cfg(any(test, feature = "solana-bridge"))]
+fn resolve_validator_rpc_url(rpc_url: Option<String>, cli_settings: Option<&Settings>) -> String {
+    rpc_url
+        .or_else(|| {
+            cli_settings
+                .map(|s| s.bridge.solana_rpc_url.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+        .unwrap_or_else(|| "https://api.devnet.solana.com".to_string())
+}
+
+#[cfg(any(test, feature = "solana-bridge"))]
+fn resolve_validator_program_id(
+    program_id: Option<String>,
+    cli_settings: Option<&Settings>,
+    default_program_id: &str,
+) -> String {
+    program_id
+        .or_else(|| {
+            cli_settings
+                .map(|s| s.bridge.program_id.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+        .unwrap_or_else(|| default_program_id.to_string())
+}
+
+#[cfg(any(test, feature = "solana-bridge"))]
+fn resolve_validator_keypair(
+    keypair: Option<PathBuf>,
+    cli_settings: Option<&Settings>,
+) -> Option<PathBuf> {
+    keypair
+        .or_else(|| {
+            cli_settings
+                .and_then(|s| s.bridge.authority_keypair_path.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            std::env::var("VALIDATOR_KEYPAIR_PATH")
+                .ok()
+                .map(PathBuf::from)
+        })
+}
 
 #[derive(Parser)]
 #[command(name = "paraloom")]
@@ -278,9 +445,9 @@ enum ComputeCommands {
 enum ValidatorCommands {
     /// Start validator node
     Start {
-        /// Configuration file
+        /// Configuration file (falls back to global --config or paraloom.toml)
         #[arg(short, long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
 
         /// Run in background (daemon mode)
         #[arg(short, long)]
@@ -429,18 +596,19 @@ async fn main() -> Result<()> {
 
     log::info!("Paraloom CLI v{}", env!("CARGO_PKG_VERSION"));
 
-    // Load config if specified
-    if let Some(config_path) = &cli.config {
-        log::debug!("Loading config from: {}", config_path.display());
-        // Note: Config loading not yet implemented
-        // Future: Parse TOML and override default settings
-    }
+    let global_config = cli.config.clone();
+    let cli_settings = match &cli.command {
+        Commands::Init { .. } => None,
+        _ => load_cli_settings(global_config.as_deref())?,
+    };
 
     // Execute command
     match cli.command {
         Commands::Wallet { command } => handle_wallet_command(command).await,
         Commands::Compute { command } => handle_compute_command(command).await,
-        Commands::Validator { command } => handle_validator_command(command).await,
+        Commands::Validator { command } => {
+            handle_validator_command(command, global_config.as_deref(), cli_settings.as_ref()).await
+        }
         Commands::Init { path, force } => handle_init_command(path, force).await,
     }
 }
@@ -978,8 +1146,12 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                     private_job.encrypted_input.len()
                 );
 
-                // Convert to standard job for execution (encrypted)
-                let job = private_job.to_compute_job();
+                // Convert to standard job for execution (encrypted) and preserve
+                // the private job's canonical job_id so status/result queries match.
+                let mut job = private_job.to_compute_job();
+                job.id = job_id.clone();
+
+                ensure_job_executor_started().await?;
 
                 // Submit to executor
                 println!("\nSubmitting encrypted job to executor...");
@@ -987,9 +1159,15 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                     .submit_job(job)
                     .context("Failed to submit job")?;
 
+                let finished = wait_for_job_completion(&job_id, timeout).await;
+                let status_label = finished
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.status))
+                    .unwrap_or_else(|| "Pending".to_string());
+
                 println!("\n[OK] Private job submitted successfully!");
                 println!("  Job ID: {}", job_id);
-                println!("  Status: Pending");
+                println!("  Status: {}", status_label);
                 println!("  Privacy: Input encrypted, output will be encrypted");
                 println!("  Proof: zkSNARK proof will be generated on completion");
             } else {
@@ -997,15 +1175,23 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
                 let job = ComputeJob::new(wasm_code, input_data, limits);
                 job_id = job.id.clone();
 
+                ensure_job_executor_started().await?;
+
                 // Submit to executor
                 println!("Submitting job to executor...");
                 JOB_EXECUTOR
                     .submit_job(job)
                     .context("Failed to submit job")?;
 
+                let finished = wait_for_job_completion(&job_id, timeout).await;
+                let status_label = finished
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.status))
+                    .unwrap_or_else(|| "Pending".to_string());
+
                 println!("\n[OK] Job submitted successfully!");
                 println!("  Job ID: {}", job_id);
-                println!("  Status: Pending");
+                println!("  Status: {}", status_label);
             }
 
             let estimated_fee = fee.unwrap_or(if private { 0.02 } else { 0.01 });
@@ -1032,8 +1218,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
         } => {
             println!("Fetching result for job {}...\n", job_id);
 
-            // Query job result from executor
-            let result = JOB_EXECUTOR.get_job_result(&job_id);
+            // Query job result from executor or persisted CLI store
+            let result = get_compute_job_result(&job_id);
 
             match result {
                 Some(job_result) => {
@@ -1114,8 +1300,8 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
         ComputeCommands::List { status, limit } => {
             println!("Your Compute Jobs:\n");
 
-            // Get all job results from executor
-            let results = JOB_EXECUTOR.get_all_results();
+            // Get all job results from executor and persisted CLI store
+            let results = get_all_compute_job_results();
 
             if results.is_empty() {
                 println!("No jobs found.");
@@ -1207,7 +1393,7 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
 
                 // Watch mode: poll every second until completed
                 loop {
-                    let status = JOB_EXECUTOR.get_job_status(&job_id);
+                    let status = get_compute_job_status(&job_id);
 
                     match status {
                         Some(job_status) => {
@@ -1239,14 +1425,14 @@ async fn handle_compute_command(command: ComputeCommands) -> Result<()> {
             } else {
                 println!("Job Status: {}\n", job_id);
 
-                let status = JOB_EXECUTOR.get_job_status(&job_id);
+                let status = get_compute_job_status(&job_id);
 
                 match status {
                     Some(job_status) => {
                         println!("Current Status: {:?}", job_status);
 
                         // Try to get result for more details
-                        if let Some(result) = JOB_EXECUTOR.get_job_result(&job_id) {
+                        if let Some(result) = get_compute_job_result(&job_id) {
                             println!("\nJob Details:");
 
                             if result.execution_time_ms > 0 {
@@ -1345,7 +1531,12 @@ fn decode_validator_pending_rewards(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[89..97].try_into().ok()?))
 }
 
-async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
+async fn handle_validator_command(
+    command: ValidatorCommands,
+    global_config: Option<&std::path::Path>,
+    cli_settings: Option<&Settings>,
+) -> Result<()> {
+    let _ = cli_settings;
     match command {
         ValidatorCommands::Start { config, daemon } => {
             if daemon {
@@ -1356,18 +1547,22 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 );
             }
 
-            println!("Starting Paraloom validator node...\n");
-            println!("Loading configuration from: {}", config.display());
+            let resolved_config = resolve_validator_start_config(global_config, config.as_deref());
 
-            if !config.exists() {
+            println!("Starting Paraloom validator node...\n");
+            println!("Loading configuration from: {}", resolved_config.display());
+
+            if !resolved_config.exists() {
                 anyhow::bail!(
                     "Config file not found: {}\n\nCopy scripts/devnet/validator.toml.example \
                      to a path of your choice and edit the marked fields.",
-                    config.display()
+                    resolved_config.display()
                 );
             }
 
-            let config_path = config.to_str().context("Config path is not valid UTF-8")?;
+            let config_path = resolved_config
+                .to_str()
+                .context("Config path is not valid UTF-8")?;
 
             // Same boot path as the `paraloom-node start` binary: load settings,
             // construct the node, and run it in the foreground until interrupted.
@@ -1391,23 +1586,14 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
                 const STAKE_LAMPORTS: u64 = LAMPORTS_PER_SOL; // 1 SOL minimum stake
 
-                let rpc_url = rpc_url
-                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+                let rpc_url = resolve_validator_rpc_url(rpc_url, cli_settings);
 
-                let keypair_path = keypair
-                    .or_else(|| {
-                        std::env::var("VALIDATOR_KEYPAIR_PATH")
-                            .ok()
-                            .map(PathBuf::from)
-                    })
-                    .context(
-                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
-                    )?;
+                let keypair_path = resolve_validator_keypair(keypair, cli_settings).context(
+                    "Validator keypair not specified. Use --keypair, bridge.authority_keypair_path in --config, or VALIDATOR_KEYPAIR_PATH",
+                )?;
 
-                let program_id_str = program_id
-                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+                let program_id_str =
+                    resolve_validator_program_id(program_id, cli_settings, DEFAULT_PROGRAM_ID);
 
                 println!("RPC URL: {}", rpc_url);
                 println!("Program ID: {}", program_id_str);
@@ -1542,23 +1728,14 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             {
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
 
-                let rpc_url = rpc_url
-                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+                let rpc_url = resolve_validator_rpc_url(rpc_url, cli_settings);
 
-                let keypair_path = keypair
-                    .or_else(|| {
-                        std::env::var("VALIDATOR_KEYPAIR_PATH")
-                            .ok()
-                            .map(PathBuf::from)
-                    })
-                    .context(
-                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
-                    )?;
+                let keypair_path = resolve_validator_keypair(keypair, cli_settings).context(
+                    "Validator keypair not specified. Use --keypair, bridge.authority_keypair_path in --config, or VALIDATOR_KEYPAIR_PATH",
+                )?;
 
-                let program_id_str = program_id
-                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+                let program_id_str =
+                    resolve_validator_program_id(program_id, cli_settings, DEFAULT_PROGRAM_ID);
 
                 println!("RPC URL: {}", rpc_url);
                 println!("Program ID: {}", program_id_str);
@@ -1643,23 +1820,14 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             {
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
 
-                let rpc_url = rpc_url
-                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+                let rpc_url = resolve_validator_rpc_url(rpc_url, cli_settings);
 
-                let keypair_path = keypair
-                    .or_else(|| {
-                        std::env::var("VALIDATOR_KEYPAIR_PATH")
-                            .ok()
-                            .map(PathBuf::from)
-                    })
-                    .context(
-                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
-                    )?;
+                let keypair_path = resolve_validator_keypair(keypair, cli_settings).context(
+                    "Validator keypair not specified. Use --keypair, bridge.authority_keypair_path in --config, or VALIDATOR_KEYPAIR_PATH",
+                )?;
 
-                let program_id_str = program_id
-                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+                let program_id_str =
+                    resolve_validator_program_id(program_id, cli_settings, DEFAULT_PROGRAM_ID);
 
                 println!("RPC URL: {}", rpc_url);
                 println!("Program ID: {}", program_id_str);
@@ -1748,23 +1916,14 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             {
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
 
-                let rpc_url = rpc_url
-                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+                let rpc_url = resolve_validator_rpc_url(rpc_url, cli_settings);
 
-                let keypair_path = keypair
-                    .or_else(|| {
-                        std::env::var("VALIDATOR_KEYPAIR_PATH")
-                            .ok()
-                            .map(PathBuf::from)
-                    })
-                    .context(
-                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
-                    )?;
+                let keypair_path = resolve_validator_keypair(keypair, cli_settings).context(
+                    "Validator keypair not specified. Use --keypair, bridge.authority_keypair_path in --config, or VALIDATOR_KEYPAIR_PATH",
+                )?;
 
-                let program_id_str = program_id
-                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+                let program_id_str =
+                    resolve_validator_program_id(program_id, cli_settings, DEFAULT_PROGRAM_ID);
 
                 println!("RPC URL: {}", rpc_url);
                 println!("Program ID: {}", program_id_str);
@@ -1876,21 +2035,15 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             // is available. No fabricated reputation/earnings numbers.
             #[cfg(feature = "solana-bridge")]
             {
-                let keypair_path = keypair.or_else(|| {
-                    std::env::var("VALIDATOR_KEYPAIR_PATH")
-                        .ok()
-                        .map(PathBuf::from)
-                });
+                let keypair_path = resolve_validator_keypair(keypair, cli_settings);
 
                 if let Some(keypair_path) = keypair_path {
-                    let rpc_url = rpc_url
-                        .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                        .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
-                    let program_id_str = program_id
-                        .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                        .unwrap_or_else(|| {
-                            "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP".to_string()
-                        });
+                    let rpc_url = resolve_validator_rpc_url(rpc_url, cli_settings);
+                    let program_id_str = resolve_validator_program_id(
+                        program_id,
+                        cli_settings,
+                        "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP",
+                    );
                     let program_id =
                         Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
                     let validator = load_keypair_from_file(
@@ -1983,12 +2136,12 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
             #[cfg(feature = "solana-bridge")]
             {
-                let rpc_url = rpc_url
-                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
-                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
-                let program_id_str = program_id
-                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
-                    .unwrap_or_else(|| "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP".to_string());
+                let rpc_url = resolve_validator_rpc_url(rpc_url, cli_settings);
+                let program_id_str = resolve_validator_program_id(
+                    program_id,
+                    cli_settings,
+                    "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP",
+                );
                 let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
@@ -2136,33 +2289,42 @@ async fn handle_init_command(path: PathBuf, force: bool) -> Result<()> {
 # Paraloom Configuration
 
 [network]
-p2p_port = 8080
-rpc_port = 8081
-bootstrap_peers = []
+listen_address = "/ip4/0.0.0.0/tcp/9300"
+bootstrap_nodes = []
+enable_mdns = true
+enable_relay_server = false
+identity_path = ".paraloom/keys/node.key"
 
-[validator]
-enabled = false
-capacity_cpu = 4
-capacity_memory = 4096  # MB
-capacity_storage = 10240  # MB
-
-[privacy]
-shielded_address = ""  # Generate with: paraloom wallet new-address
-
-[solana]
-rpc_url = "https://api.devnet.solana.com"
-bridge_program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP"
+[node]
+node_type = "ResourceProvider"
+max_cpu_usage = 80
+max_memory_usage = 70
+max_storage_usage = 10240
 
 [storage]
-path = ".paraloom/storage"
-max_size = 10240  # MB
+data_dir = ".paraloom/storage"
 
-[logging]
-level = "info"
-file = ".paraloom/logs/paraloom.log"
+[bridge]
+solana_rpc_url = "https://api.devnet.solana.com"
+program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP"
+poll_interval_secs = 8
+enabled = false
+authority_keypair_path = ""
+event_lag_warn_threshold_slots = 1500
+withdrawal_expiration_window_slots = 150
+merkle_path_query_address = "127.0.0.1:9090"
+withdrawal_ingress_address = ""
+transfer_ingress_address = ""
+ingress_token = ""
 "#;
 
-    std::fs::write(path.join("paraloom.toml"), default_config.trim())?;
+    let config_file = path.join("paraloom.toml");
+    std::fs::write(&config_file, default_config.trim())?;
+    let config_str = config_file
+        .to_str()
+        .context("Config path is not valid UTF-8")?;
+    Settings::from_file(config_str)
+        .context("Generated paraloom.toml failed Settings validation")?;
 
     println!("[OK] Paraloom initialized!");
     println!("\nCreated:");
@@ -2178,4 +2340,137 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_init_command_generates_valid_settings_toml() {
+        let dir = TempDir::new().expect("create temp dir");
+        handle_init_command(dir.path().to_path_buf(), false)
+            .await
+            .expect("init command should succeed");
+
+        let config_path = dir.path().join("paraloom.toml");
+        assert!(config_path.exists(), "paraloom.toml must be created");
+
+        let settings = Settings::from_file(&config_path).expect(
+            "paraloom.toml generated by `paraloom init` must parse via Settings::from_file",
+        );
+        assert_eq!(settings.node.node_type, "ResourceProvider");
+        assert!(!settings.network.listen_address.is_empty());
+        assert!(!settings.storage.data_dir.is_empty());
+        assert_eq!(
+            settings.bridge.solana_rpc_url,
+            "https://api.devnet.solana.com"
+        );
+    }
+
+    #[test]
+    fn test_global_config_flag_accepted_for_validator_start() {
+        let parsed = Cli::try_parse_from([
+            "paraloom",
+            "--config",
+            "custom-validator.toml",
+            "validator",
+            "start",
+        ])
+        .expect("global --config before `validator start` must parse without requiring duplicate --config");
+
+        assert_eq!(
+            parsed.config.as_deref(),
+            Some(std::path::Path::new("custom-validator.toml"))
+        );
+        let resolved = resolve_validator_start_config(parsed.config.as_deref(), None);
+        assert_eq!(resolved, PathBuf::from("custom-validator.toml"));
+
+        let missing = load_cli_settings(Some(std::path::Path::new("nonexistent-config.toml")));
+        assert!(missing.is_err(), "missing --config file must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_compute_submit_starts_executor_and_completes_job() {
+        let dir = TempDir::new().expect("create temp dir");
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )"#,
+        )
+        .expect("valid WAT");
+        let wasm_path = dir.path().join("prog.wasm");
+        let input_path = dir.path().join("input.json");
+        std::fs::write(&wasm_path, &wasm_bytes).unwrap();
+        std::fs::write(&input_path, b"{\"x\":1}").unwrap();
+
+        handle_compute_command(ComputeCommands::Submit {
+            wasm: wasm_path,
+            input: input_path,
+            timeout: 10,
+            memory: 16,
+            fee: None,
+            private: false,
+        })
+        .await
+        .expect("compute submit should succeed");
+
+        let results = JOB_EXECUTOR.get_all_results();
+        assert!(
+            results.iter().any(|r| matches!(r.status, JobStatus::Completed)),
+            "submitted compute job must be executed to completion by JOB_EXECUTOR rather than left in an unstarted queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_private_compute_submit_completes_and_allows_list() {
+        let dir = TempDir::new().expect("create temp dir");
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )"#,
+        )
+        .expect("valid WAT");
+        let wasm_path = dir.path().join("prog_priv.wasm");
+        let input_path = dir.path().join("input_priv.json");
+        std::fs::write(&wasm_path, &wasm_bytes).unwrap();
+        std::fs::write(&input_path, b"{\"secret\":42}").unwrap();
+
+        let before_count = JOB_EXECUTOR.get_all_results().len();
+
+        handle_compute_command(ComputeCommands::Submit {
+            wasm: wasm_path,
+            input: input_path,
+            timeout: 10,
+            memory: 16,
+            fee: None,
+            private: true,
+        })
+        .await
+        .expect("private compute submit should succeed");
+
+        let after = JOB_EXECUTOR.get_all_results();
+        assert!(
+            after.len() > before_count,
+            "private compute job must execute and record a result in JOB_EXECUTOR"
+        );
+        let latest = after.last().unwrap();
+        assert!(
+            handle_compute_command(ComputeCommands::Result {
+                job_id: latest.job_id.clone(),
+                output: None,
+                show_proof: false,
+            })
+            .await
+            .is_ok(),
+            "compute result must locate the completed private job by its job_id"
+        );
+    }
 }
