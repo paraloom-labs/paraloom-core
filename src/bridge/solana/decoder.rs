@@ -210,7 +210,7 @@ fn decode_compiled_deposit(
     };
 
     let payload = &raw_data[8..];
-    let data = DepositInstructionData::try_from_slice(payload).ok()?;
+    let data = DepositInstructionData::deserialize(&mut &payload[..]).ok()?;
 
     let depositor_index = *compiled.accounts.get(depositor_index)? as usize;
     let depositor = account_keys.get(depositor_index)?;
@@ -300,6 +300,44 @@ mod tests {
         assert_eq!(decoded.data.amount, amount);
         assert_eq!(decoded.data.recipient, recipient);
         assert_eq!(decoded.data.randomness, randomness);
+        assert_eq!(decoded.depositor, depositor);
+        assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+    }
+
+    #[test]
+    fn decodes_deposit_note_with_trailing_bytes() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        let account_keys = vec![other, other, other, depositor, program_id];
+
+        let amount = 2_500_000u64;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        // Append trailing instruction bytes accepted by on-chain Anchor runtime
+        bytes.push(0x00);
+        bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("deposit_note with trailing bytes must decode successfully");
+        assert_eq!(decoded.data.amount, amount);
+        assert_eq!(decoded.data.recipient, pubkey);
+        assert_eq!(decoded.data.randomness, blinding);
         assert_eq!(decoded.depositor, depositor);
         assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
     }
