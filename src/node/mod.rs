@@ -202,6 +202,91 @@ const MAX_COSIGNS_PER_SETTLEMENT: u32 = 4;
 /// certainly settled on chain (a replay of it fails there regardless).
 const MAX_COSIGN_COUNTS: usize = 1024;
 
+/// Freshness window for a `SignedDiscovery` wallet-ownership attestation
+/// (#1145). The announcer re-signs every 15s, so this is generous headroom for
+/// gossip delay while still bounding how long a captured announcement remains
+/// replayable.
+const DISCOVERY_ATTESTATION_MAX_AGE_SECS: u64 = 300;
+
+/// Tolerance for an announcer whose clock runs slightly ahead of ours, so a
+/// modest skew does not silently withhold its wallet binding.
+const DISCOVERY_ATTESTATION_FUTURE_SKEW_SECS: u64 = 60;
+
+/// Wall-clock seconds since the Unix epoch (0 if the clock predates it).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify a `SignedDiscovery` wallet-ownership attestation (#1145).
+///
+/// Returns the wallet to admit only when the advertised node id is the
+/// authenticated libp2p `source`, a wallet is advertised, the timestamp is
+/// fresh, and `signature` is a valid ed25519 signature by that wallet over
+/// [`crate::consensus::transact::discovery_wallet_signing_bytes`]. Anything
+/// else yields `None`, so a self-asserted or replayed wallet claim can never
+/// bind a `NodeId` to a validator's co-sign wallet.
+fn verify_discovery_wallet_attestation(
+    source: &NodeId,
+    node_info: &NodeInfo,
+    timestamp: u64,
+    signature: &[u8],
+    now: u64,
+) -> Option<String> {
+    if &node_info.id != source {
+        return None;
+    }
+    let wallet = node_info
+        .wallet_pubkey
+        .as_deref()
+        .filter(|w| !w.is_empty())?;
+    if timestamp > now.saturating_add(DISCOVERY_ATTESTATION_FUTURE_SKEW_SECS)
+        || now.saturating_sub(timestamp) > DISCOVERY_ATTESTATION_MAX_AGE_SECS
+    {
+        return None;
+    }
+    let wallet_key = Pubkey::from_str(wallet).ok()?;
+    let bytes = crate::consensus::transact::discovery_wallet_signing_bytes(
+        source, wallet, timestamp,
+    );
+    crate::bridge::solana::cosign_assembly::signature_is_valid(&wallet_key, signature, &bytes)
+        .then(|| wallet.to_string())
+}
+
+/// Register a peer learned through discovery (#1145).
+///
+/// `wallet` is `None` for a legacy unsigned announcement and `Some` only for a
+/// wallet whose ownership was verified from a `SignedDiscovery`; the transact
+/// coordinator's on-chain admission gate then decides whether that wallet
+/// carries co-sign weight.
+async fn register_discovered_peer(
+    compute: Option<&Arc<Coordinator>>,
+    transact: Option<&Arc<TransactVerificationCoordinator>>,
+    source: &NodeId,
+    node_info: &NodeInfo,
+    wallet: Option<String>,
+) {
+    if node_info.node_type != NodeType::ResourceProvider {
+        log::debug!(
+            "Discovered node {source} is {:?}, not registering as a validator",
+            node_info.node_type
+        );
+        return;
+    }
+
+    if let Some(coordinator) = compute {
+        coordinator.register_validator(source.clone()).await;
+    }
+
+    if let Some(transact) = transact {
+        transact
+            .register_validator_with_wallet(source.clone(), wallet)
+            .await;
+    }
+}
+
 /// Insert a verified settlement request into a bounded per-node cache (#260).
 /// The bound is a safety ceiling, not a working limit; if the map is somehow at
 /// capacity for a new key, drop one arbitrary existing entry to make room.
@@ -229,34 +314,54 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             Message::Discovery { node_info } => {
                 info!("Discovered node {}: {:?}", source, node_info);
 
-                // If we're a coordinator, register this validator
-                if let Some(coordinator) = &self.coordinator {
-                    info!("This is a coordinator node, checking if validator...");
-                    if node_info.node_type == NodeType::ResourceProvider {
-                        info!("Node is a ResourceProvider, registering...");
-                        coordinator.register_validator(source.clone()).await;
-                    } else {
-                        info!("Node type is {:?}, not registering", node_info.node_type);
+                // The wallet in an unsigned Discovery is a SELF-ASSERTED string
+                // (#1145): registering it would let any mesh peer claim a real
+                // validator's wallet, be treated as that validator by
+                // `source_is_onchain_validator`, and burn the victim's
+                // per-nullifier co-sign budget (#648/#723). Register the peer
+                // for connectivity/leader-set membership but bind no wallet;
+                // only a `SignedDiscovery` carrying a verified ownership proof
+                // may do that.
+                register_discovered_peer(
+                    self.coordinator.as_ref(),
+                    self.transact_coordinator.as_ref(),
+                    &source,
+                    &node_info,
+                    None,
+                )
+                .await;
+            }
+            Message::SignedDiscovery {
+                node_info,
+                timestamp,
+                wallet_signature,
+            } => {
+                // Admit the claimed wallet only when its owner proved it: the
+                // advertised id must be the authenticated libp2p sender, and
+                // the wallet's key must have signed the canonical
+                // (domain, NodeId, wallet, timestamp) preimage. A forged or
+                // stale claim is dropped without touching the validator set.
+                match verify_discovery_wallet_attestation(
+                    &source,
+                    &node_info,
+                    timestamp,
+                    &wallet_signature,
+                    unix_now(),
+                ) {
+                    Some(wallet) => {
+                        info!("Discovered node {} with attested wallet {}", source, wallet);
+                        register_discovered_peer(
+                            self.coordinator.as_ref(),
+                            self.transact_coordinator.as_ref(),
+                            &source,
+                            &node_info,
+                            Some(wallet),
+                        )
+                        .await;
                     }
-                } else {
-                    info!("This is not a coordinator node");
-                }
-
-                // Mirror the registration into the transact coordinator (#350)
-                // so it knows the validator set: start_verification requires a
-                // quorum-sized set, and leader selection weighs these members.
-                // Independent of the compute coordinator above — a
-                // bridge-enabled validator node has the former without being a
-                // compute Coordinator.
-                if let Some(transact) = &self.transact_coordinator {
-                    if node_info.node_type == NodeType::ResourceProvider {
-                        transact
-                            .register_validator_with_wallet(
-                                source.clone(),
-                                node_info.wallet_pubkey.clone(),
-                            )
-                            .await;
-                    }
+                    None => log::warn!(
+                        "dropping signed discovery from {source:?}: wallet ownership proof invalid"
+                    ),
                 }
             }
             Message::ResourceUpdate { resources } => {
@@ -1244,6 +1349,37 @@ impl Node {
         &self.settings.bridge.cluster_tag
     }
 
+    /// The discovery announcements this node publishes each interval (#1145).
+    ///
+    /// Always the legacy `Discovery` so pre-#1145 peers keep learning this
+    /// node, plus — when a settlement keypair is configured — a
+    /// `SignedDiscovery` whose wallet claim is signed by that wallet's key.
+    /// Peers running this build ignore the wallet on the unsigned variant and
+    /// admit the `NodeId -> wallet` binding only from the attested one.
+    pub fn discovery_announcements(&self, now: u64) -> Vec<Message> {
+        let mut messages = vec![Message::Discovery {
+            node_info: self.node_info.clone(),
+        }];
+
+        if let Some(kp) = self.cosign_keypair.as_ref() {
+            let wallet = kp.pubkey().to_string();
+            let mut node_info = self.node_info.clone();
+            node_info.wallet_pubkey = Some(wallet.clone());
+            let bytes = crate::consensus::transact::discovery_wallet_signing_bytes(
+                &node_info.id,
+                &wallet,
+                now,
+            );
+            messages.push(Message::SignedDiscovery {
+                node_info,
+                timestamp: now,
+                wallet_signature: kp.sign_message(&bytes).as_ref().to_vec(),
+            });
+        }
+
+        messages
+    }
+
     /// Build a signed transact vote for `request_id`, or `None` if this node has
     /// no co-sign keypair (it could not co-sign settlement anyway). The vote is
     /// ed25519-signed by the co-sign key over the canonical preimage.
@@ -1703,11 +1839,10 @@ impl Node {
                 let mut tick = tokio::time::interval(DISCOVERY_REANNOUNCE_INTERVAL);
                 loop {
                     tick.tick().await;
-                    let msg = Message::Discovery {
-                        node_info: me.node_info.clone(),
-                    };
-                    if let Err(e) = me.network.send_message(NodeId(vec![]), msg).await {
-                        log::debug!("periodic discovery re-announce failed: {e}");
+                    for msg in me.discovery_announcements(unix_now()) {
+                        if let Err(e) = me.network.send_message(NodeId(vec![]), msg).await {
+                            log::debug!("periodic discovery re-announce failed: {e}");
+                        }
                     }
                 }
             });
@@ -3633,5 +3768,40 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[test]
+    fn test_verify_discovery_wallet_attestation() {
+        use solana_sdk::signer::Signer;
+        let kp = solana_sdk::signature::Keypair::new();
+        let wallet = kp.pubkey().to_string();
+        let source = NodeId(vec![42; 8]);
+        let mut info = NodeInfo::new(source.clone(), NodeType::ResourceProvider);
+        info.wallet_pubkey = Some(wallet.clone());
+        let now = 1_000_000u64;
+
+        // 1. Valid signature -> Some(wallet)
+        let bytes = crate::consensus::transact::discovery_wallet_signing_bytes(&source, &wallet, now);
+        let sig = kp.sign_message(&bytes);
+        let res = verify_discovery_wallet_attestation(&source, &info, now, sig.as_ref(), now);
+        assert_eq!(res, Some(wallet.clone()));
+
+        // 2. Mismatched source NodeId -> None
+        let other_source = NodeId(vec![99; 8]);
+        let res = verify_discovery_wallet_attestation(&other_source, &info, now, sig.as_ref(), now);
+        assert_eq!(res, None);
+
+        // 3. Forged signature -> None
+        let other_kp = solana_sdk::signature::Keypair::new();
+        let bad_sig = other_kp.sign_message(&bytes);
+        let res = verify_discovery_wallet_attestation(&source, &info, now, bad_sig.as_ref(), now);
+        assert_eq!(res, None);
+
+        // 4. Stale timestamp -> None
+        let old_time = now - (DISCOVERY_ATTESTATION_MAX_AGE_SECS + 1);
+        let old_bytes = crate::consensus::transact::discovery_wallet_signing_bytes(&source, &wallet, old_time);
+        let old_sig = kp.sign_message(&old_bytes);
+        let res = verify_discovery_wallet_attestation(&source, &info, old_time, old_sig.as_ref(), now);
+        assert_eq!(res, None);
     }
 }
