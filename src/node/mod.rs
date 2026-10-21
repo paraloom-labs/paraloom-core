@@ -202,6 +202,19 @@ const MAX_COSIGNS_PER_SETTLEMENT: u32 = 4;
 /// certainly settled on chain (a replay of it fails there regardless).
 const MAX_COSIGN_COUNTS: usize = 1024;
 
+/// Maximum distinct `payload.authority` keys one input nullifier may occupy in
+/// `cosign_counts`. Because `#723` keys `cosign_counts` by
+/// `"{nullifier}:{authority}"` while `payload.authority` is not bound by the
+/// `verified_transacts` parameter match, a peer holding a single verified spend
+/// could otherwise rotate `payload.authority` through `MAX_COSIGN_COUNTS / 2`
+/// dummy 32-byte values to fill `cosign_counts` and evict `(nullifier,
+/// real_authority)` -- resetting the `#593`/`#606` per-settlement cap for the
+/// real authority infinitely many times with one proof. Capping distinct
+/// authorities per nullifier (above the on-chain `MAX_VALIDATORS = 10` cohort
+/// size) ensures a single spend can occupy at most `2 * 16 = 32` slots and can
+/// never trigger `MAX_COSIGN_COUNTS` eviction of its own or other spends' caps.
+const MAX_AUTHORITIES_PER_NULLIFIER: usize = 16;
+
 /// Insert a verified settlement request into a bounded per-node cache (#260).
 /// The bound is a safety ceiling, not a working limit; if the map is somehow at
 /// capacity for a new key, drop one arbitrary existing entry to make room.
@@ -939,6 +952,27 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 /// binding parameters — a settlement we verified `Valid`; otherwise decline
 /// (`signature: None`). Free-standing so the security-critical decision can be
 /// unit-tested without standing up a full node.
+/// Check whether the 256-byte `proof` carried in a `CoSignPayload` corresponds
+/// to the `req.proof` we verified in `verified_transacts`. In production,
+/// `req.proof` is a 129-byte tagged compressed proof whose deterministic
+/// on-chain wire encoding is `compressed_proof_to_onchain_bytes`; in synthetic
+/// unit-test fixtures that store raw wire bytes directly in `req.proof`, fall
+/// back to direct byte equality.
+fn matches_verified_proof(verified_proof: &[u8], payload_proof: &[u8]) -> bool {
+    if let Ok((suite, proof_body)) = crate::privacy::split_tagged_proof(verified_proof) {
+        match suite {
+            crate::privacy::ProofSuite::Groth16Bn254TransactV3 => {
+                if let Ok(expected) =
+                    crate::privacy::onchain_verifier::compressed_proof_to_onchain_bytes(proof_body)
+                {
+                    return payload_proof == expected.as_slice();
+                }
+            }
+        }
+    }
+    verified_proof == payload_proof
+}
+
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
@@ -976,7 +1010,7 @@ async fn cosign_settlement(
     // Match the payload against a settlement we verified Valid, by request id
     // and binding parameters, and take the input nullifiers as the per-nullifier
     // cap keys (see the cap block below for why the cap is keyed on those).
-    let (approved, cap_nullifiers) = match (request.kind, &payload.params) {
+    let (approved, nf_prefixes, cap_nullifiers) = match (request.kind, &payload.params) {
         (
             SettlementKind::Transact,
             SettlementParams::Transact {
@@ -985,16 +1019,18 @@ async fn cosign_settlement(
                 output_commitments,
                 root,
                 ext_amount,
-                ..
+                proof,
             },
         ) => {
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
+                    && matches_verified_proof(&req.proof, proof)
             });
             // Cap keys = each input nullifier paired with the payload authority
             // (#723). The approval match above binds the settlement's public
@@ -1009,11 +1045,11 @@ async fn cosign_settlement(
             // while the cap still bounds the usable signatures one spend yields
             // (they all share the one on-chain authority).
             let auth = hex::encode(payload.authority);
-            let cap_nullifiers = [
-                format!("{}:{auth}", hex::encode(nullifiers[0])),
-                format!("{}:{auth}", hex::encode(nullifiers[1])),
-            ];
-            (approved, cap_nullifiers)
+            let nf0 = hex::encode(nullifiers[0]);
+            let nf1 = hex::encode(nullifiers[1]);
+            let nf_prefixes = [format!("{nf0}:"), format!("{nf1}:")];
+            let cap_nullifiers = [format!("{nf0}:{auth}"), format!("{nf1}:{auth}")];
+            (approved, nf_prefixes, cap_nullifiers)
         }
         // SPL settlement (#779): the same binding check, but the payload's
         // recipient is the recipient token account and the asset is bound by
@@ -1028,7 +1064,7 @@ async fn cosign_settlement(
                 output_commitments,
                 root,
                 ext_amount,
-                ..
+                proof,
             },
         ) => {
             let cache = verified_transacts.lock().await;
@@ -1039,13 +1075,14 @@ async fn cosign_settlement(
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
+                    && matches_verified_proof(&req.proof, proof)
             });
             let auth = hex::encode(payload.authority);
-            let cap_nullifiers = [
-                format!("{}:{auth}", hex::encode(nullifiers[0])),
-                format!("{}:{auth}", hex::encode(nullifiers[1])),
-            ];
-            (approved, cap_nullifiers)
+            let nf0 = hex::encode(nullifiers[0]);
+            let nf1 = hex::encode(nullifiers[1]);
+            let nf_prefixes = [format!("{nf0}:"), format!("{nf1}:")];
+            let cap_nullifiers = [format!("{nf0}:{auth}"), format!("{nf1}:{auth}")];
+            (approved, nf_prefixes, cap_nullifiers)
         }
     };
     if !approved {
@@ -1086,18 +1123,34 @@ async fn cosign_settlement(
         {
             return declined("co-sign count limit reached for an input nullifier");
         }
-        for nf in cap_nullifiers {
+        // Prevent a single verified spend from rotating `payload.authority`
+        // through hundreds of dummy values to fill `MAX_COSIGN_COUNTS` and evict
+        // `(nullifier, real_authority)` (or other spends' counters).
+        for (nf, prefix) in cap_nullifiers.iter().zip(nf_prefixes.iter()) {
+            if !counts.contains_key(nf) {
+                let distinct_authorities =
+                    counts.keys().filter(|k| k.starts_with(prefix)).count();
+                if distinct_authorities >= MAX_AUTHORITIES_PER_NULLIFIER {
+                    return declined("co-sign authority limit reached for an input nullifier");
+                }
+            }
+        }
+        for nf in &cap_nullifiers {
             // Bound the map so it cannot grow without limit as settlements
             // accumulate (#626): if a new nullifier would exceed the ceiling,
-            // drop an arbitrary existing entry first. An evicted entry belongs
-            // to an older spend whose nullifiers have almost certainly settled
-            // on chain, so resetting its budget is harmless.
-            if !counts.contains_key(&nf) && counts.len() >= MAX_COSIGN_COUNTS {
-                if let Some(victim) = counts.keys().next().cloned() {
+            // drop an arbitrary existing entry first (excluding the current
+            // request's own nullifier keys so the second input cannot evict the
+            // first).
+            if !counts.contains_key(nf) && counts.len() >= MAX_COSIGN_COUNTS {
+                if let Some(victim) = counts
+                    .keys()
+                    .find(|k| !cap_nullifiers.contains(k))
+                    .cloned()
+                {
                     counts.remove(&victim);
                 }
             }
-            *counts.entry(nf).or_insert(0) += 1;
+            *counts.entry(nf.clone()).or_insert(0) += 1;
         }
     }
 
@@ -2257,42 +2310,45 @@ impl Node {
         // and never reaches the quorum. Still one vote toward the BFT threshold,
         // not a bypass of it.
         let locally_valid = {
-            let vote = match self.verify_transact_proof(&request).await {
-                Ok(true) => {
-                    // Record the encrypted notes (#196) only AFTER the proof
-                    // verifies and only the first time we see this canonical
-                    // settlement — mirroring the mesh path (#382). Recording
-                    // before verify would let an invalid proof leave notes;
-                    // recording on every sighting would let a replay with
-                    // mutated (non-proof-bound) ciphertexts pollute and
-                    // FIFO-evict the authentic ciphertext.
-                    let already_seen = self
-                        .verified_transacts
-                        .lock()
-                        .await
-                        .contains_key(&request_id);
-                    if !already_seen {
+            // Short-circuit a request we have already verified `Valid` (#726),
+            // matching the gossip `TransactVerificationRequest` handler: a
+            // client retry of an already-verified request must not re-run the
+            // Groth16 proof or risk a transient failure flipping this node's
+            // own standing `Valid` vote to `Invalid` (self-equivocation ban).
+            let already_verified = self
+                .verified_transacts
+                .lock()
+                .await
+                .contains_key(&request_id);
+            let vote = if already_verified {
+                crate::consensus::vote_tally::VerificationVote::Valid
+            } else {
+                match self.verify_transact_proof(&request).await {
+                    Ok(true) => {
+                        // Record the encrypted notes (#196) only AFTER the proof
+                        // verifies and only the first time we see this canonical
+                        // settlement — mirroring the mesh path (#382).
                         self.record_delivered_notes(
                             &request.output_commitments,
                             &request.ciphertexts,
                             request.mint,
                         )
                         .await;
+                        cache_verified(
+                            &self.verified_transacts,
+                            request_id.clone(),
+                            request.clone(),
+                        )
+                        .await;
+                        crate::consensus::vote_tally::VerificationVote::Valid
                     }
-                    cache_verified(
-                        &self.verified_transacts,
-                        request_id.clone(),
-                        request.clone(),
-                    )
-                    .await;
-                    crate::consensus::vote_tally::VerificationVote::Valid
+                    Ok(false) => crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "self-verify: proof verification failed".to_string(),
+                    },
+                    Err(e) => crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: format!("self-verify error: {e}"),
+                    },
                 }
-                Ok(false) => crate::consensus::vote_tally::VerificationVote::Invalid {
-                    reason: "self-verify: proof verification failed".to_string(),
-                },
-                Err(e) => crate::consensus::vote_tally::VerificationVote::Invalid {
-                    reason: format!("self-verify error: {e}"),
-                },
             };
             let locally_valid =
                 matches!(vote, crate::consensus::vote_tally::VerificationVote::Valid);
@@ -3633,5 +3689,244 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_authority_rotation_on_single_spend_cannot_evict_and_reset_cap() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let real_authority = [1u8; 32];
+        let legit_payload = ta_payload(
+            real_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+
+        // 1. Exhaust the per-settlement co-sign budget under `real_authority`.
+        for i in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &legit_payload),
+            )
+            .await;
+            assert!(resp.signature.is_some(), "sign #{i} within cap");
+        }
+        let over = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &legit_payload),
+        )
+        .await;
+        assert_eq!(over.signature, None, "must be at cap before authority rotation");
+
+        // 2. Attempt to evict `(nullifier, real_authority)` from `cosign_counts`
+        // by rotating `payload.authority` through `MAX_COSIGN_COUNTS` dummy
+        // 32-byte values on the SAME single cached spend `t1` (no new Groth16
+        // proof or new spend).
+        for i in 0..(MAX_COSIGN_COUNTS as u64) {
+            let mut dummy_auth = [0xAAu8; 32];
+            dummy_auth[0..8].copy_from_slice(&i.to_le_bytes());
+            let dummy_payload = ta_payload(
+                dummy_auth,
+                recipient,
+                nullifiers,
+                outputs,
+                root,
+                ext_amount,
+            );
+            let _ = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &dummy_payload),
+            )
+            .await;
+        }
+
+        // 3. The cap for `real_authority` must still be enforced; rotating
+        // dummy authorities on `t1` must never evict and reset `real_authority`'s
+        // counter in `cosign_counts`.
+        let bypass_attempt = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &legit_payload),
+        )
+        .await;
+        assert_eq!(
+            bypass_attempt.signature, None,
+            "rotating payload.authority on a single spend must not evict cosign_counts and reset the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_mutated_proof_without_burning_cosign_budget() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let mut bad_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        if let SettlementParams::Transact { ref mut proof, .. } = bad_payload.params {
+            proof[0] ^= 0xFF;
+        }
+
+        // Flood mutated-proof co-sign requests past MAX_COSIGNS_PER_SETTLEMENT:
+        // every one must be declined and none may consume the spend's budget.
+        for _ in 0..(MAX_COSIGNS_PER_SETTLEMENT + 2) {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &bad_payload),
+            )
+            .await;
+            assert_eq!(
+                resp.signature, None,
+                "a payload whose proof does not match the verified proof must be declined"
+            );
+        }
+
+        // The legitimate payload with the matching proof still has its full
+        // MAX_COSIGNS_PER_SETTLEMENT budget intact.
+        let good_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        for i in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &good_payload),
+            )
+            .await;
+            assert!(
+                resp.signature.is_some(),
+                "legitimate sign #{i} must succeed after mutated-proof flood"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initiate_transact_verification_short_circuits_already_verified_and_prevents_self_equivocation() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        // Verify counter: returns `true` on the first call, then `false` on any
+        // subsequent call to simulate a transient verifier failure on retry.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let mut node = Node::new(settings)
+            .expect("construct node")
+            .with_transact_consensus_thresholds(1, 1)
+            .with_transact_proof_verifier(Arc::new(move |_req| {
+                calls_clone.fetch_add(1, Ordering::SeqCst) == 0
+            }));
+
+        let kp = Arc::new(Keypair::new());
+        node.cosign_keypair = Some(kp.clone());
+        node.apply_onchain_stakes(HashMap::from([(
+            kp.pubkey().to_string(),
+            1_000_000_000,
+        )]))
+        .await;
+
+        let mut req = ta_request(
+            "",
+            [9u8; 32],
+            [[7u8; 32], [8u8; 32]],
+            [[5u8; 32], [6u8; 32]],
+            [2u8; 32],
+            -1_000_000_000i64,
+        );
+        req.request_id = req.canonical_id();
+
+        // First submission verifies `Valid` and caches `req` in `verified_transacts`.
+        let id1 = node
+            .initiate_transact_verification(req.clone())
+            .await
+            .expect("first initiate");
+        assert_eq!(id1, req.request_id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second submission (client retry of the same canonical request) must
+        // short-circuit via `verified_transacts` (#726) without calling the
+        // verifier a second time or flipping the self-vote to `Invalid`.
+        let id2 = node
+            .initiate_transact_verification(req.clone())
+            .await
+            .expect("retry initiate");
+        assert_eq!(id2, req.request_id);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "initiate_transact_verification must short-circuit when request_id is already in verified_transacts"
+        );
+
+        let coord = node.transact_coordinator.as_ref().unwrap();
+        let (_, valid, invalid) = coord
+            .get_status(&req.request_id)
+            .await
+            .expect("get status");
+        assert_eq!(
+            (valid, invalid),
+            (1, 0),
+            "retry must keep standing Valid vote (1, 0) rather than flipping to (0, 1)"
+        );
+        let consensus = coord
+            .check_consensus(&req.request_id)
+            .await
+            .expect("check consensus");
+        assert!(
+            matches!(
+                consensus,
+                Some(crate::consensus::vote_tally::VerificationVote::Valid)
+            ),
+            "initiator must not self-equivocate or lose Valid consensus on retry"
+        );
     }
 }
