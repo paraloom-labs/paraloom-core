@@ -4,6 +4,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::bpf_loader_upgradeable;
+use anchor_lang::CheckId;
 use anchor_spl::token_interface::{
     self, Burn, Mint, TokenAccount, TokenInterface, TransferChecked,
 };
@@ -1406,6 +1407,7 @@ pub mod paraloom_program {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
         let bridge_ai = ctx.accounts.bridge_state.to_account_info();
+        require!(bridge_ai.owner == &crate::ID, BridgeError::UnauthorizedInit);
 
         // Confirm the pinned PDA really is a BridgeState before reshaping it.
         {
@@ -1418,16 +1420,22 @@ pub mod paraloom_program {
         }
 
         let new_len = 8 + BridgeState::INIT_SPACE;
-        if bridge_ai.data_len() < new_len {
+        let old_len = bridge_ai.data_len();
+        require!(
+            old_len == new_len - 8 || old_len == new_len,
+            BridgeError::UnauthorizedInit
+        );
+
+        if old_len < new_len {
             let rent = Rent::get()?;
-            let min_balance = rent.minimum_balance(new_len);
-            let current = bridge_ai.lamports();
-            if min_balance > current {
-                let delta = min_balance - current;
+            let extra_rent = rent
+                .minimum_balance(new_len)
+                .saturating_sub(rent.minimum_balance(old_len));
+            if extra_rent > 0 {
                 let ix = anchor_lang::solana_program::system_instruction::transfer(
                     &ctx.accounts.authority.key(),
                     &bridge_ai.key(),
-                    delta,
+                    extra_rent,
                 );
                 anchor_lang::solana_program::program::invoke(
                     &ix,
@@ -1714,6 +1722,37 @@ pub mod paraloom_program {
         let token_amount = validator_account.token_unbonding_amount;
         validator_account.token_unbonding_amount = 0;
         if token_amount > 0 {
+            TokenInterface::check_id(ctx.accounts.stake_token_vault.owner)?;
+            TokenInterface::check_id(ctx.accounts.validator_token_account.owner)?;
+            TokenInterface::check_id(ctx.accounts.stake_mint.owner)?;
+
+            let decimals = {
+                let vault_data = ctx.accounts.stake_token_vault.try_borrow_data()?;
+                let stake_token_vault = TokenAccount::try_deserialize(&mut &vault_data[..])?;
+
+                let mint_data = ctx.accounts.stake_mint.try_borrow_data()?;
+                let stake_mint = Mint::try_deserialize(&mut &mint_data[..])?;
+
+                let validator_data = ctx.accounts.validator_token_account.try_borrow_data()?;
+                let validator_token_account =
+                    TokenAccount::try_deserialize(&mut &validator_data[..])?;
+
+                require!(
+                    ctx.accounts.stake_mint.key() == stake_token_vault.mint,
+                    BridgeError::UnauthorizedInit
+                );
+                require!(
+                    validator_token_account.mint == stake_token_vault.mint,
+                    BridgeError::UnauthorizedInit
+                );
+                require!(
+                    validator_token_account.owner == ctx.accounts.validator.key(),
+                    BridgeError::UnauthorizedInit
+                );
+
+                stake_mint.decimals
+            };
+
             let auth_bump = ctx.bumps.stake_vault_authority;
             let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
             token_interface::transfer_checked(
@@ -1728,7 +1767,7 @@ pub mod paraloom_program {
                     signer_seeds,
                 ),
                 token_amount,
-                ctx.accounts.stake_mint.decimals,
+                decimals,
             )?;
         }
 
@@ -1756,6 +1795,7 @@ pub mod paraloom_program {
     ) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let ai = ctx.accounts.validator_account.to_account_info();
+        require!(ai.owner == &crate::ID, BridgeError::UnauthorizedInit);
         {
             let data = ai.try_borrow_data()?;
             require!(data.len() >= 8, BridgeError::UnauthorizedInit);
@@ -1766,6 +1806,10 @@ pub mod paraloom_program {
         }
         let new_len = 8 + ValidatorAccount::INIT_SPACE;
         let old_len = ai.data_len();
+        require!(
+            old_len == new_len - 32 || old_len == new_len - 16 || old_len == new_len,
+            BridgeError::UnauthorizedInit
+        );
         if old_len < new_len {
             let rent = Rent::get()?;
             // Top up the INCREMENTAL rent for the added bytes, unconditionally.
@@ -2537,24 +2581,22 @@ pub struct WithdrawUnbondedStake<'info> {
 
     /// The dual-stake mint (the vault's), needed for the `transfer_checked`
     /// return.
-    #[account(address = stake_token_vault.mint)]
-    pub stake_mint: InterfaceAccount<'info, Mint>,
+    /// CHECK: Validated in handler when token_unbonding_amount > 0.
+    pub stake_mint: UncheckedAccount<'info>,
 
     /// Destination for the returned token stake — the validator's own token
     /// account, of the same mint the vault holds.
-    #[account(
-        mut,
-        constraint = validator_token_account.mint == stake_token_vault.mint,
-        token::authority = validator,
-    )]
-    pub validator_token_account: InterfaceAccount<'info, TokenAccount>,
+    /// CHECK: Validated in handler when token_unbonding_amount > 0.
+    #[account(mut)]
+    pub validator_token_account: UncheckedAccount<'info>,
 
+    /// CHECK: Validated in handler when token_unbonding_amount > 0. Pinned by seeds.
     #[account(
         mut,
         seeds = [b"stake_token_vault"],
         bump,
     )]
-    pub stake_token_vault: InterfaceAccount<'info, TokenAccount>,
+    pub stake_token_vault: UncheckedAccount<'info>,
 
     /// CHECK: PDA that owns the vault; pinned by seeds, signs the token return.
     #[account(seeds = [b"stake_vault_authority"], bump)]
