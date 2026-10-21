@@ -913,6 +913,7 @@ pub mod paraloom_program {
         emit!(ValidatorRegisteredEvent {
             validator: ctx.accounts.validator.key(),
             stake_amount,
+            token_stake_amount: credited_token_stake,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
@@ -1695,22 +1696,10 @@ pub mod paraloom_program {
             validator_account.pending_rewards == 0,
             BridgeError::PendingRewardsUnclaimed
         );
-        // The staked lamports live in the PDA itself; `unbonding_amount` is
-        // always the delta above the account's rent-exempt minimum, so this
-        // debit cannot drop the PDA below rent exemption.
-        **validator_account
-            .to_account_info()
-            .try_borrow_mut_lamports()? -= amount;
-        **ctx
-            .accounts
-            .validator
-            .to_account_info()
-            .try_borrow_mut_lamports()? += amount;
-        validator_account.unbonding_amount = 0;
-
-        // Return the token half from the shared vault, signed by the
-        // vault-authority PDA. Released together with the SOL unbonding, once
-        // the same window has elapsed.
+        // Return the token half from the shared vault via CPI before direct lamport mutation.
+        // In Solana runtime execution, executing CPI token transfers while accounts have pending direct
+        // lamport balance mutations without system transfer instructions violates balance isolation
+        // (InstructionError::ExternalAccountLamportSpend / UnbalancedInstruction).
         let token_amount = validator_account.token_unbonding_amount;
         validator_account.token_unbonding_amount = 0;
         if token_amount > 0 {
@@ -1732,15 +1721,32 @@ pub mod paraloom_program {
             )?;
         }
 
+        // The staked lamports live in the PDA itself; `unbonding_amount` is
+        // always the delta above the account's rent-exempt minimum, so this
+        // debit cannot drop the PDA below rent exemption.
+        if amount > 0 {
+            **validator_account
+                .to_account_info()
+                .try_borrow_mut_lamports()? -= amount;
+            **ctx
+                .accounts
+                .validator
+                .to_account_info()
+                .try_borrow_mut_lamports()? += amount;
+            validator_account.unbonding_amount = 0;
+        }
+
         emit!(UnbondedStakeWithdrawnEvent {
             validator: validator_account.validator,
             amount,
+            token_amount,
             timestamp: Clock::get()?.unix_timestamp,
         });
         msg!(
-            "Unbonded stake withdrawn: {} ({} lamports)",
+            "Unbonded stake withdrawn: {} ({} lamports, {} tokens)",
             validator_account.validator,
-            amount
+            amount,
+            token_amount
         );
         Ok(())
     }
@@ -2807,6 +2813,7 @@ pub struct TransactEvent {
 pub struct ValidatorRegisteredEvent {
     pub validator: Pubkey,
     pub stake_amount: u64,
+    pub token_stake_amount: u64,
     pub timestamp: i64,
 }
 
@@ -2821,6 +2828,7 @@ pub struct ValidatorUnregisteredEvent {
 pub struct UnbondedStakeWithdrawnEvent {
     pub validator: Pubkey,
     pub amount: u64,
+    pub token_amount: u64,
     pub timestamp: i64,
 }
 

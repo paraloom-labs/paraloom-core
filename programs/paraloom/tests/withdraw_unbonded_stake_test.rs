@@ -518,3 +518,106 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         "PDA must be closed after withdraw"
     );
 }
+
+#[tokio::test]
+async fn unbonded_stake_cpi_order_and_dual_stake_event_telemetry() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let mut ctx = pt.start_with_context().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    // 1. Registry init (upgrade authority, #204).
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await
+    .expect("init registry");
+
+    // 2. Register — PDA holds the stake, registry counts it.
+    send(
+        &mut ctx,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await
+    .expect("register");
+
+    // 3. Unregister — validator voluntarily exits. Moves SOL and token stake to unbonding.
+    send(
+        &mut ctx,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::UnregisterValidator {}.data(),
+            accounts: accounts::UnregisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: validator.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("unregister");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active);
+    assert_eq!(acc.stake_amount, 0);
+    assert_eq!(acc.unbonding_amount, MIN_VALIDATOR_STAKE);
+    assert_eq!(acc.token_unbonding_amount, TOKEN_STAKE);
+
+    // 4. Warp past unbonding window
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    let wallet_before = balance(&mut ctx, validator.pubkey()).await;
+
+    // 5. Withdraw unbonded stake: executes token CPI transfer before direct lamport mutation
+    send(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect("withdraw unbonded dual stake must succeed");
+
+    let wallet_after = balance(&mut ctx, validator.pubkey()).await;
+    assert!(
+        wallet_after > wallet_before,
+        "wallet credited by released stake + refunded rent"
+    );
+
+    // Verify token account received full unbonded token balance back
+    use anchor_lang::solana_program::program_pack::Pack;
+    let val_tok = ctx.banks_client.get_account(validator_token).await.unwrap().unwrap();
+    let val_tok_acc = spl_token::state::Account::unpack(&val_tok.data).unwrap();
+    assert_eq!(val_tok_acc.amount, common::TEST_TOKEN_FUND);
+
+    // Verify validator PDA is closed
+    let closed = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .expect("rpc");
+    assert!(closed.is_none() || closed.unwrap().lamports == 0);
+}
