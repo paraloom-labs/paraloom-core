@@ -134,7 +134,10 @@ impl ShieldedPool {
         // rather than by anything built fresh at construction. The note carries
         // fresh randomness per deposit, so an equal commitment means the same
         // deposit, not a distinct one.
-        if self.deposited.read().await.contains(&commitment) {
+        // Hold the write lock across the idempotency check and insertion
+        // to prevent TOCTOU duplicate leaves and double-counted supply (#1153).
+        let mut deposited = self.deposited.write().await;
+        if deposited.contains(&commitment) {
             return Ok(commitment);
         }
 
@@ -143,9 +146,10 @@ impl ShieldedPool {
         // and propagates here so the deposit fails atomically.
         let _index = self.commitment_tree.insert(&commitment).await?;
 
-        // Mark it credited before anything else reads the pool, in the same
-        // place the tree is appended.
-        self.deposited.write().await.insert(commitment.clone());
+        // Mark it credited before releasing the write lock, guaranteeing
+        // atomic check-and-insert against concurrent calls.
+        deposited.insert(commitment.clone());
+        drop(deposited);
 
         // Store note
         let mut notes = self.notes.write().await;
@@ -472,6 +476,35 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[&NATIVE_SOL_ASSET], 1000);
         assert_eq!(all[&usdc], 500);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_duplicate_credit_commitment_is_atomic() {
+        let pool = Arc::new(ShieldedPool::new());
+        let addr = ShieldedAddress([5u8; 32]);
+        let note = Note::new_native(addr, 500, [10u8; 32]);
+        let commitment = note.commitment();
+
+        // Spawn concurrent tasks attempting to credit the exact same commitment
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let pool_clone = Arc::clone(&pool);
+            let comm_clone = commitment.clone();
+            let note_clone = note.clone();
+            handles.push(tokio::spawn(async move {
+                pool_clone
+                    .credit_commitment(comm_clone, note_clone, 500, NATIVE_SOL_ASSET)
+                    .await
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Supply must be exactly 500 (credited once), not double/multi counted
+        assert_eq!(pool.total_supply().await, 500);
+        assert_eq!(pool.supply_of(NATIVE_SOL_ASSET).await, 500);
     }
 
     #[tokio::test]
