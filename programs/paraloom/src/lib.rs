@@ -181,6 +181,9 @@ pub mod paraloom_program {
         // uncapped (which would be the exact unbounded-loss risk the cap
         // exists to remove).
         bridge_state.deposit_cap = 0;
+        // No settlement fees have accrued yet; the vault-wide reserve starts
+        // empty (see `BridgeState::total_pending_rewards`).
+        bridge_state.total_pending_rewards = 0;
 
         msg!(
             "Bridge initialized with merkle root, program_version={}",
@@ -438,12 +441,20 @@ pub mod paraloom_program {
             // rejected the whole transaction. Guarding on the retained balance
             // turns that spurious liveness failure into a clean InsufficientFunds
             // (paraloom-core#761).
+            //
+            // The guard also reserves `total_pending_rewards`, the fees already
+            // owed to validators across the whole vault. Those lamports are not
+            // the pool's to pay users with: spending them leaves `claim_rewards`
+            // short, and `withdraw_unbonded_stake` will not close a validator
+            // PDA whose rewards are unclaimed, so the stake exit would deadlock
+            // (paraloom-core#1138).
             let vault_balance = ctx.accounts.bridge_vault.lamports();
             let rent_floor = Rent::get()?.minimum_balance(0);
-            require!(
-                vault_balance >= payout.saturating_add(rent_floor),
-                BridgeError::InsufficientFunds
-            );
+            let reserved_rewards = bridge_state.total_pending_rewards;
+            let required = payout
+                .saturating_add(rent_floor)
+                .saturating_add(reserved_rewards);
+            require!(vault_balance >= required, BridgeError::InsufficientFunds);
 
             let vault_bump = ctx.bumps.bridge_vault;
             let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
@@ -461,6 +472,13 @@ pub mod paraloom_program {
             )?;
             validator_account.pending_rewards = validator_account
                 .pending_rewards
+                .checked_add(fee)
+                .ok_or(BridgeError::InvalidAmount)?;
+            // Mirror the credit into the vault-wide reserve so the next
+            // withdrawal cannot pay a user out of this fee (#1138). `fee` is
+            // retained from `gross`, so no lamports move here — only the
+            // bookkeeping that marks them as owed to the validator.
+            bridge_state.total_pending_rewards = reserved_rewards
                 .checked_add(fee)
                 .ok_or(BridgeError::InvalidAmount)?;
 
@@ -1017,6 +1035,19 @@ pub mod paraloom_program {
 
         let reward_amount = validator_account.pending_rewards;
 
+        // The reward is paid out of `bridge_vault`, which must stay rent-exempt
+        // afterwards. Check it here so a vault that cannot cover the claim fails
+        // with a clean `InsufficientFunds` instead of a runtime rent rejection
+        // from the transfer CPI (#1138). `transact` reserves every fee it
+        // accrues, so this only trips on a vault drained before that reserve
+        // existed — anyone can top the vault up to unblock the claim.
+        let vault_balance = ctx.accounts.bridge_vault.lamports();
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        require!(
+            vault_balance >= reward_amount.saturating_add(rent_floor),
+            BridgeError::InsufficientFunds
+        );
+
         let vault_bump = ctx.bumps.bridge_vault;
         let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
         let signer_seeds = &[&seeds[..]];
@@ -1038,6 +1069,16 @@ pub mod paraloom_program {
             .total_earnings
             .checked_add(reward_amount)
             .ok_or(BridgeError::InvalidAmount)?;
+        // Release this validator's share of the vault-wide fee reserve so it
+        // keeps tracking the sum of the outstanding `pending_rewards` (#1138).
+        // Saturating: an account migrated from before the field existed starts
+        // at 0 while its validators may still carry legacy accruals, and a
+        // claim must never fail on that under-count.
+        ctx.accounts.bridge_state.total_pending_rewards = ctx
+            .accounts
+            .bridge_state
+            .total_pending_rewards
+            .saturating_sub(reward_amount);
 
         emit!(RewardClaimedEvent {
             validator: ctx.accounts.validator.key(),
@@ -2677,6 +2718,22 @@ pub struct BridgeState {
     /// to a chosen ceiling via `set_deposit_cap`. Appended last to keep the
     /// fixed `program_version` offset the L2 reads unchanged.
     pub deposit_cap: u64,
+    /// Lamports sitting in `bridge_vault` that are owed to validators rather
+    /// than to note holders: the sum of every `ValidatorAccount.pending_rewards`
+    /// accrued by `transact` and not yet paid out by `claim_rewards` (#1138).
+    ///
+    /// The vault is shared, so without this the only guard on a withdrawal was
+    /// "leave enough for the payout + the rent floor" — which let user payouts
+    /// spend lamports already earned as fees. `claim_rewards` would then fail
+    /// for want of funds, and because `withdraw_unbonded_stake` refuses to close
+    /// a PDA that still has unclaimed rewards, that validator's stake could
+    /// never exit. `transact` now reserves this amount before paying a
+    /// withdrawal out and credits the new fee here; `claim_rewards` debits it.
+    ///
+    /// Appended last so the fixed `program_version` offset the L2 reads (and
+    /// `deposit_cap`) stay unchanged. `migrate_bridge_state` zero-fills it, the
+    /// fail-safe default: it can only ever *under*-reserve, never block a claim.
+    pub total_pending_rewards: u64,
 }
 
 /// Per-asset SPL shielding config (#779): one PDA per enabled mint, holding a

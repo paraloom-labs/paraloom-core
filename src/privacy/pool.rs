@@ -29,8 +29,9 @@ pub struct ShieldedPool {
     /// cache with no persistence behind it: reloading a pool would leave it
     /// empty and let a replayed deposit through, which is exactly the case
     /// the guard exists for. `commitment_tree` is the authoritative record and
-    /// this is derived from it, so the two cannot disagree — the tree has a
-    /// single insert site, right beside the one that updates this.
+    /// this is derived from it, so the two cannot disagree — the tree is
+    /// appended only by [`ShieldedPool::insert_leaves`], which updates this
+    /// beside it.
     deposited: Arc<RwLock<HashSet<Commitment>>>,
 
     /// Note storage (commitment -> encrypted note)
@@ -108,6 +109,23 @@ impl ShieldedPool {
             .await
     }
 
+    /// Append `commitments` to the tree and mark them credited.
+    ///
+    /// The tree's only insert site, so the append and the idempotency set
+    /// cannot drift apart: every leaf in `commitment_tree` is in `deposited`
+    /// and vice versa. A storage failure leaves both untouched — see
+    /// [`MerkleTree::insert_batch`] — and propagates, so a caller's ledger
+    /// update stays all-or-nothing.
+    async fn insert_leaves(&self, commitments: &[Commitment]) -> Result<()> {
+        self.commitment_tree.insert_batch(commitments).await?;
+
+        let mut deposited = self.deposited.write().await;
+        for commitment in commitments {
+            deposited.insert(commitment.clone());
+        }
+        Ok(())
+    }
+
     /// Credit a deposit whose commitment is already known.
     ///
     /// The bridge takes this path. Its leaf has to be the one the program
@@ -141,11 +159,7 @@ impl ShieldedPool {
         // Add to commitment tree (auto-persists if storage available).
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
-        let _index = self.commitment_tree.insert(&commitment).await?;
-
-        // Mark it credited before anything else reads the pool, in the same
-        // place the tree is appended.
-        self.deposited.write().await.insert(commitment.clone());
+        self.insert_leaves(std::slice::from_ref(&commitment)).await?;
 
         // Store note
         let mut notes = self.notes.write().await;
@@ -222,6 +236,74 @@ impl ShieldedPool {
                 log::warn!("failed to record spent nullifier off-chain: {e}");
             }
         }
+    }
+
+    /// Mirror a settled `transact` into the pool's ledger (#1136).
+    ///
+    /// A `transact` settlement appends its two output notes to the on-chain
+    /// Merkle tree and, for a withdrawal (`ext_amount < 0`), pays
+    /// `|ext_amount|` out of the asset's vault. A node that settles one has to
+    /// mirror both or its ledger stops describing the chain: `path` would
+    /// return nothing for a note the recipient was just paid, and the tracked
+    /// supply would keep counting value the vault no longer custodies.
+    ///
+    /// Idempotent per settlement, the way a deposit is: outputs the pool
+    /// already holds mean this settlement was applied before — a re-emitted
+    /// approval re-proves an identical canonical id after a submit that
+    /// actually landed — and neither the tree nor the supply may move again.
+    pub async fn apply_settlement(
+        &self,
+        outputs: &[Commitment; 2],
+        asset_id: AssetId,
+        ext_amount: i64,
+    ) -> Result<()> {
+        let fresh: Vec<Commitment> = {
+            let deposited = self.deposited.read().await;
+            outputs
+                .iter()
+                .filter(|c| !deposited.contains(*c))
+                .cloned()
+                .collect()
+        };
+        if fresh.is_empty() {
+            return Ok(());
+        }
+
+        self.insert_leaves(&fresh).await?;
+
+        // Only a withdrawal moves value out of the vault: a pure shielded
+        // transfer (`ext_amount == 0`) leaves the supply alone.
+        if ext_amount < 0 {
+            self.debit_supply(asset_id, ext_amount.unsigned_abs()).await?;
+        }
+        Ok(())
+    }
+
+    /// Debit `amount` from `asset_id`'s shielded supply because that value
+    /// left the vault (#1136), persisting the new balance when storage is
+    /// configured.
+    ///
+    /// Saturating rather than checked: the off-chain ledger can legitimately
+    /// lag the chain (a deposit whose event has not been indexed yet), and a
+    /// settlement that has already landed must not be turned into a failure —
+    /// nor wrapped into a supply of nearly 2^64 — over bookkeeping.
+    pub async fn debit_supply(&self, asset_id: AssetId, amount: u64) -> Result<()> {
+        let mut supplies = self.supplies.write().await;
+        let supply = supplies.entry(asset_id).or_insert(0);
+        if amount > *supply {
+            log::warn!(
+                "shielded supply for asset {} is {} but {} left the vault; clamping at zero",
+                hex::encode(asset_id),
+                *supply,
+                amount
+            );
+        }
+        *supply = supply.saturating_sub(amount);
+
+        if let Some(storage) = &self.storage {
+            storage.set_asset_supply(&asset_id, *supply)?;
+        }
+        Ok(())
     }
 
     /// Get the native-SOL shielded supply.
