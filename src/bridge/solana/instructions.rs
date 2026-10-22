@@ -108,6 +108,9 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:slash_validator")[..8]`. Slashes an active or unbonding
+    /// validator's stake (SOL to slashed_funds_vault, token stake burned).
+    pub const SLASH_VALIDATOR: [u8; 8] = [238, 57, 244, 40, 132, 82, 78, 5];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -507,6 +510,57 @@ pub fn create_claim_rewards_instruction(program_id: &Pubkey, validator: &Pubkey)
     }
 }
 
+/// Create a `slash_validator` instruction.
+///
+/// Registry authority-signed: slashes an active or unbonding validator's stake
+/// (both SOL and dual-stake tokens). Slashed SOL is moved to `slashed_funds_vault`
+/// and slashed tokens are burned via CPI from `stake_token_vault`.
+///
+/// Account order matches `SlashValidator` struct:
+/// validator_account (mut), slashed_funds_vault (mut), validator_registry (mut),
+/// stake_mint (mut), stake_token_vault (mut), stake_vault_authority (readonly),
+/// token_program (readonly), authority (mut signer).
+pub fn create_slash_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    stake_mint: &Pubkey,
+    token_program: &Pubkey,
+    slash_percentage: u8,
+) -> Result<Instruction> {
+    if slash_percentage == 0 || slash_percentage > 100 {
+        return Err(BridgeError::InvalidTransaction(
+            "slash_percentage must be between 1 and 100".to_string(),
+        ));
+    }
+
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (slashed_funds_vault, _) = derive_slashed_funds_vault(program_id);
+    let (validator_registry, _) = derive_validator_registry(program_id);
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
+    let (stake_vault_authority, _) = derive_stake_vault_authority(program_id);
+
+    let mut data = Vec::with_capacity(8 + 32 + 1);
+    data.extend_from_slice(&discriminators::SLASH_VALIDATOR);
+    data.extend_from_slice(validator.as_ref());
+    data.push(slash_percentage);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(slashed_funds_vault, false),
+            AccountMeta::new(validator_registry, false),
+            AccountMeta::new(*stake_mint, false),
+            AccountMeta::new(stake_token_vault, false),
+            AccountMeta::new_readonly(stake_vault_authority, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new(*authority, true),
+        ],
+        data,
+    })
+}
+
 /// Create a `migrate_validator_account` instruction (#204-gated to the program's
 /// upgrade authority). Grows a legacy `ValidatorAccount` PDA to the current
 /// unbonding layout; idempotent. `validator_wallet` is the wallet whose PDA is
@@ -873,6 +927,12 @@ pub fn derive_validator_account(program_id: &Pubkey, validator: &Pubkey) -> (Pub
 /// Derive the validator registry PDA.
 pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"validator_registry"], program_id)
+}
+
+/// Derive the dead-end vault PDA (`[b"slashed_funds_vault"]`) where forfeited SOL
+/// from validator slashing is held (#728).
+pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
 }
 
 /// Derive the on-chain incremental Merkle tree PDA (circuit v3, #350).
@@ -1310,5 +1370,84 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_slash_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let res = create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &token_program,
+            50,
+        );
+        assert!(res.is_ok());
+        let ix = res.unwrap();
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_slashed_funds_vault(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(
+            ix.accounts[2].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, stake_mint);
+        assert!(ix.accounts[3].is_writable);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[4].is_writable);
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert!(!ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert!(!ix.accounts[6].is_writable);
+        assert_eq!(ix.accounts[7].pubkey, authority);
+        assert!(ix.accounts[7].is_signer);
+        assert!(ix.accounts[7].is_writable);
+
+        assert_eq!(&ix.data[..8], &discriminators::SLASH_VALIDATOR);
+        assert_eq!(&ix.data[8..40], validator.as_ref());
+        assert_eq!(ix.data[40], 50);
+
+        // Invalid percentages must be rejected
+        assert!(create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &token_program,
+            0,
+        )
+        .is_err());
+        assert!(create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &token_program,
+            101,
+        )
+        .is_err());
     }
 }

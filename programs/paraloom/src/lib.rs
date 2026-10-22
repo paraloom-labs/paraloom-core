@@ -1137,24 +1137,12 @@ pub mod paraloom_program {
                 .saturating_sub(token_slash);
         }
 
-        // Move the slashed SOL to the dead-end slashed-funds vault, NOT the
-        // bridge vault (#728): the deposit cap is measured against the bridge
-        // vault's live balance, so routing forfeited SOL there would permanently
-        // eat deposit headroom with no way back out. The slashed token half is
-        // burned just below; this is the SOL parallel to that.
-        **validator_account
-            .to_account_info()
-            .try_borrow_mut_lamports()? -= slash_amount;
-        **ctx
-            .accounts
-            .slashed_funds_vault
-            .to_account_info()
-            .try_borrow_mut_lamports()? += slash_amount;
-
         // Burn the slashed token half from the vault, signed by the vault
         // authority. Burning is the strongest deterrent, needs no destination
         // account, and works even though the real mint's authority is revoked
         // (a burn is authorised by the token account's owner, not the mint).
+        // Executed before direct lamport mutation to respect SVM account balance
+        // isolation rules across CPI boundaries.
         if token_slash > 0 {
             let auth_bump = ctx.bumps.stake_vault_authority;
             let signer_seeds: &[&[&[u8]]] = &[&[b"stake_vault_authority", &[auth_bump]]];
@@ -1172,12 +1160,35 @@ pub mod paraloom_program {
             )?;
         }
 
+        // Move the slashed SOL to the dead-end slashed-funds vault, NOT the
+        // bridge vault (#728): the deposit cap is measured against the bridge
+        // vault's live balance, so routing forfeited SOL there would permanently
+        // eat deposit headroom with no way back out. Slashed lamports are transferred
+        // only when `slash_amount > 0` to prevent redundant mutable borrows on zero-lamport slashes.
+        if slash_amount > 0 {
+            **validator_account
+                .to_account_info()
+                .try_borrow_mut_lamports()? -= slash_amount;
+            **ctx
+                .accounts
+                .slashed_funds_vault
+                .to_account_info()
+                .try_borrow_mut_lamports()? += slash_amount;
+        }
+
+        let effective_new_stake = if validator_account.is_active {
+            validator_account.stake_amount
+        } else {
+            validator_account.unbonding_amount
+        };
+
         emit!(ValidatorSlashedEvent {
             validator,
             slash_amount,
             slash_percentage,
             old_stake,
-            new_stake: validator_account.stake_amount,
+            new_stake: effective_new_stake,
+            token_slash_amount: token_slash,
             timestamp: Clock::get()?.unix_timestamp,
         });
 
@@ -2839,6 +2850,7 @@ pub struct ValidatorSlashedEvent {
     pub slash_percentage: u8,
     pub old_stake: u64,
     pub new_stake: u64,
+    pub token_slash_amount: u64,
     pub timestamp: i64,
 }
 

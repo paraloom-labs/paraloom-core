@@ -21,13 +21,13 @@ pub use instructions::{
     create_migrate_validator_account_instruction, create_pause_instruction,
     create_register_validator_instruction, create_reset_validator_registry_instruction,
     create_set_bridge_authority_instruction, create_set_deposit_cap_instruction,
-    create_transact_instruction, create_unpause_instruction,
+    create_slash_validator_instruction, create_transact_instruction, create_unpause_instruction,
     create_unregister_validator_instruction, create_withdraw_unbonded_stake_instruction,
     derive_asset_vault, derive_asset_vault_authority, derive_associated_token_address,
     derive_bridge_state, derive_bridge_vault, derive_nullifier_account, derive_program_data,
-    derive_stake_token_vault, derive_stake_vault_authority, derive_validator_account,
-    derive_validator_registry, DepositInstructionData, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
-    SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+    derive_slashed_funds_vault, derive_stake_token_vault, derive_stake_vault_authority,
+    derive_validator_account, derive_validator_registry, DepositInstructionData,
+    SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
 pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;

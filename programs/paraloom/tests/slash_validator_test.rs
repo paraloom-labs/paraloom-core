@@ -496,3 +496,127 @@ async fn slash_rent_only_ghost_does_not_underflow() {
     assert_eq!(acc.unbonding_amount, 0, "still nothing unbonding");
     assert_eq!(acc.times_slashed, 1, "the slash was recorded");
 }
+
+
+#[tokio::test]
+async fn slash_unbonding_validator_burns_tokens_and_preserves_remaining_unbonding_stake() {
+    use anchor_lang::solana_program::program_pack::Pack;
+
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"slashed_funds_vault"], &program_id);
+    let (token_vault_pda, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+
+    // Register with 2x minimum stake and 2x token stake
+    let initial_sol_stake = MIN_VALIDATOR_STAKE * 2;
+    let initial_token_stake = TOKEN_STAKE * 2;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            initial_sol_stake,
+            initial_token_stake,
+        ),
+    )
+    .await;
+
+    // Unregister: moves SOL stake and token stake into unbonding window
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::UnregisterValidator {}.data(),
+            accounts: accounts::UnregisterValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: validator.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // Verify unbonding state before slash
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert!(!acc.is_active);
+    assert_eq!(acc.stake_amount, 0);
+    assert_eq!(acc.unbonding_amount, initial_sol_stake);
+    assert_eq!(acc.token_stake_amount, 0);
+    assert_eq!(acc.token_unbonding_amount, initial_token_stake);
+
+    // Slash unbonding validator by 50%
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
+    )
+    .await;
+
+    // Verify residual balances after 50% slash
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(acc.unbonding_amount, MIN_VALIDATOR_STAKE);
+    assert_eq!(acc.token_unbonding_amount, TOKEN_STAKE);
+    assert_eq!(acc.times_slashed, 1);
+
+    // Verify slashed SOL arrived in slashed_funds_vault
+    let vault = banks_client
+        .get_account(vault_pda)
+        .await
+        .unwrap()
+        .expect("slashed_funds_vault must exist");
+    assert_eq!(vault.lamports, MIN_VALIDATOR_STAKE);
+
+    // Verify slashed tokens were burned from stake_token_vault
+    let token_vault_acc = banks_client
+        .get_account(token_vault_pda)
+        .await
+        .unwrap()
+        .expect("stake_token_vault must exist");
+    let token_account = spl_token::state::Account::unpack(&token_vault_acc.data).unwrap();
+    assert_eq!(token_account.amount, TOKEN_STAKE);
+}
