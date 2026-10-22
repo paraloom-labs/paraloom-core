@@ -138,4 +138,28 @@ pub enum Message {
     TransactVerificationResult {
         result: crate::consensus::transact::TransactVerificationResult,
     },
+
+    /// Wallet-ownership-attested node discovery (#1145).
+    ///
+    /// Same payload as [`Message::Discovery`], plus an ed25519 signature by the
+    /// advertised wallet's key over
+    /// [`crate::consensus::transact::discovery_wallet_signing_bytes`] (domain,
+    /// NodeId, wallet, timestamp). A peer admits the `NodeId -> wallet` binding
+    /// only after verifying this proof, so an unprivileged mesh peer can no
+    /// longer claim a registered validator's wallet and inherit its co-sign
+    /// authority (the residual gap of #627).
+    ///
+    /// Appended at the end of the enum, like the transact messages above, so
+    /// the bincode discriminant of every existing variant stays stable. The
+    /// legacy `Discovery` variant is still emitted for pre-#1145 peers, whose
+    /// wallet claim new peers deliberately ignore.
+    SignedDiscovery {
+        /// Node information; `wallet_pubkey` is the claimed settlement wallet.
+        node_info: crate::types::NodeInfo,
+        /// Unix seconds at signing time; bounds how long a copy can be replayed.
+        timestamp: u64,
+        /// ed25519 signature by `node_info.wallet_pubkey` over the canonical
+        /// discovery-wallet preimage.
+        wallet_signature: Vec<u8>,
+    },
 }
