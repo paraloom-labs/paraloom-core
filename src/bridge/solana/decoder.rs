@@ -8,6 +8,7 @@
 
 use crate::bridge::solana::instructions::{discriminators, DepositInstructionData};
 use crate::bridge::DepositEvent;
+use base64::Engine as _;
 use borsh::BorshDeserialize;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
@@ -249,6 +250,78 @@ fn parse_account_keys(keys: &[String]) -> std::result::Result<Vec<Pubkey>, Strin
     keys.iter()
         .map(|k| k.parse::<Pubkey>().map_err(|_| k.clone()))
         .collect()
+}
+
+/// An invocation frame tracking active execution and buffered log payloads (#1166).
+struct InvocationFrame {
+    program_id: Pubkey,
+    buffered_payloads: Vec<Vec<u8>>,
+}
+
+/// Extract base64-decoded `Program data:` event payloads emitted by `expected_program_id`
+/// across transaction logs (#1166).
+///
+/// Implements frame-buffered CPI accounting:
+/// - Pushes an invocation frame on `Program <id> invoke [<depth>]`
+/// - Buffers `Program data: <base64>` payloads in the current frame if it matches `expected_program_id`
+/// - Commits buffered payloads to output ONLY when the matching invocation frame exits with `Program <id> success`
+/// - Drops buffered payloads when an invocation frame exits with `Program <id> failed`
+/// - Ignores spoofed/mismatched exit lines where the exiting program does not match the active frame
+/// - Drops incomplete/truncated frames whose invocation never reached an explicit `success`
+pub fn extract_program_event_payloads(
+    logs: &[String],
+    expected_program_id: &Pubkey,
+) -> Vec<Vec<u8>> {
+    let mut stack: Vec<InvocationFrame> = Vec::new();
+    let mut out: Vec<Vec<u8>> = Vec::new();
+
+    for line in logs {
+        let trimmed = line.trim();
+
+        if let Some(b64) = trimmed.strip_prefix("Program data: ") {
+            if let Some(top) = stack.last_mut() {
+                if top.program_id == *expected_program_id {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim())
+                    {
+                        top.buffered_payloads.push(bytes);
+                    }
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Program ") {
+            if let Some((prog_str, _depth)) = rest.split_once(" invoke [") {
+                if let Ok(prog) = prog_str.parse::<Pubkey>() {
+                    stack.push(InvocationFrame {
+                        program_id: prog,
+                        buffered_payloads: Vec::new(),
+                    });
+                }
+            } else if let Some((prog_str, _)) = rest.split_once(" success") {
+                if let Ok(prog) = prog_str.parse::<Pubkey>() {
+                    if let Some(top) = stack.last() {
+                        if top.program_id == prog {
+                            let frame = stack.pop().unwrap();
+                            if frame.program_id == *expected_program_id {
+                                out.extend(frame.buffered_payloads);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(prog_str) = rest
+                .strip_suffix(" failed")
+                .or_else(|| rest.split_once(" failed:").map(|(p, _)| p))
+            {
+                if let Ok(prog) = prog_str.parse::<Pubkey>() {
+                    if let Some(top) = stack.last() {
+                        if top.program_id == prog {
+                            let _ = stack.pop(); // discard buffered payloads
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -515,5 +588,88 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn event_payloads_commits_matching_program_data_on_success() {
+        let prog = Pubkey::new_unique();
+        let logs = vec![
+            format!("Program {} invoke [1]", prog),
+            "Program data: aGVsbG8gd29ybGQ=".to_string(), // "hello world"
+            format!("Program {} success", prog),
+        ];
+
+        let payloads = extract_program_event_payloads(&logs, &prog);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0], b"hello world");
+    }
+
+    #[test]
+    fn event_payloads_ignores_other_program_data() {
+        let our_prog = Pubkey::new_unique();
+        let other_prog = Pubkey::new_unique();
+        let logs = vec![
+            format!("Program {} invoke [1]", our_prog),
+            "Program data: b3VyZGF0YQ==".to_string(), // "ourdata"
+            format!("Program {} invoke [2]", other_prog),
+            "Program data: b3RoZXJkYXRh".to_string(), // "otherdata"
+            format!("Program {} success", other_prog),
+            format!("Program {} success", our_prog),
+        ];
+
+        let payloads = extract_program_event_payloads(&logs, &our_prog);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0], b"ourdata");
+    }
+
+    #[test]
+    fn event_payloads_drops_failed_cpi_frame_data() {
+        let our_prog = Pubkey::new_unique();
+        let router_prog = Pubkey::new_unique();
+        let logs = vec![
+            format!("Program {} invoke [1]", router_prog),
+            format!("Program {} invoke [2]", our_prog),
+            "Program data: ZmFpbGVkZGF0YQ==".to_string(), // "faileddata"
+            format!("Program {} failed: 0x1", our_prog),
+            format!("Program {} invoke [2]", our_prog),
+            "Program data: c3VjY2Vzc2RhdGE=".to_string(), // "successdata"
+            format!("Program {} success", our_prog),
+            format!("Program {} success", router_prog),
+        ];
+
+        let payloads = extract_program_event_payloads(&logs, &our_prog);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0], b"successdata");
+    }
+
+    #[test]
+    fn event_payloads_drops_truncated_frame_data() {
+        let our_prog = Pubkey::new_unique();
+        let logs = vec![
+            format!("Program {} invoke [1]", our_prog),
+            "Program data: dHJ1bmNhdGVk".to_string(), // "truncated"
+                                                      // Transaction logs truncated before success
+        ];
+
+        let payloads = extract_program_event_payloads(&logs, &our_prog);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn event_payloads_does_not_pop_on_spoofed_or_mismatched_exit() {
+        let our_prog = Pubkey::new_unique();
+        let spoofed = Pubkey::new_unique();
+        let logs = vec![
+            format!("Program {} invoke [1]", our_prog),
+            "Program data: cGFydDE=".to_string(),   // "part1"
+            format!("Program {} success", spoofed), // Mismatched program exit - must not pop our_prog
+            "Program data: cGFydDI=".to_string(),   // "part2"
+            format!("Program {} success", our_prog),
+        ];
+
+        let payloads = extract_program_event_payloads(&logs, &our_prog);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0], b"part1");
+        assert_eq!(payloads[1], b"part2");
     }
 }

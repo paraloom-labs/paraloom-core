@@ -2,7 +2,7 @@
 
 pub(crate) mod cosign_assembly;
 mod cosign_message;
-mod decoder;
+pub mod decoder;
 mod instructions;
 mod keypair;
 mod listener;
@@ -13,6 +13,7 @@ mod test_support;
 
 pub use cosign_assembly::{assemble_transaction, gather_signatures};
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
+pub use decoder::{extract_deposit_events, extract_program_event_payloads, LISTENER_TX_ENCODING};
 pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,
     create_deposit_note_instruction, create_init_stake_token_vault_instruction,

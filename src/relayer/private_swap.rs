@@ -93,6 +93,10 @@ pub enum RelayerError {
     /// check, which the provider setting alone did not give a single request.
     #[error("swap output {out_amount} is below the caller minimum {min_out}")]
     SlippageExceeded { out_amount: u64, min_out: u64 },
+
+    /// The swap request specified a cluster tag that does not match the relayer's configured cluster (#1166).
+    #[error("cluster mismatch: relayer configured for '{expected}', request targeted '{got}'")]
+    ClusterMismatch { expected: String, got: String },
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -297,6 +301,13 @@ pub struct PrivateSwapRequest {
     /// than accept less than X" — the tunable the provider-wide `slippage_bps`
     /// could not give one order.
     pub min_out_amount: Option<u64>,
+    /// Target cluster tag for this swap (e.g. "mainnet-beta", "devnet") (#1166).
+    /// If Some, the relayer verifies that its own cluster matches this tag.
+    pub cluster_tag: Option<String>,
+    /// Ephemeral self-funded gas lamports provided on token-to-token swaps (#1166).
+    /// Any unused remainder beyond overhead is swept back into the shielded pool
+    /// to `reshield_recipient` as a native SOL deposit note.
+    pub gas_lamports: Option<u64>,
 }
 
 /// The outcome of a completed private swap.
@@ -320,6 +331,11 @@ pub struct PrivateSwapResult {
     pub fresh_address: [u8; 32],
     /// The output note produced for the user.
     pub output_note: Note,
+    /// On token-to-token swaps with self-funded gas SOL, records the on-chain leg
+    /// that swept unused gas lamports back into the shielded pool (#1166).
+    pub swept_gas_leg: Option<SubmittedLeg>,
+    /// Amount of unused gas lamports swept back to the shielded pool (#1166).
+    pub swept_gas_amount: u64,
 }
 
 /// The outcome of a swap-out-only private swap (no re-shield).
@@ -354,6 +370,9 @@ pub struct PrivateSwapRelayer<S: SwapProvider, T: Submitter> {
     /// spend the very lamports it must keep to pay for itself. Default 0 (mock
     /// providers have no rent); real Solana submitters set the on-chain figure.
     native_swap_overhead_lamports: u64,
+    /// Configured Solana cluster tag (e.g. "mainnet-beta" vs "devnet") (#1166).
+    /// Used to prevent cross-cluster execution and isolate note states.
+    cluster_tag: String,
 }
 
 impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
@@ -363,6 +382,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             swap_provider,
             submitter,
             native_swap_overhead_lamports: 0,
+            cluster_tag: "mainnet-beta".to_string(),
         }
     }
 
@@ -372,6 +392,17 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
     pub fn with_native_swap_overhead(mut self, lamports: u64) -> Self {
         self.native_swap_overhead_lamports = lamports;
         self
+    }
+
+    /// Set the target Solana cluster tag (e.g. "mainnet-beta" or "devnet") (#1166).
+    pub fn with_cluster_tag(mut self, cluster_tag: impl Into<String>) -> Self {
+        self.cluster_tag = cluster_tag.into();
+        self
+    }
+
+    /// The relayer's configured cluster tag.
+    pub fn cluster_tag(&self) -> &str {
+        &self.cluster_tag
     }
 
     /// Shared first half of every private swap: withdraw the spent note to
@@ -388,6 +419,15 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         request: &PrivateSwapRequest,
         ephemeral: &Keypair,
     ) -> Result<(SubmittedLeg, u64)> {
+        if let Some(req_cluster) = &request.cluster_tag {
+            if req_cluster != &self.cluster_tag {
+                return Err(RelayerError::ClusterMismatch {
+                    expected: self.cluster_tag.clone(),
+                    got: req_cluster.clone(),
+                });
+            }
+        }
+
         let amount_in = request.amount_in;
         if amount_in == 0 {
             return Err(RelayerError::InvalidAmount(0));
@@ -521,12 +561,38 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             )
             .await?;
 
-        let output_note = Note::new(
-            request.reshield_recipient,
+        let mut output_note = Note::new(
+            request.reshield_recipient.clone(),
             net_out_amount,
             request.reshield_randomness,
             request.asset_out,
         );
+        let cluster_tag = request.cluster_tag.as_ref().unwrap_or(&self.cluster_tag);
+        output_note = output_note.with_cluster(cluster_tag);
+
+        // Step 5 (#1166): on token-to-token swaps where self-funded gas SOL was provided,
+        // sweep unused gas lamports back into the shielded pool so they are not stranded
+        // at the ephemeral fresh address.
+        let (swept_gas_leg, swept_gas_amount) = if let Some(gas_lamports) = request.gas_lamports {
+            let unused_gas = gas_lamports.saturating_sub(self.native_swap_overhead_lamports);
+            if unused_gas > 0 {
+                let swept_leg = self
+                    .submitter
+                    .submit_deposit_from_fresh(
+                        WithdrawLeg::Native,
+                        unused_gas,
+                        &ephemeral,
+                        request.reshield_recipient,
+                        request.reshield_randomness,
+                    )
+                    .await?;
+                (Some(swept_leg), unused_gas)
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        };
 
         Ok(PrivateSwapResult {
             withdraw_leg,
@@ -536,6 +602,8 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             net_out_amount,
             fresh_address,
             output_note,
+            swept_gas_leg,
+            swept_gas_amount,
         })
     }
 
@@ -671,6 +739,8 @@ mod tests {
             reshield_randomness: [5u8; 32],
             fee_bps,
             min_out_amount: None,
+            cluster_tag: None,
+            gas_lamports: None,
         }
     }
 
@@ -977,5 +1047,93 @@ mod tests {
         );
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
+    }
+
+    #[tokio::test]
+    async fn cluster_mismatch_is_rejected_without_submitting_legs() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_cluster_tag("mainnet-beta");
+        let mut req = request(native_note(1_000_000), NATIVE_SOL_ASSET, 0);
+        req.cluster_tag = Some("devnet".to_string());
+
+        let err = relayer
+            .execute(req)
+            .await
+            .expect_err("mismatched cluster must fail");
+        match err {
+            RelayerError::ClusterMismatch { expected, got } => {
+                assert_eq!(expected, "mainnet-beta");
+                assert_eq!(got, "devnet");
+            }
+            other => panic!("expected ClusterMismatch, got {:?}", other),
+        }
+
+        // Pre-flight check fails before any transaction leg is submitted
+        assert!(relayer.submitter.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_match_succeeds_and_tags_output_note() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_cluster_tag("devnet");
+        let mut req = request(native_note(1_000_000), NATIVE_SOL_ASSET, 0);
+        req.cluster_tag = Some("devnet".to_string());
+
+        let out = relayer.execute(req).await.expect("cluster match succeeds");
+        assert_eq!(out.output_note.cluster.as_deref(), Some("devnet"));
+    }
+
+    #[tokio::test]
+    async fn token_to_token_sweeps_unused_gas_sol() {
+        let usdc: AssetId = [0x55u8; 32];
+        let usdt: AssetId = [0x66u8; 32];
+
+        // Relayer configured with 2_000_000 lamports overhead
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(2_000_000);
+
+        let mut req = request(spl_note(usdc, 1_000_000), usdt, 0);
+        // User provided 9_000_000 lamports gas reserve
+        req.gas_lamports = Some(9_000_000);
+
+        let out = relayer.execute(req).await.expect("swap executes");
+
+        // Unused gas = 9_000_000 - 2_000_000 = 7_000_000 lamports
+        assert_eq!(out.swept_gas_amount, 7_000_000);
+        let swept_leg = out.swept_gas_leg.expect("swept gas leg must be present");
+        assert_eq!(swept_leg.amount, 7_000_000);
+        assert_eq!(swept_leg.leg, WithdrawLeg::Native);
+        assert_eq!(swept_leg.fresh_address, out.fresh_address);
+
+        // 3 legs submitted in total: Withdraw SPL, Deposit SPL, Deposit Native (gas sweep)
+        let legs = relayer.submitter.recorded();
+        assert_eq!(legs.len(), 3);
+        assert_eq!(legs[0].leg, WithdrawLeg::Spl(usdc));
+        assert_eq!(legs[1].leg, WithdrawLeg::Spl(usdt));
+        assert_eq!(legs[2].leg, WithdrawLeg::Native);
+        assert_eq!(legs[2].amount, 7_000_000);
+    }
+
+    #[tokio::test]
+    async fn token_to_token_gas_sweeping_skipped_when_overhead_consumes_all_gas() {
+        let usdc: AssetId = [0x55u8; 32];
+        let usdt: AssetId = [0x66u8; 32];
+
+        // Relayer configured with 10_000_000 lamports overhead
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(10_000_000);
+
+        let mut req = request(spl_note(usdc, 1_000_000), usdt, 0);
+        // User provided only 5_000_000 lamports gas
+        req.gas_lamports = Some(5_000_000);
+
+        let out = relayer.execute(req).await.expect("swap executes");
+
+        assert_eq!(out.swept_gas_amount, 0);
+        assert!(out.swept_gas_leg.is_none());
+
+        // Only 2 legs submitted: Withdraw SPL, Deposit SPL (no gas sweep)
+        let legs = relayer.submitter.recorded();
+        assert_eq!(legs.len(), 2);
     }
 }

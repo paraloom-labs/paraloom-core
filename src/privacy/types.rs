@@ -219,6 +219,9 @@ pub struct Note {
     pub asset_id: AssetId,
     /// Memo (optional encrypted message)
     pub memo: Option<Vec<u8>>,
+    /// Target Solana cluster tag (e.g. "mainnet-beta" vs "devnet") (#1166).
+    /// Optional; untagged notes default to None.
+    pub cluster: Option<String>,
 }
 
 impl Note {
@@ -235,7 +238,14 @@ impl Note {
             randomness,
             asset_id,
             memo: None,
+            cluster: None,
         }
+    }
+
+    /// Associate this note with a specific cluster tag (e.g. "mainnet-beta", "devnet") (#1166).
+    pub fn with_cluster(mut self, cluster: impl Into<String>) -> Self {
+        self.cluster = Some(cluster.into());
+        self
     }
 
     /// Create a native-SOL note (`asset_id == NATIVE_SOL_ASSET`). Convenience
@@ -367,6 +377,24 @@ mod tests {
         // And the native constructor must agree with the explicit native id.
         let native_via_helper = Note::new_native(addr, amount, randomness);
         assert_eq!(native.commitment(), native_via_helper.commitment());
+    }
+
+    #[test]
+    fn note_cluster_tagging_and_serialization() {
+        let addr = ShieldedAddress([5u8; 32]);
+        let note_default = Note::new_native(addr.clone(), 5_000, [11u8; 32]);
+        assert_eq!(note_default.cluster, None);
+
+        let note_tagged = note_default.clone().with_cluster("devnet");
+        assert_eq!(note_tagged.cluster.as_deref(), Some("devnet"));
+
+        // Commitment computation is invariant to the off-circuit cluster metadata tag
+        assert_eq!(note_default.commitment(), note_tagged.commitment());
+
+        // Serde roundtrip preserves cluster tagging
+        let json = serde_json::to_string(&note_tagged).expect("serialize");
+        let deserialized: Note = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.cluster.as_deref(), Some("devnet"));
     }
 
     #[test]
