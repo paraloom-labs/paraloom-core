@@ -315,6 +315,10 @@ pub struct PrivateSwapResult {
     /// Net output re-shielded to the user. Equals `gross_out_amount` now that the
     /// orchestrator takes no second cut.
     pub net_out_amount: u64,
+    /// Residual native SOL overhead lamports retained at `fresh_address` on native SOL swaps
+    /// to cover rent/fees (#1168). Tracked so callers and automated sweepers can account
+    /// for and recover unused gas/rent lamports.
+    pub residual_overhead_lamports: u64,
     /// The fresh ephemeral address used for this swap. Present so callers can
     /// confirm the link-severing property; it shares no signer with the user.
     pub fresh_address: [u8; 32],
@@ -334,6 +338,8 @@ pub struct SwapOutResult {
     /// Gross swap output delivered to `fresh_address`, in `asset_out`'s smallest
     /// unit. Already net of any fee the provider realized inside the route.
     pub gross_out_amount: u64,
+    /// Residual native SOL overhead lamports retained at `fresh_address` on native SOL swaps (#1168).
+    pub residual_overhead_lamports: u64,
     /// The fresh ephemeral address holding the swap output. Shares no signer
     /// with the note's depositor.
     pub fresh_address: [u8; 32],
@@ -374,6 +380,27 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         self
     }
 
+    /// Calculate the minimum gross note amount required for a native SOL swap
+    /// to yield at least 1 lamport after the protocol withdrawal fee (25 bps)
+    /// and the native swap overhead reserve (#1168).
+    pub fn min_native_swap_amount(&self) -> u64 {
+        if self.native_swap_overhead_lamports == 0 {
+            return 1;
+        }
+        let numerator = (self.native_swap_overhead_lamports as u128 + 1) * 10_000;
+        let denominator = 10_000 - WITHDRAWAL_FEE_BPS as u128;
+        let mut est = ((numerator + denominator - 1) / denominator) as u64;
+        while est > 0 {
+            let fee = est * WITHDRAWAL_FEE_BPS / 10_000;
+            if est.saturating_sub(fee) > self.native_swap_overhead_lamports {
+                est -= 1;
+            } else {
+                return est + 1;
+            }
+        }
+        1
+    }
+
     /// Shared first half of every private swap: withdraw the spent note to
     /// `ephemeral` via a v3 transact, then swap the realized (post-fee, post-
     /// overhead) amount on the provider from that same fresh address. Returns
@@ -398,6 +425,31 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
 
         let asset_in = request.asset_in;
         let asset_out = request.asset_out;
+
+        // Pre-validate that `amount_in` yields a positive swap amount BEFORE submitting
+        // the withdraw leg on-chain (#1168). On-chain withdraw deducts `WITHDRAWAL_FEE_BPS` (25 bps)
+        // and burns the input note's nullifier permanently. If `amount_in` is too small to
+        // cover the withdrawal fee or the native swap overhead reserve, we must reject the
+        // request BEFORE withdrawing to avoid burning the user's note and stranding the
+        // funds at the ephemeral address.
+        let withdrawal_fee = amount_in
+            .checked_mul(WITHDRAWAL_FEE_BPS)
+            .map(|x| x / 10_000)
+            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+        let withdrawn = amount_in
+            .checked_sub(withdrawal_fee)
+            .filter(|&a| a > 0)
+            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+
+        let swap_amount = if asset_in == NATIVE_SOL_ASSET {
+            withdrawn
+                .checked_sub(self.native_swap_overhead_lamports)
+                .filter(|&a| a > 0)
+                .ok_or(RelayerError::InvalidAmount(amount_in))?
+        } else {
+            withdrawn
+        };
+
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
@@ -421,34 +473,6 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // Step 2: swap on public liquidity from the fresh address. The provider
         // signs and submits the public trade from `ephemeral`, so the trade
         // originates at the unlinkable fresh address.
-        //
-        // The on-chain withdraw deducts the protocol withdrawal fee
-        // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
-        // fresh address holds `amount_in - fee`, not the gross note value.
-        // Swapping the gross amount would exceed the fresh address's balance and
-        // fail *after* the nullifier is already burned, stranding the funds —
-        // so the swap trades the realized post-fee amount.
-        let withdrawal_fee = amount_in
-            .checked_mul(WITHDRAWAL_FEE_BPS)
-            .map(|x| x / 10_000)
-            .ok_or(RelayerError::InvalidAmount(amount_in))?;
-        let withdrawn = amount_in
-            .checked_sub(withdrawal_fee)
-            .filter(|&a| a > 0)
-            .ok_or(RelayerError::InvalidAmount(amount_in))?;
-
-        // On a native-SOL input leg the fresh address also pays the swap's rent
-        // and fees out of the same lamports, so trade the realized amount minus
-        // the overhead reserve — never the full note (see
-        // `native_swap_overhead_lamports`).
-        let swap_amount = if asset_in == NATIVE_SOL_ASSET {
-            withdrawn
-                .checked_sub(self.native_swap_overhead_lamports)
-                .filter(|&a| a > 0)
-                .ok_or(RelayerError::InvalidAmount(amount_in))?
-        } else {
-            withdrawn
-        };
         let swap = self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
@@ -528,12 +552,19 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             request.asset_out,
         );
 
+        let residual_overhead_lamports = if request.asset_in == NATIVE_SOL_ASSET {
+            self.native_swap_overhead_lamports
+        } else {
+            0
+        };
+
         Ok(PrivateSwapResult {
             withdraw_leg,
             deposit_leg,
             gross_out_amount,
             relayer_fee,
             net_out_amount,
+            residual_overhead_lamports,
             fresh_address,
             output_note,
         })
@@ -563,9 +594,16 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         fresh: &Keypair,
     ) -> Result<SwapOutResult> {
         let (withdraw_leg, gross_out_amount) = self.withdraw_then_swap(&request, fresh).await?;
+        let residual_overhead_lamports = if request.asset_in == NATIVE_SOL_ASSET {
+            self.native_swap_overhead_lamports
+        } else {
+            0
+        };
+
         Ok(SwapOutResult {
             withdraw_leg,
             gross_out_amount,
+            residual_overhead_lamports,
             fresh_address: fresh.pubkey().to_bytes(),
             asset_out: request.asset_out,
         })
@@ -735,13 +773,64 @@ mod tests {
 
     #[tokio::test]
     async fn native_overhead_at_or_above_amount_is_rejected() {
-        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+        let submitter = MockSubmitter::new();
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), submitter)
             .with_native_swap_overhead(1_000);
         let err = relayer
             .execute(request(native_note(1_000), NATIVE_SOL_ASSET, 0))
             .await
             .expect_err("overhead consuming the whole note must fail, not swap 0");
         assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+        // Pre-flight validation must abort BEFORE submitting on-chain withdraw,
+        // ensuring the note is never burned if the swap cannot proceed (#1168).
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "no on-chain withdraw leg may be submitted when overhead consumes the note"
+        );
+    }
+
+    #[test]
+    fn min_native_swap_amount_computes_exact_floor() {
+        let relayer_zero =
+            PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        assert_eq!(relayer_zero.min_native_swap_amount(), 1);
+
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(6_000_000);
+        let min_amount = relayer.min_native_swap_amount();
+        // At min_amount, net post-fee must exceed 6_000_000
+        let fee = min_amount * 25 / 10_000;
+        let net = min_amount - fee;
+        assert!(net > 6_000_000, "net {net} must exceed overhead 6_000_000");
+
+        // Just 1 lamport below min_amount must yield <= 6_000_000
+        let below = min_amount - 1;
+        let fee_below = below * 25 / 10_000;
+        let net_below = below - fee_below;
+        assert!(
+            net_below <= 6_000_000,
+            "below net {net_below} must be <= 6_000_000"
+        );
+    }
+
+    #[tokio::test]
+    async fn residual_overhead_is_recorded_in_results() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new())
+            .with_native_swap_overhead(5_000);
+        let out = relayer
+            .execute(request(native_note(1_000_000), [0x22; 32], 0))
+            .await
+            .expect("swap executes");
+        assert_eq!(out.residual_overhead_lamports, 5_000);
+
+        let out_swap = relayer
+            .execute_swap_out(
+                request(native_note(1_000_000), [0x22; 32], 0),
+                &Keypair::new(),
+            )
+            .await
+            .expect("swap-out executes");
+        assert_eq!(out_swap.residual_overhead_lamports, 5_000);
     }
 
     #[tokio::test]
