@@ -215,6 +215,40 @@ pub fn transact_vote_signing_bytes(
     buf
 }
 
+/// Build the exact canonical preimage a Discovery wallet-ownership attestation
+/// covers (#1145). PURE and crypto-agnostic like [`transact_vote_signing_bytes`]
+/// (no solana dependency) so this module still compiles under
+/// `--no-default-features`; the node layer signs/verifies these bytes with the
+/// co-sign ed25519 key.
+///
+/// The layout binds, in order: a domain tag, the announcing NodeId, the claimed
+/// wallet pubkey, and a Unix-seconds timestamp. Both variable-length fields are
+/// u64-little-endian length-prefixed so no field boundary can be slid, and the
+/// domain tag is disjoint from the vote and settlement preimages so an
+/// attestation signature can never be replayed as a vote or a transaction.
+///
+/// This is the proof that closes the residual #627 gap: without it the wallet
+/// in a Discovery announcement is a self-asserted string, and any mesh peer
+/// could bind a real validator's wallet to its own NodeId and inherit that
+/// validator's co-sign authority.
+pub fn discovery_wallet_signing_bytes(
+    node_id: &NodeId,
+    wallet_pubkey: &str,
+    timestamp: u64,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"paraloom:discovery-wallet:v1";
+    let mut buf = Vec::with_capacity(DOMAIN.len() + 8 * 3 + node_id.0.len() + wallet_pubkey.len());
+    buf.extend_from_slice(DOMAIN);
+    let put = |bytes: &[u8], buf: &mut Vec<u8>| {
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    };
+    put(&node_id.0, &mut buf);
+    put(wallet_pubkey.as_bytes(), &mut buf);
+    buf.extend_from_slice(&timestamp.to_le_bytes());
+    buf
+}
+
 /// A transact the validator quorum has approved (#350). Emitted on the
 /// approval channel the moment a `Valid` quorum is first reached, carrying
 /// the full request — everything needed to build the on-chain `transact`
