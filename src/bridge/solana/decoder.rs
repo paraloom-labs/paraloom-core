@@ -21,6 +21,10 @@ use solana_transaction_status::{
 /// but this decoder still reads historical deposits from that layout.
 const DEPOSITOR_ACCOUNT_INDEX: usize = 2;
 
+/// Account-index position of `bridge_vault` in both `deposit_note` and legacy
+/// `deposit` instruction account lists.
+const NATIVE_VAULT_ACCOUNT_INDEX: usize = 1;
+
 /// Recommended encoding to request from `getTransaction` for the
 /// listener. JSON encoding produces a `UiMessage::Raw` variant for
 /// unparsed programs (paraloom is unparsed), which exposes raw
@@ -92,21 +96,25 @@ pub fn extract_deposit_events(
     };
 
     let mut events = Vec::new();
+    let mut claimed_lamports = vec![0u64; account_keys.len()];
+    let meta = confirmed.transaction.meta.as_ref();
 
     // Top-level instructions are already compiled — JSON encoding for
     // an unparsed program drops the `UiInstruction` wrapper.
     for compiled in &raw.instructions {
         if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id) {
-            events.push(build_event(signature, confirmed, decoded));
+            if vault_balance_backs_deposit(meta, &decoded, false, &mut claimed_lamports) {
+                events.push(build_event(signature, confirmed, decoded));
+            }
         }
     }
 
     // Inner instructions (CPI from another program into ours) come back
     // through the meta field as `UiInstruction`, which needs the match
     // because parsed instructions can also appear there.
-    if let Some(meta) = &confirmed.transaction.meta {
+    if let Some(meta_ref) = meta {
         if let solana_transaction_status::option_serializer::OptionSerializer::Some(inner) =
-            &meta.inner_instructions
+            &meta_ref.inner_instructions
         {
             for inner_set in inner {
                 for instruction in &inner_set.instructions {
@@ -114,7 +122,14 @@ pub fn extract_deposit_events(
                         if let Some(decoded) =
                             decode_compiled_deposit(compiled, &account_keys, program_id)
                         {
-                            events.push(build_event(signature, confirmed, decoded));
+                            if vault_balance_backs_deposit(
+                                meta,
+                                &decoded,
+                                true,
+                                &mut claimed_lamports,
+                            ) {
+                                events.push(build_event(signature, confirmed, decoded));
+                            }
                         }
                     }
                 }
@@ -123,6 +138,47 @@ pub fn extract_deposit_events(
     }
 
     events
+}
+
+fn vault_balance_backs_deposit(
+    meta: Option<&solana_transaction_status::UiTransactionStatusMeta>,
+    decoded: &DecodedDeposit,
+    from_inner: bool,
+    claimed_lamports: &mut [u64],
+) -> bool {
+    let Some(meta) = meta else {
+        return !from_inner;
+    };
+
+    if let Some(vault_idx) = decoded.vault_key_index {
+        let has_balances = !meta.pre_balances.is_empty() || !meta.post_balances.is_empty();
+        if !has_balances {
+            return !from_inner;
+        }
+        let pre = meta.pre_balances.get(vault_idx).copied().unwrap_or(0);
+        let post = meta.post_balances.get(vault_idx).copied().unwrap_or(0);
+        let gain = post.saturating_sub(pre);
+        let Some(claimed) = claimed_lamports.get_mut(vault_idx) else {
+            return false;
+        };
+        let Some(next) = claimed.checked_add(decoded.data.amount) else {
+            return false;
+        };
+        if next > gain {
+            return false;
+        }
+        *claimed = next;
+        true
+    } else if from_inner {
+        match &meta.post_token_balances {
+            solana_transaction_status::option_serializer::OptionSerializer::Some(balances) => {
+                !balances.is_empty()
+            }
+            _ => false,
+        }
+    } else {
+        true
+    }
 }
 
 /// Decoded result of a single deposit instruction. Kept private so the
@@ -134,6 +190,8 @@ struct DecodedDeposit {
     /// `deposit_note_spl` (#779), or the legacy `deposit_spl`'s raw mint bytes
     /// (#237). The v3 arms must use whatever the program hashed into the leaf.
     asset_id: [u8; 32],
+    /// Index into `account_keys` for `bridge_vault` on native SOL deposits.
+    vault_key_index: Option<usize>,
 }
 
 /// `deposit_spl` account layout: bridge_state(0), mint(1), …, depositor(5).
@@ -211,6 +269,17 @@ fn decode_compiled_deposit(
 
     let payload = &raw_data[8..];
     let data = DepositInstructionData::try_from_slice(payload).ok()?;
+    if data.amount == 0 {
+        return None;
+    }
+
+    let vault_key_index = if asset_id == crate::privacy::types::NATIVE_SOL_ASSET {
+        let idx = *compiled.accounts.get(NATIVE_VAULT_ACCOUNT_INDEX)? as usize;
+        let _ = account_keys.get(idx)?;
+        Some(idx)
+    } else {
+        None
+    };
 
     let depositor_index = *compiled.accounts.get(depositor_index)? as usize;
     let depositor = account_keys.get(depositor_index)?;
@@ -219,6 +288,7 @@ fn decode_compiled_deposit(
         data,
         depositor: *depositor,
         asset_id,
+        vault_key_index,
     })
 }
 
@@ -515,5 +585,194 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn ignores_zero_amount_deposit() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let extra = Pubkey::new_unique();
+        let account_keys = vec![extra, extra, depositor, program_id];
+
+        let ix = make_compiled_ix(3, 2, encode_deposit_data(0, [7u8; 32], [9u8; 32]));
+        assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn ignores_unbacked_inner_cpi_deposit_in_successful_tx() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiInnerInstructions, UiRawMessage, UiTransaction,
+            UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let attacker_program = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+
+        let account_keys = vec![
+            depositor.to_string(),
+            vault.to_string(),
+            program_id.to_string(),
+            attacker_program.to_string(),
+        ];
+
+        let outer_ix = UiCompiledInstruction {
+            program_id_index: 3,
+            accounts: vec![0, 1, 2],
+            data: bs58::encode([0u8; 8]).into_string(),
+            stack_height: Some(1),
+        };
+
+        let fake_amount: u64 = 999_000_000_000;
+        let inner_deposit_ix = UiInstruction::Compiled(UiCompiledInstruction {
+            program_id_index: 2,
+            accounts: vec![0, 1, 0, 0],
+            data: encode_deposit_data(fake_amount, [0xAA; 32], [0xBB; 32]),
+            stack_height: Some(2),
+        });
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 42,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig_fake_cpi".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 2,
+                        },
+                        account_keys,
+                        recent_blockhash: Hash::default().to_string(),
+                        instructions: vec![outer_ix],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    status: Ok(()),
+                    err: None,
+                    fee: 5000,
+                    pre_balances: vec![1_000_000, 0, 1_000_000, 0],
+                    post_balances: vec![1_000_000, 0, 1_000_000, 0],
+                    inner_instructions: OptionSerializer::Some(vec![UiInnerInstructions {
+                        index: 0,
+                        instructions: vec![inner_deposit_ix],
+                    }]),
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::None,
+                    post_token_balances: OptionSerializer::None,
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::None,
+                    return_data: OptionSerializer::None,
+                    compute_units_consumed: OptionSerializer::None,
+                    cost_units: OptionSerializer::None,
+                }),
+                version: None,
+            },
+            block_time: Some(1_700_000_000),
+        };
+
+        let events = extract_deposit_events("sig_fake_cpi", &confirmed, &program_id);
+        assert!(
+            events.is_empty(),
+            "failed or unbacked inner CPI must not emit a DepositEvent"
+        );
+    }
+
+    #[test]
+    fn extracts_deposit_only_up_to_vault_balance_increase() {
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiInnerInstructions, UiRawMessage, UiTransaction,
+            UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let state_pda = Pubkey::new_unique();
+        let vault_pda = Pubkey::new_unique();
+        let tree_pda = Pubkey::new_unique();
+
+        let account_keys = vec![
+            state_pda.to_string(),
+            vault_pda.to_string(),
+            tree_pda.to_string(),
+            depositor.to_string(),
+            program_id.to_string(),
+        ];
+
+        let amount = 2_500_000u64;
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey: [11u8; 32],
+            blinding: [13u8; 32],
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let data_b58 = bs58::encode(bytes).into_string();
+
+        let real_ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: data_b58.clone(),
+            stack_height: None,
+        };
+        let duplicate_inner_ix = UiInstruction::Compiled(UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: data_b58,
+            stack_height: Some(2),
+        });
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 99,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig_backed".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 1,
+                        },
+                        account_keys,
+                        recent_blockhash: Hash::default().to_string(),
+                        instructions: vec![real_ix],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    status: Ok(()),
+                    err: None,
+                    fee: 5000,
+                    pre_balances: vec![1_000, 500_000, 1_000, 10_000_000, 1],
+                    post_balances: vec![1_000, 500_000 + amount, 1_000, 7_495_000, 1],
+                    inner_instructions: OptionSerializer::Some(vec![UiInnerInstructions {
+                        index: 0,
+                        instructions: vec![duplicate_inner_ix],
+                    }]),
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::None,
+                    post_token_balances: OptionSerializer::None,
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::None,
+                    return_data: OptionSerializer::None,
+                    compute_units_consumed: OptionSerializer::None,
+                    cost_units: OptionSerializer::None,
+                }),
+                version: None,
+            },
+            block_time: Some(1_700_000_000),
+        };
+
+        let events = extract_deposit_events("sig_backed", &confirmed, &program_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, amount);
     }
 }
