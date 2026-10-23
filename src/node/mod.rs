@@ -990,7 +990,8 @@ async fn cosign_settlement(
         ) => {
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient
+                req.mint.is_none()
+                    && req.recipient == *recipient
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -2358,9 +2359,10 @@ impl Node {
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            if store
+                .iter()
+                .any(|d| d.output_commitment == note.output_commitment)
+            {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3633,5 +3635,59 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_native_transact_when_verified_request_was_spl() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        let mut spl_req = ta_request("spl-1", recipient, nullifiers, outputs, root, ext_amount);
+        spl_req.mint = Some([42u8; 32]);
+        tas.lock().await.insert("spl-1".to_string(), spl_req);
+
+        let native_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("spl-1", SettlementKind::Transact, &native_payload),
+        )
+        .await;
+        assert_eq!(resp.signature, None);
+    }
+
+    #[tokio::test]
+    async fn record_delivered_notes_deduplicates_by_output_commitment() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        node.record_delivered_notes(
+            &[[1u8; 32], [2u8; 32]],
+            &["aa".repeat(88), "bb".repeat(88)],
+            None,
+        )
+        .await;
+        node.record_delivered_notes(
+            &[[1u8; 32], [2u8; 32]],
+            &["cc".repeat(88), "dd".repeat(88)],
+            None,
+        )
+        .await;
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, "aa".repeat(88));
+        assert_eq!(delivered[1].ciphertext, "bb".repeat(88));
     }
 }

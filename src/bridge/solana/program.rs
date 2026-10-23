@@ -93,12 +93,20 @@ impl ProgramInterface {
             .get_program_accounts(&self.program_id, config)
             .await?;
         let mut stakes = Vec::with_capacity(accounts.len());
-        for (_pda, acc) in accounts {
+        for (pda, acc) in accounts {
             let d = &acc.data;
-            if d.len() < 89 || d[0..8] != VALIDATOR_DISC || d[88] == 0 {
-                continue; // wrong account, truncated, or inactive
+            if acc.owner != self.program_id
+                || d.len() < 89
+                || d[0..8] != VALIDATOR_DISC
+                || d[88] == 0
+            {
+                continue; // wrong owner/account, truncated, or inactive
             }
             let wallet = Pubkey::new_from_array(d[8..40].try_into().expect("32-byte wallet"));
+            let (expected_pda, _) = super::derive_validator_account(&self.program_id, &wallet);
+            if pda != expected_pda {
+                continue;
+            }
             let stake = u64::from_le_bytes(d[40..48].try_into().expect("8-byte stake"));
             stakes.push((wallet, stake));
         }
@@ -481,5 +489,65 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn list_validator_stakes_enforces_owner_and_canonical_pda() {
+        const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
+        let mock = Arc::new(MockBridgeRpc::new());
+        let program = program_with_mock(mock.clone());
+        let program_id = *program.program_id();
+
+        let valid_wallet = Pubkey::new_unique();
+        let (valid_pda, _) = super::derive_validator_account(&program_id, &valid_wallet);
+        let mk_data = |wallet: &Pubkey, stake: u64, active: u8| {
+            let mut d = vec![0u8; 129];
+            d[0..8].copy_from_slice(&VALIDATOR_DISC);
+            d[8..40].copy_from_slice(wallet.as_ref());
+            d[40..48].copy_from_slice(&stake.to_le_bytes());
+            d[88] = active;
+            d
+        };
+
+        let wrong_pda_wallet = Pubkey::new_unique();
+        let wrong_owner_wallet = Pubkey::new_unique();
+        let (wrong_owner_pda, _) =
+            super::derive_validator_account(&program_id, &wrong_owner_wallet);
+
+        *mock.next_get_program_accounts.lock().unwrap() = Some(Ok(vec![
+            (
+                valid_pda,
+                Account {
+                    lamports: 1,
+                    data: mk_data(&valid_wallet, 1_500_000_000, 1),
+                    owner: program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            ),
+            (
+                Pubkey::new_unique(),
+                Account {
+                    lamports: 1,
+                    data: mk_data(&wrong_pda_wallet, 2_000_000_000, 1),
+                    owner: program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            ),
+            (
+                wrong_owner_pda,
+                Account {
+                    lamports: 1,
+                    data: mk_data(&wrong_owner_wallet, 3_000_000_000, 1),
+                    owner: Pubkey::new_unique(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            ),
+        ]));
+
+        let stakes = program.list_validator_stakes().await.unwrap();
+        assert_eq!(stakes, vec![(valid_wallet, 1_500_000_000)]);
     }
 }
