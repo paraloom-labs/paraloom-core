@@ -1091,6 +1091,15 @@ pub mod paraloom_program {
             validator_account.token_unbonding_amount
         };
         let token_slash = (old_token as u128 * slash_percentage as u128 / 100) as u64;
+        // Forfeit pending rewards in the same proportion (#863). Slashed validators
+        // must not retain earned fees while being penalized for protocol violations.
+        // Because pending rewards represent an unsettled claim against the bridge vault,
+        // forfeiting them directly reduces the validator's claim without moving lamports,
+        // preserving vault solvency and preventing slashed validators from extracting fees
+        // or being forced to claim them before closing the PDA.
+        let old_rewards = validator_account.pending_rewards;
+        let rewards_slash = (old_rewards as u128 * slash_percentage as u128 / 100) as u64;
+        validator_account.pending_rewards = old_rewards.saturating_sub(rewards_slash);
         validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
         if was_active {
@@ -1187,6 +1196,9 @@ pub mod paraloom_program {
             slash_percentage,
             slash_amount
         );
+        if rewards_slash > 0 {
+            msg!("Forfeited pending rewards: {} lamports", rewards_slash);
+        }
         Ok(())
     }
 

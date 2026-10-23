@@ -10,7 +10,7 @@
 //! (#204 + `has_one = authority`); register stays validator-signed.
 
 use anchor_lang::prelude::*;
-use anchor_lang::{Discriminator, InstructionData, ToAccountMetas};
+use anchor_lang::{AccountSerialize, Discriminator, InstructionData, ToAccountMetas};
 use paraloom_program::{accounts, instruction, ValidatorAccount, ValidatorRegistry};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
@@ -23,8 +23,8 @@ use solana_sdk::{
 
 mod common;
 use common::{
-    add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix,
+    add_program_data, add_stake_mint, entry, funded_validator,
+    init_validator_registry_ix, register_validator_ix, slash_validator_ix,
 };
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
@@ -495,4 +495,216 @@ async fn slash_rent_only_ghost_does_not_underflow() {
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.unbonding_amount, 0, "still nothing unbonding");
     assert_eq!(acc.times_slashed, 1, "the slash was recorded");
+}
+
+/// Regression for #863: `slash_validator` must forfeit `pending_rewards` proportionally
+/// with `slash_percentage`. Slashed validators must not retain earned fees while being
+/// penalized for protocol violations.
+#[tokio::test]
+async fn slash_validator_forfeits_pending_rewards_proportionally() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator = Keypair::new();
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    // Pre-seed an active validator account with 2_000_000 pending rewards
+    let initial_pending_rewards = 2_000_000u64;
+    let seeded = ValidatorAccount {
+        validator: validator.pubkey(),
+        stake_amount: MIN_VALIDATOR_STAKE,
+        reputation_score: 1000,
+        total_tasks_verified: 0,
+        successful_verifications: 0,
+        registered_at: 0,
+        last_active: 0,
+        is_active: true,
+        pending_rewards: initial_pending_rewards,
+        total_earnings: 0,
+        times_slashed: 0,
+        unbonding_amount: 0,
+        unbonding_slot: 0,
+        token_stake_amount: 0,
+        token_unbonding_amount: 0,
+    };
+    let mut data = Vec::new();
+    seeded
+        .try_serialize(&mut data)
+        .expect("serialize validator");
+
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: 10_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+
+    // 1. Slash 50%: pending rewards should drop from 2_000_000 to 1_000_000 (50% forfeited)
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
+    )
+    .await;
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        acc.pending_rewards, 1_000_000,
+        "a 50% slash must forfeit 50% of pending_rewards"
+    );
+    assert_eq!(acc.times_slashed, 1);
+
+    // 2. Slash 100%: remaining pending rewards must be completely forfeited to 0
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            100,
+        ),
+    )
+    .await;
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        acc.pending_rewards, 0,
+        "a 100% slash must forfeit all remaining pending_rewards"
+    );
+    assert_eq!(acc.times_slashed, 2);
+}
+
+/// Regression for #863: slashing an unbonding validator also forfeits pending rewards.
+#[tokio::test]
+async fn slash_unbonding_validator_forfeits_pending_rewards() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator = Keypair::new();
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    // Pre-seed an unbonding validator account: inactive, unbonding_amount > 0, pending_rewards = 500_000
+    let seeded = ValidatorAccount {
+        validator: validator.pubkey(),
+        stake_amount: 0,
+        reputation_score: 1000,
+        total_tasks_verified: 0,
+        successful_verifications: 0,
+        registered_at: 0,
+        last_active: 0,
+        is_active: false,
+        pending_rewards: 500_000,
+        total_earnings: 0,
+        times_slashed: 0,
+        unbonding_amount: MIN_VALIDATOR_STAKE,
+        unbonding_slot: 1000,
+        token_stake_amount: 0,
+        token_unbonding_amount: 0,
+    };
+    let mut data = Vec::new();
+    seeded
+        .try_serialize(&mut data)
+        .expect("serialize validator");
+
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: 10_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+
+    // 100% slash of the unbonding validator: both unbonding stake and pending_rewards must be cleared
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            100,
+        ),
+    )
+    .await;
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        acc.unbonding_amount, 0,
+        "a 100% slash must clear unbonding balance"
+    );
+    assert_eq!(
+        acc.pending_rewards, 0,
+        "a 100% slash must forfeit pending_rewards to 0"
+    );
+    assert_eq!(acc.times_slashed, 1);
 }
