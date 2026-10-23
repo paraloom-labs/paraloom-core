@@ -134,6 +134,9 @@ struct DecodedDeposit {
     /// `deposit_note_spl` (#779), or the legacy `deposit_spl`'s raw mint bytes
     /// (#237). The v3 arms must use whatever the program hashed into the leaf.
     asset_id: [u8; 32],
+    /// Transaction account index of `asset_vault` for `deposit_note_spl` (#976),
+    /// used to read the realized vault token balance delta from transaction meta.
+    vault_account_index: Option<u8>,
 }
 
 /// `deposit_spl` account layout: bridge_state(0), mint(1), …, depositor(5).
@@ -151,6 +154,7 @@ const DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX: usize = 3;
 /// ahead of the mint, so neither the legacy `deposit_spl` positions nor the
 /// native `deposit_note` ones carry over.
 const DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX: usize = 2;
+const DEPOSIT_NOTE_SPL_VAULT_ACCOUNT_INDEX: usize = 3;
 const DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX: usize = 6;
 
 /// Try to interpret a single compiled instruction as a Paraloom
@@ -178,36 +182,41 @@ fn decode_compiled_deposit(
     // asset. `deposit_note` and `deposit_note_spl` are the two the program
     // still exposes; the two legacy arms stay so historical deposits made
     // before `8830226` removed them still decode.
-    let (depositor_index, asset_id) = if raw_data[..8] == discriminators::DEPOSIT_NOTE {
-        (
-            DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::types::NATIVE_SOL_ASSET,
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
-        let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
-        let mint = account_keys.get(mint_index)?;
-        // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
-        // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
-        // the leaf, and `process_deposit` reduces this field into the same
-        // `v3_commit` the program computed. Feeding it raw bytes would credit a
-        // commitment the chain never appended — blind is recoverable, a wrong
-        // leaf in the pool is not.
-        (
-            DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT {
-        (
-            DEPOSITOR_ACCOUNT_INDEX,
-            crate::privacy::types::NATIVE_SOL_ASSET,
-        )
-    } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
-        let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
-        let mint = account_keys.get(mint_index)?;
-        (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes())
-    } else {
-        return None;
-    };
+    let (depositor_index, asset_id, vault_account_index) =
+        if raw_data[..8] == discriminators::DEPOSIT_NOTE {
+            (
+                DEPOSIT_NOTE_DEPOSITOR_ACCOUNT_INDEX,
+                crate::privacy::types::NATIVE_SOL_ASSET,
+                None,
+            )
+        } else if raw_data[..8] == discriminators::DEPOSIT_NOTE_SPL {
+            let mint_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_MINT_ACCOUNT_INDEX)? as usize;
+            let mint = account_keys.get(mint_index)?;
+            let vault_index = *compiled.accounts.get(DEPOSIT_NOTE_SPL_VAULT_ACCOUNT_INDEX)?;
+            // `mint_to_asset`, not the raw mint bytes the legacy arm below uses:
+            // `deposit_note_spl` hashes `Poseidon(2)` over the mint's halves into
+            // the leaf, and `process_deposit` reduces this field into the same
+            // `v3_commit` the program computed. Feeding it raw bytes would credit a
+            // commitment the chain never appended — blind is recoverable, a wrong
+            // leaf in the pool is not.
+            (
+                DEPOSIT_NOTE_SPL_DEPOSITOR_ACCOUNT_INDEX,
+                crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes()),
+                Some(vault_index),
+            )
+        } else if raw_data[..8] == discriminators::DEPOSIT {
+            (
+                DEPOSITOR_ACCOUNT_INDEX,
+                crate::privacy::types::NATIVE_SOL_ASSET,
+                None,
+            )
+        } else if raw_data[..8] == discriminators::DEPOSIT_SPL {
+            let mint_index = *compiled.accounts.get(SPL_MINT_ACCOUNT_INDEX)? as usize;
+            let mint = account_keys.get(mint_index)?;
+            (SPL_DEPOSITOR_ACCOUNT_INDEX, mint.to_bytes(), None)
+        } else {
+            return None;
+        };
 
     let payload = &raw_data[8..];
     let data = DepositInstructionData::try_from_slice(payload).ok()?;
@@ -219,7 +228,41 @@ fn decode_compiled_deposit(
         data,
         depositor: *depositor,
         asset_id,
+        vault_account_index,
     })
+}
+
+fn realized_spl_vault_delta(
+    confirmed: &EncodedConfirmedTransactionWithStatusMeta,
+    vault_account_index: u8,
+    gross_amount: u64,
+) -> Option<u64> {
+    use solana_transaction_status::option_serializer::OptionSerializer;
+    let meta = confirmed.transaction.meta.as_ref()?;
+    let OptionSerializer::Some(pre_balances) = &meta.pre_token_balances else {
+        return None;
+    };
+    let OptionSerializer::Some(post_balances) = &meta.post_token_balances else {
+        return None;
+    };
+    let pre_amt = pre_balances
+        .iter()
+        .find(|b| b.account_index == vault_account_index)
+        .and_then(|b| b.ui_token_amount.amount.parse::<u64>().ok())
+        .unwrap_or(0);
+    let post_amt = post_balances
+        .iter()
+        .find(|b| b.account_index == vault_account_index)?
+        .ui_token_amount
+        .amount
+        .parse::<u64>()
+        .ok()?;
+    let delta = post_amt.checked_sub(pre_amt)?;
+    if delta > 0 && delta <= gross_amount {
+        Some(delta)
+    } else {
+        None
+    }
 }
 
 fn build_event(
@@ -227,19 +270,19 @@ fn build_event(
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
     decoded: DecodedDeposit,
 ) -> DepositEvent {
+    let amount = decoded
+        .vault_account_index
+        .and_then(|idx| realized_spl_vault_delta(confirmed, idx, decoded.data.amount))
+        .unwrap_or(decoded.data.amount);
+    let fee = decoded.data.amount.saturating_sub(amount);
     DepositEvent {
         signature: signature.to_string(),
         from: decoded.depositor.to_bytes(),
-        amount: decoded.data.amount,
+        amount,
         recipient: decoded.data.recipient,
         randomness: decoded.data.randomness,
         asset_id: decoded.asset_id,
-        // Fees are charged inside the on-chain program rather than
-        // being part of the deposit instruction payload. Until the
-        // program emits an explicit fee component, we report 0 and let
-        // the L2 net it from the volume-deposited metric. Tracked as a
-        // follow-up on the bridge side.
-        fee: 0,
+        fee,
         block: confirmed.slot,
         timestamp: confirmed.block_time.unwrap_or_default(),
     }
@@ -515,5 +558,102 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn deposit_note_spl_uses_realized_vault_token_delta_when_meta_present() {
+        use solana_account_decoder::parse_token::UiTokenAmount;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage, UiRawMessage,
+            UiTransaction, UiTransactionStatusMeta, UiTransactionTokenBalance,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let account_keys = vec![
+            other.to_string(),
+            other.to_string(),
+            mint.to_string(),
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            depositor.to_string(),
+            other.to_string(),
+            program_id.to_string(),
+        ];
+
+        let payload = DepositNoteInstructionData {
+            amount: 10_000,
+            pubkey: [11u8; 32],
+            blinding: [13u8; 32],
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let ix = UiCompiledInstruction {
+            program_id_index: 8,
+            accounts: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let mk_bal = |amt: &str| UiTransactionTokenBalance {
+            account_index: 3,
+            mint: mint.to_string(),
+            ui_token_amount: UiTokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: amt.to_string(),
+                ui_amount_string: amt.to_string(),
+            },
+            owner: OptionSerializer::None,
+            program_id: OptionSerializer::None,
+        };
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 42,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig1".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: MessageHeader {
+                            num_required_signatures: 1,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 0,
+                        },
+                        account_keys,
+                        recent_blockhash: String::new(),
+                        instructions: vec![ix],
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    status: Ok(()),
+                    err: None,
+                    fee: 0,
+                    pre_balances: vec![],
+                    post_balances: vec![],
+                    inner_instructions: OptionSerializer::None,
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::Some(vec![mk_bal("1000")]),
+                    post_token_balances: OptionSerializer::Some(vec![mk_bal("10950")]),
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::None,
+                    return_data: OptionSerializer::None,
+                    compute_units_consumed: OptionSerializer::None,
+                    cost_units: OptionSerializer::None,
+                }),
+                version: None,
+            },
+            block_time: Some(123),
+        };
+
+        let events = extract_deposit_events("sig1", &confirmed, &program_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, 9_950);
+        assert_eq!(events[0].fee, 50);
     }
 }

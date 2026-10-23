@@ -325,12 +325,23 @@ impl EventListener {
         // Per-signature outcome, in the ascending order deposits are processed,
         // so the cursor can advance only through the unbroken run of successes.
         let mut outcomes: Vec<(Signature, bool)> = Vec::new();
+        let mut sig_ordinals: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
-        for event in events {
+        for mut event in events {
             let amount = event.amount;
             let slot = event.block;
             let sig_str = event.signature.clone();
             let parsed = sig_str.parse::<Signature>().ok();
+            let ordinal = {
+                let count = sig_ordinals.entry(sig_str.clone()).or_insert(0);
+                let cur = *count;
+                *count += 1;
+                cur
+            };
+            if ordinal > 0 {
+                event.signature = format!("{sig_str}:{ordinal}");
+            }
 
             match Self::process_deposit(&state.pool, event).await {
                 Ok(_) => {
@@ -689,7 +700,8 @@ impl EventListener {
         // Credit the deposited amount, not a net of it: the on-chain leaf
         // commits to the full amount, so a fee netted here would credit a
         // supply that does not match the tree.
-        pool.credit_commitment(
+        pool.credit_deposit_event(
+            &event.signature,
             commitment,
             deposit_tx.output_note,
             event.amount,
@@ -1545,5 +1557,39 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_deposit_indexes_distinct_deposits_with_identical_commitments() {
+        let pool = Arc::new(ShieldedPool::new());
+        let randomness = [7u8; 32];
+
+        let event_a = DepositEvent {
+            signature: "sig_a".to_string(),
+            from: [1u8; 32],
+            amount: 1_000,
+            recipient: [2u8; 32],
+            randomness,
+            asset_id: crate::privacy::types::NATIVE_SOL_ASSET,
+            fee: 0,
+            block: 100,
+            timestamp: 0,
+        };
+        let mut event_b = event_a.clone();
+        event_b.signature = "sig_b".to_string();
+
+        EventListener::process_deposit(&pool, event_a.clone())
+            .await
+            .unwrap();
+        EventListener::process_deposit(&pool, event_b)
+            .await
+            .unwrap();
+        // Replaying the same signature is a no-op.
+        EventListener::process_deposit(&pool, event_a)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.commitment_count().await, 2);
+        assert_eq!(pool.total_supply().await, 2_000);
     }
 }

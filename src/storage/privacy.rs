@@ -54,11 +54,22 @@ const CF_POOL_STATE: &str = "pool_state";
 /// multi-asset support load with no migration.
 const SUPPLY_PREFIX: &[u8] = b"supply:";
 
+/// Key prefix for credited on-chain deposit event identifiers in
+/// `CF_POOL_STATE` (#976).
+const DEPOSIT_EVENT_PREFIX: &[u8] = b"deposit_event:";
+
 /// Build the `CF_POOL_STATE` key for a non-native asset's supply.
 fn asset_supply_key(asset_id: &AssetId) -> Vec<u8> {
     let mut key = Vec::with_capacity(SUPPLY_PREFIX.len() + asset_id.len());
     key.extend_from_slice(SUPPLY_PREFIX);
     key.extend_from_slice(asset_id);
+    key
+}
+
+fn deposit_event_key(event_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DEPOSIT_EVENT_PREFIX.len() + event_id.len());
+    key.extend_from_slice(DEPOSIT_EVENT_PREFIX);
+    key.extend_from_slice(event_id.as_bytes());
     key
 }
 
@@ -451,6 +462,40 @@ impl PrivacyStorage {
         }
 
         Ok(supplies)
+    }
+
+    /// Record a credited on-chain deposit event identifier (#976).
+    pub fn insert_credited_deposit_event(&self, event_id: &str) -> Result<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_POOL_STATE)
+            .ok_or_else(|| anyhow!("Pool state CF not found"))?;
+        self.db.put_cf_opt(
+            cf,
+            deposit_event_key(event_id),
+            [1u8],
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    /// Load all credited on-chain deposit event identifiers (#976).
+    pub fn get_all_credited_deposit_events(&self) -> Result<Vec<String>> {
+        let cf = self
+            .db
+            .cf_handle(CF_POOL_STATE)
+            .ok_or_else(|| anyhow!("Pool state CF not found"))?;
+        let mut events = Vec::new();
+        for item in self.db.prefix_iterator_cf(cf, DEPOSIT_EVENT_PREFIX) {
+            let (key, _) = item?;
+            if !key.starts_with(DEPOSIT_EVENT_PREFIX) {
+                break;
+            }
+            if let Ok(id) = std::str::from_utf8(&key[DEPOSIT_EVENT_PREFIX.len()..]) {
+                events.push(id.to_string());
+            }
+        }
+        Ok(events)
     }
 
     /// Store Merkle root.

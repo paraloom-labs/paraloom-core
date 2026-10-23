@@ -24,14 +24,13 @@ pub struct ShieldedPool {
 
     /// Commitments this pool has already credited, seeded from persisted
     /// state on every construction.
-    ///
-    /// Deposit idempotency hangs on this rather than on `notes`, which is a
-    /// cache with no persistence behind it: reloading a pool would leave it
-    /// empty and let a replayed deposit through, which is exactly the case
-    /// the guard exists for. `commitment_tree` is the authoritative record and
-    /// this is derived from it, so the two cannot disagree — the tree has a
-    /// single insert site, right beside the one that updates this.
     deposited: Arc<RwLock<HashSet<Commitment>>>,
+
+    /// On-chain deposit event identifiers (`signature` / `signature:ordinal`)
+    /// already credited by the bridge listener (#976), seeded from persisted
+    /// state on construction so distinct on-chain deposits carrying identical
+    /// commitments both append leaves while listener replays stay idempotent.
+    credited_events: Arc<RwLock<HashSet<String>>>,
 
     /// Note storage (commitment -> encrypted note)
     /// In production, notes would be encrypted
@@ -54,6 +53,7 @@ impl ShieldedPool {
             commitment_tree: MerkleTree::new(),
             nullifier_set: NullifierSet::new(),
             deposited: Arc::new(RwLock::new(HashSet::new())),
+            credited_events: Arc::new(RwLock::new(HashSet::new())),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(HashMap::new())),
             storage: None,
@@ -71,15 +71,19 @@ impl ShieldedPool {
         // Load per-asset supplies from storage (native SOL + any SPL assets)
         let supplies = storage.get_all_asset_supplies()?;
 
-        // Seed the idempotency set from the same persisted record the tree is
-        // rebuilt from, so a deposit credited before a restart is still
-        // recognised after one.
+        // Seed the idempotency sets from persisted state so deposits credited
+        // before a restart are still recognised after one.
         let deposited: HashSet<Commitment> = storage.get_all_commitments()?.into_iter().collect();
+        let credited_events: HashSet<String> = storage
+            .get_all_credited_deposit_events()?
+            .into_iter()
+            .collect();
 
         Ok(ShieldedPool {
             commitment_tree,
             nullifier_set,
             deposited: Arc::new(RwLock::new(deposited)),
+            credited_events: Arc::new(RwLock::new(credited_events)),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(supplies)),
             storage: Some(storage),
@@ -104,19 +108,20 @@ impl ShieldedPool {
         asset_id: AssetId,
     ) -> Result<Commitment> {
         let commitment = note.commitment();
+        if self.deposited.read().await.contains(&commitment) {
+            return Ok(commitment);
+        }
         self.credit_commitment(commitment, note, amount, asset_id)
             .await
     }
 
     /// Credit a deposit whose commitment is already known.
     ///
-    /// The bridge takes this path. Its leaf has to be the one the program
-    /// appended to the on-chain tree, and the program derives that itself
-    /// (`merkle_tree::commitment`) rather than trusting the depositor — so the
-    /// listener recomputes it the same way and passes it in. Deriving it from
-    /// the `Note` instead would use the v2 hash, which is a different
-    /// function: the two trees would diverge one leaf at a time and only
-    /// surface later, at settlement, as a root nobody recognises.
+    /// Appends `commitment` to `commitment_tree` and increments `supplies`
+    /// unconditionally so distinct on-chain deposits carrying identical
+    /// commitments advance the off-chain Merkle tree in lockstep with the
+    /// on-chain `MerkleTreeAccount` (#976). Bridge listener idempotency is
+    /// enforced by [`credit_deposit_event`](Self::credit_deposit_event).
     pub async fn credit_commitment(
         &self,
         commitment: Commitment,
@@ -124,20 +129,6 @@ impl ShieldedPool {
         amount: u64,
         asset_id: AssetId,
     ) -> Result<Commitment> {
-        // Idempotent: a deposit whose commitment is already credited must not
-        // be inserted or credited again. Two paths replay one: the bridge
-        // listener re-fetches a deposit that failed on a prior poll, and — the
-        // case that matters — it also re-fetches deposits that succeeded after
-        // a failed sibling, because the cursor freezes below the failure. If
-        // the process restarts inside that window the replay arrives against a
-        // reloaded pool, so the check has to be backed by persisted state
-        // rather than by anything built fresh at construction. The note carries
-        // fresh randomness per deposit, so an equal commitment means the same
-        // deposit, not a distinct one.
-        if self.deposited.read().await.contains(&commitment) {
-            return Ok(commitment);
-        }
-
         // Add to commitment tree (auto-persists if storage available).
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
@@ -162,6 +153,41 @@ impl ShieldedPool {
         }
 
         Ok(commitment)
+    }
+
+    /// Credit an on-chain deposit event keyed by its unique event identifier
+    /// (`signature` or `signature:ordinal`).
+    ///
+    /// Deduplicates by `event_id` (persisted in `PrivacyStorage` across
+    /// restarts) rather than by `Commitment` hash, so distinct on-chain
+    /// deposits carrying identical `(amount, pubkey, blinding)` both append a
+    /// leaf to `commitment_tree` in lockstep with `MerkleTreeAccount`, while a
+    /// listener retry or post-restart replay of the same `event_id` is a no-op
+    /// (#976).
+    pub async fn credit_deposit_event(
+        &self,
+        event_id: &str,
+        commitment: Commitment,
+        note: Note,
+        amount: u64,
+        asset_id: AssetId,
+    ) -> Result<Commitment> {
+        if !event_id.is_empty() && self.credited_events.read().await.contains(event_id) {
+            return Ok(commitment);
+        }
+        let credited = self
+            .credit_commitment(commitment, note, amount, asset_id)
+            .await?;
+        if !event_id.is_empty() {
+            if let Some(storage) = &self.storage {
+                storage.insert_credited_deposit_event(event_id)?;
+            }
+            self.credited_events
+                .write()
+                .await
+                .insert(event_id.to_string());
+        }
+        Ok(credited)
     }
 
     /// Get the current Merkle root
@@ -293,6 +319,7 @@ impl Clone for ShieldedPool {
             // Shared, not copied: a clone that kept its own set would stop
             // recognising deposits the original had already credited.
             deposited: Arc::clone(&self.deposited),
+            credited_events: Arc::clone(&self.credited_events),
             notes: Arc::clone(&self.notes),
             supplies: Arc::clone(&self.supplies),
             storage: self.storage.clone(),
@@ -487,5 +514,39 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn credit_deposit_event_allows_distinct_events_with_identical_commitments() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([5u8; 32]);
+        let note = Note::new_native(addr, 1_000, [9u8; 32]);
+        let commitment = Commitment([42u8; 32]);
+
+        pool.credit_deposit_event(
+            "sig-1",
+            commitment.clone(),
+            note.clone(),
+            1_000,
+            NATIVE_SOL_ASSET,
+        )
+        .await
+        .unwrap();
+        pool.credit_deposit_event(
+            "sig-2",
+            commitment.clone(),
+            note.clone(),
+            1_000,
+            NATIVE_SOL_ASSET,
+        )
+        .await
+        .unwrap();
+        // Replaying an already-credited event id is a no-op.
+        pool.credit_deposit_event("sig-1", commitment, note, 1_000, NATIVE_SOL_ASSET)
+            .await
+            .unwrap();
+
+        assert_eq!(pool.commitment_count().await, 2);
+        assert_eq!(pool.total_supply().await, 2_000);
     }
 }
