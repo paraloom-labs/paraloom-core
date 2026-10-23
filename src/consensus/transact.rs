@@ -627,11 +627,24 @@ impl TransactVerificationCoordinator {
         // freshly advertised co-sign wallet (#260). Mirrors the withdrawal
         // coordinator so a wallet-less reconciler pass / periodic Discovery never
         // clobbers a known wallet or resets accumulated state.
+        let known_stake = {
+            let stakes = self.onchain_stakes.read().await;
+            wallet_pubkey
+                .as_ref()
+                .and_then(|w| stakes.get(w).copied())
+                .unwrap_or(0)
+        };
+
         let mut leader_selector = self.leader_selector.write().await;
         match leader_selector.get_validator(&validator).cloned() {
-            Some(existing) => {
+            Some(mut existing) => {
                 if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
-                    leader_selector.update_validator(existing.with_wallet(wallet_pubkey));
+                    existing = existing.with_wallet(wallet_pubkey);
+                    existing.stake_amount = known_stake;
+                    leader_selector.update_validator(existing);
+                } else if existing.stake_amount == 0 && known_stake > 0 {
+                    existing.stake_amount = known_stake;
+                    leader_selector.update_validator(existing);
                 }
                 // A reconnect re-activates a preserved (deactivated) entry;
                 // its stake/wallet/reputation are kept intact (see
@@ -639,14 +652,11 @@ impl TransactVerificationCoordinator {
                 leader_selector.activate_validator(&validator);
             }
             None => {
-                // Register with ZERO stake (fail-closed): a freshly-seen peer
-                // carries no quorum weight until the on-chain stake reconciler
-                // (`sync_onchain_stakes`) reads its real, at-risk stake from its
-                // `ValidatorAccount`. The old placeholder gave every connected
-                // peer a fixed stake, collapsing the stake-weighted quorum into
-                // head-count and making it Sybil-forgeable.
+                // Seed from `onchain_stakes` when the startup snapshot has already
+                // populated the validator's real at-risk stake; otherwise register
+                // with ZERO stake (fail-closed) until `sync_onchain_stakes` runs.
                 leader_selector.register_validator(
-                    ValidatorInfo::new(validator, 0, 1000).with_wallet(wallet_pubkey),
+                    ValidatorInfo::new(validator, known_stake, 1000).with_wallet(wallet_pubkey),
                 );
             }
         }
@@ -1541,6 +1551,20 @@ mod tests {
                 .await,
             "an on-chain swap validator must be admitted"
         );
+        {
+            let sel = coordinator.leader_selector.read().await;
+            let info = sel
+                .get_validator(&NodeId(vec![0x01]))
+                .expect("validator registered in leader_selector");
+            assert_eq!(
+                info.stake_amount, 1_000_000_000,
+                "validator discovered after startup sync_onchain_stakes must adopt its on-chain stake immediately"
+            );
+            assert_eq!(
+                sel.select_leader(b"startup-seed").unwrap(),
+                NodeId(vec![0x01])
+            );
+        }
     }
 
     #[tokio::test]

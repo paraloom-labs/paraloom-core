@@ -15,12 +15,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://localhost:8899".to_string());
     let program_id_str = std::env::var("SOLANA_PROGRAM_ID")?;
     let authority_keypair_path = std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?;
+    let stake_mint_str = std::env::var("STAKE_MINT")?;
 
     println!("RPC URL: {}", rpc_url);
     println!("Program ID: {}", program_id_str);
+    println!("Stake Mint: {}", stake_mint_str);
     println!("Authority Keypair: {}\n", authority_keypair_path);
 
     let program_id = Pubkey::from_str(&program_id_str)?;
+    let stake_mint = Pubkey::from_str(&stake_mint_str)?;
 
     println!("Loading authority keypair...");
     let authority = load_keypair_from_file(&authority_keypair_path)?;
@@ -42,11 +45,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Use the library builder: it includes the #204 ProgramData
-    // upgrade-authority account the on-chain `InitializeValidatorRegistry`
-    // requires. The hand-rolled 3-account form predated #204 and failed with
-    // AccountNotEnoughKeys (3005).
-    let ix = create_initialize_validator_registry_instruction(&program_id, &authority.pubkey())?;
+    // Resolve the token program that owns `stake_mint` (classic SPL Token or
+    // Token-2022) so the inline `stake_token_vault` init constraint matches the
+    // mint's owner.
+    let token_program = client.get_account(&stake_mint)?.owner;
+
+    // Use the library builder: it includes all 9 accounts required by the
+    // dual-stake `InitializeValidatorRegistry` context (including the #204
+    // ProgramData upgrade-authority account and the inline `stake_token_vault`
+    // init accounts).
+    let ix = create_initialize_validator_registry_instruction(
+        &program_id,
+        &authority.pubkey(),
+        &stake_mint,
+        &token_program,
+    )?;
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;

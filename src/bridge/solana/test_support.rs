@@ -31,6 +31,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub struct MockBridgeRpc {
     pub next_get_account: Mutex<Option<Result<Account>>>,
+    pub next_get_program_accounts: Mutex<Option<Result<Vec<(Pubkey, Account)>>>>,
     pub next_get_balance: Mutex<Option<Result<u64>>>,
     pub next_get_slot: Mutex<Option<Result<u64>>>,
     pub next_get_signatures: Mutex<Option<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>>>,
@@ -193,6 +194,9 @@ impl BridgeRpc for MockBridgeRpc {
         _program_id: &Pubkey,
         _config: solana_client::rpc_config::RpcProgramAccountsConfig,
     ) -> Result<Vec<(Pubkey, Account)>> {
+        if let Some(res) = self.next_get_program_accounts.lock().unwrap().take() {
+            return res;
+        }
         Ok(Vec::new())
     }
 

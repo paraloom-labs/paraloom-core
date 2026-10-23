@@ -2329,8 +2329,11 @@ impl Node {
     }
 
     /// Record the encrypted output notes of a transfer for recipient scanning
-    /// (#196), de-duplicated by `(commitment, ciphertext)` so the same transfer
-    /// seen via both ingress and gossip is stored once.
+    /// (#196), de-duplicated by `output_commitment` so the same output note
+    /// cannot be recorded multiple times with mutated ciphertexts (e.g. via a
+    /// re-randomized Groth16 proof with a fresh `request_id` or after the
+    /// bounded `verified_transacts` cache evicts an older `request_id`) to
+    /// FIFO-evict authentic notes from the 50,000-entry scan buffer.
     async fn record_delivered_notes(
         &self,
         output_commitments: &[[u8; 32]; 2],
@@ -2358,9 +2361,10 @@ impl Node {
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            if store
+                .iter()
+                .any(|d| d.output_commitment == note.output_commitment)
+            {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3633,5 +3637,24 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_delivered_notes_deduplicates_by_output_commitment_across_mutated_ciphertexts() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[0x11u8; 32], [0x22u8; 32]];
+
+        node.record_delivered_notes(&commitments, &["aa".repeat(88), "bb".repeat(88)], None)
+            .await;
+        // Re-recording the same output commitments with mutated ciphertexts
+        // (e.g. via a re-randomized Groth16 proof with a distinct request_id)
+        // must not append duplicate entries or overwrite the original ciphertexts.
+        node.record_delivered_notes(&commitments, &["cc".repeat(88), "dd".repeat(88)], None)
+            .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, "aa".repeat(88));
+        assert_eq!(delivered[1].ciphertext, "bb".repeat(88));
     }
 }
