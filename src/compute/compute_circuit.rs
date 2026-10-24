@@ -447,9 +447,63 @@ mod tests {
         );
     }
 
-    // The proof-generation smoke test that previously sat here was
-    // commented out with "TODO: Fix RNG version conflict". Untangling
-    // the `rand` major-version mismatch between arkworks 0.4 and the
-    // workspace dependency tree is a separate concern from #63 and
-    // covered under the broader operational hardening epic (#69).
+    #[test]
+    fn test_compute_circuit_proof_roundtrip_and_tamper_rejection() {
+        let mut rng = ark_std::rand::thread_rng();
+        let (pk, vk) = ComputeProofSystem::setup(&mut rng).expect("compute Groth16 setup");
+
+        let owner = [0xA1u8; 32];
+        let spending_key = [0xA5u8; 32];
+        let input_data = b"compute-input-payload".to_vec();
+        let input_randomness = [0x11u8; 32];
+        let output_data = b"compute-output-payload".to_vec();
+        let output_randomness = [0x22u8; 32];
+        let code_hash = [0x33u8; 32];
+
+        let input_hash = ComputeCircuit::hash_data_to_field(&input_data);
+        let output_hash = ComputeCircuit::hash_data_to_field(&output_data);
+        let input_commitment =
+            ComputeCircuit::compute_commitment(input_hash, &input_randomness, &owner);
+        let output_commitment =
+            ComputeCircuit::compute_commitment(output_hash, &output_randomness, &owner);
+        let input_nullifier = ComputeCircuit::compute_nullifier(input_commitment, &spending_key);
+
+        let circuit = ComputeCircuit::with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            input_data,
+            input_randomness,
+            output_data,
+            output_randomness,
+            owner,
+            spending_key,
+        );
+
+        let proof = ComputeProofSystem::prove(&pk, circuit, &mut rng).expect("prove");
+
+        let code_hash_fr = Fr::from_le_bytes_mod_order(&code_hash);
+        let public_inputs = vec![
+            code_hash_fr,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+        ];
+        assert!(
+            ComputeProofSystem::verify(&vk, &public_inputs, &proof).expect("verify"),
+            "honest witness must verify against compute verifying key"
+        );
+
+        let tampered_inputs = vec![
+            code_hash_fr,
+            input_commitment,
+            output_commitment + Fr::from(1u64),
+            input_nullifier,
+        ];
+        assert!(
+            !ComputeProofSystem::verify(&vk, &tampered_inputs, &proof).expect("verify tampered"),
+            "tampered output commitment must be rejected"
+        );
+    }
 }
