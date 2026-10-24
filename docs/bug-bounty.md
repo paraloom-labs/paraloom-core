@@ -1,22 +1,22 @@
-# Paraloom Bug Bounty (devnet, pre-mainnet)
+# Paraloom Bug Bounty (Stage 1)
 
 Paraloom is a privacy-preserving Solana L2 (a shielded pool with Groth16/BN254
-proofs and a stake-weighted validator co-sign quorum). It runs on **devnet — no
-real funds are at risk** — and we are inviting adversarial testing *before*
-mainnet, while bugs are cheap to fix. Find a real issue, report it, earn a
-reward.
+proofs and a stake-weighted validator co-sign quorum). We invite adversarial
+testing in the open: find a real issue in the in-scope settlement stack, report
+it with a clear reproduction, and earn a USDC reward.
 
 This program complements [`SECURITY.md`](../SECURITY.md) and the running
-[`security-log.md`](security-log.md). Reports: **security@paraloom.network**.
+[`security-log.md`](security-log.md). Private reports: **security@paraloom.network**.
 
 ---
 
 ## Rewards
 
 This is **Stage 1** of Paraloom's bug bounty — a **$3,000 USD pool paid in
-USDC**, while the protocol is on devnet and no real funds are at risk. Larger,
-mainnet-stage bounties follow once the pre-mainnet gates listed under
-[Out of scope](#out-of-scope--known-issues) are closed.
+USDC**. All adversarial testing must be conducted on **local test environments
+or Solana devnet** (never against live mainnet-beta state or user funds).
+Subsequent bounty stages will expand the pool and scope once the items listed
+under [Out of scope](#out-of-scope--known-issues) are closed.
 
 | Severity | What it means (see definitions) | Reward (USDC) |
 |---|---|---|
@@ -30,16 +30,31 @@ root cause, until the $3,000 pool is exhausted. Duplicates of an already-reporte
 or already-known issue (see Out of scope) are not eligible. Every rewarded report
 is credited in the security log unless you prefer to stay anonymous.
 
+### Payouts & AI-assisted research
+
+- **Payout rails:** Confirmed rewards are denominated and paid in **USDC** (on
+  **Solana** or **Base / EVM** wallet addresses provided by the researcher after
+  triage confirmation; standard Stage 1 payouts do not require KYC).
+- **AI-assisted research:** Using AI/LLM tooling to assist code review or test
+  generation is permitted. Submissions are judged strictly on **verified,
+  reproducible root causes** backed by a working test or minimal proof-of-concept
+  against `main`. Unverified or hallucinated AI-generated reports are closed as
+  invalid and may disqualify repeat submitters.
+
 ---
 
 ## Scope
 
 Stage 1 covers **only** the shielded-pool / private-settlement stack listed
-below, on the current devnet deployment. **If it is not in this list, it is out
-of scope** (see [Out of scope](#out-of-scope--known-issues)).
+below. **If it is not in this list, it is out of scope** (see
+[Out of scope](#out-of-scope--known-issues)).
 
-- **Program:** `8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP` (Solana devnet)
-- **Source:** the `main` branch at commit `468ffaa` (or later at launch)
+- **Program ID:** `8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP` (test on
+  **Solana devnet** or local `solana-program-test` / `solana-test-validator`;
+   note that while mainnet-beta `v1.5.0+` shares this program ID and may carry
+  newer instructions than the pinned devnet deployment, all testing must remain
+  strictly on local environments or devnet)
+- **Source:** the `main` branch at commit `468ffaa` or later (`HEAD` on `main`)
 
 In scope:
 
@@ -57,10 +72,11 @@ steal, mint, freeze, or forge — especially a **circuit under-constraint** that
 makes the on-chain verifier accept a semantically false proof *assuming an
 honest trusted setup*.
 
-The whole stack is open source. **Reproduce findings against a local devnet** —
-clone the repo and run your own validator set to exercise the end-to-end
-settlement path. The maintainer's live validator mesh is pre-mainnet and may be
-offline, so don't depend on it for reproduction.
+The whole stack is open source. **Reproduce findings against a local test
+harness (`cargo test` / `solana-program-test`) or a local devnet validator** —
+clone `main` and exercise the end-to-end settlement path locally. Do not depend
+on the maintainer's devnet validator mesh being online, and never probe live
+mainnet-beta state.
 
 ---
 
@@ -68,7 +84,7 @@ offline, so don't depend on it for reproduction.
 
 These are already known and documented; reports of them are **not eligible**.
 
-1. **Trusted-setup toxic waste.** `transact` now verifies against the
+1. **Trusted-setup toxic waste.** `transact` verifies against the
    multi-party ceremony Groth16 key (four independent contributions plus a
    Bitcoin-block beacon on the public Perpetual Powers of Tau; transcript and
    keys published under `ceremony/transact/`). Assume an **honest setup**, which
@@ -78,16 +94,16 @@ These are already known and documented; reports of them are **not eligible**.
 2. **Single upgrade/registry authority key.** One key is both the program
    upgrade authority and the registry admin (slash/deactivate/reset/etc.); no
    multisig/timelock yet. Attacks that assume this key is compromised or misused
-   are out of scope (multisig+timelock is a pre-mainnet gate).
+   are out of scope.
 3. **Validator-stake Sybil economics.** The minimum validator stake is
    intentionally cheap and the quorum is not yet economically Sybil-resistant.
    Both the safety (cheap co-sign stake) and liveness (a cheaply-registered
    validator inflating the quorum denominator to freeze settlement, admin-
    recoverable) dimensions are known and out of scope.
-4. **No independent external audit yet.** In-house review only.
+4. **No independent external audit yet.** In-house and open-community review only.
 5. **Discretionary admin slashing.** Slashing is admin-triggered; on-chain
-   evidence-based equivocation slashing is a tracked pre-mainnet item.
-6. **In-circuit new-root binding / ceremony-key auth** are tracked pre-mainnet
+   evidence-based equivocation slashing is a tracked roadmap item.
+6. **In-circuit new-root binding / ceremony-key auth** are tracked roadmap
    items.
 
 **The compute / DePIN subsystem is out of scope for Stage 1.** The compute task
@@ -100,7 +116,7 @@ Also out of scope: anything already in [`security-log.md`](security-log.md);
 denial of service from unbounded resource use on a single self-run node;
 findings only reproducible on branches/forks not deployed at the pinned scope;
 attacks on third-party infrastructure (RPC providers, host OS, reverse proxy);
-social engineering; physical attacks; spam/load on devnet.
+social engineering; physical attacks; spam/load on devnet or mainnet-beta.
 
 ---
 
@@ -130,13 +146,13 @@ How to submit — and why the channel matters:
   The issue *is* your claim: it timestamps your report (the first valid report of
   a unique root cause wins the reward), it becomes the public record we link from
   [`security-log.md`](security-log.md) so anyone can verify the finding and its
-  fix, and triage, reward, and credit all happen on it. Prefer email? That works
-  too.
+  fix, and triage, reward, and credit all happen on it. Prefer email, or unsure
+  whether a finding might reach High severity? Email **security@paraloom.network**.
 - **Critical and High findings — report privately to security@paraloom.network;
-  do NOT open a public issue.** A devnet exploit usually applies to mainnet too,
-  so a public write-up before a fix ships hands an attacker a weapon. A private
-  report still timestamps your claim and earns full credit — we publish it in the
-  security log once the fix lands.
+  do NOT open a public issue.** A vulnerability in the shared codebase or
+  program can affect live deployments before a fix ships, so a public write-up
+  hands an attacker a weapon. A private report still timestamps your claim and
+  earns full credit — we publish it in the security log once the fix lands.
 - Either way, include the affected component, the impact, and a proof-of-concept
   or reproduction steps.
 
@@ -148,8 +164,9 @@ public-disclosure timeline with you after the fix ships.
 
 ## Rules of engagement
 
-- Test on **devnet only**. There is no mainnet. Use faucet SOL; do not spam the
-  network or degrade it for others.
+- Test on **local test harnesses or Solana devnet only**. Never test against
+  live mainnet-beta accounts or user funds. On devnet, use faucet SOL and do not
+  spam the network or degrade it for others.
 - Attack the **protocol**, not other operators' machines — no attempts to
   compromise validator hosts, RPC providers, or infrastructure beyond protocol
   messages.

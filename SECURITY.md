@@ -1,33 +1,46 @@
 # Security
 
-Paraloom is **pre-mainnet** and runs on devnet — no real funds are at risk yet.
-We do security in the open: the protocol is open source, every circuit and
+Paraloom runs in the open: the protocol is open source, every circuit and
 on-chain path is covered by tests in CI, and we keep a public record of what we
-find and fix in [`docs/security-log.md`](docs/security-log.md).
+find and fix in [`docs/security-log.md`](docs/security-log.md). Following the
+**mainnet-beta (`v1.5.0`)** launch on 2026-08-04, all adversarial testing must
+still be performed strictly against **local test harnesses or Solana devnet** —
+never test against live mainnet-beta accounts or user funds.
 
 ## Reporting a vulnerability
 
-Email **security@paraloom.network**.
+Choose the reporting channel based on severity (see
+[`docs/bug-bounty.md`](docs/bug-bounty.md) for protocol-specific severity
+definitions):
 
-Please do **not** open a public issue for an undisclosed vulnerability. Include,
-where you can:
+- **Critical and High findings — report privately to `security@paraloom.network`.**
+  Please do **not** open a public GitHub issue for an undisclosed Critical or High
+  vulnerability, as findings in shared program or node logic can affect live
+  deployments before a fix ships.
+- **Medium and Low findings — open a public GitHub issue** at
+  [github.com/paraloom-labs/paraloom-core/issues](https://github.com/paraloom-labs/paraloom-core/issues)
+  (which timestamps your claim and tracks triage, fix, and credit in the open),
+  or email **security@paraloom.network** if you prefer private disclosure or are
+  unsure of the severity.
+
+Include, where you can:
 
 - the affected component (on-chain program, circuit, L2 node, bridge, wallet),
 - a description of the issue and its impact,
-- steps to reproduce or a proof-of-concept.
+- steps to reproduce or a self-contained proof-of-concept / regression test.
 
 We aim to acknowledge reports within 72 hours and to keep you updated through
 triage and fix.
 
 ## Bug bounty
 
-We reward valid security findings. At this pre-mainnet stage rewards are
-severity-scaled and assessed case by case, and every fixed report is credited in
-the security log (unless you prefer to remain anonymous).
+We reward valid security findings. Rewards are severity-scaled and assessed case
+by case, and every fixed report is credited in the security log (unless you
+prefer to remain anonymous).
 
 **Stage 1 is live** — a $3,000 USDC pool on the shielded-pool settlement stack.
 See [`docs/bug-bounty.md`](docs/bug-bounty.md) for the reward tiers, pinned
-scope, known issues, and reporting rules.
+scope, known issues, payout mechanics, and reporting rules.
 
 **In scope**
 
@@ -35,7 +48,7 @@ scope, known issues, and reporting rules.
 - `src/privacy/` — the shielded-pool circuits, Poseidon, and proof verification
 - `src/consensus/`, `src/node/` — L2 verification and settlement
 - `src/bridge/` — the Solana bridge
-- `paraloom-prover-wasm`, `paraloom-wallet` — client proof generation
+- `paraloom-prover-wasm`, `paraloom-wallet` — client proof generation and wallet
 
 **Out of scope**
 
@@ -58,9 +71,8 @@ Every pull request runs, on GitHub Actions:
 
 ## Audit status
 
-The circuits are reviewed adversarially in the open. Critical findings have been
-fixed **on devnet, before any real money** — see the security log. An
-**independent professional audit** and the **production MPC trusted-setup
-ceremony** are hard gates before mainnet. We do not claim Paraloom is audited or
-safe for real funds today; it is pre-mainnet, and the point is that you can
-verify the state for yourself.
+The circuits and settlement paths are reviewed adversarially in the open, with
+every confirmed finding and fix documented in [`docs/security-log.md`](docs/security-log.md).
+An **independent professional audit** and full **multisig/timelock governance**
+remain tracked security gates; verify the current state of each component in
+[`docs/security-log.md`](docs/security-log.md) and [`docs/bug-bounty.md`](docs/bug-bounty.md).
