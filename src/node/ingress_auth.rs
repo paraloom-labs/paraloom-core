@@ -36,7 +36,17 @@ pub fn check_bearer(headers: &HeaderMap, token: &IngressToken) -> Result<(), (St
     let presented = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .map(str::trim)
+        .and_then(|v| {
+            let prefix = v.get(..7)?;
+            if prefix.eq_ignore_ascii_case("Bearer ") {
+                let candidate = v[7..].trim();
+                if !candidate.is_empty() {
+                    return Some(candidate);
+                }
+            }
+            None
+        });
     match presented {
         Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => Err((
@@ -86,13 +96,16 @@ mod tests {
         let token = token_from_config("  s3cret  "); // trimmed
         assert_eq!(token.as_deref(), Some("s3cret"));
 
-        // Correct token passes.
+        // Correct token passes (including RFC 9110 case-insensitive scheme and whitespace).
         assert!(check_bearer(&headers_with(Some("Bearer s3cret")), &token).is_ok());
+        assert!(check_bearer(&headers_with(Some("bearer s3cret")), &token).is_ok());
+        assert!(check_bearer(&headers_with(Some("BEARER   s3cret  ")), &token).is_ok());
 
         // Missing, wrong, or malformed headers are all 401.
         for bad in [
             None,
             Some("Bearer wrong"),
+            Some("Bearer "),
             Some("s3cret"),
             Some("Basic s3cret"),
         ] {

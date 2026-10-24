@@ -232,13 +232,28 @@ fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
     let bytes = keypair
         .to_protobuf_encoding()
         .map_err(|e| anyhow!("encoding libp2p identity to protobuf: {}", e))?;
-    fs::write(path, &bytes)
-        .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening libp2p identity at {}", path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting 0600 permissions on {}", path.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing libp2p identity at {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, &bytes)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
     }
     info!(
         "Generated new libp2p identity, persisted to {} (PeerId stable across restarts)",
