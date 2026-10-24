@@ -18,10 +18,28 @@
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
+    account::Account, commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
     transaction::Transaction,
 };
 use std::str::FromStr;
+
+fn validate_stake_mint_account(acc: &Account) -> Result<Pubkey, Box<dyn std::error::Error>> {
+    if acc.owner != SPL_TOKEN_PROGRAM_ID && acc.owner != SPL_TOKEN_2022_PROGRAM_ID {
+        return Err(format!(
+            "stake_mint account owner {} is neither SPL Token nor Token-2022",
+            acc.owner
+        )
+        .into());
+    }
+    if acc.data.is_empty() {
+        return Err("stake_mint account has empty data (uninitialized mint)".into());
+    }
+    Ok(acc.owner)
+}
+
+fn is_stake_vault_initialized(acc: &Account, token_program: &Pubkey) -> bool {
+    acc.owner == *token_program && !acc.data.is_empty()
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -35,9 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
     // The vault's token program must be the one that owns the mint (classic SPL
-    // Token or Token-2022); read it rather than assume, so the vault's
+    // Token or Token-2022); read and verify it rather than assume, so the vault's
     // `token::token_program` matches what `register_validator` will pass.
-    let token_program = client.get_account(&stake_mint)?.owner;
+    let mint_acc = client.get_account(&stake_mint)?;
+    let token_program = validate_stake_mint_account(&mint_acc)?;
 
     let (vault, _) = derive_stake_token_vault(&program_id);
 
@@ -48,9 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Token program: {token_program}");
     println!("Vault PDA:     {vault}");
 
-    if client.get_account(&vault).is_ok() {
-        println!("\nVault already exists — nothing to do.");
-        return Ok(());
+    if let Ok(acc) = client.get_account(&vault) {
+        if is_stake_vault_initialized(&acc, &token_program) {
+            println!("\nVault already exists — nothing to do.");
+            return Ok(());
+        }
     }
 
     let ix = create_init_stake_token_vault_instruction(
@@ -72,4 +93,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Vault created. Signature: {sig}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stake_mint_must_be_owned_by_spl_token_or_token_2022() {
+        let bad_owner = Account {
+            lamports: 1_000_000,
+            data: vec![1; 82],
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(validate_stake_mint_account(&bad_owner).is_err());
+
+        let empty_mint = Account {
+            lamports: 1_000_000,
+            data: vec![],
+            owner: SPL_TOKEN_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(validate_stake_mint_account(&empty_mint).is_err());
+
+        let valid_mint = Account {
+            lamports: 1_000_000,
+            data: vec![1; 82],
+            owner: SPL_TOKEN_2022_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert_eq!(
+            validate_stake_mint_account(&valid_mint).unwrap(),
+            SPL_TOKEN_2022_PROGRAM_ID
+        );
+    }
+
+    #[test]
+    fn prefunded_vault_pda_is_not_treated_as_initialized() {
+        let squatted = Account {
+            lamports: 1,
+            data: vec![],
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(!is_stake_vault_initialized(&squatted, &SPL_TOKEN_PROGRAM_ID));
+
+        let initialized = Account {
+            lamports: 2_039_280,
+            data: vec![1; 165],
+            owner: SPL_TOKEN_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(is_stake_vault_initialized(&initialized, &SPL_TOKEN_PROGRAM_ID));
+    }
 }

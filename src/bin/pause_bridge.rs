@@ -16,15 +16,43 @@
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
+    account::Account, commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
     transaction::Transaction,
 };
 use std::str::FromStr;
+
+/// Anchor discriminator for `BridgeState`: `sha256("account:BridgeState")[..8]`.
+const BRIDGE_STATE_DISCRIMINATOR: [u8; 8] = [6, 190, 226, 198, 76, 100, 157, 198];
 
 /// Byte offset of `BridgeState.paused`: disc(8) + program_version(u32=4) +
 /// authority(32) + total_deposited(8) + total_withdrawn(8) + deposit_count(8) +
 /// withdrawal_count(8) = 76.
 const PAUSED_OFFSET: usize = 76;
+
+fn decode_paused_from_account(
+    acc: &Account,
+    program_id: &Pubkey,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if acc.owner != *program_id {
+        return Err(format!(
+            "BridgeState account owner mismatch: expected {}, got {}",
+            program_id, acc.owner
+        )
+        .into());
+    }
+    if acc.data.len() <= PAUSED_OFFSET {
+        return Err(format!(
+            "BridgeState account too short: {} bytes (need > {})",
+            acc.data.len(),
+            PAUSED_OFFSET
+        )
+        .into());
+    }
+    if acc.data[..8] != BRIDGE_STATE_DISCRIMINATOR {
+        return Err("BridgeState account discriminator mismatch".into());
+    }
+    Ok(acc.data[PAUSED_OFFSET] != 0)
+}
 
 fn read_paused(
     client: &RpcClient,
@@ -33,7 +61,7 @@ fn read_paused(
     let (bridge_state, _) =
         solana_sdk::pubkey::Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let acc = client.get_account(&bridge_state)?;
-    Ok(acc.data.get(PAUSED_OFFSET).copied().unwrap_or(0) != 0)
+    decode_paused_from_account(&acc, program_id)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,4 +104,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("sig {sig}");
     println!("paused after:  {}", read_paused(&client, &program_id)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_bridge_state_account(program_id: Pubkey, paused: bool) -> Account {
+        let mut data = vec![0u8; 117];
+        data[..8].copy_from_slice(&BRIDGE_STATE_DISCRIMINATOR);
+        data[PAUSED_OFFSET] = u8::from(paused);
+        Account {
+            lamports: 2_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn decode_paused_reads_valid_bridge_state() {
+        let program_id = Pubkey::new_unique();
+        let unpaused = valid_bridge_state_account(program_id, false);
+        assert!(!decode_paused_from_account(&unpaused, &program_id).unwrap());
+
+        let paused = valid_bridge_state_account(program_id, true);
+        assert!(decode_paused_from_account(&paused, &program_id).unwrap());
+    }
+
+    #[test]
+    fn decode_paused_rejects_wrong_owner_discriminator_or_short_data() {
+        let program_id = Pubkey::new_unique();
+        let mut wrong_owner = valid_bridge_state_account(program_id, true);
+        wrong_owner.owner = Pubkey::default();
+        assert!(decode_paused_from_account(&wrong_owner, &program_id).is_err());
+
+        let mut wrong_disc = valid_bridge_state_account(program_id, true);
+        wrong_disc.data[0] ^= 0xFF;
+        assert!(decode_paused_from_account(&wrong_disc, &program_id).is_err());
+
+        let mut short = valid_bridge_state_account(program_id, true);
+        short.data.truncate(PAUSED_OFFSET);
+        assert!(decode_paused_from_account(&short, &program_id).is_err());
+    }
 }

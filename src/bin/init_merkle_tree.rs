@@ -12,10 +12,14 @@
 use paraloom::bridge::solana::*;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
+    account::Account, commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer,
     transaction::Transaction,
 };
 use std::str::FromStr;
+
+fn is_merkle_tree_initialized(acc: &Account, program_id: &Pubkey) -> bool {
+    acc.owner == *program_id && acc.data.len() >= 8
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -41,9 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tree_pda, _bump) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
     println!("Merkle Tree PDA: {}\n", tree_pda);
 
-    if client.get_account(&tree_pda).is_ok() {
-        println!("Merkle tree already initialized!");
-        return Ok(());
+    if let Ok(acc) = client.get_account(&tree_pda) {
+        if is_merkle_tree_initialized(&acc, &program_id) {
+            println!("Merkle tree already initialized!");
+            return Ok(());
+        }
     }
 
     // The library builder includes the #204 ProgramData upgrade-authority
@@ -68,4 +74,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  solana confirm -v {}", signature);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefunded_system_pda_is_not_treated_as_initialized() {
+        let program_id = Pubkey::new_unique();
+        let squatted = Account {
+            lamports: 1_000_000,
+            data: vec![],
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(!is_merkle_tree_initialized(&squatted, &program_id));
+
+        let initialized = Account {
+            lamports: 10_000_000,
+            data: vec![0xAA; 64],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+        assert!(is_merkle_tree_initialized(&initialized, &program_id));
+    }
 }
