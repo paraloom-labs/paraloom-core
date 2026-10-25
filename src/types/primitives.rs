@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Unique identifier for a node
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub Vec<u8>);
 
 impl fmt::Display for NodeId {

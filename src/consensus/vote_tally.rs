@@ -238,6 +238,7 @@ impl VoteTally {
                 out.push(rec.node_id.clone());
             }
         }
+        out.sort_unstable();
         out
     }
 }
