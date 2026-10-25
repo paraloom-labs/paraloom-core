@@ -116,6 +116,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program),
     };
 
+    // Validate that the validator token account is initialized
+    let account_data = client.get_account_data(&validator_token_account)?;
+    if account_data.len() < 16 {
+        return Err("Validator token account not initialized".into());
+    }
+
     println!("Token Program: {}", token_program);
     println!("Validator Token Account: {}\n", validator_token_account);
 
