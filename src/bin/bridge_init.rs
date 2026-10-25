@@ -56,6 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         program_version,
         initial_merkle_root,
     )?;
+    let deposit_note_ix = create_deposit_note_spl_instruction(
+        &program_id,
+        &authority.pubkey(),
+        program_version,
+    )?;
     println!(
         "Instruction created with initial merkle root: {:?}\n",
         &initial_merkle_root[..8]
