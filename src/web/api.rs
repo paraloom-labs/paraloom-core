@@ -19,6 +19,7 @@ pub struct SubmitTaskRequest {
     pub start: u64,
     pub end: u64,
     pub algorithm: String,
+    pub slippage_bps: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

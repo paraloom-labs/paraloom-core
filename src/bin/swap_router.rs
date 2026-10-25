@@ -35,6 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
+    let slippage_bps_from_req: u16 = std::env::var("SLIPPAGE_BPS_FROM_REQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let platform_fee_bps: u16 = std::env::var("PLATFORM_FEE_BPS")
         .ok()
         .and_then(|s| s.parse().ok())
