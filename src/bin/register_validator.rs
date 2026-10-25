@@ -119,6 +119,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Token Program: {}", token_program);
     println!("Validator Token Account: {}\n", validator_token_account);
 
+    let mut instructions = Vec::new();
+
+    if client.get_account(&validator_token_account).is_err() {
+        println!("Validator token account does not exist. Adding idempotent create ATA instruction: {}", validator_token_account);
+        instructions.push(create_associated_token_account_idempotent_instruction(
+            &validator.pubkey(),
+            &validator.pubkey(),
+            &stake_mint,
+            &token_program,
+        ));
+    }
+
+    if token_stake_amount > 0 {
+        let token_balance = match client.get_token_account_balance(&validator_token_account) {
+            Ok(bal) => bal.amount.parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
+        };
+        if token_balance < token_stake_amount {
+            return Err(format!(
+                "Insufficient token balance for dual-stake registration: account {} has {} tokens, required: {}",
+                validator_token_account, token_balance, token_stake_amount
+            ).into());
+        }
+    }
+
     let ix = create_register_validator_instruction(
         &program_id,
         &validator.pubkey(),
@@ -128,13 +153,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stake_amount,
         token_stake_amount,
     )?;
+    instructions.push(ix);
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
 
     println!("Creating and signing transaction...");
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &instructions,
         Some(&validator.pubkey()),
         &[&validator],
         blockhash,

@@ -1486,6 +1486,35 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
+                let mut instructions = Vec::new();
+
+                // Ensure the validator's associated token account exists on-chain.
+                // If it does not exist, prepend an idempotent creation instruction
+                // so Anchor's RegisterValidator account validation passes.
+                if client.get_account(&validator_token).is_err() {
+                    instructions.push(create_associated_token_account_idempotent_instruction(
+                        &validator.pubkey(),
+                        &validator.pubkey(),
+                        &stake_mint,
+                        &token_program,
+                    ));
+                }
+
+                // Preflight token balance check if token stake is required
+                if min_token_stake > 0 {
+                    let token_balance = match client.get_token_account_balance(&validator_token) {
+                        Ok(bal) => bal.amount.parse::<u64>().unwrap_or(0),
+                        Err(_) => 0,
+                    };
+                    anyhow::ensure!(
+                        token_balance >= min_token_stake,
+                        "Insufficient PARALOOM token balance for validator registration.                          Account {} has {} tokens, but minimum required token stake is {}.",
+                        validator_token,
+                        token_balance,
+                        min_token_stake
+                    );
+                }
+
                 // Stake exactly the registry's current token floor (0 while the
                 // token gate is still closed).
                 let ix = create_register_validator_instruction(
@@ -1498,12 +1527,13 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     min_token_stake,
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
+                instructions.push(ix);
 
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &instructions,
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,

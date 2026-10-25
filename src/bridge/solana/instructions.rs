@@ -927,8 +927,63 @@ pub fn derive_associated_token_address(
     .0
 }
 
+/// Build an idempotent Associated Token Account creation instruction.
+///
+/// Prepend this instruction to transactions that interact with an ATA that may
+/// not yet be initialized. If the ATA already exists on-chain, this instruction
+/// is a safe no-op.
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1],
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_layout() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_associated_token_account_idempotent_instruction(&payer, &owner, &mint, &token_program);
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 6);
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable);
+
+        let expected_ata = derive_associated_token_address(&owner, &mint, &token_program);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert!(!ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+
+        assert_eq!(ix.data, vec![1]);
+    }
+
     use super::*;
 
     #[test]
