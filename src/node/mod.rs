@@ -2431,6 +2431,7 @@ impl Node {
                 }
             }
         }
+        peers.sort_by_key(|(pubkey, _)| *pubkey);
         let mut quorum_wallets = vec![leader.pubkey()];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
         let threshold = quorum_wallets.len();

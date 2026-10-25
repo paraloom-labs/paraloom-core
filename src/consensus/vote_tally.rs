@@ -238,6 +238,7 @@ impl VoteTally {
                 out.push(rec.node_id.clone());
             }
         }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 }
@@ -287,6 +288,37 @@ mod tests {
         let mut voters = tally.valid_voters(&eligible).await;
         voters.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(voters, vec![NodeId(vec![1]), NodeId(vec![3])]);
+    }
+
+    #[tokio::test]
+    async fn valid_voters_is_deterministic_across_differing_hashmap_orders() {
+        let eligible = wallets(&["W1", "W2", "W3", "W4"]);
+
+        // Instantiate two separate tallies with different vote submission orders
+        let tally1 = VoteTally::new("req-det-1".to_string(), 4, 4);
+        tally1.submit_vote("W3".into(), NodeId(vec![3]), VerificationVote::Valid, vec![3]).await.unwrap();
+        tally1.submit_vote("W1".into(), NodeId(vec![1]), VerificationVote::Valid, vec![1]).await.unwrap();
+        tally1.submit_vote("W4".into(), NodeId(vec![4]), VerificationVote::Valid, vec![4]).await.unwrap();
+        tally1.submit_vote("W2".into(), NodeId(vec![2]), VerificationVote::Valid, vec![2]).await.unwrap();
+
+        let tally2 = VoteTally::new("req-det-2".to_string(), 4, 4);
+        tally2.submit_vote("W1".into(), NodeId(vec![1]), VerificationVote::Valid, vec![1]).await.unwrap();
+        tally2.submit_vote("W4".into(), NodeId(vec![4]), VerificationVote::Valid, vec![4]).await.unwrap();
+        tally2.submit_vote("W2".into(), NodeId(vec![2]), VerificationVote::Valid, vec![2]).await.unwrap();
+        tally2.submit_vote("W3".into(), NodeId(vec![3]), VerificationVote::Valid, vec![3]).await.unwrap();
+
+        let voters1 = tally1.valid_voters(&eligible).await;
+        let voters2 = tally2.valid_voters(&eligible).await;
+
+        // Both tallies must return identical order without requiring the caller to sort
+        assert_eq!(
+            voters1, voters2,
+            "VoteTally::valid_voters must return deterministically ordered NodeIds"
+        );
+        assert_eq!(
+            voters1,
+            vec![NodeId(vec![1]), NodeId(vec![2]), NodeId(vec![3]), NodeId(vec![4])]
+        );
     }
 
     #[tokio::test]
