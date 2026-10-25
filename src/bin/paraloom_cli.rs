@@ -1499,11 +1499,18 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
 
+                let init_ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[init_ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,

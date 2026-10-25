@@ -927,6 +927,29 @@ pub fn derive_associated_token_address(
     .0
 }
 
+/// Builds the SPL Associated Token Account `CreateIdempotent` instruction,
+/// ensuring the ATA exists before CPI execution without failing if already initialized.
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1], // 1 = CreateIdempotent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

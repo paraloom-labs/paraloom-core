@@ -15,6 +15,7 @@ pub use cosign_assembly::{assemble_transaction, gather_signatures};
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,
+    create_associated_token_account_idempotent_instruction,
     create_deposit_note_instruction, create_init_stake_token_vault_instruction,
     create_initialize_instruction, create_initialize_merkle_tree_instruction,
     create_initialize_validator_registry_instruction, create_migrate_bridge_state_instruction,
