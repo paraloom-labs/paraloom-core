@@ -113,6 +113,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_program = client.get_account(&stake_mint)?.owner;
     let validator_token_account = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
         Ok(val) => Pubkey::from_str(&val)?,
+        Err(_) => {
+            let derived = derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program);
+            if client.get_account(&derived).is_err() {
+                println!("Creating validator token account...");
+                let ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    client.get_latest_blockhash()?,
+                );
+                client.send_and_confirm_transaction(&tx)?;
+            }
+            derived
+        }
+    };
+
+    // Verify token balance
+    if token_stake_amount > 0 {
+        let token_balance = client
+            .get_token_account_balance(&validator_token_account)
+            .map(|b| b.amount.parse::<u64>().unwrap_or(0))
+            .unwrap_or(0);
+        if token_balance < token_stake_amount {
+            return Err(format!("Insufficient token balance: {} < {}", token_balance, token_stake_amount).into());
+        }
+    }
+        Ok(val) => Pubkey::from_str(&val)?,
         Err(_) => derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program),
     };
 
