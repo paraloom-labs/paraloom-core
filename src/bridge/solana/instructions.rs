@@ -108,6 +108,12 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:slash_validator")[..8]`. Penalty enforcement: reduces a
+    /// misbehaving validator's stake and moves slashed funds to `slashed_funds_vault`.
+    pub const SLASH_VALIDATOR: [u8; 8] = [238, 57, 244, 40, 132, 82, 78, 5];
+    /// `sha256("global:update_reputation")[..8]`. Governance/consensus update of
+    /// a validator's reputation score.
+    pub const UPDATE_REPUTATION: [u8; 8] = [194, 220, 43, 201, 54, 209, 49, 178];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -855,6 +861,74 @@ pub fn create_set_deposit_cap_instruction(
     }
 }
 
+/// Create a `slash_validator` instruction.
+///
+/// Reduces a misbehaving validator's stake by `slash_percentage` (1..=100) and
+/// transfers the slashed SOL to `slashed_funds_vault` and burns the token half.
+/// Signed by the registry authority.
+pub fn create_slash_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    stake_mint: &Pubkey,
+    token_program: &Pubkey,
+    slash_percentage: u8,
+) -> Instruction {
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (slashed_vault_pda, _) = derive_slashed_funds_vault(program_id);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (stake_vault_pda, _) = derive_stake_token_vault(program_id);
+    let (stake_auth_pda, _) = derive_stake_vault_authority(program_id);
+
+    let mut data = Vec::with_capacity(41);
+    data.extend_from_slice(&discriminators::SLASH_VALIDATOR);
+    data.extend_from_slice(validator.as_ref());
+    data.push(slash_percentage);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(slashed_vault_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*stake_mint, false),
+            AccountMeta::new(stake_vault_pda, false),
+            AccountMeta::new_readonly(stake_auth_pda, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    }
+}
+
+/// Create an `update_reputation` instruction.
+///
+/// Updates `validator_account.reputation_score` on-chain. Signed by the registry authority.
+pub fn create_update_reputation_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    new_reputation: u64,
+) -> Instruction {
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    let mut data = Vec::with_capacity(48);
+    data.extend_from_slice(&discriminators::UPDATE_REPUTATION);
+    data.extend_from_slice(validator.as_ref());
+    data.extend_from_slice(&new_reputation.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data,
+    }
+}
+
 /// Derive bridge vault PDA
 pub fn derive_bridge_vault(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"bridge_vault"], program_id)
@@ -925,6 +999,11 @@ pub fn derive_associated_token_address(
         &SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
     )
     .0
+}
+
+/// Derive the slashed funds vault PDA (`seeds = [b"slashed_funds_vault"]`).
+pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
 }
 
 #[cfg(test)]
@@ -1310,5 +1389,130 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_slash_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+        let slash_percentage = 25u8;
+
+        let ix = create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &token_program,
+            slash_percentage,
+        );
+
+        assert_eq!(ix.program_id, program_id);
+        // validator_account (mut), slashed_funds_vault (mut), validator_registry (mut),
+        // stake_mint (mut), stake_token_vault (mut), stake_vault_authority (ro),
+        // token_program (ro), authority (signer, ro)
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_slashed_funds_vault(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(
+            ix.accounts[2].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+
+        assert_eq!(ix.accounts[3].pubkey, stake_mint);
+        assert!(ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert!(!ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
+
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert!(!ix.accounts[6].is_writable);
+        assert!(!ix.accounts[6].is_signer);
+
+        assert_eq!(ix.accounts[7].pubkey, authority);
+        assert!(!ix.accounts[7].is_writable);
+        assert!(ix.accounts[7].is_signer);
+
+        assert_eq!(&ix.data[..8], &discriminators::SLASH_VALIDATOR);
+        assert_eq!(&ix.data[8..40], validator.as_ref());
+        assert_eq!(ix.data[40], slash_percentage);
+        assert_eq!(ix.data.len(), 41);
+    }
+
+    #[test]
+    fn test_create_update_reputation_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let new_reputation = 750u64;
+
+        let ix = create_update_reputation_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            new_reputation,
+        );
+
+        assert_eq!(ix.program_id, program_id);
+        // validator_account (mut), validator_registry (ro), authority (signer, ro)
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(!ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(ix.accounts[2].pubkey, authority);
+        assert!(!ix.accounts[2].is_writable);
+        assert!(ix.accounts[2].is_signer);
+
+        assert_eq!(&ix.data[..8], &discriminators::UPDATE_REPUTATION);
+        assert_eq!(&ix.data[8..40], validator.as_ref());
+        assert_eq!(&ix.data[40..48], &new_reputation.to_le_bytes());
+        assert_eq!(ix.data.len(), 48);
+    }
+
+    #[test]
+    fn test_derive_slashed_funds_vault() {
+        let program_id = Pubkey::new_unique();
+        let (vault1, _) = derive_slashed_funds_vault(&program_id);
+        let (vault2, _) = derive_slashed_funds_vault(&program_id);
+        assert_eq!(vault1, vault2);
     }
 }
