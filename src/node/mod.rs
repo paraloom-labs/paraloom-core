@@ -2358,9 +2358,10 @@ impl Node {
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            if store
+                .iter()
+                .any(|d| d.output_commitment == note.output_commitment)
+            {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3633,5 +3634,32 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn delivered_notes_deduplicates_by_output_commitment_only() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[42u8; 32], [43u8; 32]];
+        let ciphers_initial = ["aa".repeat(88), "bb".repeat(88)];
+        let ciphers_mutated = ["cc".repeat(88), "dd".repeat(88)];
+
+        node.record_delivered_notes(&commitments, &ciphers_initial, None)
+            .await;
+
+        // Second delivery with identical commitments but mutated ciphertexts
+        // must be ignored (first-seen commitment wins, prevents feed eviction).
+        node.record_delivered_notes(&commitments, &ciphers_mutated, None)
+            .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(
+            delivered.len(),
+            2,
+            "mutated ciphertexts must be deduplicated by commitment"
+        );
+        assert_eq!(delivered[0].output_commitment, hex::encode(commitments[0]));
+        assert_eq!(delivered[0].ciphertext, ciphers_initial[0]);
+        assert_eq!(delivered[1].output_commitment, hex::encode(commitments[1]));
+        assert_eq!(delivered[1].ciphertext, ciphers_initial[1]);
     }
 }
