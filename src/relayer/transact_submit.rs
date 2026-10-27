@@ -78,18 +78,20 @@ pub struct Membership {
 }
 
 /// Read the on-chain merkle tree and reconstruct `leaf_index`'s authentication
-/// path from `filled_subtrees` + the zero-subtree hashes — the standard
-/// incremental-tree property, no leaf scanning. `commitment` is the leaf value;
-/// the path is fold-checked against the on-chain root before returning so a
-/// stale/wrong read fails here rather than at proving.
+/// path. If `custom_path` is provided (e.g. from an off-chain indexer/path service),
+/// it is validated against the on-chain root or root ring buffer history.
+/// If `custom_path` is None, frontier reconstruction is attempted.
+/// The folded root is verified against `root_onchain` AND the on-chain `root_history`
+/// ring buffer to accept proofs built against recent valid roots (#1237).
 ///
 /// Tree account layout: disc(8) | next_index(8) | root_index(8) | root(32) |
-/// `filled_subtrees[TX_LEVELS][32]` (from offset 56).
-pub fn read_membership(
+/// `filled_subtrees[TX_LEVELS][32]` (from offset 56) | `root_history[ROOT_HISTORY_SIZE][32]`.
+pub fn read_membership_with_path(
     client: &RpcClient,
     program_id: &Pubkey,
     leaf_index: u64,
     commitment: Fr,
+    custom_path: Option<Vec<[u8; 32]>>,
 ) -> Result<Membership> {
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], program_id);
     let raw = client
@@ -102,26 +104,34 @@ pub fn read_membership(
         .try_into()
         .map_err(|_| TransactSubmitError::ShortAccount("merkle_tree root"))?;
 
-    let mut zeros = vec![Fr::from(0u64)];
-    for k in 0..TX_LEVELS {
-        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
-    }
-    let mut path: Vec<[u8; 32]> = Vec::with_capacity(TX_LEVELS);
-    #[allow(clippy::needless_range_loop)]
-    for level in 0..TX_LEVELS {
-        let sib = if (leaf_index >> level) & 1 == 1 {
-            let off = 56 + level * 32;
-            let fs: [u8; 32] = raw[off..off + 32]
-                .try_into()
-                .map_err(|_| TransactSubmitError::ShortAccount("filled_subtrees"))?;
-            fs
-        } else {
-            fr_to_le(&zeros[level])
-        };
-        path.push(sib);
-    }
+    let path = if let Some(p) = custom_path {
+        if p.len() != TX_LEVELS {
+            return Err(TransactSubmitError::RootMismatch { leaf_index });
+        }
+        p
+    } else {
+        let mut zeros = vec![Fr::from(0u64)];
+        for k in 0..TX_LEVELS {
+            zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+        }
+        let mut p: Vec<[u8; 32]> = Vec::with_capacity(TX_LEVELS);
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..TX_LEVELS {
+            let sib = if (leaf_index >> level) & 1 == 1 {
+                let off = 56 + level * 32;
+                let fs: [u8; 32] = raw[off..off + 32]
+                    .try_into()
+                    .map_err(|_| TransactSubmitError::ShortAccount("filled_subtrees"))?;
+                fs
+            } else {
+                fr_to_le(&zeros[level])
+            };
+            p.push(sib);
+        }
+        p
+    };
 
-    // Fold to confirm the path matches the on-chain root before we prove.
+    // Fold to confirm the path matches the on-chain root or a valid historical root in root_history.
     let mut cur = commitment;
     for (level, sib) in path.iter().enumerate() {
         let s = Fr::from_le_bytes_mod_order(sib);
@@ -131,15 +141,39 @@ pub fn read_membership(
             v3_merkle_pair(cur, s)
         };
     }
-    if fr_to_le(&cur) != root_onchain {
+    let cur_bytes = fr_to_le(&cur);
+    let mut matched = cur_bytes == root_onchain;
+    if !matched {
+        // Check on-chain root_history ring buffer (offset 56 + TX_LEVELS * 32)
+        let history_start = 56 + TX_LEVELS * 32;
+        if raw.len() >= history_start + 64 * 32 {
+            for i in 0..64 {
+                let off = history_start + i * 32;
+                if raw[off..off + 32] == cur_bytes {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !matched {
         return Err(TransactSubmitError::RootMismatch { leaf_index });
     }
 
     Ok(Membership {
         leaf_index,
-        root: root_onchain,
+        root: cur_bytes,
         path,
     })
+}
+
+pub fn read_membership(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    leaf_index: u64,
+    commitment: Fr,
+) -> Result<Membership> {
+    read_membership_with_path(client, program_id, leaf_index, commitment, None)
 }
 
 /// The tagged proof + on-chain public parts of a withdraw-to-fresh v3 transact.
