@@ -210,7 +210,14 @@ fn decode_compiled_deposit(
     };
 
     let payload = &raw_data[8..];
-    let data = DepositInstructionData::try_from_slice(payload).ok()?;
+    // Anchor's borsh deserializer tolerates trailing bytes, but
+    // `try_from_slice` errors with "Not all bytes read" the moment the
+    // compiled instruction carries padding after the payload. Decode with
+    // `deserialize` (the same lenient semantics Anchor uses) so a deposit
+    // with trailing bytes still decodes instead of being silently dropped.
+    // See #1169.
+    let mut cursor: &[u8] = payload;
+    let data = DepositInstructionData::deserialize(&mut cursor).ok()?;
 
     let depositor_index = *compiled.accounts.get(depositor_index)? as usize;
     let depositor = account_keys.get(depositor_index)?;
@@ -302,6 +309,46 @@ mod tests {
         assert_eq!(decoded.data.randomness, randomness);
         assert_eq!(decoded.depositor, depositor);
         assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+    }
+
+    /// #1169 — Anchor 0.31's dispatcher does not require the instruction
+    /// buffer to be fully consumed, yet this decoder used `try_from_slice`,
+    /// which errors with "Not all bytes read" the moment a single trailing
+    /// byte follows the payload. A deposit that decodes fine on-chain then
+    /// fell out of `extract_deposit_events`. `deserialize` reads exactly the
+    /// borsh fields and ignores the tail, so the same deposit now decodes.
+    #[test]
+    fn decodes_a_deposit_with_trailing_byte() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let extra = Pubkey::new_unique();
+
+        let account_keys = vec![extra, extra, depositor, program_id];
+
+        let amount = 1_000_000u64;
+        let recipient = [7u8; 32];
+        let randomness = [9u8; 32];
+
+        // Same bytes as a well-formed deposit, plus one trailing 0x00 the
+        // runtime leaves in the compiled instruction's data buffer.
+        let mut bytes = discriminators::DEPOSIT.to_vec();
+        bytes.extend_from_slice(
+            &borsh::to_vec(&DepositInstructionData {
+                amount,
+                recipient,
+                randomness,
+            })
+            .unwrap(),
+        );
+        bytes.push(0x00);
+        let ix = make_compiled_ix(3, 2, bs58::encode(bytes).into_string());
+
+        let decoded =
+            decode_compiled_deposit(&ix, &account_keys, &program_id)
+                .expect("deposit with a trailing byte must decode");
+        assert_eq!(decoded.data.amount, amount);
+        assert_eq!(decoded.data.recipient, recipient);
+        assert_eq!(decoded.data.randomness, randomness);
     }
 
     /// `deposit_note` is the only deposit instruction the program still
