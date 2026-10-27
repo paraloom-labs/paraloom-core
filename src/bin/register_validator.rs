@@ -132,9 +132,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
 
+    let init_ata_ix = create_associated_token_account_idempotent_instruction(
+        &validator.pubkey(),
+        &validator.pubkey(),
+        &stake_mint,
+        &token_program,
+    );
+
     println!("Creating and signing transaction...");
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[init_ata_ix, ix],
         Some(&validator.pubkey()),
         &[&validator],
         blockhash,
