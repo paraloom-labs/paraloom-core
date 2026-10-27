@@ -175,8 +175,46 @@ async fn submit_handler(
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
+    // Both nullifiers must be distinct. The on-chain program rejects duplicates
+    // (BridgeError::DuplicateNullifier), so fail fast at ingress before burning
+    // consensus rounds.
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers must be distinct (duplicate nullifier)".to_string(),
+        ));
+    }
+
+    // Nullifiers, output commitments, and the root must be canonical BN254
+    // scalar field elements (< r). On-chain settlement requires canonical
+    // encodings (programs/paraloom/src/lib.rs:318-341); reject non-canonical
+    // elements up front.
+    for (i, nf) in nullifiers.iter().enumerate() {
+        if !crate::privacy::is_canonical_le(nf) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("nullifiers[{i}] must be a canonical field element"),
+            ));
+        }
+    }
+
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
+    for (i, oc) in output_commitments.iter().enumerate() {
+        if !crate::privacy::is_canonical_le(oc) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("output_commitments[{i}] must be a canonical field element"),
+            ));
+        }
+    }
+
     let root = parse_hex32("root", &req.root)?;
+    if !crate::privacy::is_canonical_le(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "root must be a canonical field element".to_string(),
+        ));
+    }
 
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
     let proof = hex::decode(proof_hex)
@@ -360,9 +398,9 @@ mod tests {
             "66".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
             ext_amount,
             "01".repeat(192),
             v1_ciphertext_hex(0xab),
@@ -395,8 +433,8 @@ mod tests {
         assert_eq!(id, seen.canonical_id());
         assert_eq!(seen.recipient, [0x66u8; 32]);
         assert_eq!(seen.nullifiers, [[0x11u8; 32], [0x22u8; 32]]);
-        assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);
-        assert_eq!(seen.root, [0x55u8; 32]);
+        assert_eq!(seen.output_commitments, [[0x03u8; 32], [0x04u8; 32]]);
+        assert_eq!(seen.root, [0x05u8; 32]);
         assert_eq!(seen.ext_amount, 0);
         assert_eq!(seen.proof, vec![0x01u8; 192]);
     }
@@ -424,15 +462,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_nullifiers_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "11".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_canonical_nullifier_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "ff".repeat(32),
+            "22".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_canonical_output_commitment_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "ff".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_canonical_root_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "ff".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn wrong_nullifier_count_is_400() {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"recipient":"{}","nullifiers":["{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
             "66".repeat(32),
             "11".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
             "01".repeat(192),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
@@ -449,9 +563,9 @@ mod tests {
             "66".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
             "ab".repeat(88),
             "cd".repeat(88)
         );
@@ -508,7 +622,7 @@ mod tests {
         }
         async fn delivered_notes(&self) -> Vec<DeliveredNote> {
             vec![DeliveredNote {
-                output_commitment: "33".repeat(32),
+                output_commitment: "03".repeat(32),
                 ciphertext: "ab".repeat(88),
                 mint: None,
             }]
@@ -528,7 +642,7 @@ mod tests {
         let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let notes: Vec<DeliveredNote> = serde_json::from_slice(&body).unwrap();
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].output_commitment, "33".repeat(32));
+        assert_eq!(notes[0].output_commitment, "03".repeat(32));
     }
 
     /// The carrier rule at the HTTP layer: core relays a version it cannot
