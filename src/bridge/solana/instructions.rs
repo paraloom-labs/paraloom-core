@@ -108,6 +108,12 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:slash_validator")[..8]`. Penalty enforcement: reduces a
+    /// misbehaving validator's stake and moves slashed funds to `slashed_funds_vault`.
+    pub const SLASH_VALIDATOR: [u8; 8] = [238, 57, 244, 40, 132, 82, 78, 5];
+    /// `sha256("global:update_reputation")[..8]`. Governance/consensus update of
+    /// a validator's reputation score.
+    pub const UPDATE_REPUTATION: [u8; 8] = [194, 220, 43, 201, 54, 209, 49, 178];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -855,6 +861,258 @@ pub fn create_set_deposit_cap_instruction(
     }
 }
 
+/// Builder for constructing a `slash_validator` instruction.
+///
+/// Encapsulates all required accounts and arguments for reducing a
+/// misbehaving validator's stake on-chain according to consensus slashing proofs.
+#[derive(Debug, Clone, Default)]
+pub struct SlashValidatorBuilder {
+    program_id: Option<Pubkey>,
+    authority: Option<Pubkey>,
+    validator: Option<Pubkey>,
+    stake_mint: Option<Pubkey>,
+    token_program: Option<Pubkey>,
+    slash_percentage: Option<u8>,
+}
+
+impl SlashValidatorBuilder {
+    /// Create a new empty builder instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the target Solana program ID.
+    pub fn program_id(mut self, program_id: Pubkey) -> Self {
+        self.program_id = Some(program_id);
+        self
+    }
+
+    /// Set the registry authority key (must be a transaction signer).
+    pub fn authority(mut self, authority: Pubkey) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// Set the pubkey of the validator being slashed.
+    pub fn validator(mut self, validator: Pubkey) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
+    /// Set the dual-stake SPL token mint.
+    pub fn stake_mint(mut self, stake_mint: Pubkey) -> Self {
+        self.stake_mint = Some(stake_mint);
+        self
+    }
+
+    /// Set the SPL token program ID (defaults to `SPL_TOKEN_PROGRAM_ID`).
+    pub fn token_program(mut self, token_program: Pubkey) -> Self {
+        self.token_program = Some(token_program);
+        self
+    }
+
+    /// Set the penalty percentage (1..=100).
+    pub fn slash_percentage(mut self, slash_percentage: u8) -> Self {
+        self.slash_percentage = Some(slash_percentage);
+        self
+    }
+
+    /// Pack instruction data according to Anchor wire format:
+    /// `[discriminator (8 bytes)][validator (32 bytes)][slash_percentage (1 byte)]` (41 bytes total).
+    pub fn pack_data(&self) -> Result<Vec<u8>> {
+        let validator = self.validator.ok_or_else(|| {
+            BridgeError::InvalidTransaction("SlashValidatorBuilder: validator is required".to_string())
+        })?;
+        let slash_percentage = self.slash_percentage.ok_or_else(|| {
+            BridgeError::InvalidTransaction("SlashValidatorBuilder: slash_percentage is required".to_string())
+        })?;
+
+        if slash_percentage == 0 || slash_percentage > 100 {
+            return Err(BridgeError::InvalidTransaction(
+                "SlashValidatorBuilder: slash_percentage must be between 1 and 100".to_string(),
+            ));
+        }
+
+        let mut data = Vec::with_capacity(41);
+        data.extend_from_slice(&discriminators::SLASH_VALIDATOR);
+        data.extend_from_slice(validator.as_ref());
+        data.push(slash_percentage);
+        Ok(data)
+    }
+
+    /// Build the complete Solana `Instruction`.
+    pub fn build(&self) -> Result<Instruction> {
+        let program_id = self.program_id.ok_or_else(|| {
+            BridgeError::InvalidTransaction("SlashValidatorBuilder: program_id is required".to_string())
+        })?;
+        let authority = self.authority.ok_or_else(|| {
+            BridgeError::InvalidTransaction("SlashValidatorBuilder: authority is required".to_string())
+        })?;
+        let validator = self.validator.ok_or_else(|| {
+            BridgeError::InvalidTransaction("SlashValidatorBuilder: validator is required".to_string())
+        })?;
+        let stake_mint = self.stake_mint.ok_or_else(|| {
+            BridgeError::InvalidTransaction("SlashValidatorBuilder: stake_mint is required".to_string())
+        })?;
+        let token_program = self.token_program.unwrap_or(SPL_TOKEN_PROGRAM_ID);
+
+        let data = self.pack_data()?;
+
+        let (validator_pda, _) = derive_validator_account(&program_id, &validator);
+        let (slashed_vault_pda, _) = derive_slashed_funds_vault(&program_id);
+        let (registry_pda, _) = derive_validator_registry(&program_id);
+        let (stake_vault_pda, _) = derive_stake_token_vault(&program_id);
+        let (stake_auth_pda, _) = derive_stake_vault_authority(&program_id);
+
+        let accounts = vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(slashed_vault_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(stake_mint, false),
+            AccountMeta::new(stake_vault_pda, false),
+            AccountMeta::new_readonly(stake_auth_pda, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(authority, true),
+        ];
+
+        Ok(Instruction {
+            program_id,
+            accounts,
+            data,
+        })
+    }
+}
+
+/// Create a `slash_validator` instruction.
+///
+/// Convenience wrapper around `SlashValidatorBuilder`.
+pub fn create_slash_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    stake_mint: &Pubkey,
+    token_program: &Pubkey,
+    slash_percentage: u8,
+) -> Instruction {
+    SlashValidatorBuilder::new()
+        .program_id(*program_id)
+        .authority(*authority)
+        .validator(*validator)
+        .stake_mint(*stake_mint)
+        .token_program(*token_program)
+        .slash_percentage(slash_percentage)
+        .build()
+        .expect("create_slash_validator_instruction: invalid arguments")
+}
+
+/// Builder for constructing an `update_reputation` instruction.
+///
+/// Encapsulates all required accounts and arguments for governance/consensus
+/// reputation updates of registered validators.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateReputationBuilder {
+    program_id: Option<Pubkey>,
+    authority: Option<Pubkey>,
+    validator: Option<Pubkey>,
+    new_reputation: Option<u64>,
+}
+
+impl UpdateReputationBuilder {
+    /// Create a new empty builder instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the target Solana program ID.
+    pub fn program_id(mut self, program_id: Pubkey) -> Self {
+        self.program_id = Some(program_id);
+        self
+    }
+
+    /// Set the registry authority key (must be a transaction signer).
+    pub fn authority(mut self, authority: Pubkey) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    /// Set the pubkey of the validator whose reputation is being updated.
+    pub fn validator(mut self, validator: Pubkey) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
+    /// Set the new reputation score.
+    pub fn new_reputation(mut self, new_reputation: u64) -> Self {
+        self.new_reputation = Some(new_reputation);
+        self
+    }
+
+    /// Pack instruction data according to Anchor wire format:
+    /// `[discriminator (8 bytes)][validator (32 bytes)][new_reputation (8 bytes)]` (48 bytes total).
+    pub fn pack_data(&self) -> Result<Vec<u8>> {
+        let validator = self.validator.ok_or_else(|| {
+            BridgeError::InvalidTransaction("UpdateReputationBuilder: validator is required".to_string())
+        })?;
+        let new_reputation = self.new_reputation.ok_or_else(|| {
+            BridgeError::InvalidTransaction("UpdateReputationBuilder: new_reputation is required".to_string())
+        })?;
+
+        let mut data = Vec::with_capacity(48);
+        data.extend_from_slice(&discriminators::UPDATE_REPUTATION);
+        data.extend_from_slice(validator.as_ref());
+        data.extend_from_slice(&new_reputation.to_le_bytes());
+        Ok(data)
+    }
+
+    /// Build the complete Solana `Instruction`.
+    pub fn build(&self) -> Result<Instruction> {
+        let program_id = self.program_id.ok_or_else(|| {
+            BridgeError::InvalidTransaction("UpdateReputationBuilder: program_id is required".to_string())
+        })?;
+        let authority = self.authority.ok_or_else(|| {
+            BridgeError::InvalidTransaction("UpdateReputationBuilder: authority is required".to_string())
+        })?;
+        let validator = self.validator.ok_or_else(|| {
+            BridgeError::InvalidTransaction("UpdateReputationBuilder: validator is required".to_string())
+        })?;
+
+        let data = self.pack_data()?;
+
+        let (validator_pda, _) = derive_validator_account(&program_id, &validator);
+        let (registry_pda, _) = derive_validator_registry(&program_id);
+
+        let accounts = vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new_readonly(registry_pda, false),
+            AccountMeta::new_readonly(authority, true),
+        ];
+
+        Ok(Instruction {
+            program_id,
+            accounts,
+            data,
+        })
+    }
+}
+
+/// Create an `update_reputation` instruction.
+///
+/// Convenience wrapper around `UpdateReputationBuilder`.
+pub fn create_update_reputation_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    new_reputation: u64,
+) -> Instruction {
+    UpdateReputationBuilder::new()
+        .program_id(*program_id)
+        .authority(*authority)
+        .validator(*validator)
+        .new_reputation(new_reputation)
+        .build()
+        .expect("create_update_reputation_instruction: invalid arguments")
+}
+
 /// Derive bridge vault PDA
 pub fn derive_bridge_vault(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"bridge_vault"], program_id)
@@ -925,6 +1183,11 @@ pub fn derive_associated_token_address(
         &SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
     )
     .0
+}
+
+/// Derive the slashed funds vault PDA (`seeds = [b"slashed_funds_vault"]`).
+pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
 }
 
 #[cfg(test)]
@@ -1311,4 +1574,245 @@ mod tests {
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
     }
+
+    #[test]
+    fn test_slash_validator_builder_full_chain() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+        let slash_percentage = 25u8;
+
+        let builder = SlashValidatorBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .stake_mint(stake_mint)
+            .token_program(token_program)
+            .slash_percentage(slash_percentage);
+
+        let ix = builder.build().expect("build should succeed");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 8);
+
+        // Account 0: validator_account (mut, pda)
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        // Account 1: slashed_funds_vault (mut, pda)
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_slashed_funds_vault(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        // Account 2: validator_registry (mut, pda)
+        assert_eq!(
+            ix.accounts[2].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+
+        // Account 3: stake_mint (mut)
+        assert_eq!(ix.accounts[3].pubkey, stake_mint);
+        assert!(ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        // Account 4: stake_token_vault (mut, pda)
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        // Account 5: stake_vault_authority (ro, pda)
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert!(!ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
+
+        // Account 6: token_program (ro)
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert!(!ix.accounts[6].is_writable);
+        assert!(!ix.accounts[6].is_signer);
+
+        // Account 7: authority (ro, signer)
+        assert_eq!(ix.accounts[7].pubkey, authority);
+        assert!(!ix.accounts[7].is_writable);
+        assert!(ix.accounts[7].is_signer);
+
+        // Data payload assertions
+        assert_eq!(ix.data.len(), 41);
+        assert_eq!(&ix.data[..8], &discriminators::SLASH_VALIDATOR);
+        assert_eq!(&ix.data[8..40], validator.as_ref());
+        assert_eq!(ix.data[40], slash_percentage);
+    }
+
+    #[test]
+    fn test_slash_validator_builder_validation() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+
+        // Missing slash_percentage
+        let res = SlashValidatorBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .stake_mint(stake_mint)
+            .build();
+        assert!(res.is_err());
+
+        // Invalid slash_percentage 0
+        let res = SlashValidatorBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .stake_mint(stake_mint)
+            .slash_percentage(0)
+            .build();
+        assert!(res.is_err());
+
+        // Invalid slash_percentage > 100
+        let res = SlashValidatorBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .stake_mint(stake_mint)
+            .slash_percentage(101)
+            .build();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_update_reputation_builder_full_chain() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let new_reputation = 750u64;
+
+        let builder = UpdateReputationBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .new_reputation(new_reputation);
+
+        let ix = builder.build().expect("build should succeed");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 3);
+
+        // Account 0: validator_account (mut, pda)
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        // Account 1: validator_registry (ro, pda)
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(!ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        // Account 2: authority (ro, signer)
+        assert_eq!(ix.accounts[2].pubkey, authority);
+        assert!(!ix.accounts[2].is_writable);
+        assert!(ix.accounts[2].is_signer);
+
+        // Data payload assertions
+        assert_eq!(ix.data.len(), 48);
+        assert_eq!(&ix.data[..8], &discriminators::UPDATE_REPUTATION);
+        assert_eq!(&ix.data[8..40], validator.as_ref());
+        assert_eq!(&ix.data[40..48], &new_reputation.to_le_bytes());
+    }
+
+    #[test]
+    fn test_update_reputation_builder_validation() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        // Missing new_reputation
+        let res = UpdateReputationBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .build();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_create_instruction_helpers_match_builders() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+        let slash_percentage = 40u8;
+        let new_reputation = 950u64;
+
+        let slash_ix = create_slash_validator_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            &stake_mint,
+            &token_program,
+            slash_percentage,
+        );
+        let slash_builder_ix = SlashValidatorBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .stake_mint(stake_mint)
+            .token_program(token_program)
+            .slash_percentage(slash_percentage)
+            .build()
+            .unwrap();
+
+        assert_eq!(slash_ix.accounts, slash_builder_ix.accounts);
+        assert_eq!(slash_ix.data, slash_builder_ix.data);
+
+        let rep_ix = create_update_reputation_instruction(
+            &program_id,
+            &authority,
+            &validator,
+            new_reputation,
+        );
+        let rep_builder_ix = UpdateReputationBuilder::new()
+            .program_id(program_id)
+            .authority(authority)
+            .validator(validator)
+            .new_reputation(new_reputation)
+            .build()
+            .unwrap();
+
+        assert_eq!(rep_ix.accounts, rep_builder_ix.accounts);
+        assert_eq!(rep_ix.data, rep_builder_ix.data);
+    }
+
+    #[test]
+    fn test_derive_slashed_funds_vault() {
+        let program_id = Pubkey::new_unique();
+        let (vault1, bump1) = derive_slashed_funds_vault(&program_id);
+        let (vault2, bump2) = derive_slashed_funds_vault(&program_id);
+        assert_eq!(vault1, vault2);
+        assert_eq!(bump1, bump2);
+    }
 }
+
