@@ -17,14 +17,13 @@ pub const DEFAULT_TREE_DEPTH: usize = 32;
 
 /// Merkle tree for commitments
 /// How many recent roots the tree remembers for withdrawal/transfer proof
-/// verification. A proof is built against the root the prover observed (served
-/// by the path server); by the time a validator verifies it, more deposits may
-/// have advanced the tree past that root. Accepting any of the last
-/// `ROOT_HISTORY_LEN` roots lets independently-advancing validators verify the
-/// same proof without holding byte-identical trees, the way Tornado-style pools
-/// keep a roots ring buffer. Double-spend is still prevented by the nullifier,
-/// independent of which historical root a proof names.
-pub const ROOT_HISTORY_LEN: usize = 256;
+/// verification. Capped at `ROOT_HISTORY_LEN` to strictly match the on-chain Anchor
+/// program's ring buffer (`paraloom::merkle_tree::ROOT_HISTORY_SIZE = 64`).
+/// Aligning this capacity ensures off-chain consensus nodes never validate and
+/// co-sign proofs built against roots that have already fallen out of the on-chain
+/// ring buffer, which would otherwise revert with `UnknownMerkleRoot` during
+/// on-chain settlement (#1230).
+pub const ROOT_HISTORY_LEN: usize = 64;
 
 pub struct MerkleTree {
     /// Tree depth
@@ -633,6 +632,35 @@ mod tests {
         assert!(
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_history_len_matches_onchain_history_size() {
+        assert_eq!(
+            ROOT_HISTORY_LEN, 64,
+            "off-chain ROOT_HISTORY_LEN must match on-chain ROOT_HISTORY_SIZE (64) (#1230)"
+        );
+        let tree = MerkleTree::new();
+        let initial_root = tree.root().await;
+        // Insert exactly ROOT_HISTORY_LEN (64) leaves
+        for i in 0..ROOT_HISTORY_LEN {
+            let mut leaf = [0u8; 32];
+            leaf[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            tree.insert(&Commitment(leaf)).await.unwrap();
+            tree.root().await;
+        }
+        // Initial root is still known at the boundary
+        assert!(tree.knows_root(&initial_root).await);
+
+        // One more insertion evicts initial_root beyond the 64-root capacity
+        let mut leaf = [0u8; 32];
+        leaf[..4].copy_from_slice(&999u32.to_le_bytes());
+        tree.insert(&Commitment(leaf)).await.unwrap();
+        tree.root().await;
+        assert!(
+            !tree.knows_root(&initial_root).await,
+            "root older than 64 updates must be evicted to prevent on-chain settlement revert"
         );
     }
 }
