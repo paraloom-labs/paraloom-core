@@ -178,6 +178,43 @@ async fn submit_handler(
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
 
+    // Reject duplicate nullifiers before entering consensus: the on-chain
+    // Solana program unconditionally rejects transactions with duplicate
+    // nullifiers (`BridgeError::DuplicateNullifier`). Fail fast at the ingress
+    // door instead of burning a consensus round on a doomed request (#1236).
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "duplicate nullifiers: input nullifiers must be distinct".to_string(),
+        ));
+    }
+
+    // Parity with the on-chain verifier (`programs/paraloom/src/lib.rs:318-333`):
+    // nullifiers, output commitments, and the root are BN254 scalar field elements.
+    // Reject non-canonical encodings before entering consensus (#1236).
+    for (i, nf) in nullifiers.iter().enumerate() {
+        if !crate::privacy::is_canonical_le(nf) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("nullifiers[{i}]: non-canonical field element"),
+            ));
+        }
+    }
+    for (i, oc) in output_commitments.iter().enumerate() {
+        if !crate::privacy::is_canonical_le(oc) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("output_commitments[{i}]: non-canonical field element"),
+            ));
+        }
+    }
+    if !crate::privacy::is_canonical_le(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "root: non-canonical field element".to_string(),
+        ));
+    }
+
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
     let proof = hex::decode(proof_hex)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("proof: invalid hex: {e}")))?;
@@ -360,9 +397,9 @@ mod tests {
             "66".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
             ext_amount,
             "01".repeat(192),
             v1_ciphertext_hex(0xab),
@@ -395,8 +432,8 @@ mod tests {
         assert_eq!(id, seen.canonical_id());
         assert_eq!(seen.recipient, [0x66u8; 32]);
         assert_eq!(seen.nullifiers, [[0x11u8; 32], [0x22u8; 32]]);
-        assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);
-        assert_eq!(seen.root, [0x55u8; 32]);
+        assert_eq!(seen.output_commitments, [[0x03u8; 32], [0x04u8; 32]]);
+        assert_eq!(seen.root, [0x05u8; 32]);
         assert_eq!(seen.ext_amount, 0);
         assert_eq!(seen.proof, vec![0x01u8; 192]);
     }
@@ -424,15 +461,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_nullifiers_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "11".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("duplicate nullifiers"));
+    }
+
+    #[tokio::test]
+    async fn non_canonical_nullifier_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "ff".repeat(32),
+            "22".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("nullifiers[0]: non-canonical field element")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_canonical_output_commitment_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "ff".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes)
+            .contains("output_commitments[0]: non-canonical field element"));
+    }
+
+    #[tokio::test]
+    async fn non_canonical_root_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "ff".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("root: non-canonical field element"));
+    }
+
+    #[tokio::test]
     async fn wrong_nullifier_count_is_400() {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = format!(
             r#"{{"recipient":"{}","nullifiers":["{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
             "66".repeat(32),
             "11".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
             "01".repeat(192),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
@@ -449,11 +573,11 @@ mod tests {
             "66".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
-            "ab".repeat(88),
-            "cd".repeat(88)
+            "03".repeat(32),
+            "04".repeat(32),
+            "05".repeat(32),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
