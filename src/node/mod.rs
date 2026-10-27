@@ -2358,9 +2358,18 @@ impl Node {
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            // Deduplicate strictly by output_commitment (first-seen wins):
+            // each Poseidon note commitment uniquely identifies one output note,
+            // whereas ciphertexts are not bound by the Groth16 proof or canonical_id.
+            // Checking `&& d.ciphertext == note.ciphertext` allowed re-randomized
+            // proofs (distinct request_id) or replays after verified_transacts
+            // cache eviction (MAX_VERIFIED_CACHE = 1024 < MAX_DELIVERED_NOTES = 50_000)
+            // with mutated ciphertexts to flood delivered_notes and FIFO-evict
+            // authentic recipient scan records.
+            if store
+                .iter()
+                .any(|d| d.output_commitment == note.output_commitment)
+            {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3620,6 +3629,34 @@ mod tests {
             !json.contains("mint"),
             "absent mint must not appear: {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn delivered_notes_deduplicates_by_commitment_against_mutated_ciphertexts() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[0x11u8; 32], [0x22u8; 32]];
+        let authentic = ["aa".repeat(88), "bb".repeat(88)];
+
+        node.record_delivered_notes(&commitments, &authentic, None)
+            .await;
+
+        // Replay the same output commitments with mutated ciphertexts (as via a
+        // re-randomized Groth16 proof with a fresh request_id, or after
+        // verified_transacts FIFO eviction). First-seen authentic ciphertexts
+        // must be preserved and the scan buffer must not grow.
+        for i in 0..10u8 {
+            let mutated = [
+                format!("{:02x}", i).repeat(88),
+                format!("{:02x}", i.wrapping_add(100)).repeat(88),
+            ];
+            node.record_delivered_notes(&commitments, &mutated, None)
+                .await;
+        }
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, authentic[0]);
+        assert_eq!(delivered[1].ciphertext, authentic[1]);
     }
 
     // A coordinator node does not index deposits even with the bridge
