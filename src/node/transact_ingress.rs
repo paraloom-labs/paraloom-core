@@ -38,6 +38,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::consensus::transact::TransactVerificationRequest;
 use crate::node::ingress_auth::{check_bearer, IngressToken};
 
+/// Maximum proof length accepted by the on-chain Solana program (#350).
+/// Matches `MAX_PROOF_LEN` in `programs/paraloom/src/lib.rs:308` and `MAX_PROOF_BYTES` in
+/// `src/bridge/solana/cosign_message.rs:25`.
+pub const MAX_PROOF_LEN: usize = 256;
+
+/// On-chain withdrawal fee basis points (25 bps / 0.25%).
+/// Matches `WITHDRAWAL_FEE_BPS` in `programs/paraloom/src/lib.rs:88`.
+pub const WITHDRAWAL_FEE_BPS: u64 = 25;
+
+/// Maximum gross withdrawal amount before `gross.checked_mul(WITHDRAWAL_FEE_BPS)` overflows `u64::MAX`.
+/// When `ext_amount.unsigned_abs() > MAX_WITHDRAWAL_EXT_AMOUNT`, on-chain fee arithmetic
+/// overflows and returns `BridgeError::InvalidAmount` (`programs/paraloom/src/lib.rs:429, 629`).
+pub const MAX_WITHDRAWAL_EXT_AMOUNT: u64 = u64::MAX / WITHDRAWAL_FEE_BPS;
+
 /// A delivered encrypted output note (#196): the output commitment and the
 /// opaque hex ciphertext (`EncryptedNote`) a recipient trial-decrypts. (Moved
 /// here from the retired `transfer_ingress` module.)
@@ -168,15 +182,86 @@ async fn submit_handler(
         ));
     }
 
+    // Fail fast on withdrawal amounts that cause arithmetic overflow in the
+    // on-chain fee calculation (`programs/paraloom/src/lib.rs:429, 629`).
+    // `gross.checked_mul(WITHDRAWAL_FEE_BPS)` on `u64` overflows for values > u64::MAX / 25.
+    if req.ext_amount < 0 && req.ext_amount.unsigned_abs() > MAX_WITHDRAWAL_EXT_AMOUNT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "withdrawal amount exceeds maximum safe arithmetic limit of {MAX_WITHDRAWAL_EXT_AMOUNT} lamports"
+            ),
+        ));
+    }
+
     let recipient = parse_hex32("recipient", &req.recipient)?;
+
+    // On withdrawal (`ext_amount < 0`), recipient must be a valid non-zero address.
+    // [0u8; 32] is the Solana System Program address (`11111111111111111111111111111111`),
+    // which cannot receive funds and causes unconditional runtime failure on-chain.
+    if req.ext_amount < 0 && recipient == [0u8; 32] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "recipient address must be non-zero for withdrawal".to_string(),
+        ));
+    }
+
     let mint = req
         .mint
         .as_ref()
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
+
+    // If an SPL mint is specified, it must not be the zero address.
+    if let Some(m) = mint {
+        if m == [0u8; 32] {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "SPL mint address must not be zero".to_string(),
+            ));
+        }
+    }
+
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
+
+    // Reject duplicate nullifiers before entering consensus: the on-chain
+    // Solana program unconditionally rejects transactions with duplicate
+    // nullifiers (`BridgeError::DuplicateNullifier`). Fail fast at the ingress
+    // door instead of burning a consensus round on a doomed request.
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "duplicate nullifiers: input nullifiers must be distinct".to_string(),
+        ));
+    }
+
+    // Parity with the on-chain verifier (`programs/paraloom/src/lib.rs:318-340`):
+    // nullifiers, output commitments, and root are BN254 scalar field elements.
+    // Reject non-canonical encodings before entering consensus.
+    for (i, nf) in nullifiers.iter().enumerate() {
+        if !crate::privacy::is_canonical_le(nf) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("nullifiers[{i}]: non-canonical field element"),
+            ));
+        }
+    }
+    for (i, oc) in output_commitments.iter().enumerate() {
+        if !crate::privacy::is_canonical_le(oc) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("output_commitments[{i}]: non-canonical field element"),
+            ));
+        }
+    }
+    if !crate::privacy::is_canonical_le(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "root: non-canonical field element".to_string(),
+        ));
+    }
 
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
     let proof = hex::decode(proof_hex)
@@ -185,6 +270,12 @@ async fn submit_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "proof must not be empty".to_string(),
+        ));
+    }
+    if proof.len() > MAX_PROOF_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("proof length {} exceeds maximum allowed of {MAX_PROOF_LEN} bytes", proof.len()),
         ));
     }
 
@@ -558,4 +649,147 @@ mod tests {
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn proof_exceeding_max_proof_len_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // MAX_PROOF_LEN is 256 bytes; 257 bytes must be rejected at the door.
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(257),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_ext_amount_causing_fee_overflow_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // ext_amount causing gross.checked_mul(25) to overflow u64::MAX
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":{},"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            i64::MIN,
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn zero_recipient_on_withdrawal_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // Zero recipient on withdrawal (ext_amount < 0) is Solana System Program ID
+        // and cannot receive funds.
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":-1000000,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "00".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn zero_recipient_on_shielded_transfer_is_allowed() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // For pure shielded transfer (ext_amount == 0), recipient is bound as
+        // [0u8; 32] by convention (#900, #901).
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "00".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn zero_mint_on_spl_transact_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","mint":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "00".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_nullifiers_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "11".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_canonical_field_element_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // 0xFF * 32 exceeds BN254 scalar modulus (r) and is non-canonical.
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "ff".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
 }
