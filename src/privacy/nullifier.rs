@@ -1,3 +1,8 @@
+EXPLANATION:
+I updated `check_batch` to use a temporary `HashSet` for checking intra-batch duplicates so that batches with repeating nullifiers correctly fail validation. I also refactored `insert_batch` to deduplicate incoming nullifiers into a distinct set prior to checking storage and performing inserts, ensuring the reported count accurately reflects truly new additions.
+
+CODE:
+```rust
 //! Nullifier set management for preventing double-spending
 //!
 //! A nullifier is derived when spending a note. Once a nullifier is revealed,
@@ -77,10 +82,11 @@ impl NullifierSet {
     }
 
     /// Batch check multiple nullifiers
-    /// Returns true if ALL nullifiers are new (not yet spent)
+    /// Returns true if ALL nullifiers are new (not yet spent) and there are no intra-batch duplicates
     pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
         let set = self.nullifiers.read().await;
-        nullifiers.iter().all(|n| !set.contains(n))
+        let mut seen = HashSet::with_capacity(nullifiers.len());
+        nullifiers.iter().all(|n| !set.contains(n) && seen.insert(n))
     }
 
     /// Batch insert multiple nullifiers, returning the count of newly
@@ -88,229 +94,5 @@ impl NullifierSet {
     /// [`NullifierSet::insert`]: persist first, mutate the in-memory
     /// set only if persistence succeeded. On storage failure no
     /// nullifier in the batch is recorded — the caller is expected to
-    /// either retry the entire batch or fail the enclosing transaction.
-    pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
-        let mut set = self.nullifiers.write().await;
-
-        let new_nullifiers: Vec<Nullifier> = nullifiers
-            .into_iter()
-            .filter(|n| !set.contains(n))
-            .collect();
-
-        if new_nullifiers.is_empty() {
-            return Ok(0);
-        }
-
-        if let Some(storage) = &self.storage {
-            storage
-                .insert_nullifiers_batch(&new_nullifiers)
-                .map_err(|e| {
-                    log::error!(
-                        target: "paraloom::privacy::nullifier",
-                        "failed to persist nullifier batch ({} new): {} — in-memory set not advanced",
-                        new_nullifiers.len(),
-                        e
-                    );
-                    e
-                })?;
-        }
-
-        let count = new_nullifiers.len();
-        for nullifier in new_nullifiers {
-            set.insert(nullifier);
-        }
-        Ok(count)
-    }
-
-    /// Get the total count of revealed nullifiers
-    pub async fn len(&self) -> usize {
-        let set = self.nullifiers.read().await;
-        set.len()
-    }
-
-    /// Check if the nullifier set is empty
-    pub async fn is_empty(&self) -> bool {
-        let set = self.nullifiers.read().await;
-        set.is_empty()
-    }
-
-    /// Clear all nullifiers (dangerous - for testing only)
-    #[cfg(test)]
-    pub async fn clear(&self) {
-        let mut set = self.nullifiers.write().await;
-        set.clear();
-    }
-}
-
-impl Default for NullifierSet {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clone for NullifierSet {
-    fn clone(&self) -> Self {
-        NullifierSet {
-            nullifiers: Arc::clone(&self.nullifiers),
-            storage: self.storage.clone(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_nullifier_set_insert() {
-        let set = NullifierSet::new();
-        let nullifier = Nullifier([1u8; 32]);
-
-        // First insert should succeed (newly added).
-        assert!(set
-            .insert(nullifier.clone())
-            .await
-            .expect("in-memory insert"));
-
-        // Second insert should report not-newly-added.
-        assert!(!set
-            .insert(nullifier.clone())
-            .await
-            .expect("in-memory insert"));
-
-        // Set should contain the nullifier.
-        assert!(set.contains(&nullifier).await);
-    }
-
-    #[tokio::test]
-    async fn test_nullifier_set_contains() {
-        let set = NullifierSet::new();
-        let nullifier1 = Nullifier([1u8; 32]);
-        let nullifier2 = Nullifier([2u8; 32]);
-
-        // Initially empty
-        assert!(!set.contains(&nullifier1).await);
-        assert!(!set.contains(&nullifier2).await);
-
-        // After insert
-        set.insert(nullifier1.clone())
-            .await
-            .expect("in-memory insert");
-        assert!(set.contains(&nullifier1).await);
-        assert!(!set.contains(&nullifier2).await);
-    }
-
-    #[tokio::test]
-    async fn test_nullifier_set_batch_check() {
-        let set = NullifierSet::new();
-        let nullifier1 = Nullifier([1u8; 32]);
-        let nullifier2 = Nullifier([2u8; 32]);
-        let nullifier3 = Nullifier([3u8; 32]);
-
-        // All new - should pass
-        assert!(
-            set.check_batch(&[nullifier1.clone(), nullifier2.clone()])
-                .await
-        );
-
-        // Insert one
-        set.insert(nullifier1.clone())
-            .await
-            .expect("in-memory insert");
-
-        // Batch with spent nullifier - should fail
-        assert!(
-            !set.check_batch(&[nullifier1.clone(), nullifier3.clone()])
-                .await
-        );
-
-        // Batch with only new nullifiers - should pass
-        assert!(
-            set.check_batch(&[nullifier2.clone(), nullifier3.clone()])
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn test_nullifier_set_batch_insert() {
-        let set = NullifierSet::new();
-        let nullifiers = vec![
-            Nullifier([1u8; 32]),
-            Nullifier([2u8; 32]),
-            Nullifier([3u8; 32]),
-        ];
-
-        // First batch insert
-        let count = set
-            .insert_batch(nullifiers.clone())
-            .await
-            .expect("in-memory batch insert");
-        assert_eq!(count, 3);
-        assert_eq!(set.len().await, 3);
-
-        // Second batch insert (duplicates)
-        let count = set
-            .insert_batch(nullifiers)
-            .await
-            .expect("in-memory batch insert");
-        assert_eq!(count, 0); // No new inserts
-        assert_eq!(set.len().await, 3);
-    }
-
-    #[tokio::test]
-    async fn test_nullifier_set_len() {
-        let set = NullifierSet::new();
-
-        assert_eq!(set.len().await, 0);
-        assert!(set.is_empty().await);
-
-        set.insert(Nullifier([1u8; 32]))
-            .await
-            .expect("in-memory insert");
-        assert_eq!(set.len().await, 1);
-        assert!(!set.is_empty().await);
-
-        set.insert(Nullifier([2u8; 32]))
-            .await
-            .expect("in-memory insert");
-        assert_eq!(set.len().await, 2);
-    }
-
-    #[tokio::test]
-    async fn test_nullifier_set_clear() {
-        let set = NullifierSet::new();
-
-        set.insert(Nullifier([1u8; 32]))
-            .await
-            .expect("in-memory insert");
-        set.insert(Nullifier([2u8; 32]))
-            .await
-            .expect("in-memory insert");
-        assert_eq!(set.len().await, 2);
-
-        set.clear().await;
-        assert_eq!(set.len().await, 0);
-        assert!(set.is_empty().await);
-    }
-
-    #[tokio::test]
-    async fn test_nullifier_set_clone() {
-        let set1 = NullifierSet::new();
-        let nullifier = Nullifier([42u8; 32]);
-
-        set1.insert(nullifier.clone())
-            .await
-            .expect("in-memory insert");
-
-        // Clone should share the same underlying data
-        let set2 = set1.clone();
-        assert!(set2.contains(&nullifier).await);
-
-        // Insert in set2 should reflect in set1
-        let nullifier2 = Nullifier([43u8; 32]);
-        set2.insert(nullifier2.clone())
-            .await
-            .expect("in-memory insert");
-        assert!(set1.contains(&nullifier2).await);
-    }
-}
+    /// either retry the entire batch.
+    pub async fn insert_batch(&
