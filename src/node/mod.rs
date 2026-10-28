@@ -647,7 +647,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         return Ok(());
                     }
 
-                    let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
+                    let job = crate::compute::ComputeJob::with_id(
+                        job_id.clone(),
+                        wasm_code,
+                        input_data,
+                        limits,
+                    );
                     let actual_job_id = job.id.clone();
 
                     // Store coordinator for result reporting
@@ -780,6 +785,21 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received compute job result from {}: job_id={}, status={:?}",
                     source, job_id, status
                 );
+
+                // Authenticate sender against coordinator assignments if coordinator is active
+                if let Some(coordinator) = &self.compute_coordinator {
+                    let source_str = source.to_string();
+                    if !coordinator
+                        .verify_and_remove_assignment(&job_id, &source_str)
+                        .await
+                    {
+                        log::warn!(
+                            "Rejecting unauthenticated/unexpected ComputeJobResult for job {} from node {}",
+                            job_id, source
+                        );
+                        return Ok(());
+                    }
+                }
 
                 // Store result and update job status
                 let result = crate::compute::JobResult {
@@ -2023,45 +2043,54 @@ impl Node {
                     let _stats = executor_clone.get_stats();
 
                     // Check for completed jobs
-                    let coordinators = coordinators_clone.lock().await;
-                    for (job_id, coordinator_id) in coordinators.iter() {
-                        // Skip if already reported
-                        if reported_jobs.contains(job_id) {
-                            continue;
-                        }
+                    let mut completed_to_remove = Vec::new();
+                    {
+                        let coordinators = coordinators_clone.lock().await;
+                        for (job_id, coordinator_id) in coordinators.iter() {
+                            // Skip if already reported
+                            if reported_jobs.contains(job_id) {
+                                continue;
+                            }
 
-                        // Check if job has a result
-                        if let Some(result) = executor_clone.get_job_result(job_id) {
-                            // Job is complete, send result to coordinator
-                            info!(
-                                "Reporting job {} result to coordinator {}",
-                                job_id, coordinator_id
-                            );
+                            // Check if job has a result
+                            if let Some(result) = executor_clone.get_job_result(job_id) {
+                                // Job is complete, send result to coordinator
+                                info!(
+                                    "Reporting job {} result to coordinator {}",
+                                    job_id, coordinator_id
+                                );
 
-                            let message = Message::ComputeJobResult {
-                                job_id: result.job_id.clone(),
-                                status: result.status.clone(),
-                                output_data: result.output_data.clone(),
-                                execution_time_ms: result.execution_time_ms,
-                                memory_used_bytes: result.memory_used_bytes,
-                                instructions_executed: result.instructions_executed,
-                            };
+                                let message = Message::ComputeJobResult {
+                                    job_id: result.job_id.clone(),
+                                    status: result.status.clone(),
+                                    output_data: result.output_data.clone(),
+                                    execution_time_ms: result.execution_time_ms,
+                                    memory_used_bytes: result.memory_used_bytes,
+                                    instructions_executed: result.instructions_executed,
+                                };
 
-                            match network_clone
-                                .send_message(coordinator_id.clone(), message)
-                                .await
-                            {
-                                Ok(_) => {
-                                    info!("Successfully reported job {} result", job_id);
-                                    reported_jobs.insert(job_id.clone());
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to send job result: {}", e);
+                                match network_clone
+                                    .send_message(coordinator_id.clone(), message)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        info!("Successfully reported job {} result", job_id);
+                                        reported_jobs.insert(job_id.clone());
+                                        completed_to_remove.push(job_id.clone());
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to send job result: {}", e);
+                                    }
                                 }
                             }
                         }
                     }
-                    drop(coordinators);
+                    if !completed_to_remove.is_empty() {
+                        let mut coordinators = coordinators_clone.lock().await;
+                        for id in completed_to_remove {
+                            coordinators.remove(&id);
+                        }
+                    }
 
                     // Clean up old reported jobs
                     if reported_jobs.len() > 1000 {

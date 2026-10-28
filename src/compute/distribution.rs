@@ -276,6 +276,36 @@ impl JobCoordinator {
         Ok(())
     }
 
+    /// Verify that the given validator is assigned to the job, and remove the assignment upon completion.
+    /// Returns true if the validator matches the assignment, false otherwise.
+    pub async fn verify_and_remove_assignment(
+        &self,
+        job_id: &JobId,
+        validator_id: &ValidatorId,
+    ) -> bool {
+        let mut active = self.active_assignments.write().await;
+        if let Some(assignment) = active.get(job_id) {
+            if &assignment.validator_id == validator_id {
+                active.remove(job_id);
+                debug!("Verified and removed active assignment for job {}", job_id);
+                return true;
+            }
+            return false;
+        }
+
+        let mut pending = self.pending_assignments.write().await;
+        if let Some(assignment) = pending.get(job_id) {
+            if &assignment.validator_id == validator_id {
+                pending.remove(job_id);
+                debug!("Verified and removed pending assignment for job {}", job_id);
+                return true;
+            }
+            return false;
+        }
+
+        false
+    }
+
     /// Check for timed out jobs and reassign them
     pub async fn handle_timeouts(&self) -> Result<Vec<JobId>> {
         let mut reassigned_jobs = Vec::new();

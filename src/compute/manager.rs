@@ -182,7 +182,10 @@ impl JobManager {
         let jobs_to_assign: Vec<_> = pending.drain(..).collect();
         drop(pending); // Release lock
 
-        for job in jobs_to_assign {
+        let mut unassigned_jobs = Vec::new();
+        let mut job_iter = jobs_to_assign.into_iter();
+
+        while let Some(job) = job_iter.next() {
             if let Some(validator) = available_validators.first() {
                 let assignment = JobAssignment {
                     job_id: job.id.clone(),
@@ -223,12 +226,19 @@ impl JobManager {
                 available_validators
                     .sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
             } else {
-                // No available validators, put job back in queue
+                // No available validators, collect remaining jobs without dropping queue
                 warn!("No available validators for job {}", job.id);
-                let mut pending = self.pending_jobs.lock().unwrap();
-                pending.push(job);
+                unassigned_jobs.push(job);
+                unassigned_jobs.extend(job_iter);
                 break;
             }
+        }
+
+        if !unassigned_jobs.is_empty() {
+            let mut pending = self.pending_jobs.lock().unwrap();
+            let mut remaining = unassigned_jobs;
+            remaining.extend(pending.drain(..));
+            *pending = remaining;
         }
 
         Ok(assignments_made)
@@ -243,9 +253,18 @@ impl JobManager {
             job_id, result.status
         );
 
-        // Update validator active jobs
-        let assignments = self.assignments.lock().unwrap();
-        if let Some(assignment) = assignments.get(&job_id) {
+        // Deduplication: reject duplicate result submission
+        let mut results = self.results.lock().unwrap();
+        if results.contains_key(&job_id) {
+            return Err(anyhow::anyhow!(
+                "Duplicate result submission for job {}",
+                job_id
+            ));
+        }
+
+        // Update validator active jobs and remove assignment
+        let mut assignments = self.assignments.lock().unwrap();
+        if let Some(assignment) = assignments.remove(&job_id) {
             let mut validators = self.validators.lock().unwrap();
             if let Some(validator) = validators.get_mut(&assignment.validator_id) {
                 validator.active_jobs = validator.active_jobs.saturating_sub(1);
@@ -254,7 +273,6 @@ impl JobManager {
         drop(assignments);
 
         // Store result
-        let mut results = self.results.lock().unwrap();
         results.insert(job_id, result);
 
         Ok(())
@@ -483,5 +501,65 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_assign_jobs_does_not_drop_queue_when_capacity_exceeded() {
+        let manager = JobManager::new();
+
+        // Register validator with max_concurrent_jobs = 2
+        let capacity = ValidatorCapacity::new("validator1".to_string(), 4, 8192, 2);
+        manager.register_validator(capacity).unwrap();
+
+        // Submit 4 jobs
+        for i in 0..4 {
+            let job = ComputeJob::new(vec![i], vec![], ResourceLimits::default());
+            manager.submit_job(job).unwrap();
+        }
+
+        // Assign jobs: only 2 should be assigned, 2 must remain pending in queue
+        let assignments = manager.assign_jobs().unwrap();
+        assert_eq!(assignments.len(), 2);
+
+        let stats = manager.get_stats();
+        assert_eq!(stats.active_jobs, 2);
+        assert_eq!(
+            stats.pending_jobs, 2,
+            "Pending queue dropped remaining jobs on capacity limit!"
+        );
+    }
+
+    #[test]
+    fn test_submit_result_deduplication_and_assignment_cleanup() {
+        let manager = JobManager::new();
+
+        let capacity = ValidatorCapacity::new("validator1".to_string(), 4, 8192, 2);
+        manager.register_validator(capacity).unwrap();
+
+        let job = ComputeJob::new(vec![1, 2, 3], vec![], ResourceLimits::default());
+        let job_id = job.id.clone();
+        manager.submit_job(job).unwrap();
+
+        let assignments = manager.assign_jobs().unwrap();
+        assert_eq!(assignments.len(), 1);
+
+        // Submit valid result
+        let result = JobResult::success(job_id.clone(), vec![42], 10, 1024, 100);
+        assert!(manager.submit_result(result.clone()).is_ok());
+
+        // Assignment should be removed
+        {
+            let assignments = manager.assignments.lock().unwrap();
+            assert!(
+                !assignments.contains_key(&job_id),
+                "Assignment was not removed upon completion"
+            );
+        }
+
+        // Submitting duplicate result must fail
+        assert!(
+            manager.submit_result(result).is_err(),
+            "Duplicate result submission was not rejected"
+        );
     }
 }

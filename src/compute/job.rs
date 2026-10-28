@@ -114,9 +114,13 @@ impl Default for ResourceLimits {
 }
 
 impl ComputeJob {
-    /// Create a new compute job
-    pub fn new(wasm_code: Vec<u8>, input_data: Vec<u8>, limits: ResourceLimits) -> Self {
-        let id = uuid::Uuid::new_v4().to_string();
+    /// Create a new compute job with a specified ID (preserving coordinator assignment)
+    pub fn with_id(
+        id: JobId,
+        wasm_code: Vec<u8>,
+        input_data: Vec<u8>,
+        limits: ResourceLimits,
+    ) -> Self {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -134,6 +138,12 @@ impl ComputeJob {
             completed_at: None,
             assigned_to: None,
         }
+    }
+
+    /// Create a new compute job
+    pub fn new(wasm_code: Vec<u8>, input_data: Vec<u8>, limits: ResourceLimits) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        Self::with_id(id, wasm_code, input_data, limits)
     }
 
     /// Mark job as assigned to a validator
@@ -262,6 +272,18 @@ mod tests {
         assert_eq!(result.status, JobStatus::Completed);
         assert!(result.output_data.is_some());
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_compute_job_with_id_preserves_id() {
+        let custom_id = "coordinator-assigned-1079".to_string();
+        let job = ComputeJob::with_id(
+            custom_id.clone(),
+            vec![1, 2],
+            vec![3, 4],
+            ResourceLimits::default(),
+        );
+        assert_eq!(job.id, custom_id);
     }
 
     #[test]
