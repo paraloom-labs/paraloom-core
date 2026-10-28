@@ -108,6 +108,15 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:set_min_token_stake")[..8]`. Governance-signed update
+    /// to the minimum token stake required for dual-stake validator registration.
+    pub const SET_MIN_TOKEN_STAKE: [u8; 8] = [13, 125, 2, 121, 78, 212, 10, 46];
+    /// `sha256("global:init_asset_vault")[..8]`. Upgrade-authority-gated initialization
+    /// of per-mint SPL asset vault, authority, and accounting config (#779).
+    pub const INIT_ASSET_VAULT: [u8; 8] = [178, 96, 79, 76, 25, 81, 167, 109];
+    /// `sha256("global:set_asset_deposit_cap")[..8]`. Upgrade-authority-signed adjustment
+    /// of the TVL deposit cap for a specific shielded SPL mint (#779).
+    pub const SET_ASSET_DEPOSIT_CAP: [u8; 8] = [209, 129, 220, 235, 236, 193, 22, 135];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
@@ -374,6 +383,84 @@ pub fn create_register_validator_instruction(
 /// stake_mint, stake_token_vault, stake_vault_authority, program_data,
 /// token_program, system_program, rent. `token_program` must be the program that
 /// owns `stake_mint` (classic SPL Token or Token-2022).
+/// Build a `set_min_token_stake` instruction — update the minimum token stake
+/// required for validator registration. Signed by registry authority.
+pub fn create_set_min_token_stake_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    new_min: u64,
+) -> Instruction {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    let mut instruction_data = discriminators::SET_MIN_TOKEN_STAKE.to_vec();
+    instruction_data.extend_from_slice(&new_min.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new_readonly(*authority, true),
+        ],
+        data: instruction_data,
+    }
+}
+
+/// Build an `init_asset_vault` instruction — creates per-mint TokenAccount vault,
+/// asset_vault_authority PDA, and AssetConfig accounting PDA (#779).
+/// Upgrade-authority signed.
+pub fn create_init_asset_vault_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let (asset_vault, _) = derive_asset_vault(program_id, mint);
+    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
+    let (asset_config, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(asset_vault, false),
+            AccountMeta::new_readonly(asset_vault_authority, false),
+            AccountMeta::new(asset_config, false),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
+        ],
+        data: discriminators::INIT_ASSET_VAULT.to_vec(),
+    }
+}
+
+/// Build a `set_asset_deposit_cap` instruction — adjusts TVL ceiling for an SPL asset vault (#779).
+/// Upgrade-authority signed.
+pub fn create_set_asset_deposit_cap_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    new_cap: u64,
+) -> Instruction {
+    let (asset_config, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    let mut instruction_data = discriminators::SET_ASSET_DEPOSIT_CAP.to_vec();
+    instruction_data.extend_from_slice(&new_cap.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(asset_config, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+        ],
+        data: instruction_data,
+    }
+}
+
 pub fn create_init_stake_token_vault_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -908,6 +995,11 @@ pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
 }
 
+/// Derive asset config PDA for a given SPL mint (#779)
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
+}
+
 /// Derive the canonical Associated Token Account address for `owner` + `mint`,
 /// mirroring `spl_associated_token_account::get_associated_token_address`
 /// without the dependency: it is the PDA of
@@ -932,7 +1024,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_derive_asset_config() {
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let (config1, bump1) = derive_asset_config(&program_id, &mint);
+        let (config2, bump2) = derive_asset_config(&program_id, &mint);
+        assert_eq!(config1, config2);
+        assert_eq!(bump1, bump2);
+
+        let mint2 = Pubkey::new_unique();
+        let (config3, _) = derive_asset_config(&program_id, &mint2);
+        assert_ne!(config1, config3);
+    }
+
+    #[test]
+    fn test_create_set_min_token_stake_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let new_min = 50_000_000_000u64;
+
+        let ix = create_set_min_token_stake_instruction(&program_id, &authority, new_min);
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(ix.accounts[0].is_writable, true);
+        assert_eq!(ix.accounts[0].is_signer, false);
+        assert_eq!(ix.accounts[1].pubkey, authority);
+        assert_eq!(ix.accounts[1].is_signer, true);
+        assert_eq!(&ix.data[..8], &discriminators::SET_MIN_TOKEN_STAKE);
+        assert_eq!(&ix.data[8..], &new_min.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_init_asset_vault_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_init_asset_vault_instruction(&program_id, &authority, &mint, &token_program);
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(ix.accounts[0].pubkey, authority);
+        assert_eq!(ix.accounts[0].is_signer, true);
+        assert_eq!(ix.accounts[1].pubkey, mint);
+        assert_eq!(ix.accounts[2].pubkey, derive_asset_vault(&program_id, &mint).0);
+        assert_eq!(ix.accounts[3].pubkey, derive_asset_vault_authority(&program_id).0);
+        assert_eq!(ix.accounts[4].pubkey, derive_asset_config(&program_id, &mint).0);
+        assert_eq!(ix.accounts[4].is_writable, true);
+        assert_eq!(ix.accounts[5].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert_eq!(ix.accounts[7].pubkey, SYSTEM_PROGRAM_ID);
+        assert_eq!(ix.accounts[8].pubkey, RENT_SYSVAR_ID);
+        assert_eq!(ix.data, discriminators::INIT_ASSET_VAULT.to_vec());
+    }
+
+    #[test]
+    fn test_create_set_asset_deposit_cap_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let new_cap = 1_000_000_000_000u64;
+
+        let ix = create_set_asset_deposit_cap_instruction(&program_id, &authority, &mint, new_cap);
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(ix.accounts[0].pubkey, derive_asset_config(&program_id, &mint).0);
+        assert_eq!(ix.accounts[0].is_writable, true);
+        assert_eq!(ix.accounts[1].pubkey, authority);
+        assert_eq!(ix.accounts[1].is_signer, true);
+        assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(&ix.data[..8], &discriminators::SET_ASSET_DEPOSIT_CAP);
+        assert_eq!(&ix.data[8..], &new_cap.to_le_bytes());
+    }
+
+    #[test]
     fn test_derive_pdas() {
+
         let program_id = Pubkey::new_unique();
         let (state, _) = derive_bridge_state(&program_id);
         let (vault, _) = derive_bridge_vault(&program_id);

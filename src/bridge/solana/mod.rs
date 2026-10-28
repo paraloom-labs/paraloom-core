@@ -17,6 +17,8 @@ pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,
     create_deposit_note_instruction, create_init_stake_token_vault_instruction,
     create_initialize_instruction, create_initialize_merkle_tree_instruction,
+    create_init_asset_vault_instruction, create_set_asset_deposit_cap_instruction,
+    create_set_min_token_stake_instruction, derive_asset_config,
     create_initialize_validator_registry_instruction, create_migrate_bridge_state_instruction,
     create_migrate_validator_account_instruction, create_pause_instruction,
     create_register_validator_instruction, create_reset_validator_registry_instruction,
