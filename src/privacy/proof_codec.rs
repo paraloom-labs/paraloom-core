@@ -21,8 +21,16 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes in proof: read {} of {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,8 +44,16 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes in verifying key: read {} of {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(vk)
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
@@ -56,8 +72,16 @@ pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
 /// Convert bytes to field element
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(format!(
+            "trailing bytes in field element: read {} of {}",
+            cursor.position(),
+            bytes.len()
+        )));
+    }
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -358,5 +382,67 @@ mod tests {
                 assert_eq!(body.len(), suite.body_len());
             }
         }
+    }
+
+    #[test]
+    fn test_bytes_to_field_trailing_bytes_rejected() {
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0x1234);
+        let field = Fr::rand(&mut rng);
+        let mut bytes = field_to_bytes(&field).to_vec();
+        bytes.push(0x42);
+        assert!(
+            bytes_to_field(&bytes).is_err(),
+            "trailing bytes in field must error"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_vk_trailing_bytes_rejected() {
+        use crate::privacy::circuits::{DepositCircuitV2, Groth16ProofSystem};
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0x1234);
+        let circuit = DepositCircuitV2::new();
+        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+        let mut bytes = serialize_vk(&vk).unwrap();
+        bytes.push(0xAA);
+        assert!(
+            deserialize_vk(&bytes).is_err(),
+            "trailing bytes in vk must error"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_proof_trailing_bytes_rejected() {
+        use crate::privacy::circuits::{DepositCircuitV2, Groth16ProofSystem};
+        use crate::privacy::poseidon::poseidon_commit_spend;
+        use ark_ff::{BigInteger, PrimeField};
+
+        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0x1234);
+        let circuit = DepositCircuitV2::new();
+        let (pk, _) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+
+        let value = 100u64;
+        let blinding = [2u8; 32];
+        let recipient_pubkey = [3u8; 32];
+        let asset = [0u8; 32];
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&recipient_pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+        let bytes = commitment_fr.into_bigint().to_bytes_le();
+        let mut commitment = [0u8; 32];
+        let len = bytes.len().min(32);
+        commitment[..len].copy_from_slice(&bytes[..len]);
+
+        let circuit1 =
+            DepositCircuitV2::with_witness(commitment, value, blinding, recipient_pubkey, asset);
+        let proof = Groth16ProofSystem::prove(&pk, circuit1, &mut rng).unwrap();
+        let mut proof_bytes = serialize_proof(&proof).unwrap();
+        proof_bytes.push(0x55);
+        assert!(
+            deserialize_proof(&proof_bytes).is_err(),
+            "trailing bytes in proof must error"
+        );
     }
 }
