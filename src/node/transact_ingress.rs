@@ -158,6 +158,12 @@ async fn submit_handler(
     // token is configured, before doing any work.
     check_bearer(&headers, &token)?;
 
+    // Maximum proof length matching on-chain limit (programs/paraloom/src/lib.rs:308)
+    const MAX_PROOF_LEN: usize = 256;
+    // Withdrawal fee rate in bps matching on-chain limit (programs/paraloom/src/lib.rs:428)
+    const WITHDRAWAL_FEE_BPS: u64 = 25;
+    const MAX_WITHDRAWAL_EXT_AMOUNT: u64 = u64::MAX / WITHDRAWAL_FEE_BPS;
+
     // Deposits (`ext_amount > 0`) go through `deposit_note`, never this
     // ingress; the on-chain program rejects them anyway, so fail fast at the
     // door instead of burning a consensus round on a doomed request.
@@ -167,13 +173,33 @@ async fn submit_handler(
             "ext_amount must be <= 0 (deposits go through deposit_note)".to_string(),
         ));
     }
+    if req.ext_amount < 0 && req.ext_amount.unsigned_abs() > MAX_WITHDRAWAL_EXT_AMOUNT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("withdrawal ext_amount exceeds maximum allowed limit of {MAX_WITHDRAWAL_EXT_AMOUNT}"),
+        ));
+    }
 
     let recipient = parse_hex32("recipient", &req.recipient)?;
+    if req.ext_amount < 0 && recipient == [0u8; 32] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "withdrawal recipient must not be zero address".to_string(),
+        ));
+    }
+
     let mint = req
         .mint
         .as_ref()
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
+    if mint == Some([0u8; 32]) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mint must not be zero address".to_string(),
+        ));
+    }
+
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
@@ -185,6 +211,12 @@ async fn submit_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "proof must not be empty".to_string(),
+        ));
+    }
+    if proof.len() > MAX_PROOF_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("proof exceeds maximum length of {MAX_PROOF_LEN} bytes"),
         ));
     }
 
