@@ -178,6 +178,40 @@ async fn submit_handler(
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
 
+    // Duplicate nullifiers are rejected by the on-chain settlement program
+    // (BridgeError::DuplicateNullifier). Reject early before initiating consensus.
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers must be distinct".to_string(),
+        ));
+    }
+
+    // Canonical scalar field check (< BN254 Fr modulus) ensures doomed proofs
+    // do not trigger unnecessary validator voting cycles.
+    if !crate::privacy::proof::is_canonical_le(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "root: non-canonical field element encoding".to_string(),
+        ));
+    }
+    for (i, n) in nullifiers.iter().enumerate() {
+        if !crate::privacy::proof::is_canonical_le(n) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("nullifiers[{i}]: non-canonical field element encoding"),
+            ));
+        }
+    }
+    for (i, c) in output_commitments.iter().enumerate() {
+        if !crate::privacy::proof::is_canonical_le(c) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("output_commitments[{i}]: non-canonical field element encoding"),
+            ));
+        }
+    }
+
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
     let proof = hex::decode(proof_hex)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("proof: invalid hex: {e}")))?;
@@ -557,5 +591,52 @@ mod tests {
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_nullifiers_are_rejected() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let same_nullifier = "11".repeat(32);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            same_nullifier,
+            same_nullifier,
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let err_msg = String::from_utf8_lossy(&body_bytes);
+        assert!(err_msg.contains("nullifiers must be distinct"));
+    }
+
+    #[tokio::test]
+    async fn non_canonical_scalar_field_is_rejected() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // Exceeds BN254 scalar field modulus in 32 bytes little-endian
+        let non_canonical = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            non_canonical,
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let err_msg = String::from_utf8_lossy(&body_bytes);
+        assert!(err_msg.contains("non-canonical field element encoding"));
     }
 }
