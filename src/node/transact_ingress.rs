@@ -98,6 +98,18 @@ impl TransactIngress for crate::node::Node {
     }
 }
 
+/// Maximum serialized proof length accepted into consensus. Parity with
+/// `programs/paraloom/src/lib.rs:MAX_PROOF_LEN` (256 bytes).
+pub const MAX_PROOF_LEN: usize = 256;
+
+/// Withdrawal fee in basis points (25 bps = 0.25%). Parity with
+/// `programs/paraloom/src/lib.rs:WITHDRAWAL_FEE_BPS`.
+pub const WITHDRAWAL_FEE_BPS: u64 = 25;
+
+/// Maximum gross withdrawal amount whose fee calculation `gross * 25` fits
+/// within `u64::MAX`. Larger withdrawal magnitudes overflow on-chain and abort.
+pub const MAX_WITHDRAWAL_EXT_AMOUNT: u64 = u64::MAX / WITHDRAWAL_FEE_BPS;
+
 #[derive(Deserialize)]
 struct SubmitRequest {
     recipient: String,
@@ -167,16 +179,77 @@ async fn submit_handler(
             "ext_amount must be <= 0 (deposits go through deposit_note)".to_string(),
         ));
     }
+    if req.ext_amount < 0 && req.ext_amount.unsigned_abs() > MAX_WITHDRAWAL_EXT_AMOUNT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "ext_amount withdrawal magnitude exceeds maximum {}",
+                MAX_WITHDRAWAL_EXT_AMOUNT
+            ),
+        ));
+    }
 
     let recipient = parse_hex32("recipient", &req.recipient)?;
+    if req.ext_amount < 0 && recipient == [0u8; 32] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "recipient must be non-zero for withdrawals".to_string(),
+        ));
+    }
+
     let mint = req
         .mint
         .as_ref()
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
+    if mint == Some([0u8; 32]) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mint must be non-zero when specified (omit for native SOL)".to_string(),
+        ));
+    }
+
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers must be distinct".to_string(),
+        ));
+    }
+    if !crate::privacy::proof::is_canonical_le(&nullifiers[0]) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers[0] must be a canonical BN254 field element".to_string(),
+        ));
+    }
+    if !crate::privacy::proof::is_canonical_le(&nullifiers[1]) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers[1] must be a canonical BN254 field element".to_string(),
+        ));
+    }
+
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
+    if !crate::privacy::proof::is_canonical_le(&output_commitments[0]) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "output_commitments[0] must be a canonical BN254 field element".to_string(),
+        ));
+    }
+    if !crate::privacy::proof::is_canonical_le(&output_commitments[1]) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "output_commitments[1] must be a canonical BN254 field element".to_string(),
+        ));
+    }
+
     let root = parse_hex32("root", &req.root)?;
+    if !crate::privacy::proof::is_canonical_le(&root) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "root must be a canonical BN254 field element".to_string(),
+        ));
+    }
 
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
     let proof = hex::decode(proof_hex)
@@ -185,6 +258,16 @@ async fn submit_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "proof must not be empty".to_string(),
+        ));
+    }
+    if proof.len() > MAX_PROOF_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "proof length {} exceeds maximum {}",
+                proof.len(),
+                MAX_PROOF_LEN
+            ),
         ));
     }
 
@@ -360,9 +443,9 @@ mod tests {
             "66".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "13".repeat(32),
+            "14".repeat(32),
+            "15".repeat(32),
             ext_amount,
             "01".repeat(192),
             v1_ciphertext_hex(0xab),
@@ -395,8 +478,8 @@ mod tests {
         assert_eq!(id, seen.canonical_id());
         assert_eq!(seen.recipient, [0x66u8; 32]);
         assert_eq!(seen.nullifiers, [[0x11u8; 32], [0x22u8; 32]]);
-        assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);
-        assert_eq!(seen.root, [0x55u8; 32]);
+        assert_eq!(seen.output_commitments, [[0x13u8; 32], [0x14u8; 32]]);
+        assert_eq!(seen.root, [0x15u8; 32]);
         assert_eq!(seen.ext_amount, 0);
         assert_eq!(seen.proof, vec![0x01u8; 192]);
     }
@@ -430,9 +513,9 @@ mod tests {
             r#"{{"recipient":"{}","nullifiers":["{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
             "66".repeat(32),
             "11".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
+            "13".repeat(32),
+            "14".repeat(32),
+            "15".repeat(32),
             "01".repeat(192),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
@@ -449,11 +532,11 @@ mod tests {
             "66".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
-            "33".repeat(32),
-            "44".repeat(32),
-            "55".repeat(32),
-            "ab".repeat(88),
-            "cd".repeat(88)
+            "13".repeat(32),
+            "14".repeat(32),
+            "15".repeat(32),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -556,6 +639,103 @@ mod tests {
         let app = router(Arc::new(StubIngress { accept: true }), None);
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let oversized = "01".repeat(MAX_PROOF_LEN + 1);
+        let body = well_formed_body().replace(&"01".repeat(192), &oversized);
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_fee_overflow_amount_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let resp = app
+            .clone()
+            .oneshot(post_json(&body_with_ext_amount(i64::MIN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let over_limit = -(MAX_WITHDRAWAL_EXT_AMOUNT as i64) - 1;
+        let resp2 = app
+            .oneshot(post_json(&body_with_ext_amount(over_limit)))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn zero_recipient_for_withdrawal_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = body_with_ext_amount(-100_000).replace(&"66".repeat(32), &"00".repeat(32));
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn zero_recipient_for_shielded_transfer_is_accepted() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = body_with_ext_amount(0).replace(&"66".repeat(32), &"00".repeat(32));
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn zero_mint_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(
+            r#""ext_amount":0,"#,
+            &format!(r#""mint":"{}","ext_amount":0,"#, "00".repeat(32)),
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_nullifiers_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = well_formed_body().replace(&"22".repeat(32), &"11".repeat(32));
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_canonical_field_element_is_400() {
+        let non_canonical = "ff".repeat(32);
+
+        // Non-canonical nullifier 0
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body_nf0 = well_formed_body().replace(&"11".repeat(32), &non_canonical);
+        let resp = app.oneshot(post_json(&body_nf0)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Non-canonical nullifier 1
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body_nf1 = well_formed_body().replace(&"22".repeat(32), &non_canonical);
+        let resp = app.oneshot(post_json(&body_nf1)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Non-canonical output commitment 0
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body_oc0 = well_formed_body().replace(&"13".repeat(32), &non_canonical);
+        let resp = app.oneshot(post_json(&body_oc0)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Non-canonical output commitment 1
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body_oc1 = well_formed_body().replace(&"14".repeat(32), &non_canonical);
+        let resp = app.oneshot(post_json(&body_oc1)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Non-canonical root
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body_root = well_formed_body().replace(&"15".repeat(32), &non_canonical);
+        let resp = app.oneshot(post_json(&body_root)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
