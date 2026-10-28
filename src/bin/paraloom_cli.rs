@@ -317,6 +317,25 @@ enum ValidatorCommands {
         program_id: Option<String>,
     },
 
+    /// Administratively deactivate a validator on-chain (registry authority only)
+    Deactivate {
+        /// Validator wallet public key to deactivate
+        #[arg(long)]
+        validator_address: String,
+
+        /// Registry authority keypair (also via BRIDGE_AUTHORITY_KEYPAIR_PATH)
+        #[arg(long)]
+        authority: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Withdraw stake that has finished unbonding (after unregister)
     WithdrawUnbonded {
         /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
@@ -1573,29 +1592,38 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-                let (validator_account_pda, _bump) = Pubkey::find_program_address(
-                    &[b"validator", validator.pubkey().as_ref()],
-                    &program_id,
-                );
+                let (validator_account_pda, _bump) =
+                    derive_validator_account(&program_id, &validator.pubkey());
                 let (validator_registry_pda, _registry_bump) =
-                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+                    derive_validator_registry(&program_id);
 
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Anchor discriminator for `unregister_validator` (no args).
-                let discriminator: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
-                let data = discriminator.to_vec();
+                // Pre-flight check: ensure validator account exists and is currently active
+                let account_data = client
+                    .get_account_data(&validator_account_pda)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Validator account not found on-chain: {e}. Is this validator registered? \
+                             Run `paraloom validator register` first."
+                        )
+                    })?;
 
-                let ix = solana_sdk::instruction::Instruction {
-                    program_id,
-                    accounts: vec![
-                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
-                    ],
-                    data,
-                };
+                if let Some((_, stake, _, _, is_active)) = decode_validator_account(&account_data) {
+                    if !is_active {
+                        anyhow::bail!(
+                            "Validator is already inactive/unregistered. Stake is in unbonding period \
+                             (or deactivated). Run `paraloom validator withdraw-unbonded` once the unbonding \
+                             window has elapsed."
+                        );
+                    }
+                    if stake <= 0.0 {
+                        log::warn!("Validator has zero active stake lamports");
+                    }
+                }
+
+                let ix = create_unregister_validator_instruction(&program_id, &validator.pubkey());
 
                 let blockhash = client
                     .get_latest_blockhash()
@@ -1624,6 +1652,100 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
             #[cfg(not(feature = "solana-bridge"))]
             {
+                let _ = (&keypair, &rpc_url, &program_id);
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
+
+            Ok(())
+        }
+
+        ValidatorCommands::Deactivate {
+            validator_address,
+            authority,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Deactivating validator on-chain (admin)...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let authority_path = authority
+                    .or_else(|| {
+                        std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Authority keypair not specified. Use --authority or BRIDGE_AUTHORITY_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Authority Keypair: {}\n", authority_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+                let target_validator = Pubkey::from_str(&validator_address)
+                    .context("Invalid target validator address")?;
+
+                let authority_keypair =
+                    load_keypair_from_file(authority_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load authority keypair")?;
+                println!("Authority Address: {}", authority_keypair.pubkey());
+                println!("Target Validator:  {}\n", target_validator);
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let (validator_account_pda, _) =
+                    derive_validator_account(&program_id, &target_validator);
+                let (validator_registry_pda, _) = derive_validator_registry(&program_id);
+
+                println!("Validator Account PDA: {}", validator_account_pda);
+                println!("Validator Registry PDA: {}\n", validator_registry_pda);
+
+                let ix = create_deactivate_validator_instruction(
+                    &program_id,
+                    &authority_keypair.pubkey(),
+                    &target_validator,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to build deactivate instruction: {e}"))?;
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&authority_keypair.pubkey()),
+                    &[&authority_keypair],
+                    blockhash,
+                );
+
+                println!("Deactivating validator...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Validator deactivated!");
+                println!("  Transaction:      {}", signature);
+                println!("  Target Validator: {}", target_validator);
+                println!("  Authority:        {}", authority_keypair.pubkey());
+                println!("  Stake routed to unbonding queue.");
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                let _ = (&validator_address, &authority, &rpc_url, &program_id);
                 anyhow::bail!(
                     "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
                 );
