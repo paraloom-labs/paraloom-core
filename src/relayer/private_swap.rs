@@ -84,6 +84,17 @@ pub enum RelayerError {
     #[error("on-chain submission failed: {0}")]
     SubmissionFailed(String),
 
+    /// The re-deposit leg failed after the swap succeeded. The swapped funds
+    /// sit at the ephemeral address, whose keypair bytes are preserved here
+    /// so the user or recovery pipeline can reclaim or retry re-shielding.
+    #[error("re-deposit leg failed after successful swap: {reason}")]
+    DepositFailed {
+        fresh_keypair_bytes: Vec<u8>,
+        fresh_address: [u8; 32],
+        gross_out_amount: u64,
+        reason: String,
+    },
+
     /// The swap's realized output fell below the caller's stated minimum
     /// (`min_out_amount`). Checked the instant the swap leg returns, before any
     /// fee accounting or re-deposit/delivery, so a bad fill aborts the swap
@@ -488,38 +499,49 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
     /// swapped token to the unlinkable fresh address without re-shielding it.
     ///
     /// [`execute_swap_out`]: Self::execute_swap_out
-    pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
-        // A brand-new keypair per swap — nothing on-chain links it to the user.
-        // This is the relayer-layer expression of the link-severing property
-        // that the withdrawal nullifier enforces on-chain.
-        let ephemeral = Keypair::new();
+    /// Execute one private swap end to end with a caller-supplied ephemeral keypair.
+    ///
+    /// Useful for non-custodial callers and recovery pipelines that generate and
+    /// persist the keypair in local storage before initiating the swap.
+    pub async fn execute_with_ephemeral(
+        &self,
+        request: PrivateSwapRequest,
+        ephemeral: &Keypair,
+    ) -> Result<PrivateSwapResult> {
         let fresh_address = ephemeral.pubkey().to_bytes();
         let out_leg = WithdrawLeg::for_asset(request.asset_out);
 
         let (withdraw_leg, gross_out_amount) =
-            self.withdraw_then_swap(&request, &ephemeral).await?;
+            self.withdraw_then_swap(&request, ephemeral).await?;
 
-        // Step 3: the swap output is ALREADY net of the relayer's fee — it is
-        // realized inside the route by the swap provider (Jupiter's
-        // `platformFeeBps`, credited to the relayer's fee account). The
-        // orchestrator does NOT take a second cut here; applying `fee_bps` again
-        // double-charged the user (audit). `request.fee_bps` is the declared fee
-        // the provider is configured to realize, validated for bounds above.
         let relayer_fee = 0u64;
         let net_out_amount = gross_out_amount;
 
         // Step 4: re-deposit the net output into the shielded pool to the
         // user's new recipient, producing a fresh `asset_out` note.
-        let deposit_leg = self
+        // If re-deposit fails, preserve the ephemeral keypair bytes in DepositFailed
+        // to prevent irreversible stranding of the swapped tokens.
+        let deposit_leg = match self
             .submitter
             .submit_deposit_from_fresh(
                 out_leg,
                 net_out_amount,
-                &ephemeral,
+                ephemeral,
                 request.reshield_recipient.clone(),
                 request.reshield_randomness,
             )
-            .await?;
+            .await
+        {
+            Ok(leg) => leg,
+            Err(e) => {
+                return Err(RelayerError::DepositFailed {
+                    fresh_keypair_bytes: ephemeral.to_bytes().to_vec(),
+                    fresh_address,
+                    gross_out_amount,
+                    reason: e.to_string(),
+                });
+            }
+        };
 
         let output_note = Note::new(
             request.reshield_recipient,
@@ -537,6 +559,14 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
             fresh_address,
             output_note,
         })
+    }
+
+    pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
+        // A brand-new keypair per swap — nothing on-chain links it to the user.
+        // This is the relayer-layer expression of the link-severing property
+        // that the withdrawal nullifier enforces on-chain.
+        let ephemeral = Keypair::new();
+        self.execute_with_ephemeral(request, &ephemeral).await
     }
 
     /// Execute the swap-out half of a private swap: withdraw the spent note to a
@@ -577,6 +607,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
 #[derive(Default)]
 pub struct MockSubmitter {
     legs: std::sync::Mutex<Vec<SubmittedLeg>>,
+    pub fail_deposit: std::sync::atomic::AtomicBool,
 }
 
 impl MockSubmitter {
@@ -640,6 +671,52 @@ impl Submitter for MockSubmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn deposit_failure_preserves_ephemeral_keypair_for_recovery() {
+        let submitter = MockSubmitter::new();
+        submitter.fail_deposit.store(true, std::sync::atomic::Ordering::Relaxed);
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), submitter);
+
+        let note = native_note(1_000_000);
+        let req = request(note, NATIVE_SOL_ASSET, 0);
+
+        let err = relayer.execute(req).await.unwrap_err();
+        match err {
+            RelayerError::DepositFailed {
+                fresh_keypair_bytes,
+                fresh_address,
+                gross_out_amount,
+                reason,
+            } => {
+                assert_eq!(reason, "on-chain submission failed: simulated deposit RPC failure");
+                assert!(gross_out_amount > 0);
+                let recovered = Keypair::from_bytes(&fresh_keypair_bytes).unwrap();
+                assert_eq!(recovered.pubkey().to_bytes(), fresh_address);
+            }
+            other => panic!("expected DepositFailed, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_ephemeral_uses_provided_keypair() {
+        let submitter = MockSubmitter::new();
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), submitter);
+
+        let custom_ephemeral = Keypair::new();
+        let expected_fresh = custom_ephemeral.pubkey().to_bytes();
+
+        let note = native_note(1_000_000);
+        let req = request(note, NATIVE_SOL_ASSET, 0);
+
+        let result = relayer
+            .execute_with_ephemeral(req, &custom_ephemeral)
+            .await
+            .unwrap();
+
+        assert_eq!(result.fresh_address, expected_fresh);
+        assert_eq!(result.withdraw_leg.fresh_address, expected_fresh);
+        assert_eq!(result.deposit_leg.fresh_address, expected_fresh);
+    }
 
     fn native_note(amount: u64) -> Note {
         Note::new_native(ShieldedAddress::from_bytes([7u8; 32]), amount, [3u8; 32])
