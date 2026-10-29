@@ -49,9 +49,23 @@ impl R1CSToQAP for CircomReduction {
         num_constraints: usize,
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
+        if matrices.a.len() != num_constraints
+            || matrices.b.len() != num_constraints
+            || matrices.c.len() != num_constraints
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+        let required_vars = num_inputs
+            .checked_add(matrices.num_witness_variables)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        if full_assignment.len() < required_vars {
+            return Err(SynthesisError::AssignmentMissing);
+        }
         let zero = F::zero();
-        let domain =
-            D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let total_size = num_constraints
+            .checked_add(num_inputs)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain = D::new(total_size).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_size = domain.size();
 
         let mut a = vec![zero; domain_size];

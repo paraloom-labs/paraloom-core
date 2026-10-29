@@ -72,8 +72,25 @@ fn section(out: &mut impl Write, kind: u32, body: &[u8]) -> io::Result<()> {
 /// Write `matrices` to `out` as a circom `.r1cs` file.
 pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io::Result<()> {
     let num_instance = matrices.num_instance_variables;
+    if num_instance == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ConstraintMatrices must have at least 1 instance variable (constant-one wire)",
+        ));
+    }
+    if matrices.a.len() != matrices.num_constraints
+        || matrices.b.len() != matrices.num_constraints
+        || matrices.c.len() != matrices.num_constraints
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Matrix row count does not match num_constraints",
+        ));
+    }
     let num_witness = matrices.num_witness_variables;
-    let num_wires = num_instance + num_witness;
+    let num_wires = num_instance.checked_add(num_witness).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Wire count overflow")
+    })?;
 
     out.write_all(MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;

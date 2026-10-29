@@ -163,10 +163,17 @@ fn main() -> Res<()> {
         )
         .into());
     }
+    if zkey.num_public == 0 {
+        return Err("nPublic must be at least 1".into());
+    }
+    if zkey.num_vars < zkey.ic.len() {
+        return Err(format!("nVars ({}) is less than IC.len() ({})", zkey.num_vars, zkey.ic.len()).into());
+    }
     for (name, len) in [
         ("A", zkey.a.len()),
         ("B1", zkey.b1.len()),
         ("B2", zkey.b2.len()),
+        ("C", zkey.c.len()),
     ] {
         if len != zkey.num_vars {
             return Err(format!(
