@@ -2329,8 +2329,10 @@ impl Node {
     }
 
     /// Record the encrypted output notes of a transfer for recipient scanning
-    /// (#196), de-duplicated by `(commitment, ciphertext)` so the same transfer
-    /// seen via both ingress and gossip is stored once.
+    /// (#196), de-duplicated strictly by `output_commitment` (#1244) so the same
+    /// transfer seen via both ingress and gossip is stored once, and submissions
+    /// with mutated ciphertexts for existing commitments cannot flood the scan
+    /// buffer or FIFO-evict authentic recipient notes. First-seen commitment wins.
     async fn record_delivered_notes(
         &self,
         output_commitments: &[[u8; 32]; 2],
@@ -2358,9 +2360,7 @@ impl Node {
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            if store.iter().any(|d| d.output_commitment == note.output_commitment) {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3619,6 +3619,87 @@ mod tests {
         assert!(
             !json.contains("mint"),
             "absent mint must not appear: {json}"
+        );
+    }
+
+    // Mutated ciphertexts for an already recorded output commitment must be
+    // rejected (#1244). Deduplication must check output_commitment alone,
+    // so an attacker cannot flood the scan feed and evict authentic notes.
+    #[tokio::test]
+    async fn record_delivered_notes_deduplicates_by_commitment_rejecting_mutated_ciphertext() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let comm1 = [10u8; 32];
+        let comm2 = [11u8; 32];
+        let original_cipher1 = "orig1".repeat(20);
+        let original_cipher2 = "orig2".repeat(20);
+
+        // First delivery: authentic recipient notes
+        node.record_delivered_notes(
+            &[comm1, comm2],
+            &[original_cipher1.clone(), original_cipher2.clone()],
+            None,
+        )
+        .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, original_cipher1);
+
+        // Attacker mutates the ciphertexts for the same commitments
+        let mutated_cipher1 = "mutated1".repeat(20);
+        let mutated_cipher2 = "mutated2".repeat(20);
+        node.record_delivered_notes(
+            &[comm1, comm2],
+            &[mutated_cipher1, mutated_cipher2],
+            None,
+        )
+        .await;
+
+        // Must still be 2, NOT 4! And the authentic ciphertext must be preserved.
+        let delivered_after = node.delivered_notes().await;
+        assert_eq!(
+            delivered_after.len(),
+            2,
+            "Mutated ciphertexts for existing commitments must be rejected"
+        );
+        assert_eq!(
+            delivered_after[0].ciphertext, original_cipher1,
+            "Authentic ciphertext must not be overwritten or evicted"
+        );
+    }
+
+    // Attempting to evict authentic notes by submitting a loop of mutated ciphertexts
+    // across re-randomized proofs must fail: first-seen commitment is preserved (#1244).
+    #[tokio::test]
+    async fn mutated_ciphertexts_cannot_evict_authentic_notes_from_delivered_scan_buffer() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let authentic_comm = [42u8; 32];
+        let dummy_comm = [43u8; 32];
+        let authentic_ciphertext = "authentic_recipient_data".repeat(5);
+
+        node.record_delivered_notes(
+            &[authentic_comm, dummy_comm],
+            &[authentic_ciphertext.clone(), "dummy".to_string()],
+            None,
+        )
+        .await;
+
+        // Adversary repeatedly attempts to spam with mutated ciphertexts
+        for i in 0..100 {
+            let mutated = format!("malicious_payload_{i}");
+            node.record_delivered_notes(
+                &[authentic_comm, dummy_comm],
+                &[mutated.clone(), mutated],
+                None,
+            )
+            .await;
+        }
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2, "Buffer size must not grow from duplicate commitments");
+        assert_eq!(
+            delivered[0].ciphertext, authentic_ciphertext,
+            "Authentic note must remain un-evicted"
         );
     }
 
