@@ -927,6 +927,31 @@ pub fn derive_associated_token_address(
     .0
 }
 
+/// Create an idempotent associated token account creation instruction.
+/// Guarantees the recipient ATA is initialized prior to token transfer/withdraw.
+pub fn create_associated_token_account_idempotent_instruction(
+    funding_address: &Pubkey,
+    wallet_address: &Pubkey,
+    token_mint_address: &Pubkey,
+    token_program_id: &Pubkey,
+) -> Instruction {
+    let associated_token_address =
+        derive_associated_token_address(wallet_address, token_mint_address, token_program_id);
+
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*funding_address, true),
+            AccountMeta::new(associated_token_address, false),
+            AccountMeta::new_readonly(*wallet_address, false),
+            AccountMeta::new_readonly(*token_mint_address, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program_id, false),
+        ],
+        data: vec![1], // 1 = CreateIdempotent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1311,4 +1336,33 @@ mod tests {
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
     }
+
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction() {
+        let funding = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_associated_token_account_idempotent_instruction(
+            &funding,
+            &wallet,
+            &mint,
+            &token_program,
+        );
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 6);
+        assert_eq!(ix.accounts[0].pubkey, funding);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, derive_associated_token_address(&wallet, &mint, &token_program));
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, wallet);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+        assert_eq!(ix.data, vec![1]);
+    }
+
 }
