@@ -1389,7 +1389,6 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             #[cfg(feature = "solana-bridge")]
             {
                 const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
-                const STAKE_LAMPORTS: u64 = LAMPORTS_PER_SOL; // 1 SOL minimum stake
 
                 let rpc_url = rpc_url
                     .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
@@ -1429,14 +1428,6 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     "Validator Balance: {} SOL\n",
                     balance as f64 / LAMPORTS_PER_SOL as f64
                 );
-                if balance < 2 * LAMPORTS_PER_SOL {
-                    anyhow::bail!(
-                        "Insufficient balance. Need at least 2 SOL (1 to stake + fees). \
-                         Airdrop with: solana airdrop 2 {} --url devnet",
-                        validator.pubkey()
-                    );
-                }
-
                 let (validator_account_pda, _bump) = Pubkey::find_program_address(
                     &[b"validator", validator.pubkey().as_ref()],
                     &program_id,
@@ -1447,11 +1438,11 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Dual-stake: read the registry's pinned stake mint and derive
-                // this validator's token account (the token half is transferred
-                // from it). ValidatorRegistry layout after the 8-byte
-                // discriminator: authority[8..40], three u64 counters [40..64],
-                // total_active_stake[64..72], stake_mint[72..104].
+                // Dual-stake: read the registry's minimum_stake, pinned stake mint,
+                // and min_token_stake. ValidatorRegistry layout after the 8-byte
+                // discriminator: authority[8..40], total_validators[40..48],
+                // active_validators[48..56], minimum_stake[56..64],
+                // total_active_stake[64..72], stake_mint[72..104], min_token_stake[104..112].
                 let registry_data = client
                     .get_account_data(&validator_registry_pda)
                     .context("Failed to read validator registry (is it initialized?)")?;
@@ -1459,9 +1450,11 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     registry_data.len() >= 112,
                     "validator registry predates the dual-stake layout — redeploy the program first"
                 );
-                // Registry layout after the 8-byte discriminator: authority
-                // [8..40], three u64 counters [40..64], total_active_stake
-                // [64..72], stake_mint [72..104], min_token_stake [104..112].
+                let reg_min_stake = u64::from_le_bytes(
+                    registry_data[56..64]
+                        .try_into()
+                        .expect("8-byte minimum_stake slice"),
+                );
                 let stake_mint = Pubkey::new_from_array(
                     registry_data[72..104]
                         .try_into()
@@ -1472,6 +1465,22 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                         .try_into()
                         .expect("8-byte min_token_stake slice"),
                 );
+                let stake_lamports = match std::env::var("STAKE_AMOUNT") {
+                    Ok(val) => val.parse::<u64>().context("Invalid STAKE_AMOUNT")?,
+                    Err(_) => reg_min_stake.max(LAMPORTS_PER_SOL),
+                };
+                let token_stake_amount = match std::env::var("TOKEN_STAKE_AMOUNT") {
+                    Ok(val) => val.parse::<u64>().context("Invalid TOKEN_STAKE_AMOUNT")?,
+                    Err(_) => min_token_stake,
+                };
+                if balance < stake_lamports.saturating_add(LAMPORTS_PER_SOL / 100) {
+                    anyhow::bail!(
+                        "Insufficient balance. Have {} SOL, need at least {} SOL (stake + fees).",
+                        balance as f64 / LAMPORTS_PER_SOL as f64,
+                        stake_lamports.saturating_add(LAMPORTS_PER_SOL / 100) as f64
+                            / LAMPORTS_PER_SOL as f64
+                    );
+                }
                 // The dual-stake mint may live under classic SPL Token or
                 // Token-2022; the ATA derivation and the on-chain
                 // `transfer_checked` both key off whichever program owns the
@@ -1480,22 +1489,23 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_account(&stake_mint)
                     .context("Failed to read stake mint account")?
                     .owner;
-                let validator_token = derive_associated_token_address(
-                    &validator.pubkey(),
-                    &stake_mint,
-                    &token_program,
-                );
+                let validator_token = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
+                    Ok(val) => Pubkey::from_str(&val).context("Invalid VALIDATOR_TOKEN_ACCOUNT")?,
+                    Err(_) => derive_associated_token_address(
+                        &validator.pubkey(),
+                        &stake_mint,
+                        &token_program,
+                    ),
+                };
 
-                // Stake exactly the registry's current token floor (0 while the
-                // token gate is still closed).
                 let ix = create_register_validator_instruction(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
                     &validator_token,
                     &token_program,
-                    STAKE_LAMPORTS,
-                    min_token_stake,
+                    stake_lamports,
+                    token_stake_amount,
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
 
@@ -1681,7 +1691,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_account_data(&validator_registry_pda)
                     .context("Failed to read validator registry (is it initialized?)")?;
                 anyhow::ensure!(
-                    registry_data.len() >= 104,
+                    registry_data.len() >= 112,
                     "validator registry predates the dual-stake layout"
                 );
                 let stake_mint = Pubkey::new_from_array(
@@ -1693,11 +1703,14 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_account(&stake_mint)
                     .context("Failed to read stake mint account")?
                     .owner;
-                let validator_token = derive_associated_token_address(
-                    &validator.pubkey(),
-                    &stake_mint,
-                    &token_program,
-                );
+                let validator_token = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
+                    Ok(val) => Pubkey::from_str(&val).context("Invalid VALIDATOR_TOKEN_ACCOUNT")?,
+                    Err(_) => derive_associated_token_address(
+                        &validator.pubkey(),
+                        &stake_mint,
+                        &token_program,
+                    ),
+                };
 
                 let ix = create_withdraw_unbonded_stake_instruction(
                     &program_id,
