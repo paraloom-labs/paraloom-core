@@ -21,6 +21,8 @@
 //! against the verifying key and knows nothing about the QAP reduction.
 
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
+use ark_ec::pairing::Pairing;
+use ark_ec::AffineRepr;
 use ark_ff::{Field, PrimeField, Zero};
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
@@ -97,6 +99,22 @@ fn g1(p: &G1Json, what: &str) -> Res<G1Affine> {
     check_g1(G1Affine::new_unchecked(fq(&p[0])?, fq(&p[1])?), what)
 }
 
+fn g1_non_identity(p: &G1Json, what: &str) -> Res<G1Affine> {
+    let pt = g1(p, what)?;
+    if pt.is_zero() {
+        return Err(format!("{}: generator point cannot be the identity", what).into());
+    }
+    Ok(pt)
+}
+
+fn g2_non_identity(p: &G2Json, what: &str) -> Res<G2Affine> {
+    let pt = g2(p, what)?;
+    if pt.is_zero() {
+        return Err(format!("{}: generator point cannot be the identity", what).into());
+    }
+    Ok(pt)
+}
+
 fn g2(p: &G2Json, what: &str) -> Res<G2Affine> {
     let z = Fq2::new(fq(&p[2][0])?, fq(&p[2][1])?);
     if z.is_zero() {
@@ -167,6 +185,7 @@ fn main() -> Res<()> {
         ("A", zkey.a.len()),
         ("B1", zkey.b1.len()),
         ("B2", zkey.b2.len()),
+        ("C", zkey.c.len()),
     ] {
         if len != zkey.num_vars {
             return Err(format!(
@@ -181,6 +200,14 @@ fn main() -> Res<()> {
             "hExps has {} points, expected domainSize = {}",
             zkey.h_exps.len(),
             zkey.domain_size
+        )
+        .into());
+    }
+    if zkey.num_vars < zkey.ic.len() {
+        return Err(format!(
+            "nVars ({}) is smaller than IC len ({})",
+            zkey.num_vars,
+            zkey.ic.len()
         )
         .into());
     }
@@ -208,14 +235,14 @@ fn main() -> Res<()> {
 
     let pk = ProvingKey::<Bn254> {
         vk: VerifyingKey {
-            alpha_g1: g1(&zkey.vk_alpha_1, "vk_alpha_1")?,
-            beta_g2: g2(&zkey.vk_beta_2, "vk_beta_2")?,
-            gamma_g2: g2(&zkey.vk_gamma_2, "vk_gamma_2")?,
-            delta_g2: g2(&zkey.vk_delta_2, "vk_delta_2")?,
+            alpha_g1: g1_non_identity(&zkey.vk_alpha_1, "vk_alpha_1")?,
+            beta_g2: g2_non_identity(&zkey.vk_beta_2, "vk_beta_2")?,
+            gamma_g2: g2_non_identity(&zkey.vk_gamma_2, "vk_gamma_2")?,
+            delta_g2: g2_non_identity(&zkey.vk_delta_2, "vk_delta_2")?,
             gamma_abc_g1: g1_vec(&zkey.ic, "IC")?,
         },
-        beta_g1: g1(&zkey.vk_beta_1, "vk_beta_1")?,
-        delta_g1: g1(&zkey.vk_delta_1, "vk_delta_1")?,
+        beta_g1: g1_non_identity(&zkey.vk_beta_1, "vk_beta_1")?,
+        delta_g1: g1_non_identity(&zkey.vk_delta_1, "vk_delta_1")?,
         a_query: g1_vec(&zkey.a, "A")?,
         b_g1_query: g1_vec(&zkey.b1, "B1")?,
         b_g2_query: zkey
@@ -227,6 +254,16 @@ fn main() -> Res<()> {
         h_query: g1_vec(&zkey.h_exps, "hExps")?,
         l_query,
     };
+
+    // Verify pairing consistency between G1 and G2 generators
+    let g1_gen = G1Affine::generator();
+    let g2_gen = G2Affine::generator();
+    if Bn254::pairing(pk.beta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.beta_g2) {
+        return Err("pairing check failed: beta_g1 and beta_g2 are inconsistent".into());
+    }
+    if Bn254::pairing(pk.delta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.delta_g2) {
+        return Err("pairing check failed: delta_g1 and delta_g2 are inconsistent".into());
+    }
 
     let mut bytes = Vec::new();
     pk.serialize_compressed(&mut bytes)?;
@@ -254,4 +291,47 @@ fn main() -> Res<()> {
     println!("\nThis is a circom-convention key: prove with CircomReduction.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ec::CurveGroup;
+
+    #[test]
+    fn g1_non_identity_rejects_identity() {
+        let identity: G1Json = ["0".to_string(), "1".to_string(), "0".to_string()];
+        let res = g1_non_identity(&identity, "vk_alpha_1");
+        assert!(res.is_err(), "must reject identity point for generator");
+        assert!(res.unwrap_err().to_string().contains("cannot be the identity"));
+    }
+
+    #[test]
+    fn g2_non_identity_rejects_identity() {
+        let identity: G2Json = [
+            ["0".to_string(), "0".to_string()],
+            ["1".to_string(), "0".to_string()],
+            ["0".to_string(), "0".to_string()],
+        ];
+        let res = g2_non_identity(&identity, "vk_beta_2");
+        assert!(res.is_err(), "must reject identity point for generator");
+        assert!(res.unwrap_err().to_string().contains("cannot be the identity"));
+    }
+
+    #[test]
+    fn pairing_consistency_detects_mismatch() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+
+        assert_eq!(
+            Bn254::pairing(g1_gen, g2_gen),
+            Bn254::pairing(g1_gen, g2_gen)
+        );
+
+        let double_g1 = (g1_gen * Fr::from(2u64)).into_affine();
+        assert_ne!(
+            Bn254::pairing(double_g1, g2_gen),
+            Bn254::pairing(g1_gen, g2_gen)
+        );
+    }
 }

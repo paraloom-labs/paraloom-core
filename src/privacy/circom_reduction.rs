@@ -49,6 +49,16 @@ impl R1CSToQAP for CircomReduction {
         num_constraints: usize,
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
+        if full_assignment.len() < num_inputs {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+        if matrices.a.len() != num_constraints
+            || matrices.b.len() != num_constraints
+            || matrices.c.len() != num_constraints
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+
         let zero = F::zero();
         let domain =
             D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
@@ -118,7 +128,11 @@ impl R1CSToQAP for CircomReduction {
     ) -> Result<Vec<F>, SynthesisError> {
         // The usual H query has domain-1 powers and Z has domain powers, so
         // HZ has 2*domain-1.
-        let mut scalars = (0..2 * max_power + 1)
+        let total_powers = max_power
+            .checked_mul(2)
+            .and_then(|p| p.checked_add(1))
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let mut scalars = (0..total_powers)
             .map(|i| delta_inverse * t.pow([i as u64]))
             .collect::<Vec<_>>();
         let domain_size = scalars.len();
@@ -276,5 +290,65 @@ mod tests {
                 .expect("verify runs"),
             "a ceremony-produced key must prove and verify our circuit"
         );
+    }
+
+    #[test]
+    fn witness_map_rejects_missing_inputs() {
+        use ark_poly::GeneralEvaluationDomain;
+        let matrices = ConstraintMatrices::<Fr> {
+            num_instance_variables: 2,
+            num_witness_variables: 2,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 1,
+            c_num_non_zero: 1,
+            a: vec![vec![(Fr::from(1u64), 0)]],
+            b: vec![vec![(Fr::from(1u64), 0)]],
+            c: vec![vec![(Fr::from(1u64), 0)]],
+        };
+        let full_assignment = vec![Fr::from(1u64)];
+        let res = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            2,
+            1,
+            &full_assignment,
+        );
+        assert!(matches!(res, Err(SynthesisError::AssignmentMissing)));
+    }
+
+    #[test]
+    fn witness_map_rejects_mismatched_constraints() {
+        use ark_poly::GeneralEvaluationDomain;
+        let matrices = ConstraintMatrices::<Fr> {
+            num_instance_variables: 2,
+            num_witness_variables: 2,
+            num_constraints: 2,
+            a_num_non_zero: 1,
+            b_num_non_zero: 1,
+            c_num_non_zero: 1,
+            a: vec![vec![(Fr::from(1u64), 0)]],
+            b: vec![vec![(Fr::from(1u64), 0)]],
+            c: vec![vec![(Fr::from(1u64), 0)]],
+        };
+        let full_assignment = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)];
+        let res = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            2,
+            2,
+            &full_assignment,
+        );
+        assert!(matches!(res, Err(SynthesisError::Unsatisfiable)));
+    }
+
+    #[test]
+    fn h_query_scalars_overflow_protection() {
+        use ark_poly::GeneralEvaluationDomain;
+        let res = CircomReduction::h_query_scalars::<Fr, GeneralEvaluationDomain<Fr>>(
+            usize::MAX,
+            Fr::from(2u64),
+            Fr::from(1u64),
+            Fr::from(3u64),
+        );
+        assert!(matches!(res, Err(SynthesisError::PolynomialDegreeTooLarge)));
     }
 }
