@@ -565,8 +565,15 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
+        // For shielded transfers without external withdrawal (ext_amount == 0), the recipient
+        // in the circuit public input is Pubkey::default() (unbound external recipient) (#866).
+        let recipient_key = if ext_amount < 0 {
+            ctx.accounts.recipient_token_account.key()
+        } else {
+            Pubkey::default()
+        };
         let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
+            &recipient_key,
             ext_amount,
         );
         let public_amount = public_amount_bytes(ext_amount);
@@ -1914,13 +1921,20 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    ///
+    /// CHECK: When ext_amount < 0, validated during transfer CPI to ensure
+    /// funds flow to an initialized TokenAccount matching `mint`. When ext_amount == 0
+    /// (internal shielded transfer), can be any account (e.g. Pubkey::default()) without failing Anchor validation (#866).
+    #[account(mut)]
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid.
+    ///
+    /// CHECK: When ext_amount < 0 and fee > 0, validated during transfer CPI.
+    /// When ext_amount == 0, fee is 0 and no fee transfer occurs (#866).
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
