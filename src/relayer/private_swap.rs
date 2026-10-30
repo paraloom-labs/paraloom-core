@@ -93,6 +93,35 @@ pub enum RelayerError {
     /// check, which the provider setting alone did not give a single request.
     #[error("swap output {out_amount} is below the caller minimum {min_out}")]
     SlippageExceeded { out_amount: u64, min_out: u64 },
+
+    /// The swap completed and the tokens landed at the ephemeral fresh address,
+    /// but the final re-deposit leg failed (RPC timeout, blockhash expiry,
+    /// deposit-cap saturation, transient node error). Unlike a bare
+    /// [`RelayerError::SubmissionFailed`], this carries the ephemeral *secret*
+    /// and the exact recovery state, so the caller can retry the deposit or
+    /// sweep `recovery.asset_out` (held at `fresh_address`) instead of losing
+    /// it. Previously the local `Keypair` was dropped when `execute` returned
+    /// early, permanently stranding the swapped funds.
+    #[error(
+        "re-deposit failed after swap; funds are recoverable: {source}"
+    )]
+    FundsRecoverable {
+        /// Underlying submission error string.
+        source: String,
+        /// The ephemeral address holding `asset_out`.
+        fresh_address: [u8; 32],
+        /// Discloses the ephemeral secret so the caller can sign a recovery
+        /// sweep. Handle with the same care as any private key.
+        ephemeral_secret: [u8; 32],
+        /// Amount of `asset_out` stranded at `fresh_address`.
+        net_out_amount: u64,
+        /// The asset stranded at `fresh_address`.
+        asset_out: AssetId,
+        /// The withdraw leg that funded the swap (already on-chain).
+        withdraw_leg: SubmittedLeg,
+        /// Gross swap output delivered to `fresh_address`.
+        gross_out_amount: u64,
+    },
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -510,7 +539,7 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
 
         // Step 4: re-deposit the net output into the shielded pool to the
         // user's new recipient, producing a fresh `asset_out` note.
-        let deposit_leg = self
+        let deposit_leg = match self
             .submitter
             .submit_deposit_from_fresh(
                 out_leg,
@@ -519,7 +548,28 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
                 request.reshield_recipient.clone(),
                 request.reshield_randomness,
             )
-            .await?;
+            .await
+        {
+            Ok(leg) => leg,
+            // The swap already delivered `asset_out` to the ephemeral fresh
+            // address. If the re-deposit fails, returning a bare error here
+            // would drop the local `ephemeral` Keypair and permanently strand
+            // those funds. Instead, surface a `FundsRecoverable` carrying the
+            // ephemeral secret and the exact state needed to retry the deposit
+            // or sweep the tokens — the caller (or a recovery worker) can then
+            // finish the job without loss.
+            Err(e) => {
+                return Err(RelayerError::FundsRecoverable {
+                    source: e.to_string(),
+                    fresh_address,
+                    ephemeral_secret: ephemeral.to_bytes(),
+                    net_out_amount,
+                    asset_out: request.asset_out,
+                    withdraw_leg,
+                    gross_out_amount,
+                });
+            }
+        };
 
         let output_note = Note::new(
             request.reshield_recipient,
@@ -977,5 +1027,38 @@ mod tests {
         );
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
+    }
+
+    /// The `FundsRecoverable` variant must expose a secret that reconstructs the
+    /// fresh address and the exact stranded amount — the fix's core guarantee
+    /// that a failed re-deposit never silently drops the ephemeral keypair.
+    #[test]
+    fn funds_recoverable_roundtrips_ephemeral_secret() {
+        let kp = Keypair::new();
+        let fresh = kp.pubkey().to_bytes();
+        let secret = kp.to_bytes();
+        let err = RelayerError::FundsRecoverable {
+            source: "rpc timeout".into(),
+            fresh_address: fresh,
+            ephemeral_secret: secret,
+            net_out_amount: 1_000_000,
+            asset_out: NATIVE_SOL_ASSET,
+            withdraw_leg: SubmittedLeg {
+                leg: WithdrawLeg::Native,
+                amount: 1_000_000,
+                fresh_address: fresh,
+                signature: String::new(),
+            },
+            gross_out_amount: 1_000_000,
+        };
+        match err {
+            RelayerError::FundsRecoverable { ephemeral_secret, fresh_address, net_out_amount, gross_out_amount, .. } => {
+                let recovered = Keypair::from_bytes(&ephemeral_secret).expect("valid secret");
+                assert_eq!(recovered.pubkey().to_bytes(), fresh_address);
+                assert_eq!(net_out_amount, gross_out_amount);
+                assert_ne!(net_out_amount, 0);
+            }
+            _ => unreachable!(),
+        }
     }
 }
