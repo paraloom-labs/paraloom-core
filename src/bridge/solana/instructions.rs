@@ -1188,6 +1188,87 @@ mod tests {
     }
 
     #[test]
+    fn test_create_deactivate_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let ix = create_deactivate_validator_instruction(&program_id, &authority, &validator)
+            .expect("create_deactivate_validator_instruction should succeed");
+
+        // validator_account (mut), validator_registry (mut), authority (signer).
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, authority);
+        assert!(ix.accounts[2].is_signer);
+        assert_eq!(ix.data, discriminators::DEACTIVATE_VALIDATOR.to_vec());
+    }
+
+    #[test]
+    fn test_create_register_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let validator_token_account = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let stake_amount = 1_000_000_000u64;
+        let token_stake_amount = 500_000_000u64;
+
+        let ix = create_register_validator_instruction(
+            &program_id,
+            &validator,
+            &stake_mint,
+            &validator_token_account,
+            &token_program,
+            stake_amount,
+            token_stake_amount,
+        )
+        .expect("create_register_validator_instruction should succeed");
+
+        // 8 accounts: validator_account, validator_registry, validator, stake_mint,
+        // validator_token_account, stake_token_vault, token_program, system_program.
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, validator);
+        assert!(ix.accounts[2].is_signer);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, stake_mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, validator_token_account);
+        assert!(ix.accounts[4].is_writable);
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert_eq!(ix.accounts[7].pubkey, SYSTEM_PROGRAM_ID);
+
+        let mut expected_data = discriminators::REGISTER_VALIDATOR.to_vec();
+        expected_data.extend_from_slice(&stake_amount.to_le_bytes());
+        expected_data.extend_from_slice(&token_stake_amount.to_le_bytes());
+        assert_eq!(ix.data, expected_data);
+    }
+
+    #[test]
     fn test_create_migrate_validator_account_instruction() {
         let program_id = Pubkey::new_unique();
         let authority = Pubkey::new_unique();

@@ -302,6 +302,25 @@ enum ValidatorCommands {
         program_id: Option<String>,
     },
 
+    /// Administratively deactivate an active validator node
+    Deactivate {
+        /// Authority keypair (also via AUTHORITY_KEYPAIR_PATH or VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Validator wallet public key to deactivate
+        #[arg(long)]
+        validator: Pubkey,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Unregister this validator on-chain (moves the stake into unbonding)
     Unregister {
         /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
@@ -1531,6 +1550,106 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
             Ok(())
         }
 
+        ValidatorCommands::Deactivate {
+            keypair,
+            validator,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Deactivating validator on-chain...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("AUTHORITY_KEYPAIR_PATH")
+                            .or_else(|_| std::env::var("VALIDATOR_KEYPAIR_PATH"))
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Authority keypair not specified. Use --keypair or AUTHORITY_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Authority Keypair: {}", keypair_path.display());
+                println!("Target Validator: {}\n", validator);
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let authority =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Authority Address: {}\n", authority.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                let (validator_account_pda, _) = derive_validator_account(&program_id, &validator);
+                let (validator_registry_pda, _) = derive_validator_registry(&program_id);
+
+                println!("Validator Account PDA: {}", validator_account_pda);
+                println!("Validator Registry PDA: {}\n", validator_registry_pda);
+
+                let account_data = client
+                    .get_account_data(&validator_account_pda)
+                    .context("Failed to fetch validator account data (is it registered?)")?;
+
+                let decoded = decode_validator_account(&account_data).context(
+                    "Failed to decode validator account or invalid account discriminator",
+                )?;
+
+                anyhow::ensure!(
+                    decoded.4,
+                    "Validator is already inactive or unbonding. Cannot deactivate."
+                );
+
+                let ix = create_deactivate_validator_instruction(
+                    &program_id,
+                    &authority.pubkey(),
+                    &validator,
+                )?;
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&authority.pubkey()),
+                    &[&authority],
+                    blockhash,
+                );
+
+                println!("Submitting deactivation transaction...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Validator administratively deactivated!");
+                println!("  Transaction: {}", signature);
+                println!("  Validator:   {}", validator);
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
+
+            Ok(())
+        }
+
         ValidatorCommands::Unregister {
             keypair,
             rpc_url,
@@ -1573,29 +1692,28 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-                let (validator_account_pda, _bump) = Pubkey::find_program_address(
-                    &[b"validator", validator.pubkey().as_ref()],
-                    &program_id,
-                );
-                let (validator_registry_pda, _registry_bump) =
-                    Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+                let (validator_account_pda, _) =
+                    derive_validator_account(&program_id, &validator.pubkey());
+                let (validator_registry_pda, _) = derive_validator_registry(&program_id);
 
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Anchor discriminator for `unregister_validator` (no args).
-                let discriminator: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
-                let data = discriminator.to_vec();
+                // Pre-flight check: ensure the validator account exists and is currently active
+                let account_data = client
+                    .get_account_data(&validator_account_pda)
+                    .context("Failed to fetch validator account data (is it registered?)")?;
 
-                let ix = solana_sdk::instruction::Instruction {
-                    program_id,
-                    accounts: vec![
-                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
-                    ],
-                    data,
-                };
+                let decoded = decode_validator_account(&account_data).context(
+                    "Failed to decode validator account or invalid account discriminator",
+                )?;
+
+                anyhow::ensure!(
+                    decoded.4,
+                    "Validator is already inactive or unbonding. Cannot unregister."
+                );
+
+                let ix = create_unregister_validator_instruction(&program_id, &validator.pubkey());
 
                 let blockhash = client
                     .get_latest_blockhash()
@@ -2178,4 +2296,65 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_parse_validator_unregister() {
+        let args = [
+            "paraloom",
+            "validator",
+            "unregister",
+            "--program-id",
+            "11111111111111111111111111111111",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse validator unregister");
+        match cli.command {
+            Commands::Validator { command } => match command {
+                ValidatorCommands::Unregister { program_id, .. } => {
+                    assert_eq!(
+                        program_id.as_deref(),
+                        Some("11111111111111111111111111111111")
+                    );
+                }
+                _ => panic!("expected Unregister"),
+            },
+            _ => panic!("expected Validator"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_validator_deactivate() {
+        let args = [
+            "paraloom",
+            "validator",
+            "deactivate",
+            "--validator",
+            "11111111111111111111111111111111",
+            "--program-id",
+            "22222222222222222222222222222222",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse validator deactivate");
+        match cli.command {
+            Commands::Validator { command } => match command {
+                ValidatorCommands::Deactivate {
+                    validator,
+                    program_id,
+                    ..
+                } => {
+                    assert_eq!(validator.to_string(), "11111111111111111111111111111111");
+                    assert_eq!(
+                        program_id.as_deref(),
+                        Some("22222222222222222222222222222222")
+                    );
+                }
+                _ => panic!("expected Deactivate"),
+            },
+            _ => panic!("expected Validator"),
+        }
+    }
 }
