@@ -27,7 +27,7 @@
 
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField, Zero};
-use ark_relations::r1cs::{ConstraintMatrices, Matrix};
+use ark_relations::r1cs::ConstraintMatrices;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
@@ -47,9 +47,15 @@ const SECTION_WIRE2LABEL: u32 = 3;
 /// Terms that repeat a wire are summed rather than emitted twice, and terms
 /// that cancel to zero are dropped — a duplicate wire index is not something
 /// the readers agree on how to handle.
-fn write_lc(out: &mut Vec<u8>, row: &[(Fr, usize)]) {
+fn write_lc(out: &mut Vec<u8>, row: &[(Fr, usize)], num_wires: usize) -> io::Result<()> {
     let mut terms: BTreeMap<usize, Fr> = BTreeMap::new();
     for (coeff, wire) in row {
+        if *wire >= num_wires {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("wire index {} exceeds total wires {}", wire, num_wires),
+            ));
+        }
         *terms.entry(*wire).or_insert_with(Fr::zero) += coeff;
     }
     terms.retain(|_, coeff| !coeff.is_zero());
@@ -61,6 +67,7 @@ fn write_lc(out: &mut Vec<u8>, row: &[(Fr, usize)]) {
         bytes.resize(FIELD_SIZE as usize, 0);
         out.extend_from_slice(&bytes);
     }
+    Ok(())
 }
 
 fn section(out: &mut impl Write, kind: u32, body: &[u8]) -> io::Result<()> {
@@ -74,6 +81,26 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     let num_instance = matrices.num_instance_variables;
     let num_witness = matrices.num_witness_variables;
     let num_wires = num_instance + num_witness;
+
+    if num_instance == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_instance_variables must be >= 1 (constant one wire)",
+        ));
+    }
+
+    if matrices.a.len() != matrices.num_constraints
+        || matrices.b.len() != matrices.num_constraints
+        || matrices.c.len() != matrices.num_constraints
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "matrix row count mismatch: declared {} constraints, got A:{}, B:{}, C:{}",
+                matrices.num_constraints, matrices.a.len(), matrices.b.len(), matrices.c.len()
+            ),
+        ));
+    }
 
     out.write_all(MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
@@ -99,11 +126,10 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     section(out, SECTION_HEADER, &header)?;
 
     let mut constraints = Vec::new();
-    let rows = |m: &Matrix<Fr>, i: usize| m.get(i).cloned().unwrap_or_default();
     for i in 0..matrices.num_constraints {
-        write_lc(&mut constraints, &rows(&matrices.a, i));
-        write_lc(&mut constraints, &rows(&matrices.b, i));
-        write_lc(&mut constraints, &rows(&matrices.c, i));
+        write_lc(&mut constraints, &matrices.a[i], num_wires)?;
+        write_lc(&mut constraints, &matrices.b[i], num_wires)?;
+        write_lc(&mut constraints, &matrices.c[i], num_wires)?;
     }
     section(out, SECTION_CONSTRAINTS, &constraints)?;
 
@@ -283,5 +309,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn write_r1cs_rejects_zero_instance_variables() {
+        let mut matrices = transact_v3_matrices();
+        matrices.num_instance_variables = 0;
+        let mut bytes = Vec::new();
+        let res = write_r1cs(&mut bytes, &matrices);
+        assert!(res.is_err(), "Must reject zero instance variables");
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_r1cs_rejects_matrix_row_mismatch() {
+        let mut matrices = transact_v3_matrices();
+        matrices.a.pop();
+        let mut bytes = Vec::new();
+        let res = write_r1cs(&mut bytes, &matrices);
+        assert!(res.is_err(), "Must reject matrix row count mismatch");
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_r1cs_rejects_out_of_bounds_wire() {
+        let mut matrices = transact_v3_matrices();
+        let num_wires = matrices.num_instance_variables + matrices.num_witness_variables;
+        matrices.a[0].push((Fr::from(1u64), num_wires + 10));
+        let mut bytes = Vec::new();
+        let res = write_r1cs(&mut bytes, &matrices);
+        assert!(res.is_err(), "Must reject out-of-bounds wire index");
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 }
