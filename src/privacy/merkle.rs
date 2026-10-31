@@ -24,7 +24,10 @@ pub const DEFAULT_TREE_DEPTH: usize = 32;
 /// same proof without holding byte-identical trees, the way Tornado-style pools
 /// keep a roots ring buffer. Double-spend is still prevented by the nullifier,
 /// independent of which historical root a proof names.
-pub const ROOT_HISTORY_LEN: usize = 256;
+/// Must match `programs/paraloom/src/merkle_tree.rs::ROOT_HISTORY_SIZE`.
+/// Includes the current root; a root expires after 64 appended leaves,
+/// even when intermediate roots were never computed off-chain.
+pub const ROOT_HISTORY_LEN: usize = 64;
 
 pub struct MerkleTree {
     /// Tree depth
@@ -33,9 +36,9 @@ pub struct MerkleTree {
     leaves: Arc<RwLock<Vec<[u8; 32]>>>,
     /// Cached root
     cached_root: Arc<RwLock<Option<[u8; 32]>>>,
-    /// Bounded history of recently-computed roots (newest at the back), for
+    /// Bounded history of (leaf count, root) pairs (newest at the back), for
     /// [`Self::knows_root`]. Capped at [`ROOT_HISTORY_LEN`].
-    recent_roots: Arc<RwLock<std::collections::VecDeque<[u8; 32]>>>,
+    recent_roots: Arc<RwLock<std::collections::VecDeque<(usize, [u8; 32])>>>,
     /// Optional persistent storage
     storage: Option<Arc<PrivacyStorage>>,
 }
@@ -69,7 +72,7 @@ impl MerkleTree {
         // Seed the recent-roots window with the reloaded tip so a proof built
         // against the just-restored root verifies immediately after a restart.
         let recent_roots = match cached_root {
-            Some(r) => std::collections::VecDeque::from([r]),
+            Some(r) => std::collections::VecDeque::from([(leaves.len(), r)]),
             None => std::collections::VecDeque::new(),
         };
         Ok(MerkleTree {
@@ -165,11 +168,18 @@ impl MerkleTree {
 
         // Record this root in the bounded history so a proof naming it still
         // verifies after later deposits advance the tree (see [`knows_root`] and
-        // [`ROOT_HISTORY_LEN`]). Skip consecutive duplicates.
+        // [`ROOT_HISTORY_LEN`]). Age roots by appended leaves, not root reads:
+        // the on-chain ring advances once per leaf, including batch inserts.
         {
             let mut recent = self.recent_roots.write().await;
-            if recent.back() != Some(&root) {
-                recent.push_back(root);
+            let leaf_count = leaves.len();
+            while recent.front().is_some_and(|(count, _)| {
+                leaf_count.saturating_sub(*count) >= ROOT_HISTORY_LEN
+            }) {
+                recent.pop_front();
+            }
+            if recent.back() != Some(&(leaf_count, root)) {
+                recent.push_back((leaf_count, root));
                 while recent.len() > ROOT_HISTORY_LEN {
                     recent.pop_front();
                 }
@@ -196,8 +206,8 @@ impl MerkleTree {
         root
     }
 
-    /// Whether `root` is the current tip or one of the last [`ROOT_HISTORY_LEN`]
-    /// roots this tree computed. A verifier accepts a withdrawal/transfer proof
+    /// Whether `root` is the current tip or a computed root fewer than
+    /// [`ROOT_HISTORY_LEN`] leaf appends old. A verifier accepts a withdrawal/transfer proof
     /// built against any such root, so nodes whose trees have advanced by
     /// different amounts can still verify the same proof without holding
     /// byte-identical trees. Computing the current root first guarantees the
@@ -207,7 +217,7 @@ impl MerkleTree {
             return true;
         }
         let recent = self.recent_roots.read().await;
-        recent.iter().any(|r| r == root)
+        recent.iter().any(|(_, r)| r == root)
     }
 
     /// The root the tree WOULD have after appending `commitments`, computed
@@ -614,6 +624,37 @@ mod tests {
 
         // A root the tree never computed is rejected.
         assert!(!tree.knows_root(&[0xAB; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn root_history_matches_on_chain_expiration_boundary() {
+        assert_eq!(ROOT_HISTORY_LEN, 64);
+        // Exercise eager reads, skipped reads, and batch inserts.
+        for mode in 0..3 {
+            let tree = MerkleTree::new();
+            let old = tree.root().await;
+            let commitments: Vec<_> = (1..=63u8)
+                .map(|i| Commitment([i; 32]))
+                .collect();
+            if mode == 2 {
+                tree.insert_batch(&commitments).await.unwrap();
+            } else {
+                for commitment in &commitments {
+                    tree.insert(commitment).await.unwrap();
+                    if mode == 0 {
+                        tree.root().await;
+                    }
+                }
+            }
+            assert!(tree.knows_root(&old).await, "known after 63 appends");
+            let previous = tree.root().await;
+            tree.insert(&Commitment([64; 32])).await.unwrap();
+            assert!(!tree.knows_root(&old).await, "expired after 64 appends");
+            assert!(tree.knows_root(&previous).await);
+            let tip = tree.root().await;
+            assert!(tree.knows_root(&tip).await);
+            assert!(!tree.knows_root(&[0xAB; 32]).await);
+        }
     }
 
     #[tokio::test]
