@@ -219,15 +219,18 @@ pub mod paraloom_program {
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
 
-        // TVL cap: refuse any deposit that would push the vault's *current*
-        // balance past `deposit_cap`, bounding total funds-at-risk to the cap.
-        // Checked against the live vault balance (not cumulative deposits) and
-        // before moving funds, so a rejected deposit never touches the vault.
+        // TVL cap: refuse any deposit that would push the vault's active
+        // liability past `deposit_cap`, bounding total funds-at-risk to the cap.
+        // Evaluated against tracked liability (`total_deposited - total_withdrawn`)
+        // rather than the raw vault balance so that permissionless direct donations
+        // cannot artificially trip the cap and grief deposit liveness (#1279).
         // Cap starts at 0 (deposits closed) until the cold authority raises it.
-        let projected_vault_balance = ctx
+        let active_tvl = ctx
             .accounts
-            .bridge_vault
-            .lamports()
+            .bridge_state
+            .total_deposited
+            .saturating_sub(ctx.accounts.bridge_state.total_withdrawn);
+        let projected_vault_balance = active_tvl
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
         require!(
@@ -1315,12 +1318,14 @@ pub mod paraloom_program {
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
 
-        // Per-asset TVL cap, checked against the vault's *live* token balance
-        // before moving funds, exactly like the native path checks lamports.
+        // Per-asset TVL cap: evaluated against tracked cumulative deposits on
+        // `asset_config` rather than the raw vault token balance, so that
+        // unsolicited permissionless token transfers into `asset_vault` cannot
+        // artificially trip the cap and grief deposit liveness (#1279).
         let projected_vault_balance = ctx
             .accounts
-            .asset_vault
-            .amount
+            .asset_config
+            .total_deposited
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
         require!(
