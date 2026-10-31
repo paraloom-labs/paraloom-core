@@ -77,8 +77,16 @@ impl NullifierSet {
     }
 
     /// Batch check multiple nullifiers
-    /// Returns true if ALL nullifiers are new (not yet spent)
+    /// Returns true if ALL nullifiers are new (not yet spent) AND there are
+    /// no duplicate nullifiers within the candidate batch itself.
     pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
+        let mut seen = HashSet::with_capacity(nullifiers.len());
+        for n in nullifiers {
+            if !seen.insert(n) {
+                return false; // Found intra-batch duplicate
+            }
+        }
+
         let set = self.nullifiers.read().await;
         nullifiers.iter().all(|n| !set.contains(n))
     }
@@ -92,9 +100,10 @@ impl NullifierSet {
     pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
 
+        let mut seen = HashSet::new();
         let new_nullifiers: Vec<Nullifier> = nullifiers
             .into_iter()
-            .filter(|n| !set.contains(n))
+            .filter(|n| !set.contains(n) && seen.insert(n.clone()))
             .collect();
 
         if new_nullifiers.is_empty() {
@@ -229,6 +238,33 @@ mod tests {
             set.check_batch(&[nullifier2.clone(), nullifier3.clone()])
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn test_nullifier_set_batch_check_intra_batch_duplicates() {
+        let set = NullifierSet::new();
+        let nullifier1 = Nullifier([1u8; 32]);
+
+        // Duplicate nullifiers within the same unspent batch must be rejected
+        assert!(
+            !set.check_batch(&[nullifier1.clone(), nullifier1.clone()])
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nullifier_set_batch_insert_intra_batch_duplicates() {
+        let set = NullifierSet::new();
+        let nullifier1 = Nullifier([1u8; 32]);
+        let nullifier2 = Nullifier([2u8; 32]);
+
+        // Batch with duplicates within the input should insert unique elements and return exact unique count
+        let count = set
+            .insert_batch(vec![nullifier1.clone(), nullifier1.clone(), nullifier2.clone()])
+            .await
+            .expect("in-memory batch insert");
+        assert_eq!(count, 2);
+        assert_eq!(set.len().await, 2);
     }
 
     #[tokio::test]
