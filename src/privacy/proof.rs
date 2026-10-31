@@ -42,7 +42,7 @@ use thiserror::Error;
 /// re-present under different bytes while satisfying the same proof. Reject
 /// any input that is not its own canonical encoding so the proof's field
 /// element and the byte-keyed uniqueness checks correspond 1:1.
-fn is_canonical_le(b: &[u8; 32]) -> bool {
+pub fn is_canonical_le(b: &[u8; 32]) -> bool {
     let le = Fr::from_le_bytes_mod_order(b).into_bigint().to_bytes_le();
     let mut canonical = [0u8; 32];
     let n = le.len().min(32);

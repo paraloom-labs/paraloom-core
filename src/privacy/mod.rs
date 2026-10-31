@@ -44,7 +44,7 @@ pub use merkle::MerkleTree;
 pub use note_crypto::{decrypt_note, encrypt_note, EncryptedNote, NotePlaintext};
 pub use nullifier::NullifierSet;
 pub use pool::ShieldedPool;
-pub use proof::{ProofVerifier, VerificationChunk, VerificationResult};
+pub use proof::{is_canonical_le, ProofVerifier, VerificationChunk, VerificationResult};
 pub use proof_codec::{
     bytes_to_field, deserialize_proof, field_to_bytes, serialize_proof, split_tagged_proof,
     tag_proof, Groth16Proof, Groth16VerifyingKey, ProofSuite, GROTH16_BN254_COMPRESSED_LEN,
