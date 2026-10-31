@@ -68,7 +68,10 @@ fn rand_fr() -> Fr {
     Fr::from_le_bytes_mod_order(&b)
 }
 
+pub const ROOT_HISTORY_SIZE: usize = 64;
+
 /// A leaf's authentication path against the current on-chain incremental tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Membership {
     pub leaf_index: u64,
     /// On-chain root the path folds to (LE field bytes).
@@ -77,24 +80,18 @@ pub struct Membership {
     pub path: Vec<[u8; 32]>,
 }
 
-/// Read the on-chain merkle tree and reconstruct `leaf_index`'s authentication
-/// path from `filled_subtrees` + the zero-subtree hashes — the standard
-/// incremental-tree property, no leaf scanning. `commitment` is the leaf value;
-/// the path is fold-checked against the on-chain root before returning so a
-/// stale/wrong read fails here rather than at proving.
-///
-/// Tree account layout: disc(8) | next_index(8) | root_index(8) | root(32) |
-/// `filled_subtrees[TX_LEVELS][32]` (from offset 56).
-pub fn read_membership(
-    client: &RpcClient,
-    program_id: &Pubkey,
+/// Parse the on-chain merkle tree account data and verify `leaf_index`'s authentication
+/// path. If `custom_path` is provided (e.g. from an off-chain indexer/path service),
+/// it is validated against the on-chain root or root ring buffer history.
+/// If `custom_path` is None, frontier reconstruction from `filled_subtrees` is attempted.
+/// The folded root is verified against `root_onchain` AND the on-chain `root_history`
+/// ring buffer to accept proofs built against recent valid roots (#1237).
+pub fn parse_and_verify_membership(
+    raw: &[u8],
     leaf_index: u64,
     commitment: Fr,
+    custom_path: Option<Vec<[u8; 32]>>,
 ) -> Result<Membership> {
-    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], program_id);
-    let raw = client
-        .get_account_data(&tree_pda)
-        .map_err(|e| TransactSubmitError::Rpc(e.to_string()))?;
     if raw.len() < 56 + TX_LEVELS * 32 {
         return Err(TransactSubmitError::ShortAccount("merkle_tree"));
     }
@@ -102,26 +99,34 @@ pub fn read_membership(
         .try_into()
         .map_err(|_| TransactSubmitError::ShortAccount("merkle_tree root"))?;
 
-    let mut zeros = vec![Fr::from(0u64)];
-    for k in 0..TX_LEVELS {
-        zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
-    }
-    let mut path: Vec<[u8; 32]> = Vec::with_capacity(TX_LEVELS);
-    #[allow(clippy::needless_range_loop)]
-    for level in 0..TX_LEVELS {
-        let sib = if (leaf_index >> level) & 1 == 1 {
-            let off = 56 + level * 32;
-            let fs: [u8; 32] = raw[off..off + 32]
-                .try_into()
-                .map_err(|_| TransactSubmitError::ShortAccount("filled_subtrees"))?;
-            fs
-        } else {
-            fr_to_le(&zeros[level])
-        };
-        path.push(sib);
-    }
+    let path = if let Some(p) = custom_path {
+        if p.len() != TX_LEVELS {
+            return Err(TransactSubmitError::RootMismatch { leaf_index });
+        }
+        p
+    } else {
+        let mut zeros = vec![Fr::from(0u64)];
+        for k in 0..TX_LEVELS {
+            zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+        }
+        let mut p: Vec<[u8; 32]> = Vec::with_capacity(TX_LEVELS);
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..TX_LEVELS {
+            let sib = if (leaf_index >> level) & 1 == 1 {
+                let off = 56 + level * 32;
+                let fs: [u8; 32] = raw[off..off + 32]
+                    .try_into()
+                    .map_err(|_| TransactSubmitError::ShortAccount("filled_subtrees"))?;
+                fs
+            } else {
+                fr_to_le(&zeros[level])
+            };
+            p.push(sib);
+        }
+        p
+    };
 
-    // Fold to confirm the path matches the on-chain root before we prove.
+    // Fold to confirm the path matches the on-chain root or a valid historical root in root_history.
     let mut cur = commitment;
     for (level, sib) in path.iter().enumerate() {
         let s = Fr::from_le_bytes_mod_order(sib);
@@ -131,15 +136,62 @@ pub fn read_membership(
             v3_merkle_pair(cur, s)
         };
     }
-    if fr_to_le(&cur) != root_onchain {
+    let cur_bytes = fr_to_le(&cur);
+    let mut matched = cur_bytes == root_onchain;
+    if !matched && cur_bytes != [0u8; 32] {
+        // Check on-chain root_history ring buffer (offset 56 + TX_LEVELS * 32)
+        let history_start = 56 + TX_LEVELS * 32;
+        if raw.len() >= history_start + ROOT_HISTORY_SIZE * 32 {
+            for i in 0..ROOT_HISTORY_SIZE {
+                let off = history_start + i * 32;
+                if raw[off..off + 32] == cur_bytes {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !matched {
         return Err(TransactSubmitError::RootMismatch { leaf_index });
     }
 
     Ok(Membership {
         leaf_index,
-        root: root_onchain,
+        root: cur_bytes,
         path,
     })
+}
+
+/// Read the on-chain merkle tree and reconstruct `leaf_index`'s authentication
+/// path. If `custom_path` is provided (e.g. from an off-chain indexer/path service),
+/// it is validated against the on-chain root or root ring buffer history.
+/// If `custom_path` is None, frontier reconstruction is attempted.
+/// The folded root is verified against `root_onchain` AND the on-chain `root_history`
+/// ring buffer to accept proofs built against recent valid roots (#1237).
+///
+/// Tree account layout: disc(8) | next_index(8) | root_index(8) | root(32) |
+/// `filled_subtrees[TX_LEVELS][32]` (from offset 56) | `root_history[ROOT_HISTORY_SIZE][32]`.
+pub fn read_membership_with_path(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    leaf_index: u64,
+    commitment: Fr,
+    custom_path: Option<Vec<[u8; 32]>>,
+) -> Result<Membership> {
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], program_id);
+    let raw = client
+        .get_account_data(&tree_pda)
+        .map_err(|e| TransactSubmitError::Rpc(e.to_string()))?;
+    parse_and_verify_membership(&raw, leaf_index, commitment, custom_path)
+}
+
+pub fn read_membership(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    leaf_index: u64,
+    commitment: Fr,
+) -> Result<Membership> {
+    read_membership_with_path(client, program_id, leaf_index, commitment, None)
 }
 
 /// The tagged proof + on-chain public parts of a withdraw-to-fresh v3 transact.
@@ -320,5 +372,109 @@ pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
         // active_validators is the u64 at [48..56] after the 8-byte discriminator.
         Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_and_verify_membership_short_account() {
+        let raw = vec![0u8; 100];
+        let err = parse_and_verify_membership(&raw, 0, Fr::from(1u64), None).unwrap_err();
+        match err {
+            TransactSubmitError::ShortAccount(msg) => assert_eq!(msg, "merkle_tree"),
+            _ => panic!("expected ShortAccount, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_and_verify_membership_custom_path_invalid_length() {
+        let raw = vec![0u8; 56 + TX_LEVELS * 32 + ROOT_HISTORY_SIZE * 32];
+        let err = parse_and_verify_membership(
+            &raw,
+            0,
+            Fr::from(1u64),
+            Some(vec![[0u8; 32]; TX_LEVELS - 1]),
+        )
+        .unwrap_err();
+        match err {
+            TransactSubmitError::RootMismatch { leaf_index } => assert_eq!(leaf_index, 0),
+            _ => panic!("expected RootMismatch, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_and_verify_membership_frontier_tip_root() {
+        let mut raw = vec![0u8; 56 + TX_LEVELS * 32 + ROOT_HISTORY_SIZE * 32];
+        let leaf = Fr::from(12345u64);
+
+        // Precompute zero subtrees and fold index 0
+        let mut zeros = vec![Fr::from(0u64)];
+        for k in 0..TX_LEVELS {
+            zeros.push(v3_merkle_pair(zeros[k], zeros[k]));
+        }
+        let mut cur = leaf;
+        for level in 0..TX_LEVELS {
+            cur = v3_merkle_pair(cur, zeros[level]);
+        }
+        let tip_root = fr_to_le(&cur);
+        raw[24..56].copy_from_slice(&tip_root);
+        raw[56..56 + 32].copy_from_slice(&fr_to_le(&leaf));
+
+        let membership = parse_and_verify_membership(&raw, 0, leaf, None).unwrap();
+        assert_eq!(membership.leaf_index, 0);
+        assert_eq!(membership.root, tip_root);
+        assert_eq!(membership.path.len(), TX_LEVELS);
+    }
+
+    #[test]
+    fn test_parse_and_verify_membership_historical_root_in_root_history() {
+        let mut raw = vec![0u8; 56 + TX_LEVELS * 32 + ROOT_HISTORY_SIZE * 32];
+        let tip_root = [0x55u8; 32];
+        raw[24..56].copy_from_slice(&tip_root);
+
+        let leaf = Fr::from(777u64);
+        let custom_path = vec![[0x11u8; 32]; TX_LEVELS];
+
+        // Fold custom path
+        let mut cur = leaf;
+        for (level, sib) in custom_path.iter().enumerate() {
+            let s = Fr::from_le_bytes_mod_order(sib);
+            cur = if (0 >> level) & 1 == 1 {
+                v3_merkle_pair(s, cur)
+            } else {
+                v3_merkle_pair(cur, s)
+            };
+        }
+        let historical_root = fr_to_le(&cur);
+        assert_ne!(historical_root, tip_root);
+
+        // Place historical root into root_history ring buffer slot 7
+        let history_start = 56 + TX_LEVELS * 32;
+        let slot_offset = history_start + 7 * 32;
+        raw[slot_offset..slot_offset + 32].copy_from_slice(&historical_root);
+
+        let membership = parse_and_verify_membership(&raw, 0, leaf, Some(custom_path.clone())).unwrap();
+        assert_eq!(membership.leaf_index, 0);
+        assert_eq!(membership.root, historical_root);
+        assert_eq!(membership.path, custom_path);
+    }
+
+    #[test]
+    fn test_parse_and_verify_membership_root_mismatch() {
+        let mut raw = vec![0u8; 56 + TX_LEVELS * 32 + ROOT_HISTORY_SIZE * 32];
+        let tip_root = [0x55u8; 32];
+        raw[24..56].copy_from_slice(&tip_root);
+
+        let leaf = Fr::from(777u64);
+        let custom_path = vec![[0x11u8; 32]; TX_LEVELS];
+
+        let err = parse_and_verify_membership(&raw, 0, leaf, Some(custom_path)).unwrap_err();
+        match err {
+            TransactSubmitError::RootMismatch { leaf_index } => assert_eq!(leaf_index, 0),
+            _ => panic!("expected RootMismatch, got {err:?}"),
+        }
     }
 }
