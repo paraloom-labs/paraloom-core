@@ -317,6 +317,21 @@ enum ValidatorCommands {
         program_id: Option<String>,
     },
 
+    /// Deactivate this validator on-chain (administrative)
+    Deactivate {
+        /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
+        #[arg(long)]
+        keypair: Option<PathBuf>,
+
+        /// Solana RPC URL (default: devnet)
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Bridge program ID (default: canonical devnet deployment)
+        #[arg(long)]
+        program_id: Option<String>,
+    },
+
     /// Withdraw stake that has finished unbonding (after unregister)
     WithdrawUnbonded {
         /// Validator wallet keypair (also via VALIDATOR_KEYPAIR_PATH)
@@ -1583,19 +1598,25 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("Validator Account PDA: {}", validator_account_pda);
                 println!("Validator Registry PDA: {}\n", validator_registry_pda);
 
-                // Anchor discriminator for `unregister_validator` (no args).
-                let discriminator: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
-                let data = discriminator.to_vec();
+                // FIX #1256.1: Use builder + pre-flight check
+                let validator_account_data = client
+                    .get_account_data(&validator_account_pda)
+                    .context("Failed to read validator account (is it registered?)")?;
+                
+                let (_, _, _, _, is_active) = decode_validator_account(&validator_account_data)
+                    .context("Failed to decode validator account")?;
+                
+                anyhow::ensure!(
+                    is_active,
+                    "validator not active - already unregistered or deactivated"
+                );
+                println!("Pre-flight check: validator is active ✅\n");
 
-                let ix = solana_sdk::instruction::Instruction {
-                    program_id,
-                    accounts: vec![
-                        solana_sdk::instruction::AccountMeta::new(validator_account_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator_registry_pda, false),
-                        solana_sdk::instruction::AccountMeta::new(validator.pubkey(), true),
-                    ],
-                    data,
-                };
+                let ix = create_unregister_validator_instruction(
+                    &program_id,
+                    &validator.pubkey(),
+                )
+                .map_err(|e| anyhow::anyhow!("failed to build unregister instruction: {e}"))?;
 
                 let blockhash = client
                     .get_latest_blockhash()
@@ -1619,6 +1640,87 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     "  Stake is now unbonding and still slashable. Reclaim it after the \
                      unbonding period with: paraloom validator withdraw-unbonded"
                 );
+                println!("\nVerify with: paraloom validator list");
+            }
+
+            #[cfg(not(feature = "solana-bridge"))]
+            {
+                anyhow::bail!(
+                    "Solana bridge feature not enabled. Rebuild with --features solana-bridge"
+                );
+            }
+
+            Ok(())
+        }
+
+        ValidatorCommands::Deactivate {
+            keypair,
+            rpc_url,
+            program_id,
+        } => {
+            println!("Deactivating validator on-chain (administrative)...\n");
+
+            #[cfg(feature = "solana-bridge")]
+            {
+                const DEFAULT_PROGRAM_ID: &str = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP";
+
+                let rpc_url = rpc_url
+                    .or_else(|| std::env::var("SOLANA_RPC_URL").ok())
+                    .unwrap_or_else(|| "https://api.devnet.solana.com".to_string());
+
+                let keypair_path = keypair
+                    .or_else(|| {
+                        std::env::var("VALIDATOR_KEYPAIR_PATH")
+                            .ok()
+                            .map(PathBuf::from)
+                    })
+                    .context(
+                        "Validator keypair not specified. Use --keypair or VALIDATOR_KEYPAIR_PATH",
+                    )?;
+
+                let program_id_str = program_id
+                    .or_else(|| std::env::var("SOLANA_PROGRAM_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_PROGRAM_ID.to_string());
+
+                println!("RPC URL: {}", rpc_url);
+                println!("Program ID: {}", program_id_str);
+                println!("Validator Keypair: {}\n", keypair_path.display());
+
+                let program_id = Pubkey::from_str(&program_id_str).context("Invalid program ID")?;
+
+                let validator =
+                    load_keypair_from_file(keypair_path.to_str().context("Invalid keypair path")?)
+                        .context("Failed to load keypair")?;
+                println!("Validator Address: {}\n", validator.pubkey());
+
+                let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+                // FIX #1256.3: Add missing deactivate subcommand
+                // Program and SDK support deactivation, CLI was missing it
+                let ix = create_deactivate_validator_instruction(
+                    &program_id,
+                    &validator.pubkey(),
+                )
+                .map_err(|e| anyhow::anyhow!("failed to build deactivate instruction: {e}"))?;
+
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .context("Failed to get blockhash")?;
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix],
+                    Some(&validator.pubkey()),
+                    &[&validator],
+                    blockhash,
+                );
+
+                println!("Deactivating validator...");
+                let signature = client
+                    .send_and_confirm_transaction(&tx)
+                    .context("Failed to send transaction")?;
+
+                println!("\n[OK] Validator deactivated!");
+                println!("  Transaction: {}", signature);
+                println!("  Validator:   {}", validator.pubkey());
                 println!("\nVerify with: paraloom validator list");
             }
 
@@ -1680,9 +1782,10 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 let registry_data = client
                     .get_account_data(&validator_registry_pda)
                     .context("Failed to read validator registry (is it initialized?)")?;
+                // FIX #1282.8 + #1256: registry is 112 bytes, not 104 (dual-stake layout)
                 anyhow::ensure!(
-                    registry_data.len() >= 104,
-                    "validator registry predates the dual-stake layout"
+                    registry_data.len() >= 112,
+                    "validator registry predates the dual-stake layout — redeploy the program first"
                 );
                 let stake_mint = Pubkey::new_from_array(
                     registry_data[72..104]
@@ -2179,3 +2282,4 @@ file = ".paraloom/logs/paraloom.log"
 
     Ok(())
 }
+
