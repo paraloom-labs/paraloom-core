@@ -1279,7 +1279,6 @@ pub mod paraloom_program {
     /// Upgrade-authority-gated and starts at 0, so a mint is inert until the
     /// cold authority deliberately opens it.
     pub fn set_asset_deposit_cap(ctx: Context<SetAssetDepositCap>, new_cap: u64) -> Result<()> {
-        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let config = &mut ctx.accounts.asset_config;
         let previous = config.deposit_cap;
         config.deposit_cap = new_cap;
@@ -1288,6 +1287,29 @@ pub mod paraloom_program {
             config.mint,
             previous,
             new_cap
+        );
+        Ok(())
+    }
+
+    /// Rotate the validator-registry authority to a new key.
+    ///
+    /// Gated on the CURRENT registry authority, so the cold key can hand off
+    /// control (e.g. to a new cold key) without a redeploy. This keeps the
+    /// registry authority — and therefore `set_asset_deposit_cap` and other
+    /// registry-authority-gated controls — adjustable even after the program is
+    /// made immutable (`--final`).
+    pub fn set_validator_registry_authority(
+        ctx: Context<SetValidatorRegistryAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let registry = &mut ctx.accounts.validator_registry;
+        let previous = registry.authority;
+        registry.authority = new_authority;
+
+        msg!(
+            "Validator registry authority rotated: {} -> {}",
+            previous,
+            new_authority
         );
         Ok(())
     }
@@ -2281,18 +2303,32 @@ pub struct SetAssetDepositCap<'info> {
     #[account(mut, seeds = [b"asset_config", asset_config.mint.as_ref()], bump = asset_config.bump)]
     pub asset_config: Account<'info, AssetConfig>,
 
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// Upgrade-authority gate (#204).
-    ///
-    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    // Cold-authority gated (see `SetDepositCap`): the SPL deposit cap is
+    // managed by the registry authority, not the BPF upgrade authority, so it
+    // stays adjustable even after the program is made immutable.
     #[account(
-        seeds = [crate::ID.as_ref()],
+        seeds = [b"validator_registry"],
         bump,
-        seeds::program = bpf_loader_upgradeable::id(),
+        has_one = authority
     )]
-    pub program_data: UncheckedAccount<'info>,
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
+}
+
+/// Accounts for [`set_validator_registry_authority`] — rotate the cold registry
+/// authority key.
+#[derive(Accounts)]
+pub struct SetValidatorRegistryAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
 }
 
 /// Accounts for [`deposit_note_spl`] — shield an SPL token into a note (#779).
