@@ -86,7 +86,9 @@ impl R1CSToQAP for CircomReduction {
         domain.ifft_in_place(&mut b);
 
         let root_of_unity = {
-            let domain_size_double = 2 * domain_size;
+            let domain_size_double = domain_size
+                .checked_mul(2)
+                .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             let domain_double =
                 D::new(domain_size_double).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             domain_double.element(1)
@@ -118,7 +120,11 @@ impl R1CSToQAP for CircomReduction {
     ) -> Result<Vec<F>, SynthesisError> {
         // The usual H query has domain-1 powers and Z has domain powers, so
         // HZ has 2*domain-1.
-        let mut scalars = (0..2 * max_power + 1)
+        let num_scalars = max_power
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let mut scalars = (0..num_scalars)
             .map(|i| delta_inverse * t.pow([i as u64]))
             .collect::<Vec<_>>();
         let domain_size = scalars.len();
