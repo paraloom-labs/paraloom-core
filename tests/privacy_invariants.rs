@@ -55,3 +55,21 @@ proptest! {
         result?;
     }
 }
+
+
+#[test]
+fn merkle_root_history_len_matches_on_chain_capacity() {
+    // #1230: Off-chain commitment tree recent_roots buffer capacity must align
+    // with on-chain Anchor program's ROOT_HISTORY_SIZE (64).
+    // Note: The on-chain constant is defined as `ROOT_HISTORY_SIZE: usize = 64` in
+    // `programs/paraloom/src/merkle_tree.rs:37`. Because the Anchor program crate is built
+    // as a separate workspace with dedicated Solana toolchain constraints, cross-crate
+    // assertions cannot be imported directly into `tests/`. If `ROOT_HISTORY_SIZE` in
+    // `programs/paraloom/src/merkle_tree.rs` is ever modified, this test and
+    // `ROOT_HISTORY_LEN` in `src/privacy/merkle.rs` must move with it.
+    assert_eq!(
+        crate::privacy::merkle::ROOT_HISTORY_LEN,
+        64,
+        "Off-chain ROOT_HISTORY_LEN must match on-chain ROOT_HISTORY_SIZE (64) in programs/paraloom/src/merkle_tree.rs"
+    );
+}

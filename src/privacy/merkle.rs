@@ -24,7 +24,7 @@ pub const DEFAULT_TREE_DEPTH: usize = 32;
 /// same proof without holding byte-identical trees, the way Tornado-style pools
 /// keep a roots ring buffer. Double-spend is still prevented by the nullifier,
 /// independent of which historical root a proof names.
-pub const ROOT_HISTORY_LEN: usize = 256;
+pub const ROOT_HISTORY_LEN: usize = 64;
 
 pub struct MerkleTree {
     /// Tree depth
