@@ -756,6 +756,33 @@ pub mod paraloom_program {
         Ok(())
     }
 
+    /// Rotate the validator registry authority to a new key (#1299).
+    ///
+    /// `initialize_validator_registry` (#204) pins the registry authority to
+    /// the program's upgrade authority at genesis. This instruction allows
+    /// rotating the registry authority to a cold key, Squads multisig, or
+    /// DAO governance PDA so parameter control and emergency TVL controls
+    /// can be exercised independently of (and persist after) program immutability.
+    pub fn set_registry_authority(
+        ctx: Context<SetRegistryAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            BridgeError::InvalidValidator
+        );
+        let registry = &mut ctx.accounts.validator_registry;
+        let previous = registry.authority;
+        registry.authority = new_authority;
+
+        msg!(
+            "Validator registry authority rotated: {} -> {}",
+            previous,
+            new_authority
+        );
+        Ok(())
+    }
+
     /// Set the pool deposit cap: the maximum the vault's current balance may
     /// reach via deposits.
     ///
@@ -1276,10 +1303,10 @@ pub mod paraloom_program {
     ///
     /// The SPL analogue of `set_deposit_cap`: bounds funds-at-risk for one
     /// shielded token to a chosen ceiling on the vault's live token balance.
-    /// Upgrade-authority-gated and starts at 0, so a mint is inert until the
-    /// cold authority deliberately opens it.
+    /// Gated on the validator registry authority (mirroring `set_deposit_cap`),
+    /// and starts at 0, so a mint is inert until the cold authority deliberately
+    /// opens it.
     pub fn set_asset_deposit_cap(ctx: Context<SetAssetDepositCap>, new_cap: u64) -> Result<()> {
-        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let config = &mut ctx.accounts.asset_config;
         let previous = config.deposit_cap;
         config.deposit_cap = new_cap;
@@ -2080,6 +2107,19 @@ pub struct SetBridgeAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetRegistryAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SetDepositCap<'info> {
     #[account(
         mut,
@@ -2281,18 +2321,14 @@ pub struct SetAssetDepositCap<'info> {
     #[account(mut, seeds = [b"asset_config", asset_config.mint.as_ref()], bump = asset_config.bump)]
     pub asset_config: Account<'info, AssetConfig>,
 
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// Upgrade-authority gate (#204).
-    ///
-    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
     #[account(
-        seeds = [crate::ID.as_ref()],
+        seeds = [b"validator_registry"],
         bump,
-        seeds::program = bpf_loader_upgradeable::id(),
+        has_one = authority
     )]
-    pub program_data: UncheckedAccount<'info>,
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
 }
 
 /// Accounts for [`deposit_note_spl`] — shield an SPL token into a note (#779).

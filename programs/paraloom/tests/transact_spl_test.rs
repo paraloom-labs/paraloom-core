@@ -277,8 +277,8 @@ async fn transact_spl_settles_a_token_withdrawal() {
             .data(),
             accounts: accounts::SetAssetDepositCap {
                 asset_config,
+                validator_registry: registry_pda,
                 authority: upgrade_authority.pubkey(),
-                program_data: program_data_pda,
             }
             .to_account_metas(None),
         },

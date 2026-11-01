@@ -18,7 +18,9 @@ use solana_sdk::{
 };
 
 mod common;
-use common::{add_program_data, add_stake_mint, add_token_account, program_test};
+use common::{
+    add_program_data, add_stake_mint, add_token_account, init_validator_registry_ix, program_test,
+};
 
 const DEPOSIT: u64 = 1_000_000;
 const DEPOSITOR_FUND: u64 = 10_000_000;
@@ -45,6 +47,7 @@ async fn init_spl_pool(
 ) {
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (asset_vault, asset_vault_authority, asset_config) = asset_vault_pdas(program_id, mint);
 
     let init_state = Instruction {
@@ -73,6 +76,12 @@ async fn init_spl_pool(
         }
         .to_account_metas(None),
     };
+    let init_registry = init_validator_registry_ix(
+        program_id,
+        upgrade_authority.pubkey(),
+        program_data_pda,
+        mint,
+    );
     let init_vault = Instruction {
         program_id,
         data: instruction::InitAssetVault {}.data(),
@@ -94,8 +103,8 @@ async fn init_spl_pool(
         data: instruction::SetAssetDepositCap { new_cap: cap }.data(),
         accounts: accounts::SetAssetDepositCap {
             asset_config,
+            validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
-            program_data: program_data_pda,
         }
         .to_account_metas(None),
     };
@@ -105,7 +114,7 @@ async fn init_spl_pool(
     // reliably under solana-program-test; on mainnet these are separate
     // cold-authority operations anyway.
     let mut tx = Transaction::new_with_payer(
-        &[init_state, init_tree, init_vault],
+        &[init_state, init_tree, init_registry, init_vault],
         Some(&upgrade_authority.pubkey()),
     );
     tx.sign(&[upgrade_authority], blockhash);
