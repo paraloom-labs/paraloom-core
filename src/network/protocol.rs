@@ -44,14 +44,20 @@ const PARALOOM_TOPIC: &str = "paraloom/v1";
 /// the PeerId without dialling first; if the operator gives us a
 /// bare network multiaddr (no /p2p/ suffix) we fall back to dial
 /// only.
+///
+/// A relay-v2 circuit address may contain both the relay peer ID
+/// and the final target peer ID:
+///
+/// `/ip4/<relay-ip>/tcp/<port>/p2p/<relay-peer>/p2p-circuit/p2p/<target-peer>`
+///
+/// Only the terminal `/p2p` component identifies the dial target.
+/// In particular, a bare relay circuit address ending in
+/// `/p2p-circuit` has no target peer ID and must return `None`.
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-            Some(peer_id)
-        } else {
-            None
-        }
-    })
+    match addr.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => Some(peer_id),
+        _ => None,
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -1253,6 +1259,56 @@ mod tests {
     fn peer_id_returns_none_for_bare_multiaddr() {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("multiaddr parses");
         assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
+
+    #[test]
+    fn extracts_trailing_target_peer_id_from_relay_circuit_address() {
+        let relay_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let target_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+
+        let addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}/p2p-circuit/p2p/{target_peer}"
+        )
+        .parse()
+        .expect("relay circuit target multiaddr must parse");
+
+        assert_eq!(
+            peer_id_from_multiaddr(&addr),
+            Some(target_peer),
+            "the trailing target peer must win over the relay peer"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_relay_circuit_address_without_target_peer_id() {
+        let relay_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+
+        let addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}/p2p-circuit"
+        )
+        .parse()
+        .expect("bare relay circuit multiaddr must parse");
+
+        assert_eq!(
+            peer_id_from_multiaddr(&addr),
+            None,
+            "the relay peer is not the target peer for a bare circuit address"
+        );
+    }
+
+    #[test]
+    fn uses_last_peer_id_when_multiple_peer_id_components_are_present() {
+        let first_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let trailing_peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+
+        let addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/4001/p2p/{first_peer}/p2p-circuit/p2p/{trailing_peer}"
+        )
+        .parse()
+        .expect("multi-peer multiaddr must parse");
+
+        assert_ne!(first_peer, trailing_peer);
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(trailing_peer));
     }
 
     #[tokio::test]
