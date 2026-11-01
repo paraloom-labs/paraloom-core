@@ -1493,11 +1493,34 @@ impl Node {
             // validator.toml to settle with a small live cohort (2/2), otherwise
             // it never reaches a Valid quorum and settlement silently times out.
             // The on-chain stake-weighted 2/3 quorum stays the real security gate.
-            if let (Some(min), Some(total)) = (
-                settings.bridge.consensus_min_validators,
-                settings.bridge.consensus_total_validators,
-            ) {
-                coord.set_consensus_thresholds(min, total);
+            // Resolve single-sided overrides independently so that configuring
+            // only one of the two knobs is not silently dropped (#1300).
+            if settings.bridge.consensus_min_validators.is_some()
+                || settings.bridge.consensus_total_validators.is_some()
+            {
+                let min = settings
+                    .bridge
+                    .consensus_min_validators
+                    .unwrap_or(crate::consensus::transact::DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS);
+                let total = settings
+                    .bridge
+                    .consensus_total_validators
+                    .unwrap_or(crate::consensus::transact::DEFAULT_TOTAL_VALIDATORS);
+                // Adjust total upward when only a larger `min` (> default total)
+                // was configured, unless `total` was explicitly set, so
+                // `set_consensus_thresholds` logs and falls back on genuinely
+                // invalid explicit pairs (`min > total`).
+                let effective_total = if settings.bridge.consensus_total_validators.is_none() {
+                    total.max(min)
+                } else {
+                    total
+                };
+                coord.set_consensus_thresholds(min, effective_total);
+            }
+            // Wire `consensus_min_reputation` into the coordinator so a
+            // configured reputation floor is actually enforced.
+            if let Some(rep) = settings.bridge.consensus_min_reputation {
+                coord.set_min_reputation_for_consensus(rep);
             }
             (Some(Arc::new(coord)), Some(rx))
         } else {
