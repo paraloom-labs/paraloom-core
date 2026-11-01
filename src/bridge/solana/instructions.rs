@@ -1178,11 +1178,16 @@ mod tests {
             ix.accounts[0].pubkey,
             derive_validator_account(&program_id, &validator).0
         );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
         assert_eq!(
             ix.accounts[1].pubkey,
             derive_validator_registry(&program_id).0
         );
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
         assert_eq!(ix.accounts[2].pubkey, validator);
+        assert!(ix.accounts[2].is_writable);
         assert!(ix.accounts[2].is_signer);
         assert_eq!(ix.data, discriminators::UNREGISTER_VALIDATOR.to_vec());
     }
@@ -1310,5 +1315,116 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_deactivate_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator_wallet = Pubkey::new_unique();
+
+        let ix = create_deactivate_validator_instruction(
+            &program_id,
+            &authority,
+            &validator_wallet,
+        )
+        .expect("build deactivate_validator instruction");
+
+        assert_eq!(ix.program_id, program_id);
+        // validator_account (mut), validator_registry (mut), authority (mut signer).
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator_wallet).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(ix.accounts[2].pubkey, authority);
+        assert!(ix.accounts[2].is_writable);
+        assert!(ix.accounts[2].is_signer);
+
+        assert_eq!(ix.data, discriminators::DEACTIVATE_VALIDATOR.to_vec());
+    }
+
+    #[test]
+    fn test_create_register_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let validator_token_account = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+        let stake_amount = 2_000_000_000u64;
+        let token_stake_amount = 50_000_000_000u64;
+
+        let ix = create_register_validator_instruction(
+            &program_id,
+            &validator,
+            &stake_mint,
+            &validator_token_account,
+            &token_program,
+            stake_amount,
+            token_stake_amount,
+        )
+        .expect("build register_validator instruction");
+
+        assert_eq!(ix.program_id, program_id);
+        // validator_account (mut), validator_registry (mut), validator (mut signer),
+        // stake_mint (readonly), validator_token_account (mut), stake_token_vault (mut),
+        // token_program (readonly), system_program (readonly).
+        assert_eq!(ix.accounts.len(), 8);
+
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert!(!ix.accounts[0].is_signer);
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(ix.accounts[2].pubkey, validator);
+        assert!(ix.accounts[2].is_writable);
+        assert!(ix.accounts[2].is_signer);
+
+        assert_eq!(ix.accounts[3].pubkey, stake_mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        assert_eq!(ix.accounts[4].pubkey, validator_token_account);
+        assert!(ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        assert_eq!(
+            ix.accounts[5].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
+
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert!(!ix.accounts[6].is_writable);
+        assert!(!ix.accounts[6].is_signer);
+
+        assert_eq!(ix.accounts[7].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[7].is_writable);
+        assert!(!ix.accounts[7].is_signer);
+
+        assert_eq!(&ix.data[..8], &discriminators::REGISTER_VALIDATOR);
+        assert_eq!(&ix.data[8..16], &stake_amount.to_le_bytes());
+        assert_eq!(&ix.data[16..24], &token_stake_amount.to_le_bytes());
+        assert_eq!(ix.data.len(), 24);
     }
 }
