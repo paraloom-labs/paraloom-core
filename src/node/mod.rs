@@ -1493,11 +1493,29 @@ impl Node {
             // validator.toml to settle with a small live cohort (2/2), otherwise
             // it never reaches a Valid quorum and settlement silently times out.
             // The on-chain stake-weighted 2/3 quorum stays the real security gate.
-            if let (Some(min), Some(total)) = (
-                settings.bridge.consensus_min_validators,
-                settings.bridge.consensus_total_validators,
-            ) {
-                coord.set_consensus_thresholds(min, total);
+            if settings.bridge.consensus_min_validators.is_some()
+                || settings.bridge.consensus_total_validators.is_some()
+            {
+                let min = settings
+                    .bridge
+                    .consensus_min_validators
+                    .unwrap_or(crate::consensus::transact::DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS);
+                let total = settings
+                    .bridge
+                    .consensus_total_validators
+                    .unwrap_or(crate::consensus::transact::DEFAULT_TOTAL_VALIDATORS);
+                // Adjust total upward when only a larger `min` (> 10) was configured
+                // unless `total` was explicitly set, so `set_consensus_thresholds` logs
+                // and falls back on genuinely invalid explicit pairs (`min > total`).
+                let effective_total = if settings.bridge.consensus_total_validators.is_none() {
+                    total.max(min)
+                } else {
+                    total
+                };
+                coord.set_consensus_thresholds(min, effective_total);
+            }
+            if let Some(min_rep) = settings.bridge.consensus_min_reputation {
+                coord.set_min_reputation_for_consensus(min_rep);
             }
             (Some(Arc::new(coord)), Some(rx))
         } else {
@@ -3633,5 +3651,195 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    fn sample_canonical_transact_request(
+        seed: u8,
+    ) -> crate::consensus::transact::TransactVerificationRequest {
+        let mut req = crate::consensus::transact::TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [0u8; 32],
+            mint: None,
+            nullifiers: [[seed; 32], [seed.wrapping_add(1); 32]],
+            output_commitments: [[seed.wrapping_add(2); 32], [seed.wrapping_add(3); 32]],
+            root: [seed.wrapping_add(4); 32],
+            ext_amount: 0,
+            proof: vec![1u8; 256],
+            ciphertexts: [String::new(), String::new()],
+            timestamp: 1,
+        };
+        req.request_id = req.canonical_id();
+        req
+    }
+
+    #[tokio::test]
+    async fn node_bridge_consensus_config_overrides_and_reputation_floor() {
+        use crate::consensus::transact::{
+            TransactVerificationResult, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
+        };
+        use crate::consensus::vote_tally::VerificationVote;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // 1. Single-sided `consensus_min_validators = Some(9)` is applied:
+        //    7 registered validators fail start_verification with "7 < 9",
+        //    registering 9 validators succeeds.
+        let mut stricter = Settings::development();
+        let dir1 = tmp.path().join("stricter");
+        std::fs::create_dir_all(&dir1).unwrap();
+        stricter.storage.data_dir = dir1.to_string_lossy().into_owned();
+        stricter.node.node_type = "Validator".to_string();
+        stricter.bridge.enabled = true;
+        stricter.bridge.consensus_min_validators = Some(9);
+        stricter.bridge.consensus_total_validators = None;
+
+        let node_stricter = Node::new(stricter).unwrap();
+        let coord_stricter = node_stricter.transact_coordinator.as_ref().unwrap();
+        for i in 0..7u8 {
+            coord_stricter
+                .register_validator(NodeId(vec![10 + i; 32]))
+                .await;
+        }
+        let err_with_7 = coord_stricter
+            .start_verification(sample_canonical_transact_request(1))
+            .await
+            .unwrap_err();
+        assert!(err_with_7.to_string().contains("7 < 9"));
+
+        for i in 7..9u8 {
+            coord_stricter
+                .register_validator(NodeId(vec![10 + i; 32]))
+                .await;
+        }
+        assert!(coord_stricter
+            .start_verification(sample_canonical_transact_request(1))
+            .await
+            .is_ok());
+
+        // 2. Single-sided `consensus_min_validators = Some(3)` is applied:
+        //    4 registered validators pass start_verification.
+        let mut small_cohort = Settings::development();
+        let dir2 = tmp.path().join("small_cohort");
+        std::fs::create_dir_all(&dir2).unwrap();
+        small_cohort.storage.data_dir = dir2.to_string_lossy().into_owned();
+        small_cohort.node.node_type = "Validator".to_string();
+        small_cohort.bridge.enabled = true;
+        small_cohort.bridge.consensus_min_validators = Some(3);
+        small_cohort.bridge.consensus_total_validators = None;
+
+        let node_small = Node::new(small_cohort).unwrap();
+        let coord_small = node_small.transact_coordinator.as_ref().unwrap();
+        for i in 0..4u8 {
+            coord_small
+                .register_validator(NodeId(vec![30 + i; 32]))
+                .await;
+        }
+        assert!(coord_small
+            .start_verification(sample_canonical_transact_request(10))
+            .await
+            .is_ok());
+
+        // 3. Single-sided `consensus_total_validators = Some(20)` is applied:
+        //    1 vote reports 5.0% (1/20), not 10.0% (1/10).
+        let mut custom_total = Settings::development();
+        let dir2b = tmp.path().join("custom_total");
+        std::fs::create_dir_all(&dir2b).unwrap();
+        custom_total.storage.data_dir = dir2b.to_string_lossy().into_owned();
+        custom_total.node.node_type = "Validator".to_string();
+        custom_total.bridge.enabled = true;
+        custom_total.bridge.consensus_min_validators = None;
+        custom_total.bridge.consensus_total_validators = Some(20);
+
+        let node_total = Node::new(custom_total).unwrap();
+        let coord_total = node_total.transact_coordinator.as_ref().unwrap();
+        for i in 0..7u8 {
+            coord_total
+                .register_validator(NodeId(vec![70 + i; 32]))
+                .await;
+        }
+        let req_total_id = coord_total
+            .start_verification(sample_canonical_transact_request(15))
+            .await
+            .unwrap();
+        coord_total
+            .submit_result(TransactVerificationResult {
+                request_id: req_total_id.clone(),
+                validator: NodeId(vec![70u8; 32]),
+                vote: VerificationVote::Valid,
+                timestamp: 1,
+                wallet_pubkey: "WalletT111111111111111111111111111111111111".to_string(),
+                signature: vec![1u8; 64],
+            })
+            .await
+            .unwrap();
+        let (pct, _, _) = coord_total.get_status(&req_total_id).await.unwrap();
+        assert!((pct - 5.0).abs() < 1e-6);
+
+        // 4. `consensus_min_reputation = Some(500)` is wired:
+        //    validators with reputation 100 (< 500) have votes dropped and do not reach consensus.
+        let dir3 = tmp.path().join("rep_enforced");
+        std::fs::create_dir_all(&dir3).unwrap();
+        let n1 = NodeId(vec![51u8; 32]);
+        let n2 = NodeId(vec![52u8; 32]);
+        {
+            let rep_path = dir3.join("reputation.json");
+            let tracker =
+                crate::consensus::reputation::ReputationTracker::with_persistence(rep_path);
+            tracker.register_validator(n1.clone()).await;
+            tracker.register_validator(n2.clone()).await;
+            for _ in 0..30 {
+                tracker.record_failure(&n1).await.unwrap();
+                tracker.record_failure(&n2).await.unwrap();
+            }
+            assert!(
+                tracker.get_reputation(&n1).await.unwrap() < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+            );
+            assert!(
+                tracker.get_reputation(&n2).await.unwrap() < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+            );
+        }
+
+        let mut rep_cfg = Settings::development();
+        rep_cfg.storage.data_dir = dir3.to_string_lossy().into_owned();
+        rep_cfg.node.node_type = "Validator".to_string();
+        rep_cfg.bridge.enabled = true;
+        rep_cfg.bridge.consensus_min_validators = Some(2);
+        rep_cfg.bridge.consensus_total_validators = Some(2);
+        rep_cfg.bridge.consensus_min_reputation = Some(500);
+
+        let node_rep = Node::new(rep_cfg).unwrap();
+        let coord_rep = node_rep.transact_coordinator.as_ref().unwrap();
+        assert_eq!(coord_rep.min_reputation_for_consensus(), 500);
+        let w1 = "Wallet1111111111111111111111111111111111111".to_string();
+        let w2 = "Wallet2222222222222222222222222222222222222".to_string();
+        let mut stakes = HashMap::new();
+        stakes.insert(w1.clone(), 5_000_000_000);
+        stakes.insert(w2.clone(), 5_000_000_000);
+        coord_rep.sync_onchain_stakes(stakes, 10_000_000_000).await;
+        coord_rep
+            .register_validator_with_wallet(n1.clone(), Some(w1.clone()))
+            .await;
+        coord_rep
+            .register_validator_with_wallet(n2.clone(), Some(w2.clone()))
+            .await;
+
+        let req_id = coord_rep
+            .start_verification(sample_canonical_transact_request(20))
+            .await
+            .unwrap();
+        for (node_id, wallet) in [(n1, w1), (n2, w2)] {
+            coord_rep
+                .submit_result(TransactVerificationResult {
+                    request_id: req_id.clone(),
+                    validator: node_id,
+                    vote: VerificationVote::Valid,
+                    timestamp: 1,
+                    wallet_pubkey: wallet,
+                    signature: vec![1u8; 64],
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(coord_rep.check_consensus(&req_id).await.unwrap(), None);
     }
 }

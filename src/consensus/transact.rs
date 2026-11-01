@@ -322,6 +322,9 @@ pub struct TransactVerificationCoordinator {
     /// Where the equivocator ban set is persisted (sibling of reputation.json).
     /// `None` = in-memory only (unit/unconfigured case).
     equivocators_path: Option<std::path::PathBuf>,
+
+    /// Minimum reputation floor for consensus participation.
+    min_reputation_for_consensus: u64,
 }
 
 impl TransactVerificationCoordinator {
@@ -345,6 +348,7 @@ impl TransactVerificationCoordinator {
             local_wallet: None,
             equivocators: Arc::new(RwLock::new(HashSet::new())),
             equivocators_path: None,
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
         }
     }
 
@@ -480,6 +484,11 @@ impl TransactVerificationCoordinator {
             {
                 continue;
             }
+            if let Some(rep) = self.reputation_tracker.get_reputation(&rec.node_id).await {
+                if rep < self.min_reputation_for_consensus {
+                    continue;
+                }
+            }
             counted_stake =
                 counted_stake.saturating_add(onchain_stakes.get(wallet).copied().unwrap_or(0));
         }
@@ -518,12 +527,25 @@ impl TransactVerificationCoordinator {
     }
 
     /// The eligibility basis for counting: the staked on-chain co-sign wallets
-    /// minus any banned for equivocation. Replaces the flap-prone
-    /// `active_snapshot()` NodeId set at every tally call site.
+    /// minus any banned for equivocation or whose registered validator node has
+    /// reputation below the consensus floor (#1300).
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
         let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        let mut eligible: HashSet<String> = onchain.difference(&equivocators).cloned().collect();
+
+        let sel = self.leader_selector.read().await;
+        for info in sel.get_validators_by_weight() {
+            if let Some(wallet) = &info.wallet_pubkey {
+                if let Some(rep) = self.reputation_tracker.get_reputation(&info.node_id).await {
+                    if rep < self.min_reputation_for_consensus {
+                        eligible.remove(wallet);
+                    }
+                }
+            }
+        }
+
+        eligible
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -561,6 +583,16 @@ impl TransactVerificationCoordinator {
         }
         self.min_validators_for_consensus = min_validators_for_consensus;
         self.total_validators = total_validators;
+    }
+
+    /// Override the minimum reputation floor for consensus participation (#1300).
+    pub fn set_min_reputation_for_consensus(&mut self, min_reputation: u64) {
+        self.min_reputation_for_consensus = min_reputation;
+    }
+
+    /// Minimum reputation floor for consensus participation.
+    pub fn min_reputation_for_consensus(&self) -> u64 {
+        self.min_reputation_for_consensus
     }
 
     /// Reference to the slashing-evidence log (tests/pipelines read it).
@@ -874,6 +906,25 @@ impl TransactVerificationCoordinator {
                 log::warn!(
                     "dropping vote from non-staked wallet {} for {}",
                     result.wallet_pubkey,
+                    result.request_id
+                );
+                return Ok(());
+            }
+        }
+
+        // Reputation floor check (#1300): a validator below min_reputation_for_consensus
+        // may submit a vote, but it is dropped and not counted towards consensus.
+        if let Some(rep) = self
+            .reputation_tracker
+            .get_reputation(&result.validator)
+            .await
+        {
+            if rep < self.min_reputation_for_consensus {
+                log::warn!(
+                    "dropping vote from low-reputation validator {:?} (reputation {} < floor {}) for {}",
+                    result.validator,
+                    rep,
+                    self.min_reputation_for_consensus,
                     result.request_id
                 );
                 return Ok(());
@@ -1571,5 +1622,49 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn low_reputation_validator_vote_is_dropped_and_excluded_from_consensus() {
+        let (mut c, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        c.set_consensus_thresholds(2, 2);
+        c.set_min_reputation_for_consensus(300);
+        assert_eq!(c.min_reputation_for_consensus(), 300);
+        let n1 = NodeId(vec![1]);
+        let n2 = NodeId(vec![2]);
+        let w1 = "W1".to_string();
+        let w2 = "W2".to_string();
+        c.register_validator_with_wallet(n1.clone(), Some(w1.clone()))
+            .await;
+        c.register_validator_with_wallet(n2.clone(), Some(w2.clone()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        // Lower n2 reputation below floor (300)
+        for _ in 0..20 {
+            c.reputation_tracker.record_failure(&n2).await.unwrap();
+        }
+        let rep2 = c.reputation_tracker.get_reputation(&n2).await.unwrap();
+        assert!(rep2 < 300);
+
+        let req = canonical_request();
+        let req_id = c.start_verification(req).await.unwrap();
+
+        // Submit vote for n1 (reputation 1000 >= 300)
+        c.submit_result(vote(&req_id, 1, &w1, true)).await.unwrap();
+        // Submit vote for n2 (reputation < 300)
+        c.submit_result(vote(&req_id, 2, &w2, true)).await.unwrap();
+
+        // Consensus should not be reached because n2's vote was dropped
+        assert_eq!(c.check_consensus(&req_id).await.unwrap(), None);
+
+        // Eligible wallets must exclude W2
+        let eligible = c.eligible_wallets().await;
+        assert!(eligible.contains(&w1));
+        assert!(!eligible.contains(&w2));
     }
 }
