@@ -75,6 +75,13 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     let num_witness = matrices.num_witness_variables;
     let num_wires = num_instance + num_witness;
 
+    if num_instance == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_instance_variables must be at least 1 (constant-one wire)",
+        ));
+    }
+
     out.write_all(MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
     out.write_all(&3u32.to_le_bytes())?;
@@ -100,6 +107,19 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
 
     let mut constraints = Vec::new();
     let rows = |m: &Matrix<Fr>, i: usize| m.get(i).cloned().unwrap_or_default();
+    // Validate that all wire indices are in range.
+    for m in [&matrices.a, &matrices.b, &matrices.c] {
+        for row in m {
+            for (_, wire) in row {
+                if *wire >= num_wires {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("wire index {} out of range (max {})", wire, num_wires - 1),
+                    ));
+                }
+            }
+        }
+    }
     for i in 0..matrices.num_constraints {
         write_lc(&mut constraints, &rows(&matrices.a, i));
         write_lc(&mut constraints, &rows(&matrices.b, i));

@@ -89,6 +89,10 @@ fn check_g1(p: G1Affine, what: &str) -> Res<G1Affine> {
 fn g1(p: &G1Json, what: &str) -> Res<G1Affine> {
     let z = fq(&p[2])?;
     if z.is_zero() {
+        // Identity point: x and y must both be zero.
+        if fq(&p[0])? != Fq::ZERO || fq(&p[1])? != Fq::ZERO {
+            return Err(format!("{}: identity point must have x=y=0", what).into());
+        }
         return Ok(G1Affine::identity());
     }
     if z != Fq::ONE {
@@ -100,6 +104,12 @@ fn g1(p: &G1Json, what: &str) -> Res<G1Affine> {
 fn g2(p: &G2Json, what: &str) -> Res<G2Affine> {
     let z = Fq2::new(fq(&p[2][0])?, fq(&p[2][1])?);
     if z.is_zero() {
+        // Identity point: x and y must both be zero.
+        if fq(&p[0][0])? != Fq::ZERO || fq(&p[0][1])? != Fq::ZERO
+            || fq(&p[1][0])? != Fq::ZERO || fq(&p[1][1])? != Fq::ZERO
+        {
+            return Err(format!("{}: identity point must have x=y=0", what).into());
+        }
         return Ok(G2Affine::identity());
     }
     if z != Fq2::ONE {
@@ -162,6 +172,28 @@ fn main() -> Res<()> {
             zkey.num_public + 1
         )
         .into());
+    }
+    if zkey.num_public >= zkey.num_vars {
+        return Err(format!(
+            "nPublic ({}) must be less than nVars ({})",
+            zkey.num_public, zkey.num_vars
+        )
+        .into());
+    }
+    if zkey.c.len() != zkey.num_vars {
+        return Err(format!(
+            "C has {} entries, expected nVars = {}",
+            zkey.c.len(),
+            zkey.num_vars
+        )
+        .into());
+    }
+    if zkey.num_vars == 0 {
+        return Err("nVars must be greater than 0".into());
+    }
+    // domain_size must be a power of two
+    if zkey.domain_size == 0 || (zkey.domain_size & (zkey.domain_size - 1)) != 0 {
+        return Err(format!("domainSize {} is not a power of two", zkey.domain_size).into());
     }
     for (name, len) in [
         ("A", zkey.a.len()),
