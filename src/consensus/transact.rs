@@ -275,6 +275,10 @@ pub struct TransactVerificationCoordinator {
     /// Total validator-set size (percentage divisor)
     total_validators: usize,
 
+    /// Minimum reputation score for a validator to be admitted to the
+    /// consensus quorum. Defaults to `DEFAULT_MIN_REPUTATION_FOR_CONSENSUS`.
+    min_reputation_for_consensus: u64,
+
     /// Approval-event sender; `Some` only when built with
     /// [`new_with_approvals`](Self::new_with_approvals).
     approval_tx: Option<mpsc::UnboundedSender<ApprovedTransact>>,
@@ -336,6 +340,7 @@ impl TransactVerificationCoordinator {
             timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
             min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
             total_validators: DEFAULT_TOTAL_VALIDATORS,
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
             approval_tx: None,
             emitted: Arc::new(RwLock::new(HashSet::new())),
             local_node_id: None,
@@ -561,6 +566,11 @@ impl TransactVerificationCoordinator {
         }
         self.min_validators_for_consensus = min_validators_for_consensus;
         self.total_validators = total_validators;
+    }
+
+    /// Override the minimum reputation floor for consensus admission.
+    pub fn set_min_reputation_for_consensus(&mut self, min_reputation: u64) {
+        self.min_reputation_for_consensus = min_reputation;
     }
 
     /// Reference to the slashing-evidence log (tests/pipelines read it).
@@ -874,6 +884,27 @@ impl TransactVerificationCoordinator {
                 log::warn!(
                     "dropping vote from non-staked wallet {} for {}",
                     result.wallet_pubkey,
+                    result.request_id
+                );
+                return Ok(());
+            }
+        }
+
+        // Reputation gate: validators below the configured reputation floor
+        // may still submit a vote, but their vote is not counted toward the
+        // quorum (mirrors DEFAULT_MIN_REPUTATION_FOR_CONSENSUS).
+        {
+            let rep = self
+                .reputation_tracker
+                .get_reputation(&result.validator)
+                .await
+                .unwrap_or(0);
+            if rep < self.min_reputation_for_consensus {
+                log::warn!(
+                    "dropping vote from low-reputation validator {:?} (rep {} < {}) for {}",
+                    result.validator,
+                    rep,
+                    self.min_reputation_for_consensus,
                     result.request_id
                 );
                 return Ok(());
