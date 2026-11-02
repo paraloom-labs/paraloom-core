@@ -439,3 +439,79 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         "cap must be unchanged after a rejected set"
     );
 }
+
+
+/// Direct unsolicited transfers (donations) into the `bridge_vault` PDA must not
+/// grief the deposit cap or block legitimate user deposits (#1279).
+#[tokio::test]
+async fn deposit_note_direct_donation_does_not_grief_deposit_cap() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    // Set deposit cap to exactly AMOUNT
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        AMOUNT,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    // Attacker sends direct system transfer into bridge_vault PDA (permissionless unsolicited donation)
+    let grief_donation = solana_sdk::system_instruction::transfer(
+        &payer.pubkey(),
+        &bridge_vault_pda,
+        1_000_000,
+    );
+    let mut tx = Transaction::new_with_payer(&[grief_donation], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify vault balance now has the donation
+    let vault_balance = banks.get_balance(bridge_vault_pda).await.unwrap();
+    assert!(vault_balance >= 1_000_000);
+
+    // Legitimate user deposits AMOUNT (which equals deposit_cap).
+    // Under the old bug, vault.lamports() + AMOUNT exceeded deposit_cap and reverted with DepositCapExceeded.
+    // Under the tracked liability fix, total_deposited (0) + AMOUNT <= deposit_cap (AMOUNT) succeeds!
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 42;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 99;
+    let deposit_ix = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: AMOUNT,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+
+    let mut tx = Transaction::new_with_payer(&[deposit_ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Leaf appended successfully despite the donation
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 1, "deposit note succeeded despite direct donation griefing attempt");
+}

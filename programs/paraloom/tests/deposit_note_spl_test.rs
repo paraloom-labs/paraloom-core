@@ -312,3 +312,64 @@ async fn deposit_note_spl_closed_until_cap_opened() {
     let result = banks.process_transaction(tx).await;
     assert!(result.is_err(), "deposits are closed at cap 0");
 }
+
+
+/// Direct unsolicited token transfers into the `asset_vault` must not
+/// grief the SPL deposit cap or block legitimate user deposits (#1279).
+#[tokio::test]
+async fn deposit_note_spl_direct_donation_does_not_grief_deposit_cap() {
+    let program_id = paraloom_program::ID;
+    let mut pt = program_test(program_id);
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+
+    let depositor = Keypair::new();
+    pt.add_account(
+        depositor.pubkey(),
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let depositor_token = add_token_account(&mut pt, mint, depositor.pubkey(), DEPOSITOR_FUND);
+
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    // Set cap to exactly DEPOSIT
+    init_spl_pool(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        mint,
+        DEPOSIT,
+    )
+    .await;
+
+    let (asset_vault, _) = Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], &program_id);
+
+    // Attacker sends direct token transfer to asset_vault
+    let donation_ix = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &depositor_token,
+        &asset_vault,
+        &depositor.pubkey(),
+        &[],
+        500,
+    )
+    .unwrap();
+    let mut tx = Transaction::new_with_payer(&[donation_ix], Some(&depositor.pubkey()));
+    tx.sign(&[&depositor], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Legitimate deposit of DEPOSIT (equals deposit_cap).
+    // Under the fix, tracked cumulative deposits (0) + DEPOSIT <= deposit_cap (DEPOSIT) succeeds!
+    let ix = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, DEPOSIT);
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
+    tx.sign(&[&depositor], blockhash);
+    let result = banks.process_transaction(tx).await;
+    assert!(result.is_ok(), "deposit must succeed despite direct SPL donation to vault");
+}
