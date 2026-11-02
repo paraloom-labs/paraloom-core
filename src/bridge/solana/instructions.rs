@@ -368,6 +368,49 @@ pub fn create_register_validator_instruction(
     })
 }
 
+/// Build an idempotent Associated Token Account creation instruction for
+/// `owner` + `mint` paid for by `payer` (#1215).
+///
+/// The `register_validator` builders only ever *derive* the validator's token
+/// account address — nothing creates it — so a freshly generated validator key
+/// has nothing at that address and the registration CPI has no account to
+/// transfer the token stake out of. Prepending this instruction makes the pair
+/// self-contained: on a fresh validator it creates the ATA, and on a validator
+/// that already has one the ATA program's `CreateIdempotent` (instruction index
+/// `1`) is a no-op instead of the `AlreadyInUse` that plain `Create` returns —
+/// so the same transaction is safe to rebuild and retry after a partial
+/// failure, and callers need no account-existence query to choose a variant.
+///
+/// The ATA seeds include `token_program`, so a Token-2022 mint resolves to the
+/// Token-2022 ATA; pass the same program that owns `mint`, i.e. the one given to
+/// [`create_register_validator_instruction`].
+///
+/// Account order is the ATA program's: payer, ata, owner, mint, system_program,
+/// token_program. `owner` is not a signer — the ATA program derives the address
+/// from `owner` and `mint` alone — but every in-tree caller passes the validator
+/// as both payer and owner, so registration keeps its single-signature contract.
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        // AssociatedTokenAccountInstruction::CreateIdempotent
+        data: vec![1],
+    }
+}
+
 /// Build an `init_stake_token_vault` instruction — the dual-stake vault migration
 /// for a registry that predates the vault. Upgrade-authority-signed. Account
 /// order matches the on-chain `InitStakeTokenVault` context: authority,
@@ -1310,5 +1353,85 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    /// #1215: the register path must be able to stand up the very account it
+    /// spends from. Pin the ATA program, the wire format and — most importantly —
+    /// that the created address is byte-for-byte the account
+    /// `create_register_validator_instruction` is handed, or the prepended
+    /// instruction would create one account while the registration looked at
+    /// another.
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &owner,
+            &mint,
+            &token_program,
+        );
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        // payer, ata, owner, mint, system_program, token_program.
+        assert_eq!(ix.accounts.len(), 6);
+
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable);
+
+        let expected_ata = derive_associated_token_address(&owner, &mint, &token_program);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert!(!ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+
+        // Not a signer: the ATA program derives the address from owner + mint.
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert!(!ix.accounts[2].is_signer);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[5].is_writable);
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+
+        // Byte 1 is `AssociatedTokenAccountInstruction::CreateIdempotent`.
+        assert_eq!(ix.data, vec![1]);
+    }
+
+    /// The derivation is chain-agnostic but not program-agnostic: a Token-2022
+    /// mint yields a different ATA, so the builder must thread the caller's
+    /// `token_program` through rather than assume classic SPL. A mismatch here
+    /// would silently create the wrong (unusable) account for Token-2022 stakes.
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_token_2022() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+
+        let classic = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &owner,
+            &mint,
+            &SPL_TOKEN_PROGRAM_ID,
+        );
+        let t22 = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &owner,
+            &mint,
+            &SPL_TOKEN_2022_PROGRAM_ID,
+        );
+
+        assert_eq!(t22.accounts[5].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
+        assert_eq!(
+            t22.accounts[1].pubkey,
+            derive_associated_token_address(&owner, &mint, &SPL_TOKEN_2022_PROGRAM_ID)
+        );
+        assert_ne!(
+            classic.accounts[1].pubkey, t22.accounts[1].pubkey,
+            "the token program is part of the ATA seeds"
+        );
     }
 }

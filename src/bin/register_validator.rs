@@ -119,6 +119,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Token Program: {}", token_program);
     println!("Validator Token Account: {}\n", validator_token_account);
 
+    // The token account above is derived, not created: on a fresh validator
+    // nothing exists at that address and the registration has no account to
+    // transfer the token stake from. Prepend an idempotent ATA creation so the
+    // binary is self-contained (#1215).
+    let mut instructions = Vec::new();
+    if client.get_account(&validator_token_account).is_err() {
+        println!(
+            "Token account {} not found; adding idempotent create-ATA instruction.",
+            validator_token_account
+        );
+        instructions.push(create_associated_token_account_idempotent_instruction(
+            &validator.pubkey(),
+            &validator.pubkey(),
+            &stake_mint,
+            &token_program,
+        ));
+    }
+
+    // Failure mode B (#1215): check the token half locally instead of letting
+    // the token CPI revert the whole transaction and burn the fee.
+    if token_stake_amount > 0 {
+        let token_balance = match client.get_token_account(&validator_token_account) {
+            // `UiTokenAccount` reports the raw amount as a string.
+            Ok(Some(account)) => account.token_amount.amount.parse::<u64>().unwrap_or(0),
+            _ => 0,
+        };
+        if token_balance < token_stake_amount {
+            return Err(format!(
+                "Insufficient token balance: {} holds {}, required {}",
+                validator_token_account, token_balance, token_stake_amount
+            )
+            .into());
+        }
+    }
+
     let ix = create_register_validator_instruction(
         &program_id,
         &validator.pubkey(),
@@ -128,13 +163,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stake_amount,
         token_stake_amount,
     )?;
+    instructions.push(ix);
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
 
     println!("Creating and signing transaction...");
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &instructions,
         Some(&validator.pubkey()),
         &[&validator],
         blockhash,
