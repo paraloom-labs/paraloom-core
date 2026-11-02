@@ -1486,6 +1486,51 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
+                // The validator's token account is derived above, never created:
+                // a freshly generated key has nothing at that address, and the
+                // on-chain context can only begin reading account data once it
+                // exists. Prepend an idempotent ATA creation so registering a new
+                // node needs no out-of-band `spl-token create-account` (#1215),
+                // and skip the round-trip when it is already there.
+                let mut instructions = Vec::new();
+                if client.get_account(&validator_token).is_err() {
+                    println!(
+                        "Token account {} does not exist yet; creating it in this transaction.",
+                        validator_token
+                    );
+                    instructions.push(create_associated_token_account_idempotent_instruction(
+                        &validator.pubkey(),
+                        &validator.pubkey(),
+                        &stake_mint,
+                        &token_program,
+                    ));
+                }
+
+                // Failure mode B (#1215): the balance was never checked, so a
+                // short account broadcast a transaction that reverted inside the
+                // token CPI and cost the fee with no explanation. Check locally
+                // — the ATA was just created above, so an existing account is
+                // the only case that can hold a balance to check.
+                if min_token_stake > 0 {
+                    let token_balance = match client.get_token_account(&validator_token) {
+                        // `UiTokenAccount` reports the raw amount as a string;
+                        // unparseable means effectively nothing usable.
+                        Ok(Some(account)) => {
+                            account.token_amount.amount.parse::<u64>().unwrap_or(0)
+                        }
+                        // Created by the instruction above: starts empty.
+                        _ => 0,
+                    };
+                    anyhow::ensure!(
+                        token_balance >= min_token_stake,
+                        "Insufficient PARALOOM token balance: the token account {} holds {} \
+                         but the registry's minimum token stake is {}. Fund it, then re-run.",
+                        validator_token,
+                        token_balance,
+                        min_token_stake
+                    );
+                }
+
                 // Stake exactly the registry's current token floor (0 while the
                 // token gate is still closed).
                 let ix = create_register_validator_instruction(
@@ -1498,12 +1543,13 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     min_token_stake,
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
+                instructions.push(ix);
 
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &instructions,
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,

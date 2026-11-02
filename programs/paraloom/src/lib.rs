@@ -85,6 +85,25 @@ fn check_upgrade_authority(program_data: &UncheckedAccount, expected: &Pubkey) -
     Ok(())
 }
 
+/// Read an SPL token account that arrives untyped, mapping every way it can be
+/// unusable onto [`BridgeError::ValidatorTokenAccountNotInitialized`] (#1215).
+///
+/// Exists only for the `RegisterValidator` constraints: the field is taken as an
+/// [`UncheckedAccount`] so the context can check ownership *before* any byte of
+/// account data is read and can name the account in the error. It reuses
+/// `TokenAccount::try_deserialize_unchecked` — the very call the removed
+/// `InterfaceAccount::try_from` made, which is Token-2022-aware (a classic
+/// 165-byte SPL account and a Token-2022 base account carrying extensions both
+/// unpack; the program's real mint needs the latter) — and only folds its error
+/// into the named one, so an absent/uninitialized account no longer escapes as a
+/// nameless 3012 abort.
+fn read_token_account(account: &UncheckedAccount) -> Result<TokenAccount> {
+    let data = account.try_borrow_data()?;
+    let mut buf: &[u8] = &data;
+    <TokenAccount as anchor_lang::AccountDeserialize>::try_deserialize_unchecked(&mut buf)
+        .map_err(|_| error!(BridgeError::ValidatorTokenAccountNotInitialized))
+}
+
 /// Reject a non-canonical nullifier encoding (audit: on-chain replay via a
 /// non-injective field lift). The proof's public input is
 /// `Fr::from_le_bytes_mod_order(nullifier)`, which maps both `n` and `n + p`
@@ -845,6 +864,24 @@ pub mod paraloom_program {
         // `transfer_checked` (with the mint + decimals) is the Token-2022-safe
         // form and works for classic SPL tokens too — the real PARALOOM mint is
         // a Token-2022 mint (metadata extension only).
+        //
+        // The source account arrives untyped, so it is parsed here rather than by
+        // the context (#1215). The accounting below starts at the account's real
+        // balance, so an owner that is not the validator — or an account that
+        // does not parse — must fail *before* the CPI, not after it has already
+        // moved tokens.
+        let validator_token_before =
+            read_token_account(&ctx.accounts.validator_token_account)?.amount;
+        // A token account exists, is initialized and is the right one, but is
+        // thinner than the stake asked for. Rejecting it here — before the CPI —
+        // turns what used to be SPL's bare `InsufficientFunds` (`0x1`) behind an
+        // already-reverted transfer into a named Anchor error (#1215 failure
+        // mode B). The token half still cannot be under-funded afterwards: the
+        // floor check below re-verifies what the vault actually received.
+        require!(
+            validator_token_before >= token_stake_amount,
+            BridgeError::ValidatorTokenAccountBalanceTooLow
+        );
         token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -2416,12 +2453,45 @@ pub struct RegisterValidator<'info> {
     /// The validator's token account holding the token stake to lock. Its mint
     /// must be the registry's pinned `stake_mint` and it must be owned by the
     /// registering validator.
+    ///
+    /// Taken untyped ([`UncheckedAccount`]) instead of as a typed
+    /// `InterfaceAccount<TokenAccount>` (#1215). Anchor deserializes a typed
+    /// field eagerly in `try_accounts`, *before* any constraint of the context
+    /// runs, so a validator that has not created its associated token account
+    /// yet — the normal state of a fresh node, and exactly what the CLI builders
+    /// hand over, since they only derive the address — was rejected by a bare
+    /// `InterfaceAccount::try_from` abort (`AccountNotInitialized`, 3012) with
+    /// no account name and no hint that the ATA was simply missing. Validating
+    /// in the context instead orders the checks deliberately, cheapest first:
+    ///
+    /// 1. `owner == token_program` — no data touched at all. A never-created ATA
+    ///    is still owned by the system program, so this is the check that names
+    ///    the common onboarding failure.
+    /// 2. the SPL token state actually unpacks (`AccountNotInitialized` from the
+    ///    SPL deserializer is folded into the same named error as (1): an
+    ///    uninitialized account and an absent one need the same operator action).
+    /// 3. `mint == registry.stake_mint` — its own constraint, so a wrong-mint
+    ///    account stays distinguishable from a missing one.
+    /// 4. the token authority is the registering validator.
+    ///
+    /// The owner check subsumes what `InterfaceAccount` did
+    /// (`TokenAccount::check_owner`), so no validation is lost — only the
+    /// ordering and the error surface change.
+    ///
+    /// CHECK: validated by the constraints below, then used only through its
+    /// `AccountInfo`; no `InterfaceAccount` discriminator applies to it.
     #[account(
         mut,
-        token::mint = validator_registry.stake_mint,
-        token::authority = validator,
+        constraint = *validator_token_account.owner == token_program.key()
+            @ BridgeError::ValidatorTokenAccountNotInitialized,
+        constraint = read_token_account(&validator_token_account)?.mint
+            == validator_registry.stake_mint
+            @ BridgeError::ValidatorTokenAccountMintMismatch,
+        constraint = read_token_account(&validator_token_account)?.owner
+            == validator.key()
+            @ BridgeError::ValidatorTokenAccountAuthorityMismatch,
     )]
-    pub validator_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub validator_token_account: UncheckedAccount<'info>,
 
     /// Shared token-stake vault (destination for the locked token half).
     #[account(
@@ -2916,4 +2986,22 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    /// #1215: a fresh validator's associated token account is normally absent —
+    /// the CLI builders only derive its address, they do not create it — so this
+    /// is the error that names the onboarding gap instead of a bare 3012.
+    #[msg("Validator token account does not exist for the stake mint: create the associated token account for the registering validator before registering")]
+    ValidatorTokenAccountNotInitialized,
+
+    #[msg("Validator token account's mint is not the registry's stake mint")]
+    ValidatorTokenAccountMintMismatch,
+
+    #[msg("Validator token account's authority is not the registering validator")]
+    ValidatorTokenAccountAuthorityMismatch,
+
+    /// #1215 failure mode B: the account exists and is initialized, but is short
+    /// of the requested stake — the case that used to burn the fee on a reverted
+    /// token CPI with no explanation.
+    #[msg("Validator token account holds less than the requested token stake")]
+    ValidatorTokenAccountBalanceTooLow,
 }
