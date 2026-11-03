@@ -45,7 +45,7 @@ const PARALOOM_TOPIC: &str = "paraloom/v1";
 /// bare network multiaddr (no /p2p/ suffix) we fall back to dial
 /// only.
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| {
+    addr.iter().rev().find_map(|proto| {
         if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
             Some(peer_id)
         } else {
