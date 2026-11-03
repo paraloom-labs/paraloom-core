@@ -108,6 +108,115 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:init_asset_vault")[..8]`. Initializes a per-mint SPL asset vault and config.
+    pub const INIT_ASSET_VAULT: [u8; 8] = [178, 96, 79, 76, 25, 81, 167, 109];
+    /// `sha256("global:set_asset_deposit_cap")[..8]`. Sets the deposit cap for a specific SPL asset.
+    pub const SET_ASSET_DEPOSIT_CAP: [u8; 8] = [209, 129, 220, 235, 236, 193, 22, 135];
+    /// `sha256("global:set_min_token_stake")[..8]`. Sets the minimum token stake required for validators.
+    pub const SET_MIN_TOKEN_STAKE: [u8; 8] = [240, 15, 68, 142, 219, 138, 99, 112];
+}
+
+/// Derive the asset config PDA for an SPL mint.
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
+}
+
+/// Create an `init_asset_vault` instruction.
+pub fn create_init_asset_vault_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_config_pda, _) = derive_asset_config(program_id, mint);
+    let (asset_vault_pda, _) = derive_asset_vault(program_id, mint);
+    let (asset_vault_authority_pda, _) = derive_asset_vault_authority(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new(asset_config_pda, false),
+            AccountMeta::new(asset_vault_pda, false),
+            AccountMeta::new_readonly(asset_vault_authority_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
+        ],
+        data: discriminators::INIT_ASSET_VAULT.to_vec(),
+    })
+}
+
+/// Create a `set_asset_deposit_cap` instruction.
+pub fn create_set_asset_deposit_cap_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    deposit_cap: u64,
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_config_pda, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    #[derive(BorshSerialize)]
+    struct SetAssetDepositCapData {
+        deposit_cap: u64,
+    }
+
+    let data = SetAssetDepositCapData { deposit_cap };
+    let mut instruction_data = discriminators::SET_ASSET_DEPOSIT_CAP.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new(asset_config_pda, false),
+            AccountMeta::new(*mint, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create a `set_min_token_stake` instruction.
+pub fn create_set_min_token_stake_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    min_token_stake: u64,
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    #[derive(BorshSerialize)]
+    struct SetMinTokenStakeData {
+        min_token_stake: u64,
+    }
+
+    let data = SetMinTokenStakeData { min_token_stake };
+    let mut instruction_data = discriminators::SET_MIN_TOKEN_STAKE.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(bridge_state_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+        ],
+        data: instruction_data,
+    })
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
