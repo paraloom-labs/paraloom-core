@@ -4493,6 +4493,7 @@ dependencies = [
  "solana-client",
  "solana-sdk",
  "solana-transaction-status",
+ "spl-associated-token-account",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
