@@ -879,6 +879,84 @@ pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"validator_registry"], program_id)
 }
 
+/// Derive the slashed funds vault PDA.
+pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
+}
+
+/// Create a `slash_validator` instruction.
+pub fn create_slash_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    slash_percentage: u8,
+) -> Result<Instruction> {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (vault_pda, _) = derive_slashed_funds_vault(program_id);
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+
+    #[derive(BorshSerialize)]
+    struct SlashValidatorData {
+        validator: Pubkey,
+        slash_percentage: u8,
+    }
+
+    let data = SlashValidatorData {
+        validator: *validator,
+        slash_percentage,
+    };
+
+    let mut instruction_data = discriminators::SLASH_VALIDATOR.to_vec();
+    instruction_data.extend_from_slice(&borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: instruction_data,
+    })
+}
+
+/// Create an `update_reputation` instruction.
+pub fn create_update_reputation_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator: &Pubkey,
+    new_reputation: u64,
+) -> Result<Instruction> {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let (validator_pda, _) = derive_validator_account(program_id, validator);
+
+    #[derive(BorshSerialize)]
+    struct UpdateReputationData {
+        validator: Pubkey,
+        new_reputation: u64,
+    }
+
+    let data = UpdateReputationData {
+        validator: *validator,
+        new_reputation,
+    };
+
+    let mut instruction_data = discriminators::UPDATE_REPUTATION.to_vec();
+    instruction_data.extend_from_slice(&borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(*authority, true),
+        ],
+        data: instruction_data,
+    })
+}
+
 /// Derive the on-chain incremental Merkle tree PDA (circuit v3, #350).
 pub fn derive_merkle_tree(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"merkle_tree"], program_id)
