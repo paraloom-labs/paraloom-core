@@ -1699,19 +1699,28 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                let ix = create_withdraw_unbonded_stake_instruction(
+                let ata_exists = client.get_account(&validator_token).is_ok();
+                if !ata_exists {
+                    println!(
+                        "Validator token account does not exist. Adding create_associated_token_account instruction ({})...",
+                        validator_token
+                    );
+                }
+
+                let instructions = build_withdraw_unbonded_stake_instructions(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
                     &validator_token,
                     &token_program,
+                    ata_exists,
                 );
 
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &instructions,
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
