@@ -108,6 +108,10 @@ pub mod discriminators {
     /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
     /// pending settlement fees from `bridge_vault`.
     pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
+    /// `sha256("global:slash_validator")[..8]`.
+    pub const SLASH_VALIDATOR: [u8; 8] = [238, 57, 244, 40, 132, 82, 78, 5];
+    /// `sha256("global:update_reputation")[..8]`.
+    pub const UPDATE_REPUTATION: [u8; 8] = [194, 220, 43, 201, 54, 209, 49, 178];
 }
 
 /// Instruction data for `transact` (circuit v3, #350).
