@@ -10,6 +10,7 @@ use crate::bridge::solana::instructions::{discriminators, DepositInstructionData
 use crate::bridge::DepositEvent;
 use borsh::BorshDeserialize;
 use solana_sdk::pubkey::Pubkey;
+use solana_transaction_status::option_serializer::OptionSerializer;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInstruction, UiMessage,
     UiTransactionEncoding,
@@ -33,9 +34,9 @@ pub const LISTENER_TX_ENCODING: UiTransactionEncoding = UiTransactionEncoding::J
 ///
 /// Returns an empty vector if the transaction does not target the
 /// Paraloom program, the encoding is not the expected raw JSON form,
-/// or no instruction matches the deposit discriminator. Address-table-
-/// lookup transactions are skipped with a warning — none of the deposit
-/// flows in v0.3 are expected to use LUTs.
+/// or no instruction matches the deposit discriminator. Address lookup
+/// table (LUT) accounts loaded in v0 transactions are resolved via
+/// `loaded_addresses` (`writable` followed by `readonly`).
 pub fn extract_deposit_events(
     signature: &str,
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
@@ -78,7 +79,7 @@ pub fn extract_deposit_events(
         }
     };
 
-    let account_keys = match parse_account_keys(&raw.account_keys) {
+    let mut account_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
         Err(bad) => {
             log::warn!(
@@ -90,6 +91,35 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    if let Some(meta) = &confirmed.transaction.meta {
+        if let OptionSerializer::Some(loaded) = &meta.loaded_addresses {
+            match parse_account_keys(&loaded.writable) {
+                Ok(keys) => account_keys.extend(keys),
+                Err(bad) => {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "tx {} has unparsable loaded writable address '{}'; skipping",
+                        signature,
+                        bad
+                    );
+                    return Vec::new();
+                }
+            }
+            match parse_account_keys(&loaded.readonly) {
+                Ok(keys) => account_keys.extend(keys),
+                Err(bad) => {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "tx {} has unparsable loaded readonly address '{}'; skipping",
+                        signature,
+                        bad
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
 
     let mut events = Vec::new();
 
@@ -105,9 +135,7 @@ pub fn extract_deposit_events(
     // through the meta field as `UiInstruction`, which needs the match
     // because parsed instructions can also appear there.
     if let Some(meta) = &confirmed.transaction.meta {
-        if let solana_transaction_status::option_serializer::OptionSerializer::Some(inner) =
-            &meta.inner_instructions
-        {
+        if let OptionSerializer::Some(inner) = &meta.inner_instructions {
             for inner_set in inner {
                 for instruction in &inner_set.instructions {
                     if let UiInstruction::Compiled(compiled) = instruction {
@@ -255,7 +283,65 @@ fn parse_account_keys(keys: &[String]) -> std::result::Result<Vec<Pubkey>, Strin
 mod tests {
     use super::*;
     use crate::bridge::solana::instructions::DepositNoteInstructionData;
-    use solana_transaction_status::UiCompiledInstruction;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::message::MessageHeader;
+    use solana_transaction_status::{
+        EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiInnerInstructions,
+        UiLoadedAddresses, UiRawMessage, UiTransaction, UiTransactionStatusMeta,
+    };
+
+    fn make_test_confirmed_tx(
+        instructions: Vec<UiCompiledInstruction>,
+        inner_instructions: Option<Vec<UiInnerInstructions>>,
+        static_keys: Vec<Pubkey>,
+        loaded_addresses: Option<UiLoadedAddresses>,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        let raw = UiRawMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: static_keys.into_iter().map(|k| k.to_string()).collect(),
+            recent_blockhash: Hash::default().to_string(),
+            instructions,
+            address_table_lookups: None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            status: Ok(()),
+            err: None,
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: inner_instructions
+                .map(OptionSerializer::Some)
+                .unwrap_or(OptionSerializer::None),
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: loaded_addresses
+                .map(OptionSerializer::Some)
+                .unwrap_or(OptionSerializer::None),
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+
+        EncodedConfirmedTransactionWithStatusMeta {
+            slot: 12345,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["5H7sB8...".to_string()],
+                    message: UiMessage::Raw(raw),
+                }),
+                meta: Some(meta),
+                version: None,
+            },
+            block_time: Some(1700000000),
+        }
+    }
 
     fn encode_deposit_data(amount: u64, recipient: [u8; 32], randomness: [u8; 32]) -> String {
         let payload = DepositInstructionData {
@@ -515,5 +601,201 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn extract_deposit_events_resolves_lut_loaded_addresses_spl() {
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        let amount = 5_000_000u64;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let data = bs58::encode(bytes).into_string();
+
+        let expected_asset_id = crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes());
+
+        // Case 1: Control (static keys only, no LUT)
+        // accounts: bridge_state(0), asset_config(1), mint(2), asset_vault(3),
+        // depositor_token_account(4), merkle_tree(5), depositor(6), token_program(7).
+        // program_id at 8.
+        {
+            let static_keys = vec![
+                other, other, mint, other, other, other, depositor, other, program_id,
+            ];
+            let ix = UiCompiledInstruction {
+                program_id_index: 8,
+                accounts: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                data: data.clone(),
+                stack_height: None,
+            };
+            let tx = make_test_confirmed_tx(vec![ix], None, static_keys, None);
+            let events = extract_deposit_events("tx1", &tx, &program_id);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].amount, amount);
+            assert_eq!(events[0].from, depositor.to_bytes());
+            assert_eq!(events[0].asset_id, expected_asset_id);
+            assert_eq!(events[0].recipient, pubkey);
+            assert_eq!(events[0].randomness, blinding);
+        }
+
+        // Case 2: Mint and depositor in loaded_addresses.writable (Bug A)
+        // static_keys has 7 items: indices 0..6.
+        // loaded.writable has [mint, depositor]: indices 7, 8.
+        {
+            let static_keys = vec![other, other, other, other, other, other, program_id];
+            let loaded = UiLoadedAddresses {
+                writable: vec![mint.to_string(), depositor.to_string()],
+                readonly: vec![],
+            };
+            let ix = UiCompiledInstruction {
+                program_id_index: 6,
+                // positions: 0=other(0), 1=other(1), 2=mint(7), 3=other(2), 4=other(3), 5=other(4), 6=depositor(8), 7=other(5)
+                accounts: vec![0, 1, 7, 2, 3, 4, 8, 5],
+                data: data.clone(),
+                stack_height: None,
+            };
+            let tx = make_test_confirmed_tx(vec![ix], None, static_keys, Some(loaded));
+            let events = extract_deposit_events("tx2", &tx, &program_id);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].amount, amount);
+            assert_eq!(events[0].from, depositor.to_bytes());
+            assert_eq!(events[0].asset_id, expected_asset_id);
+            assert_eq!(events[0].recipient, pubkey);
+            assert_eq!(events[0].randomness, blinding);
+        }
+
+        // Case 3: Mint in loaded_addresses.readonly, depositor in loaded_addresses.writable (Bug B)
+        // static_keys has 7 items: indices 0..6.
+        // loaded.writable has [depositor]: index 7.
+        // loaded.readonly has [mint]: index 8.
+        {
+            let static_keys = vec![other, other, other, other, other, other, program_id];
+            let loaded = UiLoadedAddresses {
+                writable: vec![depositor.to_string()],
+                readonly: vec![mint.to_string()],
+            };
+            let ix = UiCompiledInstruction {
+                program_id_index: 6,
+                // positions: 2=mint(8), 6=depositor(7)
+                accounts: vec![0, 1, 8, 2, 3, 4, 7, 5],
+                data: data.clone(),
+                stack_height: None,
+            };
+            let tx = make_test_confirmed_tx(vec![ix], None, static_keys, Some(loaded));
+            let events = extract_deposit_events("tx3", &tx, &program_id);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].amount, amount);
+            assert_eq!(events[0].from, depositor.to_bytes());
+            assert_eq!(events[0].asset_id, expected_asset_id);
+        }
+
+        // Case 4: Depositor in loaded_addresses.writable, mint in static_keys (Bug C)
+        // static_keys has 8 items: [other, other, mint, other, other, other, other, program_id]. len 8.
+        // loaded.writable has [depositor]: index 8.
+        {
+            let static_keys = vec![other, other, mint, other, other, other, other, program_id];
+            let loaded = UiLoadedAddresses {
+                writable: vec![depositor.to_string()],
+                readonly: vec![],
+            };
+            let ix = UiCompiledInstruction {
+                program_id_index: 7,
+                accounts: vec![0, 1, 2, 3, 4, 5, 8, 6],
+                data: data.clone(),
+                stack_height: None,
+            };
+            let tx = make_test_confirmed_tx(vec![ix], None, static_keys, Some(loaded));
+            let events = extract_deposit_events("tx4", &tx, &program_id);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].amount, amount);
+            assert_eq!(events[0].from, depositor.to_bytes());
+            assert_eq!(events[0].asset_id, expected_asset_id);
+        }
+    }
+
+    #[test]
+    fn extract_deposit_events_resolves_lut_loaded_addresses_for_inner_instruction() {
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        let amount = 3_000_000u64;
+        let pubkey = [21u8; 32];
+        let blinding = [22u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let data = bs58::encode(bytes).into_string();
+
+        let static_keys = vec![other, other, other, other, other, other, program_id];
+        let loaded = UiLoadedAddresses {
+            writable: vec![mint.to_string(), depositor.to_string()],
+            readonly: vec![],
+        };
+        let inner_ix = UiInstruction::Compiled(UiCompiledInstruction {
+            program_id_index: 6,
+            accounts: vec![0, 1, 7, 2, 3, 4, 8, 5],
+            data,
+            stack_height: Some(2),
+        });
+        let inner_set = UiInnerInstructions {
+            index: 0,
+            instructions: vec![inner_ix],
+        };
+        let top_ix = UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: vec![0],
+            data: "dummy".to_string(),
+            stack_height: None,
+        };
+        let tx = make_test_confirmed_tx(
+            vec![top_ix],
+            Some(vec![inner_set]),
+            static_keys,
+            Some(loaded),
+        );
+        let events = extract_deposit_events("tx_inner", &tx, &program_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, amount);
+        assert_eq!(events[0].from, depositor.to_bytes());
+        assert_eq!(
+            events[0].asset_id,
+            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes())
+        );
+    }
+
+    #[test]
+    fn extract_deposit_events_handles_unparsable_loaded_addresses() {
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let static_keys = vec![other, program_id];
+        let loaded = UiLoadedAddresses {
+            writable: vec!["invalid_pubkey".to_string()],
+            readonly: vec![],
+        };
+        let ix = UiCompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![0],
+            data: "dummy".to_string(),
+            stack_height: None,
+        };
+        let tx = make_test_confirmed_tx(vec![ix], None, static_keys, Some(loaded));
+        let events = extract_deposit_events("tx_bad", &tx, &program_id);
+        assert!(events.is_empty());
     }
 }
