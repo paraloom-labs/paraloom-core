@@ -973,6 +973,28 @@ async fn cosign_settlement(
         return declined("payload program id does not match our configured program");
     }
 
+    // Never co-sign a remote request that names our own settlement wallet as
+    // `payload.authority` — the writable fee payer and nullifier-PDA rent
+    // payer of the rebuilt message — nor one where our wallet is not listed
+    // in `quorum_validators`, nor one naming a `bridge_vault` other than our
+    // configured program's PDA (#974). The leader signs its own settlement
+    // locally; a remote co-signer only ever signs as a read-only quorum
+    // signer, for the real vault. Anything else spends the per-nullifier
+    // co-sign budget on a message that cannot settle as the verified
+    // settlement.
+    let self_pubkey_bytes = keypair.pubkey().to_bytes();
+    if payload.authority == self_pubkey_bytes {
+        return declined(
+            "refusing to co-sign a remote payload where we are the fee-payer authority",
+        );
+    }
+    if !payload.quorum_validators.contains(&self_pubkey_bytes) {
+        return declined("payload quorum_validators does not include our validator wallet");
+    }
+    if payload.bridge_vault != derive_bridge_vault(expected_program_id).0.to_bytes() {
+        return declined("payload bridge_vault is not our program's bridge vault");
+    }
+
     // Match the payload against a settlement we verified Valid, by request id
     // and binding parameters, and take the input nullifiers as the per-nullifier
     // cap keys (see the cap block below for why the cap is keyed on those).
@@ -985,16 +1007,18 @@ async fn cosign_settlement(
                 output_commitments,
                 root,
                 ext_amount,
-                ..
+                proof,
             },
         ) => {
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient
+                req.mint.is_none()
+                    && req.recipient == *recipient
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
+                    && req.proof == *proof
             });
             // Cap keys = each input nullifier paired with the payload authority
             // (#723). The approval match above binds the settlement's public
@@ -1028,7 +1052,7 @@ async fn cosign_settlement(
                 output_commitments,
                 root,
                 ext_amount,
-                ..
+                proof,
             },
         ) => {
             let cache = verified_transacts.lock().await;
@@ -1039,6 +1063,7 @@ async fn cosign_settlement(
                     && req.output_commitments == *output_commitments
                     && req.root == *root
                     && req.ext_amount == *ext_amount
+                    && req.proof == *proof
             });
             let auth = hex::encode(payload.authority);
             let cap_nullifiers = [
@@ -2918,19 +2943,30 @@ mod tests {
     }
 
     fn ta_payload(
-        authority: [u8; 32],
+        signer: [u8; 32],
         recipient: [u8; 32],
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
         ext_amount: i64,
     ) -> CoSignPayload {
+        // The payload authority is the settlement leader (the fee payer); the
+        // key under test is a remote co-signer, so the two must differ and the
+        // signer must be listed as a quorum validator — the #974 guards
+        // decline self-authority and uninvited payloads. Derive a fixed
+        // stand-in leader keyed off the signer so existing callers keep
+        // working, and name the configured program's real bridge vault.
+        let authority = if signer == [42u8; 32] {
+            [43u8; 32]
+        } else {
+            [42u8; 32]
+        };
         CoSignPayload {
             program_id: [1u8; 32],
             authority,
-            bridge_vault: [3u8; 32],
+            bridge_vault: derive_bridge_vault(&configured_program()).0.to_bytes(),
             blockhash: [4u8; 32],
-            quorum_validators: vec![authority],
+            quorum_validators: vec![authority, signer],
             params: SettlementParams::Transact {
                 recipient,
                 nullifiers,
@@ -2983,6 +3019,117 @@ mod tests {
         assert!(
             sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
             "the returned signature must be valid over the rebuilt settlement message"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_self_authority_uninvited_quorum_wrong_vault_and_mutated_proof() {
+        // #974 (Bug 3): a remote co-sign request must not make us sign as the
+        // writable fee-payer authority, must actually invite us as a quorum
+        // signer, must name the real `bridge_vault` PDA of our configured
+        // program, and must carry the exact proof of the settlement we
+        // verified. Anything else spends the per-nullifier co-sign budget on
+        // a message that can never settle as the verified settlement.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        // A legitimate remote request: the leader is the authority, we are a
+        // listed quorum signer, and the vault is our program's real PDA.
+        let leader = [42u8; 32];
+        let mut valid = ta_payload(leader, recipient, nullifiers, outputs, root, ext_amount);
+        valid.authority = leader;
+        valid.quorum_validators = vec![leader, kp.pubkey().to_bytes()];
+        valid.bridge_vault = derive_bridge_vault(&configured_program()).0.to_bytes();
+
+        let ok = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &valid),
+        )
+        .await;
+        assert!(
+            ok.signature.is_some(),
+            "a fully-bound remote request from the leader must still be signed"
+        );
+
+        // 1. Self-authority: the payload names US as the writable fee payer.
+        let mut self_auth = valid.clone();
+        self_auth.authority = kp.pubkey().to_bytes();
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &self_auth),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "must decline a payload that makes us the fee-payer authority"
+        );
+
+        // 2. Uninvited: our wallet is not listed in `quorum_validators`.
+        let mut uninvited = valid.clone();
+        uninvited.quorum_validators = vec![leader];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &uninvited),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "must decline when our wallet is not a quorum signer"
+        );
+
+        // 3. Wrong `bridge_vault`: not our program's vault PDA.
+        let mut wrong_vault = valid.clone();
+        wrong_vault.bridge_vault = [9u8; 32];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &wrong_vault),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "must decline a payload naming a foreign bridge_vault"
+        );
+
+        // 4. Mutated proof: the payload's proof differs from the proof of the
+        // settlement we verified under this request id.
+        let mut mutated_proof = valid.clone();
+        if let SettlementParams::Transact { proof, .. } = &mut mutated_proof.params {
+            proof[0] ^= 0xFF;
+        }
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &mutated_proof),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "must decline a payload whose proof is not the verified proof"
         );
     }
 
@@ -3097,14 +3244,16 @@ mod tests {
 
         // The forger floods well past the cap under its own authority, reusing
         // the real spend's params.
-        let forged = ta_payload(
-            forger_authority,
+        let mut forged = ta_payload(
+            kp.pubkey().to_bytes(),
             recipient,
             nullifiers,
             outputs,
             root,
             ext_amount,
         );
+        forged.authority = forger_authority;
+        forged.quorum_validators = vec![forger_authority, kp.pubkey().to_bytes()];
         for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
             let _ = cosign_settlement(
                 Some(&kp),
@@ -3119,14 +3268,16 @@ mod tests {
         // The legitimate leader, under a different authority, still gets signed:
         // its (nullifier, authority) budget was never touched. Before #723 the
         // cap was keyed on the nullifier alone, so this request was declined.
-        let legit = ta_payload(
-            leader_authority,
+        let mut legit = ta_payload(
+            kp.pubkey().to_bytes(),
             recipient,
             nullifiers,
             outputs,
             root,
             ext_amount,
         );
+        legit.authority = leader_authority;
+        legit.quorum_validators = vec![leader_authority, kp.pubkey().to_bytes()];
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),

@@ -244,7 +244,9 @@ pub fn create_initialize_validator_registry_instruction(
 /// its counters from `co_signers` — the validator wallets whose PDAs are passed
 /// as `remaining_accounts`. Only these are counted, so stale registrations are
 /// dropped from the stake-weighted quorum denominator. Used once at the
-/// ceremony-key redeploy.
+/// ceremony-key redeploy. The singleton `stake_token_vault` PDA is included so
+/// the program can refuse a `stake_mint` that differs from the vault's
+/// immutable SPL mint (#974).
 pub fn create_reset_validator_registry_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -257,12 +259,14 @@ pub fn create_reset_validator_registry_instruction(
 ) -> Result<Instruction> {
     let (registry_pda, _) = derive_validator_registry(program_id);
     let (program_data_pda, _) = derive_program_data(program_id);
+    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
 
     let mut accounts = vec![
         AccountMeta::new(registry_pda, false),
         AccountMeta::new(*authority, true),
         AccountMeta::new_readonly(program_data_pda, false),
         AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        AccountMeta::new_readonly(stake_token_vault, false),
     ];
     // Each co-signer's validator PDA, read-only, as remaining_accounts.
     for wallet in co_signers {
