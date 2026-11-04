@@ -75,6 +75,46 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     let num_witness = matrices.num_witness_variables;
     let num_wires = num_instance + num_witness;
 
+    if num_instance == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_instance_variables must be at least 1 (constant-one wire)",
+        ));
+    }
+
+    if matrices.a.len() != matrices.num_constraints
+        || matrices.b.len() != matrices.num_constraints
+        || matrices.c.len() != matrices.num_constraints
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "matrix row count mismatch: expected num_constraints ({}), got A={}, B={}, C={}",
+                matrices.num_constraints,
+                matrices.a.len(),
+                matrices.b.len(),
+                matrices.c.len()
+            ),
+        ));
+    }
+
+    // Validate that all wire indices are strictly within bounds
+    for (name, matrix) in [("A", &matrices.a), ("B", &matrices.b), ("C", &matrices.c)] {
+        for (row_idx, row) in matrix.iter().enumerate() {
+            for (_, wire) in row {
+                if *wire >= num_wires {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "wire index {} in matrix {} at row {} out of range (num_wires: {})",
+                            wire, name, row_idx, num_wires
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     out.write_all(MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
     out.write_all(&3u32.to_le_bytes())?;
@@ -99,11 +139,10 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     section(out, SECTION_HEADER, &header)?;
 
     let mut constraints = Vec::new();
-    let rows = |m: &Matrix<Fr>, i: usize| m.get(i).cloned().unwrap_or_default();
     for i in 0..matrices.num_constraints {
-        write_lc(&mut constraints, &rows(&matrices.a, i));
-        write_lc(&mut constraints, &rows(&matrices.b, i));
-        write_lc(&mut constraints, &rows(&matrices.c, i));
+        write_lc(&mut constraints, &matrices.a[i]);
+        write_lc(&mut constraints, &matrices.b[i]);
+        write_lc(&mut constraints, &matrices.c[i]);
     }
     section(out, SECTION_CONSTRAINTS, &constraints)?;
 
@@ -284,4 +323,53 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn write_r1cs_num_instance_zero_rejected() {
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 0,
+            num_witness_variables: 1,
+            num_constraints: 0,
+            a: vec![],
+            b: vec![],
+            c: vec![],
+        };
+        let mut out = Vec::new();
+        let err = write_r1cs(&mut out, &matrices).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("num_instance_variables must be at least 1"));
+    }
+
+    #[test]
+    fn write_r1cs_matrix_length_mismatch_rejected() {
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 2,
+            a: vec![vec![]], // len 1 != num_constraints 2
+            b: vec![vec![], vec![]],
+            c: vec![vec![], vec![]],
+        };
+        let mut out = Vec::new();
+        let err = write_r1cs(&mut out, &matrices).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("matrix row count mismatch"));
+    }
+
+    #[test]
+    fn write_r1cs_out_of_bounds_wire_rejected() {
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a: vec![vec![(Fr::from(1u64), 5)]], // wire index 5 >= num_wires 2
+            b: vec![vec![]],
+            c: vec![vec![]],
+        };
+        let mut out = Vec::new();
+        let err = write_r1cs(&mut out, &matrices).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("out of range"));
+    }
+
 }
