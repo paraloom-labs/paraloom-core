@@ -25,7 +25,10 @@ use anchor_lang::prelude::*;
 /// by stake rather than head count is what stops a permissionless registry from
 /// being Sybil-forged with many tiny validators.
 pub fn quorum_threshold(total_active_stake: u64) -> u64 {
-    total_active_stake.saturating_mul(2) / 3 + 1
+    // `u128` intermediate: `saturating_mul(2)` on `u64` saturates at
+    // `u64::MAX` for any stake above `u64::MAX / 2`, collapsing the 2/3
+    // supermajority threshold toward 1/3 (#977).
+    ((total_active_stake as u128 * 2) / 3 + 1) as u64
 }
 
 /// Verify that a stake-weighted supermajority of registered, active validators
@@ -39,15 +42,22 @@ pub fn verify_validator_quorum(
     authority_active_stake: u64,
     quorum_accounts: &[AccountInfo],
 ) -> Result<()> {
-    // The settlement authority is not an independent second factor: its own
-    // stake counts toward neither the tally nor the denominator. Subtracting it
-    // keeps the threshold a supermajority of exactly the stake that can be
-    // counted, so a compromised settlement key still needs an independent
-    // supermajority to settle.
-    let eligible_stake = registry
-        .total_active_stake
-        .saturating_sub(authority_active_stake);
-    let threshold = quorum_threshold(eligible_stake);
+    // Reject an authority whose claimed active stake exceeds the registry's
+    // recorded total (e.g. an uncounted orphan PDA excluded from
+    // `reset_validator_registry`) instead of clamping the eligible stake to
+    // zero via `saturating_sub` (#977). A counted authority must also meet
+    // the registry's minimum stake, exactly like a co-signer.
+    require!(
+        registry.total_active_stake >= authority_active_stake,
+        BridgeError::QuorumNotMet
+    );
+    if authority_active_stake > 0 {
+        require!(
+            authority_active_stake >= registry.minimum_stake,
+            BridgeError::QuorumNotMet
+        );
+    }
+
     let mut counted_stake: u64 = 0;
     let mut seen: Vec<Pubkey> = Vec::new();
 
@@ -83,7 +93,11 @@ pub fn verify_validator_quorum(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if !validator.is_active || validator.validator != *wallet.key {
+        if !validator.is_active
+            || validator.validator != *wallet.key
+            || validator.stake_amount == 0
+            || validator.stake_amount < registry.minimum_stake
+        {
             continue;
         }
         // Count each validator at most once.
@@ -92,8 +106,65 @@ pub fn verify_validator_quorum(
         }
         seen.push(*wallet.key);
         // Weight by the validator's staked amount, not a head count.
-        counted_stake = counted_stake.saturating_add(validator.stake_amount);
+        counted_stake = counted_stake
+            .checked_add(validator.stake_amount)
+            .ok_or(BridgeError::QuorumNotMet)?;
     }
+
+    // Registry head-count invariant: the distinct participants in this
+    // settlement (counted co-signers plus a stake-bearing settlement
+    // authority) can never exceed the registry's active-validator count. An
+    // excess proves an uncounted orphan PDA joined the settlement (#977).
+    let authority_counted = u64::from(authority_active_stake > 0);
+    let total_participants = (seen.len() as u64)
+        .checked_add(authority_counted)
+        .ok_or(BridgeError::QuorumNotMet)?;
+    require!(
+        total_participants <= registry.active_validators,
+        BridgeError::QuorumNotMet
+    );
+
+    // The settlement authority is not an independent second factor: its own
+    // stake counts toward neither the tally nor the denominator. Subtracting
+    // it keeps the threshold a supermajority of exactly the stake that can be
+    // counted, so a compromised settlement key still needs an independent
+    // supermajority to settle.
+    //
+    // That subtraction is only sound when the authority's stake is genuinely
+    // part of the registry's recorded total. The registry stores aggregate
+    // counters, not a roster, so membership can only be *proven* from the
+    // presented accounts when they fully account for the registry: every
+    // active validator participates AND the counted co-signer stake equals
+    // `total_active_stake - authority_active_stake` exactly. Only then is
+    // the authority's stake subtracted.
+    //
+    // On a partial roster the subtraction is unverifiable, so it is NOT
+    // applied: the threshold is computed on the full recorded total. This
+    // closes the orphan-authority shrink (#977 Impact 1A) that the
+    // full-roster-only equality guard misses — e.g. registry 3 validators /
+    // 6 SOL, an orphan authority claiming 4 SOL and one honest 2 SOL
+    // co-signer: subtracting would shrink the eligible stake to 2 SOL and
+    // let that 33% minority settle; without the subtraction the threshold
+    // is `quorum_threshold(6 SOL)` and the same signer set is rejected.
+    // Honest partial rosters retain liveness: co-signers clearing the
+    // full-total supermajority still settle.
+    let stake_after_authority = registry.total_active_stake - authority_active_stake;
+    let roster_fully_accounted =
+        total_participants == registry.active_validators && counted_stake == stake_after_authority;
+    if total_participants == registry.active_validators {
+        // Full-roster stake invariant (#977): when every active-validator
+        // slot is present in `{settlement_authority} ∪ co-signers`, their
+        // summed stake must account for the recorded total exactly. Any
+        // mismatch proves an uncounted orphan PDA substituted for a
+        // registered validator or shrank the eligible stake.
+        require!(roster_fully_accounted, BridgeError::QuorumNotMet);
+    }
+    let eligible_stake = if authority_active_stake == 0 || roster_fully_accounted {
+        stake_after_authority
+    } else {
+        registry.total_active_stake
+    };
+    let threshold = quorum_threshold(eligible_stake);
 
     // No signer set may count more stake than the eligible active total. A
     // `counted_stake` above `eligible_stake` proves the registry's recorded
@@ -371,6 +442,214 @@ mod tests {
         let si = AccountInfo::new(&ind, true, false, &mut li, &mut ei, &sys, false, 0);
         let ai = AccountInfo::new(&pda_ind, false, false, &mut lpi, &mut d_ind, &p, false, 0);
         assert!(verify_validator_quorum(&p, &registry(2), &auth, 1_000_000_000, &[si, ai]).is_ok());
+    }
+
+    #[test]
+    fn threshold_does_not_saturate_above_u64_max_div_2() {
+        let high_stake = (u64::MAX / 2) + 3_000_000_000;
+        let expected = ((high_stake as u128 * 2) / 3 + 1) as u64;
+        assert_eq!(quorum_threshold(high_stake), expected);
+        assert!(quorum_threshold(high_stake) > high_stake / 2);
+    }
+
+    #[test]
+    fn orphan_authority_partial_roster_shrink_is_rejected() {
+        // Issue #977 Impact 1A counterexample. Registry: 3 active validators,
+        // 6 SOL total (2 SOL each). An uncounted orphan PDA with 4 SOL acts as
+        // settlement_authority; one honest 2 SOL validator co-signs.
+        // Vulnerable behaviour: eligible = 6 - 4 = 2 SOL, threshold = 2 SOL,
+        // counted = 2 SOL -> a 33% minority settles. Must reject: the
+        // authority's stake may only be subtracted when the presented roster
+        // fully accounts for the registry (here 2 participants != 3 active,
+        // so the subtraction is unverifiable and must not shrink the quorum).
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let auth = Pubkey::new_unique();
+        let w0 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 2_000_000_000);
+        let (mut l0, mut lp0) = (0u64, 0u64);
+        let mut e0 = [0u8; 0];
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(3, 6_000_000_000),
+            &auth,
+            4_000_000_000,
+            &[s0, a0],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn orphan_authority_with_stake_above_registry_total_is_rejected() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let auth = Pubkey::new_unique();
+        let w0 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 1_000_000_000);
+        let (mut l0, mut lp0) = (0u64, 0u64);
+        let mut e0 = [0u8; 0];
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        // Registry has 3 SOL total, but an uncounted orphan authority claims
+        // 4 SOL. Must reject rather than saturating eligible_stake to 0.
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(3, 3_000_000_000),
+            &auth,
+            4_000_000_000,
+            &[s0, a0],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn orphan_cosigner_substituting_for_registered_validator_is_rejected() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Registry: 2 active validators, 6 SOL (V_auth 2 SOL + V_honest
+        // 4 SOL) -> eligible = 4 SOL, threshold = 2,666,666,667. An uncounted
+        // orphan with 3 SOL co-signs in place of V_honest: counted (3) <=
+        // eligible (4) and >= threshold, but participants == active_validators
+        // while counted != eligible -> must reject.
+        let auth = Pubkey::new_unique();
+        let orphan = Pubkey::new_unique();
+        let (pda_orphan, _) = Pubkey::find_program_address(&[b"validator", orphan.as_ref()], &p);
+        let mut d_orphan = validator_data_staked(orphan, true, 3_000_000_000);
+        let (mut lo, mut lpo) = (0u64, 0u64);
+        let mut eo = [0u8; 0];
+        let so = AccountInfo::new(&orphan, true, false, &mut lo, &mut eo, &sys, false, 0);
+        let ao = AccountInfo::new(
+            &pda_orphan,
+            false,
+            false,
+            &mut lpo,
+            &mut d_orphan,
+            &p,
+            false,
+            0,
+        );
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(2, 6_000_000_000),
+            &auth,
+            2_000_000_000,
+            &[so, ao],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn participant_count_exceeding_active_validators_is_rejected() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Registry declares 1 active validator with 3 SOL, but 2 active PDAs
+        // of 1.5 SOL each co-sign -> participants (2) > active_validators (1).
+        let w0 = Pubkey::new_unique();
+        let w1 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let (pda1, _) = Pubkey::find_program_address(&[b"validator", w1.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 1_500_000_000);
+        let mut d1 = validator_data_staked(w1, true, 1_500_000_000);
+        let (mut l0, mut l1, mut lp0, mut lp1) = (0u64, 0u64, 0u64, 0u64);
+        let (mut e0, mut e1) = ([0u8; 0], [0u8; 0]);
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let s1 = AccountInfo::new(&w1, true, false, &mut l1, &mut e1, &sys, false, 0);
+        let a1 = AccountInfo::new(&pda1, false, false, &mut lp1, &mut d1, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(1, 3_000_000_000),
+            &Pubkey::default(),
+            0,
+            &[s0, a0, s1, a1],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cosigner_below_minimum_stake_is_not_counted() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let w0 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 500_000_000);
+        let (mut l0, mut lp0) = (0u64, 0u64);
+        let mut e0 = [0u8; 0];
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let mut reg = registry_with_stake(1, 500_000_000);
+        reg.minimum_stake = 1_000_000_000;
+        assert!(verify_validator_quorum(&p, &reg, &Pubkey::default(), 0, &[s0, a0]).is_err());
+    }
+
+    #[test]
+    fn full_roster_legitimate_settlement_is_accepted() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Registry: 3 validators x 2 SOL = 6 SOL. The settling authority is a
+        // genuine member (2 SOL); the other two members co-sign (2 + 2 SOL).
+        // counted (4) == eligible (6 - 2) and participants (3) ==
+        // active_validators (3) -> the authority subtraction is fully
+        // accounted and the settlement must accept.
+        let auth = Pubkey::new_unique();
+        let w0 = Pubkey::new_unique();
+        let w1 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let (pda1, _) = Pubkey::find_program_address(&[b"validator", w1.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 2_000_000_000);
+        let mut d1 = validator_data_staked(w1, true, 2_000_000_000);
+        let (mut l0, mut l1, mut lp0, mut lp1) = (0u64, 0u64, 0u64, 0u64);
+        let (mut e0, mut e1) = ([0u8; 0], [0u8; 0]);
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let s1 = AccountInfo::new(&w1, true, false, &mut l1, &mut e1, &sys, false, 0);
+        let a1 = AccountInfo::new(&pda1, false, false, &mut lp1, &mut d1, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(3, 6_000_000_000),
+            &auth,
+            2_000_000_000,
+            &[s0, a0, s1, a1],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn partial_roster_legitimate_settlement_is_accepted() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Registry: 4 active validators, 10 SOL total. The settling authority
+        // holds 2 SOL; two co-signers hold 4 + 3 = 7 SOL. The roster is
+        // partial (3 of 4 participants), so the authority's stake is NOT
+        // subtracted, but the co-signers alone clear the stricter full-total
+        // threshold quorum_threshold(10 SOL) = 6,666,666,667 -> must accept.
+        // (This preserves liveness for honest partial rosters while denying
+        // the orphan-authority denominator shrink.)
+        let auth = Pubkey::new_unique();
+        let w0 = Pubkey::new_unique();
+        let w1 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let (pda1, _) = Pubkey::find_program_address(&[b"validator", w1.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 4_000_000_000);
+        let mut d1 = validator_data_staked(w1, true, 3_000_000_000);
+        let (mut l0, mut l1, mut lp0, mut lp1) = (0u64, 0u64, 0u64, 0u64);
+        let (mut e0, mut e1) = ([0u8; 0], [0u8; 0]);
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let s1 = AccountInfo::new(&w1, true, false, &mut l1, &mut e1, &sys, false, 0);
+        let a1 = AccountInfo::new(&pda1, false, false, &mut lp1, &mut d1, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(4, 10_000_000_000),
+            &auth,
+            2_000_000_000,
+            &[s0, a0, s1, a1],
+        )
+        .is_ok());
     }
 
     #[test]
