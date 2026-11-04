@@ -43,6 +43,8 @@ use solana_sdk::{
 };
 #[cfg(feature = "solana-bridge")]
 use std::str::FromStr;
+#[cfg(feature = "solana-bridge")]
+use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
 // Node boot (validator start) — core, not gated on the Solana bridge.
 use paraloom::config::Settings;
@@ -1699,7 +1701,18 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                let ix = create_withdraw_unbonded_stake_instruction(
+                // The validator token account may never have been created (first
+                // withdrawal after registration). Prepend an IDEMPOTENT ATA
+                // creation: it succeeds whether the account exists or not, so
+                // there is no preflight RPC and no check-then-create race — the
+                // whole withdrawal stays one atomic transaction.
+                let ata_ix = create_associated_token_account_idempotent(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+                let withdraw_ix = create_withdraw_unbonded_stake_instruction(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
@@ -1711,7 +1724,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[ata_ix, withdraw_ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
