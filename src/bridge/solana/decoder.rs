@@ -98,17 +98,14 @@ pub fn extract_deposit_events(
     // depositor referenced through a lookup table is out of bounds for the
     // static array, `.get()` returns `None`, and the deposit is silently
     // dropped — confirmed on-chain but never indexed.
-    let loaded: Option<(&[String], &[String])> =
-            confirmed
-            .transaction
-            .meta
-            .as_ref()
-            .and_then(|m| match &m.loaded_addresses {
-                solana_transaction_status::option_serializer::OptionSerializer::Some(l) => {
-                    Some((l.writable.as_slice(), l.readonly.as_slice()))
-                }
-                _ => None,
-            });
+    let mut loaded: Option<(&[String], &[String])> = None;
+    if let Some(m) = confirmed.transaction.meta.as_ref() {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(l) =
+            &m.loaded_addresses
+        {
+            loaded = Some((l.writable.as_slice(), l.readonly.as_slice()));
+        }
+    }
     let account_keys = resolve_account_keys(signature, static_keys, loaded);
 
     let mut events = Vec::new();
