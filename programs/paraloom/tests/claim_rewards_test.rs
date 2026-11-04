@@ -88,6 +88,7 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
 
     let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+let (rewards_vault_pda, _) = Pubkey::find_program_address(&[b"rewards_vault"], &program_id);
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
     let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
     let (validator_pda, _) = Pubkey::find_program_address(
