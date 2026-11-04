@@ -290,7 +290,8 @@ pub mod paraloom_program {
     /// `deposit_note`, so `ext_amount > 0` is rejected here.
     ///
     /// Settlement is quorum-gated exactly like `withdraw` (#260): the signer
-    /// must be a registered validator and a supermajority of validators must
+    /// must be a registered validator. For internal transfers (ext_amount == 0),
+    /// the recipient and fee token accounts are not required to be initialized.or and a supermajority of validators must
     /// co-sign, passed as `(wallet, validator PDA)` pairs in
     /// `remaining_accounts`. No single key can settle alone.
     pub fn transact(
