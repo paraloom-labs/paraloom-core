@@ -247,12 +247,18 @@ async fn submit_handler(
 /// keeping the ones that decrypt. Failed decrypts are silent.
 async fn scan_handler(
     Extension(node): Extension<Arc<dyn TransactIngress>>,
-) -> Json<Vec<DeliveredNote>> {
-    Json(node.delivered_notes().await)
+    Extension(token): Extension<IngressToken>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<DeliveredNote>>, (StatusCode, String)> {
+    // The scan feed serves every delivered note on the same ingress surface as the write route — gate it with the same bearer token.
+    check_bearer(&headers, &token)?;
+    Ok(Json(node.delivered_notes().await))
 }
 
 /// Build the ingress router. Exposed separately from [`serve`] so it can be
 /// mounted under a caller's own listener or driven directly in tests.
+/// Both routes share one admission policy: when a token is configured, the
+/// caller must present it on SUBMIT and on SCAN.
 pub fn router(node: Arc<dyn TransactIngress>, token: IngressToken) -> Router {
     Router::new()
         .route("/transact/submit", post(submit_handler))
@@ -262,8 +268,10 @@ pub fn router(node: Arc<dyn TransactIngress>, token: IngressToken) -> Router {
 }
 
 /// Bind the ingress server on `addr` and serve until the task is dropped.
-/// `token` gates the write endpoint when configured (see
-/// [`crate::node::ingress_auth`]).
+/// `token` gates the ingress when configured (see
+/// [`crate::node::ingress_auth`]): the SUBMIT write path and the SCAN
+/// delivered-note feed share the same bearer check, so an exposed ingress
+/// cannot be enumerated without the token.
 pub async fn serve(
     node: Arc<dyn TransactIngress>,
     addr: SocketAddr,
@@ -467,7 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_token_gates_submit_but_not_scan() {
+    async fn configured_token_gates_submit_and_scan() {
         let token = crate::node::ingress_auth::token_from_config("s3cret");
 
         // Submit without a bearer token → 401, never reaching the node.
@@ -487,16 +495,40 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The read-only scan route is not a consensus write surface, so the
-        // token does not gate it: an unauthenticated GET still succeeds.
-        let app = router(Arc::new(ScanStub), token);
+        // The scan feed serves every delivered note on the same surface, so the
+        // token gates it too: unauthenticated GET is 401, bearer GET is 200.
+        let app = router(Arc::new(ScanStub), token.clone());
         let req = Request::builder()
             .method("GET")
             .uri("/transact/scan")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let app = router(Arc::new(ScanStub), token.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transact/scan")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let notes: Vec<DeliveredNote> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(notes.len(), 1);
+
+        // Wrong token is the same as no token: 401, no feed.
+        let app = router(Arc::new(ScanStub), token);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transact/scan")
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Stub that serves a fixed delivered note, to exercise the scan route.
@@ -513,6 +545,22 @@ mod tests {
                 mint: None,
             }]
         }
+    }
+
+    #[tokio::test]
+    async fn scan_open_when_no_token_configured() {
+        // With no token configured the gate is a no-op (loopback default):
+        // an unauthenticated GET still serves the feed. This documents the
+        // backwards-compatible default; operators who expose the ingress
+        // beyond loopback must configure a token.
+        let app = router(Arc::new(ScanStub), None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transact/scan")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
