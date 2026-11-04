@@ -480,6 +480,33 @@ pub fn create_withdraw_unbonded_stake_instruction(
     }
 }
 
+/// Create an idempotent `create_associated_token_account` instruction.
+///
+/// Ensures the ATA exists prior to on-chain token operations (such as
+/// [`create_withdraw_unbonded_stake_instruction`]), preventing `AccountNotInitialized`
+/// reverts when a validator has not yet initialized their ATA (#1323).
+/// Matches the SPL Associated Token Account Program standard.
+pub fn create_associated_token_account_idempotent_instruction(
+    funding_account: &Pubkey,
+    wallet_address: &Pubkey,
+    token_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(wallet_address, token_mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*funding_account, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*wallet_address, false),
+            AccountMeta::new_readonly(*token_mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1], // 1 = CreateIdempotent
+    }
+}
+
 /// Create a `claim_rewards` instruction.
 ///
 /// Drains accumulated settlement fees (`pending_rewards`) from `bridge_vault`
@@ -1310,5 +1337,39 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction() {
+        let funding_account = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_associated_token_account_idempotent_instruction(
+            &funding_account,
+            &wallet,
+            &stake_mint,
+            &token_program,
+        );
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.accounts.len(), 6);
+        assert_eq!(ix.accounts[0].pubkey, funding_account);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_associated_token_address(&wallet, &stake_mint, &token_program)
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, wallet);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, stake_mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[4].is_writable);
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+        assert!(!ix.accounts[5].is_writable);
+        assert_eq!(ix.data, vec![1]);
     }
 }

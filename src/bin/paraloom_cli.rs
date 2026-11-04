@@ -1699,19 +1699,30 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                let ix = create_withdraw_unbonded_stake_instruction(
+                let mut instructions = Vec::new();
+                if client.get_account(&validator_token).is_err() {
+                    println!("Associated token account not found. Adding create ATA instruction...");
+                    instructions.push(create_associated_token_account_idempotent_instruction(
+                        &validator.pubkey(),
+                        &validator.pubkey(),
+                        &stake_mint,
+                        &token_program,
+                    ));
+                }
+
+                instructions.push(create_withdraw_unbonded_stake_instruction(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
                     &validator_token,
                     &token_program,
-                );
+                ));
 
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &instructions,
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
