@@ -68,7 +68,13 @@ fn bake_mint_at(pt: &mut ProgramTest, mint: Pubkey) {
 }
 
 /// Bake an initialized SPL token account at a FIXED address.
-fn bake_token_account_at(pt: &mut ProgramTest, addr: Pubkey, mint: Pubkey, owner: Pubkey, amount: u64) {
+fn bake_token_account_at(
+    pt: &mut ProgramTest,
+    addr: Pubkey,
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) {
     use anchor_lang::solana_program::program_option::COption;
     let mut data = vec![0u8; spl_token::state::Account::LEN];
     spl_token::state::Account {
@@ -95,11 +101,45 @@ fn bake_token_account_at(pt: &mut ProgramTest, addr: Pubkey, mint: Pubkey, owner
 }
 
 fn token_amount(account: &Account) -> u64 {
-    spl_token::state::Account::unpack(&account.data).unwrap().amount
+    spl_token::state::Account::unpack(&account.data)
+        .unwrap()
+        .amount
 }
 
-#[tokio::test]
-async fn transact_spl_settles_a_token_withdrawal() {
+fn extract_custom_error(err: &solana_program_test::BanksClientError) -> Option<u32> {
+    match err {
+        solana_program_test::BanksClientError::TransactionError(
+            solana_sdk::transaction::TransactionError::InstructionError(
+                _,
+                solana_sdk::instruction::InstructionError::Custom(code),
+            ),
+        ) => Some(*code),
+        _ => None,
+    }
+}
+
+struct FixtureContext {
+    banks: solana_program_test::BanksClient,
+    upgrade_authority: Keypair,
+    cosigner: Keypair,
+    blockhash: solana_sdk::hash::Hash,
+    program_id: Pubkey,
+    state_pda: Pubkey,
+    tree_pda: Pubkey,
+    registry_pda: Pubkey,
+    validator_pda: Pubkey,
+    cosigner_pda: Pubkey,
+    asset_mint: Pubkey,
+    asset_vault: Pubkey,
+    asset_vault_authority: Pubkey,
+    recipient_token: Pubkey,
+    fee_token: Pubkey,
+    nf0_pda: Pubkey,
+    nf1_pda: Pubkey,
+    vault_before: u64,
+}
+
+async fn setup_spl_fixture() -> FixtureContext {
     let program_id = paraloom_program::ID;
     let mut pt = program_test(program_id);
     let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
@@ -123,8 +163,7 @@ async fn transact_spl_settles_a_token_withdrawal() {
             rent_epoch: 0,
         },
     );
-    let cosigner_token =
-        add_token_account(&mut pt, stake_mint, cosigner.pubkey(), TEST_TOKEN_FUND);
+    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), TEST_TOKEN_FUND);
 
     // The shielded SPL asset, its depositor, the payout recipient, and the fee
     // account — all keyed to the fixture's fixed mint/recipient addresses.
@@ -149,7 +188,13 @@ async fn transact_spl_settles_a_token_withdrawal() {
     );
     // Payout destination at the fixture's bound token-account address.
     let recipient_token = Pubkey::new_from_array(fx::SPL_FIXTURE_RECIPIENT_TOKEN_ACCOUNT);
-    bake_token_account_at(&mut pt, recipient_token, asset_mint, Pubkey::new_unique(), 0);
+    bake_token_account_at(
+        &mut pt,
+        recipient_token,
+        asset_mint,
+        Pubkey::new_unique(),
+        0,
+    );
     // The settling validator's fee account for the withdrawn asset.
     let fee_token = add_token_account(&mut pt, asset_mint, upgrade_authority.pubkey(), 0);
 
@@ -170,10 +215,14 @@ async fn transact_spl_settles_a_token_withdrawal() {
         Pubkey::find_program_address(&[b"asset_vault_authority"], &program_id);
     let (asset_config, _) =
         Pubkey::find_program_address(&[b"asset_config", asset_mint.as_ref()], &program_id);
-    let (nf0_pda, _) =
-        Pubkey::find_program_address(&[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_0.as_ref()], &program_id);
-    let (nf1_pda, _) =
-        Pubkey::find_program_address(&[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_1.as_ref()], &program_id);
+    let (nf0_pda, _) = Pubkey::find_program_address(
+        &[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_0.as_ref()],
+        &program_id,
+    );
+    let (nf1_pda, _) = Pubkey::find_program_address(
+        &[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_1.as_ref()],
+        &program_id,
+    );
 
     // 1. initialize bridge state.
     send(
@@ -225,7 +274,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
             data: instruction::InitializeValidatorRegistry {}.data(),
             accounts: accounts::InitializeValidatorRegistry {
                 stake_mint,
-                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
                 stake_vault_authority: Pubkey::find_program_address(
                     &[b"stake_vault_authority"],
                     &program_id,
@@ -300,7 +353,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
                 stake_mint,
                 validator_account: validator_pda,
                 validator_token_account: authority_token,
-                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
                 token_program: spl_token::id(),
                 validator_registry: registry_pda,
                 validator: upgrade_authority.pubkey(),
@@ -326,7 +383,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
                 stake_mint,
                 validator_account: cosigner_pda,
                 validator_token_account: cosigner_token,
-                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
                 token_program: spl_token::id(),
                 validator_registry: registry_pda,
                 validator: cosigner.pubkey(),
@@ -370,15 +431,46 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let tree = IncrementalMerkleTree::try_deserialize(&mut tree_raw.data.as_slice()).unwrap();
     assert_eq!(tree.next_index, 1, "one note deposited");
     assert_eq!(
-        tree.root, fx::SPL_FIXTURE_ROOT,
+        tree.root,
+        fx::SPL_FIXTURE_ROOT,
         "on-chain tree root must equal the host circuit root the proof proves"
     );
     let vault_before = token_amount(&banks.get_account(asset_vault).await.unwrap().unwrap());
-    assert_eq!(vault_before, fx::SPL_FIXTURE_DEPOSIT_AMOUNT, "vault funded by deposit");
+    assert_eq!(
+        vault_before,
+        fx::SPL_FIXTURE_DEPOSIT_AMOUNT,
+        "vault funded by deposit"
+    );
+
+    FixtureContext {
+        banks,
+        upgrade_authority,
+        cosigner,
+        blockhash,
+        program_id,
+        state_pda,
+        tree_pda,
+        registry_pda,
+        validator_pda,
+        cosigner_pda,
+        asset_mint,
+        asset_vault,
+        asset_vault_authority,
+        recipient_token,
+        fee_token,
+        nf0_pda,
+        nf1_pda,
+        vault_before,
+    }
+}
+
+#[tokio::test]
+async fn transact_spl_settles_a_token_withdrawal() {
+    let mut ctx = setup_spl_fixture().await;
 
     // 7. transact_spl: spend the note, pay the token withdraw out of the vault.
     let transact_ix = Instruction {
-        program_id,
+        program_id: ctx.program_id,
         data: instruction::TransactSpl {
             nullifiers: [fx::SPL_FIXTURE_NULLIFIER_0, fx::SPL_FIXTURE_NULLIFIER_1],
             output_commitments: [fx::SPL_FIXTURE_COMMITMENT_0, fx::SPL_FIXTURE_COMMITMENT_1],
@@ -395,24 +487,26 @@ async fn transact_spl_settles_a_token_withdrawal() {
         .data(),
         accounts: {
             let mut metas = accounts::TransactSpl {
-                bridge_state: state_pda,
-                merkle_tree: tree_pda,
-                mint: asset_mint,
-                asset_vault,
-                asset_vault_authority,
-                recipient_token_account: recipient_token,
-                fee_token_account: fee_token,
-                nullifier_account_0: nf0_pda,
-                nullifier_account_1: nf1_pda,
-                validator_account: validator_pda,
-                validator_registry: registry_pda,
-                authority: upgrade_authority.pubkey(),
+                bridge_state: ctx.state_pda,
+                merkle_tree: ctx.tree_pda,
+                mint: ctx.asset_mint,
+                asset_vault: ctx.asset_vault,
+                asset_vault_authority: ctx.asset_vault_authority,
+                recipient_token_account: ctx.recipient_token,
+                fee_token_account: ctx.fee_token,
+                nullifier_account_0: ctx.nf0_pda,
+                nullifier_account_1: ctx.nf1_pda,
+                validator_account: ctx.validator_pda,
+                validator_registry: ctx.registry_pda,
+                authority: ctx.upgrade_authority.pubkey(),
                 token_program: spl_token::id(),
                 system_program: system_program::ID,
             }
             .to_account_metas(None);
-            metas.push(AccountMeta::new_readonly(cosigner.pubkey(), true));
-            metas.push(AccountMeta::new_readonly(cosigner_pda, false));
+            metas[5].is_writable = true; // recipient_token_account is written to during withdrawal CPI
+            metas[6].is_writable = true; // fee_token_account is written to during fee CPI
+            metas.push(AccountMeta::new_readonly(ctx.cosigner.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(ctx.cosigner_pda, false));
             metas
         },
     };
@@ -426,45 +520,226 @@ async fn transact_spl_settles_a_token_withdrawal() {
             solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
             transact_ix,
         ],
-        Some(&upgrade_authority.pubkey()),
-        &[&upgrade_authority, &cosigner],
-        blockhash,
+        Some(&ctx.upgrade_authority.pubkey()),
+        &[&ctx.upgrade_authority, &ctx.cosigner],
+        ctx.blockhash,
     );
-    banks.process_transaction(transact_tx).await.unwrap();
+    ctx.banks.process_transaction(transact_tx).await.unwrap();
 
     let gross = fx::SPL_FIXTURE_EXT_AMOUNT.unsigned_abs();
     let fee = gross * 25 / 10_000;
     let payout = gross - fee;
 
     // Recipient token account received the payout net of the fee.
-    let recipient_after = token_amount(&banks.get_account(recipient_token).await.unwrap().unwrap());
-    assert_eq!(recipient_after, payout, "recipient token account gains |ext| - fee");
+    let recipient_after = token_amount(
+        &ctx.banks
+            .get_account(ctx.recipient_token)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(
+        recipient_after, payout,
+        "recipient token account gains |ext| - fee"
+    );
     // The fee landed in the settling validator's token account.
-    let fee_after = token_amount(&banks.get_account(fee_token).await.unwrap().unwrap());
+    let fee_after = token_amount(&ctx.banks.get_account(ctx.fee_token).await.unwrap().unwrap());
     assert_eq!(fee_after, fee, "fee paid to the validator's token account");
     // The vault paid out exactly gross.
-    let vault_after = token_amount(&banks.get_account(asset_vault).await.unwrap().unwrap());
-    assert_eq!(vault_before - vault_after, gross, "vault debited by gross");
+    let vault_after = token_amount(
+        &ctx.banks
+            .get_account(ctx.asset_vault)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(
+        ctx.vault_before - vault_after,
+        gross,
+        "vault debited by gross"
+    );
 
     // Both input nullifiers were recorded.
     for (pda, expected) in [
-        (nf0_pda, fx::SPL_FIXTURE_NULLIFIER_0),
-        (nf1_pda, fx::SPL_FIXTURE_NULLIFIER_1),
+        (ctx.nf0_pda, fx::SPL_FIXTURE_NULLIFIER_0),
+        (ctx.nf1_pda, fx::SPL_FIXTURE_NULLIFIER_1),
     ] {
-        let raw = banks.get_account(pda).await.unwrap().expect("nullifier PDA exists");
+        let raw = ctx
+            .banks
+            .get_account(pda)
+            .await
+            .unwrap()
+            .expect("nullifier PDA exists");
         let nul = NullifierAccount::try_deserialize(&mut raw.data.as_slice()).unwrap();
         assert_eq!(nul.nullifier, expected);
         assert_eq!(nul.withdrawal_id, 1);
     }
 
     // Both output commitments appended: leaf 0 (deposit) + 2 outputs = 3.
-    let tree_raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree_raw = ctx.banks.get_account(ctx.tree_pda).await.unwrap().unwrap();
     let tree = IncrementalMerkleTree::try_deserialize(&mut tree_raw.data.as_slice()).unwrap();
     assert_eq!(tree.next_index, 3, "two output commitments appended");
     assert_ne!(tree.root, ZERO_HASHES[TREE_DEPTH]);
     assert!(tree.is_known_root(fx::SPL_FIXTURE_ROOT));
 
-    let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
+    let state_raw = ctx.banks.get_account(ctx.state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+}
+
+#[tokio::test]
+async fn transact_spl_accepts_uninitialized_token_accounts_for_internal_transfer() {
+    let mut ctx = setup_spl_fixture().await;
+
+    // Internal shielded transfer: ext_amount == 0.
+    // The client passes default / uninitialized Pubkeys for recipient_token_account
+    // and fee_token_account (#1337). Anchor account validation must accept them
+    // rather than rejecting with AccountOwnedByWrongProgram (3007) or AccountNotInitialized (3012).
+    let transact_ix = Instruction {
+        program_id: ctx.program_id,
+        data: instruction::TransactSpl {
+            nullifiers: [fx::SPL_FIXTURE_NULLIFIER_0, fx::SPL_FIXTURE_NULLIFIER_1],
+            output_commitments: [fx::SPL_FIXTURE_COMMITMENT_0, fx::SPL_FIXTURE_COMMITMENT_1],
+            root: fx::SPL_FIXTURE_ROOT,
+            ext_amount: 0,
+            proof: {
+                let mut p = Vec::new();
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_A);
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_B);
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_C);
+                p
+            },
+        }
+        .data(),
+        accounts: {
+            let mut metas = accounts::TransactSpl {
+                bridge_state: ctx.state_pda,
+                merkle_tree: ctx.tree_pda,
+                mint: ctx.asset_mint,
+                asset_vault: ctx.asset_vault,
+                asset_vault_authority: ctx.asset_vault_authority,
+                recipient_token_account: Pubkey::default(),
+                fee_token_account: Pubkey::default(),
+                nullifier_account_0: ctx.nf0_pda,
+                nullifier_account_1: ctx.nf1_pda,
+                validator_account: ctx.validator_pda,
+                validator_registry: ctx.registry_pda,
+                authority: ctx.upgrade_authority.pubkey(),
+                token_program: spl_token::id(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None);
+            metas.push(AccountMeta::new_readonly(ctx.cosigner.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(ctx.cosigner_pda, false));
+            metas
+        },
+    };
+
+    let transact_tx = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            transact_ix,
+        ],
+        Some(&ctx.upgrade_authority.pubkey()),
+        &[&ctx.upgrade_authority, &ctx.cosigner],
+        ctx.blockhash,
+    );
+
+    let err = ctx
+        .banks
+        .process_transaction(transact_tx)
+        .await
+        .unwrap_err();
+    let err_code = extract_custom_error(&err);
+    // Did NOT fail during Anchor account deserialization with 3007 or 3012:
+    assert_ne!(
+        err_code,
+        Some(3007),
+        "uninitialized recipient account must not fail account validation with AccountOwnedByWrongProgram"
+    );
+    assert_ne!(
+        err_code,
+        Some(3012),
+        "uninitialized fee account must not fail account validation with AccountNotInitialized"
+    );
+    // Execution proceeded past account validation and checks to proof verification:
+    assert_eq!(
+        err_code,
+        Some(6002),
+        "instruction execution proceeds to verify_transact and fails InvalidProof"
+    );
+}
+
+#[tokio::test]
+async fn transact_spl_withdrawal_rejects_uninitialized_fee_token_account() {
+    let mut ctx = setup_spl_fixture().await;
+
+    // External withdrawal (ext_amount < 0) MUST require valid SPL token accounts.
+    // If fee_token_account is an uninitialized/system account, it must be rejected
+    // with AccountOwnedByWrongProgram (3007) when withdrawal settlement executes.
+    let uninitialized_fee_account = Keypair::new().pubkey();
+
+    let transact_ix = Instruction {
+        program_id: ctx.program_id,
+        data: instruction::TransactSpl {
+            nullifiers: [fx::SPL_FIXTURE_NULLIFIER_0, fx::SPL_FIXTURE_NULLIFIER_1],
+            output_commitments: [fx::SPL_FIXTURE_COMMITMENT_0, fx::SPL_FIXTURE_COMMITMENT_1],
+            root: fx::SPL_FIXTURE_ROOT,
+            ext_amount: fx::SPL_FIXTURE_EXT_AMOUNT,
+            proof: {
+                let mut p = Vec::new();
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_A);
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_B);
+                p.extend_from_slice(&fx::SPL_FIXTURE_PROOF_C);
+                p
+            },
+        }
+        .data(),
+        accounts: {
+            let mut metas = accounts::TransactSpl {
+                bridge_state: ctx.state_pda,
+                merkle_tree: ctx.tree_pda,
+                mint: ctx.asset_mint,
+                asset_vault: ctx.asset_vault,
+                asset_vault_authority: ctx.asset_vault_authority,
+                recipient_token_account: ctx.recipient_token,
+                fee_token_account: uninitialized_fee_account,
+                nullifier_account_0: ctx.nf0_pda,
+                nullifier_account_1: ctx.nf1_pda,
+                validator_account: ctx.validator_pda,
+                validator_registry: ctx.registry_pda,
+                authority: ctx.upgrade_authority.pubkey(),
+                token_program: spl_token::id(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None);
+            metas[5].is_writable = true;
+            metas[6].is_writable = true;
+            metas.push(AccountMeta::new_readonly(ctx.cosigner.pubkey(), true));
+            metas.push(AccountMeta::new_readonly(ctx.cosigner_pda, false));
+            metas
+        },
+    };
+
+    let transact_tx = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            transact_ix,
+        ],
+        Some(&ctx.upgrade_authority.pubkey()),
+        &[&ctx.upgrade_authority, &ctx.cosigner],
+        ctx.blockhash,
+    );
+
+    let err = ctx
+        .banks
+        .process_transaction(transact_tx)
+        .await
+        .unwrap_err();
+    let err_code = extract_custom_error(&err);
+    assert_eq!(
+        err_code,
+        Some(3007),
+        "withdrawal with non-token fee account must be rejected with AccountOwnedByWrongProgram"
+    );
 }

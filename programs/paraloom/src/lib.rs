@@ -631,18 +631,46 @@ pub mod paraloom_program {
                 .ok_or(BridgeError::InvalidAmount)?;
             let payout = gross - fee;
 
-            // Validate that recipient_token_account is an initialized TokenAccount for this mint
             require!(
-                ctx.accounts.recipient_token_account.owner == ctx.accounts.token_program.key,
-                BridgeError::InvalidTokenAccount
+                ctx.accounts.recipient_token_account.is_writable,
+                ErrorCode::ConstraintMut
             );
-            let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
-            let recipient_account = TokenAccount::try_deserialize(&mut recipient_data.as_ref())?;
             require!(
-                recipient_account.mint == ctx.accounts.mint.key(),
-                BridgeError::InvalidTokenAccount
+                ctx.accounts.fee_token_account.is_writable,
+                ErrorCode::ConstraintMut
             );
-            drop(recipient_data);
+
+            let (recipient_mint, fee_mint, fee_owner) = {
+                require!(
+                    ctx.accounts.recipient_token_account.owner == &anchor_spl::token::ID
+                        || ctx.accounts.recipient_token_account.owner == &anchor_spl::token_2022::ID,
+                    ErrorCode::AccountOwnedByWrongProgram
+                );
+                let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
+                let recipient_ta = TokenAccount::try_deserialize(&mut &recipient_data[..])?;
+
+                require!(
+                    ctx.accounts.fee_token_account.owner == &anchor_spl::token::ID
+                        || ctx.accounts.fee_token_account.owner == &anchor_spl::token_2022::ID,
+                    ErrorCode::AccountOwnedByWrongProgram
+                );
+                let fee_data = ctx.accounts.fee_token_account.try_borrow_data()?;
+                let fee_ta = TokenAccount::try_deserialize(&mut &fee_data[..])?;
+
+                (recipient_ta.mint, fee_ta.mint, fee_ta.owner)
+            };
+            require!(
+                recipient_mint == ctx.accounts.mint.key(),
+                ErrorCode::ConstraintTokenMint
+            );
+            require!(
+                fee_mint == ctx.accounts.mint.key(),
+                ErrorCode::ConstraintTokenMint
+            );
+            require!(
+                fee_owner == ctx.accounts.authority.key(),
+                ErrorCode::ConstraintTokenOwner
+            );
 
             // Token accounts are independently rent-exempt, so unlike the native
             // vault there is no rent floor to reserve; the vault just needs the
@@ -677,21 +705,7 @@ pub mod paraloom_program {
             // The native path credits lamport `pending_rewards`
             // for a later claim; here the token fee is paid inline.
             if fee > 0 {
-                require!(
-                    ctx.accounts.fee_token_account.owner == ctx.accounts.token_program.key,
-                    BridgeError::InvalidTokenAccount
-                );
-                let fee_data = ctx.accounts.fee_token_account.try_borrow_data()?;
-                let fee_account = TokenAccount::try_deserialize(&mut fee_data.as_ref())?;
-                require!(
-                    fee_account.mint == ctx.accounts.mint.key(),
-                    BridgeError::InvalidTokenAccount
-                );
-                require!(
-                    fee_account.owner == ctx.accounts.authority.key(),
-                    BridgeError::InvalidAuthority
-                );
-                drop(fee_data);
+
 
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
@@ -1944,13 +1958,11 @@ pub struct TransactSpl<'info> {
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
     /// CHECK: when ext_amount < 0, manually verified to be an initialized TokenAccount for mint.
-    #[account(mut)]
     pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
     /// paid.
     /// CHECK: when ext_amount < 0 and fee > 0, manually verified to be an initialized TokenAccount for mint owned by authority.
-    #[account(mut)]
     pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
