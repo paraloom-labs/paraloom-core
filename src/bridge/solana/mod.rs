@@ -102,6 +102,15 @@ impl SolanaBridge {
         self.program.latest_blockhash().await
     }
 
+    /// The program that owns an account (for a mint: its token program,
+    /// #1337), resolved through the program interface's RPC.
+    pub async fn account_owner(
+        &self,
+        pubkey: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<solana_sdk::pubkey::Pubkey> {
+        self.program.account_owner(pubkey).await
+    }
+
     /// Current slot, for deriving a settlement's expiration window.
     pub async fn current_slot(&self) -> Result<u64> {
         self.program.get_slot().await

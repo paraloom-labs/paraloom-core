@@ -64,6 +64,16 @@ pub enum SettlementParams {
         root: [u8; 32],
         ext_amount: i64,
         proof: Vec<u8>,
+        /// The program that owns `mint` — classic SPL Token or Token-2022
+        /// (#1337). The ATA derivation and the settlement instruction's
+        /// `token_program` account both key off it, so (like the blockhash)
+        /// the leader resolves it from the chain and pins it here for every
+        /// co-signer to rebuild the identical message. A mint's owner never
+        /// changes, so the pinned value cannot go stale; a wrong value can
+        /// only make the settlement fail on-chain, never redirect funds
+        /// (the recipient is bound by the proof, the fee by the ATA of the
+        /// authority under this program).
+        token_program: [u8; 32],
     },
 }
 
@@ -195,15 +205,22 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
             root,
             ext_amount,
             proof,
+            token_program,
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            // The token program that owns the mint (classic SPL or
+            // Token-2022), pinned in the payload (#1337): the ATA seeds and
+            // the CPI both key off it, so hardcoding the classic program
+            // derived a fee address no account lives at for Token-2022
+            // mints and named the wrong CPI program.
+            let token_program_pk = Pubkey::new_from_array(*token_program);
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +228,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -243,6 +260,26 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
 mod tests {
     use super::*;
 
+    fn sample_transact_spl_payload(token_program: [u8; 32]) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+                token_program,
+            },
+        }
+    }
+
     fn sample_transact_payload() -> CoSignPayload {
         CoSignPayload {
             program_id: [1u8; 32],
@@ -267,6 +304,50 @@ mod tests {
         let bytes = payload.to_bytes().expect("serialize");
         let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn transact_spl_payload_round_trips_through_bytes() {
+        let payload = sample_transact_spl_payload(
+            crate::bridge::solana::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        );
+        let bytes = payload.to_bytes().expect("serialize");
+        let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn transact_spl_message_uses_the_pinned_token_program() {
+        // #1337: for a Token-2022 mint the settlement instruction must pay
+        // the fee to the ATA derived under Token-2022 and name Token-2022
+        // as the token program — the classic-SPL ATA is a different address
+        // where no account lives, and the classic program cannot move
+        // Token-2022 tokens.
+        use crate::bridge::solana::instructions::{
+            derive_associated_token_address, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+        };
+        let authority = Pubkey::new_from_array([2u8; 32]);
+        let mint = Pubkey::new_from_array([7u8; 32]);
+
+        let msg_2022 = build_settlement_message(&sample_transact_spl_payload(
+            SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        ))
+        .expect("build token-2022 message");
+        let fee_2022 = derive_associated_token_address(&authority, &mint, &SPL_TOKEN_2022_PROGRAM_ID);
+        assert!(msg_2022.account_keys.contains(&fee_2022));
+        assert!(msg_2022.account_keys.contains(&SPL_TOKEN_2022_PROGRAM_ID));
+
+        // Control: pinned to the classic program, the message carries the
+        // classic ATA and program instead.
+        let msg_classic =
+            build_settlement_message(&sample_transact_spl_payload(SPL_TOKEN_PROGRAM_ID.to_bytes()))
+                .expect("build classic message");
+        let fee_classic =
+            derive_associated_token_address(&authority, &mint, &SPL_TOKEN_PROGRAM_ID);
+        assert_ne!(fee_2022, fee_classic);
+        assert!(msg_classic.account_keys.contains(&fee_classic));
+        assert!(msg_classic.account_keys.contains(&SPL_TOKEN_PROGRAM_ID));
+        assert_ne!(msg_2022.serialize(), msg_classic.serialize());
     }
 
     #[test]

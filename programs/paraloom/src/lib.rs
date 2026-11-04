@@ -129,6 +129,33 @@ fn transact_ext_data_hash(recipient: &Pubkey, ext_amount: i64) -> [u8; 32] {
         .to_bytes()
 }
 
+/// Validate one of `transact_spl`'s payout token accounts in the handler,
+/// applying the checks the accounts struct used to enforce at the Anchor
+/// boundary via `InterfaceAccount<TokenAccount>` and its `token::`
+/// constraints (#1337) — with the same error codes: a missing (empty-data)
+/// account is `AccountNotInitialized`, a non-token-program owner is
+/// `AccountOwnedByWrongProgram`, and a mint mismatch is
+/// `ConstraintTokenMint`. The struct fields are unchecked because an
+/// internal transfer (`ext_amount == 0`) passes placeholder accounts that
+/// must not be validated at all; a withdrawal calls this for each account
+/// it actually pays. Returns the token account's owner so the caller can
+/// pin the fee account to the settling `authority`.
+fn validate_transact_spl_token_account(account: AccountInfo, mint: &Pubkey) -> Result<Pubkey> {
+    require!(account.is_writable, ErrorCode::ConstraintMut);
+    require!(
+        !account.data_is_empty(),
+        ErrorCode::AccountNotInitialized
+    );
+    require!(
+        account.owner == &anchor_spl::token::ID || account.owner == &anchor_spl::token_2022::ID,
+        ErrorCode::AccountOwnedByWrongProgram
+    );
+    let data = account.try_borrow_data()?;
+    let token_account = TokenAccount::try_deserialize(&mut &data[..])?;
+    require!(token_account.mint == *mint, ErrorCode::ConstraintTokenMint);
+    Ok(token_account.owner)
+}
+
 /// Little-endian BN254 field encoding of the signed `ext_amount`, matching the
 /// circuit's `public_amount` (`sumOut - sumIn`): a withdrawal (`ext_amount <
 /// 0`) encodes as `p - |ext_amount|`. Deriving `public_amount` on-chain from
@@ -630,6 +657,26 @@ pub mod paraloom_program {
                 .and_then(|v| v.checked_div(10_000))
                 .ok_or(BridgeError::InvalidAmount)?;
             let payout = gross - fee;
+
+            // #1337: the recipient and fee token accounts are unchecked in
+            // the accounts struct (an internal transfer passes placeholders
+            // for both), so a withdrawal validates them here, where they are
+            // actually used — the recipient on every withdrawal, the fee
+            // account only when a fee is paid, matching the CPIs below.
+            validate_transact_spl_token_account(
+                ctx.accounts.recipient_token_account.to_account_info(),
+                &ctx.accounts.mint.key(),
+            )?;
+            if fee > 0 {
+                let fee_owner = validate_transact_spl_token_account(
+                    ctx.accounts.fee_token_account.to_account_info(),
+                    &ctx.accounts.mint.key(),
+                )?;
+                require!(
+                    fee_owner == ctx.accounts.authority.key(),
+                    ErrorCode::ConstraintTokenOwner
+                );
+            }
 
             // Token accounts are independently rent-exempt, so unlike the native
             // vault there is no rent floor to reserve; the vault just needs the
@@ -1914,13 +1961,23 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    ///
+    /// CHECK: unchecked because an internal transfer (`ext_amount == 0`)
+    /// never touches this account — the wallet passes `Pubkey::default()`
+    /// for it — so it cannot be validated at the Anchor boundary (#1337).
+    /// On a withdrawal (`ext_amount < 0`) the handler validates it as an
+    /// initialized token account for `mint` before the payout CPI (see
+    /// `validate_transact_spl_token_account`).
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid. The handler validates it — only when a fee is actually paid —
+    /// as an initialized token account for `mint` owned by the `authority`
+    /// signer, so the fee cannot be diverted.
+    ///
+    /// CHECK: unchecked for the same internal-transfer reason as
+    /// `recipient_token_account` (#1337).
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,

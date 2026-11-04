@@ -108,6 +108,22 @@ impl Bridge {
         }
     }
 
+    /// The program that owns the account at `address` — for a mint, its
+    /// token program (#1337). The settlement leader resolves this from the
+    /// chain and pins it into the co-sign payload.
+    pub async fn account_owner(&self, address: &[u8; 32]) -> Result<[u8; 32]> {
+        if let Some(ref bridge) = self.solana_bridge {
+            Ok(bridge
+                .account_owner(&solana_sdk::pubkey::Pubkey::new_from_array(*address))
+                .await?
+                .to_bytes())
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
+
     /// Current slot, for deriving a settlement's expiration window.
     pub async fn current_slot(&self) -> Result<u64> {
         if let Some(ref bridge) = self.solana_bridge {
