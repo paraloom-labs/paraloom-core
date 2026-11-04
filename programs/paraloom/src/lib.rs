@@ -1518,6 +1518,43 @@ pub mod paraloom_program {
             );
         }
 
+        // The mint this reset pins must be the singleton `stake_token_vault`'s
+        // actual SPL mint (#974). The vault is seeded only by
+        // `[b"stake_token_vault"]` — no mint seed — so once created its mint
+        // can never change, while this instruction overwrites
+        // `validator_registry.stake_mint` freely: pinning any other mint
+        // desyncs the two and permanently bricks the dual-stake instructions
+        // (`register_validator` / `slash_validator` /
+        // `withdraw_unbonded_stake` all key off the vault's mint). Checking
+        // the registry's own stored value instead would prove nothing — that
+        // value is exactly what is being overwritten. A default mint can
+        // never be a real vault mint. If the vault has not been created yet
+        // (pre-dual-stake registry) there is no mint to diverge from and the
+        // pin stands; creation via `init_stake_token_vault` is then keyed to
+        // it by the runbook.
+        require!(
+            stake_mint != Pubkey::default(),
+            BridgeError::StakeMintMismatch
+        );
+        {
+            let vault_ai = ctx.accounts.stake_token_vault.to_account_info();
+            let data = vault_ai.try_borrow_data()?;
+            // An initialized SPL token account (legacy Token or Token-2022)
+            // stores its mint in bytes 0..32 either way; any other owner
+            // means the vault account does not exist as a token account yet.
+            let is_token_account = data.len() >= 32
+                && (vault_ai.owner == &anchor_spl::token::ID
+                    || vault_ai.owner == &anchor_spl::token_2022::ID);
+            if is_token_account {
+                let mut mint_bytes = [0u8; 32];
+                mint_bytes.copy_from_slice(&data[0..32]);
+                require!(
+                    stake_mint == Pubkey::new_from_array(mint_bytes),
+                    BridgeError::StakeMintMismatch
+                );
+            }
+        }
+
         // Grow to the current layout, topping up rent for the extra bytes.
         let new_len = 8 + ValidatorRegistry::INIT_SPACE;
         let rent = Rent::get()?;
@@ -1875,6 +1912,16 @@ pub struct ResetValidatorRegistry<'info> {
     pub program_data: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
+
+    /// The singleton dual-stake vault. Taken untyped because on a registry
+    /// that predates the dual-stake it may not have been created yet; when it
+    /// HAS been created, its SPL mint is immutable, and the body refuses to
+    /// pin a `stake_mint` that differs from the vault's actual mint (#974).
+    ///
+    /// CHECK: address pinned by seeds; the mint is read manually in the body
+    /// only when the account is an initialized token account.
+    #[account(seeds = [b"stake_token_vault"], bump)]
+    pub stake_token_vault: UncheckedAccount<'info>,
 }
 
 /// Accounts for [`transact_spl`] — the SPL-token settlement path (#779). Mirrors
@@ -2916,4 +2963,7 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Stake mint does not match the stake token vault's mint")]
+    StakeMintMismatch,
 }

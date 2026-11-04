@@ -169,6 +169,7 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         authority: upgrade_authority.pubkey(),
         program_data: program_data_pda,
         system_program: system_program::ID,
+        stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
     }
     .to_account_metas(None);
     short_metas.push(AccountMeta::new_readonly(pda_a, false));
@@ -203,6 +204,7 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         authority: upgrade_authority.pubkey(),
         program_data: program_data_pda,
         system_program: system_program::ID,
+        stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
     }
     .to_account_metas(None);
     reset_metas.push(AccountMeta::new_readonly(pda_a, false));
@@ -296,6 +298,8 @@ async fn reset_rejects_non_upgrade_authority() {
             authority: payer.pubkey(),
             program_data: program_data_pda,
             system_program: system_program::ID,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id)
+                .0,
         }
         .to_account_metas(None),
     };
@@ -303,4 +307,204 @@ async fn reset_rejects_non_upgrade_authority() {
     tx.sign(&[&payer], blockhash);
     let err = banks.process_transaction(tx).await;
     assert!(err.is_err(), "non-authority reset must fail");
+}
+
+/// Shared setup for the #974 mint-guard tests: a registry initialized with
+/// `stake_mint` (which also creates the singleton `stake_token_vault` with
+/// that mint) and one registered validator. Returns the banks client, the
+/// upgrade authority, the blockhash, the registry PDA and the validator PDA.
+async fn setup_registry_with_one_validator(
+    stake_mint_authority: Pubkey,
+) -> (
+    solana_program_test::BanksClient,
+    Keypair,
+    solana_sdk::hash::Hash,
+    Pubkey,
+    Pubkey,
+    Pubkey,
+) {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator = Keypair::new();
+    pt.add_account(
+        validator.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let stake_mint = add_stake_mint(&mut pt, stake_mint_authority);
+    let validator_token = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    let init_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let (reg_ix, validator_pda) = register_ix(
+        program_id,
+        registry_pda,
+        validator.pubkey(),
+        stake_mint,
+        validator_token,
+    );
+    let mut tx = Transaction::new_with_payer(&[reg_ix], Some(&validator.pubkey()));
+    tx.sign(&[&validator], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    (
+        banks,
+        upgrade_authority,
+        blockhash,
+        registry_pda,
+        validator_pda,
+        stake_mint,
+    )
+}
+
+fn reset_ix_with_mint(
+    program_id: Pubkey,
+    registry_pda: Pubkey,
+    authority: Pubkey,
+    program_data_pda: Pubkey,
+    stake_mint: Pubkey,
+    validator_pda: Pubkey,
+) -> Instruction {
+    let mut metas = accounts::ResetValidatorRegistry {
+        validator_registry: registry_pda,
+        authority,
+        program_data: program_data_pda,
+        system_program: system_program::ID,
+        stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+    }
+    .to_account_metas(None);
+    metas.push(AccountMeta::new_readonly(validator_pda, false));
+    Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 1,
+        }
+        .data(),
+        accounts: metas,
+    }
+}
+
+#[tokio::test]
+async fn reset_rejects_stake_mint_that_differs_from_stake_token_vault_mint() {
+    // #974 (Bug 2): the singleton stake_token_vault's SPL mint is fixed at
+    // creation. A reset that pins a DIFFERENT mint into the registry desyncs
+    // the two and permanently bricks the dual-stake instructions, so it must
+    // be rejected against the vault's actual mint — not against the
+    // registry's stored value, which is the very field being overwritten.
+    let program_id = paraloom_program::ID;
+    let (mut banks, upgrade_authority, blockhash, registry_pda, validator_pda, stake_mint) =
+        setup_registry_with_one_validator(Pubkey::new_unique()).await;
+    let (program_data_pda, _) =
+        Pubkey::find_program_address(&[program_id.as_ref()], &solana_sdk::bpf_loader_upgradeable::id());
+
+    // A foreign mint (a real, initialized mint account — just not the
+    // vault's) must be refused, and the registry left untouched.
+    let foreign_mint = Pubkey::new_unique();
+    let bad_ix = reset_ix_with_mint(
+        program_id,
+        registry_pda,
+        upgrade_authority.pubkey(),
+        program_data_pda,
+        foreign_mint,
+        validator_pda,
+    );
+    let mut tx = Transaction::new_with_payer(&[bad_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "reset pinning a mint that differs from the stake_token_vault mint must fail"
+    );
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let unchanged = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        unchanged.stake_mint, stake_mint,
+        "a rejected reset must leave the pinned mint untouched"
+    );
+    assert_eq!(unchanged.active_validators, 1);
+
+    // Control: a reset pinning the vault's own mint still succeeds.
+    let good_ix = reset_ix_with_mint(
+        program_id,
+        registry_pda,
+        upgrade_authority.pubkey(),
+        program_data_pda,
+        stake_mint,
+        validator_pda,
+    );
+    let mut tx = Transaction::new_with_payer(&[good_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks
+        .process_transaction(tx)
+        .await
+        .expect("reset pinning the vault's mint must succeed");
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let after = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(after.stake_mint, stake_mint);
+    assert_eq!(after.active_validators, 1);
+}
+
+#[tokio::test]
+async fn reset_rejects_default_stake_mint() {
+    // #974 (Bug 2): Pubkey::default() can never be a real vault mint; pinning
+    // it would break every dual-stake instruction's mint checks.
+    let program_id = paraloom_program::ID;
+    let (mut banks, upgrade_authority, blockhash, registry_pda, validator_pda, stake_mint) =
+        setup_registry_with_one_validator(Pubkey::new_unique()).await;
+    let (program_data_pda, _) =
+        Pubkey::find_program_address(&[program_id.as_ref()], &solana_sdk::bpf_loader_upgradeable::id());
+
+    let bad_ix = reset_ix_with_mint(
+        program_id,
+        registry_pda,
+        upgrade_authority.pubkey(),
+        program_data_pda,
+        Pubkey::default(),
+        validator_pda,
+    );
+    let mut tx = Transaction::new_with_payer(&[bad_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "reset pinning the default mint must fail"
+    );
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let unchanged = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(unchanged.stake_mint, stake_mint);
 }
