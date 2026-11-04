@@ -621,17 +621,18 @@ mod tests {
 
     #[test]
     fn lut_loaded_depositor_resolves() {
-        // deposit_note layout: depositor at position 3. Static table holds 3
-        // entries, so index 3 lives in the loaded run — exactly the reported bug.
+        // deposit_note references the depositor through the loaded run: static
+        // holds [bridge_state, bridge_vault, merkle_tree, program_id], the
+        // depositor is the first loaded address — exactly the reported bug.
         let program_id = Pubkey::new_unique();
         let other = Pubkey::new_unique();
         let depositor = Pubkey::new_unique();
         let combined = resolve_account_keys(
             "sig",
-            vec![other, other, other],
+            vec![other, other, other, program_id],
             Some((&[depositor.to_string()], &[])),
         );
-        assert_eq!(combined.len(), 4);
+        assert_eq!(combined.len(), 5);
         let amount = 500_000u64;
         let pubkey = [21u8; 32];
         let blinding = [23u8; 32];
@@ -643,14 +644,14 @@ mod tests {
         let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
         bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
         let ix = UiCompiledInstruction {
-            program_id_index: 4,
-            accounts: vec![0, 1, 2, 3],
+            program_id_index: 3,
+            accounts: vec![0, 1, 2, 4],
             data: bs58::encode(bytes).into_string(),
             stack_height: None,
         };
-        // Without the LUT extension this is out of bounds (None → silent drop);
-        // with it, the loaded depositor resolves.
-        assert!(decode_compiled_deposit(&ix, &combined[..3], &program_id).is_none());
+        // Without the LUT extension the depositor index is out of bounds
+        // (None → silent drop); with it, the loaded depositor resolves.
+        assert!(decode_compiled_deposit(&ix, &combined[..4], &program_id).is_none());
         let decoded = decode_compiled_deposit(&ix, &combined, &program_id)
             .expect("LUT-loaded depositor must resolve");
         assert_eq!(decoded.depositor, depositor);
