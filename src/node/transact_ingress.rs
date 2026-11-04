@@ -247,8 +247,12 @@ async fn submit_handler(
 /// keeping the ones that decrypt. Failed decrypts are silent.
 async fn scan_handler(
     Extension(node): Extension<Arc<dyn TransactIngress>>,
-) -> Json<Vec<DeliveredNote>> {
-    Json(node.delivered_notes().await)
+    Extension(token): Extension<IngressToken>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<DeliveredNote>>, (StatusCode, String)> {
+    // The scan feed serves every delivered note on the same ingress surface as the write route — gate it with the same bearer token.
+    check_bearer(&headers, &token)?;
+    Ok(Json(node.delivered_notes().await))
 }
 
 /// Build the ingress router. Exposed separately from [`serve`] so it can be
@@ -467,7 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_token_gates_submit_but_not_scan() {
+    async fn configured_token_gates_submit_and_scan() {
         let token = crate::node::ingress_auth::token_from_config("s3cret");
 
         // Submit without a bearer token → 401, never reaching the node.
@@ -487,12 +491,22 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The read-only scan route is not a consensus write surface, so the
-        // token does not gate it: an unauthenticated GET still succeeds.
+        // The scan feed serves every delivered note on the same surface, so the
+        // token gates it too: unauthenticated GET is 401, bearer GET is 200.
+        let app = router(Arc::new(ScanStub), token.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transact/scan")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
         let app = router(Arc::new(ScanStub), token);
         let req = Request::builder()
             .method("GET")
             .uri("/transact/scan")
+            .header("authorization", "Bearer s3cret")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
