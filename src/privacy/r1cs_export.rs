@@ -78,7 +78,7 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
     if num_instance == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "num_instance_variables must be at least 1 (constant-one wire)",
+            "num_instance_variables must be >= 1 (includes the constant-one wire at index 0)",
         ));
     }
 
@@ -140,9 +140,18 @@ pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io
 
     let mut constraints = Vec::new();
     for i in 0..matrices.num_constraints {
-        write_lc(&mut constraints, &matrices.a[i]);
-        write_lc(&mut constraints, &matrices.b[i]);
-        write_lc(&mut constraints, &matrices.c[i]);
+        let row_a = matrices.a.get(i).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("matrix A missing row {i}"))
+        })?;
+        let row_b = matrices.b.get(i).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("matrix B missing row {i}"))
+        })?;
+        let row_c = matrices.c.get(i).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("matrix C missing row {i}"))
+        })?;
+        write_lc(&mut constraints, row_a);
+        write_lc(&mut constraints, row_b);
+        write_lc(&mut constraints, row_c);
     }
     section(out, SECTION_CONSTRAINTS, &constraints)?;
 
@@ -329,15 +338,29 @@ mod tests {
         let matrices = ConstraintMatrices {
             num_instance_variables: 0,
             num_witness_variables: 1,
-            num_constraints: 0,
-            a: vec![],
-            b: vec![],
-            c: vec![],
+            num_constraints: 1,
+            a: vec![vec![]],
+            b: vec![vec![]],
+            c: vec![vec![]],
         };
         let mut out = Vec::new();
         let err = write_r1cs(&mut out, &matrices).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("num_instance_variables must be at least 1"));
+        assert!(err.to_string().contains("num_instance_variables must be >= 1"));
+    }
+
+    #[test]
+    fn write_r1cs_num_instance_one_accepted() {
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a: vec![vec![(Fr::from(1u64), 0)]],
+            b: vec![vec![(Fr::from(1u64), 1)]],
+            c: vec![vec![(Fr::from(1u64), 1)]],
+        };
+        let mut out = Vec::new();
+        assert!(write_r1cs(&mut out, &matrices).is_ok());
     }
 
     #[test]

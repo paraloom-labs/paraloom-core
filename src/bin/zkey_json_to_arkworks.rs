@@ -22,7 +22,7 @@
 
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
 use ark_ec::pairing::Pairing;
-use ark_ec::AffineRepr;
+use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{Field, PrimeField, Zero};
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
@@ -136,6 +136,20 @@ fn g1_vec(points: &[G1Json], what: &str) -> Res<Vec<G1Affine>> {
         .enumerate()
         .map(|(i, p)| g1(p, &format!("{}[{}]", what, i)))
         .collect()
+}
+
+/// Verify cross-curve pairing consistency invariants:
+/// e(beta_1, G2) == e(G1, beta_2) and e(delta_1, G2) == e(G1, delta_2).
+pub fn check_pairing_consistency(pk: &ProvingKey<Bn254>) -> Res<()> {
+    let g1_gen = G1Affine::generator();
+    let g2_gen = G2Affine::generator();
+    if Bn254::pairing(pk.beta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.beta_g2) {
+        return Err("cross-curve pairing consistency failed: e(beta_g1, G2) != e(G1, beta_g2)".into());
+    }
+    if Bn254::pairing(pk.delta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.delta_g2) {
+        return Err("cross-curve pairing consistency failed: e(delta_g1, G2) != e(G1, delta_g2)".into());
+    }
+    Ok(())
 }
 
 fn main() -> Res<()> {
@@ -290,14 +304,7 @@ fn main() -> Res<()> {
     }
 
     // Cross-curve pairing consistency invariants: e(beta_1, G2) == e(G1, beta_2) and e(delta_1, G2) == e(G1, delta_2)
-    let g1_gen = G1Affine::generator();
-    let g2_gen = G2Affine::generator();
-    if Bn254::pairing(pk.beta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.beta_g2) {
-        return Err("cross-curve pairing consistency failed: e(beta_g1, G2) != e(G1, beta_g2)".into());
-    }
-    if Bn254::pairing(pk.delta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.delta_g2) {
-        return Err("cross-curve pairing consistency failed: e(delta_g1, G2) != e(G1, delta_g2)".into());
-    }
+    check_pairing_consistency(&pk)?;
 
     let mut bytes = Vec::new();
     pk.serialize_compressed(&mut bytes)?;
@@ -365,5 +372,81 @@ mod tests {
         ];
         let p = g2(&valid, "test_g2").expect("valid identity");
         assert!(p.is_zero());
+    }
+
+    #[test]
+    fn check_pairing_consistency_valid() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+        let vk = VerifyingKey {
+            alpha_g1: g1_gen,
+            beta_g2: g2_gen,
+            gamma_g2: g2_gen,
+            delta_g2: g2_gen,
+            gamma_abc_g1: vec![g1_gen],
+        };
+        let pk = ProvingKey {
+            vk,
+            beta_g1: g1_gen,
+            delta_g1: g1_gen,
+            a_query: vec![],
+            b_g1_query: vec![],
+            b_g2_query: vec![],
+            h_query: vec![],
+            l_query: vec![],
+        };
+        assert!(check_pairing_consistency(&pk).is_ok());
+    }
+
+    #[test]
+    fn check_pairing_consistency_mismatched_beta_fails() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+        let mismatched_beta = (g1_gen * Fr::from(2u64)).into_affine();
+        let vk = VerifyingKey {
+            alpha_g1: g1_gen,
+            beta_g2: g2_gen,
+            gamma_g2: g2_gen,
+            delta_g2: g2_gen,
+            gamma_abc_g1: vec![g1_gen],
+        };
+        let pk = ProvingKey {
+            vk,
+            beta_g1: mismatched_beta,
+            delta_g1: g1_gen,
+            a_query: vec![],
+            b_g1_query: vec![],
+            b_g2_query: vec![],
+            h_query: vec![],
+            l_query: vec![],
+        };
+        let err = check_pairing_consistency(&pk).unwrap_err();
+        assert!(err.to_string().contains("e(beta_g1, G2) != e(G1, beta_g2)"));
+    }
+
+    #[test]
+    fn check_pairing_consistency_mismatched_delta_fails() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+        let mismatched_delta = (g1_gen * Fr::from(2u64)).into_affine();
+        let vk = VerifyingKey {
+            alpha_g1: g1_gen,
+            beta_g2: g2_gen,
+            gamma_g2: g2_gen,
+            delta_g2: g2_gen,
+            gamma_abc_g1: vec![g1_gen],
+        };
+        let pk = ProvingKey {
+            vk,
+            beta_g1: g1_gen,
+            delta_g1: mismatched_delta,
+            a_query: vec![],
+            b_g1_query: vec![],
+            b_g2_query: vec![],
+            h_query: vec![],
+            l_query: vec![],
+        };
+        let err = check_pairing_consistency(&pk).unwrap_err();
+        assert!(err.to_string().contains("e(delta_g1, G2) != e(G1, delta_g2)"));
     }
 }
