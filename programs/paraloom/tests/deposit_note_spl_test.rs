@@ -372,4 +372,11 @@ async fn deposit_note_spl_direct_donation_does_not_grief_deposit_cap() {
     tx.sign(&[&depositor], blockhash);
     let result = banks.process_transaction(tx).await;
     assert!(result.is_ok(), "deposit must succeed despite direct SPL donation to vault");
+
+    // Once at the cap, an additional deposit exceeds cap and is rejected
+    let ix_over = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, 1);
+    let mut tx_over = Transaction::new_with_payer(&[ix_over], Some(&depositor.pubkey()));
+    tx_over.sign(&[&depositor], blockhash);
+    let res_over = banks.process_transaction(tx_over).await;
+    assert!(res_over.is_err(), "deposit exceeding cap must be rejected");
 }

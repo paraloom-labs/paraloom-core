@@ -221,15 +221,17 @@ pub mod paraloom_program {
 
         // TVL cap: refuse any deposit that would push the vault's active
         // liability past `deposit_cap`, bounding total funds-at-risk to the cap.
-        // Evaluated against tracked liability (`total_deposited - total_withdrawn`)
-        // rather than the raw vault balance so that permissionless direct donations
-        // cannot artificially trip the cap and grief deposit liveness (#1279).
+        // Evaluated against min(live_balance, tracked_liabilities) so that
+        // unsolicited direct donations cannot artificially trip the cap (#1279),
+        // while honest withdrawals actively restore headroom.
         // Cap starts at 0 (deposits closed) until the cold authority raises it.
-        let active_tvl = ctx
+        let tracked_liabilities = ctx
             .accounts
             .bridge_state
             .total_deposited
-            .saturating_sub(ctx.accounts.bridge_state.total_withdrawn);
+            .checked_sub(ctx.accounts.bridge_state.total_withdrawn)
+            .ok_or(BridgeError::InvalidAmount)?;
+        let active_tvl = ctx.accounts.bridge_vault.lamports().min(tracked_liabilities);
         let projected_vault_balance = active_tvl
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
@@ -1318,16 +1320,17 @@ pub mod paraloom_program {
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
 
-        // Per-asset TVL cap, checked against the vault's *live* token balance
-        // before moving funds, exactly like the native path checks lamports.
-        // Per-asset TVL cap: evaluated against tracked cumulative deposits on
-        // `asset_config` rather than the raw vault token balance, so that
-        // unsolicited permissionless token transfers into `asset_vault` cannot
-        // artificially trip the cap and grief deposit liveness (#1279).
-        let projected_vault_balance = ctx
+        // Per-asset TVL cap: evaluated against min(live_balance, tracked_deposits)
+        // so that unsolicited direct token transfers into `asset_vault` cannot
+        // artificially trip the cap and grief deposit liveness (#1279),
+        // while vault drawdowns/withdrawals restore headroom without halting deposits
+        // on cumulative lifetime volume.
+        let effective_balance = ctx
             .accounts
-            .asset_config
-            .total_deposited
+            .asset_vault
+            .amount
+            .min(ctx.accounts.asset_config.total_deposited);
+        let projected_vault_balance = effective_balance
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
         require!(
@@ -2695,7 +2698,7 @@ pub struct AssetConfig {
     /// The mint this config governs (redundant with the PDA seed; stored so
     /// `SetAssetDepositCap` can re-derive the seed without a mint account).
     pub mint: Pubkey,
-    /// Ceiling on the vault's **current** token balance; deposits closed at 0.
+    /// Ceiling on the vault's active token liabilities; deposits closed at 0.
     pub deposit_cap: u64,
     /// Cumulative shielded into this asset (informational, like the native one).
     pub total_deposited: u64,
