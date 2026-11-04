@@ -49,9 +49,21 @@ impl R1CSToQAP for CircomReduction {
         num_constraints: usize,
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
+        if full_assignment.len() < num_inputs {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+        if matrices.a.len() != num_constraints
+            || matrices.b.len() != num_constraints
+            || matrices.c.len() != num_constraints
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+
         let zero = F::zero();
-        let domain =
-            D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain_dim = num_constraints
+            .checked_add(num_inputs)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain = D::new(domain_dim).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_size = domain.size();
 
         let mut a = vec![zero; domain_size];
@@ -86,7 +98,9 @@ impl R1CSToQAP for CircomReduction {
         domain.ifft_in_place(&mut b);
 
         let root_of_unity = {
-            let domain_size_double = 2 * domain_size;
+            let domain_size_double = domain_size
+                .checked_mul(2)
+                .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             let domain_double =
                 D::new(domain_size_double).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             domain_double.element(1)
@@ -118,7 +132,11 @@ impl R1CSToQAP for CircomReduction {
     ) -> Result<Vec<F>, SynthesisError> {
         // The usual H query has domain-1 powers and Z has domain powers, so
         // HZ has 2*domain-1.
-        let mut scalars = (0..2 * max_power + 1)
+        let num_scalars = max_power
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let mut scalars = (0..num_scalars)
             .map(|i| delta_inverse * t.pow([i as u64]))
             .collect::<Vec<_>>();
         let domain_size = scalars.len();
@@ -131,6 +149,7 @@ impl R1CSToQAP for CircomReduction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_poly::GeneralEvaluationDomain;
     use crate::privacy::circuits::Groth16ProofSystem;
     use crate::privacy::circuits::{TransactCircuitV3, TX_LEVELS};
     use crate::privacy::poseidon_circom::{
@@ -277,4 +296,64 @@ mod tests {
             "a ceremony-produced key must prove and verify our circuit"
         );
     }
+
+    #[test]
+    fn witness_map_missing_inputs_returns_assignment_missing() {
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 2,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a: vec![vec![]],
+            b: vec![vec![]],
+            c: vec![vec![]],
+        };
+        // num_inputs is 2, but full_assignment only has 1 element
+        let res = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            2,
+            1,
+            &[Fr::from(1u64)],
+        );
+        match res {
+            Err(SynthesisError::AssignmentMissing) => {}
+            other => panic!("expected AssignmentMissing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn witness_map_matrix_mismatch_returns_unsatisfiable() {
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 2,
+            a: vec![vec![]], // len 1 != num_constraints 2
+            b: vec![vec![], vec![]],
+            c: vec![vec![], vec![]],
+        };
+        let res = CircomReduction::witness_map_from_matrices::<Fr, GeneralEvaluationDomain<Fr>>(
+            &matrices,
+            1,
+            2,
+            &[Fr::from(1u64)],
+        );
+        match res {
+            Err(SynthesisError::Unsatisfiable) => {}
+            other => panic!("expected Unsatisfiable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn h_query_scalars_overflow_returns_err() {
+        let res = CircomReduction::h_query_scalars::<Fr, GeneralEvaluationDomain<Fr>>(
+            usize::MAX,
+            Fr::from(1u64),
+            Fr::from(1u64),
+            Fr::from(1u64),
+        );
+        match res {
+            Err(SynthesisError::PolynomialDegreeTooLarge) => {}
+            other => panic!("expected PolynomialDegreeTooLarge, got {:?}", other),
+        }
+    }
+
 }
