@@ -884,6 +884,11 @@ pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
 }
 
+/// Derive the slashed funds vault PDA.
+pub fn derive_slashed_funds_vault(program_id: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"slashed_funds_vault"], program_id)
+}
+
 /// Create a `slash_validator` instruction.
 pub fn create_slash_validator_instruction(
     program_id: &Pubkey,
