@@ -3761,6 +3761,62 @@ mod tests {
         // Because both validators have reputation < 500, their votes were dropped
         // and consensus is None (not reached).
         assert_eq!(coord_rep.check_consensus(&req_id).await.unwrap(), None);
+
+        // 4. Unknown validator admits at baseline standing, and valid consensus restores/increases
+        // reputation via record_success (#1300).
+        let n3 = NodeId(vec![73u8; 32]);
+        let w3 = "Wallet3333333333333333333333333333333333333".to_string();
+        let n4 = NodeId(vec![74u8; 32]);
+        let w4 = "Wallet4444444444444444444444444444444444444".to_string();
+
+        let mut stakes2 = HashMap::new();
+        stakes2.insert(w3.clone(), 5_000_000_000);
+        stakes2.insert(w4.clone(), 5_000_000_000);
+        coord_rep.sync_onchain_stakes(stakes2, 10_000_000_000).await;
+        coord_rep.register_validator_with_wallet(n3.clone(), Some(w3.clone())).await;
+        coord_rep.register_validator_with_wallet(n4.clone(), Some(w4.clone())).await;
+
+        let mut req2 = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [2u8; 32],
+            mint: None,
+            nullifiers: [[3u8; 32], [4u8; 32]],
+            output_commitments: [[5u8; 32], [6u8; 32]],
+            root: [7u8; 32],
+            ext_amount: -100,
+            proof: vec![1, 2, 3],
+            ciphertexts: ["c1".to_string(), "c2".to_string()],
+            timestamp: 456,
+        };
+        req2.request_id = req2.canonical_id();
+        let req2_id = coord_rep.start_verification(req2).await.unwrap();
+
+        let rep_before_n3 = coord_rep.reputation_tracker().get_reputation(&n3).await.unwrap();
+        assert_eq!(rep_before_n3, crate::consensus::reputation::BASE_REPUTATION);
+
+        for (node_id, wallet) in [(n3.clone(), w3), (n4.clone(), w4)] {
+            coord_rep
+                .submit_result(TransactVerificationResult {
+                    request_id: req2_id.clone(),
+                    validator: node_id,
+                    vote: VerificationVote::Valid,
+                    timestamp: 1,
+                    wallet_pubkey: wallet,
+                    signature: vec![1u8; 64],
+                })
+                .await
+                .unwrap();
+        }
+
+        // Both validators pass the gate and consensus is achieved.
+        assert_eq!(
+            coord_rep.check_consensus(&req2_id).await.unwrap(),
+            Some(VerificationVote::Valid)
+        );
+
+        // record_success was invoked for valid voters, increasing their reputation score.
+        let rep_after_n3 = coord_rep.reputation_tracker().get_reputation(&n3).await.unwrap();
+        assert!(rep_after_n3 > rep_before_n3);
     }
 
 }

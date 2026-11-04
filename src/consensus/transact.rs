@@ -31,6 +31,8 @@ pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
 
 /// Default reputation floor for consensus participation. A validator below this
 /// may still submit a vote, but the result is computed as if it had not.
+/// Participating validators who vote `Valid` in an approved consensus have their
+/// reputation restored via `record_success` (#1300).
 pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -589,6 +591,11 @@ impl TransactVerificationCoordinator {
         &self.slashing_tracker
     }
 
+    /// Reference to the reputation tracker (tests/pipelines read it) (#1300).
+    pub fn reputation_tracker(&self) -> &Arc<ReputationTracker> {
+        &self.reputation_tracker
+    }
+
     /// Register a validator into the transact consensus, mirroring the
     /// withdrawal coordinator (reputation tracker + leader selector).
     pub async fn register_validator(&self, validator: NodeId) {
@@ -903,21 +910,28 @@ impl TransactVerificationCoordinator {
 
         // Reputation gate (#1300): validators below the configured reputation floor
         // may still submit a vote, but their vote is not counted toward the quorum.
+        // Unknown/unregistered validators fail open at baseline standing to avoid race
+        // conditions with late discovery messages, distinctly logged.
         {
-            let rep = self
-                .reputation_tracker
-                .get_reputation(&result.validator)
-                .await
-                .unwrap_or(0);
-            if rep < self.min_reputation_for_consensus {
-                log::warn!(
-                    "dropping vote from low-reputation validator {:?} (rep {} < {}) for {}",
-                    result.validator,
-                    rep,
-                    self.min_reputation_for_consensus,
-                    result.request_id
-                );
-                return Ok(());
+            match self.reputation_tracker.get_reputation(&result.validator).await {
+                Some(rep) if rep < self.min_reputation_for_consensus => {
+                    log::warn!(
+                        "dropping vote from low-reputation validator {:?} (rep {} < {}) for {}",
+                        result.validator,
+                        rep,
+                        self.min_reputation_for_consensus,
+                        result.request_id
+                    );
+                    return Ok(());
+                }
+                None => {
+                    log::debug!(
+                        "validator {:?} not found in reputation tracker; admitting at baseline for {}",
+                        result.validator,
+                        result.request_id
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -955,10 +969,10 @@ impl TransactVerificationCoordinator {
             self.slashing_tracker.record(validator, evidence).await;
         }
 
-        // Emit the approval the first time this vote completes a `Valid` quorum.
+        // Emit the approval and reward voters the first time this vote completes a `Valid` quorum.
         // Counting is by the on-chain staked wallet set (minus equivocators), NOT
         // the flap-prone active NodeId set.
-        if let Some(tx) = &self.approval_tx {
+        {
             let eligible = self.eligible_wallets().await;
             let mut emitted = self.emitted.write().await;
             if !emitted.contains(&result.request_id)
@@ -969,11 +983,20 @@ impl TransactVerificationCoordinator {
                     Ok(VerificationVote::Valid)
                 )
             {
-                let approved = ApprovedTransact {
-                    request: consensus.request.clone(),
-                };
-                if tx.send(approved).is_ok() {
-                    emitted.insert(result.request_id.clone());
+                emitted.insert(result.request_id.clone());
+                if let Some(tx) = &self.approval_tx {
+                    let approved = ApprovedTransact {
+                        request: consensus.request.clone(),
+                    };
+                    let _ = tx.send(approved);
+                }
+                // Reward participating validators who aligned with valid consensus (#1300):
+                // prevents reputation floor from acting as a one-way ratchet.
+                let voters = consensus.tally.valid_voters(&eligible).await;
+                for voter in voters {
+                    if let Err(e) = self.reputation_tracker.record_success(&voter).await {
+                        log::warn!("could not record reputation success for {:?}: {}", voter, e);
+                    }
                 }
             }
         }
