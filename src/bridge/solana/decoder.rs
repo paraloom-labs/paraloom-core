@@ -33,9 +33,10 @@ pub const LISTENER_TX_ENCODING: UiTransactionEncoding = UiTransactionEncoding::J
 ///
 /// Returns an empty vector if the transaction does not target the
 /// Paraloom program, the encoding is not the expected raw JSON form,
-/// or no instruction matches the deposit discriminator. Address-table-
-/// lookup transactions are skipped with a warning — none of the deposit
-/// flows in v0.3 are expected to use LUTs.
+/// or no instruction matches the deposit discriminator. For v0 transactions
+/// utilizing Address Lookup Tables (LUTs), dynamic accounts in
+/// `meta.loaded_addresses` (writable then readonly) are resolved and appended
+/// to static account keys in Solana's canonical resolution order.
 pub fn extract_deposit_events(
     signature: &str,
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
@@ -78,7 +79,7 @@ pub fn extract_deposit_events(
         }
     };
 
-    let account_keys = match parse_account_keys(&raw.account_keys) {
+    let mut account_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
         Err(bad) => {
             log::warn!(
@@ -90,6 +91,41 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    // In a v0 transaction utilizing Address Lookup Tables (LUTs), compiled instructions
+    // reference accounts resolved dynamically from lookup tables. Solana runtime rules
+    // resolve these accounts in canonical order: static account keys, followed by
+    // loaded writable addresses, then loaded readonly addresses.
+    if let Some(meta) = &confirmed.transaction.meta {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(loaded) =
+            &meta.loaded_addresses
+        {
+            match parse_account_keys(&loaded.writable) {
+                Ok(mut keys) => account_keys.append(&mut keys),
+                Err(bad) => {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "tx {} has unparsable loaded writable key '{}'; skipping",
+                        signature,
+                        bad
+                    );
+                    return Vec::new();
+                }
+            }
+            match parse_account_keys(&loaded.readonly) {
+                Ok(mut keys) => account_keys.append(&mut keys),
+                Err(bad) => {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "tx {} has unparsable loaded readonly key '{}'; skipping",
+                        signature,
+                        bad
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
 
     let mut events = Vec::new();
 
@@ -516,4 +552,182 @@ mod tests {
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
     }
+
+    #[test]
+    fn extract_deposit_events_decodes_v0_lut_deposit_note_spl_with_loaded_addresses() {
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiLoadedAddresses, UiRawMessage, UiTransaction,
+            UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        // 8 static account keys (indices 0..7). Notice mint and depositor are absent here.
+        // Static layout:
+        // [0: bridge_state, 1: asset_config, 2: dummy_mint_pos, 3: asset_vault,
+        //  4: depositor_token_account, 5: merkle_tree, 6: dummy_depositor_pos, 7: program_id]
+        let static_keys = vec![
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            program_id.to_string(),
+        ];
+
+        // Loaded addresses from Address Lookup Tables (LUTs):
+        // Writable addresses: index 8 = mint
+        // Readonly addresses: index 9 = depositor
+        let loaded_addresses = UiLoadedAddresses {
+            writable: vec![mint.to_string()],
+            readonly: vec![depositor.to_string()],
+        };
+
+        let amount = 5_000_000u64;
+        let pubkey = [21u8; 32];
+        let blinding = [22u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        // Compiled instruction targets program_id at index 7.
+        // Account indices for deposit_note_spl:
+        // bridge_state(0), asset_config(1), mint(8), asset_vault(3),
+        // depositor_token_account(4), merkle_tree(5), depositor(9), token_program(0).
+        let ix = UiCompiledInstruction {
+            program_id_index: 7,
+            accounts: vec![0, 1, 8, 3, 4, 5, 9, 0],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let raw = UiRawMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            account_keys: static_keys,
+            recent_blockhash: solana_sdk::hash::Hash::default().to_string(),
+            instructions: vec![ix],
+            address_table_lookups: None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            status: Ok(()),
+            err: None,
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::None,
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::Some(loaded_addresses),
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+
+        let tx = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 42,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["5TestSignature123456789".to_string()],
+                    message: UiMessage::Raw(raw),
+                }),
+                meta: Some(meta),
+                version: Some(solana_transaction_status::TransactionVersion::Number(0)),
+            },
+            block_time: Some(1700000000),
+        };
+
+        let events = extract_deposit_events("5TestSignature123456789", &tx, &program_id);
+        assert_eq!(events.len(), 1, "deposit_note_spl with LUT loaded_addresses must be decoded");
+        let event = &events[0];
+        assert_eq!(event.amount, amount);
+        assert_eq!(event.recipient, pubkey);
+        assert_eq!(event.randomness, blinding);
+        assert_eq!(event.from, depositor.to_bytes());
+        assert_eq!(
+            event.asset_id,
+            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes())
+        );
+        assert_eq!(event.block, 42);
+        assert_eq!(event.timestamp, 1700000000);
+    }
+
+    #[test]
+    fn extract_deposit_events_skips_when_loaded_address_unparsable() {
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiLoadedAddresses, UiRawMessage, UiTransaction,
+            UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        let raw = UiRawMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![other.to_string(), program_id.to_string()],
+            recent_blockhash: solana_sdk::hash::Hash::default().to_string(),
+            instructions: vec![],
+            address_table_lookups: None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            status: Ok(()),
+            err: None,
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::None,
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::Some(UiLoadedAddresses {
+                writable: vec!["unparsable-base58-key!".to_string()],
+                readonly: vec![],
+            }),
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+
+        let tx = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 1,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig1".to_string()],
+                    message: UiMessage::Raw(raw),
+                }),
+                meta: Some(meta),
+                version: Some(solana_transaction_status::TransactionVersion::Number(0)),
+            },
+            block_time: None,
+        };
+
+        let events = extract_deposit_events("sig1", &tx, &program_id);
+        assert!(events.is_empty(), "unparsable loaded address must gracefully return empty");
+    }
+
 }
