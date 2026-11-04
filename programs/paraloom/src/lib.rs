@@ -565,10 +565,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -630,6 +628,48 @@ pub mod paraloom_program {
                 .and_then(|v| v.checked_div(10_000))
                 .ok_or(BridgeError::InvalidAmount)?;
             let payout = gross - fee;
+
+            require!(
+                ctx.accounts.recipient_token_account.is_writable,
+                ErrorCode::ConstraintMut
+            );
+            require!(
+                ctx.accounts.fee_token_account.is_writable,
+                ErrorCode::ConstraintMut
+            );
+
+            let (recipient_mint, fee_mint, fee_owner) = {
+                require!(
+                    ctx.accounts.recipient_token_account.owner == &anchor_spl::token::ID
+                        || ctx.accounts.recipient_token_account.owner
+                            == &anchor_spl::token_2022::ID,
+                    ErrorCode::AccountOwnedByWrongProgram
+                );
+                let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
+                let recipient_ta = TokenAccount::try_deserialize(&mut &recipient_data[..])?;
+
+                require!(
+                    ctx.accounts.fee_token_account.owner == &anchor_spl::token::ID
+                        || ctx.accounts.fee_token_account.owner == &anchor_spl::token_2022::ID,
+                    ErrorCode::AccountOwnedByWrongProgram
+                );
+                let fee_data = ctx.accounts.fee_token_account.try_borrow_data()?;
+                let fee_ta = TokenAccount::try_deserialize(&mut &fee_data[..])?;
+
+                (recipient_ta.mint, fee_ta.mint, fee_ta.owner)
+            };
+            require!(
+                recipient_mint == ctx.accounts.mint.key(),
+                ErrorCode::ConstraintTokenMint
+            );
+            require!(
+                fee_mint == ctx.accounts.mint.key(),
+                ErrorCode::ConstraintTokenMint
+            );
+            require!(
+                fee_owner == ctx.accounts.authority.key(),
+                ErrorCode::ConstraintTokenOwner
+            );
 
             // Token accounts are independently rent-exempt, so unlike the native
             // vault there is no rent floor to reserve; the vault just needs the
@@ -1914,13 +1954,19 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    ///
+    /// CHECK: When `ext_amount < 0`, validated as a mutable initialized TokenAccount
+    /// for `mint`. When `ext_amount == 0` (internal shielded transfer), no payout
+    /// occurs and this account is unused.
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid.
+    ///
+    /// CHECK: When `ext_amount < 0`, validated as a mutable initialized TokenAccount
+    /// for `mint` and `authority`. When `ext_amount == 0` (internal shielded transfer),
+    /// no fee is paid and this account is unused.
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
