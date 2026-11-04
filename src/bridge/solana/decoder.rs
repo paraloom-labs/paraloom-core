@@ -99,16 +99,16 @@ pub fn extract_deposit_events(
     // static array, `.get()` returns `None`, and the deposit is silently
     // dropped — confirmed on-chain but never indexed.
     let loaded: Option<(&[String], &[String])> =
-        confirmed
-        .transaction
-        .meta
-        .as_ref()
-        .and_then(|m| match &m.loaded_addresses {
-            solana_transaction_status::option_serializer::OptionSerializer::Some(l) => {
-                Some((l.writable.as_slice(), l.readonly.as_slice()))
-            }
-            _ => None,
-        });
+            confirmed
+            .transaction
+            .meta
+            .as_ref()
+            .and_then(|m| match &m.loaded_addresses {
+                solana_transaction_status::option_serializer::OptionSerializer::Some(l) => {
+                    Some((l.writable.as_slice(), l.readonly.as_slice()))
+                }
+                _ => None,
+            });
     let account_keys = resolve_account_keys(signature, static_keys, loaded);
 
     let mut events = Vec::new();
