@@ -631,6 +631,19 @@ pub mod paraloom_program {
                 .ok_or(BridgeError::InvalidAmount)?;
             let payout = gross - fee;
 
+            // Validate that recipient_token_account is an initialized TokenAccount for this mint
+            require!(
+                ctx.accounts.recipient_token_account.owner == ctx.accounts.token_program.key,
+                BridgeError::InvalidTokenAccount
+            );
+            let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
+            let recipient_account = TokenAccount::try_deserialize(&mut recipient_data.as_ref())?;
+            require!(
+                recipient_account.mint == ctx.accounts.mint.key(),
+                BridgeError::InvalidTokenAccount
+            );
+            drop(recipient_data);
+
             // Token accounts are independently rent-exempt, so unlike the native
             // vault there is no rent floor to reserve; the vault just needs the
             // gross balance.
@@ -660,10 +673,26 @@ pub mod paraloom_program {
             )?;
 
             // Settling-validator fee, paid in the withdrawn asset to the
-            // validator's own token account (constrained to `authority` in the
-            // accounts struct). The native path credits lamport `pending_rewards`
+            // validator's own token account (constrained to `authority`).
+            // The native path credits lamport `pending_rewards`
             // for a later claim; here the token fee is paid inline.
             if fee > 0 {
+                require!(
+                    ctx.accounts.fee_token_account.owner == ctx.accounts.token_program.key,
+                    BridgeError::InvalidTokenAccount
+                );
+                let fee_data = ctx.accounts.fee_token_account.try_borrow_data()?;
+                let fee_account = TokenAccount::try_deserialize(&mut fee_data.as_ref())?;
+                require!(
+                    fee_account.mint == ctx.accounts.mint.key(),
+                    BridgeError::InvalidTokenAccount
+                );
+                require!(
+                    fee_account.owner == ctx.accounts.authority.key(),
+                    BridgeError::InvalidAuthority
+                );
+                drop(fee_data);
+
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -1914,13 +1943,15 @@ pub struct TransactSpl<'info> {
 
     /// Payout destination, bound into the proof via `ext_data_hash` so the
     /// settling validator cannot redirect it.
-    #[account(mut, token::mint = mint)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: when ext_amount < 0, manually verified to be an initialized TokenAccount for mint.
+    #[account(mut)]
+    pub recipient_token_account: UncheckedAccount<'info>,
 
     /// The settling validator's token account for `mint`, where the fee is
-    /// paid. Constrained to the `authority` signer so the fee cannot be diverted.
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub fee_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// paid.
+    /// CHECK: when ext_amount < 0 and fee > 0, manually verified to be an initialized TokenAccount for mint owned by authority.
+    #[account(mut)]
+    pub fee_token_account: UncheckedAccount<'info>,
 
     #[account(
         init,
@@ -2916,4 +2947,10 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Invalid token account")]
+    InvalidTokenAccount,
+
+    #[msg("Invalid authority for token account")]
+    InvalidAuthority,
 }
