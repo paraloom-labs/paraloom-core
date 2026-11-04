@@ -154,6 +154,35 @@ impl LeaderSelector {
         }
     }
 
+    /// Prune every validator whose co-sign wallet is absent from an
+    /// authoritative on-chain snapshot, returning the pruned `NodeId`s so the
+    /// caller can drop them from its own validator set as well.
+    ///
+    /// This is the genuine-removal path `deactivate_validator` documents: a
+    /// validator that deregistered on-chain (or a peer admitted before the
+    /// first snapshot that was never on-chain — it has no wallet in the set,
+    /// including `None`) is deleted, not merely deactivated. Deletion is
+    /// destructive (the preserved wallet/reputation entry is discarded), so
+    /// callers must only invoke this with a snapshot they trust to be
+    /// complete — see `TransactVerificationCoordinator::sync_onchain_stakes`.
+    /// An empty `active_wallets` therefore prunes everyone, which is exactly
+    /// the genuine total-deactivation case (empty snapshot, registry total 0).
+    pub fn retain_onchain_wallets(&mut self, active_wallets: &HashMap<String, u64>) -> Vec<NodeId> {
+        let mut pruned = Vec::new();
+        self.validators.retain(|node_id, v| {
+            let keep = v
+                .wallet_pubkey
+                .as_ref()
+                .map(|w| active_wallets.contains_key(w))
+                .unwrap_or(false);
+            if !keep {
+                pruned.push(node_id.clone());
+            }
+            keep
+        });
+        pruned
+    }
+
     /// Get number of active validators
     pub fn active_validator_count(&self) -> usize {
         self.validators.values().filter(|v| v.is_active).count()
@@ -321,6 +350,36 @@ mod tests {
             0,
             "a validator with no wallet carries no stake weight"
         );
+    }
+
+    /// `retain_onchain_wallets` deletes exactly the validators whose wallet
+    /// is absent from the snapshot (including wallet-less entries) and
+    /// reports their NodeIds; an empty snapshot prunes everyone — the
+    /// genuine total-deactivation case (#1039).
+    #[test]
+    fn retain_onchain_wallets_prunes_absent_and_walletless_validators() {
+        let mut sel = LeaderSelector::new();
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 5, 1000).with_wallet(Some("WALLET_A".to_string())),
+        );
+        sel.register_validator(
+            ValidatorInfo::new(NodeId(vec![2]), 5, 1000).with_wallet(Some("WALLET_B".to_string())),
+        );
+        sel.register_validator(ValidatorInfo::new(NodeId(vec![3]), 5, 1000));
+
+        let mut onchain = HashMap::new();
+        onchain.insert("WALLET_A".to_string(), 7_000_000_000u64);
+        let mut pruned = sel.retain_onchain_wallets(&onchain);
+        pruned.sort_by_key(|n| n.0.clone());
+        assert_eq!(pruned, vec![NodeId(vec![2]), NodeId(vec![3])]);
+        assert!(sel.get_validator(&NodeId(vec![1])).is_some());
+        assert!(sel.get_validator(&NodeId(vec![2])).is_none());
+        assert!(sel.get_validator(&NodeId(vec![3])).is_none());
+
+        // Empty authoritative snapshot: everyone is pruned.
+        let pruned = sel.retain_onchain_wallets(&HashMap::new());
+        assert_eq!(pruned, vec![NodeId(vec![1])]);
+        assert_eq!(sel.active_validator_count(), 0);
     }
 
     #[test]

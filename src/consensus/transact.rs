@@ -700,26 +700,79 @@ impl TransactVerificationCoordinator {
         stakes: std::collections::HashMap<String, u64>,
         registry_total_active_stake: u64,
     ) {
+        // #1039 (1): a TRANSIENT empty snapshot — `list_validator_stakes`
+        // returned nothing while the registry still reports active stake —
+        // is not authoritative. Previously the maps below were (correctly)
+        // skipped, but `apply_onchain_stakes(&empty)` still ran and zeroed
+        // every leader-selector weight, breaking leader selection until the
+        // next successful tick. Preserve ALL state and bail out instead.
+        if stakes.is_empty() && registry_total_active_stake > 0 {
+            log::warn!(
+                "Ignoring empty on-chain stake snapshot while registry_total={}; \
+                 preserving existing allowlist, stakes, and leader weights",
+                registry_total_active_stake
+            );
+            return;
+        }
+
         // Refresh the registration allowlist + the wallet-keyed stake numerator
         // to exactly the on-chain swap-validator wallets. These map keys ARE the
         // ValidatorRegistry set; compute ResourceProviders have no
         // ValidatorAccount so are absent, which keeps them out of the quorum.
-        // An empty snapshot (RPC returned nothing) is NOT trusted to clear the
-        // allowlist/stakes — that would fail-open the gate; keep the previous
-        // set (and the previous registry total, updated only alongside a
-        // non-empty snapshot so numerator and denominator move together).
-        if !stakes.is_empty() {
-            *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
-            *self.onchain_registry_total.write().await = registry_total_active_stake;
-            *self.onchain_stakes.write().await = stakes.clone();
+        // #1039 (2): this now also runs for the GENUINE total-deactivation
+        // snapshot (empty map, registry_total == 0), so a fully deactivated
+        // set clears its stale allowlist/stakes/total instead of retaining
+        // them and letting deactivated validators keep passing
+        // `source_is_onchain_validator` / `stake_quorum_met`.
+        *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
+        *self.onchain_registry_total.write().await = registry_total_active_stake;
+        *self.onchain_stakes.write().await = stakes.clone();
+
+        // The on-chain invariant is `registry_total == Σ active-PDA stake`
+        // (see `reconcile_validators`), so a snapshot whose sum disagrees
+        // with the registry total is partial/lagging or inflated by orphaned
+        // PDAs — the same divergence `stake_quorum_met` fails safe on.
+        let snapshot_consistent = stakes
+            .values()
+            .map(|s| *s as u128)
+            .sum::<u128>()
+            == registry_total_active_stake as u128;
+
+        let pruned = {
+            let mut leader_selector = self.leader_selector.write().await;
+            leader_selector.apply_onchain_stakes(&stakes);
+            // #1039 (3): prune deregistered peers from the leader selector —
+            // the removal `unregister_validator` / `deactivate_validator`
+            // document but this reconciler never performed. Because the
+            // prune DELETES the preserved entry (wallet/reputation gone),
+            // it fires only on a consistent snapshot; on a divergent one the
+            // missing peers are merely zero-weighted above (reversible next
+            // tick). The genuine total-deactivation snapshot is consistent
+            // by construction (0 == 0), so it always prunes everyone.
+            if snapshot_consistent {
+                leader_selector.retain_onchain_wallets(&stakes)
+            } else {
+                log::warn!(
+                    "On-chain stake snapshot sum diverges from registry_total={}; \
+                     updating stakes but deferring validator prune to a consistent snapshot",
+                    registry_total_active_stake
+                );
+                Vec::new()
+            }
+        };
+
+        // Drop the pruned peers from the live validator set as well, so
+        // `is_registered_validator` stops authenticating them.
+        if !pruned.is_empty() {
+            let mut validators = self.validators.write().await;
+            validators.retain(|v| !pruned.contains(v));
         }
 
-        let mut leader_selector = self.leader_selector.write().await;
-        leader_selector.apply_onchain_stakes(&stakes);
         log::debug!(
-            "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
+            "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={}, pruned={})",
             stakes.len(),
-            registry_total_active_stake
+            registry_total_active_stake,
+            pruned.len()
         );
     }
 
@@ -1571,5 +1624,192 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    // ---- #1039: sync_onchain_stakes snapshot handling / on-chain prune ----
+
+    /// #1039 (a): genuine total deactivation — empty snapshot AND
+    /// registry_total == 0 — is authoritative: it must clear the stale
+    /// allowlist/stakes AND prune every former peer from both
+    /// `self.validators` and `leader_selector`. Before the fix the empty
+    /// snapshot was skipped entirely (stale maps retained) and no prune
+    /// existed at all, so deregistered validators stayed registered forever.
+    #[tokio::test]
+    async fn sync_onchain_stakes_genuine_total_deactivation_prunes_all_validators() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2".to_string()))
+            .await;
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1", 1_000_000_000), ("VAL2", 1_000_000_000)]),
+                2_000_000_000,
+            )
+            .await;
+        assert!(coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![2])).await);
+
+        // Every validator deactivates/unregisters on-chain.
+        coordinator
+            .sync_onchain_stakes(std::collections::HashMap::new(), 0)
+            .await;
+
+        // Stale allowlist / stake state must be cleared, not retained.
+        assert_eq!(*coordinator.onchain_registry_total.read().await, 0);
+        assert!(coordinator.onchain_stakes.read().await.is_empty());
+        assert!(coordinator.onchain_wallets.read().await.is_empty());
+        // Former peers must be pruned from BOTH validator sets.
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        assert_eq!(coordinator.validator_count().await, 0);
+        let sel = coordinator.leader_selector.read().await;
+        assert!(sel.get_validator(&NodeId(vec![1])).is_none());
+        assert!(sel.get_validator(&NodeId(vec![2])).is_none());
+        assert_eq!(sel.active_validator_count(), 0);
+    }
+
+    /// #1039 (b): a transient empty RPC snapshot while the registry still
+    /// reports active stake (registry_total > 0) is NOT authoritative: the
+    /// previous allowlist, stakes, registry total and leader weights must be
+    /// preserved untouched (no zeroing, no prune).
+    #[tokio::test]
+    async fn sync_onchain_stakes_transient_empty_snapshot_preserves_state() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2".to_string()))
+            .await;
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1", 1_000_000_000), ("VAL2", 1_000_000_000)]),
+                2_000_000_000,
+            )
+            .await;
+
+        // RPC blip: empty getProgramAccounts result, registry still at 2 SOL.
+        coordinator
+            .sync_onchain_stakes(std::collections::HashMap::new(), 2_000_000_000)
+            .await;
+
+        assert_eq!(*coordinator.onchain_registry_total.read().await, 2_000_000_000);
+        assert_eq!(coordinator.onchain_stakes.read().await.len(), 2);
+        assert_eq!(coordinator.onchain_wallets.read().await.len(), 2);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        let sel = coordinator.leader_selector.read().await;
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+            1_000_000_000,
+            "a transient empty snapshot must not wipe leader stake weights"
+        );
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![2])).unwrap().stake_amount,
+            1_000_000_000
+        );
+        assert!(
+            sel.select_leader(b"seed-1039").is_ok(),
+            "leader selection must survive a transient empty snapshot"
+        );
+    }
+
+    /// #1039 (c): a consistent non-empty snapshot prunes peers that are no
+    /// longer on-chain — both a deregistered validator and a wallet-less peer
+    /// admitted before the first snapshot (the prune `unregister_validator` /
+    /// `deactivate_validator` document but `sync_onchain_stakes` never did).
+    #[tokio::test]
+    async fn sync_onchain_stakes_prunes_deregistered_and_never_onchain_peers() {
+        let coordinator = TransactVerificationCoordinator::new();
+        // Admitted pre-first-snapshot under the fail-open gate, no wallet.
+        coordinator.register_validator(NodeId(vec![3])).await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2".to_string()))
+            .await;
+
+        // First authoritative snapshot: the wallet-less peer is not on-chain.
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1", 1_000_000_000), ("VAL2", 1_000_000_000)]),
+                2_000_000_000,
+            )
+            .await;
+        assert!(
+            !coordinator.is_registered_validator(&NodeId(vec![3])).await,
+            "a peer with no on-chain validator account must be pruned"
+        );
+        {
+            let sel = coordinator.leader_selector.read().await;
+            assert!(sel.get_validator(&NodeId(vec![3])).is_none());
+        }
+        assert!(coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![2])).await);
+
+        // VAL2 deregisters on-chain; the next consistent snapshot drops it.
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1", 1_000_000_000)]), 1_000_000_000)
+            .await;
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        let sel = coordinator.leader_selector.read().await;
+        assert!(sel.get_validator(&NodeId(vec![2])).is_none());
+        assert_eq!(
+            sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+            1_000_000_000
+        );
+    }
+
+    /// #1039 (d): the prune is destructive (it deletes the leader-selector
+    /// entry, discarding preserved wallet/reputation state), so it must not
+    /// fire on a snapshot that disagrees with the registry total — e.g. a
+    /// partial/lagging getProgramAccounts scan. Such a snapshot still updates
+    /// the allowlist/stakes and zeroes the missing peer's weight (reversible
+    /// next tick), but only a snapshot whose sum equals registry_total may
+    /// delete peers; the following consistent snapshot then prunes.
+    #[tokio::test]
+    async fn sync_onchain_stakes_partial_snapshot_defers_prune_until_consistent() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2".to_string()))
+            .await;
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1", 1_000_000_000), ("VAL2", 1_000_000_000)]),
+                2_000_000_000,
+            )
+            .await;
+
+        // Partial scan: only VAL1 returned, but the registry still counts
+        // 2 SOL — the scan and the registry disagree, so no deletion yet.
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1", 1_000_000_000)]), 2_000_000_000)
+            .await;
+        assert!(
+            coordinator.is_registered_validator(&NodeId(vec![2])).await,
+            "a partial/inconsistent snapshot must not destructively prune"
+        );
+        {
+            let sel = coordinator.leader_selector.read().await;
+            let info = sel
+                .get_validator(&NodeId(vec![2]))
+                .expect("entry must survive an inconsistent snapshot");
+            assert_eq!(info.stake_amount, 0, "weight is zeroed (reversible)");
+        }
+
+        // Consistent snapshot (sum == registry_total): VAL2 is really gone.
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1", 1_000_000_000)]), 1_000_000_000)
+            .await;
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![2])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![1])).await);
     }
 }
