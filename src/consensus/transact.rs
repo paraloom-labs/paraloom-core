@@ -31,6 +31,8 @@ pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
 
 /// Default reputation floor for consensus participation. A validator below this
 /// may still submit a vote, but the result is computed as if it had not.
+/// Participating validators who vote `Valid` in an approved consensus have their
+/// reputation restored via `record_success` (#1300).
 pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -275,6 +277,10 @@ pub struct TransactVerificationCoordinator {
     /// Total validator-set size (percentage divisor)
     total_validators: usize,
 
+    /// Minimum reputation score for a validator to be admitted to the
+    /// consensus quorum. Defaults to `DEFAULT_MIN_REPUTATION_FOR_CONSENSUS` (#1300).
+    min_reputation_for_consensus: u64,
+
     /// Approval-event sender; `Some` only when built with
     /// [`new_with_approvals`](Self::new_with_approvals).
     approval_tx: Option<mpsc::UnboundedSender<ApprovedTransact>>,
@@ -336,6 +342,7 @@ impl TransactVerificationCoordinator {
             timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
             min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
             total_validators: DEFAULT_TOTAL_VALIDATORS,
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
             approval_tx: None,
             emitted: Arc::new(RwLock::new(HashSet::new())),
             local_node_id: None,
@@ -563,9 +570,30 @@ impl TransactVerificationCoordinator {
         self.total_validators = total_validators;
     }
 
+    /// Read the currently configured BFT thresholds (min, total) (#1300).
+    pub fn consensus_thresholds(&self) -> (usize, usize) {
+        (self.min_validators_for_consensus, self.total_validators)
+    }
+
+    /// Set the minimum reputation score required for a validator's vote
+    /// to count toward consensus (#1300).
+    pub fn set_min_reputation_for_consensus(&mut self, min: u64) {
+        self.min_reputation_for_consensus = min;
+    }
+
+    /// Read the minimum reputation score required for consensus (#1300).
+    pub fn min_reputation_for_consensus(&self) -> u64 {
+        self.min_reputation_for_consensus
+    }
+
     /// Reference to the slashing-evidence log (tests/pipelines read it).
     pub fn slashing_tracker(&self) -> &Arc<SlashingTracker> {
         &self.slashing_tracker
+    }
+
+    /// Reference to the reputation tracker (tests/pipelines read it) (#1300).
+    pub fn reputation_tracker(&self) -> &Arc<ReputationTracker> {
+        &self.reputation_tracker
     }
 
     /// Register a validator into the transact consensus, mirroring the
@@ -880,6 +908,33 @@ impl TransactVerificationCoordinator {
             }
         }
 
+        // Reputation gate (#1300): validators below the configured reputation floor
+        // may still submit a vote, but their vote is not counted toward the quorum.
+        // Unknown/unregistered validators fail open at baseline standing to avoid race
+        // conditions with late discovery messages, distinctly logged.
+        {
+            match self.reputation_tracker.get_reputation(&result.validator).await {
+                Some(rep) if rep < self.min_reputation_for_consensus => {
+                    log::warn!(
+                        "dropping vote from low-reputation validator {:?} (rep {} < {}) for {}",
+                        result.validator,
+                        rep,
+                        self.min_reputation_for_consensus,
+                        result.request_id
+                    );
+                    return Ok(());
+                }
+                None => {
+                    log::debug!(
+                        "validator {:?} not found in reputation tracker; admitting at baseline for {}",
+                        result.validator,
+                        result.request_id
+                    );
+                }
+                _ => {}
+            }
+        }
+
         log::debug!(
             "Transact vote submitted for {}: wallet={} node={:?}",
             result.request_id,
@@ -914,10 +969,10 @@ impl TransactVerificationCoordinator {
             self.slashing_tracker.record(validator, evidence).await;
         }
 
-        // Emit the approval the first time this vote completes a `Valid` quorum.
+        // Emit the approval and reward voters the first time this vote completes a `Valid` quorum.
         // Counting is by the on-chain staked wallet set (minus equivocators), NOT
         // the flap-prone active NodeId set.
-        if let Some(tx) = &self.approval_tx {
+        {
             let eligible = self.eligible_wallets().await;
             let mut emitted = self.emitted.write().await;
             if !emitted.contains(&result.request_id)
@@ -928,11 +983,20 @@ impl TransactVerificationCoordinator {
                     Ok(VerificationVote::Valid)
                 )
             {
-                let approved = ApprovedTransact {
-                    request: consensus.request.clone(),
-                };
-                if tx.send(approved).is_ok() {
-                    emitted.insert(result.request_id.clone());
+                emitted.insert(result.request_id.clone());
+                if let Some(tx) = &self.approval_tx {
+                    let approved = ApprovedTransact {
+                        request: consensus.request.clone(),
+                    };
+                    let _ = tx.send(approved);
+                }
+                // Reward participating validators who aligned with valid consensus (#1300):
+                // prevents reputation floor from acting as a one-way ratchet.
+                let voters = consensus.tally.valid_voters(&eligible).await;
+                for voter in voters {
+                    if let Err(e) = self.reputation_tracker.record_success(&voter).await {
+                        log::warn!("could not record reputation success for {:?}: {}", voter, e);
+                    }
                 }
             }
         }

@@ -1493,11 +1493,34 @@ impl Node {
             // validator.toml to settle with a small live cohort (2/2), otherwise
             // it never reaches a Valid quorum and settlement silently times out.
             // The on-chain stake-weighted 2/3 quorum stays the real security gate.
-            if let (Some(min), Some(total)) = (
-                settings.bridge.consensus_min_validators,
-                settings.bridge.consensus_total_validators,
-            ) {
-                coord.set_consensus_thresholds(min, total);
+            // Resolve single-sided overrides independently so that configuring
+            // only one of the two knobs is not silently dropped (#1300).
+            if settings.bridge.consensus_min_validators.is_some()
+                || settings.bridge.consensus_total_validators.is_some()
+            {
+                let min = settings
+                    .bridge
+                    .consensus_min_validators
+                    .unwrap_or(crate::consensus::transact::DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS);
+                let total = settings
+                    .bridge
+                    .consensus_total_validators
+                    .unwrap_or(crate::consensus::transact::DEFAULT_TOTAL_VALIDATORS);
+                // Adjust total upward when only a larger `min` (> default total)
+                // was configured, unless `total` was explicitly set, so
+                // `set_consensus_thresholds` logs and falls back on genuinely
+                // invalid explicit pairs (`min > total`).
+                let effective_total = if settings.bridge.consensus_total_validators.is_none() {
+                    total.max(min)
+                } else {
+                    total
+                };
+                coord.set_consensus_thresholds(min, effective_total);
+            }
+            // Wire `consensus_min_reputation` into the coordinator so a
+            // configured reputation floor is actually enforced (#1300).
+            if let Some(rep) = settings.bridge.consensus_min_reputation {
+                coord.set_min_reputation_for_consensus(rep);
             }
             (Some(Arc::new(coord)), Some(rx))
         } else {
@@ -3634,4 +3657,166 @@ mod tests {
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
     }
+
+    #[tokio::test]
+    async fn single_sided_consensus_overrides_and_min_reputation_enforced() {
+        use crate::consensus::transact::{
+            TransactVerificationRequest, TransactVerificationResult, DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
+        };
+        use crate::consensus::vote_tally::VerificationVote;
+        use std::collections::HashMap;
+
+        // 1. Single-sided consensus_min_validators override alone is respected.
+        let mut cfg1 = Settings::development();
+        cfg1.node.node_type = "Validator".to_string();
+        cfg1.bridge.enabled = true;
+        cfg1.bridge.consensus_min_validators = Some(9);
+        cfg1.bridge.consensus_total_validators = None;
+        let node1 = Node::new(cfg1).unwrap();
+        assert_eq!(
+            node1.transact_coordinator.as_ref().unwrap().consensus_thresholds(),
+            (9, 10)
+        );
+
+        // 2. Single-sided consensus_total_validators override alone is respected.
+        let mut cfg2 = Settings::development();
+        cfg2.node.node_type = "Validator".to_string();
+        cfg2.bridge.enabled = true;
+        cfg2.bridge.consensus_min_validators = None;
+        cfg2.bridge.consensus_total_validators = Some(15);
+        let node2 = Node::new(cfg2).unwrap();
+        assert_eq!(
+            node2.transact_coordinator.as_ref().unwrap().consensus_thresholds(),
+            (7, 15)
+        );
+
+        // 3. consensus_min_reputation gates voting: low reputation validators do not count toward consensus.
+        let tmp = tempfile::tempdir().unwrap();
+        let rep_dir = tmp.path().join("rep_test");
+        std::fs::create_dir_all(&rep_dir).unwrap();
+        let rep_path = rep_dir.join("reputation.json");
+
+        let n1 = NodeId(vec![71u8; 32]);
+        let n2 = NodeId(vec![72u8; 32]);
+        {
+            let tracker = crate::consensus::reputation::ReputationTracker::with_persistence(rep_path);
+            tracker.register_validator(n1.clone()).await;
+            tracker.register_validator(n2.clone()).await;
+            for _ in 0..30 {
+                tracker.record_failure(&n1).await.unwrap();
+                tracker.record_failure(&n2).await.unwrap();
+            }
+            assert!(tracker.get_reputation(&n1).await.unwrap() < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS);
+            assert!(tracker.get_reputation(&n2).await.unwrap() < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS);
+        }
+
+        let mut rep_cfg = Settings::development();
+        rep_cfg.storage.data_dir = rep_dir.to_string_lossy().into_owned();
+        rep_cfg.node.node_type = "Validator".to_string();
+        rep_cfg.bridge.enabled = true;
+        rep_cfg.bridge.consensus_min_validators = Some(2);
+        rep_cfg.bridge.consensus_total_validators = Some(2);
+        rep_cfg.bridge.consensus_min_reputation = Some(500);
+
+        let node_rep = Node::new(rep_cfg).unwrap();
+        let coord_rep = node_rep.transact_coordinator.as_ref().unwrap();
+        let w1 = "Wallet1111111111111111111111111111111111111".to_string();
+        let w2 = "Wallet2222222222222222222222222222222222222".to_string();
+        let mut stakes = HashMap::new();
+        stakes.insert(w1.clone(), 5_000_000_000);
+        stakes.insert(w2.clone(), 5_000_000_000);
+        coord_rep.sync_onchain_stakes(stakes, 10_000_000_000).await;
+        coord_rep.register_validator_with_wallet(n1.clone(), Some(w1.clone())).await;
+        coord_rep.register_validator_with_wallet(n2.clone(), Some(w2.clone())).await;
+
+        let mut req = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [1u8; 32],
+            mint: None,
+            nullifiers: [[2u8; 32], [3u8; 32]],
+            output_commitments: [[4u8; 32], [5u8; 32]],
+            root: [6u8; 32],
+            ext_amount: -100,
+            proof: vec![7, 8, 9],
+            ciphertexts: ["a".to_string(), "b".to_string()],
+            timestamp: 123,
+        };
+        req.request_id = req.canonical_id();
+        let req_id = coord_rep.start_verification(req).await.unwrap();
+
+        for (node_id, wallet) in [(n1, w1), (n2, w2)] {
+            coord_rep
+                .submit_result(TransactVerificationResult {
+                    request_id: req_id.clone(),
+                    validator: node_id,
+                    vote: VerificationVote::Valid,
+                    timestamp: 1,
+                    wallet_pubkey: wallet,
+                    signature: vec![1u8; 64],
+                })
+                .await
+                .unwrap();
+        }
+
+        // Because both validators have reputation < 500, their votes were dropped
+        // and consensus is None (not reached).
+        assert_eq!(coord_rep.check_consensus(&req_id).await.unwrap(), None);
+
+        // 4. Unknown validator admits at baseline standing, and valid consensus restores/increases
+        // reputation via record_success (#1300).
+        let n3 = NodeId(vec![73u8; 32]);
+        let w3 = "Wallet3333333333333333333333333333333333333".to_string();
+        let n4 = NodeId(vec![74u8; 32]);
+        let w4 = "Wallet4444444444444444444444444444444444444".to_string();
+
+        let mut stakes2 = HashMap::new();
+        stakes2.insert(w3.clone(), 5_000_000_000);
+        stakes2.insert(w4.clone(), 5_000_000_000);
+        coord_rep.sync_onchain_stakes(stakes2, 10_000_000_000).await;
+        coord_rep.register_validator_with_wallet(n3.clone(), Some(w3.clone())).await;
+        coord_rep.register_validator_with_wallet(n4.clone(), Some(w4.clone())).await;
+
+        let mut req2 = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [2u8; 32],
+            mint: None,
+            nullifiers: [[3u8; 32], [4u8; 32]],
+            output_commitments: [[5u8; 32], [6u8; 32]],
+            root: [7u8; 32],
+            ext_amount: -100,
+            proof: vec![1, 2, 3],
+            ciphertexts: ["c1".to_string(), "c2".to_string()],
+            timestamp: 456,
+        };
+        req2.request_id = req2.canonical_id();
+        let req2_id = coord_rep.start_verification(req2).await.unwrap();
+
+        let rep_before_n3 = coord_rep.reputation_tracker().get_reputation(&n3).await.unwrap();
+        assert_eq!(rep_before_n3, crate::consensus::reputation::BASE_REPUTATION);
+
+        for (node_id, wallet) in [(n3.clone(), w3), (n4.clone(), w4)] {
+            coord_rep
+                .submit_result(TransactVerificationResult {
+                    request_id: req2_id.clone(),
+                    validator: node_id,
+                    vote: VerificationVote::Valid,
+                    timestamp: 1,
+                    wallet_pubkey: wallet,
+                    signature: vec![1u8; 64],
+                })
+                .await
+                .unwrap();
+        }
+
+        // Both validators pass the gate and consensus is achieved.
+        assert_eq!(
+            coord_rep.check_consensus(&req2_id).await.unwrap(),
+            Some(VerificationVote::Valid)
+        );
+
+        // record_success was invoked for valid voters, increasing their reputation score.
+        let rep_after_n3 = coord_rep.reputation_tracker().get_reputation(&n3).await.unwrap();
+        assert!(rep_after_n3 > rep_before_n3);
+    }
+
 }
