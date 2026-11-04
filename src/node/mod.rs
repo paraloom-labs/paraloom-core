@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::bridge::solana::{
     build_settlement_message, derive_bridge_vault, CoSignPayload, SettlementParams,
+    SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
 use crate::bridge::Bridge;
 use crate::compute::{ComputeAuthPolicy, JobCoordinator, JobExecutor, JobManager};
@@ -2455,15 +2456,39 @@ impl Node {
         // SPL settlement (#779) takes the transact_spl path; `recipient` is the
         // recipient token account and the vault is the mint's asset vault.
         let params = match request.mint {
-            Some(mint) => SettlementParams::TransactSpl {
-                recipient_token_account: request.recipient,
-                mint,
-                nullifiers: request.nullifiers,
-                output_commitments: request.output_commitments,
-                root: request.root,
-                ext_amount: request.ext_amount,
-                proof: onchain_proof.to_vec(),
-            },
+            Some(mint) => {
+                // Pin the mint's token program into the payload (#1337):
+                // the fee ATA derivation and the settlement instruction's
+                // token-program account both key off whichever program owns
+                // the mint (classic SPL Token or Token-2022), and every
+                // co-signer must rebuild the identical message from the
+                // pinned value. A mint owned by anything else can never
+                // settle, so fail here instead of co-signing a dead tx.
+                let bridge = self
+                    .bridge
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("no bridge configured"))?;
+                let token_program = bridge.lock().await.account_owner(&mint).await?;
+                if token_program != SPL_TOKEN_PROGRAM_ID.to_bytes()
+                    && token_program != SPL_TOKEN_2022_PROGRAM_ID.to_bytes()
+                {
+                    anyhow::bail!(
+                        "mint {} is owned by {}, neither SPL Token nor Token-2022",
+                        Pubkey::new_from_array(mint),
+                        Pubkey::new_from_array(token_program),
+                    );
+                }
+                SettlementParams::TransactSpl {
+                    recipient_token_account: request.recipient,
+                    mint,
+                    nullifiers: request.nullifiers,
+                    output_commitments: request.output_commitments,
+                    root: request.root,
+                    ext_amount: request.ext_amount,
+                    proof: onchain_proof.to_vec(),
+                    token_program,
+                }
+            }
             None => SettlementParams::Transact {
                 recipient: request.recipient,
                 nullifiers: request.nullifiers,
