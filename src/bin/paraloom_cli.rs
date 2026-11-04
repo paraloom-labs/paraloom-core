@@ -42,9 +42,9 @@ use solana_sdk::{
     signature::Signer, transaction::Transaction,
 };
 #[cfg(feature = "solana-bridge")]
-use std::str::FromStr;
-#[cfg(feature = "solana-bridge")]
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
+#[cfg(feature = "solana-bridge")]
+use std::str::FromStr;
 
 // Node boot (validator start) — core, not gated on the Solana bridge.
 use paraloom::config::Settings;
