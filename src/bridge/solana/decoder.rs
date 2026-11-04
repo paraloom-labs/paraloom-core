@@ -33,9 +33,11 @@ pub const LISTENER_TX_ENCODING: UiTransactionEncoding = UiTransactionEncoding::J
 ///
 /// Returns an empty vector if the transaction does not target the
 /// Paraloom program, the encoding is not the expected raw JSON form,
-/// or no instruction matches the deposit discriminator. Address-table-
-/// lookup transactions are skipped with a warning — none of the deposit
-/// flows in v0.3 are expected to use LUTs.
+/// or no instruction matches the deposit discriminator. For v0 transactions
+/// that route accounts through address lookup tables, static keys are extended
+/// with `loaded_addresses.writable` then `loaded_addresses.readonly` in Solana's
+/// canonical resolution order, so LUT-referenced mints and depositors resolve
+/// instead of being silently dropped.
 pub fn extract_deposit_events(
     signature: &str,
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
@@ -78,7 +80,7 @@ pub fn extract_deposit_events(
         }
     };
 
-    let account_keys = match parse_account_keys(&raw.account_keys) {
+    let static_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
         Err(bad) => {
             log::warn!(
@@ -90,6 +92,21 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    // v0 LUT extension: compiled instruction indexes address static keys,
+    // then loaded writable, then loaded readonly. Without this, any mint or
+    // depositor referenced through a lookup table is out of bounds for the
+    // static array, `.get()` returns `None`, and the deposit is silently
+    // dropped — confirmed on-chain but never indexed.
+    let mut loaded: Option<(&[String], &[String])> = None;
+    if let Some(m) = confirmed.transaction.meta.as_ref() {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(l) =
+            &m.loaded_addresses
+        {
+            loaded = Some((l.writable.as_slice(), l.readonly.as_slice()));
+        }
+    }
+    let account_keys = resolve_account_keys(signature, static_keys, loaded);
 
     let mut events = Vec::new();
 
@@ -243,6 +260,60 @@ fn build_event(
         block: confirmed.slot,
         timestamp: confirmed.block_time.unwrap_or_default(),
     }
+}
+
+/// Resolve the full account-key table used for compiled-instruction index
+/// resolution: static keys plus, for v0 LUT transactions, loaded writable
+/// then loaded readonly addresses in Solana's canonical order.
+///
+/// Safety invariants (each exists so a malformed LUT table can only cause a
+/// safe skip, never a wrong credit):
+/// - Missing LUT data (legacy transaction, or RPC without LUT info) returns
+///   the static table unchanged.
+/// - An unparsable *writable* key falls back to the static table and does NOT
+///   append readonly: readonly indexes are offset by the writable run, so
+///   appending readonly without writable would shift every readonly index
+///   onto the wrong account.
+/// - An unparsable *readonly* key keeps static+writable: writable indexes are
+///   unaffected by the missing tail, while readonly-dependent instructions go
+///   out of bounds (\`.get()\` → \`None\` → skip) instead of resolving wrongly.
+/// - Every skip path logs the signature and the bad key, replacing the old
+///   silent drop with an attributable warning.
+fn resolve_account_keys(
+    signature: &str,
+    mut keys: Vec<Pubkey>,
+    loaded: Option<(&[String], &[String])>,
+) -> Vec<Pubkey> {
+    let Some((writable, readonly)) = loaded else {
+        return keys;
+    };
+    if writable.is_empty() && readonly.is_empty() {
+        return keys;
+    }
+    match parse_account_keys(writable) {
+        Ok(mut w) => keys.append(&mut w),
+        Err(bad) => {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "tx {} has unparsable loaded writable key '{}'; continuing with static keys",
+                signature,
+                bad
+            );
+            return keys;
+        }
+    }
+    match parse_account_keys(readonly) {
+        Ok(mut r) => keys.append(&mut r),
+        Err(bad) => {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "tx {} has unparsable loaded readonly key '{}'; continuing with static+writable keys",
+                signature,
+                bad
+            );
+        }
+    }
+    keys
 }
 
 fn parse_account_keys(keys: &[String]) -> std::result::Result<Vec<Pubkey>, String> {
@@ -498,6 +569,92 @@ mod tests {
         let ix = make_compiled_ix(3, 2, "0OIl".to_string());
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn lut_keys_append_in_canonical_order() {
+        let s0 = Pubkey::new_unique();
+        let s1 = Pubkey::new_unique();
+        let w0 = Pubkey::new_unique();
+        let r0 = Pubkey::new_unique();
+        let combined = resolve_account_keys(
+            "sig",
+            vec![s0, s1],
+            Some((&[w0.to_string()], &[r0.to_string()])),
+        );
+        assert_eq!(combined, vec![s0, s1, w0, r0]);
+    }
+
+    #[test]
+    fn lut_missing_returns_static_unchanged() {
+        let s0 = Pubkey::new_unique();
+        let combined = resolve_account_keys("sig", vec![s0], None);
+        assert_eq!(combined, vec![s0]);
+    }
+
+    #[test]
+    fn lut_bad_writable_falls_back_to_static_without_readonly() {
+        // Readonly must NOT be appended when writable fails: readonly indexes
+        // are offset by the writable run, so appending them alone would shift
+        // every readonly index onto the wrong account.
+        let s0 = Pubkey::new_unique();
+        let r0 = Pubkey::new_unique();
+        let combined = resolve_account_keys(
+            "sig",
+            vec![s0],
+            Some((&["not-a-key".to_string()], &[r0.to_string()])),
+        );
+        assert_eq!(combined, vec![s0]);
+    }
+
+    #[test]
+    fn lut_bad_readonly_keeps_static_plus_writable() {
+        let s0 = Pubkey::new_unique();
+        let w0 = Pubkey::new_unique();
+        let combined = resolve_account_keys(
+            "sig",
+            vec![s0],
+            Some((&[w0.to_string()], &["bad-key".to_string()])),
+        );
+        assert_eq!(combined, vec![s0, w0]);
+    }
+
+    #[test]
+    fn lut_loaded_depositor_resolves() {
+        // deposit_note references the depositor through the loaded run: static
+        // holds [bridge_state, bridge_vault, merkle_tree, program_id], the
+        // depositor is the first loaded address — exactly the reported bug.
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let combined = resolve_account_keys(
+            "sig",
+            vec![other, other, other, program_id],
+            Some((&[depositor.to_string()], &[])),
+        );
+        assert_eq!(combined.len(), 5);
+        let amount = 500_000u64;
+        let pubkey = [21u8; 32];
+        let blinding = [23u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+        let ix = UiCompiledInstruction {
+            program_id_index: 3,
+            accounts: vec![0, 1, 2, 4],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+        // Without the LUT extension the depositor index is out of bounds
+        // (None → silent drop); with it, the loaded depositor resolves.
+        assert!(decode_compiled_deposit(&ix, &combined[..4], &program_id).is_none());
+        let decoded = decode_compiled_deposit(&ix, &combined, &program_id)
+            .expect("LUT-loaded depositor must resolve");
+        assert_eq!(decoded.depositor, depositor);
     }
 
     #[test]
