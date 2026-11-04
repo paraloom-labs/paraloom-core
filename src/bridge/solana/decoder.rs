@@ -98,7 +98,8 @@ pub fn extract_deposit_events(
     // depositor referenced through a lookup table is out of bounds for the
     // static array, `.get()` returns `None`, and the deposit is silently
     // dropped — confirmed on-chain but never indexed.
-    let loaded: Option<(&[String], &[String])> = confirmed
+    let loaded: Option<(&[String], &[String])> =
+        confirmed
         .transaction
         .meta
         .as_ref()
