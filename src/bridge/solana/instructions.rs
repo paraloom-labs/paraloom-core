@@ -480,6 +480,32 @@ pub fn create_withdraw_unbonded_stake_instruction(
     }
 }
 
+/// Create an idempotent associated token account creation instruction.
+///
+/// Prepends instruction `1` to the SPL Associated Token Account Program.
+/// If the ATA already exists on-chain, it safely no-ops rather than reverting with
+/// `AccountAlreadyExists` (#1323, #1242).
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1],
+    }
+}
+
 /// Create a `claim_rewards` instruction.
 ///
 /// Drains accumulated settlement fees (`pending_rewards`) from `bridge_vault`
@@ -1310,5 +1336,63 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_layout() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+        let expected_ata = derive_associated_token_address(&owner, &mint, &token_program);
+
+        let ix = create_associated_token_account_idempotent_instruction(&payer, &owner, &mint, &token_program);
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]); // Idempotent create instruction is opcode 1
+        assert_eq!(ix.accounts.len(), 6);
+
+        // Account 0: Payer (writable, signer)
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[0].is_signer);
+
+        // Account 1: Associated Token Account (writable, non-signer)
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        // Account 2: Wallet owner (readonly, non-signer)
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert!(!ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+
+        // Account 3: Mint (readonly, non-signer)
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        // Account 4: System program (readonly, non-signer)
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        // Account 5: Token program (readonly, non-signer)
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+        assert!(!ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
+    }
+
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_token_2022() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_2022_PROGRAM_ID;
+        let expected_ata = derive_associated_token_address(&owner, &mint, &token_program);
+
+        let ix = create_associated_token_account_idempotent_instruction(&payer, &owner, &mint, &token_program);
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert_eq!(ix.accounts[5].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
     }
 }

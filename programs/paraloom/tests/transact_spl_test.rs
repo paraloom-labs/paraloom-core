@@ -16,7 +16,7 @@ use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::transact_spl_fixture_data as fx;
-use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
+use paraloom_program::{accounts, instruction, AssetConfig, BridgeState, NullifierAccount};
 use solana_program_test::{tokio, ProgramTest};
 use solana_sdk::{
     account::Account,

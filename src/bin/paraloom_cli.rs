@@ -1499,11 +1499,18 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
 
+                let ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
@@ -1699,11 +1706,10 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                let ix = create_withdraw_unbonded_stake_instruction(
-                    &program_id,
+                let ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
                     &validator.pubkey(),
                     &stake_mint,
-                    &validator_token,
                     &token_program,
                 );
 
@@ -1711,7 +1717,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
