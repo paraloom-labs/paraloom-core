@@ -145,7 +145,7 @@ async fn transact_spl_settles_a_token_withdrawal() {
         &mut pt,
         asset_mint,
         depositor.pubkey(),
-        fx::SPL_FIXTURE_DEPOSIT_AMOUNT,
+        fx::SPL_FIXTURE_DEPOSIT_AMOUNT * 2,
     );
     // Payout destination at the fixture's bound token-account address.
     let recipient_token = Pubkey::new_from_array(fx::SPL_FIXTURE_RECIPIENT_TOKEN_ACCOUNT);
@@ -467,4 +467,120 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+
+    // -------------------------------------------------------------------------
+    // Regression check (#1279): Verify that SPL vault withdrawals restore deposit
+    // headroom under the deposit cap without causing a permanent halt.
+    // -------------------------------------------------------------------------
+    // 1. Lower the cap to exactly fx::SPL_FIXTURE_DEPOSIT_AMOUNT.
+    send(
+        &mut banks,
+        blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetAssetDepositCap {
+                new_cap: fx::SPL_FIXTURE_DEPOSIT_AMOUNT,
+            }
+            .data(),
+            accounts: accounts::SetAssetDepositCap {
+                asset_config,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // At this point:
+    // - asset_config.total_deposited == fx::SPL_FIXTURE_DEPOSIT_AMOUNT
+    // - asset_vault.amount == fx::SPL_FIXTURE_DEPOSIT_AMOUNT - gross (withdrawn)
+    // Under the flawed cumulative volume check (total_deposited + amount <= cap),
+    // any subsequent deposit would fail with DepositCapExceeded (permanent halt).
+    // Under min(live_balance, tracked_deposits), effective balance is
+    // fx::SPL_FIXTURE_DEPOSIT_AMOUNT - gross, restoring gross tokens of headroom.
+
+    // 2. A re-deposit of `gross` tokens succeeds.
+    let mut redeposit_pubkey = [0u8; 32];
+    redeposit_pubkey[0] = 77;
+    let mut redeposit_blinding = [0u8; 32];
+    redeposit_blinding[0] = 88;
+    let redeposit_ix = Instruction {
+        program_id,
+        data: instruction::DepositNoteSpl {
+            amount: gross,
+            pubkey: redeposit_pubkey,
+            blinding: redeposit_blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNoteSpl {
+            bridge_state: state_pda,
+            asset_config,
+            mint: asset_mint,
+            asset_vault,
+            depositor_token_account: depositor_token,
+            merkle_tree: tree_pda,
+            depositor: depositor.pubkey(),
+            token_program: spl_token::id(),
+        }
+        .to_account_metas(None),
+    };
+    let mut redeposit_tx = Transaction::new_with_payer(&[redeposit_ix], Some(&depositor.pubkey()));
+    redeposit_tx.sign(&[&depositor], blockhash);
+    banks.process_transaction(redeposit_tx).await.unwrap();
+
+    // Vault token balance is back at cap.
+    let vault_restored = token_amount(&banks.get_account(asset_vault).await.unwrap().unwrap());
+    assert_eq!(
+        vault_restored, fx::SPL_FIXTURE_DEPOSIT_AMOUNT,
+        "vault token balance restored to cap after re-deposit"
+    );
+
+    // Cumulative deposits ticked up to fx::SPL_FIXTURE_DEPOSIT_AMOUNT + gross.
+    let config_raw = banks.get_account(asset_config).await.unwrap().unwrap();
+    let config_after = AssetConfig::try_deserialize(&mut config_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        config_after.total_deposited,
+        fx::SPL_FIXTURE_DEPOSIT_AMOUNT + gross
+    );
+    assert_eq!(config_after.deposit_count, 2);
+
+    // Tree advanced to next_index = 4 (leaf 0: deposit, leaves 1 & 2: transact outputs, leaf 3: re-deposit).
+    let tree_raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree_after = IncrementalMerkleTree::try_deserialize(&mut tree_raw.data.as_slice()).unwrap();
+    assert_eq!(tree_after.next_index, 4, "re-deposit leaf appended to tree");
+
+    // 3. Once headroom is consumed, an additional deposit exceeding the cap is rejected.
+    let mut over_pubkey = [0u8; 32];
+    over_pubkey[0] = 99;
+    let mut over_blinding = [0u8; 32];
+    over_blinding[0] = 99;
+    let over_ix = Instruction {
+        program_id,
+        data: instruction::DepositNoteSpl {
+            amount: 1,
+            pubkey: over_pubkey,
+            blinding: over_blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNoteSpl {
+            bridge_state: state_pda,
+            asset_config,
+            mint: asset_mint,
+            asset_vault,
+            depositor_token_account: depositor_token,
+            merkle_tree: tree_pda,
+            depositor: depositor.pubkey(),
+            token_program: spl_token::id(),
+        }
+        .to_account_metas(None),
+    };
+    let mut over_tx = Transaction::new_with_payer(&[over_ix], Some(&depositor.pubkey()));
+    over_tx.sign(&[&depositor], blockhash);
+    let over_res = banks.process_transaction(over_tx).await;
+    assert!(
+        over_res.is_err(),
+        "deposit exceeding restored headroom must be rejected"
+    );
 }
