@@ -353,6 +353,17 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     assert_eq!(before.pending_rewards, EXPECTED_FEE);
     assert_eq!(before.total_earnings, 0);
 
+    // #1138: the transact fee credit is mirrored into the vault-wide
+    // aggregate reserve on BridgeState.
+    let state = banks_client
+        .get_account(state_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let state =
+        paraloom_program::BridgeState::try_deserialize(&mut state.data.as_slice()).unwrap();
+    assert_eq!(state.total_pending_rewards, EXPECTED_FEE);
+
     // claim_rewards — pays pending out of the vault, zeros it, accumulates earnings.
     send(
         &mut banks_client,
@@ -381,4 +392,15 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.pending_rewards, 0);
     assert_eq!(acc.total_earnings, EXPECTED_FEE);
+
+    // #1138: the claim debited the aggregate reserve back to zero (this
+    // persists on-chain only because ClaimRewards.bridge_state is `mut`).
+    let state = banks_client
+        .get_account(state_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let state =
+        paraloom_program::BridgeState::try_deserialize(&mut state.data.as_slice()).unwrap();
+    assert_eq!(state.total_pending_rewards, 0);
 }

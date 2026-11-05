@@ -487,7 +487,8 @@ pub fn create_withdraw_unbonded_stake_instruction(
 /// Required before `withdraw_unbonded_stake` can succeed if the validator
 /// ever settled transactions and earned fees (#434, #438).
 /// Account order matches the `ClaimRewards` struct:
-/// bridge_state, validator_account (mut), bridge_vault (mut), validator (mut signer),
+/// bridge_state (mut — claiming debits `total_pending_rewards`, #1138),
+/// validator_account (mut), bridge_vault (mut), validator (mut signer),
 /// system_program. Data is the discriminator only (no args).
 pub fn create_claim_rewards_instruction(program_id: &Pubkey, validator: &Pubkey) -> Instruction {
     let (bridge_state, _) = derive_bridge_state(program_id);
@@ -497,7 +498,7 @@ pub fn create_claim_rewards_instruction(program_id: &Pubkey, validator: &Pubkey)
     Instruction {
         program_id: *program_id,
         accounts: vec![
-            AccountMeta::new_readonly(bridge_state, false),
+            AccountMeta::new(bridge_state, false),
             AccountMeta::new(validator_pda, false),
             AccountMeta::new(bridge_vault, false),
             AccountMeta::new(*validator, true),
@@ -1239,10 +1240,10 @@ mod tests {
 
         let ix = create_claim_rewards_instruction(&program_id, &validator);
 
-        // bridge_state, validator_account (mut), bridge_vault (mut), validator (signer), system_program
+        // bridge_state (mut, #1138), validator_account (mut), bridge_vault (mut), validator (signer), system_program
         assert_eq!(ix.accounts.len(), 5);
         assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
-        assert!(!ix.accounts[0].is_writable);
+        assert!(ix.accounts[0].is_writable);
         assert!(!ix.accounts[0].is_signer);
 
         assert_eq!(
