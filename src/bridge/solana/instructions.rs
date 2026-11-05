@@ -480,43 +480,30 @@ pub fn create_withdraw_unbonded_stake_instruction(
     }
 }
 
-/// Builds the complete instruction set for withdrawing unbonded validator stake.
+/// Create an idempotent associated token account creation instruction.
 ///
-/// If `ata_exists` is false (meaning the validator's associated token account for
-/// `stake_mint` was not confirmed initialized during preflight), prepends
-/// `spl_associated_token_account::instruction::create_associated_token_account_idempotent`
-/// to initialize the ATA before `create_withdraw_unbonded_stake_instruction`.
-///
-/// Using the idempotent ATA creation instruction variant guarantees that even if
-/// the account was created concurrently or preflight encountered transient RPC lag,
-/// the transaction will not fail on-chain with `AccountAlreadyExists`.
-pub fn build_withdraw_unbonded_stake_instructions(
-    program_id: &Pubkey,
-    validator: &Pubkey,
-    stake_mint: &Pubkey,
-    validator_token_account: &Pubkey,
+/// Prepends instruction `1` to the SPL Associated Token Account Program.
+/// If the ATA already exists on-chain, it safely no-ops rather than reverting with
+/// `AccountAlreadyExists` (#1323, #1242).
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
     token_program: &Pubkey,
-    ata_exists: bool,
-) -> Vec<Instruction> {
-    let mut instructions = Vec::with_capacity(if ata_exists { 1 } else { 2 });
-    if !ata_exists {
-        instructions.push(
-            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                validator,
-                validator,
-                stake_mint,
-                token_program,
-            ),
-        );
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1],
     }
-    instructions.push(create_withdraw_unbonded_stake_instruction(
-        program_id,
-        validator,
-        stake_mint,
-        validator_token_account,
-        token_program,
-    ));
-    instructions
 }
 
 /// Create a `claim_rewards` instruction.
@@ -1351,101 +1338,61 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
     }
     #[test]
-    fn test_build_withdraw_unbonded_stake_instructions_uninitialized_ata() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-        let stake_mint = Pubkey::new_unique();
+    fn test_create_associated_token_account_idempotent_instruction_layout() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
         let token_program = SPL_TOKEN_PROGRAM_ID;
-        let validator_token = derive_associated_token_address(&validator, &stake_mint, &token_program);
+        let expected_ata = derive_associated_token_address(&owner, &mint, &token_program);
 
-        // When ATA does not exist on-chain (ata_exists = false), prepend idempotent ATA creation
-        let ixs = build_withdraw_unbonded_stake_instructions(
-            &program_id,
-            &validator,
-            &stake_mint,
-            &validator_token,
-            &token_program,
-            false,
-        );
+        let ix = create_associated_token_account_idempotent_instruction(&payer, &owner, &mint, &token_program);
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]); // Idempotent create instruction is opcode 1
+        assert_eq!(ix.accounts.len(), 6);
 
-        assert_eq!(ixs.len(), 2);
+        // Account 0: Payer (writable, signer)
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[0].is_signer);
 
-        // Instruction 0: create_associated_token_account_idempotent
-        let ata_ix = &ixs[0];
-        assert_eq!(ata_ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
-        assert_eq!(ata_ix.accounts.len(), 6);
-        assert_eq!(ata_ix.accounts[0].pubkey, validator); // payer
-        assert!(ata_ix.accounts[0].is_signer);
-        assert!(ata_ix.accounts[0].is_writable);
-        assert_eq!(ata_ix.accounts[1].pubkey, validator_token); // ATA to create
-        assert!(!ata_ix.accounts[1].is_signer);
-        assert!(ata_ix.accounts[1].is_writable);
-        assert_eq!(ata_ix.accounts[2].pubkey, validator); // wallet owner
-        assert!(!ata_ix.accounts[2].is_signer);
-        assert!(!ata_ix.accounts[2].is_writable);
-        assert_eq!(ata_ix.accounts[3].pubkey, stake_mint); // mint
-        assert!(!ata_ix.accounts[3].is_signer);
-        assert!(!ata_ix.accounts[3].is_writable);
-        assert_eq!(ata_ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
-        assert_eq!(ata_ix.accounts[5].pubkey, token_program);
-        // Idempotent ATA creation discriminator is 1 (standard create is 0)
-        assert_eq!(ata_ix.data, vec![1]);
+        // Account 1: Associated Token Account (writable, non-signer)
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
 
-        // Instruction 1: create_withdraw_unbonded_stake_instruction
-        let withdraw_ix = &ixs[1];
-        assert_eq!(withdraw_ix.program_id, program_id);
-        assert_eq!(withdraw_ix.accounts.len(), 7);
-        assert_eq!(withdraw_ix.accounts[1].pubkey, validator);
-        assert_eq!(withdraw_ix.accounts[3].pubkey, validator_token);
-        assert_eq!(&withdraw_ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+        // Account 2: Wallet owner (readonly, non-signer)
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert!(!ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+
+        // Account 3: Mint (readonly, non-signer)
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        // Account 4: System program (readonly, non-signer)
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        // Account 5: Token program (readonly, non-signer)
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+        assert!(!ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
     }
 
     #[test]
-    fn test_build_withdraw_unbonded_stake_instructions_existing_ata() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-        let stake_mint = Pubkey::new_unique();
-        let token_program = SPL_TOKEN_PROGRAM_ID;
-        let validator_token = derive_associated_token_address(&validator, &stake_mint, &token_program);
-
-        // When ATA already exists on-chain (ata_exists = true), do not prepend ATA creation
-        let ixs = build_withdraw_unbonded_stake_instructions(
-            &program_id,
-            &validator,
-            &stake_mint,
-            &validator_token,
-            &token_program,
-            true,
-        );
-
-        assert_eq!(ixs.len(), 1);
-        assert_eq!(ixs[0].program_id, program_id);
-        assert_eq!(ixs[0].accounts[1].pubkey, validator);
-        assert_eq!(ixs[0].accounts[3].pubkey, validator_token);
-        assert_eq!(&ixs[0].data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
-    }
-
-    #[test]
-    fn test_build_withdraw_unbonded_stake_instructions_token_2022() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-        let stake_mint = Pubkey::new_unique();
+    fn test_create_associated_token_account_idempotent_instruction_token_2022() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
         let token_program = SPL_TOKEN_2022_PROGRAM_ID;
-        let validator_token = derive_associated_token_address(&validator, &stake_mint, &token_program);
+        let expected_ata = derive_associated_token_address(&owner, &mint, &token_program);
 
-        let ixs = build_withdraw_unbonded_stake_instructions(
-            &program_id,
-            &validator,
-            &stake_mint,
-            &validator_token,
-            &token_program,
-            false,
-        );
-
-        assert_eq!(ixs.len(), 2);
-        assert_eq!(ixs[0].accounts[1].pubkey, validator_token);
-        assert_eq!(ixs[0].accounts[5].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
-        assert_eq!(ixs[1].accounts[6].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
-        assert_eq!(ixs[0].data, vec![1]); // idempotent create
+        let ix = create_associated_token_account_idempotent_instruction(&payer, &owner, &mint, &token_program);
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert_eq!(ix.accounts[5].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
     }
 }

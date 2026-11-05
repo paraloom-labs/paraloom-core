@@ -111,9 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let token_program = client.get_account(&stake_mint)?.owner;
+    let derived_ata = derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program);
     let validator_token_account = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
         Ok(val) => Pubkey::from_str(&val)?,
-        Err(_) => derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program),
+        Err(_) => derived_ata,
     };
 
     println!("Token Program: {}", token_program);
@@ -132,9 +133,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
 
+    let mut instructions = Vec::with_capacity(2);
+    if validator_token_account == derived_ata {
+        instructions.push(create_associated_token_account_idempotent_instruction(
+            &validator.pubkey(),
+            &validator.pubkey(),
+            &stake_mint,
+            &token_program,
+        ));
+    }
+    instructions.push(ix);
+
     println!("Creating and signing transaction...");
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &instructions,
         Some(&validator.pubkey()),
         &[&validator],
         blockhash,

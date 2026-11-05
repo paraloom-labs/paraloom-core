@@ -134,7 +134,7 @@ path = "src/bin/set_bridge_authority.rs"
 
 [features]
 default = ["solana-bridge"]
-solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "solana-account-decoder", "spl-associated-token-account", "borsh", "bs58"]
+solana-bridge = ["solana-client", "solana-sdk", "solana-transaction-status", "solana-account-decoder", "borsh", "bs58"]
 
 [dependencies]
 # Core networking
@@ -219,7 +219,6 @@ solana-client = { version = "2.0", optional = true }
 solana-sdk = { version = "2.0", optional = true }
 solana-transaction-status = { version = "2.0", optional = true }
 solana-account-decoder = { version = "2.0", optional = true }
-spl-associated-token-account = { version = "7.0", optional = true }
 borsh = { version = "1.5", optional = true }
 
 # WASM Runtime (Phase 3: Compute Layer)
