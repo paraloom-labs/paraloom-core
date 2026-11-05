@@ -442,4 +442,102 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     assert_eq!(state.withdrawal_count, 1);
     // Withdrawal volume is now tracked (gross = |ext_amount|, was stuck at 0).
     assert_eq!(state.total_withdrawn, gross);
+
+    // -------------------------------------------------------------------------
+    // Regression check (#1279): Verify that native vault withdrawals restore
+    // deposit headroom under the deposit cap without causing a permanent halt.
+    // -------------------------------------------------------------------------
+    // 1. Set the native deposit cap to exactly fx::FIXTURE_DEPOSIT_AMOUNT.
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::SetDepositCap {
+                new_cap: fx::FIXTURE_DEPOSIT_AMOUNT,
+            }
+            .data(),
+            accounts: accounts::SetDepositCap {
+                bridge_state: state_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // At this point:
+    // - bridge_state.total_deposited == fx::FIXTURE_DEPOSIT_AMOUNT
+    // - bridge_state.total_withdrawn == gross (fx::FIXTURE_DEPOSIT_AMOUNT)
+    // - tracked_liabilities == total_deposited - total_withdrawn == 0
+    // Under the flawed cumulative volume check (`total_deposited + amount <= cap`),
+    // any subsequent deposit would fail with DepositCapExceeded (permanent halt).
+    // Under `min(vault.lamports(), tracked_liabilities)`, active TVL is 0,
+    // restoring deposit headroom up to `new_cap`.
+
+    // 2. A re-deposit of fx::FIXTURE_DEPOSIT_AMOUNT succeeds.
+    let mut redeposit_pubkey = [0u8; 32];
+    redeposit_pubkey[0] = 77;
+    let mut redeposit_blinding = [0u8; 32];
+    redeposit_blinding[0] = 88;
+    let redeposit_ix = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: fx::FIXTURE_DEPOSIT_AMOUNT,
+            pubkey: redeposit_pubkey,
+            blinding: redeposit_blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: state_pda,
+            bridge_vault: vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut redeposit_tx = Transaction::new_with_payer(&[redeposit_ix], Some(&payer.pubkey()));
+    redeposit_tx.sign(&[&payer], recent_blockhash);
+    banks_client.process_transaction(redeposit_tx).await.unwrap();
+
+    // Tree advanced to next_index = 4 (leaf 0: deposit, leaves 1 & 2: transact outputs, leaf 3: re-deposit).
+    let tree_raw = banks_client.get_account(tree_pda).await.unwrap().unwrap();
+    let tree_after = IncrementalMerkleTree::try_deserialize(&mut tree_raw.data.as_slice()).unwrap();
+    assert_eq!(tree_after.next_index, 4, "re-deposit leaf appended after withdrawal restored headroom");
+
+    // State tracked volume updated.
+    let state_raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
+    let state_after = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
+    assert_eq!(state_after.total_deposited, fx::FIXTURE_DEPOSIT_AMOUNT * 2);
+    assert_eq!(state_after.deposit_count, 2);
+
+    // 3. Once headroom is consumed, an additional deposit exceeding the cap is rejected.
+    let mut over_pubkey = [0u8; 32];
+    over_pubkey[0] = 99;
+    let mut over_blinding = [0u8; 32];
+    over_blinding[0] = 99;
+    let over_ix = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: 1,
+            pubkey: over_pubkey,
+            blinding: over_blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: state_pda,
+            bridge_vault: vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut over_tx = Transaction::new_with_payer(&[over_ix], Some(&payer.pubkey()));
+    over_tx.sign(&[&payer], recent_blockhash);
+    let over_res = banks_client.process_transaction(over_tx).await;
+    assert!(over_res.is_err(), "deposit exceeding restored headroom must be rejected");
 }
