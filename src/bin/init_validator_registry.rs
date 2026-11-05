@@ -15,10 +15,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://localhost:8899".to_string());
     let program_id_str = std::env::var("SOLANA_PROGRAM_ID")?;
     let authority_keypair_path = std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?;
+    // The dual-stake mint pinned into the registry at creation (same
+    // `STAKE_MINT` env convention as `init_stake_token_vault`). The on-chain
+    // `InitializeValidatorRegistry` context creates the stake vault for
+    // this mint, so there is no default: a missing/invalid value is a
+    // hard error, not a silent fallback.
+    let stake_mint_str = std::env::var("STAKE_MINT").map_err(|_| {
+        "STAKE_MINT is required (the dual-stake token mint to pin into the registry)"
+    })?;
+    let stake_mint = Pubkey::from_str(&stake_mint_str)
+        .map_err(|e| format!("STAKE_MINT is not a valid pubkey ({stake_mint_str}): {e}"))?;
 
     println!("RPC URL: {}", rpc_url);
     println!("Program ID: {}", program_id_str);
-    println!("Authority Keypair: {}\n", authority_keypair_path);
+    println!("Authority Keypair: {}", authority_keypair_path);
+    println!("Stake Mint: {}\n", stake_mint);
 
     let program_id = Pubkey::from_str(&program_id_str)?;
 
@@ -42,11 +53,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // The vault's token program must be the one that owns the mint (classic
+    // SPL Token or Token-2022); read it rather than assume, so the
+    // `token_program` account matches the mint — same resolution as
+    // `init_stake_token_vault`.
+    let token_program = client.get_account(&stake_mint)?.owner;
+    println!("Token Program (mint owner): {}\n", token_program);
+
     // Use the library builder: it includes the #204 ProgramData
-    // upgrade-authority account the on-chain `InitializeValidatorRegistry`
-    // requires. The hand-rolled 3-account form predated #204 and failed with
-    // AccountNotEnoughKeys (3005).
-    let ix = create_initialize_validator_registry_instruction(&program_id, &authority.pubkey())?;
+    // upgrade-authority account and all five dual-stake accounts the
+    // on-chain `InitializeValidatorRegistry` context requires (9 total).
+    // The previous 4-account form failed with AccountNotEnoughKeys (3005).
+    let ix = create_initialize_validator_registry_instruction(
+        &program_id,
+        &authority.pubkey(),
+        &stake_mint,
+        &token_program,
+    )?;
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
