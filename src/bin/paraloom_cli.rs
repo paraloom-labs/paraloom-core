@@ -1499,11 +1499,26 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 )
                 .map_err(|e| anyhow::anyhow!("failed to build register instruction: {e}"))?;
 
+                // The on-chain `validator_token_account` is a typed token
+                // account and `register_validator` transfer_checkeds from it
+                // unconditionally, so a validator whose ATA was never created
+                // (e.g. registering while the token gate is closed) fails
+                // with AccountNotInitialized. Prepend idempotent ATA
+                // creation in the same transaction — unconditionally, with
+                // no preflight RPC check: the idempotent form no-ops when
+                // the ATA already exists (#1323/#1242).
+                let ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
@@ -1707,11 +1722,26 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
+                // The on-chain `validator_token_account` is a typed token
+                // account, so a validator whose ATA was never created (or
+                // was closed during unbonding) fails with
+                // AccountNotInitialized and the unbonded stake stays
+                // locked. Prepend idempotent ATA creation in the same
+                // transaction — unconditionally, with no preflight RPC
+                // check: the idempotent form no-ops when the ATA already
+                // exists (#1323/#1242).
+                let ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,

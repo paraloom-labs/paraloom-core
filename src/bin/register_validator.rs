@@ -111,9 +111,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let token_program = client.get_account(&stake_mint)?.owner;
+    let derived_ata =
+        derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program);
     let validator_token_account = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
         Ok(val) => Pubkey::from_str(&val)?,
-        Err(_) => derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program),
+        Err(_) => derived_ata,
     };
 
     println!("Token Program: {}", token_program);
@@ -129,12 +131,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_stake_amount,
     )?;
 
+    // The on-chain `validator_token_account` is a typed token account, so
+    // registering with a never-created ATA fails with
+    // AccountNotInitialized (#1323/#1242). Prepend idempotent ATA creation
+    // in the same transaction — but only when the account actually used is
+    // the derived ATA. A foreign `VALIDATOR_TOKEN_ACCOUNT` override is not
+    // the derived ATA: creating the derived ATA then would waste rent and
+    // would not initialize the override account anyway.
+    let mut instructions = Vec::new();
+    if validator_token_account == derived_ata {
+        instructions.push(create_associated_token_account_idempotent_instruction(
+            &validator.pubkey(),
+            &validator.pubkey(),
+            &stake_mint,
+            &token_program,
+        ));
+    }
+    instructions.push(ix);
+
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
 
     println!("Creating and signing transaction...");
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &instructions,
         Some(&validator.pubkey()),
         &[&validator],
         blockhash,

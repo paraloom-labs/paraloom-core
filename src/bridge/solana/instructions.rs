@@ -927,6 +927,39 @@ pub fn derive_associated_token_address(
     .0
 }
 
+/// Build the ATA program's `CreateAssociatedTokenAccountIdempotent`
+/// instruction (discriminator `1`) for `owner` + `mint` under
+/// `token_program`, hand-rolled to match
+/// `spl_associated_token_account::instruction::create_associated_token_account_idempotent`
+/// without the dependency. The created account is exactly
+/// [`derive_associated_token_address`] for the same inputs.
+///
+/// Idempotent creation is a no-op when the ATA already exists, so callers
+/// prepend it *unconditionally* in the same transaction as the instruction
+/// that needs the ATA: no preflight RPC existence check (which would race
+/// with a creation landing between the check and the transaction), and no
+/// failure when the ATA is already there.
+pub fn create_associated_token_account_idempotent_instruction(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let ata = derive_associated_token_address(owner, mint, token_program);
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +1013,116 @@ mod tests {
             a,
             derive_associated_token_address(&owner, &mint, &SPL_TOKEN_2022_PROGRAM_ID)
         );
+    }
+
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_classic_spl() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+
+        let ix = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &owner,
+            &mint,
+            &SPL_TOKEN_PROGRAM_ID,
+        );
+
+        // Idempotent creation is discriminator 1 of the ATA program.
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]);
+
+        // Canonical account order: [payer, ata, owner, mint, system, token].
+        assert_eq!(ix.accounts.len(), 6);
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[0].is_signer);
+
+        let ata = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_PROGRAM_ID);
+        assert_eq!(ix.accounts[1].pubkey, ata);
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert!(!ix.accounts[2].is_writable);
+        assert!(!ix.accounts[2].is_signer);
+
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert!(!ix.accounts[3].is_signer);
+
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[4].is_writable);
+        assert!(!ix.accounts[4].is_signer);
+
+        assert_eq!(ix.accounts[5].pubkey, SPL_TOKEN_PROGRAM_ID);
+        assert!(!ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
+    }
+
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_token_2022() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+
+        let ix = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &owner,
+            &mint,
+            &SPL_TOKEN_2022_PROGRAM_ID,
+        );
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]);
+        assert_eq!(ix.accounts.len(), 6);
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[0].is_signer);
+
+        // The token program is a seed of the ATA, so the Token-2022 ATA
+        // differs from the classic-SPL ATA for the same owner + mint, and
+        // the instruction's token-program account is Token-2022.
+        let ata_2022 = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_2022_PROGRAM_ID);
+        let ata_classic = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_PROGRAM_ID);
+        assert_ne!(ata_2022, ata_classic);
+        assert_eq!(ix.accounts[1].pubkey, ata_2022);
+        assert!(ix.accounts[1].is_writable);
+        assert!(!ix.accounts[1].is_signer);
+
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert!(!ix.accounts[3].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert_eq!(ix.accounts[5].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
+        assert!(!ix.accounts[5].is_writable);
+        assert!(!ix.accounts[5].is_signer);
+    }
+
+    #[test]
+    fn test_create_ata_idempotent_creates_the_account_the_cli_passes() {
+        // Mirrors the CLI withdraw-unbonded / register derivation: the ATA
+        // is derived from the validator pubkey, the registry's stake_mint,
+        // and the token program resolved from the mint account's owner.
+        // The helper must create exactly that account, for both programs.
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        for token_program in [SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID] {
+            let cli_validator_token =
+                derive_associated_token_address(&validator, &stake_mint, &token_program);
+            let ix = create_associated_token_account_idempotent_instruction(
+                &validator,
+                &validator,
+                &stake_mint,
+                &token_program,
+            );
+            assert_eq!(ix.accounts[1].pubkey, cli_validator_token);
+            assert_eq!(ix.accounts[0].pubkey, validator);
+            assert_eq!(ix.accounts[2].pubkey, validator);
+            assert_eq!(ix.accounts[3].pubkey, stake_mint);
+            assert_eq!(ix.accounts[5].pubkey, token_program);
+        }
     }
 
     #[test]
