@@ -10,9 +10,9 @@
 //! (#204 + `has_one = authority`); register stays validator-signed.
 
 use anchor_lang::prelude::*;
-use anchor_lang::{Discriminator, InstructionData, ToAccountMetas};
+use anchor_lang::{AccountSerialize, Discriminator, InstructionData, ToAccountMetas};
 use paraloom_program::{accounts, instruction, ValidatorAccount, ValidatorRegistry};
-use solana_program_test::{processor, tokio, ProgramTest};
+use solana_program_test::{processor, tokio, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_sdk::{
     account::Account,
     instruction::Instruction,
@@ -24,7 +24,7 @@ use solana_sdk::{
 mod common;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix,
+    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
 };
 
 const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
@@ -495,4 +495,314 @@ async fn slash_rent_only_ghost_does_not_underflow() {
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.unbonding_amount, 0, "still nothing unbonding");
     assert_eq!(acc.times_slashed, 1, "the slash was recorded");
+}
+
+// ---------------------------------------------------------------------------
+// #863: slash_validator must forfeit pending_rewards.
+//
+// `register_validator` always zeroes `pending_rewards` and the only on-chain
+// path that credits it is `transact`'s settlement fee, so these tests seed a
+// validator PDA directly in genesis (the pattern used by
+// `pending_rewards_before_close_test` and the ghost-PDA test above) with a
+// chosen stake / pending_rewards balance, then drive the real
+// `initialize_validator_registry` + `slash_validator` instructions against it.
+// The token half is seeded at zero so the slash's token burn is a no-op and
+// the SOL / rewards accounting is exercised in isolation.
+// ---------------------------------------------------------------------------
+
+/// Seed an ACTIVE validator PDA holding `stake_amount` lamports of stake
+/// (on top of its rent reserve, exactly as a registered PDA does) and
+/// `pending_rewards` of unclaimed settlement fees. Returns the PDA.
+fn seed_active_validator(
+    pt: &mut ProgramTest,
+    program_id: Pubkey,
+    validator: Pubkey,
+    stake_amount: u64,
+    pending_rewards: u64,
+) -> Pubkey {
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.as_ref()], &program_id);
+    let seeded = ValidatorAccount {
+        validator,
+        stake_amount,
+        reputation_score: 1000,
+        total_tasks_verified: 0,
+        successful_verifications: 0,
+        registered_at: 0,
+        last_active: 0,
+        is_active: true,
+        pending_rewards,
+        total_earnings: 0,
+        times_slashed: 0,
+        unbonding_amount: 0,
+        unbonding_slot: 0,
+        token_stake_amount: 0,
+        token_unbonding_amount: 0,
+    };
+    let mut data = Vec::new();
+    seeded
+        .try_serialize(&mut data)
+        .expect("serialize seeded validator");
+    let rent = Rent::default().minimum_balance(data.len());
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: rent + stake_amount,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    validator_pda
+}
+
+/// `send` for a `start_with_context` bank: fresh blockhash per call, raw
+/// result returned so the close-out test can assert the withdraw succeeded.
+async fn send_ctx(
+    ctx: &mut ProgramTestContext,
+    signer: &Keypair,
+    ix: Instruction,
+) -> std::result::Result<(), BanksClientError> {
+    let blockhash = ctx.get_new_latest_blockhash().await.expect("new blockhash");
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&signer.pubkey()));
+    tx.sign(&[signer], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn load_validator_ctx(ctx: &mut ProgramTestContext, pda: Pubkey) -> ValidatorAccount {
+    let raw = ctx
+        .banks_client
+        .get_account(pda)
+        .await
+        .expect("rpc")
+        .expect("validator account exists");
+    ValidatorAccount::try_deserialize(&mut raw.data.as_slice()).expect("deserialize validator")
+}
+
+/// #863 rule 2: a PARTIAL slash that deactivates the validator must forfeit
+/// ALL of its pending_rewards, not just the slashed proportion. A
+/// minimum-stake validator is deactivated by any slash; with 2.5 SOL of
+/// accrued fees (the issue's own counterexample) a 50% slash under the
+/// proportional-only rule would still leave it 1.25 SOL to extract via
+/// `claim_rewards` after ejection.
+#[tokio::test]
+async fn slash_deactivating_partial_forfeits_all_pending_rewards() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, _validator_token) = funded_validator(&mut pt, stake_mint);
+    const PENDING: u64 = 2_500_000_000; // 2.5 SOL of settlement fees
+    let validator_pda = seed_active_validator(
+        &mut pt,
+        program_id,
+        validator.pubkey(),
+        MIN_VALIDATOR_STAKE,
+        PENDING,
+    );
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
+    )
+    .await;
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert!(
+        !acc.is_active,
+        "a 50% slash on a minimum-stake validator must deactivate it"
+    );
+    assert_eq!(
+        acc.unbonding_amount,
+        MIN_VALIDATOR_STAKE / 2,
+        "the unslashed residual stake routes to unbonding on deactivation"
+    );
+    assert_eq!(
+        acc.pending_rewards, 0,
+        "a deactivating slash must forfeit ALL pending_rewards, not just the \
+         slashed proportion (proportional-only would leave {})",
+        PENDING / 2
+    );
+}
+
+/// #863 rule 1 (guard against over-forfeiture): a partial slash that does NOT
+/// deactivate the validator forfeits only the slashed proportion of
+/// pending_rewards; the validator keeps the rest and stays active.
+#[tokio::test]
+async fn slash_non_deactivating_partial_forfeits_proportionally() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, _validator_token) = funded_validator(&mut pt, stake_mint);
+    const STAKE: u64 = 10 * MIN_VALIDATOR_STAKE; // 10 SOL — comfortably above minimum
+    const PENDING: u64 = 2_000_000_000;
+    let validator_pda =
+        seed_active_validator(&mut pt, program_id, validator.pubkey(), STAKE, PENDING);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            50,
+        ),
+    )
+    .await;
+
+    let acc_raw = banks_client
+        .get_account(validator_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
+    assert_eq!(acc.stake_amount, STAKE / 2, "stake is slashed by 50%");
+    assert!(
+        acc.is_active,
+        "5 SOL remaining is above the 1 SOL minimum — validator stays active"
+    );
+    assert_eq!(
+        acc.pending_rewards,
+        PENDING / 2,
+        "a non-deactivating 50% slash forfeits exactly half the pending rewards"
+    );
+}
+
+/// #863 close-out consequence: once a deactivating (here 100%) slash has
+/// forfeited pending_rewards in full, the ejected validator can close its
+/// PDA via `withdraw_unbonded_stake` WITHOUT first calling `claim_rewards`.
+/// Before the fix the #434 guard (`PendingRewardsUnclaimed`) forced the
+/// slashed validator to extract every lamport of its fees before it could
+/// recover its rent.
+#[tokio::test]
+async fn deactivating_slash_lets_validator_close_without_claiming_rewards() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let validator_pda = seed_active_validator(
+        &mut pt,
+        program_id,
+        validator.pubkey(),
+        MIN_VALIDATOR_STAKE,
+        2_500_000_000,
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    send_ctx(
+        &mut ctx,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await
+    .expect("init registry");
+    send_ctx(
+        &mut ctx,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            100,
+        ),
+    )
+    .await
+    .expect("100% slash");
+
+    let acc = load_validator_ctx(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active, "100% slash deactivates the validator");
+    assert!(
+        acc.unbonding_slot > 0,
+        "the deactivating slash records the unbonding slot"
+    );
+
+    // Warp past the unbonding window, then close WITHOUT any claim_rewards:
+    // the forfeited rewards are already zero, so the #434 guard must pass.
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+    let wallet_before = ctx
+        .banks_client
+        .get_balance(validator.pubkey())
+        .await
+        .expect("wallet balance");
+    send_ctx(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect(
+        "withdraw after a fully-forfeiting slash must succeed without claim_rewards \
+         (pre-fix it fails with PendingRewardsUnclaimed)",
+    );
+
+    let wallet_after = ctx
+        .banks_client
+        .get_balance(validator.pubkey())
+        .await
+        .expect("wallet balance");
+    assert!(
+        wallet_after > wallet_before,
+        "the validator recovers its PDA rent on close"
+    );
+    let closed = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .expect("rpc");
+    assert!(
+        closed.is_none() || closed.unwrap().lamports == 0,
+        "the validator PDA must be closed after withdraw"
+    );
 }
