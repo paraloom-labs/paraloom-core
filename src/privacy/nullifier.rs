@@ -77,8 +77,15 @@ impl NullifierSet {
     }
 
     /// Batch check multiple nullifiers
-    /// Returns true if ALL nullifiers are new (not yet spent)
+    /// Returns true if ALL nullifiers are new (not yet spent) AND there are no duplicate
+    /// nullifiers within the batch itself (#1428).
     pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
+        let mut seen = std::collections::HashSet::with_capacity(nullifiers.len());
+        for n in nullifiers {
+            if !seen.insert(n) {
+                return false;
+            }
+        }
         let set = self.nullifiers.read().await;
         nullifiers.iter().all(|n| !set.contains(n))
     }
@@ -89,13 +96,18 @@ impl NullifierSet {
     /// set only if persistence succeeded. On storage failure no
     /// nullifier in the batch is recorded — the caller is expected to
     /// either retry the entire batch or fail the enclosing transaction.
+    /// Intra-batch duplicates are deduplicated so storage and in-memory set
+    /// remain consistent and correctly accounted (#1428).
     pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
 
-        let new_nullifiers: Vec<Nullifier> = nullifiers
-            .into_iter()
-            .filter(|n| !set.contains(n))
-            .collect();
+        let mut seen = std::collections::HashSet::with_capacity(nullifiers.len());
+        let mut new_nullifiers: Vec<Nullifier> = Vec::new();
+        for n in nullifiers {
+            if !set.contains(&n) && seen.insert(n.clone()) {
+                new_nullifiers.push(n);
+            }
+        }
 
         if new_nullifiers.is_empty() {
             return Ok(0);
@@ -229,6 +241,12 @@ mod tests {
             set.check_batch(&[nullifier2.clone(), nullifier3.clone()])
                 .await
         );
+
+        // Batch with duplicate nullifiers within the batch itself must fail (#1428)
+        assert!(
+            !set.check_batch(&[nullifier2.clone(), nullifier2.clone()])
+                .await
+        );
     }
 
     #[tokio::test]
@@ -248,13 +266,26 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(set.len().await, 3);
 
-        // Second batch insert (duplicates)
+        // Batch with duplicate nullifiers within the batch itself (#1428)
+        let dup_batch = vec![
+            Nullifier([4u8; 32]),
+            Nullifier([4u8; 32]),
+            Nullifier([5u8; 32]),
+        ];
+        let count = set
+            .insert_batch(dup_batch)
+            .await
+            .expect("in-memory batch insert");
+        assert_eq!(count, 2); // Only [4, 5] should be counted and added
+        assert_eq!(set.len().await, 5);
+
+        // Second batch insert (already spent duplicates)
         let count = set
             .insert_batch(nullifiers)
             .await
             .expect("in-memory batch insert");
         assert_eq!(count, 0); // No new inserts
-        assert_eq!(set.len().await, 3);
+        assert_eq!(set.len().await, 5);
     }
 
     #[tokio::test]
