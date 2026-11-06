@@ -140,7 +140,9 @@ fn main() {
         .unwrap_or_else(|_| "keys/transact_v3_verifying.key".to_string());
 
     use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-    let (pk, vk) = if std::path::Path::new(&pk_path).exists() {
+    let (pk, vk) = if std::path::Path::new(&pk_path).exists()
+        && std::path::Path::new(&vk_path).exists()
+    {
         let pk_bytes = std::fs::read(&pk_path).expect("read transact v3 proving key");
         let vk_bytes = std::fs::read(&vk_path).expect("read transact v3 verifying key");
         let pk = ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&pk_bytes[..])
@@ -160,8 +162,25 @@ fn main() {
         let mut vk_bytes = Vec::new();
         vk.serialize_compressed(&mut vk_bytes)
             .expect("serialize vk");
-        std::fs::write(&pk_path, pk_bytes).expect("write transact v3 proving key");
-        std::fs::write(&vk_path, vk_bytes).expect("write transact v3 verifying key");
+
+        if let Some(parent) = std::path::Path::new(&pk_path).parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir for pk");
+        }
+        if let Some(parent) = std::path::Path::new(&vk_path).parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir for vk");
+        }
+
+        std::fs::write(&pk_path, &pk_bytes).expect("write transact v3 proving key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&pk_path)
+                .expect("get pk metadata")
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&pk_path, perms).expect("set pk permissions to 0600");
+        }
+        std::fs::write(&vk_path, &vk_bytes).expect("write transact v3 verifying key");
         eprintln!("generated + saved persistent keys to {pk_path}");
         (pk, vk)
     };

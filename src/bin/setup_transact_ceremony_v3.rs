@@ -1,4 +1,4 @@
-use ark_serialize::CanonicalSerialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::thread_rng;
 use paraloom::privacy::circuits::{
     Groth16ProofSystem, TransactCircuitV3, TX_LEVELS, TX_NINS, TX_NOUTS,
@@ -89,7 +89,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Writing keys to disk...");
     fs::write(PROVING_KEY_PATH, &proving_key_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(PROVING_KEY_PATH)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(PROVING_KEY_PATH, perms)?;
+    }
     fs::write(VERIFYING_KEY_PATH, &verifying_key_bytes)?;
+
+    println!("Verifying key integrity from disk...");
+    let disk_pk_bytes = fs::read(PROVING_KEY_PATH)?;
+    let disk_vk_bytes = fs::read(VERIFYING_KEY_PATH)?;
+
+    let mut pk_cursor = &disk_pk_bytes[..];
+    let pk_loaded =
+        ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&mut pk_cursor)?;
+    if !pk_cursor.is_empty() {
+        return Err("Proving key file has unconsumed trailing bytes".into());
+    }
+
+    let mut vk_cursor = &disk_vk_bytes[..];
+    let vk_loaded =
+        ark_groth16::VerifyingKey::<ark_bn254::Bn254>::deserialize_compressed(&mut vk_cursor)?;
+    if !vk_cursor.is_empty() {
+        return Err("Verifying key file has unconsumed trailing bytes".into());
+    }
+
+    if pk_loaded.vk != vk_loaded {
+        return Err("Key integrity check failed: pk.vk != vk".into());
+    }
+    println!("✓ Keys are valid, match, and load cleanly\n");
 
     println!("\n=== Setup Complete! ===");
     println!(
