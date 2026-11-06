@@ -17,15 +17,27 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Error returned when parsing a [`NodeId`] from a string.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum NodeIdParseError {
+    #[error("NodeId cannot be empty")]
+    Empty,
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+}
+
 /// Round-trip with `Display`: the hex form an operator pastes into
 /// a config file decodes back to the same byte vector. Used by the
 /// HA settings (#66) to lift `String` config values into `NodeId`
 /// at node startup.
 impl FromStr for NodeId {
-    type Err = hex::FromHexError;
+    type Err = NodeIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        hex::decode(s).map(NodeId)
+        if s.is_empty() {
+            return Err(NodeIdParseError::Empty);
+        }
+        hex::decode(s).map(NodeId).map_err(Into::into)
     }
 }
 
@@ -110,5 +122,11 @@ mod tests {
     fn nodeid_fromstr_rejects_non_hex_characters() {
         let result: Result<NodeId, _> = "zz".parse();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn nodeid_fromstr_rejects_empty_string() {
+        let result: Result<NodeId, _> = "".parse();
+        assert_eq!(result, Err(NodeIdParseError::Empty));
     }
 }

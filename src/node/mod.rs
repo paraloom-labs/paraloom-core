@@ -1909,13 +1909,17 @@ impl Node {
         if let Some(coordinator) = &self.coordinator {
             let ha = &self.settings.ha;
             if ha.primary.is_some() {
-                let handle = Arc::clone(coordinator)
-                    .start_stall_watchdog(Duration::from_millis(ha.watchdog_interval_ms));
-                *self.ha_watchdog.lock().await = Some(handle);
-                info!(
-                    "HA stall watchdog spawned (interval {}ms, threshold {}ms)",
-                    ha.watchdog_interval_ms, ha.stall_threshold_ms
-                );
+                if ha.watchdog_interval_ms > 0 {
+                    let handle = Arc::clone(coordinator)
+                        .start_stall_watchdog(Duration::from_millis(ha.watchdog_interval_ms));
+                    *self.ha_watchdog.lock().await = Some(handle);
+                    info!(
+                        "HA stall watchdog spawned (interval {}ms, threshold {}ms)",
+                        ha.watchdog_interval_ms, ha.stall_threshold_ms
+                    );
+                } else {
+                    log::warn!("HA watchdog_interval_ms is zero; watchdog not spawned");
+                }
             } else if !ha.standbys.is_empty() {
                 let mut standby_ids = Vec::with_capacity(ha.standbys.len());
                 for hex in &ha.standbys {
@@ -1923,18 +1927,22 @@ impl Node {
                         .map_err(|e| anyhow!("invalid ha.standbys entry {:?}: {}", hex, e))?;
                     standby_ids.push(id);
                 }
-                let primary_id = self.network.local_peer_id();
-                let handle = Arc::clone(coordinator).start_heartbeat_broadcast(
-                    primary_id,
-                    standby_ids,
-                    Duration::from_millis(ha.heartbeat_interval_ms),
-                );
-                *self.ha_broadcast.lock().await = Some(handle);
-                info!(
-                    "HA heartbeat broadcast spawned to {} standbys (interval {}ms)",
-                    ha.standbys.len(),
-                    ha.heartbeat_interval_ms
-                );
+                if ha.heartbeat_interval_ms > 0 {
+                    let primary_id = self.network.local_peer_id();
+                    let handle = Arc::clone(coordinator).start_heartbeat_broadcast(
+                        primary_id,
+                        standby_ids,
+                        Duration::from_millis(ha.heartbeat_interval_ms),
+                    );
+                    *self.ha_broadcast.lock().await = Some(handle);
+                    info!(
+                        "HA heartbeat broadcast spawned to {} standbys (interval {}ms)",
+                        ha.standbys.len(),
+                        ha.heartbeat_interval_ms
+                    );
+                } else {
+                    log::warn!("HA heartbeat_interval_ms is zero; broadcast not spawned");
+                }
             }
         }
 

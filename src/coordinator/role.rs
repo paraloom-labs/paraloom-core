@@ -101,6 +101,23 @@ impl CoordinatorRole {
             None
         }
     }
+
+    /// Transition from `Primary` to `Standby` tracking `primary`.
+    /// Returns true if a transition occurred, false if already `Standby`
+    /// (idempotent on repeated calls, never panics when demoting an already-standby role).
+    pub fn demote(&mut self, primary: NodeId, stall_threshold: Duration, now: Instant) -> bool {
+        match self {
+            CoordinatorRole::Primary => {
+                *self = CoordinatorRole::Standby {
+                    primary,
+                    last_heartbeat_at: now,
+                    stall_threshold,
+                };
+                true
+            }
+            CoordinatorRole::Standby { .. } => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +181,23 @@ mod tests {
         let mut role = CoordinatorRole::Primary;
         role.record_heartbeat(Instant::now());
         assert!(role.is_primary());
+    }
+
+    #[test]
+    fn demote_flips_primary_to_standby() {
+        let now = Instant::now();
+        let mut role = CoordinatorRole::Primary;
+        assert!(role.demote(nodeid(9), Duration::from_secs(30), now));
+        assert!(!role.is_primary());
+        assert_eq!(role.primary(), Some(&nodeid(9)));
+    }
+
+    #[test]
+    fn demote_is_idempotent_on_standby_and_does_not_panic() {
+        let now = Instant::now();
+        let mut role = CoordinatorRole::standby_of(nodeid(9), Duration::from_secs(30), now);
+        assert!(!role.demote(nodeid(10), Duration::from_secs(30), now));
+        assert!(!role.is_primary());
+        assert_eq!(role.primary(), Some(&nodeid(9)));
     }
 }
