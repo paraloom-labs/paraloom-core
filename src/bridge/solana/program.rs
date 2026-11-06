@@ -196,9 +196,19 @@ impl ProgramInterface {
     /// error: the caller uses this to decide whether a retry is pointless, and
     /// an unreachable RPC is exactly when a retry is worth attempting.
     pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
+        // sha256("account:NullifierAccount")[..8].
+        const NULLIFIER_ACCOUNT_DISC: [u8; 8] = [250, 31, 238, 177, 213, 98, 48, 172];
+        // 8-byte Anchor discriminator + 32-byte nullifier + 8-byte used_at + 8-byte withdrawal_id.
+        const NULLIFIER_ACCOUNT_MIN_LEN: usize = 8 + 32 + 8 + 8;
+
         let (pda, _) = Pubkey::find_program_address(&[b"nullifier", nullifier], &self.program_id);
         match self.rpc.get_account(&pda).await {
-            Ok(account) => account.owner == self.program_id,
+            Ok(account) => {
+                account.owner == self.program_id
+                    && account.data.len() >= NULLIFIER_ACCOUNT_MIN_LEN
+                    && account.data[0..8] == NULLIFIER_ACCOUNT_DISC
+                    && account.data[8..40] == *nullifier
+            }
             Err(_) => false,
         }
     }
@@ -481,5 +491,53 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn is_nullifier_spent_validates_discriminator_length_and_payload() {
+        let nf = [0x42u8; 32];
+        let program_id = "11111111111111111111111111111111"
+            .parse::<Pubkey>()
+            .unwrap();
+
+        // 1. Valid 56-byte NullifierAccount owned by program_id -> true
+        let mut valid_data = vec![250, 31, 238, 177, 213, 98, 48, 172];
+        valid_data.extend_from_slice(&nf);
+        valid_data.extend_from_slice(&123i64.to_le_bytes());
+        valid_data.extend_from_slice(&1u64.to_le_bytes());
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data.clone(),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(program_with_mock(mock).is_nullifier_spent(&nf).await);
+
+        // 2. Empty / truncated account owned by program_id -> false
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: vec![],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program_with_mock(mock).is_nullifier_spent(&nf).await);
+
+        // 3. Wrong discriminator -> false
+        let mut bad_disc = valid_data.clone();
+        bad_disc[0] ^= 0xff;
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: bad_disc,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program_with_mock(mock).is_nullifier_spent(&nf).await);
     }
 }
