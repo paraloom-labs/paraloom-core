@@ -149,9 +149,6 @@ impl ComputeCircuit {
         owner_address: [u8; 32],
         spending_key: [u8; 32],
     ) -> Self {
-        assert!(input_data.len() <= MAX_DATA_SIZE, "Input data too large");
-        assert!(output_data.len() <= MAX_DATA_SIZE, "Output data too large");
-
         Self {
             code_hash: Some(code_hash),
             input_commitment: Some(input_commitment),
@@ -395,6 +392,52 @@ mod tests {
         assert_eq!(circuit.input_data.unwrap(), vec![1, 2, 3, 4]);
         assert!(circuit.input_nullifier.is_some());
         assert!(circuit.owner_address.is_some());
+    }
+
+    #[test]
+    fn test_circuit_with_witness_large_payload() {
+        let code_hash = [1u8; 32];
+        let input_data = vec![0xAB; 2048]; // >1KiB payload
+        let output_data = vec![0xCD; 4096]; // >1KiB payload
+        let input_randomness = [42u8; 32];
+        let output_randomness = [99u8; 32];
+        let owner_address = [7u8; 32];
+        let spending_key = [8u8; 32];
+
+        let input_hash = ComputeCircuit::hash_data_to_field(&input_data);
+        let output_hash = ComputeCircuit::hash_data_to_field(&output_data);
+        let input_commitment =
+            ComputeCircuit::compute_commitment(input_hash, &input_randomness, &owner_address);
+        let output_commitment =
+            ComputeCircuit::compute_commitment(output_hash, &output_randomness, &owner_address);
+        let input_nullifier = ComputeCircuit::compute_nullifier(input_commitment, &spending_key);
+
+        let circuit = ComputeCircuit::with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            input_data.clone(),
+            input_randomness,
+            output_data.clone(),
+            output_randomness,
+            owner_address,
+            spending_key,
+        );
+
+        assert_eq!(circuit.input_data.as_ref().unwrap().len(), 2048);
+        assert_eq!(circuit.output_data.as_ref().unwrap().len(), 4096);
+
+        // Verify constraint synthesis works with large payloads
+        use ark_relations::r1cs::ConstraintSystem;
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        circuit
+            .generate_constraints(cs.clone())
+            .expect("constraint synthesis with >1KiB payloads");
+        assert!(
+            cs.is_satisfied().expect("cs query"),
+            "circuit must be satisfied with >1KiB payloads"
+        );
     }
 
     /// Cross-circuit consistency: the in-circuit Poseidon commitment

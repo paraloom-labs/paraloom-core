@@ -119,7 +119,7 @@ impl ComputeJob {
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         Self {
@@ -153,7 +153,7 @@ impl ComputeJob {
         self.completed_at = Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64,
         );
     }
@@ -164,7 +164,7 @@ impl ComputeJob {
         self.completed_at = Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64,
         );
     }
@@ -175,7 +175,7 @@ impl ComputeJob {
         self.completed_at = Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis() as u64,
         );
     }

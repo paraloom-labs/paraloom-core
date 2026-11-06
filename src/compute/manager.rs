@@ -70,7 +70,7 @@ impl ValidatorCapacity {
     /// Check if validator is alive (heartbeat within last 30 seconds)
     pub fn is_alive(&self) -> bool {
         let now = current_timestamp();
-        now - self.last_heartbeat < 30_000 // 30 seconds
+        now.saturating_sub(self.last_heartbeat) < 30_000 // 30 seconds
     }
 }
 
@@ -323,7 +323,7 @@ impl JobManager {
         let mut removed = 0;
 
         validators.retain(|id, v| {
-            let age = now - v.last_heartbeat;
+            let age = now.saturating_sub(v.last_heartbeat);
             if age > 60_000 {
                 // 60 seconds
                 warn!(
@@ -362,7 +362,7 @@ pub struct ManagerStats {
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64
 }
 
