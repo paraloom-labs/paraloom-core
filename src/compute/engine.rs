@@ -158,10 +158,28 @@ impl WasmEngine {
 
         // Write input data to WASM memory (starting at offset 0)
         let input_ptr = 0i32;
-        let input_len = job.input_data.len() as i32;
+        let input_len = match i32::try_from(job.input_data.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!(
+                        "Input data size ({} bytes) exceeds maximum supported i32 length",
+                        job.input_data.len()
+                    ),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
+        };
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("Failed to write input data to WASM memory: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
@@ -391,5 +409,10 @@ mod tests {
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn test_oversized_input_len_rejects_wrapping() {
+        assert!(i32::try_from((i32::MAX as usize) + 1).is_err());
     }
 }
