@@ -114,6 +114,13 @@ impl HealthServerState {
         self.ready.load(Ordering::Acquire)
     }
 
+    /// Returns true if the node is considered ready to serve traffic
+    /// (startup complete AND peer count meets the configured threshold),
+    /// matching the condition under which `/ready` returns 200 OK.
+    pub fn is_ready_for_traffic(&self) -> bool {
+        self.is_ready() && self.current_peer_count() >= self.min_peers_for_ready
+    }
+
     fn current_peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Relaxed)
     }
@@ -192,7 +199,7 @@ async fn readiness_handler(Extension(state): Extension<HealthServerState>) -> im
 async fn metrics_handler(Extension(state): Extension<HealthServerState>) -> impl IntoResponse {
     let uptime = state.uptime_seconds();
     let peers = state.current_peer_count();
-    let ready = if state.is_ready() { 1u8 } else { 0 };
+    let ready = if state.is_ready_for_traffic() { 1u8 } else { 0 };
     let body = format!(
         "# HELP paraloom_uptime_seconds Process uptime in seconds.\n\
          # TYPE paraloom_uptime_seconds gauge\n\
@@ -422,5 +429,72 @@ mod tests {
         assert!(!state.is_ready());
         assert_eq!(state.current_peer_count(), 0);
         assert_eq!(state.min_peers_for_ready, DEFAULT_MIN_PEERS_FOR_READY);
+    }
+
+    /// When `mark_ready` has been called but peer count is below threshold,
+    /// `/ready` returns 503 and `/metrics` reports `paraloom_ready 0` (#1430).
+    #[tokio::test]
+    async fn metrics_reports_zero_when_peers_below_threshold() {
+        let state = HealthServerState::new().with_min_peers(5);
+        state.mark_ready();
+        state.set_peer_count(2);
+
+        // /ready is 503
+        let ready_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // /metrics reports paraloom_ready 0
+        let metrics_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_resp.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(metrics_resp.into_body())
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("paraloom_ready 0"));
+
+        // When peers reach threshold, /ready is 200 and /metrics reports paraloom_ready 1
+        state.set_peer_count(5);
+        let ready_resp2 = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_resp2.status(), StatusCode::OK);
+
+        let metrics_resp2 = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_resp2.status(), StatusCode::OK);
+        let body2 = hyper::body::to_bytes(metrics_resp2.into_body())
+            .await
+            .unwrap();
+        let text2 = std::str::from_utf8(&body2).unwrap();
+        assert!(text2.contains("paraloom_ready 1"));
     }
 }

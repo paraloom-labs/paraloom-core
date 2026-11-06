@@ -92,6 +92,9 @@ impl GcpConfidentialSpaceVerifier {
 
 impl AttestationVerifier for GcpConfidentialSpaceVerifier {
     fn verify(&self, attestation: &[u8], channel_pubkey: &[u8; 32]) -> bool {
+        if channel_pubkey == &[0u8; 32] {
+            return false;
+        }
         let Ok(token) = std::str::from_utf8(attestation) else {
             return false;
         };
@@ -239,6 +242,12 @@ mod tests {
         let token = signed_token(|_| {});
         // Same token, but checked against a different channel key.
         assert!(!verifier(true).verify(token.as_bytes(), &[9u8; 32]));
+    }
+
+    #[test]
+    fn rejects_a_zero_channel_key() {
+        let token = signed_token(|_| {});
+        assert!(!verifier(true).verify(token.as_bytes(), &[0u8; 32]));
     }
 
     #[test]

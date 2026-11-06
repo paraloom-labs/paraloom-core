@@ -95,6 +95,13 @@ async fn infer(
 /// `nonce_hex` (the channel public key) into it. Falls back to
 /// `TEE_ATTESTATION_TOKEN` for local development.
 async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
+    if nonce_hex.len() != 64
+        || nonce_hex.chars().all(|c| c == '0')
+        || hex::decode(nonce_hex).is_err()
+    {
+        return Err(anyhow!("invalid channel public key nonce: {nonce_hex}"));
+    }
+
     if let Ok(token) = std::env::var("TEE_ATTESTATION_TOKEN") {
         return Ok(token.into_bytes());
     }
@@ -129,11 +136,24 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
     }
 
     let resp = String::from_utf8_lossy(&resp);
-    let token = resp
+    let (headers, body) = resp
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| anyhow!("attestation response had no token body"))?;
+        .ok_or_else(|| anyhow!("attestation response had no header/body delimiter"))?;
+
+    let status_line = headers.lines().next().unwrap_or("");
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or("");
+    let status_code: u16 = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+    if !version.starts_with("HTTP/") || !(200..=299).contains(&status_code) {
+        return Err(anyhow!(
+            "attestation service returned HTTP error: {status_line}"
+        ));
+    }
+
+    let token = body.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("attestation response had no token body"));
+    }
     Ok(token.into_bytes())
 }
 
@@ -152,6 +172,9 @@ async fn main() -> Result<()> {
 
     // Fresh channel per enclave session; its public key is bound into the token.
     let channel = EnclaveChannel::generate();
+    if channel.public_key() == [0u8; 32] {
+        return Err(anyhow!("generated channel public key cannot be zero"));
+    }
     let nonce_hex = hex::encode(channel.public_key());
     let attestation = fetch_attestation(&nonce_hex, &audience).await?;
     let attested_key = AttestedChannelKey {
