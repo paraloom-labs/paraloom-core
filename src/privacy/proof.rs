@@ -215,10 +215,20 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadErr
         }
     };
 
-    VerifyingKey::<Bn254>::deserialize_compressed(&bytes[..]).map_err(|e| KeyLoadError::Malformed {
-        path: path.to_path_buf(),
-        source: e,
-    })
+    let mut cursor = std::io::Cursor::new(&bytes);
+    let key = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor).map_err(|e| {
+        KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: ark_serialize::SerializationError::InvalidData,
+        });
+    }
+    Ok(key)
 }
 
 /// ZK Proof verifier interface

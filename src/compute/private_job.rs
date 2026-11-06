@@ -39,7 +39,7 @@ use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::compute::{ComputeJob, JobId, JobResult, ResourceLimits};
+use crate::compute::{ComputeJob, JobId, JobResult, JobStatus, ResourceLimits};
 use crate::privacy::{Commitment, EncryptedNote, Note, ShieldedAddress, ShieldedPool};
 
 /// A private compute job with hidden input/output
@@ -114,11 +114,13 @@ impl PrivateComputeJob {
 
     /// Convert to standard compute job (for execution)
     pub fn to_compute_job(&self) -> ComputeJob {
-        ComputeJob::new(
+        let mut job = ComputeJob::new(
             self.wasm_code.clone(),
             self.encrypted_input.clone(),
             self.limits.clone(),
-        )
+        );
+        job.id = self.job_id.clone();
+        job
     }
 
     /// Hash data to u64 (for commitment)
@@ -197,6 +199,27 @@ impl PrivateJobResult {
         result: JobResult,
         owner_address: &ShieldedAddress,
     ) -> Result<Self> {
+        match &result.status {
+            JobStatus::Completed => {}
+            JobStatus::Failed { error } => {
+                return Err(anyhow!(
+                    "Cannot create private job result from failed job: {}",
+                    error
+                ));
+            }
+            JobStatus::TimedOut => {
+                return Err(anyhow!(
+                    "Cannot create private job result from timed out job"
+                ));
+            }
+            status => {
+                return Err(anyhow!(
+                    "Cannot create private job result from incomplete job with status: {:?}",
+                    status
+                ));
+            }
+        }
+
         let output_data = result
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
@@ -246,26 +269,54 @@ impl PrivateJobResult {
 
     /// Load compute proving key from disk
     fn load_proving_key() -> Result<ark_groth16::ProvingKey<ark_bn254::Bn254>> {
-        use ark_serialize::CanonicalDeserialize;
-        use std::fs;
-
-        let pk_bytes = fs::read("keys/compute_proving.key")
-            .map_err(|e| anyhow!("Failed to read proving key: {}", e))?;
-
-        ark_groth16::ProvingKey::deserialize_compressed(&pk_bytes[..])
-            .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))
+        Self::load_proving_key_from_path("keys/compute_proving.key")
     }
 
     /// Load compute verifying key from disk
     fn load_verifying_key() -> Result<ark_groth16::VerifyingKey<ark_bn254::Bn254>> {
+        Self::load_verifying_key_from_path("keys/compute_verifying.key")
+    }
+
+    fn load_proving_key_from_path(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ark_groth16::ProvingKey<ark_bn254::Bn254>> {
         use ark_serialize::CanonicalDeserialize;
         use std::fs;
 
-        let vk_bytes = fs::read("keys/compute_verifying.key")
-            .map_err(|e| anyhow!("Failed to read verifying key: {}", e))?;
+        let path = path.as_ref();
+        let pk_bytes = fs::read(path)
+            .map_err(|e| anyhow!("Failed to read proving key from {:?}: {}", path, e))?;
 
-        ark_groth16::VerifyingKey::deserialize_compressed(&vk_bytes[..])
-            .map_err(|e| anyhow!("Failed to deserialize verifying key: {}", e))
+        let mut cursor = std::io::Cursor::new(&pk_bytes);
+        let pk = ark_groth16::ProvingKey::deserialize_compressed(&mut cursor)
+            .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))?;
+
+        if cursor.position() as usize != pk_bytes.len() {
+            return Err(anyhow!("Trailing bytes in proving key"));
+        }
+
+        Ok(pk)
+    }
+
+    fn load_verifying_key_from_path(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<ark_groth16::VerifyingKey<ark_bn254::Bn254>> {
+        use ark_serialize::CanonicalDeserialize;
+        use std::fs;
+
+        let path = path.as_ref();
+        let vk_bytes = fs::read(path)
+            .map_err(|e| anyhow!("Failed to read verifying key from {:?}: {}", path, e))?;
+
+        let mut cursor = std::io::Cursor::new(&vk_bytes);
+        let vk = ark_groth16::VerifyingKey::deserialize_compressed(&mut cursor)
+            .map_err(|e| anyhow!("Failed to deserialize verifying key: {}", e))?;
+
+        if cursor.position() as usize != vk_bytes.len() {
+            return Err(anyhow!("Trailing bytes in verifying key"));
+        }
+
+        Ok(vk)
     }
 
     /// Generate zkSNARK execution proof
@@ -1077,5 +1128,107 @@ mod tests {
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
         );
+    }
+
+    #[test]
+    fn test_to_compute_job_preserves_job_id() {
+        let (owner_address, _) = owner_keypair();
+        let wasm_code = vec![0x00, 0x61, 0x73, 0x6d];
+        let input_data = vec![1, 2, 3, 4];
+        let limits = ResourceLimits::default();
+
+        let private_job =
+            PrivateComputeJob::new(wasm_code, input_data, owner_address, limits).unwrap();
+        let compute_job = private_job.to_compute_job();
+
+        assert_eq!(compute_job.id, private_job.job_id);
+    }
+
+    #[test]
+    fn test_from_job_result_rejects_failed_and_timed_out_jobs() {
+        let (owner_address, _) = owner_keypair();
+
+        let failed_result = JobResult {
+            job_id: "job-failed".to_string(),
+            status: JobStatus::Failed {
+                error: "execution error".to_string(),
+            },
+            output_data: Some(vec![1, 2, 3]),
+            error: Some("execution error".to_string()),
+            execution_time_ms: 50,
+            memory_used_bytes: 512,
+            instructions_executed: 1000,
+        };
+        let res = PrivateJobResult::from_job_result(
+            "job-failed".to_string(),
+            failed_result,
+            &owner_address,
+        );
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("failed job"));
+
+        let timed_out_result = JobResult {
+            job_id: "job-timeout".to_string(),
+            status: JobStatus::TimedOut,
+            output_data: Some(vec![1, 2, 3]),
+            error: None,
+            execution_time_ms: 30000,
+            memory_used_bytes: 512,
+            instructions_executed: 100000,
+        };
+        let res = PrivateJobResult::from_job_result(
+            "job-timeout".to_string(),
+            timed_out_result,
+            &owner_address,
+        );
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("timed out"));
+
+        let running_result = JobResult {
+            job_id: "job-running".to_string(),
+            status: JobStatus::Running,
+            output_data: Some(vec![1, 2, 3]),
+            error: None,
+            execution_time_ms: 10,
+            memory_used_bytes: 512,
+            instructions_executed: 500,
+        };
+        let res = PrivateJobResult::from_job_result(
+            "job-running".to_string(),
+            running_result,
+            &owner_address,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_load_keys_rejects_trailing_bytes() {
+        use ark_bn254::Bn254;
+        use ark_groth16::VerifyingKey;
+        use ark_serialize::CanonicalSerialize;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_keys_trailing_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let vk_path = temp_dir.join("test.vk");
+
+        let vk = VerifyingKey::<Bn254>::default();
+        let mut bytes = Vec::new();
+        vk.serialize_compressed(&mut bytes).unwrap();
+
+        // Valid key loads cleanly
+        std::fs::write(&vk_path, &bytes).unwrap();
+        let loaded = PrivateJobResult::load_verifying_key_from_path(&vk_path);
+        assert!(loaded.is_ok());
+
+        // Appending trailing bytes is rejected
+        let mut tampered = bytes.clone();
+        tampered.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        std::fs::write(&vk_path, &tampered).unwrap();
+        let loaded = PrivateJobResult::load_verifying_key_from_path(&vk_path);
+        assert!(loaded.is_err());
+        assert!(loaded.unwrap_err().to_string().contains("Trailing bytes"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
