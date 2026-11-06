@@ -94,7 +94,8 @@ fn g1(p: &G1Json, what: &str) -> Res<G1Affine> {
     if z != Fq::ONE {
         return Err(format!("{}: expected z of 0 or 1, got {}", what, p[2]).into());
     }
-    check_g1(G1Affine::new_unchecked(fq(&p[0])?, fq(&p[1])?), what)
+    let point = G1Affine::new_unchecked(fq(&p[0])?, fq(&p[1])?);
+    check_g1(point, what)
 }
 
 fn g2(p: &G2Json, what: &str) -> Res<G2Affine> {
