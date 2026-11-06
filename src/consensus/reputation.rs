@@ -103,25 +103,29 @@ impl ValidatorMetrics {
 
     /// Apply reputation decay based on inactivity
     pub fn apply_decay(&mut self) {
-        let days_inactive = self.days_inactive();
+        let days_inactive = self.days_inactive().min(3650);
         if days_inactive == 0 {
             return;
         }
 
+        let old_reputation = self.reputation;
         // Decay formula: reputation * (1 - decay_rate)^days
         // decay_rate = REPUTATION_DECAY_PER_DAY / 10000 (basis points to percentage)
         let decay_rate = REPUTATION_DECAY_PER_DAY as f64 / 10000.0;
         let multiplier = (1.0 - decay_rate).powi(days_inactive as i32);
 
-        let new_reputation = (self.reputation as f64 * multiplier) as u64;
-        self.reputation = new_reputation.max(MIN_REPUTATION);
+        let new_reputation = (old_reputation as f64 * multiplier) as u64;
+        self.reputation = new_reputation.clamp(MIN_REPUTATION, MAX_REPUTATION);
+        self.last_active = self
+            .last_active
+            .saturating_add(days_inactive * SECONDS_PER_DAY);
 
         log::debug!(
             "Applied {} days decay to {:?}: {} -> {}",
             days_inactive,
             self.node_id,
-            self.reputation,
-            new_reputation
+            old_reputation,
+            self.reputation
         );
     }
 
@@ -186,6 +190,14 @@ impl ReputationTracker {
         let Some(path) = &self.persist_path else {
             return;
         };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!(
+                    "failed to create parent dir for reputation {}: {e}",
+                    parent.display()
+                );
+            }
+        }
         let list: Vec<&ValidatorMetrics> = metrics.values().collect();
         match serde_json::to_vec(&list) {
             Ok(bytes) => {
@@ -325,6 +337,10 @@ impl ReputationTracker {
             if validator.reputation != old_reputation {
                 count += 1;
             }
+        }
+
+        if count > 0 {
+            self.persist_locked(&metrics);
         }
 
         log::debug!("Applied decay to {} validators", count);
@@ -598,5 +614,51 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+
+        // Immediate subsequent call should not decay again since last_active was advanced
+        let decayed_rep = metrics.reputation;
+        metrics.apply_decay();
+        assert_eq!(metrics.reputation, decayed_rep);
+    }
+
+    #[test]
+    fn test_decay_extreme_inactivity_clamps_safely() {
+        let mut metrics = ValidatorMetrics::new(NodeId(vec![2]));
+        // Corrupted or ancient timestamp (e.g. 0)
+        metrics.last_active = 0;
+        metrics.apply_decay();
+        assert_eq!(metrics.reputation, MIN_REPUTATION);
+    }
+
+    #[tokio::test]
+    async fn test_persistence_creates_parent_directories_and_persists_decay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist_path = tmp
+            .path()
+            .join("nested")
+            .join("dirs")
+            .join("reputation.json");
+        let tracker = ReputationTracker::with_persistence(persist_path.clone());
+
+        let node_id = NodeId(vec![7]);
+        tracker.register_validator(node_id.clone()).await;
+
+        // Verify parent directory was created and file written
+        assert!(persist_path.exists());
+
+        // Simulate 5 days inactive
+        {
+            let mut metrics = tracker.metrics.write().await;
+            let m = metrics.get_mut(&node_id).unwrap();
+            m.last_active -= 5 * SECONDS_PER_DAY;
+        }
+
+        let decayed = tracker.apply_decay_all().await;
+        assert_eq!(decayed, 1);
+
+        // Verify the persisted file on disk has decayed score
+        let reloaded = ReputationTracker::load_snapshot(&persist_path).unwrap();
+        let reloaded_metrics = reloaded.get(&node_id).unwrap();
+        assert!(reloaded_metrics.reputation < BASE_REPUTATION);
     }
 }

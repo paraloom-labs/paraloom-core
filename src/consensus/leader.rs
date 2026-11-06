@@ -66,7 +66,12 @@ impl ValidatorInfo {
         // - 10 SOL stake + 1000 reputation = 10 * 1.0 = 10 weight
         // - 10 SOL stake + 5000 reputation = 10 * 5.0 = 50 weight
         // - 100 SOL stake + 1000 reputation = 100 * 1.0 = 100 weight
-        stake * reputation / 1000
+        let raw = stake * reputation / 1000;
+        if self.stake_amount > 0 && self.reputation > 0 {
+            raw.max(1)
+        } else {
+            raw
+        }
     }
 }
 
@@ -491,5 +496,20 @@ mod tests {
         selector.unregister_validator(&NodeId(vec![1]));
 
         assert_eq!(selector.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn test_selection_weight_sub_1000_reputation_retains_min_weight() {
+        // Stake of 1 lamport with 500 reputation produces (1 * 500) / 1000 = 0.
+        // It should be bumped to at least weight 1 to prevent zero-weight division/selection failures.
+        let v = ValidatorInfo::new(NodeId(vec![42]), 1, 500);
+        assert_eq!(v.selection_weight(), 1);
+
+        // Zero stake or zero reputation should still be 0
+        let zero_stake = ValidatorInfo::new(NodeId(vec![43]), 0, 1000);
+        assert_eq!(zero_stake.selection_weight(), 0);
+
+        let zero_rep = ValidatorInfo::new(NodeId(vec![44]), 1_000_000, 0);
+        assert_eq!(zero_rep.selection_weight(), 0);
     }
 }
