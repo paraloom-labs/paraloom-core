@@ -34,12 +34,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting to Solana...");
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
-    // Check authority balance
+    // Check authority balance (121-byte BridgeState rent ~1.733M lamports + tx fee)
     let balance = client.get_balance(&authority.pubkey())?;
     println!("Authority Balance: {} SOL\n", balance as f64 / 1e9);
 
-    if balance < 1_000_000 {
-        return Err("Insufficient balance. Need at least 0.001 SOL".into());
+    if balance < 2_500_000 {
+        return Err(
+            "Insufficient balance. Need at least 0.0025 SOL for BridgeState rent and fees".into(),
+        );
+    }
+
+    let (bridge_state, bump) = derive_bridge_state(&program_id);
+    if let Ok(acc) = client.get_account(&bridge_state) {
+        if acc.owner == program_id && !acc.data.is_empty() {
+            println!("Bridge state already initialized at {bridge_state} (bump {bump})!");
+            return Ok(());
+        }
     }
 
     // Create initialize instruction with initial merkle root.
