@@ -114,6 +114,16 @@ impl Codec for HeartbeatCodec {
     {
         let data =
             bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_HEARTBEAT_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "heartbeat request payload size {} exceeds maximum {}",
+                    data.len(),
+                    MAX_HEARTBEAT_PAYLOAD_BYTES
+                ),
+            ));
+        }
         io.write_all(&data).await?;
         io.close().await
     }
@@ -129,6 +139,16 @@ impl Codec for HeartbeatCodec {
     {
         let data =
             bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_HEARTBEAT_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "heartbeat response payload size {} exceeds maximum {}",
+                    data.len(),
+                    MAX_HEARTBEAT_PAYLOAD_BYTES
+                ),
+            ));
+        }
         io.write_all(&data).await?;
         io.close().await
     }
@@ -200,5 +220,21 @@ mod tests {
             decoded.last_applied_sequence,
             response.last_applied_sequence
         );
+    }
+
+    #[tokio::test]
+    async fn write_request_rejects_payload_over_limit() {
+        let mut codec = HeartbeatCodec;
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let request = HeartbeatRequest {
+            primary: NodeId(vec![0xAA; MAX_HEARTBEAT_PAYLOAD_BYTES + 1]),
+            sequence: 1,
+            snapshot: CoordinatorSnapshot::default(),
+        };
+        let err = codec
+            .write_request(&HEARTBEAT_PROTOCOL, &mut cursor, request)
+            .await
+            .expect_err("over limit must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

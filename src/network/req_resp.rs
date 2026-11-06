@@ -110,6 +110,16 @@ impl Codec for ResultCodec {
     {
         let data =
             bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_RESULT_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "result request payload size {} exceeds maximum {}",
+                    data.len(),
+                    MAX_RESULT_PAYLOAD_BYTES
+                ),
+            ));
+        }
         io.write_all(&data).await?;
         io.close().await
     }
@@ -125,6 +135,16 @@ impl Codec for ResultCodec {
     {
         let data =
             bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_RESULT_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "result response payload size {} exceeds maximum {}",
+                    data.len(),
+                    MAX_RESULT_PAYLOAD_BYTES
+                ),
+            ));
+        }
         io.write_all(&data).await?;
         io.close().await
     }
@@ -192,5 +212,20 @@ mod tests {
             .await
             .expect("empty input is OK");
         assert!(read.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_rejects_payload_over_limit() {
+        let mut codec = ResultCodec;
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let res = ResultResponse {
+            success: true,
+            message: "x".repeat(MAX_RESULT_PAYLOAD_BYTES + 1),
+        };
+        let err = codec
+            .write_response(&RESULT_PROTOCOL, &mut cursor, res)
+            .await
+            .expect_err("over limit must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
