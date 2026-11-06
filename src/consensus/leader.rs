@@ -60,13 +60,18 @@ impl ValidatorInfo {
         let stake = self.stake_amount as u128;
         let reputation = self.reputation as u128;
 
+        if stake == 0 || reputation == 0 {
+            return 0;
+        }
+
         // Weight formula: stake * (reputation / 1000)
         // Reputation range: 0-10000 (base 1000, max 10x multiplier)
         // Example:
         // - 10 SOL stake + 1000 reputation = 10 * 1.0 = 10 weight
         // - 10 SOL stake + 5000 reputation = 10 * 5.0 = 50 weight
         // - 100 SOL stake + 1000 reputation = 100 * 1.0 = 100 weight
-        stake * reputation / 1000
+        // Ensure active validators with non-zero stake and reputation do not truncate to 0.
+        std::cmp::max(1, stake * reputation / 1000)
     }
 }
 
@@ -345,6 +350,17 @@ mod tests {
         let mut v5 = ValidatorInfo::new(NodeId(vec![5]), 100_000_000_000, 5000);
         v5.is_active = false;
         assert_eq!(v5.selection_weight(), 0);
+
+        // Sub-1000 reputation does not truncate to 0 when active with non-zero stake
+        let v6 = ValidatorInfo::new(NodeId(vec![6]), 1, 500);
+        assert_eq!(v6.selection_weight(), 1);
+
+        let v7 = ValidatorInfo::new(NodeId(vec![7]), 1, 100);
+        assert_eq!(v7.selection_weight(), 1);
+
+        // Zero stake yields zero weight
+        let v8 = ValidatorInfo::new(NodeId(vec![8]), 0, 5000);
+        assert_eq!(v8.selection_weight(), 0);
     }
 
     #[test]
