@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use paraloom::ceremony::{hash_contribution, read_pk, read_transcript, verify_phase2_transcript};
+use paraloom::ceremony::{
+    hash_contribution, read_pk, read_transcript, verify_phase2_transcript, TRANSCRIPT_VERSION,
+};
 use sha2::{Digest, Sha512};
 
 #[derive(Parser, Debug)]
@@ -55,6 +57,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if transcript.version != TRANSCRIPT_VERSION {
+        eprintln!(
+            "transcript verification FAILED: unsupported transcript version {} (expected {})",
+            transcript.version, TRANSCRIPT_VERSION
+        );
+        return ExitCode::FAILURE;
+    }
+    if transcript.is_empty() {
+        eprintln!("transcript verification FAILED: transcript has 0 contributions");
+        return ExitCode::FAILURE;
+    }
 
     // Bind the key on disk to the one the transcript was built against,
     // the same digest `paraloom_ceremony_finalize` pins. Without this the

@@ -152,6 +152,27 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if transcript.final_srs_hash != [0u8; 64] {
+        let ceremony_pk_file_hash: [u8; 64] = match std::fs::read(&args.ceremony_pk) {
+            Ok(bytes) => {
+                let digest = Sha512::digest(&bytes);
+                let mut out = [0u8; 64];
+                out.copy_from_slice(&digest[..]);
+                out
+            }
+            Err(e) => {
+                eprintln!("failed to re-read ceremony PK for hashing: {}", e);
+                return ExitCode::from(2);
+            }
+        };
+        if ceremony_pk_file_hash != transcript.final_srs_hash {
+            eprintln!(
+                "ceremony PK file hash does not match transcript.final_srs_hash, refusing to write"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     if let Err(e) = verify_phase2_transcript(&initial_pk, &transcript) {
         eprintln!("transcript verification FAILED, refusing to write: {}", e);
         return ExitCode::FAILURE;

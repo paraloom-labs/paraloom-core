@@ -38,7 +38,9 @@
 use ark_bn254::Bn254;
 use ark_groth16::ProvingKey;
 
-use super::transcript::{hash_contribution, Phase2Transcript, TranscriptHash};
+use super::transcript::{
+    hash_contribution, Phase2Transcript, TranscriptHash, TRANSCRIPT_VERSION,
+};
 
 /// Operator-supplied requirements a transcript must meet before
 /// finalize will promote it to production keys.
@@ -62,6 +64,9 @@ pub struct FinalizePolicy {
 /// Errors surfaced by [`enforce_finalize_policy`].
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
+    #[error("unsupported transcript version {got} (expected {expected})")]
+    UnsupportedVersion { got: u32, expected: u32 },
+
     #[error("transcript has no contributions; an empty ceremony must not be finalized")]
     EmptyTranscript,
 
@@ -107,6 +112,12 @@ pub fn enforce_finalize_policy(
     final_pk: &ProvingKey<Bn254>,
     transcript: &Phase2Transcript,
 ) -> Result<(), PolicyError> {
+    if transcript.version != TRANSCRIPT_VERSION {
+        return Err(PolicyError::UnsupportedVersion {
+            got: transcript.version,
+            expected: TRANSCRIPT_VERSION,
+        });
+    }
     if transcript.is_empty() {
         return Err(PolicyError::EmptyTranscript);
     }
@@ -299,5 +310,17 @@ mod tests {
         let tail = hash_contribution(t.contributions.last().unwrap());
         enforce_finalize_policy(&policy(4, Some(tail)), &PINNED, &initial, &final_pk, &t)
             .expect("exact-count policy with the true tail pin passes");
+    }
+
+    #[test]
+    fn unsupported_transcript_version_is_rejected() {
+        let initial = pk_from_seed(1);
+        let final_pk = pk_from_seed(2);
+        let mut t = dummy_transcript(PINNED, 2);
+        t.version = TRANSCRIPT_VERSION + 1;
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::UnsupportedVersion { .. }) => {}
+            other => panic!("expected UnsupportedVersion, got {:?}", other),
+        }
     }
 }
