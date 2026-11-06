@@ -70,7 +70,7 @@ impl ValidatorCapacity {
     /// Check if validator is alive (heartbeat within last 30 seconds)
     pub fn is_alive(&self) -> bool {
         let now = current_timestamp();
-        now - self.last_heartbeat < 30_000 // 30 seconds
+        now.saturating_sub(self.last_heartbeat) < 30_000 // 30 seconds
     }
 }
 
@@ -116,7 +116,7 @@ impl JobManager {
     }
 
     /// Register a validator with the manager
-    pub fn register_validator(&self, capacity: ValidatorCapacity) -> Result<()> {
+    pub fn register_validator(&self, mut capacity: ValidatorCapacity) -> Result<()> {
         let validator_id = capacity.validator_id.clone();
 
         info!(
@@ -125,6 +125,9 @@ impl JobManager {
         );
 
         let mut validators = self.validators.lock().unwrap();
+        if let Some(existing) = validators.get(&validator_id) {
+            capacity.active_jobs = existing.active_jobs;
+        }
         validators.insert(validator_id, capacity);
 
         Ok(())
@@ -243,9 +246,9 @@ impl JobManager {
             job_id, result.status
         );
 
-        // Update validator active jobs
-        let assignments = self.assignments.lock().unwrap();
-        if let Some(assignment) = assignments.get(&job_id) {
+        // Update validator active jobs and remove completed assignment
+        let mut assignments = self.assignments.lock().unwrap();
+        if let Some(assignment) = assignments.remove(&job_id) {
             let mut validators = self.validators.lock().unwrap();
             if let Some(validator) = validators.get_mut(&assignment.validator_id) {
                 validator.active_jobs = validator.active_jobs.saturating_sub(1);
@@ -323,7 +326,7 @@ impl JobManager {
         let mut removed = 0;
 
         validators.retain(|id, v| {
-            let age = now - v.last_heartbeat;
+            let age = now.saturating_sub(v.last_heartbeat);
             if age > 60_000 {
                 // 60 seconds
                 warn!(
@@ -483,5 +486,36 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_future_heartbeat_does_not_underflow_and_duplicate_result_is_idempotent() {
+        let manager = JobManager::new();
+        let mut cap = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        cap.last_heartbeat = current_timestamp() + 10_000;
+        assert!(cap.is_alive());
+
+        manager.register_validator(cap).unwrap();
+        assert_eq!(manager.cleanup_stale_validators(), 0);
+
+        let job1 = ComputeJob::new(vec![1], vec![], ResourceLimits::default());
+        let job2 = ComputeJob::new(vec![2], vec![], ResourceLimits::default());
+        let id1 = job1.id.clone();
+        manager.submit_job(job1).unwrap();
+        manager.submit_job(job2).unwrap();
+        assert_eq!(manager.assign_jobs().unwrap().len(), 2);
+        assert_eq!(manager.get_stats().active_jobs, 2);
+
+        // Re-registering preserves active_jobs.
+        manager
+            .register_validator(ValidatorCapacity::new("v1".to_string(), 8, 16384, 4))
+            .unwrap();
+        assert_eq!(manager.get_stats().active_jobs, 2);
+
+        // Submitting the same result twice only decrements active_jobs once.
+        let res1 = JobResult::success(id1.clone(), vec![], 10, 100, 100);
+        manager.submit_result(res1.clone()).unwrap();
+        manager.submit_result(res1).unwrap();
+        assert_eq!(manager.get_stats().active_jobs, 1);
     }
 }
