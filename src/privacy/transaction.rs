@@ -98,12 +98,17 @@ impl DepositTx {
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
+        let output_note = Note::new(
+            recipient,
+            amount.saturating_sub(fee),
+            randomness,
+            asset_id,
+        );
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         DepositTx {
@@ -119,6 +124,10 @@ impl DepositTx {
 
     /// Verify deposit transaction
     pub fn verify(&self) -> bool {
+        if self.amount == 0 || self.from_public.is_empty() {
+            return false;
+        }
+
         // Check amount covers fee
         if self.amount < self.fee {
             return false;
@@ -182,7 +191,7 @@ impl TransferTx {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         TransferTx {
@@ -209,9 +218,17 @@ impl TransferTx {
             return false;
         }
 
-        // Each commitment must match its note
+        // Input nullifiers must be unique within the transaction
+        let mut seen_nullifiers = std::collections::HashSet::with_capacity(self.input_nullifiers.len());
+        if !self.input_nullifiers.iter().all(|n| seen_nullifiers.insert(n)) {
+            return false;
+        }
+
+        // Output commitments must be unique and match their notes
+        let mut seen_commitments =
+            std::collections::HashSet::with_capacity(self.output_commitments.len());
         for (commitment, note) in self.output_commitments.iter().zip(self.output_notes.iter()) {
-            if commitment != &note.commitment() {
+            if commitment != &note.commitment() || !seen_commitments.insert(commitment) {
                 return false;
             }
         }
@@ -261,7 +278,7 @@ impl WithdrawTx {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         WithdrawTx {
@@ -278,6 +295,10 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
+        if self.amount == 0 {
+            return false;
+        }
+
         // Amount must cover fee
         if self.amount < self.fee {
             return false;
@@ -334,12 +355,13 @@ impl TrackedTransaction {
     /// Mark as verified
     pub fn mark_verified(&mut self) {
         self.status = TransactionStatus::Accepted;
-        self.confirmations += 1;
+        self.confirmations = self.confirmations.saturating_add(1);
     }
 
     /// Mark as rejected
     pub fn mark_rejected(&mut self, reason: String) {
         self.status = TransactionStatus::Rejected { reason };
+        self.confirmations = 0;
     }
 }
 
@@ -445,5 +467,24 @@ mod tests {
         );
 
         assert!(!tx.verify_structure());
+
+        // Duplicate input nullifiers must fail structure check
+        let dup_in = TransferTx::new(
+            vec![Nullifier([1u8; 32]), Nullifier([1u8; 32])],
+            vec![Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32])],
+            [0u8; 32],
+            10,
+        );
+        assert!(!dup_in.verify_structure());
+
+        // Underflow fee in DepositTx::new must not panic, and verify() must reject
+        let underflow_dep = DepositTx::new(vec![1u8; 32], 5, ShieldedAddress([2u8; 32]), [3u8; 32], 10);
+        assert!(!underflow_dep.verify());
+
+        // Zero-amount deposit and withdraw must be rejected
+        let zero_dep = DepositTx::new(vec![1u8; 32], 0, ShieldedAddress([2u8; 32]), [3u8; 32], 0);
+        assert!(!zero_dep.verify());
+        let zero_wd = WithdrawTx::new(Nullifier([1u8; 32]), 0, vec![5u8; 32], [0u8; 32], 0);
+        assert!(!zero_wd.verify());
     }
 }
