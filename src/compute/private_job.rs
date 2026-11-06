@@ -80,6 +80,14 @@ impl PrivateComputeJob {
     ) -> Result<Self> {
         use sha2::{Digest, Sha256};
 
+        if input_data.len() > crate::compute::compute_circuit::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Private job input data ({} bytes) exceeds maximum circuit witness size ({} bytes)",
+                input_data.len(),
+                crate::compute::compute_circuit::MAX_DATA_SIZE
+            ));
+        }
+
         // Compute code hash
         let code_hash: [u8; 32] = Sha256::digest(&wasm_code).into();
 
@@ -107,7 +115,7 @@ impl PrivateComputeJob {
             limits,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         })
     }
@@ -201,6 +209,14 @@ impl PrivateJobResult {
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
 
+        if output_data.len() > crate::compute::compute_circuit::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "Private job output data ({} bytes) exceeds maximum circuit witness size ({} bytes)",
+                output_data.len(),
+                crate::compute::compute_circuit::MAX_DATA_SIZE
+            ));
+        }
+
         // Create commitment to output
         let data_hash = PrivateComputeJob::hash_data(&output_data);
         let randomness = crate::privacy::pedersen::generate_randomness();
@@ -225,7 +241,7 @@ impl PrivateJobResult {
             instructions_executed: result.instructions_executed,
             completed_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         })
     }
@@ -324,7 +340,7 @@ impl PrivateJobResult {
                 &dummy_spending_key,
             );
 
-            let circuit = crate::compute::ComputeCircuit::with_witness(
+            let circuit = crate::compute::ComputeCircuit::try_with_witness(
                 dummy_code_hash,
                 dummy_input_commitment_fr,
                 output_commitment_fr,
@@ -335,7 +351,7 @@ impl PrivateJobResult {
                 *randomness,
                 dummy_owner,
                 dummy_spending_key,
-            );
+            )?;
 
             // Generate proof
             use ark_groth16::Groth16;
@@ -1077,5 +1093,34 @@ mod tests {
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
         );
+    }
+
+    #[test]
+    fn test_private_job_rejects_oversized_input_and_output() {
+        let wasm_code = vec![0x00, 0x61, 0x73, 0x6d];
+        let oversized = vec![1u8; crate::compute::compute_circuit::MAX_DATA_SIZE + 1];
+        let owner_address = ShieldedAddress([42u8; 32]);
+        let limits = ResourceLimits::default();
+
+        assert!(
+            PrivateComputeJob::new(wasm_code, oversized.clone(), owner_address.clone(), limits)
+                .is_err()
+        );
+
+        let job_result = JobResult {
+            job_id: "oversized-out".to_string(),
+            status: crate::compute::JobStatus::Completed,
+            output_data: Some(oversized),
+            error: None,
+            execution_time_ms: 10,
+            memory_used_bytes: 1024,
+            instructions_executed: 100,
+        };
+        assert!(PrivateJobResult::from_job_result(
+            "oversized-out".to_string(),
+            job_result,
+            &owner_address
+        )
+        .is_err());
     }
 }

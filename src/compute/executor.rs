@@ -264,22 +264,23 @@ impl JobExecutor {
         let mut completed_count = 0;
 
         for result in completed.values() {
+            total_exec_time = total_exec_time.saturating_add(result.execution_time_ms);
+            total_memory = total_memory.saturating_add(result.memory_used_bytes);
+            total_instructions = total_instructions.saturating_add(result.instructions_executed);
             match result.status {
                 JobStatus::Completed => {
                     completed_count += 1;
-                    total_exec_time += result.execution_time_ms;
-                    total_memory += result.memory_used_bytes;
-                    total_instructions += result.instructions_executed;
                 }
-                JobStatus::Failed { .. } => {
+                JobStatus::Failed { .. } | JobStatus::TimedOut => {
                     failed_count += 1;
                 }
                 _ => {}
             }
         }
 
-        let avg_exec_time = if completed_count > 0 {
-            total_exec_time / completed_count as u64
+        let total_finished = completed_count + failed_count;
+        let avg_exec_time = if total_finished > 0 {
+            total_exec_time / total_finished as u64
         } else {
             0
         };
@@ -406,5 +407,35 @@ mod tests {
         // bound (#610).
         let overflow = ComputeJob::new(vec![], vec![], ResourceLimits::default());
         assert!(executor.submit_job(overflow).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_stats_counts_timed_out_and_saturates_u64_totals() {
+        let executor = JobExecutor::new().unwrap();
+        {
+            let mut completed = executor.completed_results.lock().unwrap();
+            completed.insert(
+                "j1".to_string(),
+                JobResult::success("j1".to_string(), vec![1], u64::MAX, u64::MAX, u64::MAX),
+            );
+            completed.insert(
+                "j2".to_string(),
+                JobResult {
+                    job_id: "j2".to_string(),
+                    status: JobStatus::TimedOut,
+                    output_data: None,
+                    error: Some("timed out".to_string()),
+                    execution_time_ms: 100,
+                    memory_used_bytes: 2048,
+                    instructions_executed: 500,
+                },
+            );
+        }
+        let stats = executor.get_stats();
+        assert_eq!(stats.completed_jobs, 1);
+        assert_eq!(stats.failed_jobs, 1);
+        assert_eq!(stats.total_execution_time_ms, u64::MAX);
+        assert_eq!(stats.total_memory_used_bytes, u64::MAX);
+        assert_eq!(stats.total_instructions_executed, u64::MAX);
     }
 }
