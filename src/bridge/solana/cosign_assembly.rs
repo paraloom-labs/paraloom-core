@@ -41,6 +41,12 @@ where
     F: Fn(NodeId) -> Fut,
     Fut: Future<Output = Option<(Pubkey, Vec<u8>)>>,
 {
+    if threshold == 0 {
+        return Err(BridgeError::Serialization(
+            "co-sign threshold must be at least 1".to_string(),
+        ));
+    }
+
     let message_bytes = message.serialize();
     let expected: std::collections::HashSet<Pubkey> = peers.iter().map(|(w, _)| *w).collect();
 
@@ -94,6 +100,13 @@ pub fn assemble_transaction(
     signatures: &HashMap<Pubkey, Vec<u8>>,
 ) -> Result<Transaction> {
     let num_signers = message.header.num_required_signatures as usize;
+    if num_signers == 0 || num_signers > message.account_keys.len() {
+        return Err(BridgeError::Serialization(format!(
+            "invalid required signer count {} for {} account keys",
+            num_signers,
+            message.account_keys.len()
+        )));
+    }
     let mut ordered = Vec::with_capacity(num_signers);
     for key in &message.account_keys[..num_signers] {
         let sig_bytes = signatures.get(key).ok_or_else(|| {
@@ -251,6 +264,38 @@ mod tests {
         assert!(
             result.is_err(),
             "a forged signature must not count toward the quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn gather_rejects_zero_threshold() {
+        let leader = Keypair::new();
+        let v1 = Keypair::new();
+        let message = two_signer_message(&leader.pubkey(), &v1.pubkey());
+        let own = sign(&leader, &message);
+        let peers = vec![(v1.pubkey(), NodeId(vec![1]))];
+
+        let result = gather_signatures(&message, own, &peers, 0, |_peer| async { None }).await;
+        assert!(result.is_err(), "threshold == 0 must be rejected");
+    }
+
+    #[test]
+    fn assemble_rejects_out_of_bounds_or_zero_required_signers() {
+        let a = Keypair::new();
+        let b = Keypair::new();
+        let mut message = two_signer_message(&a.pubkey(), &b.pubkey());
+        let sigs = HashMap::new();
+
+        message.header.num_required_signatures = 0;
+        assert!(
+            assemble_transaction(message.clone(), &sigs).is_err(),
+            "zero required signers must be rejected"
+        );
+
+        message.header.num_required_signatures = (message.account_keys.len() + 5) as u8;
+        assert!(
+            assemble_transaction(message, &sigs).is_err(),
+            "num_required_signatures > account_keys.len() must return Err, not panic"
         );
     }
 }
