@@ -56,6 +56,12 @@ pub const MAX_PROOF_LEN: usize = 256;
 /// pulled out by the earner through `claim_rewards`.
 pub const WITHDRAWAL_FEE_BPS: u64 = 25;
 
+/// Minimum reputation score for an active validator
+pub const MIN_REPUTATION_SCORE: u64 = 100;
+
+/// Maximum reputation score for an active validator
+pub const MAX_REPUTATION_SCORE: u64 = 10_000;
+
 /// Verify a BPFLoaderUpgradeable `ProgramData` account's upgrade authority
 /// matches `expected` (#204). Closes the init front-run race: only the wallet
 /// holding the program's upgrade authority can call the `initialize_*`
@@ -991,6 +997,10 @@ pub mod paraloom_program {
             BridgeError::InvalidValidator
         );
         require!(validator_account.is_active, BridgeError::ValidatorNotActive);
+        require!(
+            new_reputation >= MIN_REPUTATION_SCORE && new_reputation <= MAX_REPUTATION_SCORE,
+            BridgeError::InvalidAmount
+        );
 
         validator_account.reputation_score = new_reputation;
         validator_account.last_active = Clock::get()?.unix_timestamp;

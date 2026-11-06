@@ -48,6 +48,12 @@ pub struct ProgramInterface {
     program_id: Pubkey,
 }
 
+/// Discriminator for on-chain `NullifierAccount` (Anchor `sha256("account:NullifierAccount")[..8]`).
+pub const NULLIFIER_ACCOUNT_DISC: [u8; 8] = [250, 31, 238, 177, 213, 98, 48, 172];
+
+/// Minimum expected length of on-chain `NullifierAccount` data (8 disc + 32 nullifier + 8 used_at + 8 withdrawal_id).
+pub const NULLIFIER_ACCOUNT_LEN: usize = 56;
+
 impl ProgramInterface {
     /// Create new program interface using the supplied RPC backend.
     pub fn new(config: BridgeConfig, rpc: Arc<dyn BridgeRpc>) -> Result<Self> {
@@ -198,7 +204,12 @@ impl ProgramInterface {
     pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
         let (pda, _) = Pubkey::find_program_address(&[b"nullifier", nullifier], &self.program_id);
         match self.rpc.get_account(&pda).await {
-            Ok(account) => account.owner == self.program_id,
+            Ok(account) => {
+                account.owner == self.program_id
+                    && account.data.len() >= NULLIFIER_ACCOUNT_LEN
+                    && account.data[0..8] == NULLIFIER_ACCOUNT_DISC
+                    && account.data[8..40] == *nullifier
+            }
             Err(_) => false,
         }
     }
@@ -481,5 +492,78 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn is_nullifier_spent_verifies_discriminator_length_and_payload() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let program_id = Pubkey::new_unique();
+        let config = BridgeConfig {
+            program_id: program_id.to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock.clone()).unwrap();
+
+        let nullifier = [42u8; 32];
+
+        // 1. Valid nullifier account
+        let mut valid_data = Vec::new();
+        valid_data.extend_from_slice(&NULLIFIER_ACCOUNT_DISC);
+        valid_data.extend_from_slice(&nullifier);
+        valid_data.extend_from_slice(&1000i64.to_le_bytes()); // used_at
+        valid_data.extend_from_slice(&1u64.to_le_bytes()); // withdrawal_id
+        assert_eq!(valid_data.len(), 56);
+
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data.clone(),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(program.is_nullifier_spent(&nullifier).await);
+
+        // 2. Truncated data (< 56 bytes)
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data[..50].to_vec(),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program.is_nullifier_spent(&nullifier).await);
+
+        // 3. Wrong discriminator
+        let mut bad_disc_data = valid_data.clone();
+        bad_disc_data[0] ^= 0xFF;
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: bad_disc_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program.is_nullifier_spent(&nullifier).await);
+
+        // 4. Mismatched nullifier bytes
+        let other_nullifier = [99u8; 32];
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program.is_nullifier_spent(&other_nullifier).await);
+
+        // 5. Wrong owner
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: vec![0u8; 56],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(!program.is_nullifier_spent(&nullifier).await);
     }
 }
