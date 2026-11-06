@@ -222,6 +222,12 @@ impl ProgramInterface {
         Ok(signature.to_string())
     }
 
+    /// Read the owner of `mint` to determine whether it is an SPL Token or Token-2022 mint.
+    pub async fn get_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        let account = self.rpc.get_account(mint).await?;
+        Ok(account.owner)
+    }
+
     /// Read the deployed program's `program_version` from the
     /// `BridgeState` PDA. The version sits at byte offset 8..12 of the
     /// account data — Anchor prepends an 8-byte discriminator and the
@@ -475,6 +481,26 @@ mod tests {
         let buf = vec![0u8; 11]; // 8-byte discriminator + 3 bytes < u32
         let err = parse_program_version(&buf).expect_err("short buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn get_token_program_queries_mint_owner() {
+        let mint = Pubkey::new_unique();
+        let expected_token_program = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 82],
+            owner: expected_token_program,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        let program = program_with_mock(mock);
+        let token_program = program
+            .get_token_program(&mint)
+            .await
+            .expect("get token program");
+        assert_eq!(token_program, expected_token_program);
     }
 
     #[test]

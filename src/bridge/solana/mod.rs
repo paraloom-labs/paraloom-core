@@ -38,6 +38,7 @@ use crate::bridge::{BridgeConfig, BridgeStats, Result};
 use crate::privacy::ShieldedPool;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -128,6 +129,11 @@ impl SolanaBridge {
         transaction: &solana_sdk::transaction::Transaction,
     ) -> Result<String> {
         self.program.submit_signed_transaction(transaction).await
+    }
+
+    /// Read the owner of `mint` (classic SPL Token or Token-2022).
+    pub async fn get_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        self.program.get_token_program(mint).await
     }
 
     /// Get program interface

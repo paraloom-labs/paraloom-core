@@ -159,6 +159,20 @@ impl Bridge {
             ))
         }
     }
+
+    /// Read the owner token program of `mint` (classic SPL Token or Token-2022).
+    pub async fn get_token_program(
+        &self,
+        mint: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<solana_sdk::pubkey::Pubkey> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.get_token_program(mint).await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
