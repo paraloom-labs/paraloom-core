@@ -312,6 +312,23 @@ impl TransferCircuitV2 {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let n_in = self.nullifiers.len();
+        if self.input_values.len() != n_in
+            || self.input_blindings.len() != n_in
+            || self.input_privkeys.len() != n_in
+            || self.input_paths.len() != n_in
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
+        let n_out = self.output_commitments.len();
+        if self.output_values.len() != n_out
+            || self.output_blindings.len() != n_out
+            || self.output_pubkeys.len() != n_out
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         // --- Public inputs ---
         let merkle_root_var = FpVar::new_input(cs.clone(), || {
             Ok(self
@@ -647,6 +664,20 @@ impl Default for TransactCircuitV3 {
 
 impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        if self.input_nullifiers.len() < TX_NINS
+            || self.in_amounts.len() < TX_NINS
+            || self.in_privkeys.len() < TX_NINS
+            || self.in_blindings.len() < TX_NINS
+            || self.in_leaf_indices.len() < TX_NINS
+            || self.in_paths.len() < TX_NINS
+            || self.output_commitments.len() < TX_NOUTS
+            || self.out_amounts.len() < TX_NOUTS
+            || self.out_pubkeys.len() < TX_NOUTS
+            || self.out_blindings.len() < TX_NOUTS
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         // Field-element public input from optional LE bytes.
         let input_fe = |cs: ConstraintSystemRef<Fr>, v: Option<[u8; 32]>| {
             FpVar::new_input(cs, || {
@@ -692,10 +723,12 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
 
             // leaf_index as 32 bits: gives both the field element (bound into the
             // signature/nullifier) and the per-level direction selectors.
+            let leaf_idx = match self.in_leaf_indices[tx] {
+                Some(i) => Some(u32::try_from(i).map_err(|_| SynthesisError::Unsatisfiable)?),
+                None => None,
+            };
             let idx_u32 = UInt32::new_witness(cs.clone(), || {
-                self.in_leaf_indices[tx]
-                    .map(|i| i as u32)
-                    .ok_or(SynthesisError::AssignmentMissing)
+                leaf_idx.ok_or(SynthesisError::AssignmentMissing)
             })?;
             let idx_bits = idx_u32.to_bits_le();
             let leaf_index_var = Boolean::le_bits_to_fp_var(&idx_bits)?;
@@ -1827,6 +1860,84 @@ mod tests {
             let mut bad = public_inputs.clone();
             bad[0] = Fr::from(123u64);
             assert!(!Groth16ProofSystem::verify(&vk, &bad, &proof).expect("verify"));
+        }
+
+        #[test]
+        fn transact_v3_rejects_leaf_index_overflowing_u32() {
+            use ark_relations::r1cs::ConstraintSystem;
+            let mut circuit = sample_circuit();
+            // Set index to 2^32 or greater
+            circuit.in_leaf_indices[0] = Some(1u64 << 32);
+
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            let res = circuit.generate_constraints(cs);
+            assert!(matches!(res, Err(SynthesisError::Unsatisfiable)));
+        }
+
+        #[test]
+        fn transact_v3_rejects_truncated_vectors() {
+            use ark_relations::r1cs::ConstraintSystem;
+            let mut circuit = sample_circuit();
+            circuit.in_amounts.pop(); // now len < TX_NINS
+
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            let res = circuit.generate_constraints(cs);
+            assert!(matches!(res, Err(SynthesisError::AssignmentMissing)));
+        }
+
+        #[test]
+        fn transfer_v2_rejects_mismatched_vector_lengths() {
+            use ark_relations::r1cs::ConstraintSystem;
+            let circuit = TransferCircuitV2 {
+                merkle_root: Some([0u8; 32]),
+                nullifiers: vec![Some([1u8; 32])],
+                output_commitments: vec![Some([2u8; 32])],
+                input_values: vec![Some(100), Some(200)], // len 2 != nullifiers len 1
+                input_blindings: vec![Some([0u8; 32])],
+                input_privkeys: vec![Some([0u8; 32])],
+                input_paths: vec![Some(vec![([0u8; 32], false)])],
+                output_values: vec![Some(100)],
+                output_blindings: vec![Some([0u8; 32])],
+                output_pubkeys: vec![Some([0u8; 32])],
+                asset_id: Some([0u8; 32]),
+            };
+
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            let res = circuit.generate_constraints(cs);
+            assert!(matches!(res, Err(SynthesisError::AssignmentMissing)));
+        }
+
+        fn sample_circuit() -> TransactCircuitV3 {
+            build(
+                [
+                    InNote {
+                        amount: 100,
+                        privkey: Fr::from(1u64),
+                        blinding: Fr::from(1u64),
+                        index: 0,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(2u64),
+                        blinding: Fr::from(2u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 100,
+                        pubkey: v3_pubkey(Fr::from(3u64)),
+                        blinding: Fr::from(3u64),
+                    },
+                    OutNote {
+                        amount: 0,
+                        pubkey: v3_pubkey(Fr::from(4u64)),
+                        blinding: Fr::from(4u64),
+                    },
+                ],
+                asset(),
+                [1u8; 32],
+            )
         }
     }
 }

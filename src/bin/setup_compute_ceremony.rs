@@ -89,6 +89,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pk_bytes = Vec::new();
     pk.serialize_compressed(&mut pk_bytes)?;
     fs::write(&proving_key_path, &pk_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&proving_key_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&proving_key_path, perms)?;
+    }
     println!("   ✓ {}", proving_key_path.display());
     println!("   Size: {:.2} MB", pk_bytes.len() as f64 / 1_048_576.0);
 
@@ -100,14 +107,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ {}", verifying_key_path.display());
     println!("   Size: {} bytes", vk_bytes.len());
 
-    // Verify we can load the keys back
+    // Verify we can load the keys back from disk
     println!("\n🔍 Verifying key integrity...");
-    let pk_loaded = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..])?;
-    let vk_loaded = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..])?;
+    let disk_pk_bytes = fs::read(&proving_key_path)?;
+    let disk_vk_bytes = fs::read(&verifying_key_path)?;
 
-    // Basic sanity check
-    if pk_loaded.vk.gamma_g2 != vk_loaded.gamma_g2 {
-        return Err("Key integrity check failed!".into());
+    let mut pk_cursor = &disk_pk_bytes[..];
+    let pk_loaded = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&mut pk_cursor)?;
+    if !pk_cursor.is_empty() {
+        return Err("Proving key file has unconsumed trailing bytes".into());
+    }
+
+    let mut vk_cursor = &disk_vk_bytes[..];
+    let vk_loaded = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_cursor)?;
+    if !vk_cursor.is_empty() {
+        return Err("Verifying key file has unconsumed trailing bytes".into());
+    }
+
+    // Full verifying key equality check
+    if pk_loaded.vk != vk_loaded {
+        return Err("Key integrity check failed: pk.vk != vk".into());
     }
     println!("   ✓ Keys are valid and loadable\n");
 
