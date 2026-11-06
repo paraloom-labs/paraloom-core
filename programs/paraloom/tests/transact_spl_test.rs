@@ -467,4 +467,16 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+
+    let val_raw = banks.get_account(validator_pda).await.unwrap().unwrap();
+    let val =
+        paraloom_program::ValidatorAccount::try_deserialize(&mut val_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        val.total_earnings, fee,
+        "inline SPL withdrawal fee must credit validator_account.total_earnings"
+    );
+    assert_eq!(
+        val.pending_rewards, 0,
+        "inline SPL withdrawal fee must not touch lamport pending_rewards"
+    );
 }
