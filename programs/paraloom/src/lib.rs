@@ -565,10 +565,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -750,6 +748,29 @@ pub mod paraloom_program {
 
         msg!(
             "Bridge authority rotated: {} -> {}",
+            previous,
+            new_authority
+        );
+        Ok(())
+    }
+
+    /// Rotate the cold validator-registry authority (`ValidatorRegistry.authority`)
+    /// to a new key (e.g. a dedicated cold key, Squads multisig/timelock vault PDA,
+    /// or DAO governance PDA).
+    pub fn set_registry_authority(
+        ctx: Context<SetRegistryAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            BridgeError::InvalidValidator
+        );
+        let registry = &mut ctx.accounts.validator_registry;
+        let previous = registry.authority;
+        registry.authority = new_authority;
+
+        msg!(
+            "Validator registry authority rotated: {} -> {}",
             previous,
             new_authority
         );
@@ -1276,10 +1297,11 @@ pub mod paraloom_program {
     ///
     /// The SPL analogue of `set_deposit_cap`: bounds funds-at-risk for one
     /// shielded token to a chosen ceiling on the vault's live token balance.
-    /// Upgrade-authority-gated and starts at 0, so a mint is inert until the
-    /// cold authority deliberately opens it.
+    /// Gated on the cold registry authority (`validator_registry.authority`,
+    /// like `set_deposit_cap` and `pause`) and starts at 0, so a mint is inert
+    /// until the cold authority deliberately opens it and remains controllable
+    /// after `--final` program immutability.
     pub fn set_asset_deposit_cap(ctx: Context<SetAssetDepositCap>, new_cap: u64) -> Result<()> {
-        check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
         let config = &mut ctx.accounts.asset_config;
         let previous = config.deposit_cap;
         config.deposit_cap = new_cap;
@@ -2080,6 +2102,19 @@ pub struct SetBridgeAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetRegistryAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [b"validator_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct SetDepositCap<'info> {
     #[account(
         mut,
@@ -2281,18 +2316,17 @@ pub struct SetAssetDepositCap<'info> {
     #[account(mut, seeds = [b"asset_config", asset_config.mint.as_ref()], bump = asset_config.bump)]
     pub asset_config: Account<'info, AssetConfig>,
 
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// Upgrade-authority gate (#204).
-    ///
-    /// CHECK: validated by seeds + `check_upgrade_authority` body call.
+    // Cold-authority gated (matches `SetDepositCap` and `Pause`), so per-asset
+    // SPL caps remain adjustable after `--final` program immutability and obey
+    // `validator_registry.authority` rotation.
     #[account(
-        seeds = [crate::ID.as_ref()],
+        seeds = [b"validator_registry"],
         bump,
-        seeds::program = bpf_loader_upgradeable::id(),
+        has_one = authority
     )]
-    pub program_data: UncheckedAccount<'info>,
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
+    pub authority: Signer<'info>,
 }
 
 /// Accounts for [`deposit_note_spl`] — shield an SPL token into a note (#779).
@@ -2916,4 +2950,255 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+#[cfg(test)]
+mod registry_and_asset_cap_authority_tests {
+    use super::*;
+    use anchor_lang::solana_program::{
+        account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, system_program,
+    };
+    use anchor_lang::{AccountDeserialize, AccountSerialize, InstructionData};
+
+    fn serialize_account<T: AccountSerialize>(val: &T, space: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(space);
+        val.try_serialize(&mut buf)
+            .expect("serialize anchor account");
+        if buf.len() < space {
+            buf.resize(space, 0);
+        }
+        buf
+    }
+
+    #[test]
+    fn set_asset_deposit_cap_uses_registry_authority_and_set_registry_authority_rotates() {
+        let initial_registry_authority = Pubkey::new_unique();
+        let rotated_registry_authority = Pubkey::new_unique();
+        let outsider = Pubkey::new_unique();
+        let spl_mint = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+
+        let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &crate::ID);
+        let (asset_config_pda, asset_bump) =
+            Pubkey::find_program_address(&[b"asset_config", spl_mint.as_ref()], &crate::ID);
+
+        let mut registry_bytes = serialize_account(
+            &ValidatorRegistry {
+                authority: initial_registry_authority,
+                total_validators: 4,
+                active_validators: 4,
+                minimum_stake: MIN_VALIDATOR_STAKE,
+                total_active_stake: 4 * MIN_VALIDATOR_STAKE,
+                stake_mint,
+                min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+            },
+            8 + ValidatorRegistry::INIT_SPACE,
+        );
+        let mut asset_bytes = serialize_account(
+            &AssetConfig {
+                mint: spl_mint,
+                deposit_cap: 1_000_000_000,
+                total_deposited: 0,
+                deposit_count: 0,
+                bump: asset_bump,
+            },
+            AssetConfig::SPACE,
+        );
+
+        let (mut l_reg, mut l_auth, mut l_ac) = (1_000_000u64, 1_000_000u64, 1_000_000u64);
+        let mut empty_auth = [];
+        let sys_id = system_program::ID;
+
+        // 1. Non-registry authority is rejected on `set_asset_deposit_cap`.
+        let constraint_has_one: ProgramError =
+            anchor_lang::error::Error::from(anchor_lang::error::ErrorCode::ConstraintHasOne).into();
+        {
+            let ac_ai = AccountInfo::new(
+                &asset_config_pda,
+                false,
+                true,
+                &mut l_ac,
+                &mut asset_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let reg_ai = AccountInfo::new(
+                &registry_pda,
+                false,
+                false,
+                &mut l_reg,
+                &mut registry_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let auth_ai = AccountInfo::new(
+                &outsider,
+                true,
+                false,
+                &mut l_auth,
+                &mut empty_auth,
+                &sys_id,
+                false,
+                0,
+            );
+            let ix = crate::instruction::SetAssetDepositCap { new_cap: 0 }.data();
+            assert_eq!(
+                crate::entry(&crate::ID, &[ac_ai, reg_ai, auth_ai], &ix).unwrap_err(),
+                constraint_has_one
+            );
+        }
+
+        // 2. `validator_registry.authority` succeeds without requiring `ProgramData` (even after `--final`).
+        {
+            let ac_ai = AccountInfo::new(
+                &asset_config_pda,
+                false,
+                true,
+                &mut l_ac,
+                &mut asset_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let reg_ai = AccountInfo::new(
+                &registry_pda,
+                false,
+                false,
+                &mut l_reg,
+                &mut registry_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let auth_ai = AccountInfo::new(
+                &initial_registry_authority,
+                true,
+                false,
+                &mut l_auth,
+                &mut empty_auth,
+                &sys_id,
+                false,
+                0,
+            );
+            let ix = crate::instruction::SetAssetDepositCap { new_cap: 0 }.data();
+            crate::entry(&crate::ID, &[ac_ai, reg_ai, auth_ai], &ix).unwrap();
+        }
+        assert_eq!(
+            AssetConfig::try_deserialize(&mut asset_bytes.as_slice())
+                .unwrap()
+                .deposit_cap,
+            0
+        );
+
+        // 3. `set_registry_authority` rejects `Pubkey::default()` and rotates to `rotated_registry_authority`.
+        let invalid_validator: ProgramError =
+            anchor_lang::error::Error::from(BridgeError::InvalidValidator).into();
+        {
+            let reg_ai = AccountInfo::new(
+                &registry_pda,
+                false,
+                true,
+                &mut l_reg,
+                &mut registry_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let auth_ai = AccountInfo::new(
+                &initial_registry_authority,
+                true,
+                false,
+                &mut l_auth,
+                &mut empty_auth,
+                &sys_id,
+                false,
+                0,
+            );
+            let ix = crate::instruction::SetRegistryAuthority {
+                new_authority: Pubkey::default(),
+            }
+            .data();
+            assert_eq!(
+                crate::entry(&crate::ID, &[reg_ai, auth_ai], &ix).unwrap_err(),
+                invalid_validator
+            );
+        }
+        {
+            let reg_ai = AccountInfo::new(
+                &registry_pda,
+                false,
+                true,
+                &mut l_reg,
+                &mut registry_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let auth_ai = AccountInfo::new(
+                &initial_registry_authority,
+                true,
+                false,
+                &mut l_auth,
+                &mut empty_auth,
+                &sys_id,
+                false,
+                0,
+            );
+            let ix = crate::instruction::SetRegistryAuthority {
+                new_authority: rotated_registry_authority,
+            }
+            .data();
+            crate::entry(&crate::ID, &[reg_ai, auth_ai], &ix).unwrap();
+        }
+        assert_eq!(
+            ValidatorRegistry::try_deserialize(&mut registry_bytes.as_slice())
+                .unwrap()
+                .authority,
+            rotated_registry_authority
+        );
+
+        // 4. Rotated registry authority can now call `set_asset_deposit_cap`.
+        {
+            let ac_ai = AccountInfo::new(
+                &asset_config_pda,
+                false,
+                true,
+                &mut l_ac,
+                &mut asset_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let reg_ai = AccountInfo::new(
+                &registry_pda,
+                false,
+                false,
+                &mut l_reg,
+                &mut registry_bytes,
+                &crate::ID,
+                false,
+                0,
+            );
+            let auth_ai = AccountInfo::new(
+                &rotated_registry_authority,
+                true,
+                false,
+                &mut l_auth,
+                &mut empty_auth,
+                &sys_id,
+                false,
+                0,
+            );
+            let ix = crate::instruction::SetAssetDepositCap { new_cap: 500_000 }.data();
+            crate::entry(&crate::ID, &[ac_ai, reg_ai, auth_ai], &ix).unwrap();
+        }
+        assert_eq!(
+            AssetConfig::try_deserialize(&mut asset_bytes.as_slice())
+                .unwrap()
+                .deposit_cap,
+            500_000
+        );
+    }
 }
