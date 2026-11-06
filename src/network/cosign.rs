@@ -100,6 +100,26 @@ where
     Ok(buf)
 }
 
+/// Write at most [`MAX_COSIGN_PAYLOAD_BYTES`] to `io`, erroring if `data`
+/// exceeds the protocol limit.
+async fn write_size_bounded<T>(io: &mut T, data: &[u8]) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    if data.len() > MAX_COSIGN_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cosign outbound payload exceeds {} bytes: {} bytes",
+                MAX_COSIGN_PAYLOAD_BYTES,
+                data.len()
+            ),
+        ));
+    }
+    io.write_all(data).await?;
+    io.close().await
+}
+
 /// Bincode-backed codec, structurally identical to `HeartbeatCodec`.
 #[derive(Debug, Clone, Default)]
 pub struct CoSignCodec;
@@ -145,8 +165,7 @@ impl Codec for CoSignCodec {
     {
         let data =
             bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&data).await?;
-        io.close().await
+        write_size_bounded(io, &data).await
     }
 
     async fn write_response<T>(
@@ -160,8 +179,7 @@ impl Codec for CoSignCodec {
     {
         let data =
             bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&data).await?;
-        io.close().await
+        write_size_bounded(io, &data).await
     }
 }
 
@@ -199,6 +217,26 @@ mod tests {
         let err = read_size_bounded(&mut cursor)
             .await
             .expect_err("over-limit payload must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn write_size_bounded_accepts_payload_under_limit() {
+        let payload = vec![0xABu8; 1024];
+        let mut cursor = Cursor::new(Vec::new());
+        write_size_bounded(&mut cursor, &payload)
+            .await
+            .expect("under-limit payload write");
+        assert_eq!(cursor.into_inner(), payload);
+    }
+
+    #[tokio::test]
+    async fn write_size_bounded_rejects_payload_over_limit() {
+        let payload = vec![0xCDu8; MAX_COSIGN_PAYLOAD_BYTES + 1];
+        let mut cursor = Cursor::new(Vec::new());
+        let err = write_size_bounded(&mut cursor, &payload)
+            .await
+            .expect_err("over-limit write payload must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
