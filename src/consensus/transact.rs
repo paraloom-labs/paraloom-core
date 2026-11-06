@@ -275,6 +275,10 @@ pub struct TransactVerificationCoordinator {
     /// Total validator-set size (percentage divisor)
     total_validators: usize,
 
+    /// Minimum reputation score required for a validator's vote to count
+    /// toward consensus.
+    min_reputation_for_consensus: u64,
+
     /// Approval-event sender; `Some` only when built with
     /// [`new_with_approvals`](Self::new_with_approvals).
     approval_tx: Option<mpsc::UnboundedSender<ApprovedTransact>>,
@@ -336,6 +340,7 @@ impl TransactVerificationCoordinator {
             timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
             min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
             total_validators: DEFAULT_TOTAL_VALIDATORS,
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
             approval_tx: None,
             emitted: Arc::new(RwLock::new(HashSet::new())),
             local_node_id: None,
@@ -469,14 +474,19 @@ impl TransactVerificationCoordinator {
         }
         let threshold = eligible_stake.saturating_mul(2) / 3 + 1;
 
-        let equivocators = self.equivocators.read().await;
+        let eligible_wallets = self.eligible_wallets().await;
         let votes = tally.votes.read().await;
         let mut counted_stake: u64 = 0;
         for (wallet, rec) in votes.iter() {
             if wallet == local
                 || !rec.vote.is_valid()
-                || equivocators.contains(wallet)
+                || !eligible_wallets.contains(wallet)
                 || !onchain_stakes.contains_key(wallet)
+                || self
+                    .reputation_tracker
+                    .get_reputation(&rec.node_id)
+                    .await
+                    .is_some_and(|rep| rep < self.min_reputation_for_consensus)
             {
                 continue;
             }
@@ -518,12 +528,27 @@ impl TransactVerificationCoordinator {
     }
 
     /// The eligibility basis for counting: the staked on-chain co-sign wallets
-    /// minus any banned for equivocation. Replaces the flap-prone
+    /// minus any banned for equivocation or whose validator reputation has
+    /// fallen below `min_reputation_for_consensus`. Replaces the flap-prone
     /// `active_snapshot()` NodeId set at every tally call site.
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
         let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        let mut eligible: HashSet<String> = onchain.difference(&equivocators).cloned().collect();
+        let wallet_nodes: Vec<(String, NodeId)> = {
+            let sel = self.leader_selector.read().await;
+            sel.validators()
+                .filter_map(|v| v.wallet_pubkey.as_ref().map(|w| (w.clone(), v.node_id.clone())))
+                .collect()
+        };
+        for (wallet, node_id) in wallet_nodes {
+            if let Some(rep) = self.reputation_tracker.get_reputation(&node_id).await {
+                if rep < self.min_reputation_for_consensus {
+                    eligible.remove(&wallet);
+                }
+            }
+        }
+        eligible
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -561,6 +586,39 @@ impl TransactVerificationCoordinator {
         }
         self.min_validators_for_consensus = min_validators_for_consensus;
         self.total_validators = total_validators;
+    }
+
+    /// Current `(min_validators_for_consensus, total_validators)` BFT thresholds.
+    pub fn consensus_thresholds(&self) -> (usize, usize) {
+        (self.min_validators_for_consensus, self.total_validators)
+    }
+
+    /// Override the minimum reputation score required for a validator's vote
+    /// to count toward consensus. Falls back to
+    /// [`DEFAULT_MIN_REPUTATION_FOR_CONSENSUS`] when `min_reputation == 0` or
+    /// exceeds `MAX_REPUTATION`.
+    pub fn set_min_reputation_for_consensus(&mut self, min_reputation: u64) {
+        if min_reputation == 0 || min_reputation > crate::consensus::reputation::MAX_REPUTATION {
+            log::warn!(
+                target: "paraloom::consensus",
+                "ignoring invalid transact consensus min_reputation ({}); falling back to {}",
+                min_reputation,
+                DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+            );
+            self.min_reputation_for_consensus = DEFAULT_MIN_REPUTATION_FOR_CONSENSUS;
+            return;
+        }
+        self.min_reputation_for_consensus = min_reputation;
+    }
+
+    /// Current minimum reputation score required for consensus participation.
+    pub fn min_reputation_for_consensus(&self) -> u64 {
+        self.min_reputation_for_consensus
+    }
+
+    /// Reference to the reputation tracker.
+    pub fn reputation_tracker(&self) -> &Arc<ReputationTracker> {
+        &self.reputation_tracker
     }
 
     /// Reference to the slashing-evidence log (tests/pipelines read it).
@@ -1571,5 +1629,54 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn reputation_floor_excludes_penalized_validator_vote_from_quorum() {
+        let (mut coord, mut approvals) = coord_2of2().await;
+        // Raise the floor above the 950 score that one failure produces (1000 - 50 = 950).
+        coord.set_min_reputation_for_consensus(960);
+        assert_eq!(coord.min_reputation_for_consensus(), 960);
+
+        coord
+            .reputation_tracker()
+            .record_failure(&NodeId(vec![1]))
+            .await
+            .unwrap();
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "a validator below min_reputation_for_consensus must not complete the quorum"
+        );
+        assert!(
+            coord.check_consensus(&id).await.unwrap().is_none(),
+            "check_consensus must also withhold when a voter is below the reputation floor"
+        );
+    }
+
+    #[test]
+    fn set_min_reputation_for_consensus_validates_bounds() {
+        let mut coord = TransactVerificationCoordinator::new();
+        assert_eq!(
+            coord.min_reputation_for_consensus(),
+            DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+        );
+        coord.set_min_reputation_for_consensus(500);
+        assert_eq!(coord.min_reputation_for_consensus(), 500);
+        coord.set_min_reputation_for_consensus(0);
+        assert_eq!(
+            coord.min_reputation_for_consensus(),
+            DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+        );
+        coord.set_min_reputation_for_consensus(crate::consensus::reputation::MAX_REPUTATION + 1);
+        assert_eq!(
+            coord.min_reputation_for_consensus(),
+            DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+        );
     }
 }

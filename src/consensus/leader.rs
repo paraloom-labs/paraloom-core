@@ -237,6 +237,11 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// Iterate over all registered validator entries (active and deactivated).
+    pub fn validators(&self) -> impl Iterator<Item = &ValidatorInfo> {
+        self.validators.values()
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self
