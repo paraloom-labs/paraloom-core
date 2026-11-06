@@ -136,6 +136,29 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let ceremony_pk_file_hash: [u8; 64] = match std::fs::read(&args.ceremony_pk) {
+        Ok(bytes) => {
+            let digest = Sha512::digest(&bytes);
+            let mut out = [0u8; 64];
+            out.copy_from_slice(&digest[..]);
+            out
+        }
+        Err(e) => {
+            eprintln!("failed to re-read ceremony PK for hashing: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+    if transcript.final_srs_hash != [0u8; 64] && ceremony_pk_file_hash != transcript.final_srs_hash
+    {
+        eprintln!(
+            "ceremony PK file hash does not match transcript final_srs_hash, refusing to write.\n  \
+             transcript pins: {}\n  \
+             key on disk:     {}",
+            hex::encode(transcript.final_srs_hash),
+            hex::encode(ceremony_pk_file_hash)
+        );
+        return ExitCode::FAILURE;
+    }
     let policy = FinalizePolicy {
         min_contributions: args.min_contributions,
         initial_srs_hash: pinned_initial,

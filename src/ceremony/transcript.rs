@@ -122,7 +122,12 @@ impl std::str::FromStr for CircuitId {
 /// operator pasting a wrong-length hash to a CLI flag knows what
 /// is wrong.
 pub fn try_hash_from_hex(s: &str) -> Result<TranscriptHash, String> {
-    let bytes = hex::decode(s).map_err(|e| format!("not valid hex: {}", e))?;
+    let clean = s.trim();
+    let clean = clean
+        .strip_prefix("0x")
+        .or_else(|| clean.strip_prefix("0X"))
+        .unwrap_or(clean);
+    let bytes = hex::decode(clean).map_err(|e| format!("not valid hex: {}", e))?;
     if bytes.len() != 64 {
         return Err(format!(
             "transcript hash must decode to 64 bytes, got {}",
@@ -493,5 +498,15 @@ mod tests {
             Err(msg) => assert!(msg.contains("64 bytes")),
             Ok(_) => panic!("short hex must error"),
         }
+    }
+
+    #[test]
+    fn try_hash_from_hex_accepts_0x_prefix_and_whitespace() {
+        let original: TranscriptHash = [0x42u8; 64];
+        let hex_str: String = original.iter().map(|b| format!("{:02x}", b)).collect();
+        let with_0x = format!("  0x{} \n", hex_str);
+        assert_eq!(try_hash_from_hex(&with_0x).unwrap(), original);
+        let with_upper_0x = format!("0X{}", hex_str);
+        assert_eq!(try_hash_from_hex(&with_upper_0x).unwrap(), original);
     }
 }

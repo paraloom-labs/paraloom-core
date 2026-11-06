@@ -149,8 +149,18 @@ fn main() {
         .unwrap_or_else(|_| "keys/withdraw_v2_verifying.key".to_string());
     let pk_bytes = std::fs::read(&pk_path).expect("v2 proving key");
     let vk_bytes = std::fs::read(&vk_path).expect("v2 verifying key");
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
-    let vk = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+    let mut pk_cursor = &pk_bytes[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut pk_cursor).unwrap();
+    assert!(
+        pk_cursor.is_empty(),
+        "v2 proving key has unconsumed trailing bytes"
+    );
+    let mut vk_cursor = &vk_bytes[..];
+    let vk = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_cursor).unwrap();
+    assert!(
+        vk_cursor.is_empty(),
+        "v2 verifying key has unconsumed trailing bytes"
+    );
     let vk_wire = WireVerifyingKey::from_arkworks(&vk);
 
     let mint = keypair_from_seed(&SPL_MINT_SEED).unwrap();

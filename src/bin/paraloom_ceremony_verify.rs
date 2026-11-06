@@ -56,6 +56,21 @@ fn main() -> ExitCode {
         }
     };
 
+    if transcript.version != paraloom::ceremony::transcript::TRANSCRIPT_VERSION {
+        eprintln!(
+            "transcript verification FAILED: unsupported transcript version {} (expected {})",
+            transcript.version,
+            paraloom::ceremony::transcript::TRANSCRIPT_VERSION
+        );
+        return ExitCode::FAILURE;
+    }
+    if transcript.is_empty() {
+        eprintln!(
+            "transcript verification FAILED: transcript has 0 contributions, refusing empty transcript"
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Bind the key on disk to the one the transcript was built against,
     // the same digest `paraloom_ceremony_finalize` pins. Without this the
     // chain is only ever checked against whatever key the caller happened

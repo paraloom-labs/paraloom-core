@@ -82,8 +82,18 @@ fn main() {
     let (pk, vk) = if let Some((pk_path, vk_path)) = env_keys {
         let pk_bytes = fs::read(&pk_path).expect("transfer v2 proving key");
         let vk_bytes = fs::read(&vk_path).expect("transfer v2 verifying key");
-        let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
-        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+        let mut pk_cursor = &pk_bytes[..];
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut pk_cursor).unwrap();
+        assert!(
+            pk_cursor.is_empty(),
+            "transfer v2 proving key has unconsumed trailing bytes"
+        );
+        let mut vk_cursor = &vk_bytes[..];
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_cursor).unwrap();
+        assert!(
+            vk_cursor.is_empty(),
+            "transfer v2 verifying key has unconsumed trailing bytes"
+        );
         (pk, vk)
     } else {
         // Setup against the fixed 2-in/2-out, full-depth shape.
@@ -108,6 +118,15 @@ fn main() {
         let mut pk_bytes = Vec::new();
         pk.serialize_compressed(&mut pk_bytes).unwrap();
         fs::write("keys/transfer_v2_proving.key", &pk_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata("keys/transfer_v2_proving.key")
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions("keys/transfer_v2_proving.key", perms).unwrap();
+        }
         let mut vk_bytes = Vec::new();
         vk.serialize_compressed(&mut vk_bytes).unwrap();
         fs::write("keys/transfer_v2_verifying.key", &vk_bytes).unwrap();
