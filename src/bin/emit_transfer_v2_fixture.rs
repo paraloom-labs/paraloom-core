@@ -33,6 +33,28 @@ fn fr_to_le(f: &Fr) -> [u8; 32] {
     out
 }
 
+fn write_proving_key(path: impl AsRef<std::path::Path>, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(data)?;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
+    }
+}
+
 fn rust_bytes(name: &str, b: &[u8]) {
     print!("pub const {name}: [u8; {}] = [", b.len());
     for (i, x) in b.iter().enumerate() {
@@ -82,8 +104,22 @@ fn main() {
     let (pk, vk) = if let Some((pk_path, vk_path)) = env_keys {
         let pk_bytes = fs::read(&pk_path).expect("transfer v2 proving key");
         let vk_bytes = fs::read(&vk_path).expect("transfer v2 verifying key");
-        let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
-        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+        let mut pk_cursor = std::io::Cursor::new(&pk_bytes);
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut pk_cursor)
+            .expect("deserialize proving key");
+        assert_eq!(
+            pk_cursor.position() as usize,
+            pk_bytes.len(),
+            "trailing bytes in proving key"
+        );
+        let mut vk_cursor = std::io::Cursor::new(&vk_bytes);
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_cursor)
+            .expect("deserialize verifying key");
+        assert_eq!(
+            vk_cursor.position() as usize,
+            vk_bytes.len(),
+            "trailing bytes in verifying key"
+        );
         (pk, vk)
     } else {
         // Setup against the fixed 2-in/2-out, full-depth shape.
@@ -107,7 +143,7 @@ fn main() {
         fs::create_dir_all("keys").unwrap();
         let mut pk_bytes = Vec::new();
         pk.serialize_compressed(&mut pk_bytes).unwrap();
-        fs::write("keys/transfer_v2_proving.key", &pk_bytes).unwrap();
+        write_proving_key("keys/transfer_v2_proving.key", &pk_bytes).unwrap();
         let mut vk_bytes = Vec::new();
         vk.serialize_compressed(&mut vk_bytes).unwrap();
         fs::write("keys/transfer_v2_verifying.key", &vk_bytes).unwrap();
