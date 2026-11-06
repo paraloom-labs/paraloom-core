@@ -70,7 +70,7 @@ impl ValidatorCapacity {
     /// Check if validator is alive (heartbeat within last 30 seconds)
     pub fn is_alive(&self) -> bool {
         let now = current_timestamp();
-        now - self.last_heartbeat < 30_000 // 30 seconds
+        now.saturating_sub(self.last_heartbeat) < 30_000 // 30 seconds
     }
 }
 
@@ -116,7 +116,7 @@ impl JobManager {
     }
 
     /// Register a validator with the manager
-    pub fn register_validator(&self, capacity: ValidatorCapacity) -> Result<()> {
+    pub fn register_validator(&self, mut capacity: ValidatorCapacity) -> Result<()> {
         let validator_id = capacity.validator_id.clone();
 
         info!(
@@ -125,6 +125,9 @@ impl JobManager {
         );
 
         let mut validators = self.validators.lock().unwrap();
+        if let Some(existing) = validators.get(&validator_id) {
+            capacity.active_jobs = existing.active_jobs;
+        }
         validators.insert(validator_id, capacity);
 
         Ok(())
@@ -244,8 +247,8 @@ impl JobManager {
         );
 
         // Update validator active jobs
-        let assignments = self.assignments.lock().unwrap();
-        if let Some(assignment) = assignments.get(&job_id) {
+        let mut assignments = self.assignments.lock().unwrap();
+        if let Some(assignment) = assignments.remove(&job_id) {
             let mut validators = self.validators.lock().unwrap();
             if let Some(validator) = validators.get_mut(&assignment.validator_id) {
                 validator.active_jobs = validator.active_jobs.saturating_sub(1);
@@ -323,7 +326,7 @@ impl JobManager {
         let mut removed = 0;
 
         validators.retain(|id, v| {
-            let age = now - v.last_heartbeat;
+            let age = now.saturating_sub(v.last_heartbeat);
             if age > 60_000 {
                 // 60 seconds
                 warn!(
@@ -483,5 +486,99 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_is_alive_handles_future_timestamp_without_underflow() {
+        let mut capacity = ValidatorCapacity::new("test".to_string(), 4, 8192, 2);
+        // Simulate clock skew / future timestamp: last_heartbeat > now
+        capacity.last_heartbeat = current_timestamp() + 60_000;
+        assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_cleanup_stale_validators_handles_future_timestamp_without_underflow() {
+        let manager = JobManager::new();
+        let mut capacity = ValidatorCapacity::new("future_val".to_string(), 4, 8192, 2);
+        capacity.last_heartbeat = current_timestamp() + 60_000;
+        manager.register_validator(capacity).unwrap();
+
+        // Must not panic on timestamp underflow
+        let removed = manager.cleanup_stale_validators();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_submit_result_removes_assignment_and_prevents_duplicate_decrement() {
+        let manager = JobManager::new();
+        let capacity = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        manager.register_validator(capacity).unwrap();
+
+        let job = ComputeJob::new(vec![1, 2, 3], vec![], ResourceLimits::default());
+        let job_id = job.id.clone();
+        manager.submit_job(job).unwrap();
+
+        let assignments = manager.assign_jobs().unwrap();
+        assert_eq!(assignments.len(), 1);
+
+        {
+            let validators = manager.validators.lock().unwrap();
+            assert_eq!(validators.get("v1").unwrap().active_jobs, 1);
+        }
+
+        // First submit_result removes assignment and decrements active_jobs to 0
+        let result = JobResult {
+            job_id: job_id.clone(),
+            status: JobStatus::Completed,
+            output_data: Some(vec![42]),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1024,
+            instructions_executed: 500,
+        };
+        manager.submit_result(result.clone()).unwrap();
+
+        {
+            let assignments = manager.assignments.lock().unwrap();
+            assert!(!assignments.contains_key(&job_id));
+            let validators = manager.validators.lock().unwrap();
+            assert_eq!(validators.get("v1").unwrap().active_jobs, 0);
+        }
+
+        // Duplicate submit_result for same job should be idempotent (not decrement again)
+        manager.submit_result(result).unwrap();
+
+        {
+            let validators = manager.validators.lock().unwrap();
+            assert_eq!(validators.get("v1").unwrap().active_jobs, 0);
+        }
+    }
+
+    #[test]
+    fn test_register_validator_preserves_active_jobs_on_update() {
+        let manager = JobManager::new();
+        let capacity = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        manager.register_validator(capacity).unwrap();
+
+        let job = ComputeJob::new(vec![1, 2, 3], vec![], ResourceLimits::default());
+        manager.submit_job(job).unwrap();
+        let assignments = manager.assign_jobs().unwrap();
+        assert_eq!(assignments.len(), 1);
+
+        {
+            let validators = manager.validators.lock().unwrap();
+            assert_eq!(validators.get("v1").unwrap().active_jobs, 1);
+        }
+
+        // Re-register validator with updated capacity (e.g. 8 cores)
+        let updated_capacity = ValidatorCapacity::new("v1".to_string(), 8, 16384, 4);
+        manager.register_validator(updated_capacity).unwrap();
+
+        {
+            let validators = manager.validators.lock().unwrap();
+            let v = validators.get("v1").unwrap();
+            assert_eq!(v.cpu_cores, 8);
+            assert_eq!(v.active_jobs, 1); // preserved!
+        }
     }
 }
