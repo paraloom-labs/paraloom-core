@@ -76,6 +76,9 @@ impl AttestedChannelKey {
     /// when verification fails, so a caller can never accidentally seal to an
     /// unattested key.
     pub fn verify<V: AttestationVerifier>(&self, verifier: &V) -> Option<[u8; 32]> {
+        if self.channel_pubkey == [0u8; 32] {
+            return None;
+        }
         if verifier.verify(&self.attestation, &self.channel_pubkey) {
             Some(self.channel_pubkey)
         } else {
@@ -143,6 +146,9 @@ impl InferencePayload {
         }
         let mut reply_to = [0u8; 32];
         reply_to.copy_from_slice(&b[..32]);
+        if reply_to == [0u8; 32] {
+            return None;
+        }
         Some(Self {
             reply_to,
             prompt: b[32..].to_vec(),
@@ -158,6 +164,9 @@ pub fn seal_request<V: AttestationVerifier>(
     verifier: &V,
     payload: &InferencePayload,
 ) -> Option<EncryptedNote> {
+    if payload.reply_to == [0u8; 32] {
+        return None;
+    }
     let pubkey = key.verify(verifier)?;
     Some(seal(&pubkey, &payload.to_bytes()))
 }
@@ -346,5 +355,27 @@ mod tests {
             .handle(&sealed_req)
             .expect("no model error")
             .is_none());
+    }
+
+    #[test]
+    fn all_zero_channel_or_reply_keys_are_rejected() {
+        let verifier = MockVerifier {
+            accept: b"good-report".to_vec(),
+        };
+        let zero_key = AttestedChannelKey {
+            channel_pubkey: [0u8; 32],
+            attestation: b"good-report".to_vec(),
+        };
+        assert!(zero_key.verify(&verifier).is_none());
+        assert!(seal_prompt(&zero_key, &verifier, b"secret").is_none());
+
+        let enclave = EnclaveChannel::generate();
+        let valid_key = attested(&enclave, b"good-report");
+        let bad_payload = InferencePayload {
+            prompt: b"hello".to_vec(),
+            reply_to: [0u8; 32],
+        };
+        assert!(seal_request(&valid_key, &verifier, &bad_payload).is_none());
+        assert!(InferencePayload::from_bytes(&[0u8; 40]).is_none());
     }
 }

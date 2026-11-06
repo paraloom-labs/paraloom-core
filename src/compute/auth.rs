@@ -91,24 +91,31 @@ impl ComputeAuthPolicy {
         submitter: &NodeId,
         requested: &ResourceLimits,
     ) -> Result<(), ComputeAuthError> {
+        if submitter.0.is_empty() {
+            return Err(ComputeAuthError::UnauthorizedSubmitter(submitter.clone()));
+        }
         if let Some(allowed) = &self.authorized_submitters {
             if !allowed.contains(submitter) {
                 return Err(ComputeAuthError::UnauthorizedSubmitter(submitter.clone()));
             }
         }
-        if requested.max_memory_bytes > self.max_limits.max_memory_bytes {
+        if requested.max_memory_bytes == 0
+            || requested.max_memory_bytes > self.max_limits.max_memory_bytes
+        {
             return Err(ComputeAuthError::MemoryTooHigh {
                 requested: requested.max_memory_bytes,
                 max: self.max_limits.max_memory_bytes,
             });
         }
-        if requested.max_instructions > self.max_limits.max_instructions {
+        if requested.max_instructions == 0
+            || requested.max_instructions > self.max_limits.max_instructions
+        {
             return Err(ComputeAuthError::InstructionsTooHigh {
                 requested: requested.max_instructions,
                 max: self.max_limits.max_instructions,
             });
         }
-        if requested.timeout_secs > self.max_limits.timeout_secs {
+        if requested.timeout_secs == 0 || requested.timeout_secs > self.max_limits.timeout_secs {
             return Err(ComputeAuthError::TimeoutTooHigh {
                 requested: requested.timeout_secs,
                 max: self.max_limits.timeout_secs,
@@ -225,6 +232,36 @@ mod tests {
         assert!(matches!(
             policy.authorize(&node(1), &over),
             Err(ComputeAuthError::UnauthorizedSubmitter(_))
+        ));
+    }
+
+    #[test]
+    fn empty_submitter_and_zero_limits_are_rejected() {
+        let policy = ComputeAuthPolicy::open();
+        assert!(matches!(
+            policy.authorize(&NodeId(vec![]), &small_request()),
+            Err(ComputeAuthError::UnauthorizedSubmitter(_))
+        ));
+
+        let mut zero_mem = small_request();
+        zero_mem.max_memory_bytes = 0;
+        assert!(matches!(
+            policy.authorize(&node(1), &zero_mem),
+            Err(ComputeAuthError::MemoryTooHigh { .. })
+        ));
+
+        let mut zero_inst = small_request();
+        zero_inst.max_instructions = 0;
+        assert!(matches!(
+            policy.authorize(&node(1), &zero_inst),
+            Err(ComputeAuthError::InstructionsTooHigh { .. })
+        ));
+
+        let mut zero_time = small_request();
+        zero_time.timeout_secs = 0;
+        assert!(matches!(
+            policy.authorize(&node(1), &zero_time),
+            Err(ComputeAuthError::TimeoutTooHigh { .. })
         ));
     }
 }

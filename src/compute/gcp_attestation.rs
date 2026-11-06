@@ -92,6 +92,12 @@ impl GcpConfidentialSpaceVerifier {
 
 impl AttestationVerifier for GcpConfidentialSpaceVerifier {
     fn verify(&self, attestation: &[u8], channel_pubkey: &[u8; 32]) -> bool {
+        if channel_pubkey == &[0u8; 32]
+            || self.audience.trim().is_empty()
+            || self.expected_image_digest.trim().is_empty()
+        {
+            return false;
+        }
         let Ok(token) = std::str::from_utf8(attestation) else {
             return false;
         };
@@ -142,8 +148,14 @@ pub async fn fetch_google_signing_keys() -> anyhow::Result<HashMap<String, Decod
     struct Oidc {
         jwks_uri: String,
     }
-    let oidc: Oidc = reqwest::get(CS_OIDC_CONFIG).await?.json().await?;
-    let jwks: jsonwebtoken::jwk::JwkSet = reqwest::get(&oidc.jwks_uri).await?.json().await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let oidc: Oidc = client.get(CS_OIDC_CONFIG).send().await?.json().await?;
+    if !oidc.jwks_uri.starts_with("https://") {
+        anyhow::bail!("refusing non-HTTPS jwks_uri: {}", oidc.jwks_uri);
+    }
+    let jwks: jsonwebtoken::jwk::JwkSet = client.get(&oidc.jwks_uri).send().await?.json().await?;
 
     let mut keys = HashMap::new();
     for jwk in &jwks.keys {
@@ -152,6 +164,9 @@ pub async fn fetch_google_signing_keys() -> anyhow::Result<HashMap<String, Decod
                 keys.insert(kid, key);
             }
         }
+    }
+    if keys.is_empty() {
+        anyhow::bail!("JWKS response contained no usable signing keys");
     }
     Ok(keys)
 }
