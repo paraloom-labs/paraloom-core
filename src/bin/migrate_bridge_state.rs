@@ -24,6 +24,9 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
+const BRIDGE_STATE_DISC: [u8; 8] = [6, 190, 226, 198, 76, 100, 157, 198];
+const BRIDGE_STATE_LEN: usize = 121;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -32,34 +35,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program_id = Pubkey::from_str(&std::env::var("SOLANA_PROGRAM_ID")?)?;
     let authority = load_keypair_from_file(&std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?)?;
     let deposit_cap: Option<u64> = match std::env::var("DEPOSIT_CAP") {
-        Ok(s) => Some(s.parse()?),
-        Err(_) => None,
+        Ok(s) if !s.trim().is_empty() => Some(s.trim().parse()?),
+        _ => None,
     };
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
     let (bridge_state, _) = derive_bridge_state(&program_id);
-    let len = client.get_account(&bridge_state)?.data.len();
+    let acc = client.get_account(&bridge_state)?;
+    if acc.owner != program_id {
+        return Err(format!(
+            "bridge_state {bridge_state} is owned by {}, expected program {program_id}",
+            acc.owner
+        )
+        .into());
+    }
+    if acc.data.len() < 8 || acc.data[0..8] != BRIDGE_STATE_DISC {
+        return Err("bridge_state account has an invalid Anchor discriminator".into());
+    }
+    let len = acc.data.len();
 
     println!("=== migrate bridge state ===");
     println!("Program:       {program_id}");
     println!("Authority:     {}", authority.pubkey());
     println!("Bridge state:  {bridge_state} (len {len})");
 
-    // Grow the account (idempotent: the on-chain handler no-ops once at the
-    // current length).
-    let ix = create_migrate_bridge_state_instruction(&program_id, &authority.pubkey())?;
-    let blockhash = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&authority.pubkey()),
-        &[&authority],
-        blockhash,
-    );
-    println!("\nSending migrate_bridge_state...");
-    let sig = client.send_and_confirm_transaction(&tx)?;
-    println!("Migrated. Signature: {sig}");
-    println!("New len: {}", client.get_account(&bridge_state)?.data.len());
+    if len < BRIDGE_STATE_LEN {
+        let ix = create_migrate_bridge_state_instruction(&program_id, &authority.pubkey())?;
+        let blockhash = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&authority.pubkey()),
+            &[&authority],
+            blockhash,
+        );
+        println!("\nSending migrate_bridge_state...");
+        let sig = client.send_and_confirm_transaction(&tx)?;
+        println!("Migrated. Signature: {sig}");
+        let new_len = client.get_account(&bridge_state)?.data.len();
+        println!("New len: {new_len}");
+        if new_len < BRIDGE_STATE_LEN {
+            return Err(format!(
+                "bridge_state migration incomplete: len {new_len} < {BRIDGE_STATE_LEN}"
+            )
+            .into());
+        }
+    } else {
+        println!("\nBridgeState is already migrated (len {len} >= {BRIDGE_STATE_LEN}); skipping migrate_bridge_state tx.");
+    }
 
     if let Some(cap) = deposit_cap {
         let ix = create_set_deposit_cap_instruction(&program_id, &authority.pubkey(), cap);
@@ -73,8 +96,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nSetting deposit cap to {cap} lamports...");
         let sig = client.send_and_confirm_transaction(&tx)?;
         println!("Deposit cap set. Signature: {sig}");
+        let post_data = client.get_account_data(&bridge_state)?;
+        if post_data.len() < BRIDGE_STATE_LEN {
+            return Err("bridge_state account too short after set_deposit_cap".into());
+        }
+        let onchain_cap = u64::from_le_bytes(post_data[113..121].try_into()?);
+        if onchain_cap != cap {
+            return Err(format!(
+                "on-chain deposit_cap ({onchain_cap}) does not match requested cap ({cap})"
+            )
+            .into());
+        }
     } else {
-        println!("\nDEPOSIT_CAP not set — cap stays 0 (closed). Set it deliberately later.");
+        println!("\nDEPOSIT_CAP not set — cap stays unchanged. Set it deliberately later.");
     }
 
     Ok(())

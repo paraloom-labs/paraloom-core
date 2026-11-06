@@ -228,8 +228,39 @@ impl Settings {
     /// Load settings from a file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let settings = toml::from_str(&content)?;
+        let settings: Self = toml::from_str(&content)?;
+        settings.validate()?;
         Ok(settings)
+    }
+
+    /// Validate semantic constraints on parsed settings.
+    pub fn validate(&self) -> Result<()> {
+        if self.network.listen_address.trim().is_empty() {
+            anyhow::bail!("network.listen_address must not be empty");
+        }
+        if self.storage.data_dir.trim().is_empty() {
+            anyhow::bail!("storage.data_dir must not be empty");
+        }
+        if self.node.max_cpu_usage > 100 {
+            anyhow::bail!(
+                "node.max_cpu_usage ({}) must be <= 100",
+                self.node.max_cpu_usage
+            );
+        }
+        if self.node.max_memory_usage > 100 {
+            anyhow::bail!(
+                "node.max_memory_usage ({}) must be <= 100",
+                self.node.max_memory_usage
+            );
+        }
+        match self.node.node_type.as_str() {
+            "ResourceProvider" | "Coordinator" | "Bridge" => {}
+            other => anyhow::bail!(
+                "invalid node.node_type '{}': expected ResourceProvider, Coordinator, or Bridge",
+                other
+            ),
+        }
+        Ok(())
     }
 
     /// Create development settings
@@ -466,5 +497,27 @@ mod tests {
             s.network.relay_address.as_deref(),
             Some("/ip4/203.0.113.5/tcp/9300/p2p/12D3KooWtest")
         );
+    }
+
+    #[test]
+    fn settings_validate_rejects_invalid_percentages_and_node_type() {
+        let mut s = Settings::development();
+        assert!(s.validate().is_ok());
+
+        s.node.max_cpu_usage = 101;
+        assert!(s.validate().is_err());
+        s.node.max_cpu_usage = 80;
+
+        s.node.max_memory_usage = 150;
+        assert!(s.validate().is_err());
+        s.node.max_memory_usage = 70;
+
+        s.node.node_type = "InvalidRole".to_string();
+        assert!(s.validate().is_err());
+        s.node.node_type = "Coordinator".to_string();
+        assert!(s.validate().is_ok());
+
+        s.network.listen_address = "   ".to_string();
+        assert!(s.validate().is_err());
     }
 }

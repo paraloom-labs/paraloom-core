@@ -26,11 +26,17 @@ pub struct ComputeStorage {
 impl ComputeStorage {
     /// Open compute storage with column families
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        info!("Opening compute storage at {:?}", path.as_ref());
+        let path_ref = path.as_ref();
+        if path_ref.as_os_str().is_empty() {
+            return Err(anyhow!("compute storage path must not be empty"));
+        }
+        info!("Opening compute storage at {:?}", path_ref);
 
         // Create directory if it doesn't exist
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path_ref.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         // Configure RocksDB options
@@ -337,8 +343,9 @@ mod tests {
 
     #[test]
     fn test_storage_creation() {
+        assert!(ComputeStorage::open("").is_err());
         let dir = tempdir().unwrap();
-        let storage = ComputeStorage::open(dir.path().join("compute"));
+        let storage = ComputeStorage::open(dir.path().join("nested").join("compute"));
         assert!(storage.is_ok());
     }
 
