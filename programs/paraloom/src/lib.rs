@@ -678,6 +678,10 @@ pub mod paraloom_program {
                     fee,
                     ctx.accounts.mint.decimals,
                 )?;
+                validator_account.total_earnings = validator_account
+                    .total_earnings
+                    .checked_add(fee)
+                    .ok_or(BridgeError::InvalidAmount)?;
             }
         }
 
@@ -2174,15 +2178,22 @@ pub struct InitializeValidatorRegistry<'info> {
 /// Accounts for [`init_stake_token_vault`] — the dual-stake vault migration for a
 /// registry that predates the vault. Mirrors the vault-creation half of
 /// [`InitializeValidatorRegistry`] (same seeds, same authority PDA, same
-/// interface token program) but takes no `validator_registry`, so it runs
-/// against a registry whose PDA already exists.
+/// interface token program) against a registry whose PDA already exists,
+/// verifying that the vault's mint matches the registry's pinned `stake_mint`.
 #[derive(Accounts)]
 pub struct InitStakeTokenVault<'info> {
+    #[account(
+        seeds = [b"validator_registry"],
+        bump
+    )]
+    pub validator_registry: Account<'info, ValidatorRegistry>,
+
     #[account(mut)]
     pub authority: Signer<'info>,
 
     /// The dual-stake mint the vault holds. Must match the mint
     /// `reset_validator_registry` pins into the registry.
+    #[account(address = validator_registry.stake_mint)]
     pub stake_mint: InterfaceAccount<'info, Mint>,
 
     /// Shared vault holding every validator's locked token stake, owned by the
