@@ -153,15 +153,25 @@ impl ShieldedPool {
 
         // Credit this asset's supply
         let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
+        let current_supply = supplies.get(&asset_id).copied().unwrap_or(0);
+        let new_supply = current_supply
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("shielded asset supply overflow"))?;
+        if new_supply > 0 {
+            supplies.insert(asset_id, new_supply);
+        }
 
         // Persist the asset's supply to storage if available
         if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
+            storage.set_asset_supply(&asset_id, new_supply)?;
         }
 
         Ok(commitment)
+    }
+
+    /// Whether `commitment` has already been credited to this pool.
+    pub async fn is_deposited(&self, commitment: &Commitment) -> bool {
+        self.deposited.read().await.contains(commitment)
     }
 
     /// Get the current Merkle root
@@ -242,7 +252,13 @@ impl ShieldedPool {
     /// Snapshot every asset's shielded supply (#236). Assets with a zero
     /// balance are omitted.
     pub async fn all_supplies(&self) -> HashMap<AssetId, u64> {
-        self.supplies.read().await.clone()
+        self.supplies
+            .read()
+            .await
+            .iter()
+            .filter(|(_, &v)| v > 0)
+            .map(|(k, v)| (*k, *v))
+            .collect()
     }
 
     /// Get number of commitments in the pool
@@ -487,5 +503,35 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn credit_commitment_rejects_supply_overflow_and_omits_zero_supplies() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([3u8; 32]);
+        let asset: AssetId = [0xAAu8; 32];
+
+        let zero_note = Note::new(addr.clone(), 0, [1u8; 32], asset);
+        pool.credit_commitment(zero_note.commitment(), zero_note, 0, asset)
+            .await
+            .unwrap();
+        assert!(
+            !pool.all_supplies().await.contains_key(&asset),
+            "zero-balance assets must be omitted from all_supplies"
+        );
+
+        let max_note = Note::new(addr.clone(), u64::MAX, [2u8; 32], asset);
+        pool.credit_commitment(max_note.commitment(), max_note, u64::MAX, asset)
+            .await
+            .unwrap();
+
+        let overflow_note = Note::new(addr, 1, [3u8; 32], asset);
+        assert!(
+            pool.credit_commitment(overflow_note.commitment(), overflow_note, 1, asset)
+                .await
+                .is_err(),
+            "supply overflow must return an error"
+        );
+        assert_eq!(pool.supply_of(asset).await, u64::MAX);
     }
 }
