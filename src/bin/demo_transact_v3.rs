@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     let (vault_pda, _) = derive_bridge_vault(&program_id);
-    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (tree_pda, _) = derive_merkle_tree(&program_id);
 
     // ── 1. deposit_note: 0.1 SOL as a fresh v3 note ─────────────────────────
     const AMOUNT: u64 = 100_000_000; // 0.1 SOL
@@ -264,10 +264,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proof": hex::encode(&proof_bytes),
         "ciphertexts": [placeholder_0, placeholder_1],
     });
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
-        .json(&body)
-        .send()?;
+    let client_http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let url = format!("{}/transact/submit", ingress.trim_end_matches('/'));
+    let mut req = client_http.post(url).json(&body);
+    if let Some(token) = paraloom::relayer::transact_submit::resolve_ingress_token_from_env() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send()?;
     let status = resp.status();
     let text = resp.text()?;
     println!("      {status}: {text}");

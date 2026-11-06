@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let balance = client.get_balance(&authority.pubkey())?;
     println!("Authority Balance: {} SOL\n", balance as f64 / 1e9);
 
-    let (tree_pda, _bump) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (tree_pda, _bump) = derive_merkle_tree(&program_id);
     println!("Merkle Tree PDA: {}\n", tree_pda);
 
     if client.get_account(&tree_pda).is_ok() {
