@@ -10,7 +10,7 @@
 
 use ark_bn254::Bn254;
 use ark_bn254::Fr;
-use ark_ff::PrimeField;
+use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalDeserialize;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -29,6 +29,16 @@ use crate::relayer::transact_submit;
 
 /// Default settlement poll timeout (matches the demo's 120s window).
 const SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn is_canonical_bn254_scalar(bytes: &[u8; 32]) -> bool {
+    let le = Fr::from_le_bytes_mod_order(bytes)
+        .into_bigint()
+        .to_bytes_le();
+    let mut canonical = [0u8; 32];
+    let n = le.len().min(32);
+    canonical[..n].copy_from_slice(&le[..n]);
+    &canonical == bytes
+}
 
 /// Settles the relayer's on-chain legs against a live Solana RPC + transact
 /// ingress. Cloneable config is moved into the blocking tasks that run the
@@ -52,8 +62,15 @@ impl OnChainSubmitter {
     ) -> Result<Self> {
         let bytes = std::fs::read(proving_key_path.as_ref())
             .map_err(|e| RelayerError::SubmissionFailed(format!("read proving key: {e}")))?;
-        let pk = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
+        let mut reader = &bytes[..];
+        let pk = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&mut reader)
             .map_err(|e| RelayerError::SubmissionFailed(format!("decode proving key: {e}")))?;
+        if !reader.is_empty() {
+            return Err(RelayerError::SubmissionFailed(format!(
+                "proving key has {} trailing byte(s)",
+                reader.len()
+            )));
+        }
         Ok(Self {
             program_id,
             rpc_url: rpc_url.into(),
@@ -83,6 +100,14 @@ impl Submitter for OnChainSubmitter {
         if !matches!(leg, WithdrawLeg::Native) {
             return Err(RelayerError::SubmissionFailed(
                 "SPL withdraw is unavailable on the native-only v3 program".to_string(),
+            ));
+        }
+        if amount == 0 {
+            return Err(RelayerError::InvalidAmount(0));
+        }
+        if fresh_address == [0u8; 32] {
+            return Err(RelayerError::SubmissionFailed(
+                "fresh_address must not be the all-zero system program address".to_string(),
             ));
         }
         let program_id = self.program_id;
@@ -163,6 +188,19 @@ impl Submitter for OnChainSubmitter {
                     .to_string(),
             ));
         }
+        if amount == 0 {
+            return Err(RelayerError::InvalidAmount(0));
+        }
+        if !is_canonical_bn254_scalar(&recipient.0) {
+            return Err(RelayerError::SubmissionFailed(
+                "re-shield recipient pubkey is not a canonical BN254 field element".to_string(),
+            ));
+        }
+        if !is_canonical_bn254_scalar(&randomness) {
+            return Err(RelayerError::SubmissionFailed(
+                "re-shield randomness is not a canonical BN254 field element".to_string(),
+            ));
+        }
         let program_id = self.program_id;
         let fresh_address = signer.pubkey().to_bytes();
         let signer = signer.insecure_clone();
@@ -197,5 +235,32 @@ impl Submitter for OnChainSubmitter {
             fresh_address,
             signature: sig,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_bn254_scalar_rejects_above_modulus() {
+        let mut small = [0u8; 32];
+        small[0] = 42;
+        assert!(is_canonical_bn254_scalar(&small));
+        assert!(!is_canonical_bn254_scalar(&[0xFFu8; 32]));
+    }
+
+    #[test]
+    fn onchain_submitter_new_rejects_corrupted_proving_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("bad.key");
+        std::fs::write(&bad_path, b"not-a-valid-key").unwrap();
+        let res = OnChainSubmitter::new(
+            "http://127.0.0.1:8899",
+            Pubkey::new_unique(),
+            "http://127.0.0.1:9091",
+            &bad_path,
+        );
+        assert!(matches!(res, Err(RelayerError::SubmissionFailed(_))));
     }
 }

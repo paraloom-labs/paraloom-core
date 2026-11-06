@@ -51,19 +51,44 @@ pub fn save_keypair_to_file(keypair: &Keypair, path: &str) -> Result<()> {
     let json = serde_json::to_string(&bytes.to_vec())
         .map_err(|e| BridgeError::ConfigError(format!("Failed to serialize keypair: {}", e)))?;
 
-    fs::write(path, json)
-        .map_err(|e| BridgeError::ConfigError(format!("Failed to write keypair file: {}", e)))?;
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                BridgeError::ConfigError(format!(
+                    "Failed to create keypair parent directory: {}",
+                    e
+                ))
+            })?;
+        }
+    }
 
-    // The file holds the secret key — restrict it to the owner (0600) so it is
-    // never left world-readable at the process umask.
+    // The file holds the secret key — restrict it to the owner (0600) from creation
+    // so it is never left world-readable at the process umask.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| BridgeError::ConfigError(format!("Failed to write keypair file: {}", e)))?;
+        file.write_all(json.as_bytes()).map_err(|e| {
+            BridgeError::ConfigError(format!("Failed to write keypair file: {}", e))
+        })?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
             BridgeError::ConfigError(format!(
                 "Failed to restrict keypair file permissions: {}",
                 e
             ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, json).map_err(|e| {
+            BridgeError::ConfigError(format!("Failed to write keypair file: {}", e))
         })?;
     }
 
@@ -113,5 +138,16 @@ mod tests {
     fn test_load_nonexistent_file() {
         let result = load_keypair_from_file("/nonexistent/path/keypair.json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_keypair_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("keypair.json");
+        let path_str = nested.to_str().unwrap();
+        let kp = generate_keypair();
+        save_keypair_to_file(&kp, path_str).unwrap();
+        let loaded = load_keypair_from_file(path_str).unwrap();
+        assert_eq!(kp.pubkey(), loaded.pubkey());
     }
 }
