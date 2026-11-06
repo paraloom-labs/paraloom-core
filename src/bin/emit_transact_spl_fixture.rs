@@ -144,10 +144,20 @@ fn main() {
     use ark_serialize::CanonicalDeserialize;
     let pk_bytes = std::fs::read(&pk_path).expect("read transact v3 proving key (ceremony)");
     let vk_bytes = std::fs::read(&vk_path).expect("read transact v3 verifying key (ceremony)");
-    let pk = ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&pk_bytes[..])
+    let mut pk_cursor = &pk_bytes[..];
+    let pk = ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&mut pk_cursor)
         .expect("deserialize proving key");
-    let vk = ark_groth16::VerifyingKey::<ark_bn254::Bn254>::deserialize_compressed(&vk_bytes[..])
+    assert!(
+        pk_cursor.is_empty(),
+        "proving key has unconsumed trailing bytes"
+    );
+    let mut vk_cursor = &vk_bytes[..];
+    let vk = ark_groth16::VerifyingKey::<ark_bn254::Bn254>::deserialize_compressed(&mut vk_cursor)
         .expect("deserialize verifying key");
+    assert!(
+        vk_cursor.is_empty(),
+        "verifying key has unconsumed trailing bytes"
+    );
     eprintln!("loaded ceremony keys from {pk_path}");
 
     let mut rng = ark_std::rand::thread_rng();
