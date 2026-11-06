@@ -118,7 +118,11 @@ pub fn compressed_proof_to_onchain_bytes(
     compressed: &[u8],
 ) -> Result<[u8; 256], ark_serialize::SerializationError> {
     use ark_serialize::CanonicalDeserialize;
-    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(compressed)?;
+    let mut cursor = compressed;
+    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(&mut cursor)?;
+    if !cursor.is_empty() {
+        return Err(ark_serialize::SerializationError::InvalidData);
+    }
     Ok(proof_to_onchain_bytes(&proof))
 }
 
@@ -212,7 +216,10 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         public_inputs: &'a [[u8; 32]; NR_INPUTS],
         verifyingkey: &'a Groth16Verifyingkey<'a>,
     ) -> Result<Groth16Verifier<'a, NR_INPUTS>, Groth16Error> {
-        if public_inputs.len() + 1 != verifyingkey.vk_ic.len() {
+        if verifyingkey.vk_ic.is_empty()
+            || verifyingkey.nr_pubinputs != public_inputs.len()
+            || public_inputs.len().checked_add(1) != Some(verifyingkey.vk_ic.len())
+        {
             return Err(Groth16Error::InvalidPublicInputsLength);
         }
         Ok(Groth16Verifier {
@@ -376,6 +383,27 @@ mod tests {
         assert!(
             !verify(&wire_proof, &bad_dest, &vk_view),
             "a proof bound to one ext_data_hash must not verify against another"
+        );
+
+        // Trailing bytes on compressed_proof_to_onchain_bytes must be rejected.
+        let mut compressed = Vec::new();
+        proof.serialize_compressed(&mut compressed).unwrap();
+        assert_eq!(
+            compressed_proof_to_onchain_bytes(&compressed).unwrap(),
+            wire_proof.to_bytes()
+        );
+        compressed.push(0x99);
+        assert!(
+            compressed_proof_to_onchain_bytes(&compressed).is_err(),
+            "trailing bytes after compressed proof must be rejected"
+        );
+
+        // Groth16Verifier::new must reject mismatched nr_pubinputs or empty vk_ic.
+        let mut bad_vk = vk_view;
+        bad_vk.nr_pubinputs = 4;
+        assert_eq!(
+            Groth16Verifier::new(&wire_proof.a, &wire_proof.b, &wire_proof.c, &public_inputs, &bad_vk).err(),
+            Some(Groth16Error::InvalidPublicInputsLength)
         );
     }
 

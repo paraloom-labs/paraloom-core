@@ -46,7 +46,10 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         public_inputs: &'a [[u8; 32]; NR_INPUTS],
         verifyingkey: &'a Groth16Verifyingkey<'a>,
     ) -> Result<Groth16Verifier<'a, NR_INPUTS>, Groth16Error> {
-        if public_inputs.len() + 1 != verifyingkey.vk_ic.len() {
+        if verifyingkey.vk_ic.is_empty()
+            || verifyingkey.nr_pubinputs != public_inputs.len()
+            || public_inputs.len().checked_add(1) != Some(verifyingkey.vk_ic.len())
+        {
             return Err(Groth16Error::InvalidPublicInputsLength);
         }
         Ok(Groth16Verifier {
