@@ -114,11 +114,13 @@ impl PrivateComputeJob {
 
     /// Convert to standard compute job (for execution)
     pub fn to_compute_job(&self) -> ComputeJob {
-        ComputeJob::new(
+        let mut job = ComputeJob::new(
             self.wasm_code.clone(),
             self.encrypted_input.clone(),
             self.limits.clone(),
-        )
+        );
+        job.id = self.job_id.clone();
+        job
     }
 
     /// Hash data to u64 (for commitment)
@@ -197,6 +199,13 @@ impl PrivateJobResult {
         result: JobResult,
         owner_address: &ShieldedAddress,
     ) -> Result<Self> {
+        if result.status != crate::compute::JobStatus::Completed {
+            return Err(anyhow!(
+                "Cannot create private result from non-completed job (status: {:?})",
+                result.status
+            ));
+        }
+
         let output_data = result
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
@@ -252,8 +261,16 @@ impl PrivateJobResult {
         let pk_bytes = fs::read("keys/compute_proving.key")
             .map_err(|e| anyhow!("Failed to read proving key: {}", e))?;
 
-        ark_groth16::ProvingKey::deserialize_compressed(&pk_bytes[..])
-            .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))
+        let mut reader = &pk_bytes[..];
+        let pk = ark_groth16::ProvingKey::deserialize_compressed(&mut reader)
+            .map_err(|e| anyhow!("Failed to deserialize proving key: {}", e))?;
+        if !reader.is_empty() {
+            return Err(anyhow!(
+                "Proving key file has {} trailing byte(s)",
+                reader.len()
+            ));
+        }
+        Ok(pk)
     }
 
     /// Load compute verifying key from disk
@@ -264,8 +281,16 @@ impl PrivateJobResult {
         let vk_bytes = fs::read("keys/compute_verifying.key")
             .map_err(|e| anyhow!("Failed to read verifying key: {}", e))?;
 
-        ark_groth16::VerifyingKey::deserialize_compressed(&vk_bytes[..])
-            .map_err(|e| anyhow!("Failed to deserialize verifying key: {}", e))
+        let mut reader = &vk_bytes[..];
+        let vk = ark_groth16::VerifyingKey::deserialize_compressed(&mut reader)
+            .map_err(|e| anyhow!("Failed to deserialize verifying key: {}", e))?;
+        if !reader.is_empty() {
+            return Err(anyhow!(
+                "Verifying key file has {} trailing byte(s)",
+                reader.len()
+            ));
+        }
+        Ok(vk)
     }
 
     /// Generate zkSNARK execution proof
@@ -400,10 +425,15 @@ impl PrivateJobResult {
 
             // Deserialize proof
             use ark_serialize::CanonicalDeserialize;
-            let proof = ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed(
-                proof_bytes.as_slice(),
-            )
-            .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            let mut reader = proof_bytes.as_slice();
+            let proof = ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed(&mut reader)
+                .map_err(|e| anyhow!("Proof deserialization failed: {:?}", e))?;
+            if !reader.is_empty() {
+                return Err(anyhow!(
+                    "Proof has {} unexpected trailing byte(s)",
+                    reader.len()
+                ));
+            }
 
             // Public inputs for the v0.4 ComputeCircuit shape:
             //   [code_hash_fr, input_commitment, output_commitment, input_nullifier]
@@ -1076,6 +1106,43 @@ mod tests {
         assert!(
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
+        );
+    }
+
+    #[test]
+    fn test_to_compute_job_preserves_job_id_and_from_job_result_rejects_failed_status() {
+        let wasm_code = vec![0x00, 0x61, 0x73, 0x6d];
+        let input_data = vec![1, 2, 3, 4];
+        let owner_address = ShieldedAddress([42u8; 32]);
+        let limits = ResourceLimits::default();
+
+        let private_job =
+            PrivateComputeJob::new(wasm_code, input_data, owner_address.clone(), limits).unwrap();
+        let compute_job = private_job.to_compute_job();
+        assert_eq!(
+            compute_job.id, private_job.job_id,
+            "to_compute_job must preserve the private job_id"
+        );
+
+        let failed_result = crate::compute::JobResult {
+            job_id: private_job.job_id.clone(),
+            status: crate::compute::JobStatus::Failed {
+                error: "trap".to_string(),
+            },
+            output_data: Some(vec![1, 2, 3]),
+            error: Some("trap".to_string()),
+            execution_time_ms: 10,
+            memory_used_bytes: 0,
+            instructions_executed: 0,
+        };
+        assert!(
+            PrivateJobResult::from_job_result(
+                private_job.job_id,
+                failed_result,
+                &owner_address
+            )
+            .is_err(),
+            "from_job_result must reject non-completed jobs"
         );
     }
 }
