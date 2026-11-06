@@ -1100,7 +1100,7 @@ pub mod paraloom_program {
             // the validator: registration requires `stake >= minimum_stake`, so
             // a validator below that bar must stop settling and stop counting
             // toward the BFT quorum.
-            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
+            if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake || validator_account.token_stake_amount < ctx.accounts.validator_registry.min_token_stake {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
