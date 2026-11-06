@@ -64,7 +64,7 @@ pub const MAX_DATA_SIZE: usize = 1024;
 ///
 /// Proves that input/output commitments are correctly formed
 /// without revealing the actual data.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ComputeCircuit {
     // ── Public inputs (visible on-chain) ──
     /// SHA256 hash of WASM code (32 bytes), lifted to Fr for circuit use.
@@ -128,7 +128,52 @@ impl ComputeCircuit {
         }
     }
 
-    /// Create circuit with witness data (for proving).
+    /// Create circuit with witness data (for proving), returning an error
+    /// if input or output payloads exceed [`MAX_DATA_SIZE`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_with_witness(
+        code_hash: [u8; 32],
+        input_commitment: Fr,
+        output_commitment: Fr,
+        input_nullifier: Fr,
+        input_data: Vec<u8>,
+        input_randomness: [u8; 32],
+        output_data: Vec<u8>,
+        output_randomness: [u8; 32],
+        owner_address: [u8; 32],
+        spending_key: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        if input_data.len() > MAX_DATA_SIZE {
+            anyhow::bail!(
+                "Input data too large: {} bytes (max {})",
+                input_data.len(),
+                MAX_DATA_SIZE
+            );
+        }
+        if output_data.len() > MAX_DATA_SIZE {
+            anyhow::bail!(
+                "Output data too large: {} bytes (max {})",
+                output_data.len(),
+                MAX_DATA_SIZE
+            );
+        }
+
+        Ok(Self {
+            code_hash: Some(code_hash),
+            input_commitment: Some(input_commitment),
+            output_commitment: Some(output_commitment),
+            input_nullifier: Some(input_nullifier),
+            input_data: Some(input_data),
+            input_randomness: Some(input_randomness),
+            output_data: Some(output_data),
+            output_randomness: Some(output_randomness),
+            owner_address: Some(owner_address),
+            spending_key: Some(spending_key),
+        })
+    }
+
+    /// Create circuit with witness data (for proving). Panics if payloads
+    /// exceed [`MAX_DATA_SIZE`].
     ///
     /// The host derives `input_commitment`, `output_commitment`, and
     /// `input_nullifier` via [`ComputeCircuit::compute_commitment`] and
@@ -149,21 +194,19 @@ impl ComputeCircuit {
         owner_address: [u8; 32],
         spending_key: [u8; 32],
     ) -> Self {
-        assert!(input_data.len() <= MAX_DATA_SIZE, "Input data too large");
-        assert!(output_data.len() <= MAX_DATA_SIZE, "Output data too large");
-
-        Self {
-            code_hash: Some(code_hash),
-            input_commitment: Some(input_commitment),
-            output_commitment: Some(output_commitment),
-            input_nullifier: Some(input_nullifier),
-            input_data: Some(input_data),
-            input_randomness: Some(input_randomness),
-            output_data: Some(output_data),
-            output_randomness: Some(output_randomness),
-            owner_address: Some(owner_address),
-            spending_key: Some(spending_key),
-        }
+        Self::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            input_data,
+            input_randomness,
+            output_data,
+            output_randomness,
+            owner_address,
+            spending_key,
+        )
+        .expect("with_witness failed")
     }
 
     /// Hash data to a field element via SHA-256 reduced mod the BN254
@@ -445,6 +488,57 @@ mod tests {
             cs.is_satisfied().expect("cs query"),
             "compute circuit must be satisfied by host-aligned witnesses"
         );
+    }
+
+    #[test]
+    fn test_try_with_witness_rejects_oversized_payloads() {
+        let code_hash = [1u8; 32];
+        let input_commitment = Fr::from(12345u64);
+        let output_commitment = Fr::from(67890u64);
+        let input_nullifier = Fr::from(54321u64);
+        let normal_data = vec![1, 2, 3, 4];
+        let oversized_data = vec![0u8; MAX_DATA_SIZE + 1];
+        let randomness = [42u8; 32];
+        let owner_address = [7u8; 32];
+        let spending_key = [8u8; 32];
+
+        // Oversized input
+        let res_input = ComputeCircuit::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            oversized_data.clone(),
+            randomness,
+            normal_data.clone(),
+            randomness,
+            owner_address,
+            spending_key,
+        );
+        assert!(res_input.is_err());
+        assert!(res_input
+            .unwrap_err()
+            .to_string()
+            .contains("Input data too large"));
+
+        // Oversized output
+        let res_output = ComputeCircuit::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            normal_data,
+            randomness,
+            oversized_data,
+            randomness,
+            owner_address,
+            spending_key,
+        );
+        assert!(res_output.is_err());
+        assert!(res_output
+            .unwrap_err()
+            .to_string()
+            .contains("Output data too large"));
     }
 
     // The proof-generation smoke test that previously sat here was

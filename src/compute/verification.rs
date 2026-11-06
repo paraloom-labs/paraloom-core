@@ -274,7 +274,10 @@ impl VerificationCoordinator {
         let requests = self.requests.read().await;
         let results = self.results.read().await;
 
-        let total_results: usize = results.values().map(|v| v.len()).sum();
+        let total_results: usize = results
+            .values()
+            .map(|v| v.len())
+            .fold(0usize, usize::saturating_add);
 
         // Analyze current verifications for consensus state
         let mut consensus_agreements = 0;
@@ -294,6 +297,7 @@ impl VerificationCoordinator {
                 .collect();
 
             if output_hashes.is_empty() {
+                consensus_disagreements += 1;
                 continue;
             }
 
@@ -311,8 +315,13 @@ impl VerificationCoordinator {
             }
         }
 
+        let active_request_results: usize = requests
+            .keys()
+            .map(|job_id| results.get(job_id).map(|v| v.len()).unwrap_or(0))
+            .fold(0usize, usize::saturating_add);
+
         let avg_validators = if !requests.is_empty() {
-            results.values().map(|v| v.len()).sum::<usize>() as f64 / requests.len() as f64
+            active_request_results as f64 / requests.len() as f64
         } else {
             0.0
         };
@@ -564,5 +573,66 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verification_stats_all_failed_and_orphaned_results() {
+        let coordinator = VerificationCoordinator::new();
+        let job1 = "job_failed".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job1.clone(), validators.clone())
+            .await
+            .unwrap();
+
+        // 3 validators submit results with output_data: None (failure)
+        let fail_res1 = JobResult::failure(job1.clone(), "err1".to_string(), 10);
+        let fail_res2 = JobResult::failure(job1.clone(), "err2".to_string(), 10);
+        let fail_res3 = JobResult::failure(job1.clone(), "err3".to_string(), 10);
+
+        coordinator
+            .submit_result(&job1, "v1".to_string(), fail_res1)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job1, "v2".to_string(), fail_res2)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job1, "v3".to_string(), fail_res3)
+            .await
+            .unwrap();
+
+        // Also add an orphaned result in results map (e.g. from an already completed/removed request)
+        {
+            let mut results = coordinator.results.write().await;
+            let orphan_res1 = JobResult::success("orphaned_job".to_string(), vec![1], 10, 1024, 100);
+            let orphan_res2 = JobResult::success("orphaned_job".to_string(), vec![1], 10, 1024, 100);
+            results.insert(
+                "orphaned_job".to_string(),
+                vec![
+                    ValidatorResult {
+                        validator_id: "v4".to_string(),
+                        result: orphan_res1,
+                        submitted_at: 0,
+                    },
+                    ValidatorResult {
+                        validator_id: "v5".to_string(),
+                        result: orphan_res2,
+                        submitted_at: 0,
+                    },
+                ],
+            );
+        }
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_verifications, 1);
+        assert_eq!(stats.consensus_disagreements, 1); // All-failed round counts as disagreement
+        assert_eq!(stats.consensus_agreements, 1); // Orphaned job reached consensus
+        assert_eq!(stats.insufficient_results, 0);
+        // Average validators should be computed ONLY over active requests (job1 with 3 validators),
+        // ignoring the 2 validators from the orphaned job: 3.0, not 5.0.
+        assert_eq!(stats.average_validators_per_job, 3.0);
     }
 }

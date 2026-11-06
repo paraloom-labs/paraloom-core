@@ -66,14 +66,14 @@ impl JobAssignment {
     pub fn new(job_id: JobId, validator_id: ValidatorId) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
             job_id,
             validator_id,
             assigned_at: now,
-            timeout_at: now + DEFAULT_JOB_TIMEOUT_SECS,
+            timeout_at: now.saturating_add(DEFAULT_JOB_TIMEOUT_SECS),
             retry_count: 0,
         }
     }
@@ -82,14 +82,14 @@ impl JobAssignment {
     pub fn with_timeout(job_id: JobId, validator_id: ValidatorId, timeout_secs: u64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
             job_id,
             validator_id,
             assigned_at: now,
-            timeout_at: now + timeout_secs,
+            timeout_at: now.saturating_add(timeout_secs),
             retry_count: 0,
         }
     }
@@ -98,7 +98,7 @@ impl JobAssignment {
     pub fn is_timed_out(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now >= self.timeout_at
     }
@@ -107,15 +107,15 @@ impl JobAssignment {
     pub fn retry(&self, new_validator_id: ValidatorId) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
             job_id: self.job_id.clone(),
             validator_id: new_validator_id,
             assigned_at: now,
-            timeout_at: now + DEFAULT_JOB_TIMEOUT_SECS,
-            retry_count: self.retry_count + 1,
+            timeout_at: now.saturating_add(DEFAULT_JOB_TIMEOUT_SECS),
+            retry_count: self.retry_count.saturating_add(1),
         }
     }
 }
@@ -614,8 +614,14 @@ impl JobCoordinator {
                 .values()
                 .filter(|v| v.available_capacity() > 0)
                 .count(),
-            total_capacity: validators.values().map(|v| v.max_concurrent_jobs).sum(),
-            current_load: validators.values().map(|v| v.current_load).sum(),
+            total_capacity: validators
+                .values()
+                .map(|v| v.max_concurrent_jobs)
+                .fold(0usize, usize::saturating_add),
+            current_load: validators
+                .values()
+                .map(|v| v.current_load)
+                .fold(0usize, usize::saturating_add),
             pending_assignments: pending.len(),
             active_assignments: active.len(),
             total_assignments: total_jobs,
@@ -917,5 +923,29 @@ mod tests {
         // Job should be removed from pending
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.pending_assignments, 0);
+    }
+
+    #[tokio::test]
+    async fn test_job_assignment_timeout_and_retry_overflow_safety() {
+        let assignment = JobAssignment::with_timeout("job_ovf".to_string(), "v1".to_string(), u64::MAX);
+        assert_eq!(assignment.timeout_at, u64::MAX);
+
+        let mut max_retry_assignment = assignment;
+        max_retry_assignment.retry_count = u32::MAX;
+        let retried = max_retry_assignment.retry("v2".to_string());
+        assert_eq!(retried.retry_count, u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_get_stats_saturating_capacity() {
+        let coordinator = JobCoordinator::new();
+        let capacity = ValidatorCapacity::new("v_huge".to_string(), 8, 8192, usize::MAX);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(capacity, usize::MAX))
+            .await;
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.total_capacity, usize::MAX);
+        assert_eq!(stats.current_load, usize::MAX);
     }
 }

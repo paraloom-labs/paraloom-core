@@ -78,6 +78,14 @@ impl PrivateComputeJob {
         owner_address: ShieldedAddress,
         limits: ResourceLimits,
     ) -> Result<Self> {
+        if input_data.len() > crate::compute::compute_circuit::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "input data exceeds maximum size: {} bytes (max {})",
+                input_data.len(),
+                crate::compute::compute_circuit::MAX_DATA_SIZE
+            ));
+        }
+
         use sha2::{Digest, Sha256};
 
         // Compute code hash
@@ -107,7 +115,7 @@ impl PrivateComputeJob {
             limits,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         })
     }
@@ -201,6 +209,14 @@ impl PrivateJobResult {
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
 
+        if output_data.len() > crate::compute::compute_circuit::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "output data exceeds maximum size: {} bytes (max {})",
+                output_data.len(),
+                crate::compute::compute_circuit::MAX_DATA_SIZE
+            ));
+        }
+
         // Create commitment to output
         let data_hash = PrivateComputeJob::hash_data(&output_data);
         let randomness = crate::privacy::pedersen::generate_randomness();
@@ -225,7 +241,7 @@ impl PrivateJobResult {
             instructions_executed: result.instructions_executed,
             completed_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         })
     }
@@ -283,6 +299,14 @@ impl PrivateJobResult {
         output_hash: u64,
         randomness: &[u8; 32],
     ) -> Result<Vec<u8>> {
+        if output_data.len() > crate::compute::compute_circuit::MAX_DATA_SIZE {
+            return Err(anyhow!(
+                "output data exceeds maximum size: {} bytes (max {})",
+                output_data.len(),
+                crate::compute::compute_circuit::MAX_DATA_SIZE
+            ));
+        }
+
         use sha2::{Digest, Sha256};
 
         // Check if real keys are available
@@ -324,7 +348,7 @@ impl PrivateJobResult {
                 &dummy_spending_key,
             );
 
-            let circuit = crate::compute::ComputeCircuit::with_witness(
+            let circuit = crate::compute::ComputeCircuit::try_with_witness(
                 dummy_code_hash,
                 dummy_input_commitment_fr,
                 output_commitment_fr,
@@ -335,7 +359,7 @@ impl PrivateJobResult {
                 *randomness,
                 dummy_owner,
                 dummy_spending_key,
-            );
+            )?;
 
             // Generate proof
             use ark_groth16::Groth16;
@@ -1077,5 +1101,45 @@ mod tests {
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_private_compute_job_rejects_oversized_input() {
+        let (owner_address, _) = owner_keypair();
+        let wasm_code = vec![0x00, 0x61, 0x73, 0x6d];
+        let limits = ResourceLimits::default();
+        let oversized_input = vec![0u8; crate::compute::compute_circuit::MAX_DATA_SIZE + 1];
+
+        let result = PrivateComputeJob::new(wasm_code, oversized_input, owner_address, limits);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("input data exceeds maximum size"));
+    }
+
+    #[tokio::test]
+    async fn test_private_job_result_rejects_oversized_output() {
+        use crate::compute::{JobResult, JobStatus};
+        let (owner_address, _) = owner_keypair();
+        let job_id = "test-oversized-output".to_string();
+        let oversized_output = vec![0u8; crate::compute::compute_circuit::MAX_DATA_SIZE + 1];
+
+        let job_result = JobResult {
+            job_id: job_id.clone(),
+            status: JobStatus::Completed,
+            output_data: Some(oversized_output),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1024,
+            instructions_executed: 50000,
+        };
+
+        let result = PrivateJobResult::from_job_result(job_id, job_result, &owner_address);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("output data exceeds maximum size"));
     }
 }
