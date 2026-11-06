@@ -82,8 +82,20 @@ fn main() {
     let (pk, vk) = if let Some((pk_path, vk_path)) = env_keys {
         let pk_bytes = fs::read(&pk_path).expect("transfer v2 proving key");
         let vk_bytes = fs::read(&vk_path).expect("transfer v2 verifying key");
-        let pk = ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..]).unwrap();
-        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..]).unwrap();
+        let mut pk_reader = &pk_bytes[..];
+        let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut pk_reader).unwrap();
+        assert!(
+            pk_reader.is_empty(),
+            "proving key has {} trailing byte(s)",
+            pk_reader.len()
+        );
+        let mut vk_reader = &vk_bytes[..];
+        let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_reader).unwrap();
+        assert!(
+            vk_reader.is_empty(),
+            "verifying key has {} trailing byte(s)",
+            vk_reader.len()
+        );
         (pk, vk)
     } else {
         // Setup against the fixed 2-in/2-out, full-depth shape.
@@ -108,6 +120,15 @@ fn main() {
         let mut pk_bytes = Vec::new();
         pk.serialize_compressed(&mut pk_bytes).unwrap();
         fs::write("keys/transfer_v2_proving.key", &pk_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                "keys/transfer_v2_proving.key",
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
         let mut vk_bytes = Vec::new();
         vk.serialize_compressed(&mut vk_bytes).unwrap();
         fs::write("keys/transfer_v2_verifying.key", &vk_bytes).unwrap();
