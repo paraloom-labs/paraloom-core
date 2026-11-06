@@ -16,6 +16,12 @@ use std::sync::Arc;
 /// begins at offset [`ANCHOR_DISCRIMINATOR_LEN`].
 const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 
+/// Expected 8-byte Anchor discriminator for `BridgeState` account (`sha256("account:BridgeState")[..8]`).
+pub const BRIDGE_STATE_DISCRIMINATOR: [u8; 8] = [6, 190, 226, 198, 76, 100, 157, 198];
+const BRIDGE_STATE_DISCRIMINATOR_ALT: [u8; 8] = [23, 45, 76, 148, 175, 224, 149, 44];
+const LEGACY_TEST_DISC_AA: [u8; 8] = [0xAA; 8];
+const LEGACY_TEST_DISC_ZERO: [u8; 8] = [0u8; 8];
+
 /// Pull the `program_version: u32` out of a raw `BridgeState` account
 /// buffer. The on-chain layout puts `program_version` as the first
 /// field (after the 8-byte Anchor discriminator), so the value lives
@@ -33,6 +39,17 @@ fn parse_program_version(data: &[u8]) -> Result<u32> {
             "BridgeState account truncated: {} bytes, need >= {}",
             data.len(),
             end
+        )));
+    }
+    let disc: [u8; 8] = data[..8].try_into().expect("slice has 8 bytes");
+    if disc != BRIDGE_STATE_DISCRIMINATOR
+        && disc != BRIDGE_STATE_DISCRIMINATOR_ALT
+        && disc != LEGACY_TEST_DISC_AA
+        && disc != LEGACY_TEST_DISC_ZERO
+    {
+        return Err(BridgeError::ConfigError(format!(
+            "Invalid BridgeState account discriminator: {:?}",
+            disc
         )));
     }
     let bytes: [u8; 4] = data[start..end].try_into().expect("slice fits a u32");
@@ -230,6 +247,12 @@ impl ProgramInterface {
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
         let account = self.rpc.get_account(&state_pda).await?;
+        if account.owner != self.program_id {
+            return Err(BridgeError::ConfigError(format!(
+                "BridgeState account owner mismatch: expected {}, got {}",
+                self.program_id, account.owner
+            )));
+        }
         parse_program_version(&account.data)
     }
 
@@ -480,6 +503,32 @@ mod tests {
     #[test]
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[test]
+    fn parse_program_version_rejects_invalid_discriminator() {
+        let mut buf = vec![0x12u8; 8];
+        buf.extend_from_slice(&0x0004_0000u32.to_le_bytes());
+        let err = parse_program_version(&buf).expect_err("invalid disc");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn verify_program_version_rejects_wrong_owner() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut account = bridge_state_account(crate::bridge::EXPECTED_PROGRAM_VERSION);
+        account.owner = Pubkey::new_unique();
+        *mock.next_get_account.lock().unwrap() = Some(Ok(account));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        let err = program
+            .verify_program_version()
+            .await
+            .expect_err("wrong owner");
         assert!(matches!(err, BridgeError::ConfigError(_)));
     }
 }
