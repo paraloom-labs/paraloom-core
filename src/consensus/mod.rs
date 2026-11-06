@@ -11,7 +11,7 @@ pub mod vote_tally;
 
 pub use leader::{LeaderSelector, ValidatorInfo};
 pub use reputation::{ReputationTracker, ValidatorMetrics};
-pub use slashing::{SlashingEvidence, SlashingRecord, SlashingTracker};
+pub use slashing::{SlashingEvidence, SlashingRecord, SlashingTracker, MAX_RECORDS_PER_VALIDATOR};
 pub use transact::{
     ApprovedTransact, TransactVerificationCoordinator, TransactVerificationRequest,
     TransactVerificationResult,

@@ -79,6 +79,9 @@ impl SlashingRecord {
     }
 }
 
+/// Maximum slashing records retained per validator to prevent unbounded growth (#1393).
+pub const MAX_RECORDS_PER_VALIDATOR: usize = 1000;
+
 /// In-memory log of slashing evidence.
 ///
 /// Keyed by validator so a downstream slashing pipeline can iterate
@@ -104,12 +107,12 @@ impl SlashingTracker {
             evidence
         );
         let record = SlashingRecord::new(validator.clone(), evidence);
-        self.records
-            .write()
-            .await
-            .entry(validator)
-            .or_default()
-            .push(record);
+        let mut records = self.records.write().await;
+        let entries = records.entry(validator).or_default();
+        if entries.len() >= MAX_RECORDS_PER_VALIDATOR {
+            entries.remove(0);
+        }
+        entries.push(record);
     }
 
     /// All records for a single validator, in insertion order.
@@ -193,5 +196,34 @@ mod tests {
         let unknown = NodeId(vec![99]);
         assert!(tracker.for_validator(&unknown).await.is_empty());
         assert_eq!(tracker.total_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn tracker_records_are_bounded_per_validator() {
+        let tracker = SlashingTracker::new();
+        let node = NodeId(vec![42]);
+
+        for i in 0..(MAX_RECORDS_PER_VALIDATOR + 10) {
+            tracker
+                .record(
+                    node.clone(),
+                    SlashingEvidence::PersistentUnavailability {
+                        streak_length: i as u64,
+                        threshold: 3,
+                    },
+                )
+                .await;
+        }
+
+        let records = tracker.for_validator(&node).await;
+        assert_eq!(records.len(), MAX_RECORDS_PER_VALIDATOR);
+        // The oldest records should have been evicted; newest was streak_length = MAX_RECORDS_PER_VALIDATOR + 9
+        if let SlashingEvidence::PersistentUnavailability { streak_length, .. } =
+            records.last().unwrap().evidence
+        {
+            assert_eq!(streak_length, (MAX_RECORDS_PER_VALIDATOR + 9) as u64);
+        } else {
+            panic!("unexpected evidence variant");
+        }
     }
 }

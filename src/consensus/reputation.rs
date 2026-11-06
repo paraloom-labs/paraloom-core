@@ -186,6 +186,17 @@ impl ReputationTracker {
         let Some(path) = &self.persist_path else {
             return;
         };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    log::warn!(
+                        "failed to create parent directory for {}: {e}",
+                        path.display()
+                    );
+                    return;
+                }
+            }
+        }
         let list: Vec<&ValidatorMetrics> = metrics.values().collect();
         match serde_json::to_vec(&list) {
             Ok(bytes) => {
@@ -408,6 +419,25 @@ mod tests {
             Some(penalised),
             "penalised reputation must survive a restart (#691)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_persist_locked_creates_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nested subdirectories that do not exist yet
+        let path = dir
+            .path()
+            .join("nested")
+            .join("sub")
+            .join("reputation.json");
+        let node = NodeId(vec![4, 5, 6]);
+
+        let tracker = ReputationTracker::with_persistence(path.clone());
+        tracker.register_validator(node.clone()).await;
+
+        assert!(path.exists(), "parent directory and file must be created");
+        let reloaded = ReputationTracker::with_persistence(path);
+        assert_eq!(reloaded.get_reputation(&node).await, Some(BASE_REPUTATION));
     }
 
     #[test]
