@@ -82,10 +82,16 @@ pub enum ResultData {
 impl Task {
     /// Create a new task
     pub fn new(task_type: TaskType) -> Self {
+        Self::new_at(task_type, std::time::SystemTime::now())
+    }
+
+    /// Create a new task at a specific timestamp.
+    /// Uses [`std::time::Duration::ZERO`] if the clock is set before UNIX epoch (#1414).
+    pub fn new_at(task_type: TaskType, at: std::time::SystemTime) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let created_at = std::time::SystemTime::now()
+        let created_at = at
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         Task {
@@ -95,5 +101,27 @@ impl Task {
             created_at,
             assigned_to: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn pre_epoch_clock_does_not_panic() {
+        let pre_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(10))
+            .expect("subtraction within bounds");
+        let task = Task::new_at(
+            TaskType::HashCalculation {
+                start: 0,
+                end: 1,
+                algorithm: "sha256".to_string(),
+            },
+            pre_epoch,
+        );
+        assert_eq!(task.created_at, 0);
     }
 }

@@ -412,9 +412,16 @@ impl Coordinator {
                 end,
                 algorithm,
             } => {
+                if end < start {
+                    return Err(anyhow::anyhow!(
+                        "invalid hash range: end ({end}) < start ({start})"
+                    ));
+                }
+                let total = (end - start)
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("hash range exceeds u64::MAX"))?;
                 let validators = self.validators.lock().await;
                 let num_validators = validators.len().max(1);
-                let total = end - start + 1;
                 let chunk_size = total.div_ceil(num_validators as u64);
 
                 let mut chunks = Vec::new();
@@ -467,6 +474,56 @@ impl Coordinator {
                     result.task_id
                 ));
             }
+
+            // Validate the result payload consistency and match against the task (#1414).
+            match (&task.task_type, &result.data) {
+                (
+                    TaskType::HashCalculation { start, end, .. },
+                    ResultData::Hashes { hashes, count },
+                ) => {
+                    if hashes.len() != *count {
+                        return Err(anyhow::anyhow!(
+                            "inconsistent ResultData::Hashes: count ({}) != hashes.len() ({})",
+                            count,
+                            hashes.len()
+                        ));
+                    }
+                    if end < start {
+                        return Err(anyhow::anyhow!(
+                            "task has invalid range: end ({end}) < start ({start})"
+                        ));
+                    }
+                    let expected_count = match (end - start).checked_add(1) {
+                        Some(c) => c,
+                        None => return Err(anyhow::anyhow!("task hash range overflow")),
+                    };
+                    if hashes.len() as u64 != expected_count {
+                        return Err(anyhow::anyhow!(
+                            "mismatched hash count: expected {}, got {}",
+                            expected_count,
+                            hashes.len()
+                        ));
+                    }
+                    for (idx, (num, hash)) in hashes.iter().enumerate() {
+                        let expected_num = match start.checked_add(idx as u64) {
+                            Some(n) => n,
+                            None => return Err(anyhow::anyhow!("hash item number overflow")),
+                        };
+                        if *num != expected_num {
+                            return Err(anyhow::anyhow!(
+                                "mismatched hash number at index {}: expected {}, got {}",
+                                idx,
+                                expected_num,
+                                num
+                            ));
+                        }
+                        if hash.is_empty() {
+                            return Err(anyhow::anyhow!("empty hash string at index {}", idx));
+                        }
+                    }
+                }
+            }
+
             task.status = TaskStatus::Completed;
         }
 
@@ -573,7 +630,7 @@ impl Coordinator {
                         );
                         all_hashes.extend(hashes.clone());
                         max_time = max_time.max(result.execution_time_ms);
-                        total_time += result.execution_time_ms;
+                        total_time = total_time.saturating_add(result.execution_time_ms);
                     }
 
                     info!("");
@@ -598,8 +655,9 @@ impl Coordinator {
                     } else {
                         1 // Avoid division by zero
                     };
-                    let estimated_single_node_time =
-                        all_hashes.len() as u64 * avg_time / chunk_results.len() as u64;
+                    let estimated_single_node_time = (all_hashes.len() as u64)
+                        .saturating_mul(avg_time)
+                        / chunk_results.len() as u64;
                     let speedup = if max_time > 0 {
                         estimated_single_node_time as f64 / max_time as f64
                     } else {
@@ -809,8 +867,8 @@ mod tests {
             task_id: "t1".to_string(),
             execution_time_ms: 1,
             data: ResultData::Hashes {
-                hashes: vec![],
-                count: 0,
+                hashes: vec![(0, "dummy_hash_value".to_string())],
+                count: 1,
             },
         };
 
@@ -855,6 +913,161 @@ mod tests {
             .handle_task_result(&assignee, make_result())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_result_rejects_inconsistent_and_mismatched_payloads() {
+        let coordinator = Coordinator::new(make_test_network());
+        let assignee = NodeId(vec![0xAA]);
+
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 10,
+            end: 12,
+            algorithm: "sha256".to_string(),
+        });
+        task.id = "t_check".to_string();
+        task.assigned_to = Some(format!("{:?}", assignee));
+        task.status = TaskStatus::Assigned;
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert("t_check".to_string(), task);
+
+        // Inconsistent count vs hashes.len()
+        let res_inconsistent = TaskResult {
+            task_id: "t_check".to_string(),
+            execution_time_ms: 1,
+            data: ResultData::Hashes {
+                hashes: vec![(10, "h10".to_string())],
+                count: 2,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, res_inconsistent)
+            .await
+            .is_err());
+
+        // Mismatched count vs range (range 10..=12 expects 3 hashes, got 2)
+        let res_wrong_len = TaskResult {
+            task_id: "t_check".to_string(),
+            execution_time_ms: 1,
+            data: ResultData::Hashes {
+                hashes: vec![(10, "h10".to_string()), (11, "h11".to_string())],
+                count: 2,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, res_wrong_len)
+            .await
+            .is_err());
+
+        // Mismatched item numbers (starts at 9 instead of 10)
+        let res_wrong_nums = TaskResult {
+            task_id: "t_check".to_string(),
+            execution_time_ms: 1,
+            data: ResultData::Hashes {
+                hashes: vec![
+                    (9, "h9".to_string()),
+                    (10, "h10".to_string()),
+                    (11, "h11".to_string()),
+                ],
+                count: 3,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, res_wrong_nums)
+            .await
+            .is_err());
+
+        // Empty hash string
+        let res_empty_hash = TaskResult {
+            task_id: "t_check".to_string(),
+            execution_time_ms: 1,
+            data: ResultData::Hashes {
+                hashes: vec![
+                    (10, "h10".to_string()),
+                    (11, "".to_string()),
+                    (12, "h12".to_string()),
+                ],
+                count: 3,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, res_empty_hash)
+            .await
+            .is_err());
+
+        // Task must still be in Assigned status, not completed
+        {
+            let active = coordinator.active_tasks.lock().await;
+            assert_eq!(active.get("t_check").unwrap().status, TaskStatus::Assigned);
+        }
+
+        // Correct payload succeeds
+        let res_ok = TaskResult {
+            task_id: "t_check".to_string(),
+            execution_time_ms: 1,
+            data: ResultData::Hashes {
+                hashes: vec![
+                    (10, "h10".to_string()),
+                    (11, "h11".to_string()),
+                    (12, "h12".to_string()),
+                ],
+                count: 3,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, res_ok)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn aggregate_results_handles_execution_time_overflow() {
+        let coordinator = Coordinator::new(make_test_network());
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert("chunk1".to_string(), "parent1".to_string());
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert("chunk2".to_string(), "parent1".to_string());
+
+        let res1 = TaskResult {
+            task_id: "chunk1".to_string(),
+            execution_time_ms: u64::MAX - 10,
+            data: ResultData::Hashes {
+                hashes: vec![(0, "h0".to_string())],
+                count: 1,
+            },
+        };
+        let res2 = TaskResult {
+            task_id: "chunk2".to_string(),
+            execution_time_ms: 50,
+            data: ResultData::Hashes {
+                hashes: vec![(1, "h1".to_string())],
+                count: 1,
+            },
+        };
+
+        coordinator
+            .results
+            .lock()
+            .await
+            .insert("chunk1".to_string(), res1);
+        coordinator
+            .results
+            .lock()
+            .await
+            .insert("chunk2".to_string(), res2);
+
+        // Must not panic on execution_time_ms addition overflow
+        let agg_res = coordinator.aggregate_results("parent1").await;
+        assert!(agg_res.is_ok());
     }
 
     #[tokio::test]

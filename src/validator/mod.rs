@@ -33,6 +33,14 @@ fn checked_hash_count(start: u64, end: u64) -> Result<u64> {
         })
 }
 
+/// Validate that the requested hash algorithm is supported (#1414).
+fn validate_algorithm(algorithm: &str) -> Result<()> {
+    match algorithm {
+        "sha256" => Ok(()),
+        _ => Err(anyhow::anyhow!("Unsupported algorithm: {}", algorithm)),
+    }
+}
+
 /// Validator executes tasks
 pub struct Validator {
     network: Arc<NetworkManager>,
@@ -99,6 +107,13 @@ impl Validator {
                 // `start=0, end=u64::MAX` would otherwise overflow `end - start
                 // + 1` and loop ~2^64 times, exhausting memory (#609).
                 let count = checked_hash_count(start, end)?;
+
+                // Reject an unsupported algorithm before allocating memory.
+                // An attacker sending an invalid algorithm would otherwise cause
+                // the validator to allocate up to 32MB (Vec<(u64, String)> with
+                // capacity 1_000_000) before erroring on the first item (#1414).
+                validate_algorithm(&algorithm)?;
+
                 info!(
                     "Calculating {} hashes ({} to {}) using {}",
                     count, start, end, algorithm
@@ -128,6 +143,7 @@ impl Validator {
 
     /// Calculate hash of a number
     fn calculate_hash(&self, number: u64, algorithm: &str) -> Result<String> {
+        validate_algorithm(algorithm)?;
         match algorithm {
             "sha256" => {
                 let mut hasher = Sha256::new();
@@ -142,7 +158,22 @@ impl Validator {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_hash_count, MAX_HASH_TASK_ITEMS};
+    use super::{checked_hash_count, Validator, MAX_HASH_TASK_ITEMS};
+    use crate::task::{Task, TaskType};
+
+    #[tokio::test]
+    async fn execute_task_rejects_unsupported_algorithm_without_allocating() {
+        let mgr = crate::network::NetworkManager::new(&crate::config::Settings::development())
+            .expect("network manager");
+        let validator = Validator::new(std::sync::Arc::new(mgr));
+        let task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: MAX_HASH_TASK_ITEMS - 1,
+            algorithm: "unsupported_algo".to_string(),
+        });
+        let err = validator.execute_task(task).await.unwrap_err();
+        assert!(err.to_string().contains("Unsupported algorithm"));
+    }
 
     #[test]
     fn hash_count_accepts_a_bounded_range() {
