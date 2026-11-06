@@ -69,6 +69,24 @@ where
     Ok(buf)
 }
 
+/// Write `data` to `io` only if it does not exceed [`MAX_HEARTBEAT_PAYLOAD_BYTES`].
+async fn write_size_bounded<T>(io: &mut T, data: &[u8]) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    if data.len() > MAX_HEARTBEAT_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "heartbeat payload exceeds {} bytes",
+                MAX_HEARTBEAT_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    io.write_all(data).await?;
+    io.close().await
+}
+
 /// Bincode-backed codec, structurally identical to `ResultCodec`.
 #[derive(Debug, Clone, Default)]
 pub struct HeartbeatCodec;
@@ -114,8 +132,7 @@ impl Codec for HeartbeatCodec {
     {
         let data =
             bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&data).await?;
-        io.close().await
+        write_size_bounded(io, &data).await
     }
 
     async fn write_response<T>(
@@ -129,8 +146,7 @@ impl Codec for HeartbeatCodec {
     {
         let data =
             bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&data).await?;
-        io.close().await
+        write_size_bounded(io, &data).await
     }
 }
 
@@ -168,6 +184,17 @@ mod tests {
             .await
             .expect_err("over-limit payload must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn write_size_bounded_rejects_payload_over_limit() {
+        let payload = vec![0xCDu8; MAX_HEARTBEAT_PAYLOAD_BYTES + 1];
+        let mut out = Vec::new();
+        let err = write_size_bounded(&mut out, &payload)
+            .await
+            .expect_err("over-limit outbound payload must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -203,7 +203,7 @@ fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
     use std::fs;
     use std::path::Path;
 
-    let path = match path {
+    let path = match path.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => Path::new(p),
         None => return Ok(identity::Keypair::generate_ed25519()),
     };
@@ -232,13 +232,26 @@ fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
     let bytes = keypair
         .to_protobuf_encoding()
         .map_err(|e| anyhow!("encoding libp2p identity to protobuf: {}", e))?;
-    fs::write(path, &bytes)
-        .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
+        f.write_all(&bytes)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting 0600 permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, &bytes)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
     }
     info!(
         "Generated new libp2p identity, persisted to {} (PeerId stable across restarts)",
@@ -450,6 +463,10 @@ impl NetworkManager {
                     // but not added to kad.
                     let peer_id = peer_id_from_multiaddr(&addr);
                     if let Some(pid) = peer_id {
+                        if pid == self.peer_id {
+                            debug!("Skipping self bootstrap address {}", addr);
+                            continue;
+                        }
                         swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
                         info!("Registered bootstrap {} in Kademlia routing table", pid);
                     } else {
@@ -503,8 +520,8 @@ impl NetworkManager {
                 }
             };
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
-                if connected.contains(&pid.to_bytes()) {
-                    continue; // already connected — nothing to do
+                if pid == self.peer_id || connected.contains(&pid.to_bytes()) {
+                    continue; // self or already connected — nothing to do
                 }
                 swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
             }
@@ -561,6 +578,13 @@ impl NetworkManager {
                 relay_addr
             )
         })?;
+        if relay_peer == self.peer_id {
+            return Err(anyhow!(
+                "relay address {} points to this node's own PeerId ({}); cannot reserve a circuit on self",
+                relay_addr,
+                self.peer_id
+            ));
+        }
 
         let mut swarm = self.swarm.lock().await;
 
@@ -1091,6 +1115,9 @@ impl NetworkManager {
 
     pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send result request to self ({})", peer_id));
+        }
 
         info!("=== SENDING RESULT REQUEST ===");
         info!("Target peer: {}", peer_id);
@@ -1123,6 +1150,12 @@ impl NetworkManager {
         request: HeartbeatRequest,
     ) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!(
+                "Cannot send heartbeat request to self ({})",
+                peer_id
+            ));
+        }
         let mut swarm = self.swarm.lock().await;
         swarm
             .behaviour_mut()
@@ -1143,15 +1176,26 @@ impl NetworkManager {
         peer: NodeId,
         request: CoSignRequest,
     ) -> Result<CoSignResponse> {
+        const COSIGN_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send cosign request to self ({})", peer_id));
+        }
         let (tx, rx) = oneshot::channel();
-        {
+        let request_id = {
             let mut swarm = self.swarm.lock().await;
             let request_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
             self.cosign_waiters.lock().await.insert(request_id, tx);
+            request_id
+        };
+        match tokio::time::timeout(COSIGN_WAIT_TIMEOUT, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(anyhow!("cosign request to {} failed or timed out", peer_id)),
+            Err(_) => {
+                self.cosign_waiters.lock().await.remove(&request_id);
+                Err(anyhow!("cosign request to {} timed out", peer_id))
+            }
         }
-        rx.await
-            .map_err(|_| anyhow!("cosign request to {} failed or timed out", peer_id))
     }
 
     /// Get local peer ID
@@ -1375,5 +1419,45 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn identity_is_ephemeral_when_path_is_empty_or_whitespace() {
+        let key1 = load_or_create_identity(Some("")).expect("empty path falls back to ephemeral");
+        let key2 =
+            load_or_create_identity(Some("   ")).expect("whitespace path falls back to ephemeral");
+        assert_ne!(
+            PeerId::from(key1.public()),
+            PeerId::from(key2.public()),
+            "empty/whitespace identity_path must generate ephemeral identities"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_peer_is_rejected_or_skipped_across_network_operations() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let self_addr = format!("/ip4/127.0.0.1/tcp/9300/p2p/{}", mgr.peer_id_base58());
+
+        // Self-address in bootstrap or co_validators is skipped cleanly.
+        mgr.connect_to_bootstrap(vec![self_addr.clone()])
+            .await
+            .expect("self bootstrap is skipped");
+        mgr.redial_disconnected_co_validators(&[self_addr.clone()])
+            .await;
+
+        // Reserving a relay circuit or sending point-to-point requests to self errors.
+        assert!(mgr.listen_via_relay(&self_addr).await.is_err());
+        let self_node = mgr.local_peer_id();
+        assert!(mgr
+            .send_cosign_request(
+                self_node,
+                CoSignRequest {
+                    request_id: "r1".to_string(),
+                    kind: super::super::cosign::SettlementKind::Transact,
+                    message: vec![],
+                }
+            )
+            .await
+            .is_err());
     }
 }
