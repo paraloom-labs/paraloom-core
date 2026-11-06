@@ -16,7 +16,7 @@ use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::transact_spl_fixture_data as fx;
-use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount};
+use paraloom_program::{accounts, instruction, BridgeState, NullifierAccount, ValidatorAccount};
 use solana_program_test::{tokio, ProgramTest};
 use solana_sdk::{
     account::Account,
@@ -442,6 +442,18 @@ async fn transact_spl_settles_a_token_withdrawal() {
     // The fee landed in the settling validator's token account.
     let fee_after = token_amount(&banks.get_account(fee_token).await.unwrap().unwrap());
     assert_eq!(fee_after, fee, "fee paid to the validator's token account");
+
+    // Settling validator account total_earnings is credited with the inline SPL fee.
+    let val_raw = banks.get_account(validator_pda).await.unwrap().unwrap();
+    let val_acc = ValidatorAccount::try_deserialize(&mut val_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        val_acc.total_earnings, fee,
+        "validator total_earnings credited with inline SPL fee"
+    );
+    assert_eq!(
+        val_acc.pending_rewards, 0,
+        "pending_rewards remains 0 for SPL fee"
+    );
     // The vault paid out exactly gross.
     let vault_after = token_amount(&banks.get_account(asset_vault).await.unwrap().unwrap());
     assert_eq!(vault_before - vault_after, gross, "vault debited by gross");
