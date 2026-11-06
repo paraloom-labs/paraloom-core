@@ -1210,8 +1210,9 @@ impl NetworkManager {
         self: Arc<Self>,
         interval: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let safe_interval = interval.max(std::time::Duration::from_millis(1));
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let mut ticker = tokio::time::interval(safe_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Skip the immediate first tick so the very first
             // bootstrap attempt happens after `interval`, by which
@@ -1375,5 +1376,13 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn start_kad_bootstrap_refresh_handles_zero_duration_without_panic() {
+        let mgr = Arc::new(NetworkManager::new(&Settings::development()).expect("network manager"));
+        let handle = mgr.start_kad_bootstrap_refresh(std::time::Duration::ZERO);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        handle.abort();
     }
 }
