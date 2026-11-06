@@ -120,8 +120,14 @@ impl std::str::FromStr for CircuitId {
 /// Decode a hex-encoded SHA-512 digest into a [`TranscriptHash`].
 /// Surfaces a clear error rather than silently truncating, so an
 /// operator pasting a wrong-length hash to a CLI flag knows what
-/// is wrong.
+/// is wrong. Accepts optional leading 0x/0X prefix and surrounding
+/// whitespace.
 pub fn try_hash_from_hex(s: &str) -> Result<TranscriptHash, String> {
+    let s = s.trim();
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let bytes = hex::decode(s).map_err(|e| format!("not valid hex: {}", e))?;
     if bytes.len() != 64 {
         return Err(format!(
@@ -488,10 +494,82 @@ mod tests {
     }
 
     #[test]
+    fn try_hash_from_hex_accepts_0x_and_0x_uppercase_prefix_and_whitespace() {
+        let original: TranscriptHash = [0x5au8; 64];
+        let hex_str: String = original.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let with_lower = format!("0x{}", hex_str);
+        let decoded = try_hash_from_hex(&with_lower).expect("0x prefix decodes");
+        assert_eq!(decoded, original);
+
+        let with_upper = format!("0X{}", hex_str);
+        let decoded = try_hash_from_hex(&with_upper).expect("0X prefix decodes");
+        assert_eq!(decoded, original);
+
+        let with_whitespace = format!("  0x{} \n", hex_str);
+        let decoded = try_hash_from_hex(&with_whitespace).expect("whitespace trimmed and decodes");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
     fn try_hash_from_hex_rejects_short_input() {
         match try_hash_from_hex("aabbccdd") {
             Err(msg) => assert!(msg.contains("64 bytes")),
             Ok(_) => panic!("short hex must error"),
         }
+        match try_hash_from_hex("0xaabbccdd") {
+            Err(msg) => assert!(msg.contains("64 bytes")),
+            Ok(_) => panic!("short hex with 0x must error"),
+        }
+    }
+
+    #[test]
+    fn key_deserialization_rejects_trailing_bytes() {
+        use ark_bn254::Bn254;
+        use ark_groth16::VerifyingKey;
+        use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+
+        let vk = VerifyingKey::<Bn254>::default();
+        let mut bytes = Vec::new();
+        vk.serialize_compressed(&mut bytes).unwrap();
+
+        // Valid bytes deserialize cleanly and cursor matches exact length
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let _ = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor).expect("deserialize vk");
+        assert_eq!(cursor.position() as usize, bytes.len());
+
+        // Appending trailing bytes results in cursor position < buffer length
+        let mut tampered = bytes.clone();
+        tampered.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut cursor = std::io::Cursor::new(&tampered);
+        let _ = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor).expect("deserialize vk");
+        assert_ne!(cursor.position() as usize, tampered.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proving_key_file_permissions_are_restricted() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let temp_dir = std::env::temp_dir().join(format!("test_pk_perm_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let key_path = temp_dir.join("test_proving.key");
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .unwrap();
+        file.write_all(b"dummy proving key").unwrap();
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+
+        let meta = std::fs::metadata(&key_path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
