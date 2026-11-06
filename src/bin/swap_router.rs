@@ -19,7 +19,9 @@ use paraloom::relayer::{
     JupiterSwapProvider, ReqwestJupiterClient, RpcSwapSubmitter, SwapQuoter,
     DEFAULT_JUPITER_BASE_URL,
 };
+use solana_sdk::pubkey::Pubkey;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -29,17 +31,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = std::env::var("SWAP_ROUTER_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8788".to_string())
         .parse()?;
-    let jupiter_base_url =
-        std::env::var("JUPITER_BASE_URL").unwrap_or_else(|_| DEFAULT_JUPITER_BASE_URL.to_string());
-    let slippage_bps: u16 = std::env::var("SLIPPAGE_BPS")
+    let jupiter_base_url = std::env::var("JUPITER_BASE_URL")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    let platform_fee_bps: u16 = std::env::var("PLATFORM_FEE_BPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let fee_account = std::env::var("FEE_ACCOUNT").ok();
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_JUPITER_BASE_URL.to_string());
+    let slippage_bps: u16 = match std::env::var("SLIPPAGE_BPS") {
+        Ok(s) if !s.trim().is_empty() => {
+            let v: u16 = s
+                .trim()
+                .parse()
+                .map_err(|e| format!("invalid SLIPPAGE_BPS '{s}': {e}"))?;
+            if v == 0 || v > 10_000 {
+                return Err(format!("SLIPPAGE_BPS must be in 1..=10000, got {v}").into());
+            }
+            v
+        }
+        _ => 50,
+    };
+    let platform_fee_bps: u16 = match std::env::var("PLATFORM_FEE_BPS") {
+        Ok(s) if !s.trim().is_empty() => {
+            let v: u16 = s
+                .trim()
+                .parse()
+                .map_err(|e| format!("invalid PLATFORM_FEE_BPS '{s}': {e}"))?;
+            if v > 10_000 {
+                return Err(format!("PLATFORM_FEE_BPS must be <= 10000, got {v}").into());
+            }
+            v
+        }
+        _ => 0,
+    };
+    let fee_account = match std::env::var("FEE_ACCOUNT") {
+        Ok(s) if !s.trim().is_empty() => {
+            let pk = Pubkey::from_str(s.trim())
+                .map_err(|e| format!("invalid FEE_ACCOUNT '{s}': {e}"))?;
+            if pk == Pubkey::default() {
+                return Err("FEE_ACCOUNT must not be the default all-zero pubkey".into());
+            }
+            Some(pk.to_string())
+        }
+        _ => None,
+    };
 
     // The submitter is never invoked on the routing path (the service only
     // builds unsigned transactions), but the provider type needs one; give it a
