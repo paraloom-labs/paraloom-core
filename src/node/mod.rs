@@ -159,12 +159,19 @@ fn build_compute_auth_policy(cfg: &crate::config::ComputeSettings) -> ComputeAut
         timeout_secs: cfg.max_timeout_secs.unwrap_or(DEFAULT_MAX_TIMEOUT_SECS),
     };
 
-    if cfg.authorized_submitters.is_empty() {
+    let non_empty: Vec<&str> = cfg
+        .authorized_submitters
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if non_empty.is_empty() {
         return ComputeAuthPolicy::open().with_max_limits(max_limits);
     }
 
     let mut allowed = std::collections::HashSet::new();
-    for entry in &cfg.authorized_submitters {
+    for entry in non_empty {
         match entry.parse::<NodeId>() {
             Ok(id) => {
                 allowed.insert(id);
@@ -1365,7 +1372,13 @@ impl Node {
         // as a Primary (the existing default, preserved for any
         // operator who has not opted into HA yet).
         let coordinator = if node_type == NodeType::Coordinator {
-            let coord = if let Some(primary_hex) = &settings.ha.primary {
+            let primary_opt = settings
+                .ha
+                .primary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let coord = if let Some(primary_hex) = primary_opt {
                 let primary_id = NodeId::from_str(primary_hex)
                     .map_err(|e| anyhow!("invalid ha.primary hex {:?}: {}", primary_hex, e))?;
                 let stall = Duration::from_millis(settings.ha.stall_threshold_ms);
@@ -1908,7 +1921,13 @@ impl Node {
         // without HA) skips both, preserving the pre-#66 behavior.
         if let Some(coordinator) = &self.coordinator {
             let ha = &self.settings.ha;
-            if ha.primary.is_some() {
+            let is_standby = ha
+                .primary
+                .as_deref()
+                .map(str::trim)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if is_standby {
                 let handle = Arc::clone(coordinator)
                     .start_stall_watchdog(Duration::from_millis(ha.watchdog_interval_ms));
                 *self.ha_watchdog.lock().await = Some(handle);
@@ -1916,25 +1935,33 @@ impl Node {
                     "HA stall watchdog spawned (interval {}ms, threshold {}ms)",
                     ha.watchdog_interval_ms, ha.stall_threshold_ms
                 );
-            } else if !ha.standbys.is_empty() {
-                let mut standby_ids = Vec::with_capacity(ha.standbys.len());
-                for hex in &ha.standbys {
-                    let id = NodeId::from_str(hex)
-                        .map_err(|e| anyhow!("invalid ha.standbys entry {:?}: {}", hex, e))?;
-                    standby_ids.push(id);
+            } else {
+                let non_empty_standbys: Vec<&str> = ha
+                    .standbys
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !non_empty_standbys.is_empty() {
+                    let mut standby_ids = Vec::with_capacity(non_empty_standbys.len());
+                    for hex in non_empty_standbys {
+                        let id = NodeId::from_str(hex)
+                            .map_err(|e| anyhow!("invalid ha.standbys entry {:?}: {}", hex, e))?;
+                        standby_ids.push(id);
+                    }
+                    let primary_id = self.network.local_peer_id();
+                    let handle = Arc::clone(coordinator).start_heartbeat_broadcast(
+                        primary_id,
+                        standby_ids.clone(),
+                        Duration::from_millis(ha.heartbeat_interval_ms),
+                    );
+                    *self.ha_broadcast.lock().await = Some(handle);
+                    info!(
+                        "HA heartbeat broadcast spawned to {} standbys (interval {}ms)",
+                        standby_ids.len(),
+                        ha.heartbeat_interval_ms
+                    );
                 }
-                let primary_id = self.network.local_peer_id();
-                let handle = Arc::clone(coordinator).start_heartbeat_broadcast(
-                    primary_id,
-                    standby_ids,
-                    Duration::from_millis(ha.heartbeat_interval_ms),
-                );
-                *self.ha_broadcast.lock().await = Some(handle);
-                info!(
-                    "HA heartbeat broadcast spawned to {} standbys (interval {}ms)",
-                    ha.standbys.len(),
-                    ha.heartbeat_interval_ms
-                );
             }
         }
 
@@ -2661,9 +2688,9 @@ impl Node {
     fn validator_id_to_node_id(&self, validator_id: &str) -> Result<NodeId> {
         // For now, use ValidatorId as-is since it should be NodeId.to_string() format
         // In a production system, maintain a mapping
-        let bytes = hex::decode(validator_id)
-            .map_err(|e| anyhow::anyhow!("Invalid validator ID format: {}", e))?;
-        Ok(NodeId(bytes))
+        validator_id
+            .parse::<NodeId>()
+            .map_err(|e| anyhow::anyhow!("Invalid validator ID format: {}", e))
     }
 
     /// Get compute manager reference (for Coordinator nodes)
@@ -3633,5 +3660,35 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[test]
+    fn compute_auth_policy_empty_entries_remain_open() {
+        let mut cfg = crate::config::ComputeSettings::default();
+        cfg.authorized_submitters = vec!["".to_string(), "   ".to_string()];
+        let policy = build_compute_auth_policy(&cfg);
+        assert!(policy.is_open());
+    }
+
+    #[test]
+    fn compute_auth_policy_supports_hex_prefix_and_whitespace() {
+        let mut cfg = crate::config::ComputeSettings::default();
+        cfg.authorized_submitters = vec!["  0x1234  ".to_string()];
+        let policy = build_compute_auth_policy(&cfg);
+        assert!(!policy.is_open());
+        assert!(policy.authorize(&NodeId(vec![0x12, 0x34]), &crate::compute::ResourceLimits::default()).is_ok());
+        assert!(policy.authorize(&NodeId(vec![0x99]), &crate::compute::ResourceLimits::default()).is_err());
+    }
+
+    #[test]
+    fn validator_id_to_node_id_validates_input() {
+        let settings = Settings::development();
+        let node = Node::new(settings).expect("node");
+        assert!(node.validator_id_to_node_id("").is_err());
+        assert!(node.validator_id_to_node_id("   ").is_err());
+        assert_eq!(
+            node.validator_id_to_node_id("0x1234").unwrap(),
+            NodeId(vec![0x12, 0x34])
+        );
     }
 }

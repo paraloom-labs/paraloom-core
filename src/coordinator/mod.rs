@@ -219,6 +219,7 @@ impl Coordinator {
         interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let interval = std::cmp::max(Duration::from_millis(1), interval);
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // The first tick fires immediately; consume it so the
@@ -267,6 +268,7 @@ impl Coordinator {
         check_interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let check_interval = std::cmp::max(Duration::from_millis(1), check_interval);
             let mut ticker = tokio::time::interval(check_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
@@ -1016,5 +1018,20 @@ mod tests {
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_interval_broadcast_and_watchdog_do_not_panic() {
+        let coord = Arc::new(Coordinator::new(make_test_network()));
+        let handle1 = coord.clone().start_heartbeat_broadcast(
+            NodeId(vec![0x01]),
+            vec![NodeId(vec![0x02])],
+            Duration::ZERO,
+        );
+        let handle2 = coord.clone().start_stall_watchdog(Duration::ZERO);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle1.abort();
+        handle2.abort();
     }
 }
