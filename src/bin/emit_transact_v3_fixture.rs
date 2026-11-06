@@ -140,14 +140,23 @@ fn main() {
         .unwrap_or_else(|_| "keys/transact_v3_verifying.key".to_string());
 
     use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-    let (pk, vk) = if std::path::Path::new(&pk_path).exists() {
+    let (pk, vk) = if std::path::Path::new(&pk_path).exists()
+        && std::path::Path::new(&vk_path).exists()
+    {
         let pk_bytes = std::fs::read(&pk_path).expect("read transact v3 proving key");
         let vk_bytes = std::fs::read(&vk_path).expect("read transact v3 verifying key");
-        let pk = ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&pk_bytes[..])
-            .expect("deserialize proving key");
+        let mut pk_cur = &pk_bytes[..];
+        let mut vk_cur = &vk_bytes[..];
+        let pk =
+            ark_groth16::ProvingKey::<ark_bn254::Bn254>::deserialize_compressed(&mut pk_cur)
+                .expect("deserialize proving key");
         let vk =
-            ark_groth16::VerifyingKey::<ark_bn254::Bn254>::deserialize_compressed(&vk_bytes[..])
+            ark_groth16::VerifyingKey::<ark_bn254::Bn254>::deserialize_compressed(&mut vk_cur)
                 .expect("deserialize verifying key");
+        assert!(
+            pk_cur.is_empty() && vk_cur.is_empty(),
+            "transact v3 key files must not contain trailing bytes"
+        );
         eprintln!("loaded persistent keys from {pk_path}");
         (pk, vk)
     } else {
@@ -160,7 +169,23 @@ fn main() {
         let mut vk_bytes = Vec::new();
         vk.serialize_compressed(&mut vk_bytes)
             .expect("serialize vk");
+        if let Some(parent) = std::path::Path::new(&pk_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).expect("create proving key parent dir");
+            }
+        }
+        if let Some(parent) = std::path::Path::new(&vk_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).expect("create verifying key parent dir");
+            }
+        }
         std::fs::write(&pk_path, pk_bytes).expect("write transact v3 proving key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pk_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set 0600 permissions on proving key");
+        }
         std::fs::write(&vk_path, vk_bytes).expect("write transact v3 verifying key");
         eprintln!("generated + saved persistent keys to {pk_path}");
         (pk, vk)

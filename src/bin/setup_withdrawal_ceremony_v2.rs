@@ -83,7 +83,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Writing keys to disk...");
     fs::write(PROVING_KEY_PATH, &proving_key_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(PROVING_KEY_PATH, fs::Permissions::from_mode(0o600))?;
+    }
     fs::write(VERIFYING_KEY_PATH, &verifying_key_bytes)?;
+
+    {
+        use ark_bn254::Bn254;
+        use ark_groth16::{ProvingKey, VerifyingKey};
+        use ark_serialize::CanonicalDeserialize;
+        let pk_disk = fs::read(PROVING_KEY_PATH)?;
+        let vk_disk = fs::read(VERIFYING_KEY_PATH)?;
+        let mut pk_cur = &pk_disk[..];
+        let mut vk_cur = &vk_disk[..];
+        let pk_loaded = ProvingKey::<Bn254>::deserialize_compressed(&mut pk_cur)?;
+        let vk_loaded = VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_cur)?;
+        if !pk_cur.is_empty() || !vk_cur.is_empty() || pk_loaded.vk != vk_loaded {
+            return Err("Withdraw v2 key read-back integrity check failed!".into());
+        }
+    }
 
     println!("\n=== Setup Complete! ===");
     println!(
