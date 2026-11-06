@@ -54,11 +54,13 @@ pub enum SettlementParams {
     /// An SPL-token `transact_spl` settlement (#779): the same 2-in/2-out spend
     /// but the payout leaves `mint`'s per-asset vault and `recipient` is the
     /// recipient **token account**. The settling validator's fee token account
-    /// is derived from the payload `authority` + `mint` (its ATA), so every
+    /// is derived from the payload `authority` + `mint` + `token_program` (its ATA), so every
     /// co-signer builds the same instruction without an extra field.
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        #[serde(default)]
+        token_program: Option<[u8; 32]>,
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +192,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -198,12 +201,15 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            let token_program_pk = token_program
+                .map(Pubkey::new_from_array)
+                .unwrap_or(super::instructions::SPL_TOKEN_PROGRAM_ID);
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +217,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -242,6 +248,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::solana::instructions;
 
     fn sample_transact_payload() -> CoSignPayload {
         CoSignPayload {
@@ -325,5 +332,90 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    fn sample_transact_spl_payload(token_program: Option<[u8; 32]>) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                token_program,
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    #[test]
+    fn transact_spl_default_uses_spl_token_program() {
+        let payload = sample_transact_spl_payload(None);
+        let msg = build_settlement_message(&payload).expect("build transact_spl default");
+
+        let authority = Pubkey::new_from_array(payload.authority);
+        let mint_pk = Pubkey::new_from_array([7u8; 32]);
+        let expected_fee_ta = instructions::derive_associated_token_address(
+            &authority,
+            &mint_pk,
+            &instructions::SPL_TOKEN_PROGRAM_ID,
+        );
+
+        assert!(msg.account_keys.contains(&expected_fee_ta));
+        assert!(msg.account_keys.contains(&instructions::SPL_TOKEN_PROGRAM_ID));
+        assert!(!msg.account_keys.contains(&instructions::SPL_TOKEN_2022_PROGRAM_ID));
+    }
+
+    #[test]
+    fn transact_spl_with_token_2022_derives_correct_fee_ta_and_token_program() {
+        let token_2022_bytes = instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes();
+        let payload = sample_transact_spl_payload(Some(token_2022_bytes));
+        let msg = build_settlement_message(&payload).expect("build transact_spl token-2022");
+
+        let authority = Pubkey::new_from_array(payload.authority);
+        let mint_pk = Pubkey::new_from_array([7u8; 32]);
+        let expected_fee_ta_2022 = instructions::derive_associated_token_address(
+            &authority,
+            &mint_pk,
+            &instructions::SPL_TOKEN_2022_PROGRAM_ID,
+        );
+        let classic_fee_ta = instructions::derive_associated_token_address(
+            &authority,
+            &mint_pk,
+            &instructions::SPL_TOKEN_PROGRAM_ID,
+        );
+
+        assert_ne!(expected_fee_ta_2022, classic_fee_ta);
+        assert!(msg.account_keys.contains(&expected_fee_ta_2022));
+        assert!(msg.account_keys.contains(&instructions::SPL_TOKEN_2022_PROGRAM_ID));
+        assert!(!msg.account_keys.contains(&instructions::SPL_TOKEN_PROGRAM_ID));
+
+        // Comparing against default SPL payload message:
+        let default_payload = sample_transact_spl_payload(None);
+        let default_msg = build_settlement_message(&default_payload).expect("build default");
+        assert_ne!(msg.serialize(), default_msg.serialize());
+    }
+
+    #[test]
+    fn transact_spl_payload_round_trips_through_bytes() {
+        // Test with Token-2022 program set
+        let token_2022_bytes = instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes();
+        let payload = sample_transact_spl_payload(Some(token_2022_bytes));
+        let bytes = payload.to_bytes().expect("serialize");
+        let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded, payload);
+
+        // Test with None (default)
+        let default_payload = sample_transact_spl_payload(None);
+        let default_bytes = default_payload.to_bytes().expect("serialize default");
+        let default_decoded =
+            CoSignPayload::from_bytes(&default_bytes).expect("deserialize default");
+        assert_eq!(default_decoded, default_payload);
     }
 }
