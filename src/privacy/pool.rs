@@ -152,13 +152,17 @@ impl ShieldedPool {
         notes.insert(commitment.clone(), note);
 
         // Credit this asset's supply
-        let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
+        if amount > 0 {
+            let mut supplies = self.supplies.write().await;
+            let supply = supplies.entry(asset_id).or_insert(0);
+            *supply = supply
+                .checked_add(amount)
+                .ok_or_else(|| anyhow!("asset supply overflow for asset {:?}", asset_id))?;
 
-        // Persist the asset's supply to storage if available
-        if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
+            // Persist the asset's supply to storage if available
+            if let Some(storage) = &self.storage {
+                storage.set_asset_supply(&asset_id, *supply)?;
+            }
         }
 
         Ok(commitment)
@@ -210,6 +214,11 @@ impl ShieldedPool {
         self.nullifier_set.contains(nullifier).await
     }
 
+    /// Check if a commitment has already been deposited into the pool.
+    pub async fn is_deposited(&self, commitment: &Commitment) -> bool {
+        self.deposited.read().await.contains(commitment)
+    }
+
     /// Record input nullifiers as spent once their settlement has landed on
     /// chain, so a later `check_batch` pre-filters replays of that spend before
     /// they reach consensus (#624). The on-chain nullifier PDAs remain the
@@ -242,7 +251,13 @@ impl ShieldedPool {
     /// Snapshot every asset's shielded supply (#236). Assets with a zero
     /// balance are omitted.
     pub async fn all_supplies(&self) -> HashMap<AssetId, u64> {
-        self.supplies.read().await.clone()
+        self.supplies
+            .read()
+            .await
+            .iter()
+            .filter(|(_, &amount)| amount > 0)
+            .map(|(&asset, &amount)| (asset, amount))
+            .collect()
     }
 
     /// Get number of commitments in the pool
@@ -487,5 +502,68 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_is_deposited_reflects_pool_state() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([5u8; 32]);
+        let note = Note::new_native(addr, 500, [10u8; 32]);
+        let commitment = note.commitment();
+
+        assert!(!pool.is_deposited(&commitment).await);
+        pool.deposit(note, 500).await.unwrap();
+        assert!(pool.is_deposited(&commitment).await);
+    }
+
+    #[tokio::test]
+    async fn test_credit_commitment_supply_overflow_rejected() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([6u8; 32]);
+        let note1 = Note::new_native(addr.clone(), u64::MAX, [11u8; 32]);
+        let commitment1 = note1.commitment();
+        pool.credit_commitment(commitment1, note1, u64::MAX, NATIVE_SOL_ASSET)
+            .await
+            .unwrap();
+
+        let note2 = Note::new_native(addr, 1, [12u8; 32]);
+        let commitment2 = note2.commitment();
+        let result = pool
+            .credit_commitment(commitment2, note2, 1, NATIVE_SOL_ASSET)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("supply overflow"));
+    }
+
+    #[tokio::test]
+    async fn test_all_supplies_omits_zero_balance_assets() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([7u8; 32]);
+        let zero_asset: AssetId = [99u8; 32];
+        let non_zero_asset: AssetId = [98u8; 32];
+
+        // Zero amount deposit should not insert a zero supply entry
+        let zero_note = Note::new(addr.clone(), 0, [13u8; 32], zero_asset);
+        let zero_commitment = zero_note.commitment();
+        pool.credit_commitment(zero_commitment, zero_note, 0, zero_asset)
+            .await
+            .unwrap();
+
+        // Non-zero amount deposit
+        let non_zero_note = Note::new(addr, 100, [14u8; 32], non_zero_asset);
+        let non_zero_commitment = non_zero_note.commitment();
+        pool.credit_commitment(non_zero_commitment, non_zero_note, 100, non_zero_asset)
+            .await
+            .unwrap();
+
+        // Manually insert an asset with 0 into supplies to verify all_supplies filtering
+        {
+            let mut supplies = pool.supplies.write().await;
+            supplies.insert(zero_asset, 0);
+        }
+
+        let supplies = pool.all_supplies().await;
+        assert!(!supplies.contains_key(&zero_asset));
+        assert_eq!(supplies.get(&non_zero_asset), Some(&100));
     }
 }

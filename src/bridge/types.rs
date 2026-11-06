@@ -212,6 +212,7 @@ impl Default for BridgeConfig {
             poll_interval_secs: std::env::var("BRIDGE_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
+                .filter(|&v| v > 0)
                 .unwrap_or(5),
             start_block: std::env::var("BRIDGE_START_BLOCK")
                 .ok()
