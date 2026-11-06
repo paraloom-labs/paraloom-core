@@ -744,6 +744,10 @@ pub mod paraloom_program {
         ctx: Context<SetBridgeAuthority>,
         new_authority: Pubkey,
     ) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            BridgeError::InvalidValidator
+        );
         let bridge_state = &mut ctx.accounts.bridge_state;
         let previous = bridge_state.authority;
         bridge_state.authority = new_authority;

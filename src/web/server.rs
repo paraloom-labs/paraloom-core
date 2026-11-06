@@ -33,6 +33,8 @@ pub struct WebNodeInfo {
     pub uptime: u64,
 }
 
+pub const MAX_DASHBOARD_NODES: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct DashboardState {
     pub nodes: Arc<Mutex<HashMap<String, WebNodeInfo>>>,
@@ -54,8 +56,14 @@ impl DashboardState {
     }
 
     pub fn add_node(&self, info: &NodeInfo) {
+        let node_id = format!("{}", info.id);
+        let mut nodes = self.nodes.lock().unwrap();
+        if nodes.len() >= MAX_DASHBOARD_NODES && !nodes.contains_key(&node_id) {
+            return;
+        }
+
         let web_info = WebNodeInfo {
-            id: format!("{}", info.id),
+            id: node_id.clone(),
             node_type: format!("{:?}", info.node_type),
             status: "active".to_string(),
             resources: info.resources.clone(),
@@ -63,8 +71,7 @@ impl DashboardState {
             uptime: self.start_time.elapsed().as_secs(),
         };
 
-        let mut nodes = self.nodes.lock().unwrap();
-        nodes.insert(web_info.id.clone(), web_info);
+        nodes.insert(node_id, web_info);
     }
 
     pub fn clear_nodes(&self) {
@@ -75,8 +82,12 @@ impl DashboardState {
     pub fn get_stats(&self) -> NetworkStats {
         let nodes = self.nodes.lock().unwrap();
 
-        let total_cpu_cores: u32 = nodes.values().map(|n| n.resources.cpu_cores as u32).sum();
-        let total_memory_mb: u64 = nodes.values().map(|n| n.resources.memory_mb).sum();
+        let total_cpu_cores: u32 = nodes
+            .values()
+            .fold(0u32, |acc, n| acc.saturating_add(n.resources.cpu_cores as u32));
+        let total_memory_mb: u64 = nodes
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(n.resources.memory_mb));
 
         NetworkStats {
             total_nodes: nodes.len(),
@@ -86,6 +97,21 @@ impl DashboardState {
             uptime_seconds: self.start_time.elapsed().as_secs(),
         }
     }
+
+    pub fn get_nodes(&self) -> Vec<WebNodeInfo> {
+        let current_uptime = self.start_time.elapsed().as_secs();
+        let nodes = self.nodes.lock().unwrap();
+        let mut out: Vec<WebNodeInfo> = nodes
+            .values()
+            .cloned()
+            .map(|mut n| {
+                n.uptime = current_uptime;
+                n
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
 }
 
 // API Handlers
@@ -94,8 +120,7 @@ async fn get_stats(Extension(state): Extension<DashboardState>) -> Json<NetworkS
 }
 
 async fn get_nodes(Extension(state): Extension<DashboardState>) -> Json<Vec<WebNodeInfo>> {
-    let nodes = state.nodes.lock().unwrap();
-    Json(nodes.values().cloned().collect())
+    Json(state.get_nodes())
 }
 
 async fn dashboard() -> Html<String> {
@@ -158,4 +183,70 @@ pub async fn start_dashboard_with_coordinator(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{NodeId, NodeType, ResourceContribution};
+
+    fn make_node(id_bytes: Vec<u8>, cpu: u8, mem: u64) -> crate::types::NodeInfo {
+        crate::types::NodeInfo {
+            id: NodeId(id_bytes),
+            node_type: NodeType::ResourceProvider,
+            address: "127.0.0.1:8000".to_string(),
+            resources: ResourceContribution {
+                cpu_cores: cpu,
+                memory_mb: mem,
+                storage_mb: 100,
+                bandwidth_kbps: 1000,
+            },
+            wallet_pubkey: None,
+        }
+    }
+
+    #[test]
+    fn get_stats_saturates_without_overflow_panic() {
+        let state = DashboardState::new();
+        state.add_node(&make_node(vec![0x01], 255, u64::MAX));
+        state.add_node(&make_node(vec![0x02], 255, u64::MAX));
+
+        let stats = state.get_stats();
+        assert_eq!(stats.total_nodes, 2);
+        assert_eq!(stats.total_cpu_cores, 510);
+        assert_eq!(stats.total_memory_mb, u64::MAX);
+    }
+
+    #[test]
+    fn max_dashboard_nodes_cap_enforced() {
+        let state = DashboardState::new();
+        for i in 0..MAX_DASHBOARD_NODES {
+            let b1 = (i >> 8) as u8;
+            let b2 = (i & 0xff) as u8;
+            state.add_node(&make_node(vec![b1, b2], 1, 1024));
+        }
+        assert_eq!(state.get_stats().total_nodes, MAX_DASHBOARD_NODES);
+
+        // Trying to add 1 more node must be ignored
+        state.add_node(&make_node(vec![0xff, 0xff, 0x01], 1, 1024));
+        assert_eq!(state.get_stats().total_nodes, MAX_DASHBOARD_NODES);
+
+        // Updating an existing node still succeeds
+        state.add_node(&make_node(vec![0, 0], 2, 2048));
+        assert_eq!(state.get_stats().total_nodes, MAX_DASHBOARD_NODES);
+    }
+
+    #[test]
+    fn get_nodes_sorts_deterministically_by_id() {
+        let state = DashboardState::new();
+        state.add_node(&make_node(vec![0xcc], 1, 100));
+        state.add_node(&make_node(vec![0xaa], 1, 100));
+        state.add_node(&make_node(vec![0xbb], 1, 100));
+
+        let nodes = state.get_nodes();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].id, "aa");
+        assert_eq!(nodes[1].id, "bb");
+        assert_eq!(nodes[2].id, "cc");
+    }
 }
