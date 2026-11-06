@@ -150,6 +150,21 @@ impl EncryptedNote {
         out
     }
 
+    /// True iff `self.ct` carries at least the 16-byte Poly1305 tag required by
+    /// the v1 envelope layout (`V1_MIN_REMAINDER - 56`).
+    pub fn is_well_formed(&self) -> bool {
+        self.ct.len() >= (V1_MIN_REMAINDER - 32 - 24)
+    }
+
+    /// Fallible counterpart to [`Self::to_bytes`] that rejects a hand-built
+    /// [`EncryptedNote`] whose `ct` is shorter than the 16-byte Poly1305 tag.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, EnvelopeError> {
+        if !self.is_well_formed() {
+            return Err(EnvelopeError::Malformed(ENVELOPE_TAG_V1));
+        }
+        Ok(self.to_bytes())
+    }
+
     /// Parse a canonical encoding.
     ///
     /// An unrecognised tag is rejected rather than fallen back on: a reader
@@ -246,6 +261,9 @@ pub fn seal(recipient_pub: &[u8; 32], plaintext: &[u8]) -> EncryptedNote {
 /// Open a `seal`ed box with the recipient's X25519 `secret`, returning the raw
 /// plaintext bytes. `None` on any failure (wrong key or tampered ciphertext).
 pub fn open(secret: &[u8; 32], sealed: &EncryptedNote) -> Option<Vec<u8>> {
+    if !sealed.is_well_formed() {
+        return None;
+    }
     let salsa = SalsaBox::new(&PublicKey::from(sealed.epk), &SecretKey::from(*secret));
     // `.into()` builds the nonce without naming the deprecated GenericArray type.
     salsa.decrypt(&sealed.nonce.into(), sealed.ct.as_ref()).ok()
@@ -329,6 +347,17 @@ mod tests {
         // A flipped ciphertext byte fails the Poly1305 tag.
         sealed.ct[0] ^= 0xff;
         assert!(open(&secret.to_bytes(), &sealed).is_none());
+
+        // A hand-built EncryptedNote with ct shorter than 16 bytes is rejected
+        // by try_to_bytes() and open() before any ECDH work.
+        let short_ct = EncryptedNote {
+            epk: [1u8; 32],
+            nonce: [2u8; 24],
+            ct: vec![0u8; 15],
+        };
+        assert!(!short_ct.is_well_formed());
+        assert_eq!(short_ct.try_to_bytes(), Err(EnvelopeError::Malformed(1)));
+        assert!(open(&secret.to_bytes(), &short_ct).is_none());
     }
 
     /// Interop vector produced by the wallet's `tweetnacl.box` (see #196). Core

@@ -94,11 +94,16 @@ impl VerificationChunk {
                     };
                 }
 
-                // Commitments must be non-zero
+                // Commitments must be non-zero and canonical field elements
                 for commitment in commitments {
                     if commitment.as_bytes() == &[0u8; 32] {
                         return VerificationResult::Invalid {
                             reason: "Zero commitment detected".to_string(),
+                        };
+                    }
+                    if !is_canonical_le(commitment.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "Non-canonical output commitment encoding".to_string(),
                         };
                     }
                 }
@@ -113,10 +118,15 @@ impl VerificationChunk {
                     };
                 }
 
-                // Check for duplicates within batch
+                // Check for canonical encodings and duplicates within batch
                 use std::collections::HashSet;
                 let mut seen = HashSet::new();
                 for nullifier in nullifiers {
+                    if !is_canonical_le(nullifier.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "Non-canonical nullifier encoding".to_string(),
+                        };
+                    }
                     if !seen.insert(nullifier) {
                         return VerificationResult::Invalid {
                             reason: "Duplicate nullifier in transaction".to_string(),
@@ -128,6 +138,11 @@ impl VerificationChunk {
             }
 
             VerificationChunk::MerkleProof { leaf, path, root } => {
+                if !is_canonical_le(leaf) || !is_canonical_le(root) {
+                    return VerificationResult::Invalid {
+                        reason: "Non-canonical Merkle leaf or root encoding".to_string(),
+                    };
+                }
                 // Verify path
                 if path.verify(leaf, root) {
                     VerificationResult::Valid
@@ -215,10 +230,20 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadErr
         }
     };
 
-    VerifyingKey::<Bn254>::deserialize_compressed(&bytes[..]).map_err(|e| KeyLoadError::Malformed {
-        path: path.to_path_buf(),
-        source: e,
-    })
+    let mut cursor = &bytes[..];
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor).map_err(|e| {
+        KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    if !cursor.is_empty() || vk.gamma_abc_g1.is_empty() {
+        return Err(KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: ark_serialize::SerializationError::InvalidData,
+        });
+    }
+    Ok(vk)
 }
 
 /// ZK Proof verifier interface
@@ -645,6 +670,43 @@ mod tests {
             "expected Malformed, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn load_verifying_key_rejects_trailing_bytes_and_chunk_rejects_non_canonical() {
+        use crate::privacy::circuits::{DepositCircuitV2, Groth16ProofSystem};
+        use ark_serialize::CanonicalSerialize;
+        use ark_std::rand::{rngs::StdRng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x1385);
+        let (_, vk) = Groth16ProofSystem::setup(DepositCircuitV2::new(), &mut rng).unwrap();
+        let mut vk_bytes = Vec::new();
+        vk.serialize_compressed(&mut vk_bytes).unwrap();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid_path = dir.path().join("valid.key");
+        std::fs::write(&valid_path, &vk_bytes).unwrap();
+        assert!(load_verifying_key(&valid_path).is_ok());
+
+        vk_bytes.push(0x99);
+        let trailing_path = dir.path().join("trailing.key");
+        std::fs::write(&trailing_path, &vk_bytes).unwrap();
+        assert!(matches!(
+            load_verifying_key(&trailing_path),
+            Err(KeyLoadError::Malformed { .. })
+        ));
+
+        let non_canonical = [0xFFu8; 32];
+        assert!(!VerificationChunk::OutputCommitments {
+            commitments: vec![Commitment(non_canonical)],
+        }
+        .verify()
+        .is_valid());
+        assert!(!VerificationChunk::NullifierUniqueness {
+            nullifiers: vec![Nullifier(non_canonical)],
+        }
+        .verify()
+        .is_valid());
     }
 
     #[test]
