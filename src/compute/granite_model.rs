@@ -54,13 +54,26 @@ impl ModelRunner for GraniteModelRunner {
     fn run(&self, prompt: &[u8]) -> Result<Vec<u8>> {
         let prompt =
             std::str::from_utf8(prompt).map_err(|_| anyhow!("prompt is not valid UTF-8"))?;
+        if self.max_tokens == 0 {
+            return Err(anyhow!("max_tokens must be greater than 0"));
+        }
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(anyhow!(
+                "temperature must be finite and non-negative, got {}",
+                self.temperature
+            ));
+        }
 
         // A blocking loopback request keeps `run` synchronous, so it composes
         // with the worker whether it is called from an async task or not.
         let addr = self
             .endpoint
+            .trim()
             .trim_start_matches("http://")
             .trim_end_matches('/');
+        if addr.is_empty() {
+            return Err(anyhow!("llama-server endpoint must not be empty"));
+        }
         let body = serde_json::json!({
             "prompt": prompt,
             "n_predict": self.max_tokens,
@@ -77,15 +90,21 @@ impl ModelRunner for GraniteModelRunner {
         let mut stream = TcpStream::connect(addr)
             .map_err(|e| anyhow!("cannot reach llama-server at {addr}: {e}"))?;
         stream.set_read_timeout(Some(Duration::from_secs(180)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         stream.write_all(request.as_bytes())?;
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw)?;
 
         let response = String::from_utf8_lossy(&raw);
-        let json_body = response
+        let (headers, json_body) = response
             .split_once("\r\n\r\n")
-            .map(|(_, body)| body)
             .ok_or_else(|| anyhow!("llama-server response had no body"))?;
+        let status_line = headers.lines().next().unwrap_or("");
+        if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+            return Err(anyhow!(
+                "llama-server returned non-200 status: {status_line}"
+            ));
+        }
         let parsed: serde_json::Value = serde_json::from_str(json_body.trim())
             .map_err(|e| anyhow!("llama-server returned invalid JSON: {e}"))?;
         let content = parsed
@@ -112,6 +131,18 @@ mod tests {
         // Port 1 is not served; the connection fails cleanly.
         let runner = GraniteModelRunner::new("http://127.0.0.1:1");
         assert!(runner.run(b"hello").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_max_tokens_and_invalid_temperature() {
+        let zero_tokens = GraniteModelRunner::new("http://127.0.0.1:1").with_max_tokens(0);
+        assert!(zero_tokens.run(b"hello").is_err());
+
+        let nan_temp = GraniteModelRunner::new("http://127.0.0.1:1").with_temperature(f32::NAN);
+        assert!(nan_temp.run(b"hello").is_err());
+
+        let neg_temp = GraniteModelRunner::new("http://127.0.0.1:1").with_temperature(-0.1);
+        assert!(neg_temp.run(b"hello").is_err());
     }
 
     /// End-to-end against a real `llama-server`. Ignored by default — run locally
