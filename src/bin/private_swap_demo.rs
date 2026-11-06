@@ -96,6 +96,27 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1").unwrap_or(false)
 }
 
+fn write_secret_file(path: &str, contents: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -159,7 +180,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Fork/localnet only: fund the payer so the deposit can land. Never on mainnet.
     if env_flag("AIRDROP") {
-        let need = swap_amount + LAMPORTS_PER_SOL;
+        let need = swap_amount
+            .checked_add(LAMPORTS_PER_SOL)
+            .ok_or_else(|| anyhow::anyhow!("swap_amount overflow"))?;
         println!("Airdropping payer {} SOL (fork)...", need as f64 / 1e9);
         let _ = client.request_airdrop(&payer.pubkey(), need);
         for _ in 0..20 {
@@ -199,17 +222,23 @@ async fn main() -> anyhow::Result<()> {
         let amt = v["amount"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("note file missing amount"))?;
+        if amt == 0 {
+            return Err(anyhow::anyhow!("resumed note amount must be > 0"));
+        }
+        let sk_le = hex32("in_sk")?;
+        let blinding_le = hex32("in_blinding")?;
+        let pk_le = hex32("in_note_pubkey")?;
+        let expected_pk = fr_to_le(&v3_pubkey(Fr::from_le_bytes_mod_order(&sk_le)));
+        if pk_le != expected_pk {
+            return Err(anyhow::anyhow!(
+                "resumed note in_note_pubkey does not match v3_pubkey(in_sk)"
+            ));
+        }
         println!(
             "resumed note:      {resume_path} (leaf {li}, {} SOL)",
             amt as f64 / 1e9
         );
-        (
-            hex32("in_sk")?,
-            hex32("in_blinding")?,
-            hex32("in_note_pubkey")?,
-            li,
-            amt,
-        )
+        (sk_le, blinding_le, pk_le, li, amt)
     } else {
         header("Step 1: shielded deposit (native SOL, deposit_note v3)");
         let sk = rand_fr();
@@ -230,8 +259,16 @@ async fn main() -> anyhow::Result<()> {
 
         // Read the just-appended leaf index from the on-chain tree.
         let raw = client.get_account_data(&tree_pda)?;
+        if raw.len() < 16 {
+            return Err(anyhow::anyhow!(
+                "merkle_tree account data too short ({} bytes)",
+                raw.len()
+            ));
+        }
         let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-        let leaf_index = next_index - 1;
+        let leaf_index = next_index
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("merkle_tree is empty (next_index == 0)"))?;
         println!("leaf index:        {leaf_index}");
 
         // Persist the note secret NOW, before the withdraw, so the deposit is
@@ -247,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
             "leaf_index": leaf_index,
             "amount": swap_amount,
         });
-        std::fs::write(&note_path, serde_json::to_string_pretty(&note)?)?;
+        write_secret_file(&note_path, serde_json::to_string_pretty(&note)?.as_bytes())?;
         println!("note saved:        {note_path}  (retry withdraw with RESUME_NOTE={note_path})");
         (sk_le, blinding_le, pk_le, leaf_index, swap_amount)
     };
@@ -259,9 +296,9 @@ async fn main() -> anyhow::Result<()> {
     // realized USDC is recoverable after the run.
     let fresh = Keypair::new();
     let fresh_path = format!("private_swap_fresh_{}.json", fresh.pubkey());
-    std::fs::write(
+    write_secret_file(
         &fresh_path,
-        serde_json::to_string(&fresh.to_bytes().to_vec())?,
+        serde_json::to_string(&fresh.to_bytes().to_vec())?.as_bytes(),
     )?;
     println!("fresh address:     {}", fresh.pubkey());
     println!("fresh key saved:   {fresh_path}  (holds the swapped USDC — keep it)");

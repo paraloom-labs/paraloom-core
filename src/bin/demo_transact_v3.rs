@@ -74,8 +74,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. read the tree: our leaf index + the post-deposit root ────────────
     let raw = client.get_account_data(&tree_pda)?;
+    if raw.len() < 56 + TX_LEVELS * 32 {
+        return Err(format!(
+            "merkle_tree account data too short ({} bytes, need >= {})",
+            raw.len(),
+            56 + TX_LEVELS * 32
+        )
+        .into());
+    }
     let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-    let leaf_index = next_index - 1;
+    let leaf_index = next_index
+        .checked_sub(1)
+        .ok_or("merkle_tree is empty (next_index == 0)")?;
     let root_onchain: [u8; 32] = raw[24..56].try_into()?;
     println!(
         "[2/5] on-chain tree: leaf {leaf_index}, root {}",
@@ -264,10 +274,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proof": hex::encode(&proof_bytes),
         "ciphertexts": [placeholder_0, placeholder_1],
     });
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
-        .json(&body)
-        .send()?;
+    let ingress = ingress.trim_end_matches('/');
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut req_builder = http.post(format!("{ingress}/transact/submit")).json(&body);
+    if let Ok(token) = std::env::var("BRIDGE_INGRESS_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            req_builder = req_builder.bearer_auth(trimmed);
+        }
+    }
+    let resp = req_builder.send()?;
     let status = resp.status();
     let text = resp.text()?;
     println!("      {status}: {text}");
