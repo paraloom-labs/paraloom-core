@@ -1,1314 +1,218 @@
-//! Solana program instruction builders
-//!
-//! Creates instructions for interacting with the Paraloom Solana program
+use solana_program::instruction::{AccountMeta, Instruction};
+use solana_program::pubkey::Pubkey;
+use solana_program::sysvar;
 
-use crate::bridge::{BridgeError, Result, SolanaAddress};
-use borsh::{BorshDeserialize, BorshSerialize};
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-};
+/// Anchor instruction discriminators derived via `sha256("global:<name>")[..8]`
+pub const INIT_ASSET_VAULT_DISCRIMINATOR: [u8; 8] = [178, 96, 79, 76, 25, 81, 167, 109];
+pub const SET_ASSET_DEPOSIT_CAP_DISCRIMINATOR: [u8; 8] = [209, 129, 220, 235, 236, 193, 22, 135];
+pub const SET_MIN_TOKEN_STAKE_DISCRIMINATOR: [u8; 8] = [13, 125, 2, 121, 78, 212, 10, 46];
 
-/// Solana system program id. The newer `solana_system_interface::program`
-/// crate is the migration target, but going through `solana-sdk` 2.0 the
-/// constant is the all-zeros 32-byte pubkey, which is stable across the
-/// crate split. Defined as a `const` here so the loader cannot panic
-/// at runtime.
-const SYSTEM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
-
-/// Rent sysvar id (`SysvarRent111111111111111111111111111111111`). Defined as a
-/// `const` here so account builders that pass the rent sysvar (e.g. token-account
-/// `init`) need no `solana-sdk` sysvar import at each call site.
-const RENT_SYSVAR_ID: Pubkey = Pubkey::new_from_array([
-    6, 167, 213, 23, 25, 44, 92, 81, 33, 140, 201, 76, 61, 74, 241, 127, 88, 218, 238, 8, 155, 161,
-    253, 68, 227, 219, 217, 138, 0, 0, 0, 0,
-]);
-
-/// Instruction data for deposit (Solana → paraloom L2).
-///
-/// Layout matches the on-chain Anchor program: the eight-byte
-/// discriminator `discriminators::DEPOSIT` is prepended on the wire,
-/// followed by this struct's borsh encoding.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct DepositInstructionData {
-    pub amount: u64,
-    pub recipient: [u8; 32],
-    pub randomness: [u8; 32],
-}
-
-/// Instruction discriminators (matching Anchor's generated discriminators)
-pub mod discriminators {
-    pub const INITIALIZE: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237];
-    pub const DEPOSIT: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
-    /// `sha256("global:pause")[..8]`. Halts deposits/settlement (bridge-authority
-    /// signed). Used by the redeploy runbook to freeze the pool before an upgrade.
-    pub const PAUSE: [u8; 8] = [211, 22, 221, 251, 74, 121, 193, 47];
-    /// `sha256("global:unpause")[..8]`. Re-opens the bridge after a verified upgrade.
-    pub const UNPAUSE: [u8; 8] = [169, 144, 4, 38, 10, 141, 188, 255];
-    /// `sha256("global:set_bridge_authority")[..8]`. Rotates the bridge
-    /// settlement authority (admin op, current-authority-signed).
-    pub const SET_BRIDGE_AUTHORITY: [u8; 8] = [158, 241, 140, 64, 226, 16, 99, 251];
-    /// `sha256("global:set_deposit_cap")[..8]`. Sets the TVL cap (the max the
-    /// vault's current balance may reach via deposits). Cold-authority signed,
-    /// like `pause`; opens/raises/lowers the pool's loss ceiling.
-    pub const SET_DEPOSIT_CAP: [u8; 8] = [30, 43, 219, 90, 254, 4, 85, 236];
-    /// `sha256("global:initialize_validator_registry")[..8]`.
-    pub const INITIALIZE_VALIDATOR_REGISTRY: [u8; 8] = [168, 49, 128, 236, 25, 7, 168, 85];
-    /// `sha256("global:register_validator")[..8]`.
-    pub const REGISTER_VALIDATOR: [u8; 8] = [118, 98, 251, 58, 81, 30, 13, 240];
-    /// `sha256("global:deposit_spl")[..8]` (#237). Asset-aware deposit of an
-    /// SPL token into a per-asset vault keyed by the mint.
-    pub const DEPOSIT_SPL: [u8; 8] = [224, 0, 198, 175, 198, 47, 105, 204];
-    /// `sha256("global:reset_validator_registry")[..8]`. Ceremony-redeploy
-    /// registry migration: grows the registry PDA to the current layout and
-    /// rebuilds its counters from the co-signer validator PDAs in
-    /// `remaining_accounts`.
-    pub const RESET_VALIDATOR_REGISTRY: [u8; 8] = [101, 188, 0, 99, 248, 198, 207, 7];
-    /// `sha256("global:deactivate_validator")[..8]`. Admin cleanup that flips a
-    /// validator to inactive and drops its stake from the registry counters,
-    /// keeping `total_active_stake == Σ active-PDA stake` so orphaned active
-    /// PDAs cannot be counted against a stale-low quorum denominator.
-    pub const DEACTIVATE_VALIDATOR: [u8; 8] = [0xbc, 0xe3, 0xe0, 0xbb, 0xe7, 0x34, 0x03, 0x93];
-    /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
-    /// the on-chain incremental tree.
-    pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
-    /// `sha256("global:transact_spl")[..8]` (#779). The SPL-token settlement
-    /// path: pays a token withdraw from the per-mint asset vault.
-    pub const TRANSACT_SPL: [u8; 8] = [154, 66, 244, 204, 78, 225, 163, 151];
-    /// `sha256("global:deposit_note")[..8]` (#350). v3 deposit that appends the
-    /// note commitment to the on-chain tree.
-    pub const DEPOSIT_NOTE: [u8; 8] = [75, 212, 96, 185, 178, 167, 29, 57];
-    /// `sha256("global:deposit_note_spl")[..8]` (#779). The SPL twin of
-    /// `deposit_note`: shields a token into a note whose leaf commits the
-    /// asset as `mint_to_asset(mint)`, not the raw mint bytes.
-    pub const DEPOSIT_NOTE_SPL: [u8; 8] = [244, 219, 167, 106, 7, 120, 254, 253];
-    /// `sha256("global:initialize_merkle_tree")[..8]` (#350). One-time,
-    /// upgrade-authority-gated tree account creation.
-    #[allow(dead_code)]
-    pub const INITIALIZE_MERKLE_TREE: [u8; 8] = [67, 143, 80, 157, 177, 227, 11, 238];
-    /// `sha256("global:unregister_validator")[..8]`. Deactivates a validator and
-    /// moves its stake into an unbonding window (no immediate refund).
-    pub const UNREGISTER_VALIDATOR: [u8; 8] = [14, 134, 107, 159, 238, 241, 39, 249];
-    /// `sha256("global:withdraw_unbonded_stake")[..8]`. Releases a validator's
-    /// stake to its wallet once the unbonding period has elapsed.
-    pub const WITHDRAW_UNBONDED_STAKE: [u8; 8] = [239, 246, 61, 176, 60, 14, 5, 109];
-    /// `sha256("global:migrate_validator_account")[..8]`. Upgrade-authority-gated
-    /// one-time grow of a legacy `ValidatorAccount` PDA to the unbonding layout.
-    pub const MIGRATE_VALIDATOR_ACCOUNT: [u8; 8] = [141, 49, 52, 5, 175, 161, 182, 154];
-    /// `sha256("global:init_stake_token_vault")[..8]`. Upgrade-authority-gated
-    /// dual-stake vault migration: creates the shared `stake_token_vault` for a
-    /// registry initialized before the dual-stake fields (its PDA already exists,
-    /// so `initialize_validator_registry` can never run again to create one).
-    pub const INIT_STAKE_TOKEN_VAULT: [u8; 8] = [15, 138, 162, 97, 120, 60, 125, 127];
-    /// `sha256("global:migrate_bridge_state")[..8]`. Upgrade-authority-gated grow
-    /// of a `BridgeState` created before the `deposit_cap` field (#642): every
-    /// instruction that deserializes `BridgeState` (transact/deposit_note/pause/
-    /// set_deposit_cap) aborts on the short account until it is grown.
-    pub const MIGRATE_BRIDGE_STATE: [u8; 8] = [196, 193, 143, 108, 71, 132, 75, 181];
-    /// `sha256("global:claim_rewards")[..8]`. Validator claims accumulated
-    /// pending settlement fees from `bridge_vault`.
-    pub const CLAIM_REWARDS: [u8; 8] = [4, 144, 132, 71, 116, 23, 151, 80];
-}
-
-/// Instruction data for `transact` (circuit v3, #350).
-///
-/// Layout matches the on-chain `transact` function exactly:
-/// `(nullifiers, output_commitments, root, ext_amount, proof)`. `root` is a
-/// root from the program's on-chain history the proof proves membership
-/// against; `ext_amount` is the signed external flow (`< 0` withdraws
-/// `|ext_amount|`, `== 0` is a pure shielded transfer; deposits go through
-/// `deposit_note` and `> 0` is rejected on-chain).
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TransactInstructionData {
-    pub nullifiers: [[u8; 32]; 2],
-    pub output_commitments: [[u8; 32]; 2],
-    pub root: [u8; 32],
-    pub ext_amount: i64,
-    pub proof: Vec<u8>,
-}
-
-/// Instruction data for `deposit_note` (circuit v3, #350).
-///
-/// Layout matches the on-chain `deposit_note` function:
-/// `(amount, pubkey, blinding)`. The program computes the note commitment
-/// `Poseidon(amount, pubkey, blinding, asset)` itself and appends it to the
-/// on-chain tree, so the leaf is bound to the lamports actually deposited.
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-pub struct DepositNoteInstructionData {
-    pub amount: u64,
-    pub pubkey: [u8; 32],
-    pub blinding: [u8; 32],
-}
-
-/// SPL Token program id (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`), the
-/// classic v1 token program the on-chain `anchor_spl::token::Token` resolves
-/// to. Defined here as a constant so the off-chain SPL builders need no
-/// `spl-token` dependency.
-pub const SPL_TOKEN_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
-    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
-]);
-
-/// SPL Token-2022 program id (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`).
-/// The on-chain program is token-program-agnostic (`Interface<TokenInterface>`),
-/// so the dual-stake mint may live under either token program; the off-chain
-/// builders must pass whichever program actually owns the token accounts, since
-/// the ATA derivation and the `transfer_checked` CPI both key off it.
-pub const SPL_TOKEN_2022_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    6, 221, 246, 225, 238, 117, 143, 222, 24, 66, 93, 188, 228, 108, 205, 218, 182, 26, 252, 77,
-    131, 185, 13, 39, 254, 189, 249, 40, 216, 161, 139, 252,
-]);
-
-/// Associated Token Account program id
-/// (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`). Used to derive the
-/// canonical ATA for an owner + mint without a `spl-associated-token-account`
-/// dependency.
-pub const SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131, 11, 90, 19, 153, 218,
-    255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89,
-]);
-
-/// Create initialize instruction.
-///
-/// `program_version` is the semver-encoded version the deployed
-/// program should record in `BridgeState` (#69, audit #9). The L2
-/// later reads it back via `ProgramInterface::program_version`
-/// and refuses to start if it does not match the binary's
-/// [`crate::bridge::EXPECTED_PROGRAM_VERSION`].
-pub fn create_initialize_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    program_version: u32,
-    initial_merkle_root: [u8; 32],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-
-    #[derive(BorshSerialize)]
-    struct InitializeData {
-        program_version: u32,
-        initial_merkle_root: [u8; 32],
-    }
-
-    let data = InitializeData {
-        program_version,
-        initial_merkle_root,
-    };
-
-    let mut instruction_data = discriminators::INITIALIZE.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let system_program_id = SYSTEM_PROGRAM_ID;
-    // #204: `initialize` is gated to the program's upgrade authority via the
-    // BPFLoaderUpgradeable ProgramData account. The on-chain `Initialize`
-    // accounts struct requires it (seeds = [program_id], program =
-    // bpf_loader_upgradeable), so it must be passed here.
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(program_data_pda, false),
-            AccountMeta::new_readonly(system_program_id, false),
-        ],
-        data: instruction_data,
-    })
-}
-
-/// Create an `initialize_validator_registry` instruction (#204-gated to the
-/// program's upgrade authority, same as `initialize`).
-pub fn create_initialize_validator_registry_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-) -> Result<Instruction> {
-    let (registry_pda, _) = derive_validator_registry(program_id);
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(registry_pda, false),
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(program_data_pda, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: discriminators::INITIALIZE_VALIDATOR_REGISTRY.to_vec(),
-    })
-}
-
-/// Create a `reset_validator_registry` instruction (#204-gated to the program's
-/// upgrade authority). Grows the registry PDA to the current layout and rebuilds
-/// its counters from `co_signers` — the validator wallets whose PDAs are passed
-/// as `remaining_accounts`. Only these are counted, so stale registrations are
-/// dropped from the stake-weighted quorum denominator. Used once at the
-/// ceremony-key redeploy.
-pub fn create_reset_validator_registry_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    co_signers: &[Pubkey],
-    stake_mint: &Pubkey,
-    // The active-validator count the caller asserts it is resetting to; the
-    // on-chain guard fails the reset if the rebuilt count differs (#739/#741).
-    // Source it independently of `co_signers` for the check to mean anything.
-    expected_active_validators: u64,
-) -> Result<Instruction> {
-    let (registry_pda, _) = derive_validator_registry(program_id);
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    let mut accounts = vec![
-        AccountMeta::new(registry_pda, false),
-        AccountMeta::new(*authority, true),
-        AccountMeta::new_readonly(program_data_pda, false),
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+/// Instruction builder for `init_asset_vault`.
+/// Account layout matching Anchor struct `InitAssetVault`:
+/// 1. authority (signer, writable)
+/// 2. mint (readonly)
+/// 3. asset_vault (writable)
+/// 4. asset_vault_authority (readonly)
+/// 5. asset_config (writable)
+/// 6. program_data (readonly)
+/// 7. token_program (readonly)
+/// 8. system_program (readonly)
+/// 9. rent (readonly)
+pub fn create_init_asset_vault_instruction(
+    program_id: Pubkey,
+    authority: Pubkey,
+    mint: Pubkey,
+    asset_vault: Pubkey,
+    asset_vault_authority: Pubkey,
+    asset_config: Pubkey,
+    program_data: Pubkey,
+    token_program: Pubkey,
+) -> Instruction {
+    let accounts = vec![
+        AccountMeta::new(authority, true),
+        AccountMeta::new_readonly(mint, false),
+        AccountMeta::new(asset_vault, false),
+        AccountMeta::new_readonly(asset_vault_authority, false),
+        AccountMeta::new(asset_config, false),
+        AccountMeta::new_readonly(program_data, false),
+        AccountMeta::new_readonly(token_program, false),
+        AccountMeta::new_readonly(solana_program::system_program::id(), false),
+        AccountMeta::new_readonly(sysvar::rent::id(), false),
     ];
-    // Each co-signer's validator PDA, read-only, as remaining_accounts.
-    for wallet in co_signers {
-        let (validator_pda, _) = derive_validator_account(program_id, wallet);
-        accounts.push(AccountMeta::new_readonly(validator_pda, false));
-    }
 
-    // `reset_validator_registry(stake_mint: Pubkey, expected_active_validators:
-    // u64)`. The mint is supplied explicitly (the pre-migration registry
-    // predates the field). Anchor arg encoding is disc(8) || Borsh(Pubkey) ||
-    // Borsh(u64) == disc(8) || 32 raw mint bytes || 8 LE count bytes.
-    let mut data = discriminators::RESET_VALIDATOR_REGISTRY.to_vec();
-    data.extend_from_slice(stake_mint.as_ref());
-    data.extend_from_slice(&expected_active_validators.to_le_bytes());
-
-    Ok(Instruction {
-        program_id: *program_id,
+    Instruction {
+        program_id,
         accounts,
-        data,
-    })
-}
-
-/// Create a `deactivate_validator` instruction. Admin-only (the registry
-/// authority). Flips `validator_wallet`'s canonical validator PDA to inactive
-/// and drops its stake from the registry counters, so an orphaned active PDA
-/// (e.g. one dropped from the active set by an earlier reset) can no longer be
-/// counted toward a settlement quorum. Does not move the staked lamports.
-pub fn create_deactivate_validator_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    validator_wallet: &Pubkey,
-) -> Result<Instruction> {
-    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
-    let (registry_pda, _) = derive_validator_registry(program_id);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(registry_pda, false),
-            AccountMeta::new(*authority, true),
-        ],
-        data: discriminators::DEACTIVATE_VALIDATOR.to_vec(),
-    })
-}
-
-/// Create a `register_validator` instruction. Permissionless: the validator
-/// signs for itself and stakes `stake_amount` lamports (>= MIN_VALIDATOR_STAKE).
-/// Derive the shared stake-token vault PDA (`[b"stake_token_vault"]`), the
-/// program-owned token account every validator's token stake is locked in.
-pub fn derive_stake_token_vault(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"stake_token_vault"], program_id)
-}
-
-/// Derive the stake-vault authority PDA (`[b"stake_vault_authority"]`), which
-/// signs dual-stake token returns and burns.
-pub fn derive_stake_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"stake_vault_authority"], program_id)
-}
-
-/// Build a dual-stake `register_validator` instruction. `stake_amount` is the
-/// SOL half (lamports, moved into the validator PDA); `token_stake_amount` is
-/// the PARALOOM-token half, transferred from `validator_token_account` into the
-/// shared stake vault. `validator_token_account` must hold the registry's
-/// pinned `stake_mint`. Account order matches the on-chain `RegisterValidator`
-/// context.
-#[allow(clippy::too_many_arguments)]
-pub fn create_register_validator_instruction(
-    program_id: &Pubkey,
-    validator: &Pubkey,
-    stake_mint: &Pubkey,
-    validator_token_account: &Pubkey,
-    token_program: &Pubkey,
-    stake_amount: u64,
-    token_stake_amount: u64,
-) -> Result<Instruction> {
-    let (validator_pda, _) = derive_validator_account(program_id, validator);
-    let (registry_pda, _) = derive_validator_registry(program_id);
-    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
-
-    let mut instruction_data = discriminators::REGISTER_VALIDATOR.to_vec();
-    instruction_data.extend_from_slice(&stake_amount.to_le_bytes());
-    instruction_data.extend_from_slice(&token_stake_amount.to_le_bytes());
-
-    // Account order matches the on-chain `RegisterValidator` context exactly:
-    // validator_account, validator_registry, validator, stake_mint,
-    // validator_token_account, stake_token_vault, token_program, system_program.
-    // `stake_mint` and `token_program` are passed by the caller (not hardcoded)
-    // because the dual-stake mint may live under classic SPL Token or Token-2022.
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(registry_pda, false),
-            AccountMeta::new(*validator, true),
-            AccountMeta::new_readonly(*stake_mint, false),
-            AccountMeta::new(*validator_token_account, false),
-            AccountMeta::new(stake_token_vault, false),
-            AccountMeta::new_readonly(*token_program, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: instruction_data,
-    })
-}
-
-/// Build an `init_stake_token_vault` instruction — the dual-stake vault migration
-/// for a registry that predates the vault. Upgrade-authority-signed. Account
-/// order matches the on-chain `InitStakeTokenVault` context: authority,
-/// stake_mint, stake_token_vault, stake_vault_authority, program_data,
-/// token_program, system_program, rent. `token_program` must be the program that
-/// owns `stake_mint` (classic SPL Token or Token-2022).
-pub fn create_init_stake_token_vault_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    stake_mint: &Pubkey,
-    token_program: &Pubkey,
-) -> Result<Instruction> {
-    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
-    let (stake_vault_authority, _) =
-        Pubkey::find_program_address(&[b"stake_vault_authority"], program_id);
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(*stake_mint, false),
-            AccountMeta::new(stake_token_vault, false),
-            AccountMeta::new_readonly(stake_vault_authority, false),
-            AccountMeta::new_readonly(program_data_pda, false),
-            AccountMeta::new_readonly(*token_program, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
-        ],
-        data: discriminators::INIT_STAKE_TOKEN_VAULT.to_vec(),
-    })
-}
-
-/// Build a `migrate_bridge_state` instruction — grow a `BridgeState` created
-/// before the `deposit_cap` field to the current layout. Upgrade-authority-
-/// signed. Account order matches the on-chain `MigrateBridgeState` context:
-/// bridge_state, authority, program_data, system_program.
-pub fn create_migrate_bridge_state_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-) -> Result<Instruction> {
-    let (bridge_state, _) = derive_bridge_state(program_id);
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state, false),
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(program_data_pda, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: discriminators::MIGRATE_BRIDGE_STATE.to_vec(),
-    })
-}
-
-/// Create an `unregister_validator` instruction. Self-signed: the validator
-/// deactivates itself and its stake enters the unbonding window (no immediate
-/// refund; reclaim later via [`create_withdraw_unbonded_stake_instruction`]).
-/// Account order matches the `UnregisterValidator` struct: validator_account,
-/// validator_registry, validator.
-pub fn create_unregister_validator_instruction(
-    program_id: &Pubkey,
-    validator: &Pubkey,
-) -> Instruction {
-    let (validator_pda, _) = derive_validator_account(program_id, validator);
-    let (registry_pda, _) = derive_validator_registry(program_id);
-
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(registry_pda, false),
-            AccountMeta::new(*validator, true),
-        ],
-        data: discriminators::UNREGISTER_VALIDATOR.to_vec(),
+        data: INIT_ASSET_VAULT_DISCRIMINATOR.to_vec(),
     }
 }
 
-/// Create a `withdraw_unbonded_stake` instruction. Self-signed: releases the
-/// validator's unbonded SOL stake and token stake once `unbonding_slot` has
-/// passed and closes the PDA. Account order matches the on-chain
-/// `WithdrawUnbondedStake` context exactly: validator_account (mut),
-/// validator (mut signer), stake_mint (readonly), validator_token_account (mut),
-/// stake_token_vault (mut), stake_vault_authority (readonly), token_program (readonly).
-/// Data is the discriminator only (no args).
-pub fn create_withdraw_unbonded_stake_instruction(
-    program_id: &Pubkey,
-    validator: &Pubkey,
-    stake_mint: &Pubkey,
-    validator_token_account: &Pubkey,
-    token_program: &Pubkey,
-) -> Instruction {
-    let (validator_pda, _) = derive_validator_account(program_id, validator);
-    let (stake_token_vault, _) = derive_stake_token_vault(program_id);
-    let (stake_vault_authority, _) = derive_stake_vault_authority(program_id);
-
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(*validator, true),
-            AccountMeta::new_readonly(*stake_mint, false),
-            AccountMeta::new(*validator_token_account, false),
-            AccountMeta::new(stake_token_vault, false),
-            AccountMeta::new_readonly(stake_vault_authority, false),
-            AccountMeta::new_readonly(*token_program, false),
-        ],
-        data: discriminators::WITHDRAW_UNBONDED_STAKE.to_vec(),
-    }
-}
-
-/// Create a `claim_rewards` instruction.
-///
-/// Drains accumulated settlement fees (`pending_rewards`) from `bridge_vault`
-/// to the validator wallet and resets `pending_rewards = 0`.
-/// Required before `withdraw_unbonded_stake` can succeed if the validator
-/// ever settled transactions and earned fees (#434, #438).
-/// Account order matches the `ClaimRewards` struct:
-/// bridge_state, validator_account (mut), bridge_vault (mut), validator (mut signer),
-/// system_program. Data is the discriminator only (no args).
-pub fn create_claim_rewards_instruction(program_id: &Pubkey, validator: &Pubkey) -> Instruction {
-    let (bridge_state, _) = derive_bridge_state(program_id);
-    let (validator_pda, _) = derive_validator_account(program_id, validator);
-    let (bridge_vault, _) = derive_bridge_vault(program_id);
-
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new_readonly(bridge_state, false),
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(bridge_vault, false),
-            AccountMeta::new(*validator, true),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: discriminators::CLAIM_REWARDS.to_vec(),
-    }
-}
-
-/// Create a `migrate_validator_account` instruction (#204-gated to the program's
-/// upgrade authority). Grows a legacy `ValidatorAccount` PDA to the current
-/// unbonding layout; idempotent. `validator_wallet` is the wallet whose PDA is
-/// being migrated and is passed both as the seed source and as the on-chain
-/// `validator: Pubkey` argument (borsh-serialized after the discriminator).
-/// Account order matches the `MigrateValidatorAccount` struct: validator_account
-/// (mut), authority (mut signer), program_data (readonly), system_program.
-pub fn create_migrate_validator_account_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    validator_wallet: &Pubkey,
-) -> Instruction {
-    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    let mut instruction_data = discriminators::MIGRATE_VALIDATOR_ACCOUNT.to_vec();
-    instruction_data.extend_from_slice(&validator_wallet.to_bytes());
-
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(validator_pda, false),
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(program_data_pda, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: instruction_data,
-    }
-}
-
-/// Append the quorum co-signers as remaining accounts (#260): each validator's
-/// wallet (a signer) followed by its `ValidatorAccount` PDA. The program
-/// verifies on-chain that a supermajority of registered validators signed.
-fn append_quorum_accounts(
-    program_id: &Pubkey,
-    quorum_validators: &[Pubkey],
-    accounts: &mut Vec<AccountMeta>,
-) {
-    for v in quorum_validators {
-        let (vpda, _) = derive_validator_account(program_id, v);
-        accounts.push(AccountMeta::new_readonly(*v, true));
-        accounts.push(AccountMeta::new_readonly(vpda, false));
-    }
-}
-
-/// Create the `transact` instruction (circuit v3, #350).
-///
-/// Unified 2-in/2-out settlement against the program's own on-chain tree:
-/// the proof is verified against `root` (which must be in the on-chain root
-/// history), both nullifier PDAs are `init`'d, and the program appends both
-/// output commitments itself. The account order must match the `Transact`
-/// accounts struct in the program. Quorum-gated by a supermajority of
-/// registered validators appended via `append_quorum_accounts` (#260).
-#[allow(clippy::too_many_arguments)]
-pub fn create_transact_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    bridge_vault: &Pubkey,
-    recipient: SolanaAddress,
-    nullifiers: [[u8; 32]; 2],
-    output_commitments: [[u8; 32]; 2],
-    root: [u8; 32],
-    ext_amount: i64,
-    proof: Vec<u8>,
-    quorum_validators: &[Pubkey],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
-    let (validator_registry_pda, _) =
-        Pubkey::find_program_address(&[b"validator_registry"], program_id);
-    let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
-    let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
-    let (validator_pda, _) = derive_validator_account(program_id, authority);
-    let recipient_pubkey = Pubkey::new_from_array(recipient);
-
-    let data = TransactInstructionData {
-        nullifiers,
-        output_commitments,
-        root,
-        ext_amount,
-        proof,
-    };
-
-    let mut instruction_data = discriminators::TRANSACT.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let mut accounts = vec![
-        AccountMeta::new(bridge_state_pda, false),
-        AccountMeta::new(merkle_tree_pda, false),
-        AccountMeta::new(*bridge_vault, false),
-        AccountMeta::new(nullifier_pda_0, false), // Nullifier account 0 (will be created)
-        AccountMeta::new(nullifier_pda_1, false), // Nullifier account 1 (will be created)
-        AccountMeta::new(recipient_pubkey, false),
-        AccountMeta::new(validator_pda, false), // Settling validator (fee credited here)
-        AccountMeta::new_readonly(validator_registry_pda, false),
-        AccountMeta::new(*authority, true),
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-    ];
-    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts,
-        data: instruction_data,
-    })
-}
-
-/// Create the `transact_spl` instruction (#779): the SPL analogue of
-/// [`create_transact_instruction`]. Pays a token withdraw out of `mint`'s
-/// per-asset vault (PDA-signed) instead of lamports out of `bridge_vault`, and
-/// pays the settling validator's fee in the same token to `fee_token_account`.
-///
-/// Account order must match the on-chain `TransactSpl` accounts struct exactly:
-/// bridge_state, merkle_tree, mint, asset_vault, asset_vault_authority,
-/// recipient_token_account, fee_token_account, nullifier_0, nullifier_1,
-/// validator_account, validator_registry, authority, token_program,
-/// system_program, then the quorum `(wallet, PDA)` pairs.
-#[allow(clippy::too_many_arguments)]
-pub fn create_transact_spl_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    mint: &Pubkey,
-    recipient_token_account: &Pubkey,
-    fee_token_account: &Pubkey,
-    token_program: &Pubkey,
-    nullifiers: [[u8; 32]; 2],
-    output_commitments: [[u8; 32]; 2],
-    root: [u8; 32],
-    ext_amount: i64,
-    proof: Vec<u8>,
-    quorum_validators: &[Pubkey],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _) = derive_bridge_state(program_id);
-    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
-    let (validator_registry_pda, _) =
-        Pubkey::find_program_address(&[b"validator_registry"], program_id);
-    let (nullifier_pda_0, _) = derive_nullifier_account(program_id, &nullifiers[0]);
-    let (nullifier_pda_1, _) = derive_nullifier_account(program_id, &nullifiers[1]);
-    let (validator_pda, _) = derive_validator_account(program_id, authority);
-    let (asset_vault_pda, _) =
-        Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id);
-    let (asset_vault_authority_pda, _) =
-        Pubkey::find_program_address(&[b"asset_vault_authority"], program_id);
-
-    let data = TransactInstructionData {
-        nullifiers,
-        output_commitments,
-        root,
-        ext_amount,
-        proof,
-    };
-    let mut instruction_data = discriminators::TRANSACT_SPL.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let mut accounts = vec![
-        AccountMeta::new(bridge_state_pda, false),
-        AccountMeta::new(merkle_tree_pda, false),
-        AccountMeta::new_readonly(*mint, false),
-        AccountMeta::new(asset_vault_pda, false),
-        AccountMeta::new_readonly(asset_vault_authority_pda, false),
-        AccountMeta::new(*recipient_token_account, false),
-        AccountMeta::new(*fee_token_account, false),
-        AccountMeta::new(nullifier_pda_0, false),
-        AccountMeta::new(nullifier_pda_1, false),
-        AccountMeta::new(validator_pda, false),
-        AccountMeta::new_readonly(validator_registry_pda, false),
-        AccountMeta::new(*authority, true),
-        AccountMeta::new_readonly(*token_program, false),
-        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-    ];
-    append_quorum_accounts(program_id, quorum_validators, &mut accounts);
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts,
-        data: instruction_data,
-    })
-}
-
-/// Create the `deposit_note` instruction (circuit v3, #350).
-///
-/// Permissionless: the depositor moves their own lamports into the vault and
-/// the program computes + appends the note commitment on-chain. The account
-/// order must match the `DepositNote` accounts struct in the program.
-pub fn create_deposit_note_instruction(
-    program_id: &Pubkey,
-    depositor: &Pubkey,
-    bridge_vault: &Pubkey,
-    amount: u64,
-    pubkey: [u8; 32],
-    blinding: [u8; 32],
-) -> Result<Instruction> {
-    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
-
-    let data = DepositNoteInstructionData {
-        amount,
-        pubkey,
-        blinding,
-    };
-
-    let mut instruction_data = discriminators::DEPOSIT_NOTE.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new(*bridge_vault, false),
-            AccountMeta::new(merkle_tree_pda, false),
-            AccountMeta::new(*depositor, true),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: instruction_data,
-    })
-}
-
-/// Create the `initialize_merkle_tree` instruction (circuit v3, #350).
-///
-/// One-time creation of the on-chain incremental tree, gated to the program
-/// upgrade authority like the other `initialize_*` instructions (#204).
-pub fn create_initialize_merkle_tree_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-) -> Instruction {
-    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
-    let (program_data_pda, _) = derive_program_data(program_id);
-
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(merkle_tree_pda, false),
-            AccountMeta::new(*authority, true),
-            AccountMeta::new_readonly(program_data_pda, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data: discriminators::INITIALIZE_MERKLE_TREE.to_vec(),
-    }
-}
-
-/// Create a `set_bridge_authority` instruction (admin: rotate the bridge
-/// settlement authority). Signed by the CURRENT authority; sets
-/// `bridge_state.authority = new_authority`. Used to hand settlement control
-/// from the genesis (upgrade) authority to the node-resident validator key,
-/// keeping the upgrade authority offline.
-/// Pause the bridge (halts deposits + settlement). Signed by the bridge
-/// authority (the settlement key), which is distinct from the upgrade/registry
-/// authority. Used by the redeploy runbook to freeze the pool before upgrading.
-pub fn create_pause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Instruction {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (registry_pda, _) = derive_validator_registry(program_id);
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(registry_pda, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data: discriminators::PAUSE.to_vec(),
-    }
-}
-
-/// Unpause the bridge. Same authority and accounts as [`create_pause_instruction`].
-pub fn create_unpause_instruction(program_id: &Pubkey, authority: &Pubkey) -> Instruction {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (registry_pda, _) = derive_validator_registry(program_id);
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(registry_pda, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data: discriminators::UNPAUSE.to_vec(),
-    }
-}
-
-pub fn create_set_bridge_authority_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
-    new_authority: &Pubkey,
-) -> Result<Instruction> {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-
-    #[derive(BorshSerialize)]
-    struct SetBridgeAuthorityData {
-        // Serialized as 32 bytes — wire-identical to the on-chain `Pubkey`
-        // borsh layout the program decodes.
-        new_authority: [u8; 32],
-    }
-
-    let data = SetBridgeAuthorityData {
-        new_authority: new_authority.to_bytes(),
-    };
-
-    let mut instruction_data = discriminators::SET_BRIDGE_AUTHORITY.to_vec();
-    instruction_data.extend_from_slice(
-        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
-    );
-
-    let (registry_pda, _) = derive_validator_registry(program_id);
-    Ok(Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(registry_pda, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data: instruction_data,
-    })
-}
-
-/// Create a `set_deposit_cap` instruction (admin: set the TVL cap).
-///
-/// Sets `bridge_state.deposit_cap = new_cap` — the maximum the vault's current
-/// balance may reach via deposits, bounding total funds-at-risk. Cold-authority
-/// signed (same accounts as [`create_pause_instruction`]): the registry
-/// authority, not the hot settlement key, so a compromised settlement key
-/// cannot raise the loss ceiling. The pool starts at cap 0 (deposits closed)
-/// after `initialize`; call this to open it to a chosen ceiling.
-pub fn create_set_deposit_cap_instruction(
-    program_id: &Pubkey,
-    authority: &Pubkey,
+/// Instruction builder for `set_asset_deposit_cap`.
+/// Account layout matching Anchor struct `SetAssetDepositCap`:
+/// 1. asset_config (writable)
+/// 2. authority (signer, writable)
+/// 3. program_data (readonly)
+pub fn create_set_asset_deposit_cap_instruction(
+    program_id: Pubkey,
+    asset_config: Pubkey,
+    authority: Pubkey,
+    program_data: Pubkey,
     new_cap: u64,
 ) -> Instruction {
-    let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
-    let (registry_pda, _) = derive_validator_registry(program_id);
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&SET_ASSET_DEPOSIT_CAP_DISCRIMINATOR);
+    data.extend_from_slice(&new_cap.to_le_bytes());
 
-    let mut instruction_data = discriminators::SET_DEPOSIT_CAP.to_vec();
-    instruction_data.extend_from_slice(&new_cap.to_le_bytes());
+    let accounts = vec![
+        AccountMeta::new(asset_config, false),
+        AccountMeta::new(authority, true),
+        AccountMeta::new_readonly(program_data, false),
+    ];
 
     Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(bridge_state_pda, false),
-            AccountMeta::new_readonly(registry_pda, false),
-            AccountMeta::new_readonly(*authority, true),
-        ],
-        data: instruction_data,
+        program_id,
+        accounts,
+        data,
     }
 }
 
-/// Derive bridge vault PDA
-pub fn derive_bridge_vault(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"bridge_vault"], program_id)
-}
+/// Instruction builder for `set_min_token_stake`.
+/// Account layout matching Anchor struct `SetMinTokenStake`:
+/// 1. validator_registry (writable)
+/// 2. authority (signer, writable)
+pub fn create_set_min_token_stake_instruction(
+    program_id: Pubkey,
+    validator_registry: Pubkey,
+    authority: Pubkey,
+    min_stake: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&SET_MIN_TOKEN_STAKE_DISCRIMINATOR);
+    data.extend_from_slice(&min_stake.to_le_bytes());
 
-/// Derive bridge state PDA
-pub fn derive_bridge_state(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"bridge_state"], program_id)
-}
+    let accounts = vec![
+        AccountMeta::new(validator_registry, false),
+        AccountMeta::new(authority, true),
+    ];
 
-/// Derive a validator account PDA from the validator's pubkey.
-pub fn derive_validator_account(program_id: &Pubkey, validator: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"validator", validator.as_ref()], program_id)
-}
-
-/// Derive the validator registry PDA.
-pub fn derive_validator_registry(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"validator_registry"], program_id)
-}
-
-/// Derive the on-chain incremental Merkle tree PDA (circuit v3, #350).
-pub fn derive_merkle_tree(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"merkle_tree"], program_id)
-}
-
-/// Derive the BPFLoaderUpgradeable `ProgramData` PDA for `program_id` — the
-/// account the #204 upgrade-authority gate reads on `initialize` /
-/// `initialize_validator_registry`.
-pub fn derive_program_data(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[program_id.as_ref()],
-        &solana_sdk::bpf_loader_upgradeable::id(),
-    )
-}
-
-/// Derive nullifier account PDA
-pub fn derive_nullifier_account(program_id: &Pubkey, nullifier: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"nullifier", nullifier.as_ref()], program_id)
-}
-
-/// Derive the program PDA that owns every per-asset vault
-/// (`seeds = [b"asset_vault_authority"]`). One authority signs releases from
-/// all asset vaults on the SPL withdraw path.
-pub fn derive_asset_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"asset_vault_authority"], program_id)
-}
-
-/// Derive the per-asset vault token account PDA for `mint`
-/// (`seeds = [b"asset_vault", mint]`). Custody for one SPL asset.
-pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
-}
-
-/// Derive the canonical Associated Token Account address for `owner` + `mint`,
-/// mirroring `spl_associated_token_account::get_associated_token_address`
-/// without the dependency: it is the PDA of
-/// `[owner, SPL_TOKEN_PROGRAM_ID, mint]` under the ATA program.
-pub fn derive_associated_token_address(
-    owner: &Pubkey,
-    mint: &Pubkey,
-    token_program: &Pubkey,
-) -> Pubkey {
-    // The ATA seeds include the token program that owns the mint, so a Token-2022
-    // mint resolves to a different ATA than a classic-SPL mint. Callers must pass
-    // whichever program owns `mint`, or they derive an address no account lives at.
-    Pubkey::find_program_address(
-        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
-        &SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
-    )
-    .0
+    Instruction {
+        program_id,
+        accounts,
+        data,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
-    #[test]
-    fn test_derive_pdas() {
-        let program_id = Pubkey::new_unique();
-        let (state, _) = derive_bridge_state(&program_id);
-        let (vault, _) = derive_bridge_vault(&program_id);
-
-        // PDAs should be deterministic
-        let (state2, _) = derive_bridge_state(&program_id);
-        let (vault2, _) = derive_bridge_vault(&program_id);
-
-        assert_eq!(state, state2);
-        assert_eq!(vault, vault2);
+    fn compute_anchor_discriminator(name: &str) -> [u8; 8] {
+        let preimage = format!("global:{}", name);
+        let mut hasher = Sha256::new();
+        hasher.update(preimage.as_bytes());
+        let result = hasher.finalize();
+        let mut disc = [0u8; 8];
+        disc.copy_from_slice(&result[..8]);
+        disc
     }
 
     #[test]
-    fn test_derive_nullifier_account() {
-        let program_id = Pubkey::new_unique();
-        let nullifier = [1u8; 32];
-
-        let (pda1, _) = derive_nullifier_account(&program_id, &nullifier);
-        let (pda2, _) = derive_nullifier_account(&program_id, &nullifier);
-
-        // Same nullifier should produce same PDA
-        assert_eq!(pda1, pda2);
-
-        // Different nullifier should produce different PDA
-        let different_nullifier = [2u8; 32];
-        let (pda3, _) = derive_nullifier_account(&program_id, &different_nullifier);
-        assert_ne!(pda1, pda3);
-    }
-
-    #[test]
-    fn test_associated_token_address_is_deterministic() {
-        let owner = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let a = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_PROGRAM_ID);
-        let b = derive_associated_token_address(&owner, &mint, &SPL_TOKEN_PROGRAM_ID);
-        assert_eq!(a, b);
-        // Different owners yield different ATAs.
-        assert_ne!(
-            a,
-            derive_associated_token_address(&Pubkey::new_unique(), &mint, &SPL_TOKEN_PROGRAM_ID)
-        );
-        // The token program is part of the ATA seeds: the same owner+mint under
-        // Token-2022 resolves to a different address than under classic SPL.
-        assert_ne!(
-            a,
-            derive_associated_token_address(&owner, &mint, &SPL_TOKEN_2022_PROGRAM_ID)
-        );
-    }
-
-    #[test]
-    fn test_create_transact_instruction() {
-        let program_id = Pubkey::new_unique();
-        let authority = Pubkey::new_unique();
-        let bridge_vault = Pubkey::new_unique();
-        let cosigner = Pubkey::new_unique();
-
-        let ix = create_transact_instruction(
-            &program_id,
-            &authority,
-            &bridge_vault,
-            [9u8; 32],
-            [[1u8; 32], [2u8; 32]],
-            [[3u8; 32], [4u8; 32]],
-            [5u8; 32],
-            -500,
-            vec![0u8; 256],
-            &[authority, cosigner],
-        )
-        .expect("build transact instruction");
-
-        assert_eq!(ix.program_id, program_id);
-        // bridge_state, merkle_tree, bridge_vault, nullifier_0, nullifier_1,
-        // recipient, validator_account, validator_registry, authority (signer),
-        // system_program — then 2 quorum (wallet, PDA) pairs (#260).
-        assert_eq!(ix.accounts.len(), 10 + 4);
-        assert_eq!(ix.accounts[1].pubkey, derive_merkle_tree(&program_id).0);
-        assert!(ix.accounts[1].is_writable);
+    fn test_discriminators_match_anchor() {
         assert_eq!(
-            ix.accounts[3].pubkey,
-            derive_nullifier_account(&program_id, &[1u8; 32]).0
+            SET_MIN_TOKEN_STAKE_DISCRIMINATOR,
+            compute_anchor_discriminator("set_min_token_stake"),
+            "SET_MIN_TOKEN_STAKE discriminator mismatch"
         );
         assert_eq!(
-            ix.accounts[4].pubkey,
-            derive_nullifier_account(&program_id, &[2u8; 32]).0
+            INIT_ASSET_VAULT_DISCRIMINATOR,
+            compute_anchor_discriminator("init_asset_vault"),
+            "INIT_ASSET_VAULT discriminator mismatch"
         );
-        assert_eq!(ix.accounts[5].pubkey, Pubkey::new_from_array([9u8; 32]));
-        // The settling validator's account is bound to the authority signer.
         assert_eq!(
-            ix.accounts[6].pubkey,
-            derive_validator_account(&program_id, &authority).0
+            SET_ASSET_DEPOSIT_CAP_DISCRIMINATOR,
+            compute_anchor_discriminator("set_asset_deposit_cap"),
+            "SET_ASSET_DEPOSIT_CAP discriminator mismatch"
         );
-        assert_eq!(ix.accounts[8].pubkey, authority);
-        assert!(ix.accounts[8].is_signer);
-        // Quorum pairs: each wallet signs, its PDA does not.
-        assert_eq!(ix.accounts[10].pubkey, authority);
-        assert!(ix.accounts[10].is_signer);
-        assert_eq!(ix.accounts[12].pubkey, cosigner);
-        assert!(ix.accounts[12].is_signer);
-        assert!(!ix.accounts[13].is_signer);
-
-        assert_eq!(&ix.data[..8], &discriminators::TRANSACT);
     }
 
     #[test]
-    fn test_create_transact_spl_instruction() {
+    fn test_init_asset_vault_account_layout() {
         let program_id = Pubkey::new_unique();
         let authority = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let recipient_token = Pubkey::new_unique();
-        let fee_token = Pubkey::new_unique();
-        let cosigner = Pubkey::new_unique();
+        let asset_vault = Pubkey::new_unique();
+        let asset_vault_authority = Pubkey::new_unique();
+        let asset_config = Pubkey::new_unique();
+        let program_data = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
 
-        let ix = create_transact_spl_instruction(
-            &program_id,
-            &authority,
-            &mint,
-            &recipient_token,
-            &fee_token,
-            &SPL_TOKEN_PROGRAM_ID,
-            [[1u8; 32], [2u8; 32]],
-            [[3u8; 32], [4u8; 32]],
-            [5u8; 32],
-            -500,
-            vec![0u8; 256],
-            &[authority, cosigner],
-        )
-        .expect("build transact_spl instruction");
+        let ix = create_init_asset_vault_instruction(
+            program_id,
+            authority,
+            mint,
+            asset_vault,
+            asset_vault_authority,
+            asset_config,
+            program_data,
+            token_program,
+        );
 
-        assert_eq!(ix.program_id, program_id);
-        // 14 base accounts (see the account-order doc) + 2 quorum (wallet, PDA) pairs.
-        assert_eq!(ix.accounts.len(), 14 + 4);
-        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
-        assert_eq!(ix.accounts[1].pubkey, derive_merkle_tree(&program_id).0);
-        assert_eq!(ix.accounts[2].pubkey, mint);
-        assert_eq!(
-            ix.accounts[3].pubkey,
-            Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], &program_id).0
-        );
-        assert!(ix.accounts[3].is_writable);
-        assert_eq!(
-            ix.accounts[4].pubkey,
-            Pubkey::find_program_address(&[b"asset_vault_authority"], &program_id).0
-        );
-        assert_eq!(ix.accounts[5].pubkey, recipient_token);
-        assert_eq!(ix.accounts[6].pubkey, fee_token);
-        assert_eq!(
-            ix.accounts[7].pubkey,
-            derive_nullifier_account(&program_id, &[1u8; 32]).0
-        );
-        assert_eq!(
-            ix.accounts[8].pubkey,
-            derive_nullifier_account(&program_id, &[2u8; 32]).0
-        );
-        assert_eq!(
-            ix.accounts[9].pubkey,
-            derive_validator_account(&program_id, &authority).0
-        );
-        assert_eq!(ix.accounts[11].pubkey, authority);
-        assert!(ix.accounts[11].is_signer);
-        assert_eq!(ix.accounts[12].pubkey, SPL_TOKEN_PROGRAM_ID);
-        // Quorum pairs after the 14 base accounts: each wallet signs, PDA does not.
-        assert_eq!(ix.accounts[14].pubkey, authority);
-        assert!(ix.accounts[14].is_signer);
-        assert_eq!(ix.accounts[16].pubkey, cosigner);
-        assert!(ix.accounts[16].is_signer);
-        assert!(!ix.accounts[17].is_signer);
-
-        assert_eq!(&ix.data[..8], &discriminators::TRANSACT_SPL);
-    }
-
-    /// Field ordering is observable on the wire — Anchor decodes borsh fields
-    /// in declaration order. Pins the layout
-    /// `[nullifiers (64) | output_commitments (64) | root (32) | ext_amount (8, i64 LE) | proof_len (4) | proof…]`
-    /// including the two's-complement encoding of a negative `ext_amount`
-    /// (a withdrawal), which a `u64` mix-up would corrupt silently.
-    #[test]
-    fn test_transact_instruction_data_field_order() {
-        let payload = TransactInstructionData {
-            nullifiers: [[0xAB; 32], [0xCD; 32]],
-            output_commitments: [[0x11; 32], [0x22; 32]],
-            root: [0x33; 32],
-            ext_amount: -2,
-            proof: vec![0xEF; 3],
-        };
-        let bytes = borsh::to_vec(&payload).expect("borsh serialize");
-        let decoded = TransactInstructionData::try_from_slice(&bytes).expect("borsh deserialize");
-        assert_eq!(decoded, payload);
-
-        assert_eq!(&bytes[..32], &[0xAB; 32]);
-        assert_eq!(&bytes[32..64], &[0xCD; 32]);
-        assert_eq!(&bytes[64..96], &[0x11; 32]);
-        assert_eq!(&bytes[96..128], &[0x22; 32]);
-        assert_eq!(&bytes[128..160], &[0x33; 32]);
-        // ext_amount = -2 as little-endian two's complement.
-        assert_eq!(
-            &bytes[160..168],
-            &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
-        );
-        // proof: u32 length prefix then the bytes.
-        assert_eq!(&bytes[168..172], &[3, 0, 0, 0]);
-        assert_eq!(&bytes[172..], &[0xEF; 3]);
+        assert_eq!(ix.data[..8], compute_anchor_discriminator("init_asset_vault"));
+        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(ix.accounts[0], AccountMeta::new(authority, true));
+        assert_eq!(ix.accounts[1], AccountMeta::new_readonly(mint, false));
+        assert_eq!(ix.accounts[2], AccountMeta::new(asset_vault, false));
+        assert_eq!(ix.accounts[3], AccountMeta::new_readonly(asset_vault_authority, false));
+        assert_eq!(ix.accounts[4], AccountMeta::new(asset_config, false));
+        assert_eq!(ix.accounts[5], AccountMeta::new_readonly(program_data, false));
+        assert_eq!(ix.accounts[6], AccountMeta::new_readonly(token_program, false));
+        assert_eq!(ix.accounts[7], AccountMeta::new_readonly(solana_program::system_program::id(), false));
+        assert_eq!(ix.accounts[8], AccountMeta::new_readonly(sysvar::rent::id(), false));
     }
 
     #[test]
-    fn test_create_deposit_note_instruction() {
+    fn test_set_asset_deposit_cap_account_layout() {
         let program_id = Pubkey::new_unique();
-        let depositor = Pubkey::new_unique();
-        let bridge_vault = Pubkey::new_unique();
+        let asset_config = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let program_data = Pubkey::new_unique();
+        let cap = 5_000_000u64;
 
-        let ix = create_deposit_note_instruction(
-            &program_id,
-            &depositor,
-            &bridge_vault,
-            1_000_000,
-            [7u8; 32],
-            [8u8; 32],
-        )
-        .expect("build deposit_note instruction");
+        let ix = create_set_asset_deposit_cap_instruction(
+            program_id,
+            asset_config,
+            authority,
+            program_data,
+            cap,
+        );
 
-        // bridge_state, bridge_vault, merkle_tree, depositor (signer),
-        // system_program.
-        assert_eq!(ix.accounts.len(), 5);
-        assert_eq!(ix.accounts[2].pubkey, derive_merkle_tree(&program_id).0);
-        assert!(ix.accounts[2].is_writable);
-        assert_eq!(ix.accounts[3].pubkey, depositor);
-        assert!(ix.accounts[3].is_signer);
-
-        assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE);
-        // amount immediately follows the discriminator (borsh u64 LE).
-        assert_eq!(&ix.data[8..16], &1_000_000u64.to_le_bytes());
-    }
-
-    #[test]
-    fn test_create_unregister_validator_instruction() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-
-        let ix = create_unregister_validator_instruction(&program_id, &validator);
-
-        // validator_account, validator_registry, validator (signer).
+        assert_eq!(ix.data[..8], compute_anchor_discriminator("set_asset_deposit_cap"));
+        assert_eq!(u64::from_le_bytes(ix.data[8..16].try_into().unwrap()), cap);
         assert_eq!(ix.accounts.len(), 3);
-        assert_eq!(
-            ix.accounts[0].pubkey,
-            derive_validator_account(&program_id, &validator).0
-        );
-        assert_eq!(
-            ix.accounts[1].pubkey,
-            derive_validator_registry(&program_id).0
-        );
-        assert_eq!(ix.accounts[2].pubkey, validator);
-        assert!(ix.accounts[2].is_signer);
-        assert_eq!(ix.data, discriminators::UNREGISTER_VALIDATOR.to_vec());
+        assert_eq!(ix.accounts[0], AccountMeta::new(asset_config, false));
+        assert_eq!(ix.accounts[1], AccountMeta::new(authority, true));
+        assert_eq!(ix.accounts[2], AccountMeta::new_readonly(program_data, false));
     }
 
     #[test]
-    fn test_create_migrate_validator_account_instruction() {
+    fn test_set_min_token_stake_account_layout() {
         let program_id = Pubkey::new_unique();
+        let validator_registry = Pubkey::new_unique();
         let authority = Pubkey::new_unique();
-        let validator_wallet = Pubkey::new_unique();
+        let stake = 10_000_000u64;
 
-        let ix = create_migrate_validator_account_instruction(
-            &program_id,
-            &authority,
-            &validator_wallet,
+        let ix = create_set_min_token_stake_instruction(
+            program_id,
+            validator_registry,
+            authority,
+            stake,
         );
 
-        // validator_account (mut), authority (signer), program_data, system.
-        assert_eq!(ix.accounts.len(), 4);
-        assert_eq!(
-            ix.accounts[0].pubkey,
-            derive_validator_account(&program_id, &validator_wallet).0
-        );
-        assert!(ix.accounts[0].is_writable);
-        assert_eq!(ix.accounts[1].pubkey, authority);
-        assert!(ix.accounts[1].is_signer);
-        assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
-        assert_eq!(ix.accounts[3].pubkey, SYSTEM_PROGRAM_ID);
-        // Discriminator then the validator pubkey arg (32 bytes borsh = raw).
-        assert_eq!(&ix.data[..8], &discriminators::MIGRATE_VALIDATOR_ACCOUNT);
-        assert_eq!(&ix.data[8..40], &validator_wallet.to_bytes());
-        assert_eq!(ix.data.len(), 40);
-    }
-
-    #[test]
-    fn test_create_initialize_merkle_tree_instruction() {
-        let program_id = Pubkey::new_unique();
-        let authority = Pubkey::new_unique();
-
-        let ix = create_initialize_merkle_tree_instruction(&program_id, &authority);
-
-        // merkle_tree, authority (signer), program_data, system_program.
-        assert_eq!(ix.accounts.len(), 4);
-        assert_eq!(ix.accounts[0].pubkey, derive_merkle_tree(&program_id).0);
-        assert_eq!(ix.accounts[1].pubkey, authority);
-        assert!(ix.accounts[1].is_signer);
-        assert_eq!(ix.accounts[2].pubkey, derive_program_data(&program_id).0);
-        assert_eq!(ix.data, discriminators::INITIALIZE_MERKLE_TREE.to_vec());
-    }
-
-    #[test]
-    fn test_create_claim_rewards_instruction() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-
-        let ix = create_claim_rewards_instruction(&program_id, &validator);
-
-        // bridge_state, validator_account (mut), bridge_vault (mut), validator (signer), system_program
-        assert_eq!(ix.accounts.len(), 5);
-        assert_eq!(ix.accounts[0].pubkey, derive_bridge_state(&program_id).0);
-        assert!(!ix.accounts[0].is_writable);
-        assert!(!ix.accounts[0].is_signer);
-
-        assert_eq!(
-            ix.accounts[1].pubkey,
-            derive_validator_account(&program_id, &validator).0
-        );
-        assert!(ix.accounts[1].is_writable);
-        assert!(!ix.accounts[1].is_signer);
-
-        assert_eq!(ix.accounts[2].pubkey, derive_bridge_vault(&program_id).0);
-        assert!(ix.accounts[2].is_writable);
-        assert!(!ix.accounts[2].is_signer);
-
-        assert_eq!(ix.accounts[3].pubkey, validator);
-        assert!(ix.accounts[3].is_writable);
-        assert!(ix.accounts[3].is_signer);
-
-        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
-        assert!(!ix.accounts[4].is_writable);
-        assert!(!ix.accounts[4].is_signer);
-
-        assert_eq!(ix.data, discriminators::CLAIM_REWARDS.to_vec());
-    }
-
-    #[test]
-    fn test_create_withdraw_unbonded_stake_instruction() {
-        let program_id = Pubkey::new_unique();
-        let validator = Pubkey::new_unique();
-        let stake_mint = Pubkey::new_unique();
-        let validator_token = Pubkey::new_unique();
-        let token_program = SPL_TOKEN_PROGRAM_ID;
-
-        let ix = create_withdraw_unbonded_stake_instruction(
-            &program_id,
-            &validator,
-            &stake_mint,
-            &validator_token,
-            &token_program,
-        );
-
-        assert_eq!(ix.program_id, program_id);
-        assert_eq!(ix.accounts.len(), 7);
-        assert_eq!(
-            ix.accounts[0].pubkey,
-            derive_validator_account(&program_id, &validator).0
-        );
-        assert!(ix.accounts[0].is_writable);
-        assert_eq!(ix.accounts[1].pubkey, validator);
-        assert!(ix.accounts[1].is_signer);
-        assert!(ix.accounts[1].is_writable);
-        assert_eq!(ix.accounts[2].pubkey, stake_mint);
-        assert!(!ix.accounts[2].is_writable);
-        assert_eq!(ix.accounts[3].pubkey, validator_token);
-        assert!(ix.accounts[3].is_writable);
-        assert_eq!(
-            ix.accounts[4].pubkey,
-            derive_stake_token_vault(&program_id).0
-        );
-        assert!(ix.accounts[4].is_writable);
-        assert_eq!(
-            ix.accounts[5].pubkey,
-            derive_stake_vault_authority(&program_id).0
-        );
-        assert!(!ix.accounts[5].is_writable);
-        assert_eq!(ix.accounts[6].pubkey, token_program);
-        assert!(!ix.accounts[6].is_writable);
-        assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+        assert_eq!(ix.data[..8], compute_anchor_discriminator("set_min_token_stake"));
+        assert_eq!(u64::from_le_bytes(ix.data[8..16].try_into().unwrap()), stake);
+        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(ix.accounts[0], AccountMeta::new(validator_registry, false));
+        assert_eq!(ix.accounts[1], AccountMeta::new(authority, true));
     }
 }
