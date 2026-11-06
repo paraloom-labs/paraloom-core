@@ -110,18 +110,24 @@ impl ValidatorMetrics {
 
         // Decay formula: reputation * (1 - decay_rate)^days
         // decay_rate = REPUTATION_DECAY_PER_DAY / 10000 (basis points to percentage)
+        // Clamp exponent to a safe i32 bound to prevent sign-wrapping on extreme timestamps.
+        let clamped_days = days_inactive.min(365_000) as i32;
         let decay_rate = REPUTATION_DECAY_PER_DAY as f64 / 10000.0;
-        let multiplier = (1.0 - decay_rate).powi(days_inactive as i32);
+        let multiplier = (1.0 - decay_rate).powi(clamped_days);
 
+        let old_reputation = self.reputation;
         let new_reputation = (self.reputation as f64 * multiplier) as u64;
-        self.reputation = new_reputation.max(MIN_REPUTATION);
+        self.reputation = new_reputation.clamp(MIN_REPUTATION, MAX_REPUTATION);
+        self.last_active = self
+            .last_active
+            .saturating_add(days_inactive.saturating_mul(SECONDS_PER_DAY));
 
         log::debug!(
             "Applied {} days decay to {:?}: {} -> {}",
             days_inactive,
             self.node_id,
-            self.reputation,
-            new_reputation
+            old_reputation,
+            self.reputation
         );
     }
 
@@ -189,6 +195,17 @@ impl ReputationTracker {
         let list: Vec<&ValidatorMetrics> = metrics.values().collect();
         match serde_json::to_vec(&list) {
             Ok(bytes) => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            log::warn!(
+                                "failed to create parent directory {}: {e}",
+                                parent.display()
+                            );
+                            return;
+                        }
+                    }
+                }
                 if let Err(e) = std::fs::write(path, &bytes) {
                     log::warn!("failed to persist reputation to {}: {e}", path.display());
                 }
@@ -325,6 +342,10 @@ impl ReputationTracker {
             if validator.reputation != old_reputation {
                 count += 1;
             }
+        }
+
+        if count > 0 {
+            self.persist_locked(&metrics);
         }
 
         log::debug!("Applied decay to {} validators", count);
@@ -598,5 +619,19 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+    }
+
+    #[tokio::test]
+    async fn persist_creates_missing_parent_directory_and_persists_decay() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_path = dir.path().join("nested").join("subdir").join("reputation.json");
+        let node = NodeId(vec![7, 8, 9]);
+
+        let tracker = ReputationTracker::with_persistence(nested_path.clone());
+        tracker.register_validator(node.clone()).await;
+        assert!(nested_path.exists(), "parent directories must be created automatically");
+
+        let reloaded = ReputationTracker::with_persistence(nested_path);
+        assert_eq!(reloaded.get_reputation(&node).await, Some(BASE_REPUTATION));
     }
 }

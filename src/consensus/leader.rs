@@ -52,7 +52,7 @@ impl ValidatorInfo {
     /// Weight = stake_amount * (reputation / 1000)
     /// This gives more weight to validators with both high stake and high reputation
     pub fn selection_weight(&self) -> u128 {
-        if !self.is_active {
+        if !self.is_active || self.stake_amount == 0 || self.reputation == 0 {
             return 0;
         }
 
@@ -66,7 +66,7 @@ impl ValidatorInfo {
         // - 10 SOL stake + 1000 reputation = 10 * 1.0 = 10 weight
         // - 10 SOL stake + 5000 reputation = 10 * 5.0 = 50 weight
         // - 100 SOL stake + 1000 reputation = 100 * 1.0 = 100 weight
-        stake * reputation / 1000
+        (stake * reputation / 1000).max(1)
     }
 }
 
@@ -491,5 +491,19 @@ mod tests {
         selector.unregister_validator(&NodeId(vec![1]));
 
         assert_eq!(selector.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn test_sub_1000_product_preserves_nonzero_weight() {
+        // Active validator with small unit stake (1) and penalized reputation (100)
+        // must still carry non-zero weight (1) rather than truncating to 0.
+        let v = ValidatorInfo::new(NodeId(vec![1]), 1, 100);
+        assert_eq!(v.selection_weight(), 1);
+
+        let v_zero_stake = ValidatorInfo::new(NodeId(vec![2]), 0, 1000);
+        assert_eq!(v_zero_stake.selection_weight(), 0);
+
+        let v_zero_rep = ValidatorInfo::new(NodeId(vec![3]), 1000, 0);
+        assert_eq!(v_zero_rep.selection_weight(), 0);
     }
 }

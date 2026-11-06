@@ -79,11 +79,17 @@ impl SlashingRecord {
     }
 }
 
+/// Maximum slashing records retained per validator to bound memory usage.
+pub const MAX_RECORDS_PER_VALIDATOR: usize = 256;
+
+/// Maximum distinct validators tracked in the in-memory slashing log.
+pub const MAX_TRACKED_VALIDATORS: usize = 1024;
+
 /// In-memory log of slashing evidence.
 ///
 /// Keyed by validator so a downstream slashing pipeline can iterate
 /// per-validator without re-grouping. Each validator's entries are
-/// kept in insertion order (vec).
+/// kept in insertion order (vec), bounded to [`MAX_RECORDS_PER_VALIDATOR`].
 #[derive(Default)]
 pub struct SlashingTracker {
     records: RwLock<HashMap<NodeId, Vec<SlashingRecord>>>,
@@ -104,12 +110,17 @@ impl SlashingTracker {
             evidence
         );
         let record = SlashingRecord::new(validator.clone(), evidence);
-        self.records
-            .write()
-            .await
-            .entry(validator)
-            .or_default()
-            .push(record);
+        let mut map = self.records.write().await;
+        if !map.contains_key(&validator) && map.len() >= MAX_TRACKED_VALIDATORS {
+            if let Some(victim) = map.keys().next().cloned() {
+                map.remove(&victim);
+            }
+        }
+        let entries = map.entry(validator).or_default();
+        if entries.len() >= MAX_RECORDS_PER_VALIDATOR {
+            entries.remove(0);
+        }
+        entries.push(record);
     }
 
     /// All records for a single validator, in insertion order.
@@ -193,5 +204,34 @@ mod tests {
         let unknown = NodeId(vec![99]);
         assert!(tracker.for_validator(&unknown).await.is_empty());
         assert_eq!(tracker.total_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn tracker_bounds_records_per_validator() {
+        let tracker = SlashingTracker::new();
+        let alice = NodeId(vec![1]);
+
+        for i in 0..(MAX_RECORDS_PER_VALIDATOR + 10) {
+            tracker
+                .record(
+                    alice.clone(),
+                    SlashingEvidence::PersistentUnavailability {
+                        streak_length: i as u64,
+                        threshold: 3,
+                    },
+                )
+                .await;
+        }
+
+        let records = tracker.for_validator(&alice).await;
+        assert_eq!(records.len(), MAX_RECORDS_PER_VALIDATOR);
+        // Oldest 10 entries were evicted; first remaining entry has streak_length == 10.
+        assert_eq!(
+            records[0].evidence,
+            SlashingEvidence::PersistentUnavailability {
+                streak_length: 10,
+                threshold: 3,
+            }
+        );
     }
 }
