@@ -39,6 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `token::token_program` matches what `register_validator` will pass.
     let token_program = client.get_account(&stake_mint)?.owner;
 
+    let (registry_pda, _) = derive_validator_registry(&program_id);
+    let registry_data = client.get_account_data(&registry_pda)?;
+    let registry = paraloom::quorum::ValidatorRegistry::try_deserialize(&mut registry_data.as_slice())?;
+    if registry.stake_mint != stake_mint {
+        return Err(format!("Registry stake_mint mismatch: expected {}, got {}", registry.stake_mint, stake_mint).into());
+    }
+
     let (vault, _) = derive_stake_token_vault(&program_id);
 
     println!("=== init stake token vault ===");
