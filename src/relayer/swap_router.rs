@@ -94,8 +94,20 @@ async fn route_handler(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("input_mint: {e}")))?;
     let asset_out = mint_to_asset(&req.output_mint)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("output_mint: {e}")))?;
+    if asset_in == asset_out {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input_mint and output_mint cannot be the same asset".to_string(),
+        ));
+    }
     let user = Pubkey::from_str(&req.user_public_key)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("user_public_key: {e}")))?;
+    if user == Pubkey::default() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "user_public_key cannot be default pubkey".to_string(),
+        ));
+    }
     if req.amount == 0 {
         return Err((StatusCode::BAD_REQUEST, "amount must be > 0".to_string()));
     }
@@ -104,10 +116,18 @@ async fn route_handler(
         .quote_swap(asset_in, asset_out, req.amount, &user)
         .await
     {
-        Ok(quote) => Ok(Json(RouteResponse {
-            out_amount: quote.out_amount,
-            swap_transaction: quote.swap_transaction,
-        })),
+        Ok(quote) => {
+            if quote.out_amount == 0 || quote.swap_transaction.trim().is_empty() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "quote has zero output or empty transaction".to_string(),
+                ));
+            }
+            Ok(Json(RouteResponse {
+                out_amount: quote.out_amount,
+                swap_transaction: quote.swap_transaction,
+            }))
+        }
         // A well-formed request that simply has no liquidity path: the input is
         // fine, so 422 rather than 400 or a 5xx.
         Err(RelayerError::NoRoute(m)) => {
@@ -296,6 +316,66 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("user_public_key"));
+    }
+
+    #[tokio::test]
+    async fn default_user_pubkey_is_400() {
+        let mut b = valid_body();
+        b["user_public_key"] = serde_json::json!(Pubkey::default().to_string());
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("default pubkey"));
+    }
+
+    #[tokio::test]
+    async fn same_asset_swap_is_400() {
+        let mut b = valid_body();
+        b["output_mint"] = serde_json::json!("SOL");
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("same asset"));
+    }
+
+    #[tokio::test]
+    async fn zero_output_quote_is_422() {
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 0,
+                swap_transaction: "BASE64TX".into(),
+            })),
+            valid_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("zero output or empty transaction"));
+    }
+
+    #[tokio::test]
+    async fn empty_swap_transaction_is_422() {
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 100,
+                swap_transaction: "   ".into(),
+            })),
+            valid_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("zero output or empty transaction"));
     }
 
     #[tokio::test]
