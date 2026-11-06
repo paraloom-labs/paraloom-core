@@ -2397,6 +2397,19 @@ impl Node {
     /// external flow is negative (zero for a pure shielded transfer). The
     /// approving validators co-sign over libp2p and the leader assembles their
     /// signatures into one transaction.
+    /// Determine the token program for `mint` (classic SPL Token or Token-2022),
+    /// querying the on-chain mint account owner via the bridge RPC if available,
+    /// and falling back to `SPL_TOKEN_PROGRAM_ID`.
+    pub async fn get_token_program(&self, mint: &Pubkey) -> Pubkey {
+        if let Some(bridge) = &self.bridge {
+            let bridge = bridge.lock().await;
+            if let Ok(owner) = bridge.get_token_program(mint).await {
+                return owner;
+            }
+        }
+        crate::bridge::solana::SPL_TOKEN_PROGRAM_ID
+    }
+
     pub async fn cosign_settlement_transact_tx(
         &self,
         approved: &ApprovedTransact,
@@ -2455,15 +2468,20 @@ impl Node {
         // SPL settlement (#779) takes the transact_spl path; `recipient` is the
         // recipient token account and the vault is the mint's asset vault.
         let params = match request.mint {
-            Some(mint) => SettlementParams::TransactSpl {
-                recipient_token_account: request.recipient,
-                mint,
-                nullifiers: request.nullifiers,
-                output_commitments: request.output_commitments,
-                root: request.root,
-                ext_amount: request.ext_amount,
-                proof: onchain_proof.to_vec(),
-            },
+            Some(mint) => {
+                let mint_pk = Pubkey::new_from_array(mint);
+                let token_program = self.get_token_program(&mint_pk).await.to_bytes();
+                SettlementParams::TransactSpl {
+                    recipient_token_account: request.recipient,
+                    mint,
+                    token_program,
+                    nullifiers: request.nullifiers,
+                    output_commitments: request.output_commitments,
+                    root: request.root,
+                    ext_amount: request.ext_amount,
+                    proof: onchain_proof.to_vec(),
+                }
+            }
             None => SettlementParams::Transact {
                 recipient: request.recipient,
                 nullifiers: request.nullifiers,

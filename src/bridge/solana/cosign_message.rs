@@ -32,6 +32,10 @@ use solana_sdk::{
 /// rebuilds the byte-identical transaction (see the module invariant).
 const TRANSACT_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
+fn default_spl_token_program() -> [u8; 32] {
+    super::instructions::SPL_TOKEN_PROGRAM_ID.to_bytes()
+}
+
 /// The settlement-specific parameters of a co-sign payload — the fields the
 /// validator matches against the request it approved before signing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,11 +58,14 @@ pub enum SettlementParams {
     /// An SPL-token `transact_spl` settlement (#779): the same 2-in/2-out spend
     /// but the payout leaves `mint`'s per-asset vault and `recipient` is the
     /// recipient **token account**. The settling validator's fee token account
-    /// is derived from the payload `authority` + `mint` (its ATA), so every
-    /// co-signer builds the same instruction without an extra field.
+    /// is derived from the payload `authority` + `mint` + `token_program` (its
+    /// ATA), so every co-signer builds the same instruction. `token_program`
+    /// pins the token program that owns the mint (classic SPL Token or Token-2022).
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        #[serde(default = "default_spl_token_program")]
+        token_program: [u8; 32],
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +197,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -198,12 +206,13 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            let token_program_pk = Pubkey::new_from_array(*token_program);
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +220,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -325,5 +334,123 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    fn sample_transact_spl_payload(token_program: [u8; 32]) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                token_program,
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    #[test]
+    fn transact_spl_payload_round_trips_through_bytes() {
+        for token_prog in [
+            super::super::instructions::SPL_TOKEN_PROGRAM_ID.to_bytes(),
+            super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        ] {
+            let payload = sample_transact_spl_payload(token_prog);
+            let bytes = payload.to_bytes().expect("serialize");
+            let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    #[test]
+    fn message_build_is_deterministic_for_transact_spl() {
+        let payload = sample_transact_spl_payload(
+            super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        );
+        let a = build_settlement_message(&payload).expect("build a");
+        let b = build_settlement_message(&payload).expect("build b");
+        assert_eq!(a.serialize(), b.serialize());
+    }
+
+    #[test]
+    fn transact_spl_token_2022_differs_from_classic_spl() {
+        let spl_payload = sample_transact_spl_payload(
+            super::super::instructions::SPL_TOKEN_PROGRAM_ID.to_bytes(),
+        );
+        let token_2022_payload = sample_transact_spl_payload(
+            super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        );
+
+        let spl_msg = build_settlement_message(&spl_payload).expect("build spl");
+        let token_2022_msg =
+            build_settlement_message(&token_2022_payload).expect("build token 2022");
+
+        // The serialized messages must differ because fee ATA derivation and token_program account differ.
+        assert_ne!(spl_msg.serialize(), token_2022_msg.serialize());
+
+        // Verify account keys inside the message
+        let spl_token_pk = super::super::instructions::SPL_TOKEN_PROGRAM_ID;
+        let spl_token_2022_pk = super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID;
+
+        assert!(spl_msg.account_keys.contains(&spl_token_pk));
+        assert!(!spl_msg.account_keys.contains(&spl_token_2022_pk));
+
+        assert!(token_2022_msg.account_keys.contains(&spl_token_2022_pk));
+        assert!(!token_2022_msg.account_keys.contains(&spl_token_pk));
+
+        // Verify that the fee ATA matches the token program used in ATA derivation
+        let authority = Pubkey::new_from_array(spl_payload.authority);
+        let mint = Pubkey::new_from_array([7u8; 32]);
+        let expected_spl_fee_ta = super::super::instructions::derive_associated_token_address(
+            &authority,
+            &mint,
+            &spl_token_pk,
+        );
+        let expected_token_2022_fee_ta =
+            super::super::instructions::derive_associated_token_address(
+                &authority,
+                &mint,
+                &spl_token_2022_pk,
+            );
+
+        assert_ne!(expected_spl_fee_ta, expected_token_2022_fee_ta);
+        assert!(spl_msg.account_keys.contains(&expected_spl_fee_ta));
+        assert!(token_2022_msg
+            .account_keys
+            .contains(&expected_token_2022_fee_ta));
+    }
+
+    #[test]
+    fn transact_spl_json_default_spl_token_program() {
+        // Test serde default backward compatibility when deserializing JSON without token_program
+        let json_without_token_program = serde_json::json!({
+            "TransactSpl": {
+                "recipient_token_account": vec![6u8; 32],
+                "mint": vec![7u8; 32],
+                "nullifiers": [vec![8u8; 32], vec![9u8; 32]],
+                "output_commitments": [vec![10u8; 32], vec![11u8; 32]],
+                "root": vec![12u8; 32],
+                "ext_amount": -500,
+                "proof": vec![0u8; 256],
+            }
+        });
+        let params: SettlementParams =
+            serde_json::from_value(json_without_token_program).expect("json deserialize");
+        match params {
+            SettlementParams::TransactSpl { token_program, .. } => {
+                assert_eq!(
+                    token_program,
+                    super::super::instructions::SPL_TOKEN_PROGRAM_ID.to_bytes()
+                );
+            }
+            _ => panic!("expected TransactSpl"),
+        }
     }
 }
