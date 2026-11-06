@@ -232,10 +232,8 @@ impl ReqwestJupiterClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
-            http,
-            base_url: base_url.into(),
-        }
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        Self { http, base_url }
     }
 
     /// Send with a small retry on 429 / 5xx / transport timeouts, and surface the
@@ -446,7 +444,13 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         platform_fee_bps: u16,
         fee_account: Option<String>,
     ) -> Result<Self> {
-        if platform_fee_bps > 0 && fee_account.is_none() {
+        if slippage_bps > 10_000 {
+            return Err(RelayerError::SwapFailed(format!(
+                "slippage_bps {slippage_bps} exceeds 10000 (100%)"
+            )));
+        }
+        let fee_account = fee_account.map(|a| a.trim().to_string());
+        if platform_fee_bps > 0 && fee_account.as_deref().unwrap_or("").is_empty() {
             return Err(RelayerError::SwapFailed(
                 "platform_fee_bps > 0 requires a fee_account".into(),
             ));
@@ -514,9 +518,15 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if quote.route_plan.is_empty() {
             return Err(RelayerError::NoRoute("empty routePlan".into()));
         }
-        quote.out_amount.parse::<u64>().map_err(|e| {
+        let out_amount = quote.out_amount.parse::<u64>().map_err(|e| {
             RelayerError::SwapFailed(format!("bad outAmount '{}': {e}", quote.out_amount))
-        })
+        })?;
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "quote returned zero outAmount".into(),
+            ));
+        }
+        Ok(out_amount)
     }
 
     /// Decode Jupiter's base64 `swapTransaction` into a [`VersionedTransaction`].
@@ -547,6 +557,11 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
     ) -> Result<(u64, serde_json::Value)> {
         if amount == 0 {
             return Err(RelayerError::InvalidAmount(0));
+        }
+        if asset_in == asset_out {
+            return Err(RelayerError::SwapFailed(
+                "asset_in and asset_out must differ".into(),
+            ));
         }
         let input_mint = asset_to_mint(asset_in);
         let output_mint = asset_to_mint(asset_out);
@@ -646,6 +661,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
                 .await?
                 .unwrap_or(out_amount)
         };
+
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "realized swap output is zero".into(),
+            ));
+        }
 
         Ok(SwapResult { out_amount })
     }
@@ -973,5 +994,44 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn slippage_above_100_percent_and_same_asset_and_zero_out_are_rejected() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        assert!(matches!(
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 10_001, 0, None),
+            Err(RelayerError::SwapFailed(_))
+        ));
+
+        let http2 = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        assert!(matches!(
+            JupiterSwapProvider::new(
+                http2,
+                RecordingSubmitter::default(),
+                50,
+                10,
+                Some("   ".into())
+            ),
+            Err(RelayerError::SwapFailed(_))
+        ));
+
+        let zero_quote = serde_json::json!({
+            "outAmount": "0",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        assert!(matches!(
+            JupiterSwapProvider::<CannedClient, RecordingSubmitter>::parse_quote(&zero_quote),
+            Err(RelayerError::SwapFailed(_))
+        ));
+
+        let http3 = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let provider =
+            JupiterSwapProvider::new(http3, RecordingSubmitter::default(), 50, 0, None).unwrap();
+        let same_err = provider
+            .swap(NATIVE_SOL_ASSET, NATIVE_SOL_ASSET, 1_000, &Keypair::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(same_err, RelayerError::SwapFailed(_)));
     }
 }

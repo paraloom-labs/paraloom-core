@@ -77,10 +77,13 @@ impl NullifierSet {
     }
 
     /// Batch check multiple nullifiers
-    /// Returns true if ALL nullifiers are new (not yet spent)
+    /// Returns true if ALL nullifiers are new (not yet spent) and unique within the batch
     pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
         let set = self.nullifiers.read().await;
-        nullifiers.iter().all(|n| !set.contains(n))
+        let mut seen = HashSet::with_capacity(nullifiers.len());
+        nullifiers
+            .iter()
+            .all(|n| !set.contains(n) && seen.insert(n))
     }
 
     /// Batch insert multiple nullifiers, returning the count of newly
@@ -92,9 +95,10 @@ impl NullifierSet {
     pub async fn insert_batch(&self, nullifiers: Vec<Nullifier>) -> Result<usize, anyhow::Error> {
         let mut set = self.nullifiers.write().await;
 
+        let mut seen = HashSet::with_capacity(nullifiers.len());
         let new_nullifiers: Vec<Nullifier> = nullifiers
             .into_iter()
-            .filter(|n| !set.contains(n))
+            .filter(|n| !set.contains(n) && seen.insert(n.clone()))
             .collect();
 
         if new_nullifiers.is_empty() {
@@ -229,6 +233,25 @@ mod tests {
             set.check_batch(&[nullifier2.clone(), nullifier3.clone()])
                 .await
         );
+
+        // Batch with intra-batch duplicate unspent nullifiers - must fail
+        assert!(
+            !set.check_batch(&[nullifier2.clone(), nullifier2.clone()])
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nullifier_set_batch_insert_deduplicates_within_batch() {
+        let set = NullifierSet::new();
+        let dup = vec![
+            Nullifier([9u8; 32]),
+            Nullifier([9u8; 32]),
+            Nullifier([10u8; 32]),
+        ];
+        let count = set.insert_batch(dup).await.expect("in-memory batch insert");
+        assert_eq!(count, 2);
+        assert_eq!(set.len().await, 2);
     }
 
     #[tokio::test]

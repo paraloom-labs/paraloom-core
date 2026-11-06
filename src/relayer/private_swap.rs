@@ -401,6 +401,27 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
+        // Validate the post-fee, post-overhead swap amount BEFORE submitting the
+        // on-chain withdrawal so an under-sized note fails pre-flight instead of
+        // burning its nullifier on-chain and stranding the funds.
+        let withdrawal_fee = amount_in
+            .checked_mul(WITHDRAWAL_FEE_BPS)
+            .map(|x| x / 10_000)
+            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+        let withdrawn = amount_in
+            .checked_sub(withdrawal_fee)
+            .filter(|&a| a > 0)
+            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+
+        let swap_amount = if asset_in == NATIVE_SOL_ASSET {
+            withdrawn
+                .checked_sub(self.native_swap_overhead_lamports)
+                .filter(|&a| a > 0)
+                .ok_or(RelayerError::InvalidAmount(amount_in))?
+        } else {
+            withdrawn
+        };
+
         // Step 1: withdraw the spent note to the fresh address via a v3
         // transact. The submitter takes the note's v3 spend witness, proves the
         // withdrawal to `fresh_address`, and waits for the quorum to settle it;
@@ -421,38 +442,16 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // Step 2: swap on public liquidity from the fresh address. The provider
         // signs and submits the public trade from `ephemeral`, so the trade
         // originates at the unlinkable fresh address.
-        //
-        // The on-chain withdraw deducts the protocol withdrawal fee
-        // (`WITHDRAWAL_FEE_BPS`, credited to the settling validator), so the
-        // fresh address holds `amount_in - fee`, not the gross note value.
-        // Swapping the gross amount would exceed the fresh address's balance and
-        // fail *after* the nullifier is already burned, stranding the funds —
-        // so the swap trades the realized post-fee amount.
-        let withdrawal_fee = amount_in
-            .checked_mul(WITHDRAWAL_FEE_BPS)
-            .map(|x| x / 10_000)
-            .ok_or(RelayerError::InvalidAmount(amount_in))?;
-        let withdrawn = amount_in
-            .checked_sub(withdrawal_fee)
-            .filter(|&a| a > 0)
-            .ok_or(RelayerError::InvalidAmount(amount_in))?;
-
-        // On a native-SOL input leg the fresh address also pays the swap's rent
-        // and fees out of the same lamports, so trade the realized amount minus
-        // the overhead reserve — never the full note (see
-        // `native_swap_overhead_lamports`).
-        let swap_amount = if asset_in == NATIVE_SOL_ASSET {
-            withdrawn
-                .checked_sub(self.native_swap_overhead_lamports)
-                .filter(|&a| a > 0)
-                .ok_or(RelayerError::InvalidAmount(amount_in))?
-        } else {
-            withdrawn
-        };
         let swap = self
             .swap_provider
             .swap(asset_in, asset_out, swap_amount, ephemeral)
             .await?;
+
+        if swap.out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "swap provider returned zero output amount".into(),
+            ));
+        }
 
         // Independent slippage floor. The provider enforces its own slippage
         // bound on-chain, but that is a single value fixed when the relayer is
@@ -742,6 +741,20 @@ mod tests {
             .await
             .expect_err("overhead consuming the whole note must fail, not swap 0");
         assert!(matches!(err, RelayerError::InvalidAmount(1_000)));
+        // Pre-flight rejection: the withdraw leg must NOT have been submitted.
+        assert!(relayer.submitter.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_swap_output_is_rejected_before_redeposit() {
+        let relayer =
+            PrivateSwapRelayer::new(MockSwapProvider::with_rate(0, 1), MockSubmitter::new());
+        let err = relayer
+            .execute(request(native_note(1_000_000), NATIVE_SOL_ASSET, 0))
+            .await
+            .expect_err("zero output from swap provider must error");
+        assert!(matches!(err, RelayerError::SwapFailed(_)));
+        assert_eq!(relayer.submitter.recorded().len(), 1);
     }
 
     #[tokio::test]
