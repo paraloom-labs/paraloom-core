@@ -23,6 +23,7 @@ use libp2p::{
 use log::{debug, info};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::config::Settings;
@@ -204,8 +205,8 @@ fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
     use std::path::Path;
 
     let path = match path {
-        Some(p) => Path::new(p),
-        None => return Ok(identity::Keypair::generate_ed25519()),
+        Some(p) if !p.trim().is_empty() => Path::new(p.trim()),
+        _ => return Ok(identity::Keypair::generate_ed25519()),
     };
 
     if path.exists() {
@@ -232,14 +233,27 @@ fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
     let bytes = keypair
         .to_protobuf_encoding()
         .map_err(|e| anyhow!("encoding libp2p identity to protobuf: {}", e))?;
-    fs::write(path, &bytes)
-        .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting 0600 permissions on {}", path.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening libp2p identity at {}", path.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, &bytes)
+            .with_context(|| format!("writing libp2p identity to {}", path.display()))?;
+    }
+
     info!(
         "Generated new libp2p identity, persisted to {} (PeerId stable across restarts)",
         path.display()
@@ -450,6 +464,10 @@ impl NetworkManager {
                     // but not added to kad.
                     let peer_id = peer_id_from_multiaddr(&addr);
                     if let Some(pid) = peer_id {
+                        if pid == self.peer_id {
+                            log::debug!("Skipping self bootstrap address: {}", addr);
+                            continue;
+                        }
                         swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
                         info!("Registered bootstrap {} in Kademlia routing table", pid);
                     } else {
@@ -503,6 +521,10 @@ impl NetworkManager {
                 }
             };
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                if pid == self.peer_id {
+                    log::debug!("co-validator keep-alive: skipping self address {}", addr);
+                    continue;
+                }
                 if connected.contains(&pid.to_bytes()) {
                     continue; // already connected — nothing to do
                 }
@@ -561,6 +583,13 @@ impl NetworkManager {
                 relay_addr
             )
         })?;
+
+        if relay_peer == self.peer_id {
+            return Err(anyhow!(
+                "cannot listen via self ({}) as relay",
+                self.peer_id
+            ));
+        }
 
         let mut swarm = self.swarm.lock().await;
 
@@ -1091,6 +1120,9 @@ impl NetworkManager {
 
     pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send result request to self"));
+        }
 
         info!("=== SENDING RESULT REQUEST ===");
         info!("Target peer: {}", peer_id);
@@ -1123,6 +1155,9 @@ impl NetworkManager {
         request: HeartbeatRequest,
     ) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send heartbeat request to self"));
+        }
         let mut swarm = self.swarm.lock().await;
         swarm
             .behaviour_mut()
@@ -1144,14 +1179,25 @@ impl NetworkManager {
         request: CoSignRequest,
     ) -> Result<CoSignResponse> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send cosign request to self"));
+        }
         let (tx, rx) = oneshot::channel();
-        {
+        let request_id = {
             let mut swarm = self.swarm.lock().await;
             let request_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
             self.cosign_waiters.lock().await.insert(request_id, tx);
+            request_id
+        };
+        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(res) => {
+                res.map_err(|_| anyhow!("cosign request to {} failed or timed out", peer_id))
+            }
+            Err(_) => {
+                self.cosign_waiters.lock().await.remove(&request_id);
+                Err(anyhow!("cosign request to {} timed out", peer_id))
+            }
         }
-        rx.await
-            .map_err(|_| anyhow!("cosign request to {} failed or timed out", peer_id))
     }
 
     /// Get local peer ID
@@ -1238,6 +1284,9 @@ impl NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::CoordinatorSnapshot;
+    use crate::network::SettlementKind;
+    use crate::task::TaskResult;
 
     #[test]
     fn peer_id_extracted_from_multiaddr_with_p2p_suffix() {
@@ -1375,5 +1424,138 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn identity_is_ephemeral_when_path_empty_or_whitespace() {
+        let key1 = load_or_create_identity(Some("")).expect("empty string path");
+        let key2 = load_or_create_identity(Some("   \t  ")).expect("whitespace path");
+        assert_ne!(
+            PeerId::from(key1.public()),
+            PeerId::from(key2.public()),
+            "empty/whitespace paths must yield distinct ephemeral identities"
+        );
+    }
+
+    #[test]
+    fn identity_file_created_with_0600_permissions() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("paraloom-perm-test-{}", std::process::id()));
+        let tmp_path = tmp_dir.join("subdir").join("identity.key");
+        let path_str = tmp_path.to_string_lossy().to_string();
+
+        let _ = load_or_create_identity(Some(&path_str)).expect("create identity");
+        assert!(tmp_path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&tmp_path).expect("metadata");
+            let mode = meta.permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "identity file permissions must be 0600"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn self_peer_filtering_tests() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let self_pid = mgr.peer_id_base58();
+        let self_multiaddr = format!("/ip4/127.0.0.1/tcp/9000/p2p/{}", self_pid);
+
+        // connect_to_bootstrap skips self
+        mgr.connect_to_bootstrap(vec![self_multiaddr.clone()])
+            .await
+            .expect("connect_to_bootstrap skips self without error");
+
+        // redial_disconnected_co_validators skips self
+        mgr.redial_disconnected_co_validators(&[self_multiaddr.clone()])
+            .await;
+
+        // listen_via_relay rejects self as relay
+        let err = mgr
+            .listen_via_relay(&self_multiaddr)
+            .await
+            .expect_err("cannot listen via self as relay");
+        assert!(err.to_string().contains("cannot listen via self"));
+
+        // send_result_request rejects self
+        let dummy_result = TaskResult {
+            task_id: "test".to_string(),
+            execution_time_ms: 0,
+            data: crate::task::ResultData::Hashes {
+                hashes: vec![],
+                count: 0,
+            },
+        };
+        let err = mgr
+            .send_result_request(
+                mgr.local_peer_id(),
+                ResultRequest {
+                    result: dummy_result,
+                },
+            )
+            .await
+            .expect_err("rejects self");
+        assert!(err
+            .to_string()
+            .contains("Cannot send result request to self"));
+
+        // send_heartbeat_request rejects self
+        let dummy_hb = HeartbeatRequest {
+            primary: mgr.local_peer_id(),
+            sequence: 1,
+            snapshot: CoordinatorSnapshot::default(),
+        };
+        let err = mgr
+            .send_heartbeat_request(mgr.local_peer_id(), dummy_hb)
+            .await
+            .expect_err("rejects self");
+        assert!(err
+            .to_string()
+            .contains("Cannot send heartbeat request to self"));
+
+        // send_cosign_request rejects self
+        let dummy_cs = CoSignRequest {
+            request_id: "test".to_string(),
+            kind: SettlementKind::Transact,
+            message: vec![],
+        };
+        let err = mgr
+            .send_cosign_request(mgr.local_peer_id(), dummy_cs)
+            .await
+            .expect_err("rejects self");
+        assert!(err
+            .to_string()
+            .contains("Cannot send cosign request to self"));
+    }
+
+    #[tokio::test]
+    async fn send_cosign_request_times_out_and_cleans_up_waiter() {
+        tokio::time::pause();
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let other_key = identity::Keypair::generate_ed25519();
+        let other_pid = PeerId::from(other_key.public());
+        let dummy_cs = CoSignRequest {
+            request_id: "test-timeout".to_string(),
+            kind: SettlementKind::Transact,
+            message: vec![],
+        };
+
+        let req_fut = mgr.send_cosign_request(NodeId(other_pid.to_bytes()), dummy_cs);
+        tokio::pin!(req_fut);
+
+        // Advance tokio clock past the 10s timeout
+        tokio::time::advance(Duration::from_secs(11)).await;
+
+        let res = req_fut.await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(mgr.cosign_waiters.lock().await.len(), 0);
     }
 }
