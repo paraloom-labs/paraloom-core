@@ -467,6 +467,47 @@ impl Coordinator {
                     result.task_id
                 ));
             }
+            match (&task.task_type, &result.data) {
+                (
+                    TaskType::HashCalculation { start, end, .. },
+                    ResultData::Hashes { hashes, count },
+                ) => {
+                    if hashes.len() != *count {
+                        return Err(anyhow::anyhow!(
+                            "result for {} has mismatched count ({}) vs hashes.len() ({})",
+                            result.task_id,
+                            count,
+                            hashes.len()
+                        ));
+                    }
+                    if !hashes.is_empty() {
+                        let expected_len = end
+                            .checked_sub(*start)
+                            .and_then(|d| d.checked_add(1))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("invalid task range for {}", result.task_id)
+                            })?;
+                        if hashes.len() as u64 != expected_len {
+                            return Err(anyhow::anyhow!(
+                                "result for {} returned {} hashes, expected {}",
+                                result.task_id,
+                                hashes.len(),
+                                expected_len
+                            ));
+                        }
+                        for (idx, (num, digest)) in hashes.iter().enumerate() {
+                            if *num != start.saturating_add(idx as u64) || digest.trim().is_empty()
+                            {
+                                return Err(anyhow::anyhow!(
+                                    "result for {} has invalid hash entry at index {}",
+                                    result.task_id,
+                                    idx
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             task.status = TaskStatus::Completed;
         }
 
@@ -573,7 +614,7 @@ impl Coordinator {
                         );
                         all_hashes.extend(hashes.clone());
                         max_time = max_time.max(result.execution_time_ms);
-                        total_time += result.execution_time_ms;
+                        total_time = total_time.saturating_add(result.execution_time_ms);
                     }
 
                     info!("");
@@ -598,8 +639,11 @@ impl Coordinator {
                     } else {
                         1 // Avoid division by zero
                     };
-                    let estimated_single_node_time =
-                        all_hashes.len() as u64 * avg_time / chunk_results.len() as u64;
+                    let estimated_single_node_time = ((all_hashes.len() as u128
+                        * avg_time as u128)
+                        / chunk_results.len() as u128)
+                        .min(u64::MAX as u128)
+                        as u64;
                     let speedup = if max_time > 0 {
                         estimated_single_node_time as f64 / max_time as f64
                     } else {
@@ -855,6 +899,93 @@ mod tests {
             .handle_task_result(&assignee, make_result())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_task_result_rejects_mismatched_count_and_survives_max_execution_time() {
+        let coordinator = Coordinator::new(make_test_network());
+        let assignee = NodeId(vec![0xBB]);
+
+        let register_chunk = |cid: &str, start: u64, end: u64| {
+            let mut task = Task::new(TaskType::HashCalculation {
+                start,
+                end,
+                algorithm: "sha256".to_string(),
+            });
+            task.id = cid.to_string();
+            task.assigned_to = Some(format!("{:?}", assignee));
+            task.status = TaskStatus::Assigned;
+            task
+        };
+
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert("p-chunk-0".to_string(), register_chunk("p-chunk-0", 0, 1));
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert("p-chunk-1".to_string(), register_chunk("p-chunk-1", 2, 3));
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert("p-chunk-0".to_string(), "p".to_string());
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert("p-chunk-1".to_string(), "p".to_string());
+
+        // Mismatched count vs hashes.len() must be rejected before marking Completed.
+        let bad_count = TaskResult {
+            task_id: "p-chunk-0".to_string(),
+            execution_time_ms: 10,
+            data: ResultData::Hashes {
+                hashes: vec![(0, "aa".to_string()), (1, "bb".to_string())],
+                count: 99,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, bad_count)
+            .await
+            .is_err());
+
+        // Wrong index in hashes must be rejected.
+        let bad_index = TaskResult {
+            task_id: "p-chunk-0".to_string(),
+            execution_time_ms: 10,
+            data: ResultData::Hashes {
+                hashes: vec![(0, "aa".to_string()), (9, "bb".to_string())],
+                count: 2,
+            },
+        };
+        assert!(coordinator
+            .handle_task_result(&assignee, bad_index)
+            .await
+            .is_err());
+
+        // Extreme execution_time_ms across two chunks must aggregate without overflowing u64.
+        let ok0 = TaskResult {
+            task_id: "p-chunk-0".to_string(),
+            execution_time_ms: u64::MAX,
+            data: ResultData::Hashes {
+                hashes: vec![(0, "aa".to_string()), (1, "bb".to_string())],
+                count: 2,
+            },
+        };
+        let ok1 = TaskResult {
+            task_id: "p-chunk-1".to_string(),
+            execution_time_ms: u64::MAX,
+            data: ResultData::Hashes {
+                hashes: vec![(2, "cc".to_string()), (3, "dd".to_string())],
+                count: 2,
+            },
+        };
+        assert!(coordinator.handle_task_result(&assignee, ok0).await.is_ok());
+        assert!(coordinator.handle_task_result(&assignee, ok1).await.is_ok());
     }
 
     #[tokio::test]
