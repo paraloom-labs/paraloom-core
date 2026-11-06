@@ -92,6 +92,16 @@ fn header(s: &str) {
     println!("\n=== {s} ===");
 }
 
+fn write_secret_file(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    std::fs::write(&path, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1").unwrap_or(false)
 }
@@ -116,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let ingress = std::env::var("TRANSACT_INGRESS_URL")
         .unwrap_or_else(|_| "https://node.paraloom.io".to_string());
+    let ingress = ingress.trim_end_matches('/').to_string();
     let proving_key_path =
         std::env::var("TRANSACT_PROVING_KEY").unwrap_or_else(|_| DEFAULT_PROVING_KEY.to_string());
     let usdc_mint = Pubkey::from_str(
@@ -199,14 +210,25 @@ async fn main() -> anyhow::Result<()> {
         let amt = v["amount"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("note file missing amount"))?;
+        if amt == 0 {
+            anyhow::bail!("note amount must be greater than zero");
+        }
+        let in_sk = hex32("in_sk")?;
+        let in_blinding = hex32("in_blinding")?;
+        let in_note_pubkey = hex32("in_note_pubkey")?;
+        let in_sk_fr = Fr::from_le_bytes_mod_order(&in_sk);
+        let expected_pk = fr_to_le(&v3_pubkey(in_sk_fr));
+        if in_note_pubkey != expected_pk {
+            anyhow::bail!("in_note_pubkey does not match v3_pubkey(in_sk)");
+        }
         println!(
             "resumed note:      {resume_path} (leaf {li}, {} SOL)",
             amt as f64 / 1e9
         );
         (
-            hex32("in_sk")?,
-            hex32("in_blinding")?,
-            hex32("in_note_pubkey")?,
+            in_sk,
+            in_blinding,
+            in_note_pubkey,
             li,
             amt,
         )
@@ -230,8 +252,16 @@ async fn main() -> anyhow::Result<()> {
 
         // Read the just-appended leaf index from the on-chain tree.
         let raw = client.get_account_data(&tree_pda)?;
+        if raw.len() < 16 {
+            anyhow::bail!(
+                "merkle tree account data too short: {} bytes (need at least 16)",
+                raw.len()
+            );
+        }
         let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-        let leaf_index = next_index - 1;
+        let leaf_index = next_index
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("merkle tree has no leaves (next_index is 0)"))?;
         println!("leaf index:        {leaf_index}");
 
         // Persist the note secret NOW, before the withdraw, so the deposit is
@@ -247,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
             "leaf_index": leaf_index,
             "amount": swap_amount,
         });
-        std::fs::write(&note_path, serde_json::to_string_pretty(&note)?)?;
+        write_secret_file(&note_path, serde_json::to_string_pretty(&note)?)?;
         println!("note saved:        {note_path}  (retry withdraw with RESUME_NOTE={note_path})");
         (sk_le, blinding_le, pk_le, leaf_index, swap_amount)
     };
@@ -259,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
     // realized USDC is recoverable after the run.
     let fresh = Keypair::new();
     let fresh_path = format!("private_swap_fresh_{}.json", fresh.pubkey());
-    std::fs::write(
+    write_secret_file(
         &fresh_path,
         serde_json::to_string(&fresh.to_bytes().to_vec())?,
     )?;

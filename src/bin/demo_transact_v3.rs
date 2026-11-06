@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = load_keypair_from_file(&std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?)?;
     let ingress = std::env::var("TRANSACT_INGRESS_URL")
         .unwrap_or_else(|_| "https://node.paraloom.io".to_string());
+    let ingress = ingress.trim_end_matches('/').to_string();
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     let (vault_pda, _) = derive_bridge_vault(&program_id);
@@ -74,8 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. read the tree: our leaf index + the post-deposit root ────────────
     let raw = client.get_account_data(&tree_pda)?;
+    let min_tree_len = 56 + TX_LEVELS * 32;
+    if raw.len() < min_tree_len {
+        return Err(format!(
+            "merkle tree account data too short: {} bytes (need at least {min_tree_len})",
+            raw.len()
+        )
+        .into());
+    }
     let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-    let leaf_index = next_index - 1;
+    let leaf_index = next_index
+        .checked_sub(1)
+        .ok_or_else(|| "merkle tree has no leaves (next_index is 0)")?;
     let root_onchain: [u8; 32] = raw[24..56].try_into()?;
     println!(
         "[2/5] on-chain tree: leaf {leaf_index}, root {}",
@@ -264,10 +275,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proof": hex::encode(&proof_bytes),
         "ciphertexts": [placeholder_0, placeholder_1],
     });
-    let resp = reqwest::blocking::Client::new()
+    let http_client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut req = http_client
         .post(format!("{ingress}/transact/submit"))
-        .json(&body)
-        .send()?;
+        .json(&body);
+    if let Ok(token) = std::env::var("BRIDGE_INGRESS_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    let resp = req.send()?;
     let status = resp.status();
     let text = resp.text()?;
     println!("      {status}: {text}");
