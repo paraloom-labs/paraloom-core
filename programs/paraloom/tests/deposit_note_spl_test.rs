@@ -24,11 +24,9 @@ const DEPOSIT: u64 = 1_000_000;
 const DEPOSITOR_FUND: u64 = 10_000_000;
 
 fn asset_vault_pdas(program_id: Pubkey, mint: Pubkey) -> (Pubkey, Pubkey, Pubkey) {
-    let (vault, _) =
-        Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], &program_id);
+    let (vault, _) = Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], &program_id);
     let (authority, _) = Pubkey::find_program_address(&[b"asset_vault_authority"], &program_id);
-    let (config, _) =
-        Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], &program_id);
+    let (config, _) = Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], &program_id);
     (vault, authority, config)
 }
 
@@ -45,6 +43,10 @@ async fn init_spl_pool(
 ) {
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (stake_token_vault, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);
+    let (stake_vault_authority, _) =
+        Pubkey::find_program_address(&[b"stake_vault_authority"], &program_id);
     let (asset_vault, asset_vault_authority, asset_config) = asset_vault_pdas(program_id, mint);
 
     let init_state = Instruction {
@@ -73,6 +75,22 @@ async fn init_spl_pool(
         }
         .to_account_metas(None),
     };
+    let init_registry = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            stake_mint: mint,
+            stake_token_vault,
+            stake_vault_authority,
+            program_data: program_data_pda,
+            token_program: spl_token::id(),
+            system_program: system_program::ID,
+            rent: solana_sdk::sysvar::rent::ID,
+        }
+        .to_account_metas(None),
+    };
     let init_vault = Instruction {
         program_id,
         data: instruction::InitAssetVault {}.data(),
@@ -94,8 +112,8 @@ async fn init_spl_pool(
         data: instruction::SetAssetDepositCap { new_cap: cap }.data(),
         accounts: accounts::SetAssetDepositCap {
             asset_config,
+            validator_registry: registry_pda,
             authority: upgrade_authority.pubkey(),
-            program_data: program_data_pda,
         }
         .to_account_metas(None),
     };
@@ -105,7 +123,7 @@ async fn init_spl_pool(
     // reliably under solana-program-test; on mainnet these are separate
     // cold-authority operations anyway.
     let mut tx = Transaction::new_with_payer(
-        &[init_state, init_tree, init_vault],
+        &[init_state, init_tree, init_registry, init_vault],
         Some(&upgrade_authority.pubkey()),
     );
     tx.sign(&[upgrade_authority], blockhash);
@@ -154,7 +172,9 @@ fn deposit_spl_ix(
 
 fn token_balance(account: &Account) -> u64 {
     use anchor_lang::solana_program::program_pack::Pack;
-    spl_token::state::Account::unpack(&account.data).unwrap().amount
+    spl_token::state::Account::unpack(&account.data)
+        .unwrap()
+        .amount
 }
 
 #[tokio::test]
@@ -195,7 +215,13 @@ async fn deposit_note_spl_appends_and_moves_tokens() {
 
     let vault_before = token_balance(&banks.get_account(asset_vault).await.unwrap().unwrap());
 
-    let ix = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, DEPOSIT);
+    let ix = deposit_spl_ix(
+        program_id,
+        mint,
+        depositor.pubkey(),
+        depositor_token,
+        DEPOSIT,
+    );
     let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
     tx.sign(&[&depositor], blockhash);
     banks.process_transaction(tx).await.unwrap();
@@ -204,15 +230,26 @@ async fn deposit_note_spl_appends_and_moves_tokens() {
     let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
     let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
     assert_eq!(tree.next_index, 1, "one leaf appended");
-    assert_ne!(tree.root, ZERO_HASHES[TREE_DEPTH], "root advanced from empty");
+    assert_ne!(
+        tree.root, ZERO_HASHES[TREE_DEPTH],
+        "root advanced from empty"
+    );
     assert!(tree.is_known_root(tree.root), "new root is known");
 
     // Tokens moved from the depositor into the asset vault.
     let vault_after = token_balance(&banks.get_account(asset_vault).await.unwrap().unwrap());
-    assert_eq!(vault_after - vault_before, DEPOSIT, "vault received the deposit");
+    assert_eq!(
+        vault_after - vault_before,
+        DEPOSIT,
+        "vault received the deposit"
+    );
     let depositor_after =
         token_balance(&banks.get_account(depositor_token).await.unwrap().unwrap());
-    assert_eq!(depositor_after, DEPOSITOR_FUND - DEPOSIT, "depositor debited");
+    assert_eq!(
+        depositor_after,
+        DEPOSITOR_FUND - DEPOSIT,
+        "depositor debited"
+    );
 
     // Per-asset accounting ticked.
     let craw = banks.get_account(asset_config).await.unwrap().unwrap();
@@ -255,11 +292,20 @@ async fn deposit_note_spl_enforces_cap() {
     )
     .await;
 
-    let ix = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, DEPOSIT);
+    let ix = deposit_spl_ix(
+        program_id,
+        mint,
+        depositor.pubkey(),
+        depositor_token,
+        DEPOSIT,
+    );
     let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
     tx.sign(&[&depositor], blockhash);
     let result = banks.process_transaction(tx).await;
-    assert!(result.is_err(), "a deposit past the per-asset cap must be rejected");
+    assert!(
+        result.is_err(),
+        "a deposit past the per-asset cap must be rejected"
+    );
 
     // No leaf appended and no tokens moved.
     let (asset_vault, _, _) = asset_vault_pdas(program_id, mint);
@@ -306,7 +352,13 @@ async fn deposit_note_spl_closed_until_cap_opened() {
     )
     .await;
 
-    let ix = deposit_spl_ix(program_id, mint, depositor.pubkey(), depositor_token, DEPOSIT);
+    let ix = deposit_spl_ix(
+        program_id,
+        mint,
+        depositor.pubkey(),
+        depositor_token,
+        DEPOSIT,
+    );
     let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
     tx.sign(&[&depositor], blockhash);
     let result = banks.process_transaction(tx).await;
