@@ -24,6 +24,10 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 
 /// Convert a hex string to bytes
 pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, &'static str> {
+    if !hex.is_ascii() {
+        return Err("Invalid hex character");
+    }
+
     if !hex.len().is_multiple_of(2) {
         return Err("Hex string must have an even number of characters");
     }
@@ -35,4 +39,36 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, &'static str> {
     }
 
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_to_bytes_valid_round_trip() {
+        let original = vec![0x00, 0x12, 0xab, 0xff];
+        let hex = bytes_to_hex(&original);
+        assert_eq!(hex_to_bytes(&hex).unwrap(), original);
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_odd_length() {
+        assert_eq!(
+            hex_to_bytes("abc"),
+            Err("Hex string must have an even number of characters")
+        );
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_non_ascii_without_panic() {
+        // Multi-byte UTF-8 string whose byte length is even (4 bytes: 'a' is 1 byte, '€' is 3 bytes)
+        assert_eq!(hex_to_bytes("a€"), Err("Invalid hex character"));
+        assert_eq!(hex_to_bytes("€€"), Err("Invalid hex character"));
+    }
+
+    #[test]
+    fn hex_to_bytes_rejects_invalid_hex() {
+        assert_eq!(hex_to_bytes("zz"), Err("Invalid hex character"));
+    }
 }
