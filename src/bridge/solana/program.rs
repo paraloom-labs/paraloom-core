@@ -16,6 +16,9 @@ use std::sync::Arc;
 /// begins at offset [`ANCHOR_DISCRIMINATOR_LEN`].
 const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
 
+/// `sha256("account:BridgeState")[..8]`.
+const BRIDGE_STATE_DISC: [u8; 8] = [6, 190, 226, 198, 76, 100, 157, 198];
+
 /// Pull the `program_version: u32` out of a raw `BridgeState` account
 /// buffer. The on-chain layout puts `program_version` as the first
 /// field (after the 8-byte Anchor discriminator), so the value lives
@@ -34,6 +37,11 @@ fn parse_program_version(data: &[u8]) -> Result<u32> {
             data.len(),
             end
         )));
+    }
+    if data[0..8] != BRIDGE_STATE_DISC {
+        return Err(BridgeError::ConfigError(
+            "BridgeState account has invalid Anchor discriminator".to_string(),
+        ));
     }
     let bytes: [u8; 4] = data[start..end].try_into().expect("slice fits a u32");
     Ok(u32::from_le_bytes(bytes))
@@ -230,6 +238,12 @@ impl ProgramInterface {
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
         let account = self.rpc.get_account(&state_pda).await?;
+        if account.owner != self.program_id {
+            return Err(BridgeError::ConfigError(format!(
+                "BridgeState account owner {} does not match program_id {}",
+                account.owner, self.program_id
+            )));
+        }
         parse_program_version(&account.data)
     }
 
@@ -263,7 +277,7 @@ mod tests {
     use solana_sdk::account::Account;
 
     fn bridge_state_account(program_version: u32) -> Account {
-        let mut data = vec![0xAAu8; 8];
+        let mut data = BRIDGE_STATE_DISC.to_vec();
         data.extend_from_slice(&program_version.to_le_bytes());
         Account {
             lamports: 1,
@@ -454,7 +468,7 @@ mod tests {
 
     #[test]
     fn parse_program_version_reads_v04() {
-        let mut buf = vec![0xAAu8; 8]; // discriminator
+        let mut buf = BRIDGE_STATE_DISC.to_vec(); // discriminator
         buf.extend_from_slice(&0x0004_0000u32.to_le_bytes());
         buf.extend_from_slice(&[0xFFu8; 200]); // trailing payload
         assert_eq!(parse_program_version(&buf).unwrap(), 0x0004_0000);
@@ -462,9 +476,17 @@ mod tests {
 
     #[test]
     fn parse_program_version_reads_v123() {
-        let mut buf = vec![0u8; 8];
+        let mut buf = BRIDGE_STATE_DISC.to_vec();
         buf.extend_from_slice(&0x0102_0304u32.to_le_bytes());
         assert_eq!(parse_program_version(&buf).unwrap(), 0x0102_0304);
+    }
+
+    #[test]
+    fn parse_program_version_rejects_wrong_discriminator() {
+        let mut buf = vec![0xAAu8; 8];
+        buf.extend_from_slice(&0x0004_0000u32.to_le_bytes());
+        let err = parse_program_version(&buf).expect_err("wrong discriminator");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
     }
 
     /// A short buffer (BridgeState account that hasn't been
