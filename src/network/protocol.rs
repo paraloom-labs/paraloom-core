@@ -204,8 +204,8 @@ fn load_or_create_identity(path: Option<&str>) -> Result<identity::Keypair> {
     use std::path::Path;
 
     let path = match path {
-        Some(p) => Path::new(p),
-        None => return Ok(identity::Keypair::generate_ed25519()),
+        Some(p) if !p.trim().is_empty() => Path::new(p),
+        _ => return Ok(identity::Keypair::generate_ed25519()),
     };
 
     if path.exists() {
@@ -450,6 +450,10 @@ impl NetworkManager {
                     // but not added to kad.
                     let peer_id = peer_id_from_multiaddr(&addr);
                     if let Some(pid) = peer_id {
+                        if pid == self.peer_id {
+                            info!("Skipping self bootstrap node: {}", addr);
+                            continue;
+                        }
                         swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
                         info!("Registered bootstrap {} in Kademlia routing table", pid);
                     } else {
@@ -503,6 +507,10 @@ impl NetworkManager {
                 }
             };
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                if pid == self.peer_id {
+                    log::debug!("co-validator keep-alive: skipping self address {}", addr);
+                    continue;
+                }
                 if connected.contains(&pid.to_bytes()) {
                     continue; // already connected — nothing to do
                 }
@@ -1091,6 +1099,9 @@ impl NetworkManager {
 
     pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send result request to self"));
+        }
 
         info!("=== SENDING RESULT REQUEST ===");
         info!("Target peer: {}", peer_id);
@@ -1123,6 +1134,9 @@ impl NetworkManager {
         request: HeartbeatRequest,
     ) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send heartbeat request to self"));
+        }
         let mut swarm = self.swarm.lock().await;
         swarm
             .behaviour_mut()
@@ -1144,14 +1158,60 @@ impl NetworkManager {
         request: CoSignRequest,
     ) -> Result<CoSignResponse> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut swarm = self.swarm.lock().await;
-            let request_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
-            self.cosign_waiters.lock().await.insert(request_id, tx);
+        if peer_id == self.peer_id {
+            return Err(anyhow!("Cannot send cosign request to self"));
         }
-        rx.await
-            .map_err(|_| anyhow!("cosign request to {} failed or timed out", peer_id))
+        let (tx, rx) = oneshot::channel();
+        let request_id = {
+            let mut swarm = self.swarm.lock().await;
+            let req_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
+            self.cosign_waiters.lock().await.insert(req_id, tx);
+            req_id
+        };
+
+        struct WaiterGuard {
+            waiters: Arc<Mutex<HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>>>,
+            request_id: OutboundRequestId,
+            active: bool,
+        }
+
+        impl Drop for WaiterGuard {
+            fn drop(&mut self) {
+                if self.active {
+                    let waiters = self.waiters.clone();
+                    let req_id = self.request_id;
+                    tokio::spawn(async move {
+                        waiters.lock().await.remove(&req_id);
+                    });
+                }
+            }
+        }
+
+        let mut guard = WaiterGuard {
+            waiters: self.cosign_waiters.clone(),
+            request_id,
+            active: true,
+        };
+
+        // 10s matches the libp2p co-sign request timeout in create_cosign_protocol.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
+
+        match result {
+            Ok(Ok(response)) => {
+                guard.active = false;
+                Ok(response)
+            }
+            Ok(Err(_)) => {
+                guard.active = false;
+                self.cosign_waiters.lock().await.remove(&request_id);
+                Err(anyhow!("cosign request to {} failed", peer_id))
+            }
+            Err(_) => {
+                guard.active = false;
+                self.cosign_waiters.lock().await.remove(&request_id);
+                Err(anyhow!("cosign request to {} timed out", peer_id))
+            }
+        }
     }
 
     /// Get local peer ID
@@ -1375,5 +1435,74 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn identity_is_ephemeral_when_path_empty() {
+        let key1 = load_or_create_identity(Some("")).expect("empty string path");
+        let key2 = load_or_create_identity(Some("   ")).expect("whitespace path");
+        assert_ne!(
+            PeerId::from(key1.public()),
+            PeerId::from(key2.public()),
+            "empty path identities must be ephemeral"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_to_self_is_rejected() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let self_id = mgr.local_peer_id();
+
+        let cosign_req = CoSignRequest {
+            request_id: "req-1".to_string(),
+            kind: crate::network::cosign::SettlementKind::Transact,
+            message: vec![1, 2, 3],
+        };
+        let err = mgr.send_cosign_request(self_id.clone(), cosign_req).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("self"));
+
+        let result_req = ResultRequest {
+            result: crate::task::TaskResult {
+                task_id: "t1".to_string(),
+                execution_time_ms: 10,
+                data: crate::task::ResultData::Hashes {
+                    hashes: vec![],
+                    count: 0,
+                },
+            },
+        };
+        let err = mgr.send_result_request(self_id.clone(), result_req).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("self"));
+    }
+
+    #[tokio::test]
+    async fn connect_to_bootstrap_skips_self() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let self_b58 = mgr.peer_id_base58();
+        let self_multiaddr = format!("/ip4/127.0.0.1/tcp/9999/p2p/{}", self_b58);
+
+        // Connecting to bootstrap node containing own PeerId should skip it cleanly without error
+        let res = mgr.connect_to_bootstrap(vec![self_multiaddr]).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_cosign_request_times_out_and_cleans_up_waiter() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let other_peer = NodeId(PeerId::random().to_bytes());
+        let cosign_req = CoSignRequest {
+            request_id: "req-timeout-test".to_string(),
+            kind: crate::network::cosign::SettlementKind::Transact,
+            message: vec![1, 2, 3],
+        };
+
+        let err = mgr.send_cosign_request(other_peer, cosign_req).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("timed out"));
+
+        let waiters = mgr.cosign_waiters.lock().await;
+        assert!(waiters.is_empty());
     }
 }

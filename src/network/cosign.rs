@@ -145,6 +145,16 @@ impl Codec for CoSignCodec {
     {
         let data =
             bincode::serialize(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_COSIGN_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cosign request payload size {} exceeds maximum {}",
+                    data.len(),
+                    MAX_COSIGN_PAYLOAD_BYTES
+                ),
+            ));
+        }
         io.write_all(&data).await?;
         io.close().await
     }
@@ -160,6 +170,16 @@ impl Codec for CoSignCodec {
     {
         let data =
             bincode::serialize(&res).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if data.len() > MAX_COSIGN_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cosign response payload size {} exceeds maximum {}",
+                    data.len(),
+                    MAX_COSIGN_PAYLOAD_BYTES
+                ),
+            ));
+        }
         io.write_all(&data).await?;
         io.close().await
     }
@@ -249,5 +269,21 @@ mod tests {
         let encoded = bincode::serialize(&kind).expect("serialize");
         let decoded: SettlementKind = bincode::deserialize(&encoded).expect("deserialize");
         assert_eq!(decoded, kind);
+    }
+
+    #[tokio::test]
+    async fn write_request_rejects_payload_over_limit() {
+        let mut codec = CoSignCodec;
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let req = CoSignRequest {
+            request_id: "over-limit".to_string(),
+            kind: SettlementKind::Transact,
+            message: vec![0x42u8; MAX_COSIGN_PAYLOAD_BYTES + 1],
+        };
+        let err = codec
+            .write_request(&COSIGN_PROTOCOL, &mut cursor, req)
+            .await
+            .expect_err("over limit must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
