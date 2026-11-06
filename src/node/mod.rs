@@ -144,6 +144,28 @@ pub struct Node {
     cosign_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
+/// Apply optional `[bridge]` BFT consensus threshold and reputation-floor
+/// overrides to `coord`, allowing `consensus_min_validators`,
+/// `consensus_total_validators`, and `consensus_min_reputation` to be
+/// configured independently with defaults filling any omitted side.
+fn apply_bridge_consensus_overrides(
+    coord: &mut TransactVerificationCoordinator,
+    bridge: &crate::bridge::BridgeConfig,
+) {
+    if bridge.consensus_min_validators.is_some() || bridge.consensus_total_validators.is_some() {
+        let min = bridge
+            .consensus_min_validators
+            .unwrap_or(crate::consensus::transact::DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS);
+        let total = bridge
+            .consensus_total_validators
+            .unwrap_or(crate::consensus::transact::DEFAULT_TOTAL_VALIDATORS);
+        coord.set_consensus_thresholds(min, total);
+    }
+    if let Some(min_reputation) = bridge.consensus_min_reputation {
+        coord.set_min_reputation_for_consensus(min_reputation);
+    }
+}
+
 /// Build the compute-job authorization policy (F3) from `[compute]` settings.
 /// An empty `authorized_submitters` list leaves submission open to any peer
 /// (dev/demo); a non-empty list restricts submission to exactly those NodeIds.
@@ -1493,12 +1515,7 @@ impl Node {
             // validator.toml to settle with a small live cohort (2/2), otherwise
             // it never reaches a Valid quorum and settlement silently times out.
             // The on-chain stake-weighted 2/3 quorum stays the real security gate.
-            if let (Some(min), Some(total)) = (
-                settings.bridge.consensus_min_validators,
-                settings.bridge.consensus_total_validators,
-            ) {
-                coord.set_consensus_thresholds(min, total);
-            }
+            apply_bridge_consensus_overrides(&mut coord, &settings.bridge);
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
@@ -3633,5 +3650,44 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[test]
+    fn apply_bridge_consensus_overrides_supports_single_sided_and_reputation_overrides() {
+        use crate::consensus::transact::{
+            DEFAULT_MIN_REPUTATION_FOR_CONSENSUS, DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
+            DEFAULT_TOTAL_VALIDATORS,
+        };
+
+        // Only consensus_min_validators set -> pairs with DEFAULT_TOTAL_VALIDATORS.
+        let mut cfg = crate::bridge::BridgeConfig::default();
+        cfg.consensus_min_validators = Some(2);
+        let mut coord = TransactVerificationCoordinator::new();
+        apply_bridge_consensus_overrides(&mut coord, &cfg);
+        assert_eq!(coord.consensus_thresholds(), (2, DEFAULT_TOTAL_VALIDATORS));
+        assert_eq!(
+            coord.min_reputation_for_consensus(),
+            DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+        );
+
+        // Only consensus_total_validators set -> pairs with DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS.
+        let mut cfg = crate::bridge::BridgeConfig::default();
+        cfg.consensus_total_validators = Some(8);
+        let mut coord = TransactVerificationCoordinator::new();
+        apply_bridge_consensus_overrides(&mut coord, &cfg);
+        assert_eq!(
+            coord.consensus_thresholds(),
+            (DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS, 8)
+        );
+
+        // Both thresholds + consensus_min_reputation set.
+        let mut cfg = crate::bridge::BridgeConfig::default();
+        cfg.consensus_min_validators = Some(2);
+        cfg.consensus_total_validators = Some(2);
+        cfg.consensus_min_reputation = Some(450);
+        let mut coord = TransactVerificationCoordinator::new();
+        apply_bridge_consensus_overrides(&mut coord, &cfg);
+        assert_eq!(coord.consensus_thresholds(), (2, 2));
+        assert_eq!(coord.min_reputation_for_consensus(), 450);
     }
 }
