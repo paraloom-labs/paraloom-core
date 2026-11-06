@@ -127,4 +127,25 @@ async fn set_bridge_authority_rotates_and_rejects_non_authority() {
         new_authority.pubkey(),
         "bridge authority must be the rotated key"
     );
+
+    // Negative: rotating to Pubkey::default() ([0u8; 32], System Program ID) must be rejected.
+    let zero_ix = Instruction {
+        program_id,
+        data: instruction::SetBridgeAuthority {
+            new_authority: Pubkey::default(),
+        }
+        .data(),
+        accounts: accounts::SetBridgeAuthority {
+            bridge_state: state_pda,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[zero_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], recent_blockhash);
+    assert!(
+        banks_client.process_transaction(tx).await.is_err(),
+        "rotating bridge authority to Pubkey::default() must be rejected"
+    );
 }
