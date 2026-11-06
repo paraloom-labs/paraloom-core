@@ -46,6 +46,7 @@ pub struct MockBridgeRpc {
     pub get_transactions: Mutex<HashMap<Signature, EncodedConfirmedTransactionWithStatusMeta>>,
     pub next_get_latest_blockhash: Mutex<Option<Result<Hash>>>,
     pub next_send_and_confirm: Mutex<Option<Result<Signature>>>,
+    pub next_get_program_accounts: Mutex<Option<Result<Vec<(Pubkey, Account)>>>>,
 }
 
 impl MockBridgeRpc {
@@ -193,7 +194,11 @@ impl BridgeRpc for MockBridgeRpc {
         _program_id: &Pubkey,
         _config: solana_client::rpc_config::RpcProgramAccountsConfig,
     ) -> Result<Vec<(Pubkey, Account)>> {
-        Ok(Vec::new())
+        if self.next_get_program_accounts.lock().unwrap().is_some() {
+            take(&self.next_get_program_accounts, "get_program_accounts")
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn send_and_confirm_transaction(&self, _tx: &Transaction) -> Result<Signature> {
