@@ -138,4 +138,28 @@ async fn update_reputation_overwrites_score() {
     // overwrite it with the supplied value rather than ignore the
     // call.
     assert_eq!(acc.reputation_score, 750);
+
+    // Out-of-bounds reputation scores (< 100 or > 10_000) must be rejected.
+    for invalid_rep in [0u64, 99, 10_001, u64::MAX] {
+        let ix = Instruction {
+            program_id,
+            data: instruction::UpdateReputation {
+                validator: validator.pubkey(),
+                new_reputation: invalid_rep,
+            }
+            .data(),
+            accounts: accounts::UpdateReputation {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        };
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&upgrade_authority.pubkey()));
+        tx.sign(&[&upgrade_authority], recent_blockhash);
+        assert!(
+            banks_client.process_transaction(tx).await.is_err(),
+            "reputation {invalid_rep} outside [100, 10_000] must be rejected"
+        );
+    }
 }

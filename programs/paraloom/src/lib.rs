@@ -19,6 +19,8 @@ mod transact_vk_data;
 declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
+pub const MIN_VALIDATOR_REPUTATION: u64 = 100;
+pub const MAX_VALIDATOR_REPUTATION: u64 = 10_000;
 
 /// Recommended PARALOOM-token stake floor for the dual-stake (tokenomics.mdx):
 /// 1,000,000 PARALOOM = 1e12 base units at 6 decimals, roughly at parity with
@@ -991,6 +993,10 @@ pub mod paraloom_program {
             BridgeError::InvalidValidator
         );
         require!(validator_account.is_active, BridgeError::ValidatorNotActive);
+        require!(
+            (MIN_VALIDATOR_REPUTATION..=MAX_VALIDATOR_REPUTATION).contains(&new_reputation),
+            BridgeError::InvalidAmount
+        );
 
         validator_account.reputation_score = new_reputation;
         validator_account.last_active = Clock::get()?.unix_timestamp;
