@@ -182,8 +182,14 @@ impl PeerRegistry {
             } => consecutive_failures.saturating_add(1),
             _ => 1,
         };
-        let backoff_idx = next_failure_count.min(RECONNECT_BACKOFF.len()) - 1;
-        let retry_at = now + RECONNECT_BACKOFF[backoff_idx];
+        let backoff_idx = next_failure_count
+            .min(RECONNECT_BACKOFF.len())
+            .saturating_sub(1);
+        let delay = RECONNECT_BACKOFF
+            .get(backoff_idx)
+            .copied()
+            .unwrap_or(Duration::from_secs(10));
+        let retry_at = now.checked_add(delay).unwrap_or(now);
         entry.state = PeerState::Backoff {
             retry_at,
             consecutive_failures: next_failure_count,
@@ -192,7 +198,7 @@ impl PeerRegistry {
             target: "paraloom::network::discovery",
             "peer {:?} disconnected; next retry in {:?} (failure #{})",
             node_id,
-            RECONNECT_BACKOFF[backoff_idx],
+            delay,
             next_failure_count
         );
     }
@@ -485,5 +491,17 @@ mod tests {
         let mut due = registry.peers_due_for_reconnect();
         due.sort_by_key(|n| n.0.clone());
         assert_eq!(due, vec![early, late]);
+    }
+
+    #[test]
+    fn mark_disconnected_handles_high_failure_count_safely() {
+        let (mut registry, _clock) = registry_with_fake_clock();
+        let peer = node(10);
+        for _ in 0..100 {
+            registry.mark_disconnected(peer.clone());
+        }
+        let summary = &registry.summaries()[0];
+        assert!(matches!(summary.state, PeerState::Backoff { .. }));
+        assert_eq!(registry.counts().backoff, 1);
     }
 }
