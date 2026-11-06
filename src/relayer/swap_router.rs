@@ -90,12 +90,24 @@ async fn route_handler(
     Extension(quoter): Extension<Arc<dyn SwapQuoter>>,
     Json(req): Json<RouteRequest>,
 ) -> Result<Json<RouteResponse>, (StatusCode, String)> {
-    let asset_in = mint_to_asset(&req.input_mint)
+    let asset_in = mint_to_asset(req.input_mint.trim())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("input_mint: {e}")))?;
-    let asset_out = mint_to_asset(&req.output_mint)
+    let asset_out = mint_to_asset(req.output_mint.trim())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("output_mint: {e}")))?;
-    let user = Pubkey::from_str(&req.user_public_key)
+    if asset_in == asset_out {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input_mint and output_mint must differ".to_string(),
+        ));
+    }
+    let user = Pubkey::from_str(req.user_public_key.trim())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("user_public_key: {e}")))?;
+    if user == Pubkey::default() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "user_public_key must not be the default all-zero address".to_string(),
+        ));
+    }
     if req.amount == 0 {
         return Err((StatusCode::BAD_REQUEST, "amount must be > 0".to_string()));
     }
@@ -104,10 +116,18 @@ async fn route_handler(
         .quote_swap(asset_in, asset_out, req.amount, &user)
         .await
     {
-        Ok(quote) => Ok(Json(RouteResponse {
-            out_amount: quote.out_amount,
-            swap_transaction: quote.swap_transaction,
-        })),
+        Ok(quote) => {
+            if quote.out_amount == 0 || quote.swap_transaction.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "swap quoter returned an empty or zero-output quote".to_string(),
+                ));
+            }
+            Ok(Json(RouteResponse {
+                out_amount: quote.out_amount,
+                swap_transaction: quote.swap_transaction,
+            }))
+        }
         // A well-formed request that simply has no liquidity path: the input is
         // fine, so 422 rather than 400 or a 5xx.
         Err(RelayerError::NoRoute(m)) => {
@@ -178,6 +198,7 @@ mod tests {
                 .map(|q| q.clone())
                 .map_err(|e| match e {
                     RelayerError::NoRoute(m) => RelayerError::NoRoute(m.clone()),
+                    RelayerError::InvalidAmount(a) => RelayerError::InvalidAmount(*a),
                     other => RelayerError::SwapFailed(other.to_string()),
                 })
         }
@@ -313,5 +334,56 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn same_asset_swap_and_default_user_pubkey_are_rejected_with_400() {
+        let mut same = valid_body();
+        same["output_mint"] = serde_json::json!("So11111111111111111111111111111111111111112");
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            same,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("differ"));
+
+        let mut zero_user = valid_body();
+        zero_user["user_public_key"] = serde_json::json!(Pubkey::default().to_string());
+        let (status, _) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            zero_user,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn zero_output_or_empty_tx_quote_maps_to_502() {
+        let (status, _) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 0,
+                swap_transaction: "BASE64TX".into(),
+            })),
+            valid_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let (status, _) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 100,
+                swap_transaction: "   ".into(),
+            })),
+            valid_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 }

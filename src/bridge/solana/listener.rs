@@ -131,7 +131,13 @@ impl EventListener {
             ))
         })?;
 
-        *self.running.write().await = true;
+        {
+            let mut running = self.running.write().await;
+            if *running {
+                return Ok(());
+            }
+            *running = true;
+        }
 
         // Resume from the persisted cursor if one exists, so a restart does not
         // re-scan from the chain tip and lose deposits that landed while the node

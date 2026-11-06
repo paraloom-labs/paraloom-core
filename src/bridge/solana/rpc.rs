@@ -26,6 +26,11 @@ use std::time::Duration;
 /// normally-confirming transaction is never cut off.
 const SEND_AND_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Caller-side bound on read RPC calls (`getAccount`, `getProgramAccounts`,
+/// `getLatestBlockhash`, `getSignaturesForAddress`, `getTransaction`, etc.) so
+/// a stalled TCP socket cannot hold `bridge.lock().await` forever.
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[async_trait]
 pub trait BridgeRpc: Send + Sync {
     async fn get_signatures_for_address_with_config(
@@ -115,7 +120,7 @@ impl BridgeRpc for RealBridgeRpc {
     ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
         let rpc = Arc::clone(&self.client);
         let addr = *address;
-        blocking("getSignaturesForAddress", move || {
+        blocking_timed("getSignaturesForAddress", RPC_READ_TIMEOUT, move || {
             rpc_err(
                 "getSignaturesForAddress",
                 rpc.get_signatures_for_address_with_config(&addr, config),
@@ -140,7 +145,7 @@ impl BridgeRpc for RealBridgeRpc {
             commitment: None,
             max_supported_transaction_version: Some(0),
         };
-        blocking("getTransaction", move || {
+        blocking_timed("getTransaction", RPC_READ_TIMEOUT, move || {
             rpc_err(
                 "getTransaction",
                 rpc.get_transaction_with_config(&sig, config),
@@ -152,7 +157,7 @@ impl BridgeRpc for RealBridgeRpc {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Account> {
         let rpc = Arc::clone(&self.client);
         let key = *pubkey;
-        blocking("getAccount", move || {
+        blocking_timed("getAccount", RPC_READ_TIMEOUT, move || {
             rpc_err("getAccount", rpc.get_account(&key))
         })
         .await
@@ -165,7 +170,7 @@ impl BridgeRpc for RealBridgeRpc {
     ) -> Result<Vec<(Pubkey, Account)>> {
         let rpc = Arc::clone(&self.client);
         let pid = *program_id;
-        blocking("getProgramAccounts", move || {
+        blocking_timed("getProgramAccounts", RPC_READ_TIMEOUT, move || {
             rpc_err(
                 "getProgramAccounts",
                 rpc.get_program_accounts_with_config(&pid, config),
@@ -192,7 +197,7 @@ impl BridgeRpc for RealBridgeRpc {
 
     async fn get_latest_blockhash(&self) -> Result<Hash> {
         let rpc = Arc::clone(&self.client);
-        blocking("getLatestBlockhash", move || {
+        blocking_timed("getLatestBlockhash", RPC_READ_TIMEOUT, move || {
             rpc_err("getLatestBlockhash", rpc.get_latest_blockhash())
         })
         .await
@@ -201,7 +206,7 @@ impl BridgeRpc for RealBridgeRpc {
     async fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
         let rpc = Arc::clone(&self.client);
         let key = *pubkey;
-        blocking("getBalance", move || {
+        blocking_timed("getBalance", RPC_READ_TIMEOUT, move || {
             rpc_err("getBalance", rpc.get_balance(&key))
         })
         .await
@@ -209,7 +214,10 @@ impl BridgeRpc for RealBridgeRpc {
 
     async fn get_slot(&self) -> Result<u64> {
         let rpc = Arc::clone(&self.client);
-        blocking("getSlot", move || rpc_err("getSlot", rpc.get_slot())).await
+        blocking_timed("getSlot", RPC_READ_TIMEOUT, move || {
+            rpc_err("getSlot", rpc.get_slot())
+        })
+        .await
     }
 }
 

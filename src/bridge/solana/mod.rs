@@ -64,8 +64,9 @@ impl SolanaBridge {
         // One RpcClient instance shared across listener / program /
         // submitter via the BridgeRpc trait.
         let rpc: Arc<dyn BridgeRpc> = Arc::new(RealBridgeRpc::new(Arc::new(
-            RpcClient::new_with_commitment(
+            RpcClient::new_with_timeout_and_commitment(
                 config.solana_rpc_url.clone(),
+                std::time::Duration::from_secs(30),
                 CommitmentConfig::confirmed(),
             ),
         )));
