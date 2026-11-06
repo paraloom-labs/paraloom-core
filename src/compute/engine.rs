@@ -158,10 +158,28 @@ impl WasmEngine {
 
         // Write input data to WASM memory (starting at offset 0)
         let input_ptr = 0i32;
-        let input_len = job.input_data.len() as i32;
+        let input_len = match i32::try_from(job.input_data.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!(
+                        "Input data length {} exceeds i32::MAX",
+                        job.input_data.len()
+                    ),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
+        };
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("Failed to write input data to WASM memory: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
@@ -342,7 +360,7 @@ impl ResourceLimiter for ResourceLimiterImpl {
         _maximum: Option<usize>,
     ) -> anyhow::Result<bool> {
         // Allow table growth up to a reasonable limit
-        Ok(desired < 10000)
+        Ok(desired <= 10_000)
     }
 }
 
@@ -391,5 +409,24 @@ mod tests {
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn test_zero_memory_module_with_input_returns_failure_not_err() {
+        let engine = WasmEngine::new().unwrap();
+        let wat = r#"
+            (module
+                (memory (export "memory") 0)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let job = ComputeJob::new(wasm_bytes, vec![1, 2, 3, 4], ResourceLimits::default());
+        let result = engine
+            .execute_job(&job)
+            .expect("memory.write out-of-bounds must return JobResult::failure, not Err");
+        assert!(matches!(result.status, JobStatus::Failed { .. }));
     }
 }
