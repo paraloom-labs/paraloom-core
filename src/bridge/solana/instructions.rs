@@ -795,6 +795,11 @@ pub fn create_set_bridge_authority_instruction(
     authority: &Pubkey,
     new_authority: &Pubkey,
 ) -> Result<Instruction> {
+    if *new_authority == Pubkey::default() {
+        return Err(BridgeError::InvalidTransaction(
+            "new_authority must not be Pubkey::default() (all-zero system program id)".to_string(),
+        ));
+    }
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
     #[derive(BorshSerialize)]
@@ -1310,5 +1315,25 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_set_bridge_authority_rejects_default_pubkey() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let err = create_set_bridge_authority_instruction(
+            &program_id,
+            &authority,
+            &Pubkey::default(),
+        )
+        .expect_err("default/zero new_authority must be rejected");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+
+        let new_authority = Pubkey::new_unique();
+        let ix =
+            create_set_bridge_authority_instruction(&program_id, &authority, &new_authority)
+                .expect("valid new_authority succeeds");
+        assert_eq!(&ix.data[..8], &discriminators::SET_BRIDGE_AUTHORITY);
+        assert_eq!(&ix.data[8..40], &new_authority.to_bytes());
     }
 }

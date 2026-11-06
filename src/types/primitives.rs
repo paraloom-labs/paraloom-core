@@ -25,7 +25,15 @@ impl FromStr for NodeId {
     type Err = hex::FromHexError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        hex::decode(s).map(NodeId)
+        let trimmed = s.trim();
+        let hex_str = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        if hex_str.is_empty() {
+            return Err(hex::FromHexError::InvalidStringLength);
+        }
+        hex::decode(hex_str).map(NodeId)
     }
 }
 
@@ -110,5 +118,20 @@ mod tests {
     fn nodeid_fromstr_rejects_non_hex_characters() {
         let result: Result<NodeId, _> = "zz".parse();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn nodeid_fromstr_rejects_empty_and_whitespace_only_strings() {
+        assert!("".parse::<NodeId>().is_err());
+        assert!("   ".parse::<NodeId>().is_err());
+        assert!("0x".parse::<NodeId>().is_err());
+        assert!("0X".parse::<NodeId>().is_err());
+    }
+
+    #[test]
+    fn nodeid_fromstr_accepts_0x_prefix_and_surrounding_whitespace() {
+        let expected = NodeId(vec![0x12, 0x34, 0xab, 0xcd]);
+        assert_eq!("  0x1234abcd  ".parse::<NodeId>().unwrap(), expected);
+        assert_eq!("0X1234ABCD".parse::<NodeId>().unwrap(), expected);
     }
 }
