@@ -87,8 +87,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut verifying_key_bytes = Vec::new();
     verifying_key.serialize_compressed(&mut verifying_key_bytes)?;
 
+    use std::os::unix::fs::PermissionsExt;
     println!("Writing keys to disk...");
     fs::write(PROVING_KEY_PATH, &proving_key_bytes)?;
+    fs::set_permissions(PROVING_KEY_PATH, fs::Permissions::from_mode(0o600))?;
     fs::write(VERIFYING_KEY_PATH, &verifying_key_bytes)?;
 
     println!("\n=== Setup Complete! ===");
