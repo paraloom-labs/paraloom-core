@@ -244,3 +244,97 @@ async fn register_rejects_token_stake_below_minimum() {
         "a token stake below the minimum must be rejected"
     );
 }
+
+#[tokio::test]
+async fn init_stake_token_vault_rejects_mismatched_mint_and_accepts_pinned_mint() {
+    use anchor_lang::Discriminator;
+    use paraloom_program::ValidatorRegistry;
+
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let pinned_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let wrong_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (vault, vault_authority) = stake_vault_pdas(program_id);
+
+    // Seed a migrated ValidatorRegistry PDA with `stake_mint = pinned_mint` and
+    // no `stake_token_vault` yet (the ceremony-redeploy migration state).
+    let reg = ValidatorRegistry {
+        authority: upgrade_authority.pubkey(),
+        total_validators: 0,
+        active_validators: 0,
+        minimum_stake: SOL_STAKE,
+        total_active_stake: 0,
+        stake_mint: pinned_mint,
+        min_token_stake: TOKEN_STAKE,
+    };
+    let mut reg_data = ValidatorRegistry::DISCRIMINATOR.to_vec();
+    reg.serialize(&mut reg_data).unwrap();
+    pt.add_account(
+        registry_pda,
+        Account {
+            lamports: 1_000_000_000,
+            data: reg_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (mut banks, _payer, blockhash) = pt.start().await;
+
+    // 1. Mismatched `wrong_mint` must be rejected so the singleton vault PDA is
+    //    not permanently locked to a mint that disagrees with the registry.
+    let bad_init = Instruction {
+        program_id,
+        data: instruction::InitStakeTokenVault {}.data(),
+        accounts: accounts::InitStakeTokenVault {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            stake_mint: wrong_mint,
+            stake_token_vault: vault,
+            stake_vault_authority: vault_authority,
+            program_data: program_data_pda,
+            token_program: spl_token::id(),
+            system_program: system_program::ID,
+            rent: solana_sdk::sysvar::rent::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[bad_init], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "init_stake_token_vault must reject a stake_mint that disagrees with validator_registry.stake_mint"
+    );
+
+    // 2. Passing the registry's pinned `stake_mint` succeeds and creates the vault.
+    let good_init = Instruction {
+        program_id,
+        data: instruction::InitStakeTokenVault {}.data(),
+        accounts: accounts::InitStakeTokenVault {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            stake_mint: pinned_mint,
+            stake_token_vault: vault,
+            stake_vault_authority: vault_authority,
+            program_data: program_data_pda,
+            token_program: spl_token::id(),
+            system_program: system_program::ID,
+            rent: solana_sdk::sysvar::rent::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[good_init], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks
+        .process_transaction(tx)
+        .await
+        .expect("init_stake_token_vault with matching stake_mint must succeed");
+
+    let vault_raw = banks.get_account(vault).await.unwrap().unwrap();
+    let vault_state = spl_token::state::Account::unpack(&vault_raw.data).unwrap();
+    assert_eq!(vault_state.mint, pinned_mint);
+}

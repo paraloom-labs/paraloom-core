@@ -678,6 +678,10 @@ pub mod paraloom_program {
                     fee,
                     ctx.accounts.mint.decimals,
                 )?;
+                validator_account.total_earnings = validator_account
+                    .total_earnings
+                    .checked_add(fee)
+                    .ok_or(BridgeError::InvalidAmount)?;
             }
         }
 
@@ -1237,6 +1241,32 @@ pub mod paraloom_program {
     /// account, and the registry's pinned mint to all agree.
     pub fn init_stake_token_vault(ctx: Context<InitStakeTokenVault>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        // Verify the registry PDA exists, is program-owned, and carries the
+        // ValidatorRegistry discriminator; when the registry is already at the
+        // dual-stake layout with a pinned stake_mint, require it to match
+        // `stake_mint` so the singleton vault cannot be locked to a diverging mint.
+        let registry_ai = ctx.accounts.validator_registry.to_account_info();
+        require!(
+            registry_ai.owner == &crate::ID,
+            BridgeError::UnauthorizedInit
+        );
+        let data = registry_ai.try_borrow_data()?;
+        require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+        require!(
+            data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
+            BridgeError::UnauthorizedInit
+        );
+        if data.len() >= 104 {
+            let pinned_mint = Pubkey::new_from_array(data[72..104].try_into().unwrap());
+            if pinned_mint != Pubkey::default() {
+                require!(
+                    pinned_mint == ctx.accounts.stake_mint.key(),
+                    BridgeError::UnauthorizedInit
+                );
+            }
+        }
+
         msg!(
             "Stake token vault initialized (mint {})",
             ctx.accounts.stake_mint.key()
@@ -2174,10 +2204,16 @@ pub struct InitializeValidatorRegistry<'info> {
 /// Accounts for [`init_stake_token_vault`] — the dual-stake vault migration for a
 /// registry that predates the vault. Mirrors the vault-creation half of
 /// [`InitializeValidatorRegistry`] (same seeds, same authority PDA, same
-/// interface token program) but takes no `validator_registry`, so it runs
-/// against a registry whose PDA already exists.
+/// interface token program) and takes `validator_registry` untyped so it runs
+/// against both pre-dual-stake and already-reset registries while enforcing
+/// `stake_mint` agreement.
 #[derive(Accounts)]
 pub struct InitStakeTokenVault<'info> {
+    /// CHECK: address pinned by seeds; owner, discriminator, and `stake_mint`
+    /// agreement are verified in `init_stake_token_vault`.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: UncheckedAccount<'info>,
+
     #[account(mut)]
     pub authority: Signer<'info>,
 

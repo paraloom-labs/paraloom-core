@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_program = client.get_account(&stake_mint)?.owner;
 
     let (vault, _) = derive_stake_token_vault(&program_id);
+    let (registry, _) = derive_validator_registry(&program_id);
 
     println!("=== init stake token vault ===");
     println!("Program:       {program_id}");
@@ -48,9 +49,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Token program: {token_program}");
     println!("Vault PDA:     {vault}");
 
-    if client.get_account(&vault).is_ok() {
-        println!("\nVault already exists — nothing to do.");
-        return Ok(());
+    // Pre-flight check: verify the validator registry exists and, if already at
+    // the dual-stake layout, its pinned `stake_mint` agrees with `STAKE_MINT`.
+    let reg_acc = client
+        .get_account(&registry)
+        .map_err(|e| format!("validator_registry PDA not found ({registry}): {e}"))?;
+    if reg_acc.owner != program_id {
+        return Err(format!(
+            "validator_registry PDA ({registry}) is owned by {}, expected {program_id}",
+            reg_acc.owner
+        )
+        .into());
+    }
+    if reg_acc.data.len() >= 104 {
+        let pinned_mint = Pubkey::new_from_array(reg_acc.data[72..104].try_into()?);
+        if pinned_mint != Pubkey::default() && pinned_mint != stake_mint {
+            return Err(format!(
+                "STAKE_MINT ({stake_mint}) does not match validator_registry.stake_mint ({pinned_mint})"
+            )
+            .into());
+        }
+    }
+
+    if let Ok(vault_acc) = client.get_account(&vault) {
+        if vault_acc.owner == token_program && !vault_acc.data.is_empty() {
+            println!("\nVault already exists — nothing to do.");
+            return Ok(());
+        }
     }
 
     let ix = create_init_stake_token_vault_instruction(
