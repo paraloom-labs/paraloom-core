@@ -122,6 +122,23 @@ impl std::fmt::Display for EnvelopeError {
 impl std::error::Error for EnvelopeError {}
 
 impl EncryptedNote {
+    /// Minimum ciphertext length for a valid envelope: 16-byte Poly1305 tag.
+    pub const MIN_CT_LEN: usize = 16;
+
+    /// Whether this note carries a valid ciphertext length (at least the 16-byte Poly1305 tag).
+    pub fn is_well_formed(&self) -> bool {
+        self.ct.len() >= Self::MIN_CT_LEN
+    }
+
+    /// Try to serialize into canonical wire encoding, returning an error if
+    /// the note is not well-formed (`ct.len() < 16`).
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, EnvelopeError> {
+        if !self.is_well_formed() {
+            return Err(EnvelopeError::Malformed(ENVELOPE_TAG_V1));
+        }
+        Ok(self.to_bytes_unchecked())
+    }
+
     /// Canonical wire encoding: `tag(1) || <version-defined remainder>`.
     ///
     /// The tag selects a *parser* rather than sitting inside a fixed layout:
@@ -142,6 +159,15 @@ impl EncryptedNote {
     /// goes through this and [`EncryptedNote::from_bytes`], so no two of them
     /// can drift apart independently.
     pub fn to_bytes(&self) -> Vec<u8> {
+        assert!(
+            self.is_well_formed(),
+            "cannot serialize malformed EncryptedNote: ciphertext length {} is less than minimum tag length 16",
+            self.ct.len()
+        );
+        self.to_bytes_unchecked()
+    }
+
+    fn to_bytes_unchecked(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + 32 + 24 + self.ct.len());
         out.push(ENVELOPE_TAG_V1);
         out.extend_from_slice(&self.epk);
@@ -246,6 +272,9 @@ pub fn seal(recipient_pub: &[u8; 32], plaintext: &[u8]) -> EncryptedNote {
 /// Open a `seal`ed box with the recipient's X25519 `secret`, returning the raw
 /// plaintext bytes. `None` on any failure (wrong key or tampered ciphertext).
 pub fn open(secret: &[u8; 32], sealed: &EncryptedNote) -> Option<Vec<u8>> {
+    if !sealed.is_well_formed() {
+        return None;
+    }
     let salsa = SalsaBox::new(&PublicKey::from(sealed.epk), &SecretKey::from(*secret));
     // `.into()` builds the nonce without naming the deprecated GenericArray type.
     salsa.decrypt(&sealed.nonce.into(), sealed.ct.as_ref()).ok()
@@ -540,5 +569,31 @@ mod tests {
                 "relay mismatch: {name}"
             );
         }
+    }
+
+    #[test]
+    fn encrypted_note_is_well_formed_and_to_bytes_guards() {
+        let malformed = v1_fixture(15);
+        assert!(!malformed.is_well_formed());
+        assert_eq!(
+            malformed.try_to_bytes(),
+            Err(EnvelopeError::Malformed(ENVELOPE_TAG_V1))
+        );
+
+        let secret = SecretKey::generate(&mut OsRng);
+        // open short-circuits on malformed note without invoking SalsaBox
+        assert!(open(&secret.to_bytes(), &malformed).is_none());
+
+        let well_formed = v1_fixture(16);
+        assert!(well_formed.is_well_formed());
+        assert!(well_formed.try_to_bytes().is_ok());
+        assert_eq!(well_formed.to_bytes().len(), 1 + 32 + 24 + 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot serialize malformed EncryptedNote")]
+    fn to_bytes_panics_on_malformed_note() {
+        let malformed = v1_fixture(15);
+        let _ = malformed.to_bytes();
     }
 }

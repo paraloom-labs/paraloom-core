@@ -48,6 +48,10 @@ impl MerkleTree {
 
     /// Create a new Merkle tree with specific depth (in-memory only)
     pub fn with_depth(depth: usize) -> Self {
+        assert!(
+            (1..=DEFAULT_TREE_DEPTH).contains(&depth),
+            "tree depth must be between 1 and {DEFAULT_TREE_DEPTH}, got {depth}"
+        );
         MerkleTree {
             depth,
             leaves: Arc::new(RwLock::new(Vec::new())),
@@ -89,6 +93,15 @@ impl MerkleTree {
     /// memory and disk, or neither.
     pub async fn insert(&self, commitment: &Commitment) -> Result<usize, anyhow::Error> {
         let mut leaves = self.leaves.write().await;
+        if let Some(capacity) = 1usize.checked_shl(self.depth as u32) {
+            if leaves.len() >= capacity {
+                anyhow::bail!(
+                    "merkle tree capacity exceeded: current {}, max {}",
+                    leaves.len(),
+                    capacity
+                );
+            }
+        }
         let index = leaves.len();
 
         if let Some(storage) = &self.storage {
@@ -118,6 +131,20 @@ impl MerkleTree {
         commitments: &[Commitment],
     ) -> Result<Vec<usize>, anyhow::Error> {
         let mut leaves = self.leaves.write().await;
+        if let Some(capacity) = 1usize.checked_shl(self.depth as u32) {
+            let new_len = leaves
+                .len()
+                .checked_add(commitments.len())
+                .ok_or_else(|| anyhow::anyhow!("leaf count overflow"))?;
+            if new_len > capacity {
+                anyhow::bail!(
+                    "merkle tree capacity exceeded: attempting to insert {} leaves with {} existing, max {}",
+                    commitments.len(),
+                    leaves.len(),
+                    capacity
+                );
+            }
+        }
         let start_index = leaves.len();
         let indices: Vec<usize> = (start_index..start_index + commitments.len()).collect();
 
@@ -292,6 +319,14 @@ impl MerkleTree {
     /// requirements — changed with the leaf count), so a single trusted setup
     /// covers a pool of any size up to `2^depth` notes.
     fn compute_root(&self, leaves: &[[u8; 32]]) -> [u8; 32] {
+        if let Some(capacity) = 1usize.checked_shl(self.depth as u32) {
+            assert!(
+                leaves.len() <= capacity,
+                "merkle tree leaf count {} exceeds capacity {}",
+                leaves.len(),
+                capacity
+            );
+        }
         let empties = self.empty_subtree_hashes();
         if leaves.is_empty() {
             return empties[self.depth];
@@ -319,6 +354,14 @@ impl MerkleTree {
     /// `MerklePath::verify` and the circuit gadget (same `hash_pair`, same
     /// direction convention).
     fn compute_path(&self, leaves: &[[u8; 32]], index: usize) -> MerklePath {
+        if let Some(capacity) = 1usize.checked_shl(self.depth as u32) {
+            assert!(
+                index < capacity,
+                "leaf index {} exceeds tree capacity {}",
+                index,
+                capacity
+            );
+        }
         let empties = self.empty_subtree_hashes();
         let mut path = Vec::with_capacity(self.depth);
         let mut indices = Vec::with_capacity(self.depth);
@@ -634,5 +677,50 @@ mod tests {
             !tree.knows_root(&early).await,
             "a root older than the history window is forgotten"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "tree depth must be between 1 and 32")]
+    fn with_depth_zero_panics() {
+        MerkleTree::with_depth(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "tree depth must be between 1 and 32")]
+    fn with_depth_exceeding_max_panics() {
+        MerkleTree::with_depth(DEFAULT_TREE_DEPTH + 1);
+    }
+
+    #[tokio::test]
+    async fn insert_and_insert_batch_reject_overflowing_capacity() {
+        let tree = MerkleTree::with_depth(2);
+        for i in 0..4 {
+            let res = tree.insert(&Commitment([i as u8; 32])).await;
+            assert!(res.is_ok());
+        }
+        let err = tree.insert(&Commitment([4u8; 32])).await.unwrap_err();
+        assert!(err.to_string().contains("capacity exceeded"));
+
+        let tree2 = MerkleTree::with_depth(2);
+        let batch = vec![
+            Commitment([1u8; 32]),
+            Commitment([2u8; 32]),
+            Commitment([3u8; 32]),
+            Commitment([4u8; 32]),
+            Commitment([5u8; 32]),
+        ];
+        let err2 = tree2.insert_batch(&batch).await.unwrap_err();
+        assert!(err2.to_string().contains("capacity exceeded"));
+
+        let tree3 = MerkleTree::with_depth(2);
+        tree3.insert(&Commitment([1u8; 32])).await.unwrap();
+        tree3.insert(&Commitment([2u8; 32])).await.unwrap();
+        let batch_tail = vec![
+            Commitment([3u8; 32]),
+            Commitment([4u8; 32]),
+            Commitment([5u8; 32]),
+        ];
+        let err3 = tree3.insert_batch(&batch_tail).await.unwrap_err();
+        assert!(err3.to_string().contains("capacity exceeded"));
     }
 }

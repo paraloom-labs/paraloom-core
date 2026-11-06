@@ -94,11 +94,16 @@ impl VerificationChunk {
                     };
                 }
 
-                // Commitments must be non-zero
+                // Commitments must be non-zero and canonical
                 for commitment in commitments {
                     if commitment.as_bytes() == &[0u8; 32] {
                         return VerificationResult::Invalid {
                             reason: "Zero commitment detected".to_string(),
+                        };
+                    }
+                    if !is_canonical_le(commitment.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "non-canonical output commitment encoding".to_string(),
                         };
                     }
                 }
@@ -113,10 +118,15 @@ impl VerificationChunk {
                     };
                 }
 
-                // Check for duplicates within batch
+                // Check for non-canonical encodings and duplicates within batch
                 use std::collections::HashSet;
                 let mut seen = HashSet::new();
                 for nullifier in nullifiers {
+                    if !is_canonical_le(nullifier.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "non-canonical nullifier encoding".to_string(),
+                        };
+                    }
                     if !seen.insert(nullifier) {
                         return VerificationResult::Invalid {
                             reason: "Duplicate nullifier in transaction".to_string(),
@@ -128,6 +138,24 @@ impl VerificationChunk {
             }
 
             VerificationChunk::MerkleProof { leaf, path, root } => {
+                if !is_canonical_le(leaf) {
+                    return VerificationResult::Invalid {
+                        reason: "non-canonical leaf encoding".to_string(),
+                    };
+                }
+                if !is_canonical_le(root) {
+                    return VerificationResult::Invalid {
+                        reason: "non-canonical root encoding".to_string(),
+                    };
+                }
+                for sibling in &path.path {
+                    if !is_canonical_le(sibling) {
+                        return VerificationResult::Invalid {
+                            reason: "non-canonical path sibling encoding".to_string(),
+                        };
+                    }
+                }
+
                 // Verify path
                 if path.verify(leaf, root) {
                     VerificationResult::Valid
@@ -215,10 +243,22 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadErr
         }
     };
 
-    VerifyingKey::<Bn254>::deserialize_compressed(&bytes[..]).map_err(|e| KeyLoadError::Malformed {
-        path: path.to_path_buf(),
-        source: e,
-    })
+    let mut cursor = &bytes[..];
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor).map_err(|e| {
+        KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+
+    if !cursor.is_empty() || vk.gamma_abc_g1.is_empty() {
+        return Err(KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: ark_serialize::SerializationError::InvalidData,
+        });
+    }
+
+    Ok(vk)
 }
 
 /// ZK Proof verifier interface
@@ -661,5 +701,123 @@ mod tests {
         h.update(amount.to_le_bytes());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(withdraw_ext_data_hash(&recipient, amount), expected);
+    }
+
+    #[test]
+    fn test_chunks_reject_non_canonical_encodings() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut non_canonical = [0u8; 32];
+        non_canonical[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        // OutputCommitments
+        let chunk_out = VerificationChunk::OutputCommitments {
+            commitments: vec![Commitment([1u8; 32]), Commitment(non_canonical)],
+        };
+        match chunk_out.verify() {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical output commitment encoding"), "{reason}");
+            }
+            _ => panic!("non-canonical commitment must be rejected"),
+        }
+
+        // NullifierUniqueness
+        let chunk_null = VerificationChunk::NullifierUniqueness {
+            nullifiers: vec![Nullifier([1u8; 32]), Nullifier(non_canonical)],
+        };
+        match chunk_null.verify() {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical nullifier encoding"), "{reason}");
+            }
+            _ => panic!("non-canonical nullifier must be rejected"),
+        }
+
+        // MerkleProof leaf
+        let chunk_leaf = VerificationChunk::MerkleProof {
+            leaf: non_canonical,
+            path: MerklePath::empty(),
+            root: [1u8; 32],
+        };
+        match chunk_leaf.verify() {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical leaf encoding"), "{reason}");
+            }
+            _ => panic!("non-canonical leaf must be rejected"),
+        }
+
+        // MerkleProof root
+        let chunk_root = VerificationChunk::MerkleProof {
+            leaf: [1u8; 32],
+            path: MerklePath::empty(),
+            root: non_canonical,
+        };
+        match chunk_root.verify() {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical root encoding"), "{reason}");
+            }
+            _ => panic!("non-canonical root must be rejected"),
+        }
+
+        // MerkleProof path sibling
+        let chunk_path = VerificationChunk::MerkleProof {
+            leaf: [1u8; 32],
+            path: MerklePath {
+                path: vec![non_canonical],
+                indices: vec![false],
+            },
+            root: [1u8; 32],
+        };
+        match chunk_path.verify() {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical path sibling encoding"), "{reason}");
+            }
+            _ => panic!("non-canonical path sibling must be rejected"),
+        }
+    }
+
+    #[test]
+    fn load_verifying_key_rejects_trailing_garbage_and_empty_gamma_abc() {
+        use ark_bn254::{G1Affine, G2Affine};
+        use ark_ec::AffineRepr;
+        use ark_serialize::CanonicalSerialize;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let valid_vk = VerifyingKey::<Bn254> {
+            alpha_g1: G1Affine::generator(),
+            beta_g2: G2Affine::generator(),
+            gamma_g2: G2Affine::generator(),
+            delta_g2: G2Affine::generator(),
+            gamma_abc_g1: vec![G1Affine::generator()],
+        };
+        let mut valid_bytes = Vec::new();
+        valid_vk.serialize_compressed(&mut valid_bytes).expect("serialize");
+
+        let valid_path = dir.path().join("valid.key");
+        std::fs::write(&valid_path, &valid_bytes).expect("write valid key");
+        assert!(load_verifying_key(&valid_path).is_ok());
+
+        // Trailing byte
+        let mut trailing_bytes = valid_bytes.clone();
+        trailing_bytes.push(0x42);
+        let trailing_path = dir.path().join("trailing.key");
+        std::fs::write(&trailing_path, &trailing_bytes).expect("write trailing key");
+        let err = load_verifying_key(&trailing_path).expect_err("trailing bytes must error");
+        assert!(matches!(err, KeyLoadError::Malformed { .. }));
+
+        // Empty gamma_abc_g1
+        let empty_gamma_vk = VerifyingKey::<Bn254> {
+            alpha_g1: G1Affine::generator(),
+            beta_g2: G2Affine::generator(),
+            gamma_g2: G2Affine::generator(),
+            delta_g2: G2Affine::generator(),
+            gamma_abc_g1: vec![],
+        };
+        let mut empty_gamma_bytes = Vec::new();
+        empty_gamma_vk.serialize_compressed(&mut empty_gamma_bytes).expect("serialize");
+
+        let empty_gamma_path = dir.path().join("empty_gamma.key");
+        std::fs::write(&empty_gamma_path, &empty_gamma_bytes).expect("write empty gamma key");
+        let err2 = load_verifying_key(&empty_gamma_path).expect_err("empty gamma_abc must error");
+        assert!(matches!(err2, KeyLoadError::Malformed { .. }));
     }
 }
