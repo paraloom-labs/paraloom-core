@@ -312,6 +312,19 @@ impl TransferCircuitV2 {
 
 impl ConstraintSynthesizer<Fr> for TransferCircuitV2 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let num_in = self.nullifiers.len();
+        let num_out = self.output_commitments.len();
+        if self.input_values.len() != num_in
+            || self.input_blindings.len() != num_in
+            || self.input_privkeys.len() != num_in
+            || self.input_paths.len() != num_in
+            || self.output_values.len() != num_out
+            || self.output_blindings.len() != num_out
+            || self.output_pubkeys.len() != num_out
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         // --- Public inputs ---
         let merkle_root_var = FpVar::new_input(cs.clone(), || {
             Ok(self
@@ -647,6 +660,20 @@ impl Default for TransactCircuitV3 {
 
 impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        if self.input_nullifiers.len() != TX_NINS
+            || self.in_amounts.len() != TX_NINS
+            || self.in_privkeys.len() != TX_NINS
+            || self.in_blindings.len() != TX_NINS
+            || self.in_leaf_indices.len() != TX_NINS
+            || self.in_paths.len() != TX_NINS
+            || self.output_commitments.len() != TX_NOUTS
+            || self.out_amounts.len() != TX_NOUTS
+            || self.out_pubkeys.len() != TX_NOUTS
+            || self.out_blindings.len() != TX_NOUTS
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
         // Field-element public input from optional LE bytes.
         let input_fe = |cs: ConstraintSystemRef<Fr>, v: Option<[u8; 32]>| {
             FpVar::new_input(cs, || {
@@ -693,9 +720,8 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
             // leaf_index as 32 bits: gives both the field element (bound into the
             // signature/nullifier) and the per-level direction selectors.
             let idx_u32 = UInt32::new_witness(cs.clone(), || {
-                self.in_leaf_indices[tx]
-                    .map(|i| i as u32)
-                    .ok_or(SynthesisError::AssignmentMissing)
+                let raw = self.in_leaf_indices[tx].ok_or(SynthesisError::AssignmentMissing)?;
+                u32::try_from(raw).map_err(|_| SynthesisError::Unsatisfiable)
             })?;
             let idx_bits = idx_u32.to_bits_le();
             let leaf_index_var = Boolean::le_bits_to_fp_var(&idx_bits)?;
@@ -1827,6 +1853,15 @@ mod tests {
             let mut bad = public_inputs.clone();
             bad[0] = Fr::from(123u64);
             assert!(!Groth16ProofSystem::verify(&vk, &bad, &proof).expect("verify"));
+
+            // Leaf index >= 2^32 must be rejected, not silently truncated to u32.
+            let mut overflow_idx = circuit.clone();
+            overflow_idx.in_leaf_indices[0] = Some((1u64 << 32) + 7);
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            assert!(
+                overflow_idx.generate_constraints(cs).is_err(),
+                "in_leaf_indices >= 2^32 must return Err, not truncate"
+            );
         }
     }
 }

@@ -89,6 +89,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pk_bytes = Vec::new();
     pk.serialize_compressed(&mut pk_bytes)?;
     fs::write(&proving_key_path, &pk_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&proving_key_path, fs::Permissions::from_mode(0o600))?;
+    }
     println!("   ✓ {}", proving_key_path.display());
     println!("   Size: {:.2} MB", pk_bytes.len() as f64 / 1_048_576.0);
 
@@ -100,13 +105,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   ✓ {}", verifying_key_path.display());
     println!("   Size: {} bytes", vk_bytes.len());
 
-    // Verify we can load the keys back
+    // Verify we can load the keys back from disk with no trailing bytes
     println!("\n🔍 Verifying key integrity...");
-    let pk_loaded = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&pk_bytes[..])?;
-    let vk_loaded = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..])?;
+    let pk_disk = fs::read(&proving_key_path)?;
+    let vk_disk = fs::read(&verifying_key_path)?;
+    let mut pk_cursor = &pk_disk[..];
+    let mut vk_cursor = &vk_disk[..];
+    let pk_loaded = ark_groth16::ProvingKey::<Bn254>::deserialize_compressed(&mut pk_cursor)?;
+    let vk_loaded = ark_groth16::VerifyingKey::<Bn254>::deserialize_compressed(&mut vk_cursor)?;
 
-    // Basic sanity check
-    if pk_loaded.vk.gamma_g2 != vk_loaded.gamma_g2 {
+    // Full integrity check
+    if !pk_cursor.is_empty() || !vk_cursor.is_empty() || pk_loaded.vk != vk_loaded {
         return Err("Key integrity check failed!".into());
     }
     println!("   ✓ Keys are valid and loadable\n");
