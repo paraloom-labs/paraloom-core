@@ -109,8 +109,17 @@ pub fn contribute<R: RngCore + CryptoRng>(
 /// Read a `ProvingKey<Bn254>` from a compressed-arkworks file.
 pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
     let bytes = fs::read(path)?;
-    ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
-        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
+    let mut cursor = &bytes[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))?;
+    if !cursor.is_empty() {
+        return Err(ContributeError::Deserialize(format!(
+            "ProvingKey at {:?}: {} unexpected trailing byte(s)",
+            path,
+            cursor.len()
+        )));
+    }
+    Ok(pk)
 }
 
 /// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
@@ -132,6 +141,11 @@ where
     value
         .serialize_compressed(&mut bytes)
         .map_err(|e| ContributeError::Serialize(format!("{:?}: {}", path, e)))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     fs::write(path, &bytes)?;
     Ok(())
 }
@@ -139,8 +153,18 @@ where
 /// Read a `Phase2Transcript` from a bincode file.
 pub fn read_transcript(path: &Path) -> Result<Phase2Transcript, ContributeError> {
     let bytes = fs::read(path)?;
-    bincode::deserialize::<Phase2Transcript>(&bytes)
-        .map_err(|e| ContributeError::Deserialize(format!("Phase2Transcript at {:?}: {}", path, e)))
+    let mut cursor = std::io::Cursor::new(&bytes);
+    let transcript: Phase2Transcript = bincode::deserialize_from(&mut cursor).map_err(|e| {
+        ContributeError::Deserialize(format!("Phase2Transcript at {:?}: {}", path, e))
+    })?;
+    if (cursor.position() as usize) != bytes.len() {
+        return Err(ContributeError::Deserialize(format!(
+            "Phase2Transcript at {:?}: {} unexpected trailing byte(s)",
+            path,
+            bytes.len().saturating_sub(cursor.position() as usize)
+        )));
+    }
+    Ok(transcript)
 }
 
 /// Write a `Phase2Transcript` to a bincode file.
@@ -148,6 +172,11 @@ pub fn write_transcript(transcript: &Phase2Transcript, path: &Path) -> Result<()
     let bytes = bincode::serialize(transcript).map_err(|e| {
         ContributeError::Serialize(format!("Phase2Transcript to {:?}: {}", path, e))
     })?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     fs::write(path, &bytes)?;
     Ok(())
 }
@@ -240,5 +269,48 @@ mod tests {
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    #[test]
+    fn write_and_read_create_parent_dirs_and_reject_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pk_path = dir.path().join("nested/keys/test.pk");
+        let tx_path = dir.path().join("nested/transcripts/test.bin");
+
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+        let (after_pk, transcript) = contribute(
+            initial_pk,
+            None,
+            CircuitId::Deposit,
+            [0x11u8; 64],
+            NodeId(vec![0x01]),
+            "test contributor".to_string(),
+            &mut rng,
+        )
+        .unwrap();
+
+        write_pk(&after_pk, &pk_path).expect("creates nested parent dir and writes pk");
+        write_transcript(&transcript, &tx_path)
+            .expect("creates nested parent dir and writes transcript");
+
+        let loaded_pk = read_pk(&pk_path).expect("reads valid pk");
+        assert_eq!(loaded_pk.delta_g1, after_pk.delta_g1);
+        let loaded_tx = read_transcript(&tx_path).expect("reads valid transcript");
+        assert_eq!(loaded_tx.len(), 1);
+
+        // Appending trailing garbage bytes must be rejected by both readers.
+        let mut pk_bytes = fs::read(&pk_path).unwrap();
+        pk_bytes.push(0xFF);
+        fs::write(&pk_path, &pk_bytes).unwrap();
+        assert!(read_pk(&pk_path).is_err(), "trailing bytes on PK must error");
+
+        let mut tx_bytes = fs::read(&tx_path).unwrap();
+        tx_bytes.push(0xFF);
+        fs::write(&tx_path, &tx_bytes).unwrap();
+        assert!(
+            read_transcript(&tx_path).is_err(),
+            "trailing bytes on transcript must error"
+        );
     }
 }

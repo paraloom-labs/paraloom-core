@@ -182,8 +182,14 @@ impl PeerRegistry {
             } => consecutive_failures.saturating_add(1),
             _ => 1,
         };
-        let backoff_idx = next_failure_count.min(RECONNECT_BACKOFF.len()) - 1;
-        let retry_at = now + RECONNECT_BACKOFF[backoff_idx];
+        let backoff_idx = next_failure_count
+            .min(RECONNECT_BACKOFF.len())
+            .saturating_sub(1);
+        let delay = RECONNECT_BACKOFF
+            .get(backoff_idx)
+            .copied()
+            .unwrap_or(Duration::from_secs(10));
+        let retry_at = now.checked_add(delay).unwrap_or(now);
         entry.state = PeerState::Backoff {
             retry_at,
             consecutive_failures: next_failure_count,
@@ -192,7 +198,7 @@ impl PeerRegistry {
             target: "paraloom::network::discovery",
             "peer {:?} disconnected; next retry in {:?} (failure #{})",
             node_id,
-            RECONNECT_BACKOFF[backoff_idx],
+            delay,
             next_failure_count
         );
     }
