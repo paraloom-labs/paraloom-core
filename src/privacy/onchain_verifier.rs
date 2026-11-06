@@ -118,7 +118,11 @@ pub fn compressed_proof_to_onchain_bytes(
     compressed: &[u8],
 ) -> Result<[u8; 256], ark_serialize::SerializationError> {
     use ark_serialize::CanonicalDeserialize;
-    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(compressed)?;
+    let mut cursor = compressed;
+    let proof = Proof::<ark_bn254::Bn254>::deserialize_compressed(&mut cursor)?;
+    if !cursor.is_empty() {
+        return Err(ark_serialize::SerializationError::InvalidData);
+    }
     Ok(proof_to_onchain_bytes(&proof))
 }
 
@@ -212,7 +216,10 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         public_inputs: &'a [[u8; 32]; NR_INPUTS],
         verifyingkey: &'a Groth16Verifyingkey<'a>,
     ) -> Result<Groth16Verifier<'a, NR_INPUTS>, Groth16Error> {
-        if public_inputs.len() + 1 != verifyingkey.vk_ic.len() {
+        if verifyingkey.vk_ic.is_empty()
+            || verifyingkey.nr_pubinputs != public_inputs.len()
+            || public_inputs.len().checked_add(1) != Some(verifyingkey.vk_ic.len())
+        {
             return Err(Groth16Error::InvalidPublicInputsLength);
         }
         Ok(Groth16Verifier {
@@ -290,6 +297,85 @@ mod tests {
     /// asset binding (finding A) and the destination binding (finding D) hold
     /// through the wire verifier, not just the native arkworks one. Self-contained
     /// inline setup, so it needs no `keys/`.
+    #[test]
+    fn compressed_proof_to_onchain_bytes_rejects_trailing_bytes() {
+        use ark_ec::AffineRepr;
+        let proof = Proof::<ark_bn254::Bn254> {
+            a: G1Affine::generator(),
+            b: G2Affine::generator(),
+            c: G1Affine::generator(),
+        };
+        let mut bytes = Vec::new();
+        proof.serialize_compressed(&mut bytes).expect("serialize");
+
+        let onchain = compressed_proof_to_onchain_bytes(&bytes).expect("ok");
+        assert_eq!(onchain.len(), 256);
+
+        let mut with_trailing = bytes.clone();
+        with_trailing.push(0x00);
+        let err = compressed_proof_to_onchain_bytes(&with_trailing).unwrap_err();
+        assert!(matches!(err, ark_serialize::SerializationError::InvalidData));
+    }
+
+    #[test]
+    fn groth16_verifier_new_rejects_empty_or_mismatched_vk_ic() {
+        let proof_a = [0u8; 64];
+        let proof_b = [0u8; 128];
+        let proof_c = [0u8; 64];
+        let public_inputs: [[u8; 32]; 2] = [[1u8; 32], [2u8; 32]];
+
+        let empty_vk = Groth16Verifyingkey {
+            nr_pubinputs: 2,
+            vk_alpha_g1: [0u8; 64],
+            vk_beta_g2: [0u8; 128],
+            vk_gamme_g2: [0u8; 128],
+            vk_delta_g2: [0u8; 128],
+            vk_ic: &[],
+        };
+        assert_eq!(
+            Groth16Verifier::new(&proof_a, &proof_b, &proof_c, &public_inputs, &empty_vk).err(),
+            Some(Groth16Error::InvalidPublicInputsLength)
+        );
+
+        let dummy_ic = [[0u8; 64]; 3];
+        let mismatched_nr_vk = Groth16Verifyingkey {
+            nr_pubinputs: 1,
+            vk_alpha_g1: [0u8; 64],
+            vk_beta_g2: [0u8; 128],
+            vk_gamme_g2: [0u8; 128],
+            vk_delta_g2: [0u8; 128],
+            vk_ic: &dummy_ic,
+        };
+        assert_eq!(
+            Groth16Verifier::new(&proof_a, &proof_b, &proof_c, &public_inputs, &mismatched_nr_vk).err(),
+            Some(Groth16Error::InvalidPublicInputsLength)
+        );
+
+        let wrong_ic_len = [[0u8; 64]; 2];
+        let mismatched_ic_vk = Groth16Verifyingkey {
+            nr_pubinputs: 2,
+            vk_alpha_g1: [0u8; 64],
+            vk_beta_g2: [0u8; 128],
+            vk_gamme_g2: [0u8; 128],
+            vk_delta_g2: [0u8; 128],
+            vk_ic: &wrong_ic_len,
+        };
+        assert_eq!(
+            Groth16Verifier::new(&proof_a, &proof_b, &proof_c, &public_inputs, &mismatched_ic_vk).err(),
+            Some(Groth16Error::InvalidPublicInputsLength)
+        );
+
+        let valid_vk = Groth16Verifyingkey {
+            nr_pubinputs: 2,
+            vk_alpha_g1: [0u8; 64],
+            vk_beta_g2: [0u8; 128],
+            vk_gamme_g2: [0u8; 128],
+            vk_delta_g2: [0u8; 128],
+            vk_ic: &dummy_ic,
+        };
+        assert!(Groth16Verifier::new(&proof_a, &proof_b, &proof_c, &public_inputs, &valid_vk).is_ok());
+    }
+
     #[test]
     fn withdraw_v2_verifies_through_alt_bn128_with_asset_and_ext_data_bound() {
         use crate::privacy::circuits::WithdrawCircuitV2;
