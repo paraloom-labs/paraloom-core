@@ -565,10 +565,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -744,6 +742,10 @@ pub mod paraloom_program {
         ctx: Context<SetBridgeAuthority>,
         new_authority: Pubkey,
     ) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            BridgeError::InvalidAuthority
+        );
         let bridge_state = &mut ctx.accounts.bridge_state;
         let previous = bridge_state.authority;
         bridge_state.authority = new_authority;
@@ -2916,4 +2918,7 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Invalid authority: new_authority cannot be zero")]
+    InvalidAuthority,
 }

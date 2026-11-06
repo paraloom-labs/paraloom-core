@@ -75,8 +75,12 @@ impl DashboardState {
     pub fn get_stats(&self) -> NetworkStats {
         let nodes = self.nodes.lock().unwrap();
 
-        let total_cpu_cores: u32 = nodes.values().map(|n| n.resources.cpu_cores as u32).sum();
-        let total_memory_mb: u64 = nodes.values().map(|n| n.resources.memory_mb).sum();
+        let total_cpu_cores: u32 = nodes.values().fold(0u32, |acc, n| {
+            acc.saturating_add(n.resources.cpu_cores as u32)
+        });
+        let total_memory_mb: u64 = nodes
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(n.resources.memory_mb));
 
         NetworkStats {
             total_nodes: nodes.len(),
@@ -158,4 +162,57 @@ pub async fn start_dashboard_with_coordinator(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_stats_on_empty_nodes() {
+        let state = DashboardState::new();
+        let stats = state.get_stats();
+        assert_eq!(stats.total_nodes, 0);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.total_cpu_cores, 0);
+        assert_eq!(stats.total_memory_mb, 0);
+    }
+
+    #[test]
+    fn get_stats_saturates_on_overflow_without_panicking() {
+        let state = DashboardState::new();
+        let info1 = NodeInfo {
+            id: crate::types::NodeId(vec![1]),
+            node_type: crate::types::NodeType::ResourceProvider,
+            resources: ResourceContribution {
+                cpu_cores: u8::MAX,
+                memory_mb: u64::MAX - 10,
+                storage_mb: 100,
+                bandwidth_kbps: 1000,
+            },
+            address: "127.0.0.1:8000".to_string(),
+            wallet_pubkey: None,
+        };
+        let info2 = NodeInfo {
+            id: crate::types::NodeId(vec![2]),
+            node_type: crate::types::NodeType::ResourceProvider,
+            resources: ResourceContribution {
+                cpu_cores: u8::MAX,
+                memory_mb: 50,
+                storage_mb: 100,
+                bandwidth_kbps: 1000,
+            },
+            address: "127.0.0.1:8001".to_string(),
+            wallet_pubkey: None,
+        };
+
+        state.add_node(&info1);
+        state.add_node(&info2);
+
+        let stats = state.get_stats();
+        assert_eq!(stats.total_nodes, 2);
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.total_cpu_cores, (u8::MAX as u32) * 2);
+        assert_eq!(stats.total_memory_mb, u64::MAX);
+    }
 }

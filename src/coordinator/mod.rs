@@ -194,6 +194,13 @@ impl Coordinator {
         role.promote()
     }
 
+    /// Demote this coordinator from Primary to Standby tracking `primary`.
+    /// Returns true if demoted, false if already Standby (idempotent, never panics).
+    pub async fn demote(&self, primary: NodeId, stall_threshold: Duration, now: Instant) -> bool {
+        let mut role = self.role.lock().await;
+        role.demote(primary, stall_threshold, now)
+    }
+
     /// Spawn the primary-side heartbeat broadcast task.
     ///
     /// Every `interval`, builds a single heartbeat from the current
@@ -219,6 +226,10 @@ impl Coordinator {
         interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            if interval.is_zero() {
+                log::warn!("heartbeat broadcast interval is zero; broadcast disabled");
+                return;
+            }
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // The first tick fires immediately; consume it so the
@@ -267,6 +278,10 @@ impl Coordinator {
         check_interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            if check_interval.is_zero() {
+                log::warn!("stall watchdog check_interval is zero; watchdog disabled");
+                return;
+            }
             let mut ticker = tokio::time::interval(check_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
@@ -1016,5 +1031,50 @@ mod tests {
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_interval_heartbeat_broadcast_does_not_panic() {
+        let coordinator = Arc::new(Coordinator::new(make_test_network()));
+        let handle = coordinator.start_heartbeat_broadcast(
+            NodeId(vec![0x01]),
+            vec![NodeId(vec![0x02])],
+            Duration::ZERO,
+        );
+        let result = handle.await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_interval_stall_watchdog_does_not_panic() {
+        let coordinator = Arc::new(Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(50),
+        ));
+        let handle = coordinator.start_stall_watchdog(Duration::ZERO);
+        let result = handle.await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn coordinator_demote_transitions_role_and_is_idempotent() {
+        let coordinator = Coordinator::new(make_test_network());
+        assert!(coordinator.is_primary().await);
+
+        let now = Instant::now();
+        assert!(
+            coordinator
+                .demote(NodeId(vec![0x05]), Duration::from_secs(30), now)
+                .await
+        );
+        assert!(!coordinator.is_primary().await);
+
+        assert!(
+            !coordinator
+                .demote(NodeId(vec![0x06]), Duration::from_secs(30), now)
+                .await
+        );
+        assert!(!coordinator.is_primary().await);
     }
 }
