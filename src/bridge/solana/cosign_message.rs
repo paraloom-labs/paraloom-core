@@ -59,6 +59,8 @@ pub enum SettlementParams {
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        #[serde(default)]
+        token_program: Option<[u8; 32]>,
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +192,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -198,12 +201,15 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            let token_program_pk = token_program
+                .map(Pubkey::new_from_array)
+                .unwrap_or(super::instructions::SPL_TOKEN_PROGRAM_ID);
             // The settling validator's fee lands in its own ATA for the mint,
-            // derived deterministically so every co-signer builds the same ix.
+            // derived deterministically using the mint's owning token program.
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +217,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -325,5 +331,51 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    fn sample_transact_spl_payload(token_program: Option<[u8; 32]>) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                token_program,
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    #[test]
+    fn message_build_is_deterministic_for_transact_spl() {
+        let payload = sample_transact_spl_payload(None);
+        let a = build_settlement_message(&payload).expect("build a");
+        let b = build_settlement_message(&payload).expect("build b");
+        assert_eq!(a.serialize(), b.serialize());
+    }
+
+    #[test]
+    fn transact_spl_token_2022_derives_distinct_message_and_ata() {
+        let classic_payload = sample_transact_spl_payload(None);
+        let token_2022_payload = sample_transact_spl_payload(Some(
+            super::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        ));
+
+        let classic_msg = build_settlement_message(&classic_payload).expect("build classic");
+        let token_2022_msg =
+            build_settlement_message(&token_2022_payload).expect("build token 2022");
+
+        assert_ne!(
+            classic_msg.serialize(),
+            token_2022_msg.serialize(),
+            "Token-2022 transact_spl message must differ from classic SPL Token message"
+        );
     }
 }
