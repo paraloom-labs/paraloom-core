@@ -202,15 +202,11 @@ impl VerificationCoordinator {
         }
 
         // Group results by output hash (for deterministic WASM)
-        let mut result_groups: HashMap<Vec<u8>, Vec<&ValidatorResult>> = HashMap::new();
+        let mut result_groups: HashMap<Option<Vec<u8>>, Vec<&ValidatorResult>> = HashMap::new();
 
         for validator_result in job_results {
-            // Use output data as key (deterministic WASM should produce same output)
-            let key = match &validator_result.result.output_data {
-                Some(data) => data.clone(),
-                None => vec![], // Failed results group together
-            };
-
+            // Use output data as key (keeping None for failure distinct from empty success)
+            let key = validator_result.result.output_data.clone();
             result_groups.entry(key).or_default().push(validator_result);
         }
 
@@ -281,26 +277,23 @@ impl VerificationCoordinator {
         let mut consensus_disagreements = 0;
         let mut insufficient_results = 0;
 
-        for validator_results in results.values() {
+        for job_id in requests.keys() {
+            let validator_results = match results.get(job_id) {
+                Some(r) => r.as_slice(),
+                None => &[],
+            };
+
             if validator_results.len() < CONSENSUS_THRESHOLD {
                 insufficient_results += 1;
                 continue;
             }
 
-            // Check if we have consensus (simplified check)
-            let output_hashes: Vec<_> = validator_results
-                .iter()
-                .filter_map(|r| r.result.output_data.as_ref().cloned())
-                .collect();
-
-            if output_hashes.is_empty() {
-                continue;
-            }
-
-            // Count matching outputs
-            let mut hash_counts: HashMap<Vec<u8>, usize> = HashMap::new();
-            for hash in output_hashes {
-                *hash_counts.entry(hash).or_insert(0) += 1;
+            // Count matching outputs, keeping None (failure) distinct from Some
+            let mut hash_counts: HashMap<Option<&[u8]>, usize> = HashMap::new();
+            for r in validator_results {
+                *hash_counts
+                    .entry(r.result.output_data.as_deref())
+                    .or_insert(0) += 1;
             }
 
             let max_agreement = hash_counts.values().max().copied().unwrap_or(0);
@@ -312,7 +305,7 @@ impl VerificationCoordinator {
         }
 
         let avg_validators = if !requests.is_empty() {
-            results.values().map(|v| v.len()).sum::<usize>() as f64 / requests.len() as f64
+            total_results as f64 / requests.len() as f64
         } else {
             0.0
         };
@@ -354,6 +347,96 @@ mod tests {
         let coordinator = VerificationCoordinator::new();
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.active_verifications, 0);
+    }
+
+    #[tokio::test]
+    async fn test_verification_stats_insufficient_when_no_results() {
+        let coordinator = VerificationCoordinator::new();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+        coordinator
+            .create_verification_request("job1".to_string(), validators)
+            .await
+            .unwrap();
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_verifications, 1);
+        assert_eq!(stats.total_results_collected, 0);
+        assert_eq!(stats.insufficient_results, 1);
+        assert_eq!(stats.consensus_agreements, 0);
+        assert_eq!(stats.consensus_disagreements, 0);
+        assert_eq!(stats.average_validators_per_job, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_verification_stats_failed_results_consensus() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job_fail_consensus".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        // 2 validators fail, 1 succeeds
+        let fail1 = JobResult::failure(job_id.clone(), "err1".to_string(), 10);
+        let fail2 = JobResult::failure(job_id.clone(), "err2".to_string(), 12);
+        let ok = JobResult::success(job_id.clone(), vec![1, 2, 3], 15, 100, 100);
+
+        coordinator
+            .submit_result(&job_id, "v1".to_string(), fail1)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job_id, "v2".to_string(), fail2)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job_id, "v3".to_string(), ok)
+            .await
+            .unwrap();
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_verifications, 1);
+        assert_eq!(stats.total_results_collected, 3);
+        assert_eq!(stats.consensus_agreements, 1);
+        assert_eq!(stats.consensus_disagreements, 0);
+        assert_eq!(stats.insufficient_results, 0);
+        assert!((stats.average_validators_per_job - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_verification_stats_disagreements() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job_disagree".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        let res1 = JobResult::success(job_id.clone(), vec![1], 10, 100, 100);
+        let res2 = JobResult::success(job_id.clone(), vec![2], 10, 100, 100);
+        let res3 = JobResult::success(job_id.clone(), vec![3], 10, 100, 100);
+
+        coordinator
+            .submit_result(&job_id, "v1".to_string(), res1)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job_id, "v2".to_string(), res2)
+            .await
+            .unwrap();
+        coordinator
+            .submit_result(&job_id, "v3".to_string(), res3)
+            .await
+            .unwrap();
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_verifications, 1);
+        assert_eq!(stats.total_results_collected, 3);
+        assert_eq!(stats.consensus_agreements, 0);
+        assert_eq!(stats.consensus_disagreements, 1);
+        assert_eq!(stats.insufficient_results, 0);
     }
 
     #[tokio::test]

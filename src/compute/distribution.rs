@@ -66,14 +66,14 @@ impl JobAssignment {
     pub fn new(job_id: JobId, validator_id: ValidatorId) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
             job_id,
             validator_id,
             assigned_at: now,
-            timeout_at: now + DEFAULT_JOB_TIMEOUT_SECS,
+            timeout_at: now.saturating_add(DEFAULT_JOB_TIMEOUT_SECS),
             retry_count: 0,
         }
     }
@@ -82,14 +82,14 @@ impl JobAssignment {
     pub fn with_timeout(job_id: JobId, validator_id: ValidatorId, timeout_secs: u64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
             job_id,
             validator_id,
             assigned_at: now,
-            timeout_at: now + timeout_secs,
+            timeout_at: now.saturating_add(timeout_secs),
             retry_count: 0,
         }
     }
@@ -98,7 +98,7 @@ impl JobAssignment {
     pub fn is_timed_out(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now >= self.timeout_at
     }
@@ -107,15 +107,15 @@ impl JobAssignment {
     pub fn retry(&self, new_validator_id: ValidatorId) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
             job_id: self.job_id.clone(),
             validator_id: new_validator_id,
             assigned_at: now,
-            timeout_at: now + DEFAULT_JOB_TIMEOUT_SECS,
-            retry_count: self.retry_count + 1,
+            timeout_at: now.saturating_add(DEFAULT_JOB_TIMEOUT_SECS),
+            retry_count: self.retry_count.saturating_add(1),
         }
     }
 }
@@ -586,22 +586,22 @@ impl JobCoordinator {
 
         // Calculate retry and timeout metrics
         let mut total_retries = 0u64;
-        let mut jobs_at_max_retries = 0;
-        let mut timed_out_jobs = 0;
+        let mut jobs_at_max_retries: usize = 0;
+        let mut timed_out_jobs: usize = 0;
 
         for assignment in pending.values().chain(active.values()) {
-            total_retries += assignment.retry_count as u64;
+            total_retries = total_retries.saturating_add(assignment.retry_count as u64);
 
             if assignment.retry_count >= MAX_JOB_RETRIES {
-                jobs_at_max_retries += 1;
+                jobs_at_max_retries = jobs_at_max_retries.saturating_add(1);
             }
 
             if assignment.is_timed_out() {
-                timed_out_jobs += 1;
+                timed_out_jobs = timed_out_jobs.saturating_add(1);
             }
         }
 
-        let total_jobs = pending.len() + active.len();
+        let total_jobs = pending.len().saturating_add(active.len());
         let average_retry_count = if total_jobs > 0 {
             total_retries as f64 / total_jobs as f64
         } else {
@@ -917,5 +917,23 @@ mod tests {
         // Job should be removed from pending
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.pending_assignments, 0);
+    }
+
+    #[test]
+    fn test_job_assignment_timeout_overflow() {
+        let job_id = "job-overflow".to_string();
+        let validator_id = "v1".to_string();
+
+        // Very large timeout (u64::MAX) must not panic with overflow
+        let assignment =
+            JobAssignment::with_timeout(job_id.clone(), validator_id.clone(), u64::MAX);
+        assert_eq!(assignment.timeout_at, u64::MAX);
+        assert!(!assignment.is_timed_out());
+
+        // Retry at u32::MAX must not panic with overflow
+        let mut assignment_max_retries = assignment;
+        assignment_max_retries.retry_count = u32::MAX;
+        let retried = assignment_max_retries.retry("v2".to_string());
+        assert_eq!(retried.retry_count, u32::MAX);
     }
 }

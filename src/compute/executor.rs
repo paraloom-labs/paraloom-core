@@ -267,11 +267,12 @@ impl JobExecutor {
             match result.status {
                 JobStatus::Completed => {
                     completed_count += 1;
-                    total_exec_time += result.execution_time_ms;
-                    total_memory += result.memory_used_bytes;
-                    total_instructions += result.instructions_executed;
+                    total_exec_time = total_exec_time.saturating_add(result.execution_time_ms);
+                    total_memory = total_memory.saturating_add(result.memory_used_bytes);
+                    total_instructions =
+                        total_instructions.saturating_add(result.instructions_executed);
                 }
-                JobStatus::Failed { .. } => {
+                JobStatus::Failed { .. } | JobStatus::TimedOut => {
                     failed_count += 1;
                 }
                 _ => {}
@@ -279,7 +280,9 @@ impl JobExecutor {
         }
 
         let avg_exec_time = if completed_count > 0 {
-            total_exec_time / completed_count as u64
+            total_exec_time
+                .checked_div(completed_count as u64)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -371,6 +374,33 @@ mod tests {
 
         let stats = executor.get_stats();
         assert_eq!(stats.pending_jobs, 1);
+    }
+
+    #[tokio::test]
+    async fn test_executor_stats_accounting_failed_and_timed_out() {
+        let executor = JobExecutor::new().unwrap();
+
+        // Inject completed, failed, and timed out results directly
+        {
+            let mut completed = executor.completed_results.lock().unwrap();
+            let success_res = JobResult::success("job-1".to_string(), vec![1, 2], 50, 100, 500);
+            let fail_res = JobResult::failure("job-2".to_string(), "error".to_string(), 20);
+            let mut timeout_res =
+                JobResult::failure("job-3".to_string(), "timeout".to_string(), 30);
+            timeout_res.status = JobStatus::TimedOut;
+
+            completed.insert("job-1".to_string(), success_res);
+            completed.insert("job-2".to_string(), fail_res);
+            completed.insert("job-3".to_string(), timeout_res);
+        }
+
+        let stats = executor.get_stats();
+        assert_eq!(stats.completed_jobs, 1);
+        assert_eq!(stats.failed_jobs, 2);
+        assert_eq!(stats.total_execution_time_ms, 50);
+        assert_eq!(stats.average_execution_time_ms, 50);
+        assert_eq!(stats.total_memory_used_bytes, 100);
+        assert_eq!(stats.total_instructions_executed, 500);
     }
 
     #[tokio::test]
