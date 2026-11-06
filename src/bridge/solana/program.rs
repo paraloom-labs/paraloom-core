@@ -93,13 +93,23 @@ impl ProgramInterface {
             .get_program_accounts(&self.program_id, config)
             .await?;
         let mut stakes = Vec::with_capacity(accounts.len());
-        for (_pda, acc) in accounts {
+        for (pda, acc) in accounts {
+            if acc.owner != self.program_id {
+                continue;
+            }
             let d = &acc.data;
-            if d.len() < 89 || d[0..8] != VALIDATOR_DISC || d[88] == 0 {
-                continue; // wrong account, truncated, or inactive
+            if d.len() < 89 || d[0..8] != VALIDATOR_DISC || d[88] != 1 {
+                continue; // wrong account, truncated, or inactive/non-canonical bool
             }
             let wallet = Pubkey::new_from_array(d[8..40].try_into().expect("32-byte wallet"));
+            let (expected_pda, _) = super::derive_validator_account(&self.program_id, &wallet);
+            if pda != expected_pda {
+                continue; // reject non-canonical validator PDAs claiming `wallet`
+            }
             let stake = u64::from_le_bytes(d[40..48].try_into().expect("8-byte stake"));
+            if stake == 0 {
+                continue;
+            }
             stakes.push((wallet, stake));
         }
         Ok(stakes)
@@ -115,15 +125,28 @@ impl ProgramInterface {
     /// `total_validators[40..48]`, `active_validators[48..56]`,
     /// `minimum_stake[56..64]`, `total_active_stake[64..72]`.
     pub async fn registry_total_active_stake(&self) -> Result<u64> {
+        // sha256("account:ValidatorRegistry")[..8].
+        const VALIDATOR_REGISTRY_DISC: [u8; 8] = [168, 113, 195, 186, 62, 121, 163, 230];
         let (registry_pda, _) =
             Pubkey::find_program_address(&[b"validator_registry"], &self.program_id);
         let account = self.rpc.get_account(&registry_pda).await?;
+        if account.owner != self.program_id {
+            return Err(BridgeError::Serialization(format!(
+                "ValidatorRegistry account owner {} != program_id {}",
+                account.owner, self.program_id
+            )));
+        }
         let d = &account.data;
         if d.len() < 72 {
             return Err(BridgeError::Serialization(format!(
                 "ValidatorRegistry account too short: {} bytes (need >= 72)",
                 d.len()
             )));
+        }
+        if d[0..8] != VALIDATOR_REGISTRY_DISC {
+            return Err(BridgeError::Serialization(
+                "ValidatorRegistry discriminator mismatch".to_string(),
+            ));
         }
         Ok(u64::from_le_bytes(
             d[64..72].try_into().expect("8-byte total_active_stake"),
@@ -481,5 +504,91 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn list_validator_stakes_enforces_canonical_pda_owner_and_active_flag() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let program = program_with_mock(mock.clone());
+        let program_id = *program.program_id();
+
+        let honest_wallet = Pubkey::new_unique();
+        let (canonical_pda, _) = super::super::derive_validator_account(&program_id, &honest_wallet);
+        let forged_pda = Pubkey::new_unique();
+
+        let make_validator_acc = |owner: Pubkey, wallet: Pubkey, stake: u64, active_byte: u8| {
+            let mut data = vec![0u8; 89];
+            data[0..8].copy_from_slice(&[32, 144, 229, 203, 9, 154, 158, 255]);
+            data[8..40].copy_from_slice(wallet.as_ref());
+            data[40..48].copy_from_slice(&stake.to_le_bytes());
+            data[88] = active_byte;
+            Account {
+                lamports: 1,
+                data,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+        };
+
+        *mock.next_get_program_accounts.lock().unwrap() = Some(Ok(vec![
+            // Canonical active validator -> accepted.
+            (canonical_pda, make_validator_acc(program_id, honest_wallet, 5_000_000_000, 1)),
+            // Non-canonical PDA claiming honest_wallet with stake 1 -> rejected.
+            (forged_pda, make_validator_acc(program_id, honest_wallet, 1, 1)),
+            // Wrong owner -> rejected.
+            (canonical_pda, make_validator_acc(Pubkey::new_unique(), honest_wallet, 9_000, 1)),
+            // Non-boolean active byte (2) -> rejected.
+            (canonical_pda, make_validator_acc(program_id, honest_wallet, 9_000, 2)),
+        ]));
+
+        let stakes = program.list_validator_stakes().await.expect("list stakes");
+        assert_eq!(stakes, vec![(honest_wallet, 5_000_000_000)]);
+    }
+
+    #[tokio::test]
+    async fn registry_total_active_stake_enforces_owner_and_discriminator() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let program = program_with_mock(mock.clone());
+        let program_id = *program.program_id();
+
+        let mut valid_data = vec![0u8; 72];
+        valid_data[0..8].copy_from_slice(&[168, 113, 195, 186, 62, 121, 163, 230]);
+        valid_data[64..72].copy_from_slice(&7_000_000_000u64.to_le_bytes());
+
+        // Wrong owner -> rejected.
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data.clone(),
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(program.registry_total_active_stake().await.is_err());
+
+        // Wrong discriminator -> rejected.
+        let mut bad_disc = valid_data.clone();
+        bad_disc[0] ^= 0xff;
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: bad_disc,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert!(program.registry_total_active_stake().await.is_err());
+
+        // Valid owner + discriminator -> returns total_active_stake.
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: valid_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }));
+        assert_eq!(
+            program.registry_total_active_stake().await.expect("valid registry"),
+            7_000_000_000
+        );
     }
 }
