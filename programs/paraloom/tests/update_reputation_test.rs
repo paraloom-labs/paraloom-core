@@ -139,3 +139,119 @@ async fn update_reputation_overwrites_score() {
     // call.
     assert_eq!(acc.reputation_score, 750);
 }
+
+#[tokio::test]
+async fn update_reputation_rejects_out_of_bounds_scores() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::InitializeValidatorRegistry {}.data(),
+            accounts: accounts::InitializeValidatorRegistry {
+                stake_mint,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                stake_vault_authority: Pubkey::find_program_address(
+                    &[b"stake_vault_authority"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
+                rent: solana_sdk::sysvar::rent::ID,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+                program_data: program_data_pda,
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &validator,
+        Instruction {
+            program_id,
+            data: instruction::RegisterValidator {
+                token_stake_amount: paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE,
+                stake_amount: MIN_VALIDATOR_STAKE,
+            }
+            .data(),
+            accounts: accounts::RegisterValidator {
+                stake_mint,
+                validator_token_account: validator_token,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
+                token_program: spl_token::id(),
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                validator: validator.pubkey(),
+                system_program: solana_sdk::system_program::ID,
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await;
+
+    // Test below MIN_REPUTATION_SCORE (< 100)
+    let mut tx_below = Transaction::new_with_payer(
+        &[Instruction {
+            program_id,
+            data: instruction::UpdateReputation {
+                validator: validator.pubkey(),
+                new_reputation: 99,
+            }
+            .data(),
+            accounts: accounts::UpdateReputation {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        }],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx_below.sign(&[&upgrade_authority], recent_blockhash);
+    assert!(banks_client.process_transaction(tx_below).await.is_err());
+
+    // Test above MAX_REPUTATION_SCORE (> 10_000)
+    let mut tx_above = Transaction::new_with_payer(
+        &[Instruction {
+            program_id,
+            data: instruction::UpdateReputation {
+                validator: validator.pubkey(),
+                new_reputation: 10_001,
+            }
+            .data(),
+            accounts: accounts::UpdateReputation {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        }],
+        Some(&upgrade_authority.pubkey()),
+    );
+    tx_above.sign(&[&upgrade_authority], recent_blockhash);
+    assert!(banks_client.process_transaction(tx_above).await.is_err());
+}

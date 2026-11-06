@@ -17,7 +17,9 @@ impl BlockchainStorage {
 
         // Create directory if it doesn't exist
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         // Configure RocksDB
