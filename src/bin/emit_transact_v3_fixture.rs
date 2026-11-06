@@ -160,7 +160,10 @@ fn main() {
         let mut vk_bytes = Vec::new();
         vk.serialize_compressed(&mut vk_bytes)
             .expect("serialize vk");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all("keys").expect("create keys directory");
         std::fs::write(&pk_path, pk_bytes).expect("write transact v3 proving key");
+        std::fs::set_permissions(&pk_path, std::fs::Permissions::from_mode(0o600)).expect("set pk permissions");
         std::fs::write(&vk_path, vk_bytes).expect("write transact v3 verifying key");
         eprintln!("generated + saved persistent keys to {pk_path}");
         (pk, vk)
