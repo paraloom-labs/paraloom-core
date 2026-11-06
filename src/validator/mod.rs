@@ -99,6 +99,7 @@ impl Validator {
                 // `start=0, end=u64::MAX` would otherwise overflow `end - start
                 // + 1` and loop ~2^64 times, exhausting memory (#609).
                 let count = checked_hash_count(start, end)?;
+                Self::validate_algorithm(&algorithm)?;
                 info!(
                     "Calculating {} hashes ({} to {}) using {}",
                     count, start, end, algorithm
@@ -117,7 +118,10 @@ impl Validator {
             }
         };
 
-        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        let execution_time_ms = start_time
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
 
         Ok(TaskResult {
             task_id: task.id,
@@ -126,17 +130,24 @@ impl Validator {
         })
     }
 
+    fn validate_algorithm(algorithm: &str) -> Result<()> {
+        let normalized = algorithm.trim();
+        if normalized.eq_ignore_ascii_case("sha256")
+            || normalized.eq_ignore_ascii_case("sha-256")
+        {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Unsupported algorithm: {}", algorithm))
+        }
+    }
+
     /// Calculate hash of a number
     fn calculate_hash(&self, number: u64, algorithm: &str) -> Result<String> {
-        match algorithm {
-            "sha256" => {
-                let mut hasher = Sha256::new();
-                hasher.update(number.to_le_bytes());
-                let result = hasher.finalize();
-                Ok(format!("{:x}", result))
-            }
-            _ => Err(anyhow::anyhow!("Unsupported algorithm: {}", algorithm)),
-        }
+        Self::validate_algorithm(algorithm)?;
+        let mut hasher = Sha256::new();
+        hasher.update(number.to_le_bytes());
+        let result = hasher.finalize();
+        Ok(format!("{:x}", result))
     }
 }
 
@@ -164,5 +175,19 @@ mod tests {
     fn hash_count_rejects_oversized_and_inverted_ranges() {
         assert!(checked_hash_count(0, MAX_HASH_TASK_ITEMS).is_err());
         assert!(checked_hash_count(5, 4).is_err());
+    }
+
+    #[test]
+    fn validate_algorithm_accepts_sha256_variants_and_rejects_unknown() {
+        use super::Validator;
+        for valid in ["sha256", "SHA256", "sha-256", "SHA-256", "  sha256  "] {
+            assert!(
+                Validator::validate_algorithm(valid).is_ok(),
+                "expected {valid} to be accepted"
+            );
+        }
+        for invalid in ["", "md5", "blake3"] {
+            assert!(Validator::validate_algorithm(invalid).is_err());
+        }
     }
 }

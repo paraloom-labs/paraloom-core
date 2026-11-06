@@ -85,8 +85,9 @@ impl Task {
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
 
         Task {
             id,
