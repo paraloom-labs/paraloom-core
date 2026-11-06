@@ -130,6 +130,11 @@ impl EventListener {
                 self.config.program_id, e
             ))
         })?;
+        if self.config.poll_interval_secs == 0 {
+            return Err(BridgeError::ConfigError(
+                "invalid bridge poll_interval_secs: must be > 0".to_string(),
+            ));
+        }
 
         *self.running.write().await = true;
 
@@ -333,12 +338,16 @@ impl EventListener {
             let parsed = sig_str.parse::<Signature>().ok();
 
             match Self::process_deposit(&state.pool, event).await {
-                Ok(_) => {
-                    processed += 1;
-                    let mut stats_guard = state.stats.write().await;
-                    stats_guard.total_deposits += 1;
-                    stats_guard.volume_deposited += amount;
-                    drop(stats_guard);
+                Ok(newly_credited) => {
+                    if newly_credited {
+                        processed += 1;
+                        let mut stats_guard = state.stats.write().await;
+                        stats_guard.total_deposits =
+                            stats_guard.total_deposits.saturating_add(1);
+                        stats_guard.volume_deposited =
+                            stats_guard.volume_deposited.saturating_add(amount);
+                        drop(stats_guard);
+                    }
 
                     if slot > latest_slot {
                         latest_slot = slot;
@@ -643,14 +652,22 @@ impl EventListener {
         Ok(events)
     }
 
-    /// Process a single deposit event
-    async fn process_deposit(pool: &Arc<ShieldedPool>, event: DepositEvent) -> Result<()> {
+    /// Process a single deposit event. Returns `Ok(true)` if the deposit was
+    /// newly credited to the pool, or `Ok(false)` if it was already present
+    /// (idempotent replay).
+    async fn process_deposit(pool: &Arc<ShieldedPool>, event: DepositEvent) -> Result<bool> {
         log::info!(
             target: "paraloom::bridge::solana",
             "processing deposit: {} lamports from {:?}",
             event.amount,
             &event.from[..8]
         );
+
+        if event.amount == 0 || event.amount < event.fee {
+            return Err(BridgeError::InvalidTransaction(
+                "Deposit verification failed".to_string(),
+            ));
+        }
 
         // Create shielded address from recipient
         let recipient = ShieldedAddress(event.recipient);
@@ -686,6 +703,14 @@ impl EventListener {
             Fr::from_le_bytes_mod_order(&event.asset_id),
         )));
 
+        if pool.is_deposited(&commitment).await {
+            log::debug!(
+                target: "paraloom::bridge::solana",
+                "deposit commitment already credited; skipping duplicate credit"
+            );
+            return Ok(false);
+        }
+
         // Credit the deposited amount, not a net of it: the on-chain leaf
         // commits to the full amount, so a fee netted here would credit a
         // supply that does not match the tree.
@@ -699,7 +724,7 @@ impl EventListener {
         .map_err(|e| BridgeError::DepositFailed(e.to_string()))?;
 
         log::info!(target: "paraloom::bridge::solana", "deposit processed successfully");
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1545,5 +1570,114 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn start_rejects_zero_poll_interval() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mut config = BridgeConfig::default();
+        config.program_id = Pubkey::new_unique().to_string();
+        config.poll_interval_secs = 0;
+
+        let pool = Arc::new(ShieldedPool::new());
+        let stats = Arc::new(RwLock::new(BridgeStats::default()));
+        let rpc = Arc::new(MockBridgeRpc::new());
+        let mut listener = EventListener::new(config, rpc, pool, stats);
+
+        let err = listener.start().await.expect_err("zero poll_interval_secs must fail");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+        assert!(!*listener.running.read().await);
+    }
+
+    #[tokio::test]
+    async fn process_deposit_rejects_zero_amount_and_fee_exceeding_amount() {
+        let pool = Arc::new(ShieldedPool::new());
+        let zero_event = DepositEvent {
+            signature: "zero_sig".to_string(),
+            from: [1u8; 32],
+            amount: 0,
+            recipient: [2u8; 32],
+            randomness: [3u8; 32],
+            asset_id: crate::privacy::types::NATIVE_SOL_ASSET,
+            fee: 0,
+            block: 100,
+            timestamp: 0,
+        };
+        assert!(EventListener::process_deposit(&pool, zero_event).await.is_err());
+
+        let underflow_event = DepositEvent {
+            signature: "underflow_sig".to_string(),
+            from: [1u8; 32],
+            amount: 5,
+            recipient: [2u8; 32],
+            randomness: [4u8; 32],
+            asset_id: crate::privacy::types::NATIVE_SOL_ASSET,
+            fee: 10,
+            block: 100,
+            timestamp: 0,
+        };
+        assert!(
+            EventListener::process_deposit(&pool, underflow_event)
+                .await
+                .is_err(),
+            "amount < fee must return an error without panicking"
+        );
+        assert_eq!(pool.commitment_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn poll_events_does_not_double_count_replayed_deposits_in_stats() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let sig = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        let status = RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot: 7,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+        let make_tx = || synth_deposit_tx(sig, 7, &program_id, &depositor, 1_000, [9u8; 32], [11u8; 32]);
+
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![status.clone()]));
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(make_tx()));
+
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+
+        let processed1 = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed1, 1);
+        assert_eq!(state.stats.read().await.total_deposits, 1);
+        assert_eq!(state.stats.read().await.volume_deposited, 1_000);
+
+        // Simulate a cold-start or un-seen signature replay against the same pool.
+        state.seen_signatures.write().await.clear();
+        *state.last_signature.write().await = None;
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![status]));
+        *mock.next_get_transaction.lock().unwrap() = Some(Ok(make_tx()));
+
+        let processed2 = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed2, 0, "idempotent replay must not increment processed");
+        assert_eq!(
+            state.stats.read().await.total_deposits,
+            1,
+            "idempotent replay must not double-count total_deposits"
+        );
+        assert_eq!(
+            state.stats.read().await.volume_deposited,
+            1_000,
+            "idempotent replay must not double-count volume_deposited"
+        );
+        assert_eq!(
+            *state.last_signature.read().await,
+            Some(sig),
+            "cursor must still advance past the already-credited signature"
+        );
     }
 }
