@@ -137,6 +137,48 @@ impl ComputeCircuit {
     /// recompute the public inputs from the same helpers without
     /// running the full constraint system.
     #[allow(clippy::too_many_arguments)]
+    pub fn try_with_witness(
+        code_hash: [u8; 32],
+        input_commitment: Fr,
+        output_commitment: Fr,
+        input_nullifier: Fr,
+        input_data: Vec<u8>,
+        input_randomness: [u8; 32],
+        output_data: Vec<u8>,
+        output_randomness: [u8; 32],
+        owner_address: [u8; 32],
+        spending_key: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        if input_data.len() > MAX_DATA_SIZE {
+            return Err(anyhow::anyhow!(
+                "Input data too large: {} bytes exceeds maximum {} bytes",
+                input_data.len(),
+                MAX_DATA_SIZE
+            ));
+        }
+        if output_data.len() > MAX_DATA_SIZE {
+            return Err(anyhow::anyhow!(
+                "Output data too large: {} bytes exceeds maximum {} bytes",
+                output_data.len(),
+                MAX_DATA_SIZE
+            ));
+        }
+
+        Ok(Self {
+            code_hash: Some(code_hash),
+            input_commitment: Some(input_commitment),
+            output_commitment: Some(output_commitment),
+            input_nullifier: Some(input_nullifier),
+            input_data: Some(input_data),
+            input_randomness: Some(input_randomness),
+            output_data: Some(output_data),
+            output_randomness: Some(output_randomness),
+            owner_address: Some(owner_address),
+            spending_key: Some(spending_key),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn with_witness(
         code_hash: [u8; 32],
         input_commitment: Fr,
@@ -149,21 +191,19 @@ impl ComputeCircuit {
         owner_address: [u8; 32],
         spending_key: [u8; 32],
     ) -> Self {
-        assert!(input_data.len() <= MAX_DATA_SIZE, "Input data too large");
-        assert!(output_data.len() <= MAX_DATA_SIZE, "Output data too large");
-
-        Self {
-            code_hash: Some(code_hash),
-            input_commitment: Some(input_commitment),
-            output_commitment: Some(output_commitment),
-            input_nullifier: Some(input_nullifier),
-            input_data: Some(input_data),
-            input_randomness: Some(input_randomness),
-            output_data: Some(output_data),
-            output_randomness: Some(output_randomness),
-            owner_address: Some(owner_address),
-            spending_key: Some(spending_key),
-        }
+        Self::try_with_witness(
+            code_hash,
+            input_commitment,
+            output_commitment,
+            input_nullifier,
+            input_data,
+            input_randomness,
+            output_data,
+            output_randomness,
+            owner_address,
+            spending_key,
+        )
+        .expect("witness data within MAX_DATA_SIZE")
     }
 
     /// Hash data to a field element via SHA-256 reduced mod the BN254
@@ -445,6 +485,38 @@ mod tests {
             cs.is_satisfied().expect("cs query"),
             "compute circuit must be satisfied by host-aligned witnesses"
         );
+    }
+
+    #[test]
+    fn test_try_with_witness_rejects_oversized_payloads_without_panic() {
+        let oversized = vec![0u8; MAX_DATA_SIZE + 1];
+        let err_in = ComputeCircuit::try_with_witness(
+            [0u8; 32],
+            Fr::from(0u64),
+            Fr::from(0u64),
+            Fr::from(0u64),
+            oversized.clone(),
+            [0u8; 32],
+            vec![1u8],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+        );
+        assert!(err_in.is_err());
+
+        let err_out = ComputeCircuit::try_with_witness(
+            [0u8; 32],
+            Fr::from(0u64),
+            Fr::from(0u64),
+            Fr::from(0u64),
+            vec![1u8],
+            [0u8; 32],
+            oversized,
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+        );
+        assert!(err_out.is_err());
     }
 
     // The proof-generation smoke test that previously sat here was

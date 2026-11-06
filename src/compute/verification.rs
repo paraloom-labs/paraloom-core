@@ -294,6 +294,7 @@ impl VerificationCoordinator {
                 .collect();
 
             if output_hashes.is_empty() {
+                consensus_disagreements += 1;
                 continue;
             }
 
@@ -311,8 +312,14 @@ impl VerificationCoordinator {
             }
         }
 
+        let active_results_count: usize = requests
+            .keys()
+            .filter_map(|job_id| results.get(job_id))
+            .map(|v| v.len())
+            .sum();
+
         let avg_validators = if !requests.is_empty() {
-            results.values().map(|v| v.len()).sum::<usize>() as f64 / requests.len() as f64
+            active_results_count as f64 / requests.len() as f64
         } else {
             0.0
         };
@@ -564,5 +571,33 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_stats_counts_all_failed_rounds_as_disagreements() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job-failed".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        for v in ["v1", "v2"] {
+            let failed = JobResult::failure(job_id.clone(), "err".to_string(), 10);
+            coordinator
+                .submit_result(&job_id, v.to_string(), failed)
+                .await
+                .unwrap();
+        }
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_verifications, 1);
+        assert_eq!(stats.total_results_collected, 2);
+        assert_eq!(stats.consensus_agreements, 0);
+        assert_eq!(stats.consensus_disagreements, 1);
+        assert_eq!(stats.insufficient_results, 0);
+        assert!((stats.average_validators_per_job - 2.0).abs() < 1e-6);
     }
 }
