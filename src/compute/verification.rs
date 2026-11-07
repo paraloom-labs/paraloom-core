@@ -281,19 +281,25 @@ impl VerificationCoordinator {
         let mut consensus_disagreements = 0;
         let mut insufficient_results = 0;
 
-        for validator_results in results.values() {
+        for job_id in requests.keys() {
+            let Some(validator_results) = results.get(job_id) else {
+                insufficient_results += 1;
+                continue;
+            };
             if validator_results.len() < CONSENSUS_THRESHOLD {
                 insufficient_results += 1;
                 continue;
             }
 
-            // Check if we have consensus (simplified check)
+            // Check if we have consensus over completed outputs
             let output_hashes: Vec<_> = validator_results
                 .iter()
+                .filter(|r| r.result.status == super::job::JobStatus::Completed)
                 .filter_map(|r| r.result.output_data.as_ref().cloned())
                 .collect();
 
             if output_hashes.is_empty() {
+                consensus_disagreements += 1;
                 continue;
             }
 
@@ -312,7 +318,7 @@ impl VerificationCoordinator {
         }
 
         let avg_validators = if !requests.is_empty() {
-            results.values().map(|v| v.len()).sum::<usize>() as f64 / requests.len() as f64
+            total_results as f64 / requests.len() as f64
         } else {
             0.0
         };
@@ -564,5 +570,24 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_stats_counts_zero_result_requests_as_insufficient() {
+        let coordinator = VerificationCoordinator::new();
+        coordinator
+            .create_verification_request(
+                "job-empty".to_string(),
+                vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let stats = coordinator.get_stats().await;
+        assert_eq!(stats.active_verifications, 1);
+        assert_eq!(
+            stats.insufficient_results, 1,
+            "an active verification request with 0 submitted results must count as insufficient_results"
+        );
     }
 }

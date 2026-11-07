@@ -346,6 +346,7 @@ impl Coordinator {
         };
 
         // Assign and send chunks to validators
+        let mut sent_chunks = 0usize;
         for (i, mut chunk) in chunks.into_iter().enumerate() {
             let validator_id = validators[i % validators.len()].clone();
             chunk.assigned_to = Some(format!("{:?}", validator_id));
@@ -384,10 +385,16 @@ impl Coordinator {
 
             match send_result {
                 Ok(Ok(_)) => {
+                    sent_chunks += 1;
                     log::debug!("Successfully sent chunk {} to validator", chunk.id);
                 }
                 Ok(Err(e)) => {
                     log::error!("Failed to send chunk {}: {}", chunk.id, e);
+                    if let Some(task) = self.active_tasks.lock().await.get_mut(&chunk.id) {
+                        task.status = TaskStatus::Failed {
+                            error: format!("Failed to send chunk: {e}"),
+                        };
+                    }
                 }
                 Err(_) => {
                     log::error!(
@@ -395,11 +402,25 @@ impl Coordinator {
                         chunk.id,
                         validator_id
                     );
+                    if let Some(task) = self.active_tasks.lock().await.get_mut(&chunk.id) {
+                        task.status = TaskStatus::Failed {
+                            error: format!("Timeout sending chunk to validator {validator_id:?}"),
+                        };
+                    }
                 }
             }
         }
 
-        info!("All {} task chunks distributed to validators", chunks_len);
+        if sent_chunks < chunks_len {
+            log::warn!(
+                "Only {}/{} task chunks were sent for parent task {}",
+                sent_chunks,
+                chunks_len,
+                parent_id
+            );
+        } else {
+            info!("All {} task chunks distributed to validators", chunks_len);
+        }
 
         Ok(parent_id)
     }
@@ -529,19 +550,30 @@ impl Coordinator {
 
         // Clone the data and release locks immediately
         let chunk_results: Vec<TaskResult> = {
-            let results = self.results.lock().await;
-            let parent_tasks = self.parent_tasks.lock().await;
+            let mut active_tasks = self.active_tasks.lock().await;
+            let mut results = self.results.lock().await;
+            let mut parent_tasks = self.parent_tasks.lock().await;
 
-            let mut chunk_results: Vec<_> = results
+            let chunk_ids: Vec<TaskId> = parent_tasks
                 .iter()
-                .filter(|(task_id, _)| {
-                    parent_tasks
-                        .get(task_id.as_str())
-                        .map(|pid| pid == parent_id)
-                        .unwrap_or(false)
+                .filter_map(|(cid, pid)| {
+                    if pid == parent_id {
+                        Some(cid.clone())
+                    } else {
+                        None
+                    }
                 })
-                .map(|(_, result)| result.clone())
                 .collect();
+
+            let mut chunk_results: Vec<_> = chunk_ids
+                .iter()
+                .filter_map(|cid| results.remove(cid))
+                .collect();
+
+            for cid in &chunk_ids {
+                active_tasks.remove(cid);
+                parent_tasks.remove(cid);
+            }
 
             // Sort by task_id to ensure consistent ordering
             chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
@@ -1015,6 +1047,53 @@ mod tests {
             post_promotion.parent_tasks.len(),
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_results_reclaims_completed_chunk_state() {
+        let coordinator = Coordinator::new(make_test_network());
+        let assignee = NodeId(vec![0xAA]);
+
+        let mut chunk = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 0,
+            algorithm: "sha256".to_string(),
+        });
+        chunk.id = "parent-1-chunk-0".to_string();
+        chunk.assigned_to = Some(format!("{:?}", assignee));
+        chunk.status = TaskStatus::Assigned;
+
+        coordinator
+            .active_tasks
+            .lock()
+            .await
+            .insert(chunk.id.clone(), chunk.clone());
+        coordinator
+            .parent_tasks
+            .lock()
+            .await
+            .insert(chunk.id.clone(), "parent-1".to_string());
+
+        let result = TaskResult {
+            task_id: chunk.id.clone(),
+            execution_time_ms: 5,
+            data: ResultData::Hashes {
+                hashes: vec![(0, "00".repeat(32))],
+                count: 1,
+            },
+        };
+        coordinator
+            .handle_task_result(&assignee, result)
+            .await
+            .expect("chunk result accepted");
+
+        let snap = coordinator.snapshot().await;
+        assert!(
+            snap.active_tasks.is_empty()
+                && snap.parent_tasks.is_empty()
+                && snap.results.is_empty(),
+            "completed parent task must reclaim chunk entries from active_tasks, parent_tasks, and results"
         );
     }
 }

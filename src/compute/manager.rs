@@ -243,9 +243,14 @@ impl JobManager {
             job_id, result.status
         );
 
-        // Update validator active jobs
-        let assignments = self.assignments.lock().unwrap();
-        if let Some(assignment) = assignments.get(&job_id) {
+        // Require an active assignment before accepting a result so arbitrary
+        // or duplicate job_ids cannot pollute `results` or overwrite completed
+        // entries.
+        let mut assignments = self.assignments.lock().unwrap();
+        let assignment = assignments
+            .remove(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("No active assignment for job {}", job_id))?;
+        {
             let mut validators = self.validators.lock().unwrap();
             if let Some(validator) = validators.get_mut(&assignment.validator_id) {
                 validator.active_jobs = validator.active_jobs.saturating_sub(1);
@@ -320,24 +325,46 @@ impl JobManager {
     pub fn cleanup_stale_validators(&self) -> usize {
         let mut validators = self.validators.lock().unwrap();
         let now = current_timestamp();
-        let mut removed = 0;
+        let mut removed_ids = Vec::new();
 
         validators.retain(|id, v| {
-            let age = now - v.last_heartbeat;
+            let age = now.saturating_sub(v.last_heartbeat);
             if age > 60_000 {
                 // 60 seconds
                 warn!(
                     "Removing stale validator {} (last heartbeat: {}ms ago)",
                     id, age
                 );
-                removed += 1;
+                removed_ids.push(id.clone());
                 false
             } else {
                 true
             }
         });
+        drop(validators);
 
-        removed
+        if !removed_ids.is_empty() {
+            let mut assignments = self.assignments.lock().unwrap();
+            let mut results = self.results.lock().unwrap();
+            let orphaned: Vec<JobId> = assignments
+                .iter()
+                .filter(|(_, a)| removed_ids.contains(&a.validator_id))
+                .map(|(job_id, _)| job_id.clone())
+                .collect();
+            for job_id in orphaned {
+                assignments.remove(&job_id);
+                results.insert(
+                    job_id.clone(),
+                    JobResult::failure(
+                        job_id,
+                        "Assigned validator became stale and was removed".to_string(),
+                        0,
+                    ),
+                );
+            }
+        }
+
+        removed_ids.len()
     }
 }
 
@@ -483,5 +510,35 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_submit_result_requires_active_assignment_and_stale_cleanup_fails_assigned_jobs() {
+        let manager = JobManager::new();
+        // Submitting a result for an unassigned job must fail and not pollute completed_jobs.
+        let bogus = JobResult::success("unassigned-job".to_string(), vec![1], 10, 100, 100);
+        assert!(manager.submit_result(bogus).is_err());
+        assert_eq!(manager.get_stats().completed_jobs, 0);
+
+        // Register validator, submit and assign a job, then expire validator heartbeat.
+        manager
+            .register_validator(ValidatorCapacity::new("v1".to_string(), 4, 8192, 2))
+            .unwrap();
+        let job = ComputeJob::new(vec![1], vec![], ResourceLimits::default());
+        let job_id = job.id.clone();
+        manager.submit_job(job).unwrap();
+        assert_eq!(manager.assign_jobs().unwrap().len(), 1);
+        assert_eq!(manager.get_job_status(&job_id), Some(JobStatus::Running));
+
+        {
+            let mut validators = manager.validators.lock().unwrap();
+            validators.get_mut("v1").unwrap().last_heartbeat =
+                current_timestamp().saturating_sub(120_000);
+        }
+        assert_eq!(manager.cleanup_stale_validators(), 1);
+        assert!(matches!(
+            manager.get_job_status(&job_id),
+            Some(JobStatus::Failed { .. })
+        ));
     }
 }
