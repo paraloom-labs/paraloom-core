@@ -725,8 +725,12 @@ mod tests {
         assert_eq!(storage.commitment_count().unwrap(), 0);
 
         // Sparse index gap (0 and 2, missing 1) must be rejected by get_all_commitments
-        storage.insert_commitment(0, &Commitment([1u8; 32])).unwrap();
-        storage.insert_commitment(2, &Commitment([2u8; 32])).unwrap();
+        storage
+            .insert_commitment(0, &Commitment([1u8; 32]))
+            .unwrap();
+        storage
+            .insert_commitment(2, &Commitment([2u8; 32]))
+            .unwrap();
         assert!(storage.get_all_commitments().is_err());
     }
 }

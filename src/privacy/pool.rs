@@ -142,9 +142,7 @@ impl ShieldedPool {
             ));
         }
         if note.asset_id != asset_id {
-            return Err(anyhow!(
-                "note asset_id does not match credited asset_id"
-            ));
+            return Err(anyhow!("note asset_id does not match credited asset_id"));
         }
 
         if self.deposited.read().await.contains(&commitment) {
@@ -524,7 +522,12 @@ mod tests {
         // Mismatched amount is rejected without inserting into tree
         let note_bad_amount = Note::new_native(addr.clone(), 500, [1u8; 32]);
         assert!(pool
-            .credit_commitment(note_bad_amount.commitment(), note_bad_amount, 1000, NATIVE_SOL_ASSET)
+            .credit_commitment(
+                note_bad_amount.commitment(),
+                note_bad_amount,
+                1000,
+                NATIVE_SOL_ASSET
+            )
             .await
             .is_err());
         assert_eq!(pool.commitment_count().await, 0);
@@ -532,7 +535,12 @@ mod tests {
         // Mismatched asset_id is rejected without inserting into tree
         let note_bad_asset = Note::new(addr.clone(), 500, [2u8; 32], usdc);
         assert!(pool
-            .credit_commitment(note_bad_asset.commitment(), note_bad_asset, 500, NATIVE_SOL_ASSET)
+            .credit_commitment(
+                note_bad_asset.commitment(),
+                note_bad_asset,
+                500,
+                NATIVE_SOL_ASSET
+            )
             .await
             .is_err());
         assert_eq!(pool.commitment_count().await, 0);
