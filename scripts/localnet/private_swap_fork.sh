@@ -233,6 +233,12 @@ export SOLANA_RPC_URL="$RPC_URL"
 export SOLANA_PROGRAM_ID="$PROGRAM_ID"
 export BRIDGE_AUTHORITY_KEYPAIR_PATH="$AUTHORITY_KEYPAIR"
 export VALIDATOR_KEYPAIR_PATH="$AUTHORITY_KEYPAIR"
+# init-validator-registry now requires STAKE_MINT (the dual-stake mint the
+# registry pins and the stake vault is created for). Use the WSOL mint this
+# script already clones from mainnet above as the fork-local stand-in: the
+# account exists on the fork and is owned by the classic SPL Token program,
+# which the CLI resolves from the mint account itself.
+export STAKE_MINT="$WSOL"
 
 echo "=== Bootstrapping the Paraloom bridge on the fork ==="
 # registry (#204-gated to the program upgrade authority = our authority) ->
