@@ -109,8 +109,16 @@ pub fn contribute<R: RngCore + CryptoRng>(
 /// Read a `ProvingKey<Bn254>` from a compressed-arkworks file.
 pub fn read_pk(path: &Path) -> Result<ProvingKey<Bn254>, ContributeError> {
     let bytes = fs::read(path)?;
-    ProvingKey::<Bn254>::deserialize_compressed(&bytes[..])
-        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))
+    let mut cursor = &bytes[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| ContributeError::Deserialize(format!("ProvingKey at {:?}: {}", path, e)))?;
+    if !cursor.is_empty() {
+        return Err(ContributeError::Deserialize(format!(
+            "ProvingKey at {:?}: trailing bytes",
+            path
+        )));
+    }
+    Ok(pk)
 }
 
 /// Write a `ProvingKey<Bn254>` to a compressed-arkworks file.
@@ -240,5 +248,17 @@ mod tests {
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    #[test]
+    fn read_pk_rejects_trailing_bytes() {
+        let pk = fresh_initial_pk();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trailing.pk");
+        let mut bytes = Vec::new();
+        pk.serialize_compressed(&mut bytes).unwrap();
+        bytes.push(0x42);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_pk(&path).is_err());
     }
 }
