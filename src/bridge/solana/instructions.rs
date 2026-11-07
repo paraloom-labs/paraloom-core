@@ -24,6 +24,12 @@ const RENT_SYSVAR_ID: Pubkey = Pubkey::new_from_array([
     253, 68, 227, 219, 217, 138, 0, 0, 0, 0,
 ]);
 
+/// Minimum validator stake (1 SOL)
+pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000;
+
+/// Maximum proof length in bytes (256 bytes)
+pub const MAX_PROOF_LEN: usize = 256;
+
 /// Instruction data for deposit (Solana → paraloom L2).
 ///
 /// Layout matches the on-chain Anchor program: the eight-byte
@@ -181,6 +187,12 @@ pub fn create_initialize_instruction(
     program_version: u32,
     initial_merkle_root: [u8; 32],
 ) -> Result<Instruction> {
+    if program_version == 0 {
+        return Err(BridgeError::ConfigError(
+            "program_version must be non-zero".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
     #[derive(BorshSerialize)]
@@ -339,6 +351,13 @@ pub fn create_register_validator_instruction(
     stake_amount: u64,
     token_stake_amount: u64,
 ) -> Result<Instruction> {
+    if stake_amount < MIN_VALIDATOR_STAKE {
+        return Err(BridgeError::InsufficientFunds {
+            required: MIN_VALIDATOR_STAKE,
+            available: stake_amount,
+        });
+    }
+
     let (validator_pda, _) = derive_validator_account(program_id, validator);
     let (registry_pda, _) = derive_validator_registry(program_id);
     let (stake_token_vault, _) = derive_stake_token_vault(program_id);
@@ -573,6 +592,29 @@ pub fn create_transact_instruction(
     proof: Vec<u8>,
     quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
+    if ext_amount > 0 {
+        return Err(BridgeError::InvalidTransaction(
+            "transact ext_amount must be <= 0".to_string(),
+        ));
+    }
+    if proof.is_empty() {
+        return Err(BridgeError::InvalidTransaction(
+            "transact proof cannot be empty".to_string(),
+        ));
+    }
+    if proof.len() > MAX_PROOF_LEN {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "transact proof length {} exceeds maximum {}",
+            proof.len(),
+            MAX_PROOF_LEN,
+        )));
+    }
+    if nullifiers[0] == nullifiers[1] {
+        return Err(BridgeError::InvalidTransaction(
+            "duplicate nullifiers in transact".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
     let (validator_registry_pda, _) =
@@ -641,6 +683,29 @@ pub fn create_transact_spl_instruction(
     proof: Vec<u8>,
     quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
+    if ext_amount > 0 {
+        return Err(BridgeError::InvalidTransaction(
+            "transact ext_amount must be <= 0".to_string(),
+        ));
+    }
+    if proof.is_empty() {
+        return Err(BridgeError::InvalidTransaction(
+            "transact proof cannot be empty".to_string(),
+        ));
+    }
+    if proof.len() > MAX_PROOF_LEN {
+        return Err(BridgeError::InvalidTransaction(format!(
+            "transact proof length {} exceeds maximum {}",
+            proof.len(),
+            MAX_PROOF_LEN,
+        )));
+    }
+    if nullifiers[0] == nullifiers[1] {
+        return Err(BridgeError::InvalidTransaction(
+            "duplicate nullifiers in transact".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _) = derive_bridge_state(program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
     let (validator_registry_pda, _) =
@@ -703,6 +768,12 @@ pub fn create_deposit_note_instruction(
     pubkey: [u8; 32],
     blinding: [u8; 32],
 ) -> Result<Instruction> {
+    if amount == 0 {
+        return Err(BridgeError::InvalidTransaction(
+            "deposit amount must be greater than 0".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
 
@@ -795,6 +866,12 @@ pub fn create_set_bridge_authority_instruction(
     authority: &Pubkey,
     new_authority: &Pubkey,
 ) -> Result<Instruction> {
+    if *new_authority == Pubkey::default() {
+        return Err(BridgeError::InvalidTransaction(
+            "new_authority cannot be default pubkey".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
     #[derive(BorshSerialize)]
@@ -1310,5 +1387,150 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_preflight_bounds_enforced() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let bridge_vault = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_account = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        // 1. create_initialize_instruction requires non-zero program_version
+        let res_init = create_initialize_instruction(&program_id, &authority, 0, [0u8; 32]);
+        assert!(matches!(res_init, Err(BridgeError::ConfigError(_))));
+
+        // 2. create_register_validator_instruction requires stake >= MIN_VALIDATOR_STAKE
+        let res_reg = create_register_validator_instruction(
+            &program_id,
+            &authority,
+            &stake_mint,
+            &token_account,
+            &token_program,
+            MIN_VALIDATOR_STAKE - 1,
+            0,
+        );
+        match res_reg {
+            Err(BridgeError::InsufficientFunds {
+                required,
+                available,
+            }) => {
+                assert_eq!(required, MIN_VALIDATOR_STAKE);
+                assert_eq!(available, MIN_VALIDATOR_STAKE - 1);
+            }
+            other => panic!("expected InsufficientFunds, got {:?}", other),
+        }
+
+        // 3. create_deposit_note_instruction requires amount > 0
+        let res_dep = create_deposit_note_instruction(
+            &program_id,
+            &depositor,
+            &bridge_vault,
+            0,
+            [1u8; 32],
+            [2u8; 32],
+        );
+        assert!(matches!(res_dep, Err(BridgeError::InvalidTransaction(_))));
+
+        // 4. create_transact_instruction pre-flight checks
+        // a) ext_amount > 0
+        let res_tx_amt = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            1, // > 0
+            vec![0u8; 128],
+            &[authority],
+        );
+        assert!(matches!(
+            res_tx_amt,
+            Err(BridgeError::InvalidTransaction(_))
+        ));
+
+        // b) empty proof
+        let res_tx_empty_proof = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -10,
+            vec![],
+            &[authority],
+        );
+        assert!(matches!(
+            res_tx_empty_proof,
+            Err(BridgeError::InvalidTransaction(_))
+        ));
+
+        // c) proof too large
+        let res_tx_large_proof = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -10,
+            vec![0u8; MAX_PROOF_LEN + 1],
+            &[authority],
+        );
+        assert!(matches!(
+            res_tx_large_proof,
+            Err(BridgeError::InvalidTransaction(_))
+        ));
+
+        // d) duplicate nullifiers
+        let res_tx_dup_nullifiers = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [1u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -10,
+            vec![0u8; 128],
+            &[authority],
+        );
+        assert!(matches!(
+            res_tx_dup_nullifiers,
+            Err(BridgeError::InvalidTransaction(_))
+        ));
+
+        // 5. create_transact_spl_instruction pre-flight checks
+        let res_tx_spl_dup = create_transact_spl_instruction(
+            &program_id,
+            &authority,
+            &stake_mint,
+            &token_account,
+            &token_account,
+            &token_program,
+            [[1u8; 32], [1u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -10,
+            vec![0u8; 128],
+            &[authority],
+        );
+        assert!(matches!(
+            res_tx_spl_dup,
+            Err(BridgeError::InvalidTransaction(_))
+        ));
+
+        // 6. create_set_bridge_authority_instruction requires non-default pubkey
+        let res_auth =
+            create_set_bridge_authority_instruction(&program_id, &authority, &Pubkey::default());
+        assert!(matches!(res_auth, Err(BridgeError::InvalidTransaction(_))));
     }
 }

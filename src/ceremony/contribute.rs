@@ -40,6 +40,15 @@ pub enum ContributeError {
 
     #[error("transcript chain rejected the new contribution: {0}")]
     Transcript(#[from] TranscriptError),
+
+    #[error("circuit mismatch: expected {expected:?}, got {actual:?}")]
+    CircuitMismatch {
+        expected: CircuitId,
+        actual: CircuitId,
+    },
+
+    #[error("initial SRS hash mismatch: expected {expected}, got {actual}")]
+    InitialSrsMismatch { expected: String, actual: String },
 }
 
 /// Apply one contribution and return the updated proving key plus
@@ -69,6 +78,21 @@ pub fn contribute<R: RngCore + CryptoRng>(
     attestation: String,
     rng: &mut R,
 ) -> Result<(ProvingKey<Bn254>, Phase2Transcript), ContributeError> {
+    if let Some(ref prev_t) = prior_transcript {
+        if prev_t.circuit != circuit {
+            return Err(ContributeError::CircuitMismatch {
+                expected: circuit,
+                actual: prev_t.circuit.clone(),
+            });
+        }
+        if prev_t.initial_srs_hash != initial_srs_hash {
+            return Err(ContributeError::InitialSrsMismatch {
+                expected: hex::encode(initial_srs_hash),
+                actual: hex::encode(prev_t.initial_srs_hash),
+            });
+        }
+    }
+
     let delta_i = Fr::rand(rng);
     let proof = apply_contribution(&mut prior_pk, delta_i, rng)?;
 
@@ -240,5 +264,55 @@ mod tests {
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    #[test]
+    fn mismatched_circuit_or_initial_srs_hash_is_rejected() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+
+        let (after_pk_1, transcript_1) = contribute(
+            initial_pk.clone(),
+            None,
+            CircuitId::Transfer,
+            [0x42u8; 64],
+            NodeId(vec![0x01]),
+            "first contributor".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        // Attempting to contribute with a different circuit must fail
+        let res_circuit = contribute(
+            after_pk_1.clone(),
+            Some(transcript_1.clone()),
+            CircuitId::Withdraw,
+            [0x42u8; 64],
+            NodeId(vec![0x02]),
+            "second contributor".to_string(),
+            &mut rng,
+        );
+        match res_circuit {
+            Err(ContributeError::CircuitMismatch { expected, actual }) => {
+                assert_eq!(expected, CircuitId::Withdraw);
+                assert_eq!(actual, CircuitId::Transfer);
+            }
+            other => panic!("expected CircuitMismatch, got {:?}", other),
+        }
+
+        // Attempting to contribute with a different initial SRS hash must fail
+        let res_srs = contribute(
+            after_pk_1,
+            Some(transcript_1),
+            CircuitId::Transfer,
+            [0x99u8; 64],
+            NodeId(vec![0x02]),
+            "second contributor".to_string(),
+            &mut rng,
+        );
+        match res_srs {
+            Err(ContributeError::InitialSrsMismatch { .. }) => {}
+            other => panic!("expected InitialSrsMismatch, got {:?}", other),
+        }
     }
 }

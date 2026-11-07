@@ -49,10 +49,33 @@ impl R1CSToQAP for CircomReduction {
         num_constraints: usize,
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
+        if full_assignment.len() < num_inputs {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+
+        for terms in matrices
+            .a
+            .iter()
+            .chain(matrices.b.iter())
+            .chain(matrices.c.iter())
+        {
+            for &(_, idx) in terms.iter() {
+                if idx >= full_assignment.len() {
+                    return Err(SynthesisError::AssignmentMissing);
+                }
+            }
+        }
+
         let zero = F::zero();
-        let domain =
-            D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain_len = num_constraints
+            .checked_add(num_inputs)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain = D::new(domain_len).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_size = domain.size();
+
+        if domain_size < domain_len {
+            return Err(SynthesisError::PolynomialDegreeTooLarge);
+        }
 
         let mut a = vec![zero; domain_size];
         let mut b = vec![zero; domain_size];
@@ -69,7 +92,9 @@ impl R1CSToQAP for CircomReduction {
 
         {
             let start = num_constraints;
-            let end = start + num_inputs;
+            let end = start
+                .checked_add(num_inputs)
+                .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             a[start..end].clone_from_slice(&full_assignment[..num_inputs]);
         }
 
@@ -86,7 +111,9 @@ impl R1CSToQAP for CircomReduction {
         domain.ifft_in_place(&mut b);
 
         let root_of_unity = {
-            let domain_size_double = 2 * domain_size;
+            let domain_size_double = domain_size
+                .checked_mul(2)
+                .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             let domain_double =
                 D::new(domain_size_double).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             domain_double.element(1)
@@ -116,9 +143,14 @@ impl R1CSToQAP for CircomReduction {
         _: F,
         delta_inverse: F,
     ) -> Result<Vec<F>, SynthesisError> {
+        let count = max_power
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+
         // The usual H query has domain-1 powers and Z has domain powers, so
         // HZ has 2*domain-1.
-        let mut scalars = (0..2 * max_power + 1)
+        let mut scalars = (0..count)
             .map(|i| delta_inverse * t.pow([i as u64]))
             .collect::<Vec<_>>();
         let domain_size = scalars.len();
@@ -276,5 +308,93 @@ mod tests {
                 .expect("verify runs"),
             "a ceremony-produced key must prove and verify our circuit"
         );
+    }
+
+    #[test]
+    fn witness_map_rejects_short_witness_and_out_of_bounds() {
+        use ark_poly::Radix2EvaluationDomain;
+
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 2,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 1,
+            c_num_non_zero: 1,
+            a: vec![vec![(Fr::from(1u64), 0)]],
+            b: vec![vec![(Fr::from(1u64), 0)]],
+            c: vec![vec![(Fr::from(1u64), 0)]],
+        };
+
+        // full_assignment shorter than num_inputs (2)
+        let short_assignment = vec![Fr::from(1u64)];
+        let res = CircomReduction::witness_map_from_matrices::<Fr, Radix2EvaluationDomain<Fr>>(
+            &matrices,
+            2,
+            1,
+            &short_assignment,
+        );
+        assert!(matches!(res, Err(SynthesisError::AssignmentMissing)));
+
+        // index in constraint out of bounds
+        let out_of_bounds_matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 1,
+            c_num_non_zero: 1,
+            a: vec![vec![(Fr::from(1u64), 10)]],
+            b: vec![vec![(Fr::from(1u64), 0)]],
+            c: vec![vec![(Fr::from(1u64), 0)]],
+        };
+        let assignment = vec![Fr::from(1u64), Fr::from(2u64)];
+        let res_oob = CircomReduction::witness_map_from_matrices::<Fr, Radix2EvaluationDomain<Fr>>(
+            &out_of_bounds_matrices,
+            1,
+            1,
+            &assignment,
+        );
+        assert!(matches!(res_oob, Err(SynthesisError::AssignmentMissing)));
+    }
+
+    #[test]
+    fn witness_map_and_h_query_reject_overflow() {
+        use ark_poly::Radix2EvaluationDomain;
+
+        let matrices = ConstraintMatrices {
+            num_instance_variables: 1,
+            num_witness_variables: 1,
+            num_constraints: 1,
+            a_num_non_zero: 1,
+            b_num_non_zero: 1,
+            c_num_non_zero: 1,
+            a: vec![vec![(Fr::from(1u64), 0)]],
+            b: vec![vec![(Fr::from(1u64), 0)]],
+            c: vec![vec![(Fr::from(1u64), 0)]],
+        };
+        let assignment = vec![Fr::from(1u64), Fr::from(2u64)];
+
+        // Overflow in num_constraints + num_inputs
+        let res_overflow = CircomReduction::witness_map_from_matrices::<
+            Fr,
+            Radix2EvaluationDomain<Fr>,
+        >(&matrices, 1, usize::MAX, &assignment);
+        assert!(matches!(
+            res_overflow,
+            Err(SynthesisError::PolynomialDegreeTooLarge)
+        ));
+
+        // Overflow in h_query_scalars
+        let res_h_overflow = CircomReduction::h_query_scalars::<Fr, Radix2EvaluationDomain<Fr>>(
+            usize::MAX / 2 + 1,
+            Fr::from(2u64),
+            Fr::from(1u64),
+            Fr::from(1u64),
+        );
+        assert!(matches!(
+            res_h_overflow,
+            Err(SynthesisError::PolynomialDegreeTooLarge)
+        ));
     }
 }

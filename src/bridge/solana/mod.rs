@@ -26,8 +26,8 @@ pub use instructions::{
     derive_asset_vault, derive_asset_vault_authority, derive_associated_token_address,
     derive_bridge_state, derive_bridge_vault, derive_nullifier_account, derive_program_data,
     derive_stake_token_vault, derive_stake_vault_authority, derive_validator_account,
-    derive_validator_registry, DepositInstructionData, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
-    SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+    derive_validator_registry, DepositInstructionData, MAX_PROOF_LEN, MIN_VALIDATOR_STAKE,
+    SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
 };
 pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;
