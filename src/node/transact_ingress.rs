@@ -119,6 +119,49 @@ struct SubmitResponse {
     request_id: String,
 }
 
+/// A token-bucket rate limiter for transact ingress endpoints.
+#[derive(Clone, Debug)]
+pub struct RateLimiter {
+    capacity: f64,
+    refill_rate: f64,
+    state: Arc<std::sync::Mutex<(f64, std::time::Instant)>>,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        // Default: burst capacity of 10 requests, refilling at 5 requests/sec
+        Self::new(10, 5)
+    }
+}
+
+impl RateLimiter {
+    pub fn new(capacity: u32, refill_rate_per_sec: u32) -> Self {
+        Self {
+            capacity: capacity as f64,
+            refill_rate: refill_rate_per_sec as f64,
+            state: Arc::new(std::sync::Mutex::new((
+                capacity as f64,
+                std::time::Instant::now(),
+            ))),
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed, false if rate limited.
+    pub fn check(&self) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(guard.1).as_secs_f64();
+        guard.1 = now;
+        guard.0 = (guard.0 + elapsed * self.refill_rate).min(self.capacity);
+        if guard.0 >= 1.0 {
+            guard.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Parse a 32-byte field from hex, tolerating a `0x` prefix; 400 on any
 /// malformed input.
 fn parse_hex32(label: &str, s: &str) -> Result<[u8; 32], (StatusCode, String)> {
@@ -151,12 +194,22 @@ fn parse_hex32_pair(label: &str, items: &[String]) -> Result<[[u8; 32]; 2], (Sta
 async fn submit_handler(
     Extension(node): Extension<Arc<dyn TransactIngress>>,
     Extension(token): Extension<IngressToken>,
+    Extension(rate_limiter): Extension<RateLimiter>,
     headers: axum::http::HeaderMap,
     Json(req): Json<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, (StatusCode, String)> {
     // This endpoint triggers consensus; reject an unauthenticated caller when a
     // token is configured, before doing any work.
     check_bearer(&headers, &token)?;
+
+    // Rate limit check: prevent unbounded submission flood from forcing Groth16
+    // verification and consensus rounds.
+    if !rate_limiter.check() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded: too many transact submissions".to_string(),
+        ));
+    }
 
     // Deposits (`ext_amount > 0`) go through `deposit_note`, never this
     // ingress; the on-chain program rejects them anyway, so fail fast at the
@@ -251,14 +304,25 @@ async fn scan_handler(
     Json(node.delivered_notes().await)
 }
 
-/// Build the ingress router. Exposed separately from [`serve`] so it can be
-/// mounted under a caller's own listener or driven directly in tests.
+/// Build the ingress router with default rate limiting. Exposed separately from
+/// [`serve`] so it can be mounted under a caller's own listener or driven
+/// directly in tests.
 pub fn router(node: Arc<dyn TransactIngress>, token: IngressToken) -> Router {
+    router_with_rate_limiter(node, token, RateLimiter::default())
+}
+
+/// Build the ingress router with a specific [`RateLimiter`].
+pub fn router_with_rate_limiter(
+    node: Arc<dyn TransactIngress>,
+    token: IngressToken,
+    rate_limiter: RateLimiter,
+) -> Router {
     Router::new()
         .route("/transact/submit", post(submit_handler))
         .route("/transact/scan", get(scan_handler))
         .layer(Extension(node))
         .layer(Extension(token))
+        .layer(Extension(rate_limiter))
 }
 
 /// Bind the ingress server on `addr` and serve until the task is dropped.
@@ -269,6 +333,7 @@ pub async fn serve(
     addr: SocketAddr,
     token: IngressToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    crate::node::ingress_auth::warn_on_non_loopback_unauthenticated(&addr, &token);
     log::info!(
         target: "paraloom::node::transact_ingress",
         "Transact ingress listening on http://{}",
@@ -557,5 +622,32 @@ mod tests {
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn submit_handler_enforces_rate_limit() {
+        // Rate limiter with capacity 2 and 0 refill rate
+        let rate_limiter = RateLimiter::new(2, 0);
+        let app =
+            router_with_rate_limiter(Arc::new(StubIngress { accept: true }), None, rate_limiter);
+
+        // First 2 requests succeed
+        let resp1 = app
+            .clone()
+            .oneshot(post_json(&well_formed_body()))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let resp2 = app
+            .clone()
+            .oneshot(post_json(&well_formed_body()))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // 3rd request is rate limited (429 Too Many Requests)
+        let resp3 = app.oneshot(post_json(&well_formed_body())).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

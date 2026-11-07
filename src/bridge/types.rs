@@ -138,8 +138,10 @@ pub struct BridgeConfig {
     /// `transact_ingress_address`) require. When non-empty, a request must
     /// present `Authorization: Bearer <token>` or it is refused with 401 — so an
     /// ingress exposed beyond loopback cannot be driven by an unauthenticated
-    /// caller. Empty (the default) keeps the historical
-    /// no-auth behaviour, which is only safe on a loopback/management interface.
+    /// caller. Empty (the default) keeps the historical no-auth behaviour, which
+    /// is only safe on a loopback/management interface (binding to a non-loopback
+    /// address without a token emits a security warning). Ingress write
+    /// endpoints also enforce rate limiting to guard against submission flooding.
     /// `#[serde(default)]` so a config predating this field still parses (and
     /// gets the empty, no-auth default) instead of failing to load.
     #[serde(default)]

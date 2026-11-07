@@ -2101,6 +2101,7 @@ impl Node {
                             Arc::new(self.clone());
                         let token =
                             ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
+                        ingress_auth::warn_on_non_loopback_unauthenticated(&addr, &token);
                         let handle = tokio::spawn(async move {
                             if let Err(e) = transact_ingress::serve(ingress, addr, token).await {
                                 log::error!(
