@@ -76,6 +76,9 @@ impl AttestedChannelKey {
     /// when verification fails, so a caller can never accidentally seal to an
     /// unattested key.
     pub fn verify<V: AttestationVerifier>(&self, verifier: &V) -> Option<[u8; 32]> {
+        if self.channel_pubkey == [0u8; 32] || self.attestation.is_empty() {
+            return None;
+        }
         if verifier.verify(&self.attestation, &self.channel_pubkey) {
             Some(self.channel_pubkey)
         } else {
@@ -143,6 +146,9 @@ impl InferencePayload {
         }
         let mut reply_to = [0u8; 32];
         reply_to.copy_from_slice(&b[..32]);
+        if reply_to == [0u8; 32] {
+            return None;
+        }
         Some(Self {
             reply_to,
             prompt: b[32..].to_vec(),
@@ -158,7 +164,13 @@ pub fn seal_request<V: AttestationVerifier>(
     verifier: &V,
     payload: &InferencePayload,
 ) -> Option<EncryptedNote> {
+    if payload.reply_to == [0u8; 32] {
+        return None;
+    }
     let pubkey = key.verify(verifier)?;
+    if pubkey == [0u8; 32] {
+        return None;
+    }
     Some(seal(&pubkey, &payload.to_bytes()))
 }
 
@@ -196,6 +208,9 @@ impl<M: ModelRunner> ConfidentialWorker<M> {
         let Some(payload) = InferencePayload::from_bytes(&bytes) else {
             return Ok(None);
         };
+        if payload.reply_to == [0u8; 32] {
+            return Ok(None);
+        }
         let result = self.model.run(&payload.prompt)?;
         Ok(Some(seal(&payload.reply_to, &result)))
     }
@@ -346,5 +361,36 @@ mod tests {
             .handle(&sealed_req)
             .expect("no model error")
             .is_none());
+    }
+
+    #[test]
+    fn zero_channel_pubkey_is_rejected() {
+        let key = AttestedChannelKey {
+            channel_pubkey: [0u8; 32],
+            attestation: b"good-report".to_vec(),
+        };
+        let verifier = MockVerifier {
+            accept: b"good-report".to_vec(),
+        };
+        assert!(key.verify(&verifier).is_none());
+        assert!(seal_prompt(&key, &verifier, b"test").is_none());
+    }
+
+    #[test]
+    fn zero_reply_to_key_is_rejected() {
+        let enclave = EnclaveChannel::generate();
+        let key = attested(&enclave, b"good-report");
+        let verifier = MockVerifier {
+            accept: b"good-report".to_vec(),
+        };
+        let payload = InferencePayload {
+            prompt: b"test".to_vec(),
+            reply_to: [0u8; 32],
+        };
+        assert!(seal_request(&key, &verifier, &payload).is_none());
+
+        let mut bytes = vec![0u8; 32];
+        bytes.extend_from_slice(b"test");
+        assert!(InferencePayload::from_bytes(&bytes).is_none());
     }
 }
