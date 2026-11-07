@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
     let usdc_asset: [u8; 32] = usdc_mint.to_bytes();
     let (vault_pda, _) = derive_bridge_vault(&program_id);
-    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let (tree_pda, _) = derive_merkle_tree(&program_id);
 
     header("Pre-flight");
     println!("RPC URL:           {rpc_url}");

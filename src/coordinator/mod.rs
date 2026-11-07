@@ -218,6 +218,7 @@ impl Coordinator {
         standbys: Vec<NodeId>,
         interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let interval = interval.max(Duration::from_millis(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -266,6 +267,7 @@ impl Coordinator {
         self: Arc<Self>,
         check_interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
+        let check_interval = check_interval.max(Duration::from_millis(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(check_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -877,6 +879,27 @@ mod tests {
         // After promotion, further calls are no-ops and return None.
         let again = standby.try_promote_if_stalled(Instant::now()).await;
         assert_eq!(again, None);
+    }
+
+    #[tokio::test]
+    async fn zero_interval_heartbeat_and_watchdog_do_not_panic() {
+        let primary = Arc::new(Coordinator::new(make_test_network()));
+        let hb_handle = Arc::clone(&primary).start_heartbeat_broadcast(
+            NodeId(vec![0x01]),
+            vec![NodeId(vec![0x02])],
+            Duration::ZERO,
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        hb_handle.abort();
+
+        let standby = Arc::new(Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        ));
+        let wd_handle = Arc::clone(&standby).start_stall_watchdog(Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        wd_handle.abort();
     }
 
     /// Kill-the-primary RTO scenario from #66's acceptance criteria.
