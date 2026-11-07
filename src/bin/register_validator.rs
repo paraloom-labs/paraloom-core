@@ -111,13 +111,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let token_program = client.get_account(&stake_mint)?.owner;
-    let validator_token_account = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
-        Ok(val) => Pubkey::from_str(&val)?,
-        Err(_) => derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program),
+    let derived_ata =
+        derive_associated_token_address(&validator.pubkey(), &stake_mint, &token_program);
+    let (validator_token_account, needs_init_ata) = match std::env::var("VALIDATOR_TOKEN_ACCOUNT") {
+        Ok(val) => {
+            let explicit = Pubkey::from_str(&val)?;
+            let needs = explicit == derived_ata;
+            (explicit, needs)
+        }
+        Err(_) => (derived_ata, true),
     };
 
     println!("Token Program: {}", token_program);
     println!("Validator Token Account: {}\n", validator_token_account);
+
+    let mut instructions = Vec::new();
+    if needs_init_ata {
+        instructions.push(create_associated_token_account_idempotent_instruction(
+            &validator.pubkey(),
+            &validator.pubkey(),
+            &stake_mint,
+            &token_program,
+        ));
+    }
 
     let ix = create_register_validator_instruction(
         &program_id,
@@ -128,13 +144,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stake_amount,
         token_stake_amount,
     )?;
+    instructions.push(ix);
 
     println!("Getting recent blockhash...");
     let blockhash = client.get_latest_blockhash()?;
 
     println!("Creating and signing transaction...");
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &instructions,
         Some(&validator.pubkey()),
         &[&validator],
         blockhash,
