@@ -215,10 +215,20 @@ pub fn load_verifying_key(path: &Path) -> Result<VerifyingKey<Bn254>, KeyLoadErr
         }
     };
 
-    VerifyingKey::<Bn254>::deserialize_compressed(&bytes[..]).map_err(|e| KeyLoadError::Malformed {
-        path: path.to_path_buf(),
-        source: e,
-    })
+    let mut cursor = std::io::Cursor::new(&bytes[..]);
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor).map_err(|e| {
+        KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(KeyLoadError::Malformed {
+            path: path.to_path_buf(),
+            source: ark_serialize::SerializationError::InvalidData,
+        });
+    }
+    Ok(vk)
 }
 
 /// ZK Proof verifier interface
@@ -287,6 +297,13 @@ impl ProofVerifier {
             };
         }
 
+        // Enforce distinct input nullifiers matching on-chain constraints
+        if nullifiers[0] == nullifiers[1] {
+            return VerificationResult::Invalid {
+                reason: "duplicate nullifiers".to_string(),
+            };
+        }
+
         // Reject non-canonical encodings (see `is_canonical_le`) before any
         // disk or crypto work: the nullifier bytes seed the on-chain PDA and
         // the output-commitment bytes are appended verbatim to the on-chain
@@ -296,6 +313,11 @@ impl ProofVerifier {
         if !is_canonical_le(root) {
             return VerificationResult::Invalid {
                 reason: "non-canonical root encoding".to_string(),
+            };
+        }
+        if !is_canonical_le(asset_id) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical asset_id encoding".to_string(),
             };
         }
         for nullifier in nullifiers {
@@ -327,7 +349,8 @@ impl ProofVerifier {
             }
         };
 
-        let proof = match Proof::<Bn254>::deserialize_compressed(body) {
+        let mut cursor = std::io::Cursor::new(body);
+        let proof = match Proof::<Bn254>::deserialize_compressed(&mut cursor) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to deserialize transact proof: {}", e);
@@ -336,6 +359,12 @@ impl ProofVerifier {
                 };
             }
         };
+        if cursor.position() as usize != body.len() {
+            log::warn!("Transact proof body has trailing bytes");
+            return VerificationResult::Invalid {
+                reason: "Invalid proof format: trailing bytes".to_string(),
+            };
+        }
 
         // The suite names the key that verifies it, so a second suite cannot
         // silently borrow this one: adding a variant makes this a compile
@@ -397,6 +426,8 @@ impl ProofVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_bn254::{G1Affine, G2Affine};
+    use ark_serialize::CanonicalSerialize;
 
     /// A canonical encoding is accepted; the same field element re-encoded as
     /// `b + p` (a distinct 32-byte buffer that lifts to the same `Fr`) is
@@ -485,6 +516,75 @@ mod tests {
                 assert!(reason.contains("non-canonical nullifier"), "{reason}")
             }
             _ => panic!("non-canonical nullifier must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_duplicate_nullifiers() {
+        let nullifier = [1u8; 32];
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[nullifier, nullifier],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("duplicate nullifiers"), "{reason}")
+            }
+            _ => panic!("duplicate nullifiers must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_non_canonical_asset_id() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus = [0u8; 32];
+        modulus[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &modulus,
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical asset_id"), "{reason}")
+            }
+            _ => panic!("non-canonical asset_id must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_non_canonical_output_commitment() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus = [0u8; 32];
+        modulus[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let r = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+            &[modulus, [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r {
+            VerificationResult::Invalid { reason } => {
+                assert!(
+                    reason.contains("non-canonical output commitment"),
+                    "{reason}"
+                )
+            }
+            _ => panic!("non-canonical output commitment must be invalid"),
         }
     }
 
@@ -640,6 +740,31 @@ mod tests {
         std::fs::write(&path, &garbage).expect("write garbage key");
 
         let err = load_verifying_key(&path).expect_err("garbage bytes must error");
+        assert!(
+            matches!(err, KeyLoadError::Malformed { .. }),
+            "expected Malformed, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_verifying_key_trailing_bytes_returns_malformed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trailing.key");
+
+        let vk = VerifyingKey::<Bn254> {
+            alpha_g1: G1Affine::default(),
+            beta_g2: G2Affine::default(),
+            gamma_g2: G2Affine::default(),
+            delta_g2: G2Affine::default(),
+            gamma_abc_g1: vec![G1Affine::default()],
+        };
+        let mut bytes = Vec::new();
+        vk.serialize_compressed(&mut bytes).expect("serialize vk");
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).expect("write trailing key");
+
+        let err = load_verifying_key(&path).expect_err("trailing bytes must error");
         assert!(
             matches!(err, KeyLoadError::Malformed { .. }),
             "expected Malformed, got {:?}",
