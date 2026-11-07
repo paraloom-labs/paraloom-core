@@ -24,13 +24,23 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use sha2::{Digest, Sha512};
 
 use super::bgm17::{verify_contribution_deltas, BgmError, DleqProof};
-use super::transcript::{Phase2Transcript, TranscriptError};
+use super::transcript::{Phase2Transcript, TranscriptError, TRANSCRIPT_VERSION};
+use std::collections::HashSet;
 
 /// Errors surfaced by [`verify_phase2_transcript`].
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     #[error("transcript chain is broken or malformed: {0}")]
     Chain(#[from] TranscriptError),
+
+    #[error(
+        "unsupported transcript version {version}; expected {expected}",
+        expected = crate::ceremony::transcript::TRANSCRIPT_VERSION
+    )]
+    UnsupportedVersion { version: u32 },
+
+    #[error("cycle detected in transcript at position {position}")]
+    CycleDetected { position: usize },
 
     #[error("contribution {position}: delta_after_g1 bytes are not a valid G1Affine")]
     MalformedDeltaG1 { position: usize },
@@ -82,16 +92,42 @@ pub fn verify_phase2_transcript(
     initial_pk: &ProvingKey<Bn254>,
     transcript: &Phase2Transcript,
 ) -> Result<(), VerifyError> {
-    transcript.verify_chain()?;
+    if transcript.version != TRANSCRIPT_VERSION {
+        return Err(VerifyError::UnsupportedVersion {
+            version: transcript.version,
+        });
+    }
+
+    transcript.verify_chain().map_err(|e| match e {
+        TranscriptError::CycleDetected { position } => VerifyError::CycleDetected { position },
+        other => VerifyError::Chain(other),
+    })?;
 
     let mut delta_before_g1 = initial_pk.delta_g1;
     let mut delta_before_g2 = initial_pk.vk.delta_g2;
 
+    let mut seen_deltas = HashSet::new();
+    seen_deltas.insert((delta_before_g1, delta_before_g2));
+
     for (position, contribution) in transcript.contributions.iter().enumerate() {
-        let delta_after_g1 = G1Affine::deserialize_compressed(&contribution.delta_after_g1[..])
+        let mut cursor_g1 = &contribution.delta_after_g1[..];
+        let delta_after_g1 = G1Affine::deserialize_compressed(&mut cursor_g1)
             .map_err(|_| VerifyError::MalformedDeltaG1 { position })?;
-        let delta_after_g2 = G2Affine::deserialize_compressed(&contribution.delta_after_g2[..])
+        if !cursor_g1.is_empty() {
+            return Err(VerifyError::MalformedDeltaG1 { position });
+        }
+
+        let mut cursor_g2 = &contribution.delta_after_g2[..];
+        let delta_after_g2 = G2Affine::deserialize_compressed(&mut cursor_g2)
             .map_err(|_| VerifyError::MalformedDeltaG2 { position })?;
+        if !cursor_g2.is_empty() {
+            return Err(VerifyError::MalformedDeltaG2 { position });
+        }
+
+        if !seen_deltas.insert((delta_after_g1, delta_after_g2)) {
+            return Err(VerifyError::CycleDetected { position });
+        }
+
         let proof = DleqProof::from_bytes(&contribution.dleq_proof)
             .map_err(|source| VerifyError::MalformedDleq { position, source })?;
 
@@ -133,10 +169,18 @@ pub fn verify_final_pk(
     let (expected_g1, expected_g2) = match transcript.contributions.last() {
         Some(last) => {
             let position = transcript.contributions.len() - 1;
-            let g1 = G1Affine::deserialize_compressed(&last.delta_after_g1[..])
+            let mut cursor_g1 = &last.delta_after_g1[..];
+            let g1 = G1Affine::deserialize_compressed(&mut cursor_g1)
                 .map_err(|_| VerifyError::MalformedDeltaG1 { position })?;
-            let g2 = G2Affine::deserialize_compressed(&last.delta_after_g2[..])
+            if !cursor_g1.is_empty() {
+                return Err(VerifyError::MalformedDeltaG1 { position });
+            }
+            let mut cursor_g2 = &last.delta_after_g2[..];
+            let g2 = G2Affine::deserialize_compressed(&mut cursor_g2)
                 .map_err(|_| VerifyError::MalformedDeltaG2 { position })?;
+            if !cursor_g2.is_empty() {
+                return Err(VerifyError::MalformedDeltaG2 { position });
+            }
             (g1, g2)
         }
         None => (initial_pk.delta_g1, initial_pk.vk.delta_g2),
@@ -613,6 +657,60 @@ mod tests {
         match verify_final_pk(&initial_pk, &transcript, &other_pk) {
             Err(VerifyError::FinalPkDeltaMismatch) => {}
             other => panic!("expected FinalPkDeltaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unsupported_transcript_version_is_rejected() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(1);
+        transcript.version = 42;
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::UnsupportedVersion { version: 42 }) => {}
+            other => panic!("expected UnsupportedVersion(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_in_delta_after_g1_rejected() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(1);
+        transcript.contributions[0].delta_after_g1.push(0xFF);
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::MalformedDeltaG1 { position: 0 }) => {}
+            other => panic!("expected MalformedDeltaG1 at 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_in_delta_after_g2_rejected() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(1);
+        transcript.contributions[0].delta_after_g2.push(0xFF);
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::MalformedDeltaG2 { position: 0 }) => {}
+            other => panic!("expected MalformedDeltaG2 at 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cycle_in_delta_chain_is_rejected() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(2);
+        // Set second contribution's delta_after to equal the initial delta (cycle back)
+        let mut initial_g1_bytes = Vec::new();
+        initial_pk
+            .delta_g1
+            .serialize_compressed(&mut initial_g1_bytes)
+            .unwrap();
+        let mut initial_g2_bytes = Vec::new();
+        initial_pk
+            .vk
+            .delta_g2
+            .serialize_compressed(&mut initial_g2_bytes)
+            .unwrap();
+        transcript.contributions[1].delta_after_g1 = initial_g1_bytes;
+        transcript.contributions[1].delta_after_g2 = initial_g2_bytes;
+
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::CycleDetected { position: 1 }) => {}
+            other => panic!("expected CycleDetected at 1, got {:?}", other),
         }
     }
 }
