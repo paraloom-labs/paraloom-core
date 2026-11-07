@@ -12,7 +12,10 @@ pub mod rpc;
 mod test_support;
 
 pub use cosign_assembly::{assemble_transaction, gather_signatures};
-pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
+pub use cosign_message::{
+    build_settlement_message, CoSignPayload, SettlementParams, MAX_PROOF_BYTES,
+    MAX_QUORUM_COSIGNERS,
+};
 pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,
     create_deposit_note_instruction, create_init_stake_token_vault_instruction,
