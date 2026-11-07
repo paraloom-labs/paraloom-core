@@ -927,9 +927,93 @@ pub fn derive_associated_token_address(
     .0
 }
 
+/// Create an idempotent Associated Token Account creation instruction.
+///
+/// Prepended before operations that require the recipient's ATA to exist (such as
+/// validator unbonded stake withdrawal or registration). If the ATA already exists,
+/// the instruction succeeds cleanly without error (opcode 1).
+pub fn create_associated_token_account_idempotent_instruction(
+    funding_address: &Pubkey,
+    wallet_address: &Pubkey,
+    token_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let associated_token_address =
+        derive_associated_token_address(wallet_address, token_mint, token_program);
+
+    Instruction {
+        program_id: SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*funding_address, true),
+            AccountMeta::new(associated_token_address, false),
+            AccountMeta::new_readonly(*wallet_address, false),
+            AccountMeta::new_readonly(*token_mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![1], // AssociatedTokenAccountInstruction::CreateIdempotent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_classic_spl() {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &wallet,
+            &mint,
+            &SPL_TOKEN_PROGRAM_ID,
+        );
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]);
+        assert_eq!(ix.accounts.len(), 6);
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable);
+        let expected_ata = derive_associated_token_address(&wallet, &mint, &SPL_TOKEN_PROGRAM_ID);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert!(!ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, wallet);
+        assert!(!ix.accounts[2].is_signer);
+        assert!(!ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert!(!ix.accounts[3].is_signer);
+        assert!(!ix.accounts[3].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, SYSTEM_PROGRAM_ID);
+        assert!(!ix.accounts[4].is_signer);
+        assert!(!ix.accounts[4].is_writable);
+        assert_eq!(ix.accounts[5].pubkey, SPL_TOKEN_PROGRAM_ID);
+        assert!(!ix.accounts[5].is_signer);
+        assert!(!ix.accounts[5].is_writable);
+    }
+
+    #[test]
+    fn test_create_associated_token_account_idempotent_instruction_token_2022() {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = create_associated_token_account_idempotent_instruction(
+            &payer,
+            &wallet,
+            &mint,
+            &SPL_TOKEN_2022_PROGRAM_ID,
+        );
+
+        assert_eq!(ix.program_id, SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID);
+        assert_eq!(ix.data, vec![1]);
+        let expected_ata =
+            derive_associated_token_address(&wallet, &mint, &SPL_TOKEN_2022_PROGRAM_ID);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert_eq!(ix.accounts[5].pubkey, SPL_TOKEN_2022_PROGRAM_ID);
+    }
 
     #[test]
     fn test_derive_pdas() {

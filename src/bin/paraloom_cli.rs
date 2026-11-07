@@ -1488,6 +1488,13 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 // Stake exactly the registry's current token floor (0 while the
                 // token gate is still closed).
+                let init_ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
                 let ix = create_register_validator_instruction(
                     &program_id,
                     &validator.pubkey(),
@@ -1503,7 +1510,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[init_ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
@@ -1699,6 +1706,13 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
+                let init_ata_ix = create_associated_token_account_idempotent_instruction(
+                    &validator.pubkey(),
+                    &validator.pubkey(),
+                    &stake_mint,
+                    &token_program,
+                );
+
                 let ix = create_withdraw_unbonded_stake_instruction(
                     &program_id,
                     &validator.pubkey(),
@@ -1711,7 +1725,7 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &[init_ata_ix, ix],
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
