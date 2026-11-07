@@ -111,7 +111,11 @@ impl VerificationCoordinator {
         let request = VerificationRequest::new(job_id.clone(), validators);
 
         let mut requests = self.requests.write().await;
+        let mut results = self.results.write().await;
         requests.insert(job_id.clone(), request.clone());
+        results.remove(&job_id);
+        drop(results);
+        drop(requests);
 
         info!(
             "Created verification request for job {} with {} validators",
@@ -129,6 +133,16 @@ impl VerificationCoordinator {
         validator_id: ValidatorId,
         result: JobResult,
     ) -> Result<()> {
+        if validator_id.trim().is_empty() {
+            return Err(anyhow!("validator_id must not be empty"));
+        }
+        if &result.job_id != job_id {
+            return Err(anyhow!(
+                "Result job_id '{}' does not match target job '{}'",
+                result.job_id,
+                job_id
+            ));
+        }
         // Bind the result to the job's assigned validator set: only a validator
         // this job was actually assigned to may contribute a result. Without
         // this, any peer could inject results toward the consensus tally for a
@@ -564,5 +578,42 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn submit_result_rejects_mismatched_job_id_and_recreation_clears_stale_results() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job-verify-1".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators.clone())
+            .await
+            .unwrap();
+
+        // Mismatched result.job_id must be rejected.
+        let mismatched = JobResult::success("other-job".to_string(), vec![1], 10, 1024, 100);
+        assert!(coordinator
+            .submit_result(&job_id, "v1".to_string(), mismatched)
+            .await
+            .is_err());
+
+        // Valid result from v1.
+        let valid = JobResult::success(job_id.clone(), vec![1], 10, 1024, 100);
+        coordinator
+            .submit_result(&job_id, "v1".to_string(), valid)
+            .await
+            .unwrap();
+        assert_eq!(coordinator.get_results(&job_id).await.len(), 1);
+
+        // Re-creating the verification request for the same job_id clears stale results.
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+        assert!(
+            coordinator.get_results(&job_id).await.is_empty(),
+            "re-creating a verification request must clear stale results from a prior round"
+        );
     }
 }

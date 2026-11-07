@@ -146,10 +146,23 @@ impl JobManager {
     /// Submit a job for distributed execution
     pub fn submit_job(&self, job: ComputeJob) -> Result<JobId> {
         let job_id = job.id.clone();
+        if job_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("job_id must not be empty"));
+        }
 
         info!("Submitting job {} for distributed execution", job_id);
 
         let mut pending = self.pending_jobs.lock().unwrap();
+        let assignments = self.assignments.lock().unwrap();
+        let results = self.results.lock().unwrap();
+        if pending.iter().any(|j| j.id == job_id)
+            || assignments.contains_key(&job_id)
+            || results.contains_key(&job_id)
+        {
+            return Err(anyhow::anyhow!("duplicate job_id '{}'", job_id));
+        }
+        drop(results);
+        drop(assignments);
         pending.push(job);
 
         Ok(job_id)
@@ -303,8 +316,14 @@ impl JobManager {
 
         let total_validators = validators.len();
         let active_validators = validators.values().filter(|v| v.is_alive()).count();
-        let total_capacity: usize = validators.values().map(|v| v.max_concurrent_jobs).sum();
-        let active_jobs: usize = validators.values().map(|v| v.active_jobs).sum();
+        let total_capacity: usize = validators
+            .values()
+            .filter(|v| v.is_alive())
+            .fold(0usize, |acc, v| acc.saturating_add(v.max_concurrent_jobs));
+        let active_jobs: usize = validators
+            .values()
+            .filter(|v| v.is_alive())
+            .fold(0usize, |acc, v| acc.saturating_add(v.active_jobs));
 
         ManagerStats {
             total_validators,
@@ -483,5 +502,37 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn submit_job_rejects_duplicates_and_stats_exclude_dead_validators() {
+        let manager = JobManager::new();
+
+        let alive = ValidatorCapacity::new("alive".to_string(), 4, 8192, 3);
+        let mut dead = ValidatorCapacity::new("dead".to_string(), 4, 8192, 5);
+        dead.last_heartbeat = current_timestamp().saturating_sub(60_000);
+        dead.active_jobs = 2;
+
+        manager.register_validator(alive).unwrap();
+        manager.register_validator(dead).unwrap();
+
+        let stats = manager.get_stats();
+        assert_eq!(stats.total_validators, 2);
+        assert_eq!(stats.active_validators, 1);
+        assert_eq!(
+            stats.total_capacity, 3,
+            "dead validators must not inflate total_capacity"
+        );
+        assert_eq!(
+            stats.active_jobs, 0,
+            "dead validators must not inflate active_jobs"
+        );
+
+        let job = ComputeJob::new(vec![1], vec![], ResourceLimits::default());
+        manager.submit_job(job.clone()).unwrap();
+        assert!(
+            manager.submit_job(job).is_err(),
+            "duplicate job_id must be rejected"
+        );
     }
 }
