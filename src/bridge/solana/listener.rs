@@ -318,7 +318,7 @@ impl EventListener {
     /// process them into the pool. Returns the number of events processed.
     async fn poll_events(state: &PollerState) -> Result<usize> {
         let cursor = *state.last_signature.read().await;
-        let events = Self::fetch_events(state, cursor).await?;
+        let (events, reached_cursor) = Self::fetch_events(state, cursor).await?;
 
         let mut processed = 0;
         let mut latest_slot: u64 = 0;
@@ -374,14 +374,25 @@ impl EventListener {
             }
         }
 
-        if let Some(sig) = cursor_advance {
-            *state.last_signature.write().await = Some(sig);
-            // Persist the advanced cursor so a restart resumes here. Best-effort:
-            // a write failure is logged but does not fail the poll — the
-            // in-memory cursor still drives this run.
-            if let Some(path) = &state.cursor_path {
-                Self::persist_cursor(path, &sig).await;
+        // Only advance the cursor if the fetch reached the previous cursor (or
+        // cold started). If we hit the page cap before reaching it, advancing
+        // the cursor to this batch's newest signature would permanently skip
+        // older deposits between the old cursor and the window boundary.
+        if cursor.is_none() || reached_cursor {
+            if let Some(sig) = cursor_advance {
+                *state.last_signature.write().await = Some(sig);
+                // Persist the advanced cursor so a restart resumes here. Best-effort:
+                // a write failure is logged but does not fail the poll — the
+                // in-memory cursor still drives this run.
+                if let Some(path) = &state.cursor_path {
+                    Self::persist_cursor(path, &sig).await;
+                }
             }
+        } else {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "withholding cursor advance: scan hit page cap before reaching previous cursor; preserving last_signature"
+            );
         }
         if latest_slot > 0 {
             // `last_block` tracks the most recent DEPOSIT slot for stats; the
@@ -455,10 +466,14 @@ impl EventListener {
     /// Signatures already seen during this listener's lifetime are
     /// filtered out before the RPC fetch to avoid redundant
     /// `getTransaction` calls.
+    ///
+    /// Returns the decoded events and a boolean indicating whether the previous
+    /// cursor was actually reached (`true` on a full walk or cold start; `false`
+    /// when the `MAX_SIGNATURE_PAGES` cap was hit before reaching `cursor`).
     async fn fetch_events(
         state: &PollerState,
         cursor: Option<Signature>,
-    ) -> Result<Vec<DepositEvent>> {
+    ) -> Result<(Vec<DepositEvent>, bool)> {
         // RPC calls go through the BridgeRpc trait — RealBridgeRpc
         // handles the spawn_blocking + ClientError mapping, mocks
         // return canned data directly.
@@ -475,6 +490,7 @@ impl EventListener {
         let mut signatures = Vec::new();
         let mut before: Option<Signature> = None;
         let mut pages = 0usize;
+        let mut reached_cursor = false;
         // The cursor is the `until` boundary. If it ages out of the RPC's
         // queryable history (some providers retain devnet signatures only
         // briefly), the RPC rejects it as a boundary with a "Transaction not
@@ -524,6 +540,7 @@ impl EventListener {
             };
             let batch_len = batch.len();
             if batch_len == 0 {
+                reached_cursor = true;
                 break;
             }
             // The batch is newest-first, so its last entry is the oldest — the
@@ -537,10 +554,12 @@ impl EventListener {
             // A short page means this batch reached `cursor` (or the end of
             // history): there is nothing older left to walk.
             if batch_len < state.batch_limit {
+                reached_cursor = true;
                 break;
             }
             // Cold start: take only the newest page, do not walk all history.
             if effective_cursor.is_none() {
+                reached_cursor = true;
                 break;
             }
             if pages >= MAX_SIGNATURE_PAGES {
@@ -550,6 +569,7 @@ impl EventListener {
                     MAX_SIGNATURE_PAGES,
                     MAX_SIGNATURE_PAGES * state.batch_limit
                 );
+                reached_cursor = false;
                 break;
             }
             match oldest {
@@ -559,7 +579,7 @@ impl EventListener {
         }
 
         if signatures.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), reached_cursor));
         }
 
         // The RPC returns newest-first; we want to process in the order
@@ -640,7 +660,7 @@ impl EventListener {
             }
         }
 
-        Ok(events)
+        Ok((events, reached_cursor))
     }
 
     /// Process a single deposit event
@@ -851,7 +871,7 @@ mod tests {
         use crate::bridge::solana::test_support::MockBridgeRpc;
         let mock = Arc::new(MockBridgeRpc::new());
         *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![]));
-        let events = EventListener::fetch_events(&make_state(mock), None)
+        let (events, _) = EventListener::fetch_events(&make_state(mock), None)
             .await
             .unwrap();
         assert!(events.is_empty());
@@ -905,7 +925,7 @@ mod tests {
         state.program_id = program_id;
         *state.last_signature.write().await = Some(stale);
 
-        let events = EventListener::fetch_events(&state, Some(stale))
+        let (events, _) = EventListener::fetch_events(&state, Some(stale))
             .await
             .expect("a stale cursor must self-heal, not propagate the error");
 
@@ -1374,6 +1394,83 @@ mod tests {
         assert_eq!(EventListener::load_cursor(&path).await, Some(sig));
     }
 
+    #[tokio::test]
+    async fn poll_events_does_not_advance_cursor_when_page_cap_hit_before_reaching_cursor() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let old_cursor = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        // Queue MAX_SIGNATURE_PAGES of full batches (batch_limit = 2) without ever reaching old_cursor
+        let mut all_sigs = Vec::new();
+        {
+            let mut pages = mock.get_signatures_pages.lock().unwrap();
+            for p in 0..MAX_SIGNATURE_PAGES {
+                let s1 = Signature::new_unique();
+                let s2 = Signature::new_unique();
+                all_sigs.push(s1);
+                all_sigs.push(s2);
+                pages.push_back(Ok(vec![
+                    RpcConfirmedTransactionStatusWithSignature {
+                        signature: s1.to_string(),
+                        slot: (p * 2 + 1) as u64,
+                        err: None,
+                        memo: None,
+                        block_time: None,
+                        confirmation_status: None,
+                    },
+                    RpcConfirmedTransactionStatusWithSignature {
+                        signature: s2.to_string(),
+                        slot: (p * 2 + 2) as u64,
+                        err: None,
+                        memo: None,
+                        block_time: None,
+                        confirmation_status: None,
+                    },
+                ]));
+            }
+        }
+
+        // Configure get_transaction for all returned signatures
+        {
+            let mut tx_map = mock.get_transactions.lock().unwrap();
+            for (idx, sig) in all_sigs.iter().enumerate() {
+                tx_map.insert(
+                    *sig,
+                    synth_deposit_tx(
+                        *sig,
+                        idx as u64 + 1,
+                        &program_id,
+                        &depositor,
+                        1_000,
+                        [9u8; 32],
+                        [11u8; 32],
+                    ),
+                );
+            }
+        }
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(100));
+
+        let mut state = make_state(mock);
+        state.batch_limit = 2;
+        state.program_id = program_id;
+        *state.last_signature.write().await = Some(old_cursor);
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, MAX_SIGNATURE_PAGES * 2);
+
+        // Crucial invariant: since page cap was hit without reaching old_cursor,
+        // last_signature must NOT advance, so older deposits are not permanently skipped.
+        assert_eq!(
+            *state.last_signature.read().await,
+            Some(old_cursor),
+            "cursor must not advance past un-scanned older transactions on page cap"
+        );
+    }
+
     #[test]
     fn contiguous_cursor_stops_before_the_first_failure() {
         let a = Signature::new_unique();
@@ -1452,7 +1549,7 @@ mod tests {
             }]));
         let state = make_state(mock);
         state.seen_signatures.write().await.insert(already_seen);
-        let events = EventListener::fetch_events(&state, None).await.unwrap();
+        let (events, _) = EventListener::fetch_events(&state, None).await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -1477,7 +1574,7 @@ mod tests {
                 block_time: None,
                 confirmation_status: None,
             }]));
-        let events = EventListener::fetch_events(&make_state(mock), None)
+        let (events, _) = EventListener::fetch_events(&make_state(mock), None)
             .await
             .unwrap();
         assert!(events.is_empty());
