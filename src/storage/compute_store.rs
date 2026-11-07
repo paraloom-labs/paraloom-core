@@ -224,8 +224,9 @@ impl ComputeStorage {
         let value = bincode::serialize(result)?;
         self.db.put_cf(cf, key, value)?;
 
-        // Remove from active jobs
+        // Remove from active jobs and pending jobs
         self.remove_active_job(&result.job_id)?;
+        self.remove_pending_job(&result.job_id)?;
 
         debug!("Stored result for job: {}", result.job_id);
         Ok(())
@@ -416,5 +417,16 @@ mod tests {
         let retrieved = storage.get_result(&job_id).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().job_id, job_id);
+
+        // Store result cleans up pending jobs too (never strands them)
+        let job2 = ComputeJob::new(vec![7], vec![8], ResourceLimits::default());
+        let job2_id = job2.id.clone();
+        storage.add_pending_job(&job2).unwrap();
+        assert_eq!(storage.count_pending_jobs().unwrap(), 1);
+
+        let result2 = crate::compute::JobResult::success(job2_id.clone(), vec![99], 50, 512, 10000);
+        storage.store_result(&result2).unwrap();
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+        assert!(storage.get_pending_job(&job2_id).unwrap().is_none());
     }
 }

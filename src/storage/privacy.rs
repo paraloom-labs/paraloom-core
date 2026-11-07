@@ -148,6 +148,10 @@ impl PrivacyStorage {
         start_index: u64,
         commitments: &[Commitment],
     ) -> Result<()> {
+        if commitments.is_empty() {
+            return Ok(());
+        }
+
         let cf = self
             .db
             .cf_handle(CF_MERKLE_TREE)
@@ -155,7 +159,9 @@ impl PrivacyStorage {
 
         let mut batch = rocksdb::WriteBatch::default();
         for (i, commitment) in commitments.iter().enumerate() {
-            let index = start_index + i as u64;
+            let index = start_index
+                .checked_add(i as u64)
+                .ok_or_else(|| anyhow!("Commitment index overflow in batch insert"))?;
             let key = index.to_le_bytes();
             batch.put_cf(cf, key, commitment.as_bytes());
         }
@@ -213,7 +219,18 @@ impl PrivacyStorage {
         }
 
         indexed.sort_by_key(|(index, _)| *index);
-        Ok(indexed.into_iter().map(|(_, c)| c).collect())
+
+        if indexed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let max_index = indexed.last().unwrap().0;
+        let mut commitments = vec![Commitment::from_bytes([0u8; 32]); (max_index + 1) as usize];
+        for (index, c) in indexed {
+            commitments[index as usize] = c;
+        }
+
+        Ok(commitments)
     }
 
     // ========== Nullifier Set Operations ==========
@@ -253,6 +270,10 @@ impl PrivacyStorage {
     /// `WriteBatch`. All-or-nothing relative to a crash, with one
     /// fsync amortised across the whole batch.
     pub fn insert_nullifiers_batch(&self, nullifiers: &[Nullifier]) -> Result<()> {
+        if nullifiers.is_empty() {
+            return Ok(());
+        }
+
         let cf = self
             .db
             .cf_handle(CF_NULLIFIER_SET)
@@ -274,7 +295,11 @@ impl PrivacyStorage {
             .cf_handle(CF_NULLIFIER_SET)
             .ok_or_else(|| anyhow!("Nullifier set CF not found"))?;
 
+        let mut seen = std::collections::HashSet::new();
         for nullifier in nullifiers {
+            if !seen.insert(nullifier.as_bytes()) {
+                return Ok(false); // Intra-batch duplicate
+            }
             if self.db.get_cf(cf, nullifier.as_bytes())?.is_some() {
                 return Ok(false); // Found spent nullifier
             }
@@ -700,5 +725,58 @@ mod tests {
                  follow numeric index order, not RocksDB bytewise key order"
             );
         }
+    }
+
+    #[test]
+    fn test_get_all_commitments_sparse_indices() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        let c1 = Commitment([1u8; 32]);
+        let c4 = Commitment([4u8; 32]);
+
+        // Sparse insert: index 1 and index 4
+        storage.insert_commitment(1, &c1).unwrap();
+        storage.insert_commitment(4, &c4).unwrap();
+
+        let all = storage.get_all_commitments().unwrap();
+        // Should span from 0 to 4 (len 5), with gaps filled by empty commitments
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], Commitment([0u8; 32]));
+        assert_eq!(all[1], c1);
+        assert_eq!(all[2], Commitment([0u8; 32]));
+        assert_eq!(all[3], Commitment([0u8; 32]));
+        assert_eq!(all[4], c4);
+    }
+
+    #[test]
+    fn test_check_nullifiers_batch_intra_batch_duplicates() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        let n1 = Nullifier([10u8; 32]);
+        // Duplicate in batch must fail
+        assert!(!storage
+            .check_nullifiers_batch(&[n1.clone(), n1.clone()])
+            .unwrap());
+
+        let n2 = Nullifier([20u8; 32]);
+        // Distinct unspent must pass
+        assert!(storage.check_nullifiers_batch(&[n1, n2]).unwrap());
+    }
+
+    #[test]
+    fn test_batch_operations_empty_and_overflow() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        // Empty batches succeed as no-op
+        storage.insert_commitments_batch(0, &[]).unwrap();
+        storage.insert_nullifiers_batch(&[]).unwrap();
+
+        // Index overflow in batch insert
+        let commitments = vec![Commitment([1u8; 32]), Commitment([2u8; 32])];
+        let res = storage.insert_commitments_batch(u64::MAX, &commitments);
+        assert!(res.is_err());
     }
 }

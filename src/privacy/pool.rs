@@ -138,6 +138,36 @@ impl ShieldedPool {
             return Ok(commitment);
         }
 
+        // Validate BEFORE mutating commitment tree
+        if amount == 0 {
+            return Err(anyhow!("deposit amount must be greater than zero"));
+        }
+
+        if note.amount > amount {
+            return Err(anyhow!(
+                "note amount {} cannot exceed deposit amount {}",
+                note.amount,
+                amount
+            ));
+        }
+
+        if note.asset_id != asset_id {
+            return Err(anyhow!("note asset ID does not match deposit asset ID"));
+        }
+
+        if commitment.as_bytes() == &[0u8; 32] {
+            return Err(anyhow!("zero commitment cannot be credited"));
+        }
+
+        // Validate supply overflow before mutating the tree
+        let new_supply = {
+            let supplies = self.supplies.read().await;
+            let current = supplies.get(&asset_id).copied().unwrap_or(0);
+            current
+                .checked_add(amount)
+                .ok_or_else(|| anyhow!("supply overflow for asset"))?
+        };
+
         // Add to commitment tree (auto-persists if storage available).
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
@@ -153,12 +183,11 @@ impl ShieldedPool {
 
         // Credit this asset's supply
         let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
+        supplies.insert(asset_id, new_supply);
 
         // Persist the asset's supply to storage if available
         if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
+            storage.set_asset_supply(&asset_id, new_supply)?;
         }
 
         Ok(commitment)
@@ -487,5 +516,54 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn credit_commitment_does_not_mutate_tree_on_invalid_inputs() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([3u8; 32]);
+        let usdc: AssetId = [9u8; 32];
+        let note = Note::new(addr.clone(), 100, [1u8; 32], usdc);
+        let commitment = Commitment([42u8; 32]);
+
+        // Initial commitment count must be 0
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // 1. amount == 0
+        let zero_amount_note = Note::new(addr.clone(), 0, [1u8; 32], usdc);
+        let res = pool
+            .credit_commitment(commitment.clone(), zero_amount_note, 0, usdc)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // 2. note.amount > amount (note claims more than deposited)
+        let excessive_note = Note::new(addr.clone(), 200, [1u8; 32], usdc);
+        let res = pool
+            .credit_commitment(commitment.clone(), excessive_note, 100, usdc)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // 3. note.asset_id != asset_id
+        let res = pool
+            .credit_commitment(commitment.clone(), note.clone(), 100, NATIVE_SOL_ASSET)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // 4. zero commitment
+        let zero_comm = Commitment([0u8; 32]);
+        let res = pool
+            .credit_commitment(zero_comm, note.clone(), 100, usdc)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // Valid credit must succeed and increment commitment count to 1
+        let res = pool.credit_commitment(commitment, note, 100, usdc).await;
+        assert!(res.is_ok());
+        assert_eq!(pool.commitment_count().await, 1);
+        assert_eq!(pool.supply_of(usdc).await, 100);
     }
 }
