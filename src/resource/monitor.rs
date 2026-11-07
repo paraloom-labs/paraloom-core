@@ -24,12 +24,15 @@ impl ResourceMonitor {
         let mut system = System::new_all();
         system.refresh_all();
 
-        let contribution = ResourceContribution {
-            cpu_cores: system.cpus().len() as u8,
-            memory_mb: 0,      // Will be updated later
-            storage_mb: 0,     // Will be updated later
-            bandwidth_kbps: 0, // Will be measured later
-        };
+        let max_cpu_usage = max_cpu_usage.min(100);
+        let max_memory_usage = max_memory_usage.min(100);
+
+        let contribution = Self::calculate_contribution(
+            &system,
+            max_cpu_usage,
+            max_memory_usage,
+            max_storage_usage,
+        );
 
         ResourceMonitor {
             system: Arc::new(Mutex::new(system)),
@@ -37,6 +40,44 @@ impl ResourceMonitor {
             max_cpu_usage,
             max_memory_usage,
             max_storage_usage,
+        }
+    }
+
+    /// Calculate contribution metrics from system state and limits
+    fn calculate_contribution(
+        sys: &System,
+        _max_cpu_usage: u8,
+        max_memory_usage: u8,
+        max_storage_usage: u64,
+    ) -> ResourceContribution {
+        // CPU information
+        let cpu_cores = sys.cpus().len() as u8;
+
+        // RAM information - Calculate based on total memory and max usage percentage clamped to 100%
+        let effective_memory_usage = max_memory_usage.min(100);
+        let total_memory_kb = sys.total_memory();
+        let total_memory_mb = total_memory_kb / 1024;
+        let memory_limit_kb =
+            (total_memory_kb as f64 * (effective_memory_usage as f64 / 100.0)) as u64;
+        let memory_mb = std::cmp::min(memory_limit_kb / 1024, total_memory_mb);
+
+        // Disk information - Calculate based on available space and max usage limit
+        let mut total_available_mb = 0;
+        for disk in sys.disks() {
+            total_available_mb += disk.available_space() / (1024 * 1024); // Bytes to MB conversion
+        }
+
+        let storage_mb = std::cmp::min(total_available_mb, max_storage_usage);
+
+        // Bandwidth estimation (a more complex method would be needed for actual measurement)
+        // For now, we assume 10 Mbps (10000 Kbps), real testing to be added later
+        let bandwidth_kbps = 10000;
+
+        ResourceContribution {
+            cpu_cores,
+            memory_mb,
+            storage_mb,
+            bandwidth_kbps,
         }
     }
 
@@ -95,32 +136,15 @@ impl ResourceMonitor {
     async fn update_contribution(
         system: Arc<Mutex<System>>,
         contribution: Arc<Mutex<ResourceContribution>>,
-        _max_cpu_usage: u8,
+        max_cpu_usage: u8,
         max_memory_usage: u8,
         max_storage_usage: u64,
     ) {
         let sys = system.lock().unwrap();
+        let updated =
+            Self::calculate_contribution(&sys, max_cpu_usage, max_memory_usage, max_storage_usage);
         let mut contrib = contribution.lock().unwrap();
-
-        // CPU information
-        contrib.cpu_cores = sys.cpus().len() as u8;
-
-        // RAM information - Calculate based on total memory and max usage percentage
-        let total_memory_kb = sys.total_memory();
-        let memory_limit_kb = (total_memory_kb as f64 * (max_memory_usage as f64 / 100.0)) as u64;
-        contrib.memory_mb = memory_limit_kb / 1024; // KB to MB conversion
-
-        // Disk information - Calculate based on available space and max usage limit
-        let mut total_available_mb = 0;
-        for disk in sys.disks() {
-            total_available_mb += disk.available_space() / (1024 * 1024); // Bytes to MB conversion
-        }
-
-        contrib.storage_mb = std::cmp::min(total_available_mb, max_storage_usage);
-
-        // Bandwidth estimation (a more complex method would be needed for actual measurement)
-        // For now, we assume 10 Mbps (10000 Kbps), real testing to be added later
-        contrib.bandwidth_kbps = 10000;
+        *contrib = updated;
     }
 
     /// Check for GPU information (if available)
@@ -162,5 +186,31 @@ impl ResourceMonitor {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contribution_nonzero_before_first_tick() {
+        let monitor = ResourceMonitor::new(80, 70, 10240);
+        let contrib = monitor.get_contribution();
+        assert!(contrib.cpu_cores > 0);
+        assert!(contrib.memory_mb > 0);
+        assert_eq!(contrib.bandwidth_kbps, 10000);
+    }
+
+    #[test]
+    fn test_contribution_clamps_over_100_percent_limits() {
+        let monitor = ResourceMonitor::new(150, 200, 10240);
+        let contrib = monitor.get_contribution();
+
+        let sys = monitor.system.lock().unwrap();
+        let total_memory_mb = sys.total_memory() / 1024;
+        assert!(contrib.memory_mb <= total_memory_mb);
+        assert_eq!(monitor.max_cpu_usage, 100);
+        assert_eq!(monitor.max_memory_usage, 100);
     }
 }

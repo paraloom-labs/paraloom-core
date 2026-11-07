@@ -82,10 +82,20 @@ impl ModelRunner for GraniteModelRunner {
         stream.read_to_end(&mut raw)?;
 
         let response = String::from_utf8_lossy(&raw);
-        let json_body = response
+        let (headers, json_body) = response
             .split_once("\r\n\r\n")
-            .map(|(_, body)| body)
             .ok_or_else(|| anyhow!("llama-server response had no body"))?;
+
+        let status_line = headers.lines().next().unwrap_or("");
+        let mut parts = status_line.split_whitespace();
+        let version = parts.next().unwrap_or("");
+        let status_code: u16 = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+        if !version.starts_with("HTTP/") || !(200..=299).contains(&status_code) {
+            return Err(anyhow!(
+                "llama-server returned HTTP {status_code}: {status_line}"
+            ));
+        }
+
         let parsed: serde_json::Value = serde_json::from_str(json_body.trim())
             .map_err(|e| anyhow!("llama-server returned invalid JSON: {e}"))?;
         let content = parsed
@@ -112,6 +122,25 @@ mod tests {
         // Port 1 is not served; the connection fails cleanly.
         let runner = GraniteModelRunner::new("http://127.0.0.1:1");
         assert!(runner.run(b"hello").is_err());
+    }
+
+    #[test]
+    fn llama_server_http_error_is_rejected() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 17\r\n\r\n{\"error\": \"failed\"}";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let runner = GraniteModelRunner::new(format!("http://127.0.0.1:{port}"));
+        let err = runner.run(b"test").unwrap_err();
+        assert!(err.to_string().contains("HTTP 500"));
     }
 
     /// End-to-end against a real `llama-server`. Ignored by default — run locally
