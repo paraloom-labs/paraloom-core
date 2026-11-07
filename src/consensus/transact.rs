@@ -745,6 +745,63 @@ impl TransactVerificationCoordinator {
         }
     }
 
+    /// Calculate the minimum number of co-signers (including the leader authority)
+    /// required to satisfy the on-chain 2/3 stake quorum (#1504).
+    ///
+    /// If on-chain stakes are available, determines how many validators from
+    /// `candidate_wallets` are needed to clear `floor(2 * eligible_stake / 3) + 1`.
+    /// Otherwise falls back to the configured consensus threshold (e.g. 7-of-10 BFT).
+    pub async fn required_cosign_threshold<S: AsRef<str>>(&self, candidate_wallets: &[S]) -> usize {
+        let local = match &self.local_wallet {
+            Some(w) => w,
+            None => {
+                return self.min_validators_for_consensus;
+            }
+        };
+
+        let onchain_stakes = self.onchain_stakes.read().await;
+        let registry_total = *self.onchain_registry_total.read().await;
+        let authority_stake = onchain_stakes.get(local).copied().unwrap_or(0);
+        let eligible_stake = registry_total.saturating_sub(authority_stake);
+
+        if eligible_stake == 0 {
+            return self.min_validators_for_consensus;
+        }
+
+        let threshold_stake = eligible_stake.saturating_mul(2) / 3 + 1;
+        let equivocators = self.equivocators.read().await;
+
+        let mut stakes: Vec<u64> = candidate_wallets
+            .iter()
+            .filter_map(|w| {
+                let s = w.as_ref();
+                if s == local || equivocators.contains(s) {
+                    None
+                } else {
+                    onchain_stakes.get(s).copied()
+                }
+            })
+            .collect();
+
+        stakes.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut cum_stake: u64 = 0;
+        let mut needed_peers = 0;
+        for s in stakes {
+            if cum_stake >= threshold_stake {
+                break;
+            }
+            cum_stake = cum_stake.saturating_add(s);
+            needed_peers += 1;
+        }
+
+        if cum_stake < threshold_stake {
+            return candidate_wallets.len();
+        }
+
+        1 + needed_peers
+    }
+
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
     /// flap-surviving driver-auth check (replaces `is_registered_validator`,
     /// which used the flap-prone `self.validators`). The leader_selector entry
@@ -1571,5 +1628,53 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn required_cosign_threshold_mirrors_onchain_stake_rules() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(7, 10);
+
+        // 1. Unconfigured local wallet: falls back to consensus threshold (7)
+        let candidates = vec!["W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9", "W10"];
+        assert_eq!(
+            coordinator.required_cosign_threshold(&candidates).await,
+            7,
+            "unconfigured local wallet must use min_validators_for_consensus"
+        );
+
+        // 2. Configured local wallet with on-chain stakes
+        // Total registry: 10_000. Authority: 1_000.
+        // Eligible stake = 9_000. 2/3 stake threshold = 9_000 * 2 / 3 + 1 = 6_001.
+        coordinator = coordinator.with_local_wallet("AUTHORITY".to_string());
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[
+                    ("AUTHORITY", 1_000),
+                    ("W1", 4_000),
+                    ("W2", 3_000),
+                    ("W3", 2_000),
+                ]),
+                10_000,
+            )
+            .await;
+
+        let wallets = vec!["AUTHORITY", "W1", "W2", "W3"];
+        // W1 (4_000) + W2 (3_000) = 7_000 >= 6_001 (2 peers needed, plus leader = 3 total)
+        assert_eq!(
+            coordinator.required_cosign_threshold(&wallets).await,
+            3,
+            "two largest peers (4k+3k=7k >= 6001) plus leader must satisfy threshold"
+        );
+
+        // If candidate peers cannot reach the stake threshold, falls back safely to candidates length
+        let insufficient_wallets = vec!["AUTHORITY", "W3"]; // W3 only has 2_000 < 6_001
+        assert_eq!(
+            coordinator
+                .required_cosign_threshold(&insufficient_wallets)
+                .await,
+            insufficient_wallets.len(),
+            "insufficient candidate stake must fall back safely to total candidate count"
+        );
     }
 }

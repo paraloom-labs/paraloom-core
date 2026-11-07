@@ -34,7 +34,9 @@ use std::future::Future;
 /// - `peers` are the other approving validators to request signatures from,
 ///   paired with the libp2p node to send to.
 /// - `threshold` is how many distinct, verified signatures must be collected
-///   (the on-chain quorum size).
+///   (the on-chain quorum size). If some peers decline or time out but the
+///   collected count satisfies `threshold`, the round re-assembles with the
+///   responsive co-signer subset (#1504).
 /// - `send` performs one co-sign request, yielding the peer's response or
 ///   `None` on decline/timeout.
 ///
@@ -64,7 +66,7 @@ where
         bridge_vault: bridge_vault.to_bytes(),
         blockhash,
         quorum_validators: quorum_wallets.iter().map(|p| p.to_bytes()).collect(),
-        params,
+        params: params.clone(),
     };
 
     let message = build_settlement_message(&payload)?;
@@ -76,25 +78,111 @@ where
         message: payload.to_bytes()?,
     };
 
-    let collected = gather_signatures(
-        &message,
-        (leader.pubkey(), own_sig),
-        peers,
-        threshold,
-        |peer| {
-            let send = &send;
-            let request = request.clone();
-            async move {
-                let response = send(peer, request).await?;
-                let sig = response.signature?;
-                let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
-                Some((wallet, sig))
-            }
-        },
-    )
-    .await?;
+    let message_bytes = message.serialize();
+    let expected: std::collections::HashSet<Pubkey> = peers.iter().map(|(w, _)| *w).collect();
 
-    assemble_transaction(message, &collected)
+    let mut collected: std::collections::HashMap<Pubkey, Vec<u8>> =
+        std::collections::HashMap::new();
+    if !crate::bridge::solana::cosign_assembly::signature_is_valid(
+        &leader.pubkey(),
+        &own_sig,
+        &message_bytes,
+    ) {
+        return Err(crate::bridge::BridgeError::Serialization(
+            "leader's own co-sign signature does not verify".to_string(),
+        ));
+    }
+    collected.insert(leader.pubkey(), own_sig);
+
+    for (_, peer) in peers {
+        let Some(response) = send(peer.clone(), request.clone()).await else {
+            continue; // declined or timed out
+        };
+        let Some(sig) = response.signature else {
+            continue;
+        };
+        let Ok(wallet) = response.wallet_pubkey.parse::<Pubkey>() else {
+            continue;
+        };
+        if !expected.contains(&wallet) || collected.contains_key(&wallet) {
+            continue;
+        }
+        if !crate::bridge::solana::cosign_assembly::signature_is_valid(
+            &wallet,
+            &sig,
+            &message_bytes,
+        ) {
+            log::warn!("co-sign signature from {wallet} did not verify; ignoring");
+            continue;
+        }
+        collected.insert(wallet, sig);
+    }
+
+    if collected.len() < threshold {
+        return Err(crate::bridge::BridgeError::Serialization(format!(
+            "co-sign quorum not reached: {} of {} signatures",
+            collected.len(),
+            threshold
+        )));
+    }
+
+    if collected.len() < quorum_wallets.len() {
+        // A subset of peers declined or timed out, but the collected signatures
+        // meet or exceed the on-chain threshold (#1504). Re-assemble with the
+        // responsive co-signer subset so the transaction does not require missing signatures.
+        let responsive_wallets: Vec<Pubkey> = quorum_wallets
+            .iter()
+            .copied()
+            .filter(|w| collected.contains_key(w))
+            .collect();
+        let responsive_peers: Vec<(Pubkey, NodeId)> = peers
+            .iter()
+            .filter(|(w, _)| collected.contains_key(w))
+            .cloned()
+            .collect();
+
+        let fallback_payload = CoSignPayload {
+            program_id: program_id.to_bytes(),
+            authority: leader.pubkey().to_bytes(),
+            bridge_vault: bridge_vault.to_bytes(),
+            blockhash,
+            quorum_validators: responsive_wallets.iter().map(|p| p.to_bytes()).collect(),
+            params,
+        };
+
+        let fallback_message = build_settlement_message(&fallback_payload)?;
+        let fallback_own_sig = leader
+            .sign_message(&fallback_message.serialize())
+            .as_ref()
+            .to_vec();
+        let fallback_request = CoSignRequest {
+            request_id: request_id.to_string(),
+            kind,
+            message: fallback_payload.to_bytes()?,
+        };
+
+        let fallback_collected = gather_signatures(
+            &fallback_message,
+            (leader.pubkey(), fallback_own_sig),
+            &responsive_peers,
+            responsive_wallets.len(),
+            |peer| {
+                let send = &send;
+                let request = fallback_request.clone();
+                async move {
+                    let response = send(peer, request).await?;
+                    let sig = response.signature?;
+                    let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
+                    Some((wallet, sig))
+                }
+            },
+        )
+        .await?;
+
+        assemble_transaction(fallback_message, &fallback_collected)
+    } else {
+        assemble_transaction(message, &collected)
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +283,55 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn assembles_transaction_when_co_signer_declines_but_threshold_is_met() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+
+        // 3 validators in the quorum, but threshold is 2 (2/3 quorum: leader + 1 peer) (#1504).
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey(), p2.pubkey()];
+        let peers = vec![
+            (p1.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+        ];
+
+        // p1 co-signs, but p2 declines/refuses.
+        let tx = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            2,
+            |peer, request| {
+                let p1 = &p1;
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        Some(honest_response(p1, &request))
+                    } else {
+                        None // p2 refuses to co-sign
+                    }
+                }
+            },
+        )
+        .await
+        .expect("round completes with fallback responsive subset");
+
+        assert!(
+            tx.verify().is_ok(),
+            "the fallback assembled transaction must verify"
+        );
+        assert_eq!(
+            tx.signatures.len(),
+            2,
+            "leader plus the responsive co-signer must have signed"
+        );
     }
 }
