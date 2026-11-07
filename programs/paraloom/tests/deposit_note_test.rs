@@ -375,6 +375,105 @@ async fn deposit_note_enforces_the_deposit_cap() {
     assert_eq!(tree.next_index, 1, "only the in-cap deposit was appended");
 }
 
+/// Permissionless donations directly to `bridge_vault` do not grief deposit liveness (#1507).
+/// The cap is enforced against recorded user liabilities (`total_deposited - total_withdrawn`),
+/// not the raw physical lamports on the vault PDA.
+#[tokio::test]
+async fn deposit_note_cap_resilient_to_permissionless_donations() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    // Cap set to exactly two deposits (2 * AMOUNT).
+    let cap = AMOUNT * 2;
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        cap,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    // Permissionless direct donation: transfer 5 * AMOUNT directly to bridge_vault,
+    // which exceeds the entire deposit cap (2 * AMOUNT).
+    let donation_amount = AMOUNT * 5;
+    let donate_ix = anchor_lang::solana_program::system_instruction::transfer(
+        &payer.pubkey(),
+        &bridge_vault_pda,
+        donation_amount,
+    );
+    let mut donate_tx = Transaction::new_with_payer(&[donate_ix], Some(&payer.pubkey()));
+    donate_tx.sign(&[&payer], blockhash);
+    banks.process_transaction(donate_tx).await.unwrap();
+
+    let vault_balance = banks.get_balance(bridge_vault_pda).await.unwrap();
+    assert!(
+        vault_balance >= donation_amount,
+        "vault balance now far exceeds the cap due to donation"
+    );
+
+    let deposit_ix = |pk: u8, bl: u8| {
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = pk;
+        let mut blinding = [0u8; 32];
+        blinding[0] = bl;
+        Instruction {
+            program_id,
+            data: instruction::DepositNote {
+                amount: AMOUNT,
+                pubkey,
+                blinding,
+            }
+            .data(),
+            accounts: accounts::DepositNote {
+                bridge_state: bridge_state_pda,
+                bridge_vault: bridge_vault_pda,
+                merkle_tree: tree_pda,
+                depositor: payer.pubkey(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        }
+    };
+
+    // First legitimate deposit: accepted despite raw vault balance > cap.
+    let mut tx = Transaction::new_with_payer(&[deposit_ix(11, 21)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Second legitimate deposit: fills recorded liabilities to the cap (2 * AMOUNT) — accepted.
+    let mut tx = Transaction::new_with_payer(&[deposit_ix(12, 22)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Third legitimate deposit: would push liabilities past cap — rejected.
+    let mut tx = Transaction::new_with_payer(&[deposit_ix(13, 23)], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    let result = banks.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "a deposit pushing recorded liabilities past cap must be rejected"
+    );
+
+    // Exactly two legitimate note leaves appended to the tree.
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 2, "two note deposits appended to tree");
+
+    let sraw = banks.get_account(bridge_state_pda).await.unwrap().unwrap();
+    let state = BridgeState::try_deserialize(&mut sraw.data.as_slice()).unwrap();
+    assert_eq!(state.total_deposited, 2 * AMOUNT);
+}
+
 /// Raising the cap is a cold-authority operation: a signer that is not the
 /// registry authority cannot lift the loss ceiling, even though the bridge is
 /// otherwise permissionless to deposit into.
