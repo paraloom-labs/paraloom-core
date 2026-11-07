@@ -21,6 +21,7 @@
 //! against the verifying key and knows nothing about the QAP reduction.
 
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
+use ark_ec::AffineRepr;
 use ark_ff::{Field, PrimeField, Zero};
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
@@ -163,10 +164,19 @@ fn main() -> Res<()> {
         )
         .into());
     }
+    if zkey.num_vars < zkey.ic.len() {
+        return Err(format!(
+            "nVars ({}) must be at least IC length ({})",
+            zkey.num_vars,
+            zkey.ic.len()
+        )
+        .into());
+    }
     for (name, len) in [
         ("A", zkey.a.len()),
         ("B1", zkey.b1.len()),
         ("B2", zkey.b2.len()),
+        ("C", zkey.c.len()),
     ] {
         if len != zkey.num_vars {
             return Err(format!(
@@ -206,16 +216,32 @@ fn main() -> Res<()> {
     );
     println!("(every point is checked on-curve and in-subgroup)");
 
+    let alpha_g1 = g1(&zkey.vk_alpha_1, "vk_alpha_1")?;
+    let beta_g1 = g1(&zkey.vk_beta_1, "vk_beta_1")?;
+    let beta_g2 = g2(&zkey.vk_beta_2, "vk_beta_2")?;
+    let gamma_g2 = g2(&zkey.vk_gamma_2, "vk_gamma_2")?;
+    let delta_g1 = g1(&zkey.vk_delta_1, "vk_delta_1")?;
+    let delta_g2 = g2(&zkey.vk_delta_2, "vk_delta_2")?;
+    if alpha_g1.is_zero()
+        || beta_g1.is_zero()
+        || beta_g2.is_zero()
+        || gamma_g2.is_zero()
+        || delta_g1.is_zero()
+        || delta_g2.is_zero()
+    {
+        return Err("verifying/proving key structural points (alpha/beta/gamma/delta) must not be the identity".into());
+    }
+
     let pk = ProvingKey::<Bn254> {
         vk: VerifyingKey {
-            alpha_g1: g1(&zkey.vk_alpha_1, "vk_alpha_1")?,
-            beta_g2: g2(&zkey.vk_beta_2, "vk_beta_2")?,
-            gamma_g2: g2(&zkey.vk_gamma_2, "vk_gamma_2")?,
-            delta_g2: g2(&zkey.vk_delta_2, "vk_delta_2")?,
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
             gamma_abc_g1: g1_vec(&zkey.ic, "IC")?,
         },
-        beta_g1: g1(&zkey.vk_beta_1, "vk_beta_1")?,
-        delta_g1: g1(&zkey.vk_delta_1, "vk_delta_1")?,
+        beta_g1,
+        delta_g1,
         a_query: g1_vec(&zkey.a, "A")?,
         b_g1_query: g1_vec(&zkey.b1, "B1")?,
         b_g2_query: zkey

@@ -46,7 +46,7 @@
 
 use ark_bn254::{Bn254, Fr, G1Affine, G2Affine};
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{Field, PrimeField, UniformRand, Zero};
+use ark_ff::{Field, One, PrimeField, UniformRand, Zero};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::RngCore;
@@ -116,7 +116,7 @@ pub fn apply_contribution<R: RngCore>(
     delta_i: Fr,
     rng: &mut R,
 ) -> Result<DleqProof, BgmError> {
-    if delta_i.is_zero() {
+    if delta_i.is_zero() || delta_i.is_one() || pk.delta_g1.is_zero() || pk.vk.delta_g2.is_zero() {
         return Err(BgmError::ZeroContribution);
     }
     let delta_inv = delta_i.inverse().ok_or(BgmError::ZeroContribution)?;
@@ -132,7 +132,10 @@ pub fn apply_contribution<R: RngCore>(
     let delta_after_g1 = pk.delta_g1;
     let delta_after_g2 = pk.vk.delta_g2;
 
-    let k = Fr::rand(rng);
+    let mut k = Fr::rand(rng);
+    if k.is_zero() {
+        k = Fr::one();
+    }
     let r_g1 = (delta_before_g1 * k).into_affine();
     let r_g2 = (delta_before_g2 * k).into_affine();
     let c = fiat_shamir_challenge(
@@ -184,8 +187,17 @@ pub fn verify_contribution_deltas(
     delta_after_g2: &G2Affine,
     proof: &DleqProof,
 ) -> Result<(), BgmError> {
-    if delta_after_g1.is_zero() || delta_after_g2.is_zero() {
+    if delta_before_g1.is_zero()
+        || delta_before_g2.is_zero()
+        || delta_after_g1.is_zero()
+        || delta_after_g2.is_zero()
+        || delta_after_g1 == delta_before_g1
+        || delta_after_g2 == delta_before_g2
+    {
         return Err(BgmError::ZeroContribution);
+    }
+    if proof.r_g1.is_zero() || proof.r_g2.is_zero() {
+        return Err(BgmError::MalformedDleqProof);
     }
 
     let c = fiat_shamir_challenge(
@@ -449,5 +461,42 @@ mod tests {
             let expected = (*before * delta_inv).into_affine();
             assert_eq!(*after, expected, "l_query[{}] mismatch", i);
         }
+    }
+
+    #[test]
+    fn identity_contribution_and_zero_nonce_are_rejected() {
+        let pk_before = fresh_pk();
+        let mut pk = pk_before.clone();
+        let mut rng = test_rng();
+
+        // Identity scalar (delta_i == 1) leaves delta unchanged and must be rejected.
+        assert!(matches!(
+            apply_contribution(&mut pk, Fr::one(), &mut rng),
+            Err(BgmError::ZeroContribution)
+        ));
+        assert!(matches!(
+            verify_contribution_deltas(
+                &pk_before.delta_g1,
+                &pk_before.delta_g1,
+                &pk_before.vk.delta_g2,
+                &pk_before.vk.delta_g2,
+                &DleqProof {
+                    r_g1: pk_before.delta_g1,
+                    r_g2: pk_before.vk.delta_g2,
+                    s: Fr::one(),
+                },
+            ),
+            Err(BgmError::ZeroContribution)
+        ));
+
+        // A DLEQ proof with k = 0 (identity r_g1 / r_g2) leaks delta_i and must be rejected.
+        let mut pk_after = pk_before.clone();
+        let delta_i = Fr::rand(&mut rng);
+        let mut proof = apply_contribution(&mut pk_after, delta_i, &mut rng).unwrap();
+        proof.r_g1 = G1Affine::identity();
+        assert!(matches!(
+            verify_contribution(&pk_before, &pk_after, &proof),
+            Err(BgmError::MalformedDleqProof)
+        ));
     }
 }
