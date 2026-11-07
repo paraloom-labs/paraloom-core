@@ -40,17 +40,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_program = client.get_account(&stake_mint)?.owner;
 
     let (vault, _) = derive_stake_token_vault(&program_id);
+    let (registry_pda, _) = derive_validator_registry(&program_id);
 
     println!("=== init stake token vault ===");
-    println!("Program:       {program_id}");
-    println!("Authority:     {}", authority.pubkey());
-    println!("Stake mint:    {stake_mint}");
-    println!("Token program: {token_program}");
-    println!("Vault PDA:     {vault}");
+    println!("Program:            {program_id}");
+    println!("Authority:          {}", authority.pubkey());
+    println!("Stake mint:         {stake_mint}");
+    println!("Token program:      {token_program}");
+    println!("Vault PDA:          {vault}");
+    println!("Validator registry: {registry_pda}");
 
     if client.get_account(&vault).is_ok() {
         println!("\nVault already exists — nothing to do.");
         return Ok(());
+    }
+
+    // Pre-flight check: verify STAKE_MINT against on-chain validator_registry
+    // if the registry has already been migrated/initialized to the dual-stake layout.
+    if let Ok(registry_data) = client.get_account_data(&registry_pda) {
+        if registry_data.len() >= 112 {
+            let onchain_stake_mint = Pubkey::new_from_array(
+                registry_data[72..104]
+                    .try_into()
+                    .map_err(|_| "invalid stake_mint slice in validator_registry")?,
+            );
+            if onchain_stake_mint != Pubkey::default() && onchain_stake_mint != stake_mint {
+                return Err(format!(
+                    "STAKE_MINT ({stake_mint}) does not match on-chain validator_registry.stake_mint ({onchain_stake_mint})"
+                )
+                .into());
+            }
+        }
     }
 
     let ix = create_init_stake_token_vault_instruction(

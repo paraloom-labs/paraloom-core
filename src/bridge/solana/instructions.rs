@@ -371,9 +371,9 @@ pub fn create_register_validator_instruction(
 /// Build an `init_stake_token_vault` instruction — the dual-stake vault migration
 /// for a registry that predates the vault. Upgrade-authority-signed. Account
 /// order matches the on-chain `InitStakeTokenVault` context: authority,
-/// stake_mint, stake_token_vault, stake_vault_authority, program_data,
-/// token_program, system_program, rent. `token_program` must be the program that
-/// owns `stake_mint` (classic SPL Token or Token-2022).
+/// stake_mint, stake_token_vault, stake_vault_authority, validator_registry,
+/// program_data, token_program, system_program, rent. `token_program` must be
+/// the program that owns `stake_mint` (classic SPL Token or Token-2022).
 pub fn create_init_stake_token_vault_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -383,6 +383,7 @@ pub fn create_init_stake_token_vault_instruction(
     let (stake_token_vault, _) = derive_stake_token_vault(program_id);
     let (stake_vault_authority, _) =
         Pubkey::find_program_address(&[b"stake_vault_authority"], program_id);
+    let (validator_registry, _) = derive_validator_registry(program_id);
     let (program_data_pda, _) = derive_program_data(program_id);
 
     Ok(Instruction {
@@ -392,6 +393,7 @@ pub fn create_init_stake_token_vault_instruction(
             AccountMeta::new_readonly(*stake_mint, false),
             AccountMeta::new(stake_token_vault, false),
             AccountMeta::new_readonly(stake_vault_authority, false),
+            AccountMeta::new_readonly(validator_registry, false),
             AccountMeta::new_readonly(program_data_pda, false),
             AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
