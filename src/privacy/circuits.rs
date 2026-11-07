@@ -178,14 +178,12 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuitV2 {
                 .unwrap_or_else(|| Fr::from(0u64)))
         })?;
 
-        // CONSTRAINT 1: input_value >= withdraw_amount (change is u64-bounded).
-        let change_value = match (self.input_value, self.withdraw_amount) {
-            (Some(input), Some(withdraw)) => Some(input.saturating_sub(withdraw)),
-            _ => None,
-        };
-        let (_change_bits, change_var) = alloc_u64_witness(cs.clone(), change_value)?;
-        let computed_change = &input_value_var - &withdraw_amount_var;
-        change_var.enforce_equal(&computed_change)?;
+        // CONSTRAINT 1: exact full spend (input_value == withdraw_amount).
+        // WithdrawCircuitV2 has no change output note commitment in its public
+        // inputs or constraint system. A partial withdrawal (withdraw_amount < input_value)
+        // would nullify the input note while silently destroying the unspent remainder.
+        // Enforce exact equality so no change is destroyed (#1506).
+        input_value_var.enforce_equal(&withdraw_amount_var)?;
 
         // CONSTRAINT 2: the note commitment binds the spend public key.
         let pubkey_var = poseidon_pubkey_gadget(cs.clone(), &privkey_var)?;
@@ -862,7 +860,7 @@ mod tests {
     // --- WithdrawCircuitV2 (spend-key construction, #293) ---
 
     /// A consistent v2 withdraw witness set: a note owned by `privkey` at tree
-    /// position 2 (path = left@0, right@1), withdrawing 500 of 1000. Returns the
+    /// position 2 (path = left@0, right@1), withdrawing 1000 of 1000 (full spend). Returns the
     /// pieces so tests can tamper individually.
     #[allow(clippy::type_complexity)]
     fn v2_withdraw_parts() -> (
@@ -879,7 +877,7 @@ mod tests {
         let blinding = [3u8; 32];
         let asset = [0u8; 32];
         let input_value = 1_000u64;
-        let withdraw_amount = 500u64;
+        let withdraw_amount = 1_000u64;
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
         let pubkey = poseidon_pubkey(sk);
@@ -980,14 +978,30 @@ mod tests {
 
     #[test]
     fn withdraw_v2_rejects_underflow() {
-        // withdraw_amount > input_value; the commitment/nullifier are unchanged
-        // (they don't depend on the withdraw amount), so only the change range
-        // constraint traps it.
+        // withdraw_amount > input_value; the full-spend equality constraint traps it.
         let (root, nf, _wd, val, bl, pk, asset, path) = v2_withdraw_parts();
         assert!(!synth_v2(WithdrawCircuitV2 {
             merkle_root: Some(root),
             nullifier: Some(nf),
             withdraw_amount: Some(2_000), // > input_value (1000)
+            ext_data_hash: Some([7u8; 32]),
+            input_value: Some(val),
+            blinding: Some(bl),
+            privkey: Some(pk),
+            asset_id: Some(asset),
+            input_path: Some(path),
+        }));
+    }
+
+    #[test]
+    fn withdraw_v2_rejects_partial_spend() {
+        // Partial withdrawal (withdraw_amount < input_value) is rejected because
+        // v2 has no change output commitment and would otherwise burn user funds (#1506).
+        let (root, nf, _wd, val, bl, pk, asset, path) = v2_withdraw_parts();
+        assert!(!synth_v2(WithdrawCircuitV2 {
+            merkle_root: Some(root),
+            nullifier: Some(nf),
+            withdraw_amount: Some(500), // < input_value (1000)
             ext_data_hash: Some([7u8; 32]),
             input_value: Some(val),
             blinding: Some(bl),

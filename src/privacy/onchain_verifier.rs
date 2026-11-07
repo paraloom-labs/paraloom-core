@@ -299,12 +299,12 @@ mod tests {
         };
 
         // A note owned by `privkey`, native asset, at tree position 2
-        // (path = left@depth0, right@depth1), withdrawing 500 of 1000.
+        // (path = left@depth0, right@depth1), withdrawing 1000 of 1000 (full spend).
         let privkey = [6u8; 32];
         let blinding = [3u8; 32];
         let asset = [0u8; 32];
         let input_value = 1_000u64;
-        let withdraw_amount = 500u64;
+        let withdraw_amount = 1_000u64;
         let ext_data_hash = [0x42u8; 32];
 
         let sk = Fr::from_le_bytes_mod_order(&privkey);
