@@ -97,6 +97,15 @@ impl Bridge {
         }
     }
 
+    /// Whether a Merkle root is known on-chain (#1509). `false` when no Solana
+    /// bridge is configured or when the RPC cannot answer.
+    pub async fn is_known_root(&self, root: &[u8; 32]) -> bool {
+        match self.solana_bridge {
+            Some(ref bridge) => bridge.is_known_root(root).await,
+            None => false,
+        }
+    }
+
     /// Latest blockhash for a node-assembled co-signed settlement tx (#260).
     pub async fn latest_blockhash(&self) -> Result<[u8; 32]> {
         if let Some(ref bridge) = self.solana_bridge {

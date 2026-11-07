@@ -2249,6 +2249,15 @@ impl Node {
                 .await;
         }
 
+        if self.transact_proof_verifier_override.is_none()
+            && !self.is_known_root(&request.root).await
+        {
+            return Err(anyhow!(
+                "transact rejected: root {} is not a known Merkle root",
+                hex::encode(request.root)
+            ));
+        }
+
         let request_id = coordinator.start_verification(request.clone()).await?;
 
         // The initiator does not receive its own gossip broadcast, so it must
@@ -2681,14 +2690,36 @@ impl Node {
         self.compute_executor.clone()
     }
 
+    /// Whether `root` is a known Merkle root: checked against the local pool
+    /// (recent history) or against the on-chain MerkleTree account history ring buffer (#1509).
+    pub async fn is_known_root(&self, root: &[u8; 32]) -> bool {
+        if root == &[0u8; 32] {
+            return false;
+        }
+
+        // 1. Check local shielded pool (fast in-memory path)
+        if let Some(pool) = &self.shielded_pool {
+            if pool.knows_root(root).await {
+                return true;
+            }
+        }
+
+        // 2. Check on-chain Merkle tree via Solana bridge if available
+        if let Some(bridge_mutex) = &self.bridge {
+            let bridge = bridge_mutex.lock().await;
+            if bridge.is_known_root(root).await {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Verify a v3 unified-transact zkSNARK proof (#350).
     ///
-    /// Deliberately NOT verified against `pool.root().await`: the v3 proof is
-    /// built against `request.root` — the on-chain incremental-tree root
-    /// carried in the request — and the root's legitimacy is enforced at
-    /// settlement by the program's `is_known_root` check over its root
-    /// history. The method therefore needs no pool state at all, which is why
-    /// it takes no pool parameter.
+    /// Checks that `request.root` is a known Merkle root (in the local pool or
+    /// on-chain MerkleTree account history) before running the Groth16 proof
+    /// verification, defeating fabricated-root griefing (#1509).
     async fn verify_transact_proof(
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
@@ -2696,6 +2727,17 @@ impl Node {
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
+        }
+
+        // Pre-filter: verify that request.root is known to our pool or on-chain (#1509).
+        // Rejects fabricated roots before burning settlement quorum/fees.
+        if !self.is_known_root(&request.root).await {
+            log::warn!(
+                "transact proof rejected for {}: root {} is not a known Merkle root",
+                request.request_id,
+                hex::encode(request.root)
+            );
+            return Ok(false);
         }
 
         // Asset id: all-zero for native SOL, or `mint_to_asset(mint)` for an SPL
@@ -3633,5 +3675,84 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // --- #1509 known-root verification in off-chain transact path ---
+
+    #[tokio::test]
+    async fn is_known_root_checks_pool_and_rejects_zero_or_fabricated() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+
+        let pool = node.shielded_pool.as_ref().expect("pool enabled");
+        let initial_root = pool.root().await;
+
+        // Empty root of the initialized pool is known
+        assert!(node.is_known_root(&initial_root).await);
+
+        // All-zero root is always rejected
+        assert!(!node.is_known_root(&[0u8; 32]).await);
+
+        // Arbitrary fabricated root is rejected
+        assert!(!node.is_known_root(&[0xEE; 32]).await);
+
+        // Advancing the pool makes the new root known while keeping initial root in history
+        let note = crate::privacy::Note::new_native(
+            crate::privacy::ShieldedAddress([1u8; 32]),
+            500,
+            [2u8; 32],
+        );
+        pool.deposit(note, 500).await.expect("deposit note");
+        let new_root = pool.root().await;
+        assert_ne!(new_root, initial_root);
+
+        assert!(node.is_known_root(&new_root).await);
+        assert!(node.is_known_root(&initial_root).await);
+    }
+
+    #[tokio::test]
+    async fn verify_transact_proof_rejects_fabricated_root() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+
+        let fabricated_root = [0xAA; 32];
+        let req = ta_request(
+            "tx-fabricated",
+            [1u8; 32],
+            [[2u8; 32], [3u8; 32]],
+            [[4u8; 32], [5u8; 32]],
+            fabricated_root,
+            0,
+        );
+
+        let result = node.verify_transact_proof(&req).await.expect("verify call");
+        assert!(!result, "fabricated root must be rejected as invalid");
+    }
+
+    #[tokio::test]
+    async fn initiate_transact_verification_rejects_fabricated_root() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+
+        let fabricated_root = [0xBB; 32];
+        let req = ta_request(
+            "tx-fabricated-init",
+            [1u8; 32],
+            [[2u8; 32], [3u8; 32]],
+            [[4u8; 32], [5u8; 32]],
+            fabricated_root,
+            0,
+        );
+
+        let result = node.initiate_transact_verification(req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not a known Merkle root"),
+            "expected unknown root error, got: {err}"
+        );
     }
 }
