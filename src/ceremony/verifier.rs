@@ -88,10 +88,18 @@ pub fn verify_phase2_transcript(
     let mut delta_before_g2 = initial_pk.vk.delta_g2;
 
     for (position, contribution) in transcript.contributions.iter().enumerate() {
-        let delta_after_g1 = G1Affine::deserialize_compressed(&contribution.delta_after_g1[..])
+        let mut cursor_g1 = &contribution.delta_after_g1[..];
+        let delta_after_g1 = G1Affine::deserialize_compressed(&mut cursor_g1)
             .map_err(|_| VerifyError::MalformedDeltaG1 { position })?;
-        let delta_after_g2 = G2Affine::deserialize_compressed(&contribution.delta_after_g2[..])
+        if !cursor_g1.is_empty() {
+            return Err(VerifyError::MalformedDeltaG1 { position });
+        }
+        let mut cursor_g2 = &contribution.delta_after_g2[..];
+        let delta_after_g2 = G2Affine::deserialize_compressed(&mut cursor_g2)
             .map_err(|_| VerifyError::MalformedDeltaG2 { position })?;
+        if !cursor_g2.is_empty() {
+            return Err(VerifyError::MalformedDeltaG2 { position });
+        }
         let proof = DleqProof::from_bytes(&contribution.dleq_proof)
             .map_err(|source| VerifyError::MalformedDleq { position, source })?;
 
@@ -133,10 +141,18 @@ pub fn verify_final_pk(
     let (expected_g1, expected_g2) = match transcript.contributions.last() {
         Some(last) => {
             let position = transcript.contributions.len() - 1;
-            let g1 = G1Affine::deserialize_compressed(&last.delta_after_g1[..])
+            let mut cursor_g1 = &last.delta_after_g1[..];
+            let g1 = G1Affine::deserialize_compressed(&mut cursor_g1)
                 .map_err(|_| VerifyError::MalformedDeltaG1 { position })?;
-            let g2 = G2Affine::deserialize_compressed(&last.delta_after_g2[..])
+            if !cursor_g1.is_empty() {
+                return Err(VerifyError::MalformedDeltaG1 { position });
+            }
+            let mut cursor_g2 = &last.delta_after_g2[..];
+            let g2 = G2Affine::deserialize_compressed(&mut cursor_g2)
                 .map_err(|_| VerifyError::MalformedDeltaG2 { position })?;
+            if !cursor_g2.is_empty() {
+                return Err(VerifyError::MalformedDeltaG2 { position });
+            }
             (g1, g2)
         }
         None => (initial_pk.delta_g1, initial_pk.vk.delta_g2),
@@ -492,6 +508,26 @@ mod tests {
         match verify_phase2_transcript(&initial_pk, &transcript) {
             Err(VerifyError::MalformedDleq { position: 0, .. }) => {}
             other => panic!("expected MalformedDleq at 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn malformed_delta_g1_trailing_bytes_rejected() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(1);
+        transcript.contributions[0].delta_after_g1.push(0x42);
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::MalformedDeltaG1 { position: 0 }) => {}
+            other => panic!("expected MalformedDeltaG1 at 0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn malformed_delta_g2_trailing_bytes_rejected() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(1);
+        transcript.contributions[0].delta_after_g2.push(0x42);
+        match verify_phase2_transcript(&initial_pk, &transcript) {
+            Err(VerifyError::MalformedDeltaG2 { position: 0 }) => {}
+            other => panic!("expected MalformedDeltaG2 at 0, got {:?}", other),
         }
     }
 
