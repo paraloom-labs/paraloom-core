@@ -121,6 +121,15 @@ impl EventListener {
 
     /// Start listening for events
     pub async fn start(&mut self) -> Result<()> {
+        let mut running = self.running.write().await;
+        if *running {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "EventListener is already running; skipping start to avoid duplicate pollers"
+            );
+            return Ok(());
+        }
+
         // Defer program-ID resolution to start time so that
         // construction of the listener cannot fail just because the
         // bridge hasn't been configured yet.
@@ -131,7 +140,8 @@ impl EventListener {
             ))
         })?;
 
-        *self.running.write().await = true;
+        *running = true;
+        drop(running);
 
         // Resume from the persisted cursor if one exists, so a restart does not
         // re-scan from the chain tip and lose deposits that landed while the node
@@ -825,6 +835,28 @@ mod tests {
         let listener = EventListener::new(config, rpc, pool, stats);
         assert!(listener.last_signature.blocking_read().is_none());
         assert_eq!(*listener.last_processed_slot.blocking_read(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_twice_does_not_spawn_duplicate_pollers() {
+        use crate::bridge::solana::test_support::MockBridgeRpc;
+        let mut config = BridgeConfig::default();
+        config.program_id = Pubkey::new_unique().to_string();
+        let pool = Arc::new(ShieldedPool::new());
+        let stats = Arc::new(RwLock::new(BridgeStats::default()));
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_signatures.lock().unwrap() = Some(Ok(vec![]));
+        let mut listener = EventListener::new(config, mock, pool, stats);
+
+        assert!(listener.start().await.is_ok());
+        assert!(*listener.running.read().await);
+
+        // Second call must succeed without error and not spawn duplicate pollers
+        assert!(listener.start().await.is_ok());
+        assert!(*listener.running.read().await);
+
+        assert!(listener.stop().await.is_ok());
+        assert!(!*listener.running.read().await);
     }
 
     fn make_state(rpc: Arc<dyn BridgeRpc>) -> PollerState {
