@@ -747,25 +747,47 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id
                 );
 
-                if let Some(executor) = &self.compute_executor {
-                    // Check if job exists and get result
-                    if let Some(result) = executor.get_job_result(&job_id) {
-                        let response = Message::ComputeJobResult {
-                            job_id: result.job_id.clone(),
-                            status: result.status.clone(),
-                            output_data: result.output_data.clone(),
-                            execution_time_ms: result.execution_time_ms,
-                            memory_used_bytes: result.memory_used_bytes,
-                            instructions_executed: result.instructions_executed,
-                        };
-                        if let Err(e) = self.network.send_message(source, response).await {
-                            log::error!("Failed to send compute job result: {}", e);
+                // Only the coordinator that submitted `job_id` may query its result
+                // when `job_coordinators` tracks the submitter.
+                {
+                    let coordinators = self.job_coordinators.lock().await;
+                    if let Some(expected_coord) = coordinators.get(&job_id) {
+                        if expected_coord != &source {
+                            log::warn!(
+                                "Ignoring compute job query for {} from unauthorized peer {} (expected {})",
+                                job_id,
+                                source,
+                                expected_coord
+                            );
+                            return Ok(());
                         }
-                    } else {
-                        log::warn!("Job {} not found in executor", job_id);
+                    }
+                }
+
+                let found = self
+                    .compute_executor
+                    .as_ref()
+                    .and_then(|executor| executor.get_job_result(&job_id))
+                    .or_else(|| {
+                        self.compute_storage
+                            .as_ref()
+                            .and_then(|storage| storage.get_result(&job_id).ok().flatten())
+                    });
+
+                if let Some(result) = found {
+                    let response = Message::ComputeJobResult {
+                        job_id: result.job_id.clone(),
+                        status: result.status.clone(),
+                        output_data: result.output_data.clone(),
+                        execution_time_ms: result.execution_time_ms,
+                        memory_used_bytes: result.memory_used_bytes,
+                        instructions_executed: result.instructions_executed,
+                    };
+                    if let Err(e) = self.network.send_message(source, response).await {
+                        log::error!("Failed to send compute job result: {}", e);
                     }
                 } else {
-                    log::warn!("Received compute job query but this node has no executor");
+                    log::warn!("Job {} not found in executor or storage", job_id);
                 }
             }
             Message::ComputeJobResult {
@@ -1488,17 +1510,24 @@ impl Node {
             coord = coord.with_reputation_persistence(
                 format!("{}/reputation.json", settings.storage.data_dir).into(),
             );
-            // Optional config override of the BFT consensus defaults (7/10/rep200).
-            // Unset on mainnet → the secure defaults stand; devnet lowers them in
-            // validator.toml to settle with a small live cohort (2/2), otherwise
-            // it never reaches a Valid quorum and settlement silently times out.
-            // The on-chain stake-weighted 2/3 quorum stays the real security gate.
-            if let (Some(min), Some(total)) = (
-                settings.bridge.consensus_min_validators,
-                settings.bridge.consensus_total_validators,
-            ) {
-                coord.set_consensus_thresholds(min, total);
-            }
+        // Optional config override of the BFT consensus defaults (7/10/rep200).
+        // Unset on mainnet → the secure defaults stand; devnet lowers them in
+        // validator.toml to settle with a small live cohort (2/2), otherwise
+        // it never reaches a Valid quorum and settlement silently times out.
+        // The on-chain stake-weighted 2/3 quorum stays the real security gate.
+        if settings.bridge.consensus_min_validators.is_some()
+            || settings.bridge.consensus_total_validators.is_some()
+        {
+            let min = settings
+                .bridge
+                .consensus_min_validators
+                .unwrap_or(crate::consensus::transact::DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS);
+            let total = settings
+                .bridge
+                .consensus_total_validators
+                .unwrap_or(crate::consensus::transact::DEFAULT_TOTAL_VALIDATORS);
+            coord.set_consensus_thresholds(min, total);
+        }
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
@@ -2005,6 +2034,7 @@ impl Node {
             let executor_clone = executor.clone();
             let network_clone = self.network.clone();
             let coordinators_clone = self.job_coordinators.clone();
+            let storage_clone = self.compute_storage.clone();
             let status_clone = self.status.clone();
 
             tokio::spawn(async move {
@@ -2023,6 +2053,7 @@ impl Node {
                     let _stats = executor_clone.get_stats();
 
                     // Check for completed jobs
+                    let mut finished_ids = Vec::new();
                     let coordinators = coordinators_clone.lock().await;
                     for (job_id, coordinator_id) in coordinators.iter() {
                         // Skip if already reported
@@ -2032,6 +2063,11 @@ impl Node {
 
                         // Check if job has a result
                         if let Some(result) = executor_clone.get_job_result(job_id) {
+                            if let Some(storage) = &storage_clone {
+                                if let Err(e) = storage.store_result(&result) {
+                                    log::error!("Failed to persist completed job result: {}", e);
+                                }
+                            }
                             // Job is complete, send result to coordinator
                             info!(
                                 "Reporting job {} result to coordinator {}",
@@ -2054,6 +2090,7 @@ impl Node {
                                 Ok(_) => {
                                     info!("Successfully reported job {} result", job_id);
                                     reported_jobs.insert(job_id.clone());
+                                    finished_ids.push(job_id.clone());
                                 }
                                 Err(e) => {
                                     log::error!("Failed to send job result: {}", e);
@@ -2062,6 +2099,12 @@ impl Node {
                         }
                     }
                     drop(coordinators);
+                    if !finished_ids.is_empty() {
+                        let mut coordinators = coordinators_clone.lock().await;
+                        for id in finished_ids {
+                            coordinators.remove(&id);
+                        }
+                    }
 
                     // Clean up old reported jobs
                     if reported_jobs.len() > 1000 {
@@ -2328,48 +2371,49 @@ impl Node {
         Ok(request_id)
     }
 
-    /// Record the encrypted output notes of a transfer for recipient scanning
-    /// (#196), de-duplicated by `(commitment, ciphertext)` so the same transfer
-    /// seen via both ingress and gossip is stored once.
-    async fn record_delivered_notes(
-        &self,
-        output_commitments: &[[u8; 32]; 2],
-        ciphertexts: &[String; 2],
-        mint: Option<[u8; 32]>,
-    ) {
-        // Bound the in-memory scan buffer so a high volume of transfers cannot
-        // grow it without limit (this records only proof-verified transfers, so
-        // it is not cheaply floodable, but the bound is defence in depth).
-        const MAX_DELIVERED_NOTES: usize = 50_000;
+        // Record the encrypted output notes of a transfer for recipient scanning
+        // (#196), de-duplicated by `output_commitment` so a replay of the same
+        // commitment with mutated ciphertexts cannot evict authentic notes.
+        async fn record_delivered_notes(
+            &self,
+            output_commitments: &[[u8; 32]; 2],
+            ciphertexts: &[String; 2],
+            mint: Option<[u8; 32]>,
+        ) {
+            // Bound the in-memory scan buffer so a high volume of transfers cannot
+            // grow it without limit (this records only proof-verified transfers, so
+            // it is not cheaply floodable, but the bound is defence in depth).
+            const MAX_DELIVERED_NOTES: usize = 50_000;
 
-        // Hex, matching `output_commitment` in the same struct and the `mint`
-        // that `/transact/submit` accepts (`parse_hex32`), so one field name has
-        // one spelling across the ingress. Base58 is how a wallet spells a mint
-        // in its own storage, not how this surface spells one, and a scanning
-        // wallet feeds this straight to `mint_to_asset`, which takes 32-byte
-        // hex. `None` for a native settlement, so an unchanged native feed stays
-        // byte-identical (the field is skipped when absent).
-        let mint = mint.map(hex::encode);
+            // Hex, matching `output_commitment` in the same struct and the `mint`
+            // that `/transact/submit` accepts (`parse_hex32`), so one field name has
+            // one spelling across the ingress. Base58 is how a wallet spells a mint
+            // in its own storage, not how this surface spells one, and a scanning
+            // wallet feeds this straight to `mint_to_asset`, which takes 32-byte
+            // hex. `None` for a native settlement, so an unchanged native feed stays
+            // byte-identical (the field is skipped when absent).
+            let mint = mint.map(hex::encode);
 
-        let mut store = self.delivered_notes.lock().await;
-        for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
-            let note = transact_ingress::DeliveredNote {
-                output_commitment: hex::encode(commitment),
-                ciphertext: ciphertext.clone(),
-                mint: mint.clone(),
-            };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
-                continue;
+            let mut store = self.delivered_notes.lock().await;
+            for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
+                let note = transact_ingress::DeliveredNote {
+                    output_commitment: hex::encode(commitment),
+                    ciphertext: ciphertext.clone(),
+                    mint: mint.clone(),
+                };
+                if store
+                    .iter()
+                    .any(|d| d.output_commitment == note.output_commitment)
+                {
+                    continue;
+                }
+                // Evict the oldest note when at capacity (FIFO).
+                if store.len() >= MAX_DELIVERED_NOTES {
+                    store.remove(0);
+                }
+                store.push(note);
             }
-            // Evict the oldest note when at capacity (FIFO).
-            if store.len() >= MAX_DELIVERED_NOTES {
-                store.remove(0);
-            }
-            store.push(note);
         }
-    }
 
     /// Snapshot of the encrypted notes this node has seen (#196), for the
     /// `GET /transact/scan` endpoint.
@@ -2522,17 +2566,21 @@ impl Node {
         // recorded either way. Previously only the winner recorded it, so a
         // losing node's off-chain nullifier set drifted from the chain it is
         // meant to pre-filter against (#703).
+        // Only ask the chain on failure, and only when BOTH nullifier PDAs
+        // exist on chain: checking only `nullifiers[0]` could misclassify a
+        // distinct transaction that spent `nullifiers[0]` with a different
+        // second input as `AlreadySettled`, poisoning `nullifiers[1]` in the
+        // local `ShieldedPool` even though `nullifiers[1]` was never spent.
         let settled = match &result {
             Ok(_) => true,
-            // Only ask the chain on failure, and only about the first
-            // nullifier: the pair is spent atomically in one instruction, so
-            // either both PDAs exist or neither does.
             Err(_) => {
-                bridge
-                    .lock()
-                    .await
+                let guard = bridge.lock().await;
+                guard
                     .is_nullifier_spent(&approved.request.nullifiers[0])
                     .await
+                    && guard
+                        .is_nullifier_spent(&approved.request.nullifiers[1])
+                        .await
             }
         };
 
@@ -3633,5 +3681,21 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn delivered_notes_deduplicates_by_commitment_against_mutated_ciphertexts() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[0x11u8; 32], [0x22u8; 32]];
+        node.record_delivered_notes(&commitments, &["aa".repeat(88), "bb".repeat(88)], None)
+            .await;
+        // Re-recording the same commitments with mutated ciphertexts must not append duplicates.
+        node.record_delivered_notes(&commitments, &["cc".repeat(88), "dd".repeat(88)], None)
+            .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, "aa".repeat(88));
+        assert_eq!(delivered[1].ciphertext, "bb".repeat(88));
     }
 }

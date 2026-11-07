@@ -167,6 +167,7 @@ pub mod paraloom_program {
         initial_merkle_root: [u8; 32],
     ) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+        require_canonical_field(&initial_merkle_root, BridgeError::NonCanonicalFieldElement)?;
         let bridge_state = &mut ctx.accounts.bridge_state;
         bridge_state.program_version = program_version;
         bridge_state.authority = ctx.accounts.authority.key();
@@ -425,10 +426,7 @@ pub mod paraloom_program {
         let mut fee = 0u64;
         if ext_amount < 0 {
             let gross = ext_amount.unsigned_abs();
-            fee = gross
-                .checked_mul(WITHDRAWAL_FEE_BPS)
-                .and_then(|v| v.checked_div(10_000))
-                .ok_or(BridgeError::InvalidAmount)?;
+            fee = (gross as u128 * WITHDRAWAL_FEE_BPS as u128 / 10_000) as u64;
             let payout = gross - fee;
 
             // The vault is a system account and must stay rent-exempt after the
@@ -625,10 +623,7 @@ pub mod paraloom_program {
         let mut fee = 0u64;
         if ext_amount < 0 {
             let gross = ext_amount.unsigned_abs();
-            fee = gross
-                .checked_mul(WITHDRAWAL_FEE_BPS)
-                .and_then(|v| v.checked_div(10_000))
-                .ok_or(BridgeError::InvalidAmount)?;
+            fee = (gross as u128 * WITHDRAWAL_FEE_BPS as u128 / 10_000) as u64;
             let payout = gross - fee;
 
             // Token accounts are independently rent-exempt, so unlike the native
