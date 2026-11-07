@@ -973,6 +973,23 @@ async fn cosign_settlement(
         return declined("payload program id does not match our configured program");
     }
 
+    let (expected_vault, _) =
+        crate::bridge::solana::instructions::derive_bridge_vault(expected_program_id);
+    if payload.bridge_vault != expected_vault.to_bytes() {
+        return declined("payload bridge_vault does not match canonical bridge_vault PDA");
+    }
+
+    let our_wallet = keypair.pubkey().to_bytes();
+    if !payload.quorum_validators.contains(&our_wallet) {
+        return declined("our settlement wallet is not in payload.quorum_validators");
+    }
+    {
+        let mut unique = std::collections::HashSet::with_capacity(payload.quorum_validators.len());
+        if !payload.quorum_validators.iter().all(|v| unique.insert(v)) {
+            return declined("payload.quorum_validators contains duplicate validator pubkeys");
+        }
+    }
+
     // Match the payload against a settlement we verified Valid, by request id
     // and binding parameters, and take the input nullifiers as the per-nullifier
     // cap keys (see the cap block below for why the cap is keyed on those).
