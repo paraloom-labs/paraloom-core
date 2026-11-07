@@ -21,6 +21,8 @@
 //! against the verifying key and knows nothing about the QAP reduction.
 
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
+use ark_ec::pairing::Pairing;
+use ark_ec::AffineRepr;
 use ark_ff::{Field, PrimeField, Zero};
 use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
@@ -89,6 +91,9 @@ fn check_g1(p: G1Affine, what: &str) -> Res<G1Affine> {
 fn g1(p: &G1Json, what: &str) -> Res<G1Affine> {
     let z = fq(&p[2])?;
     if z.is_zero() {
+        if fq(&p[0])? != Fq::ZERO || fq(&p[1])? != Fq::ZERO {
+            return Err(format!("{}: identity point must have x=y=0", what).into());
+        }
         return Ok(G1Affine::identity());
     }
     if z != Fq::ONE {
@@ -100,6 +105,13 @@ fn g1(p: &G1Json, what: &str) -> Res<G1Affine> {
 fn g2(p: &G2Json, what: &str) -> Res<G2Affine> {
     let z = Fq2::new(fq(&p[2][0])?, fq(&p[2][1])?);
     if z.is_zero() {
+        if fq(&p[0][0])? != Fq::ZERO
+            || fq(&p[0][1])? != Fq::ZERO
+            || fq(&p[1][0])? != Fq::ZERO
+            || fq(&p[1][1])? != Fq::ZERO
+        {
+            return Err(format!("{}: identity point must have x=y=0", what).into());
+        }
         return Ok(G2Affine::identity());
     }
     if z != Fq2::ONE {
@@ -124,6 +136,24 @@ fn g1_vec(points: &[G1Json], what: &str) -> Res<Vec<G1Affine>> {
         .enumerate()
         .map(|(i, p)| g1(p, &format!("{}[{}]", what, i)))
         .collect()
+}
+
+/// Verify cross-curve pairing consistency invariants:
+/// e(beta_1, G2) == e(G1, beta_2) and e(delta_1, G2) == e(G1, delta_2).
+pub fn check_pairing_consistency(pk: &ProvingKey<Bn254>) -> Res<()> {
+    let g1_gen = G1Affine::generator();
+    let g2_gen = G2Affine::generator();
+    if Bn254::pairing(pk.beta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.beta_g2) {
+        return Err(
+            "cross-curve pairing consistency failed: e(beta_g1, G2) != e(G1, beta_g2)".into(),
+        );
+    }
+    if Bn254::pairing(pk.delta_g1, g2_gen) != Bn254::pairing(g1_gen, pk.vk.delta_g2) {
+        return Err(
+            "cross-curve pairing consistency failed: e(delta_g1, G2) != e(G1, delta_g2)".into(),
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Res<()> {
@@ -154,6 +184,35 @@ fn main() -> Res<()> {
     // before building any of them.
     if zkey.r != Fr::MODULUS.to_string() || zkey.q != Fq::MODULUS.to_string() {
         return Err("key is not over BN254".into());
+    }
+    if zkey.num_vars == 0 {
+        return Err("nVars must be greater than 0".into());
+    }
+    if zkey.num_public >= zkey.num_vars {
+        return Err(format!(
+            "nPublic ({}) must be less than nVars ({})",
+            zkey.num_public, zkey.num_vars
+        )
+        .into());
+    }
+    if zkey.num_vars < zkey.ic.len() {
+        return Err(format!(
+            "nVars ({}) must be at least IC.len ({})",
+            zkey.num_vars,
+            zkey.ic.len()
+        )
+        .into());
+    }
+    if zkey.c.len() != zkey.num_vars {
+        return Err(format!(
+            "C has {} entries, expected nVars = {}",
+            zkey.c.len(),
+            zkey.num_vars
+        )
+        .into());
+    }
+    if zkey.domain_size == 0 || (zkey.domain_size & (zkey.domain_size - 1)) != 0 {
+        return Err(format!("domainSize {} is not a power of two", zkey.domain_size).into());
     }
     if zkey.ic.len() != zkey.num_public + 1 {
         return Err(format!(
@@ -228,6 +287,29 @@ fn main() -> Res<()> {
         l_query,
     };
 
+    // Degenerate identity checks on verifying key generators
+    if pk.vk.alpha_g1.is_zero() {
+        return Err("vk_alpha_1 cannot be the identity point".into());
+    }
+    if pk.vk.beta_g2.is_zero() {
+        return Err("vk_beta_2 cannot be the identity point".into());
+    }
+    if pk.vk.gamma_g2.is_zero() {
+        return Err("vk_gamma_2 cannot be the identity point".into());
+    }
+    if pk.vk.delta_g2.is_zero() {
+        return Err("vk_delta_2 cannot be the identity point".into());
+    }
+    if pk.beta_g1.is_zero() {
+        return Err("vk_beta_1 cannot be the identity point".into());
+    }
+    if pk.delta_g1.is_zero() {
+        return Err("vk_delta_1 cannot be the identity point".into());
+    }
+
+    // Cross-curve pairing consistency invariants: e(beta_1, G2) == e(G1, beta_2) and e(delta_1, G2) == e(G1, delta_2)
+    check_pairing_consistency(&pk)?;
+
     let mut bytes = Vec::new();
     pk.serialize_compressed(&mut bytes)?;
     std::fs::write(&output, &bytes)?;
@@ -254,4 +336,124 @@ fn main() -> Res<()> {
     println!("\nThis is a circom-convention key: prove with CircomReduction.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_ec::CurveGroup;
+
+    #[test]
+    fn g1_identity_rejects_nonzero_coordinates() {
+        let malformed = ["1".to_string(), "0".to_string(), "0".to_string()];
+        let err = g1(&malformed, "test_g1").unwrap_err();
+        assert!(err.to_string().contains("identity point must have x=y=0"));
+    }
+
+    #[test]
+    fn g2_identity_rejects_nonzero_coordinates() {
+        let malformed = [
+            ["1".to_string(), "0".to_string()],
+            ["0".to_string(), "0".to_string()],
+            ["0".to_string(), "0".to_string()],
+        ];
+        let err = g2(&malformed, "test_g2").unwrap_err();
+        assert!(err.to_string().contains("identity point must have x=y=0"));
+    }
+
+    #[test]
+    fn g1_identity_valid_when_x_y_zero() {
+        let valid = ["0".to_string(), "0".to_string(), "0".to_string()];
+        let p = g1(&valid, "test_g1").expect("valid identity");
+        assert!(p.is_zero());
+    }
+
+    #[test]
+    fn g2_identity_valid_when_x_y_zero() {
+        let valid = [
+            ["0".to_string(), "0".to_string()],
+            ["0".to_string(), "0".to_string()],
+            ["0".to_string(), "0".to_string()],
+        ];
+        let p = g2(&valid, "test_g2").expect("valid identity");
+        assert!(p.is_zero());
+    }
+
+    #[test]
+    fn check_pairing_consistency_valid() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+        let vk = VerifyingKey {
+            alpha_g1: g1_gen,
+            beta_g2: g2_gen,
+            gamma_g2: g2_gen,
+            delta_g2: g2_gen,
+            gamma_abc_g1: vec![g1_gen],
+        };
+        let pk = ProvingKey {
+            vk,
+            beta_g1: g1_gen,
+            delta_g1: g1_gen,
+            a_query: vec![],
+            b_g1_query: vec![],
+            b_g2_query: vec![],
+            h_query: vec![],
+            l_query: vec![],
+        };
+        assert!(check_pairing_consistency(&pk).is_ok());
+    }
+
+    #[test]
+    fn check_pairing_consistency_mismatched_beta_fails() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+        let mismatched_beta = (g1_gen * Fr::from(2u64)).into_affine();
+        let vk = VerifyingKey {
+            alpha_g1: g1_gen,
+            beta_g2: g2_gen,
+            gamma_g2: g2_gen,
+            delta_g2: g2_gen,
+            gamma_abc_g1: vec![g1_gen],
+        };
+        let pk = ProvingKey {
+            vk,
+            beta_g1: mismatched_beta,
+            delta_g1: g1_gen,
+            a_query: vec![],
+            b_g1_query: vec![],
+            b_g2_query: vec![],
+            h_query: vec![],
+            l_query: vec![],
+        };
+        let err = check_pairing_consistency(&pk).unwrap_err();
+        assert!(err.to_string().contains("e(beta_g1, G2) != e(G1, beta_g2)"));
+    }
+
+    #[test]
+    fn check_pairing_consistency_mismatched_delta_fails() {
+        let g1_gen = G1Affine::generator();
+        let g2_gen = G2Affine::generator();
+        let mismatched_delta = (g1_gen * Fr::from(2u64)).into_affine();
+        let vk = VerifyingKey {
+            alpha_g1: g1_gen,
+            beta_g2: g2_gen,
+            gamma_g2: g2_gen,
+            delta_g2: g2_gen,
+            gamma_abc_g1: vec![g1_gen],
+        };
+        let pk = ProvingKey {
+            vk,
+            beta_g1: g1_gen,
+            delta_g1: mismatched_delta,
+            a_query: vec![],
+            b_g1_query: vec![],
+            b_g2_query: vec![],
+            h_query: vec![],
+            l_query: vec![],
+        };
+        let err = check_pairing_consistency(&pk).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("e(delta_g1, G2) != e(G1, delta_g2)"));
+    }
 }

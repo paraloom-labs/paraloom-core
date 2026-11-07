@@ -49,9 +49,21 @@ impl R1CSToQAP for CircomReduction {
         num_constraints: usize,
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
+        if full_assignment.len() < num_inputs {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+        if matrices.a.len() != num_constraints
+            || matrices.b.len() != num_constraints
+            || matrices.c.len() != num_constraints
+        {
+            return Err(SynthesisError::Unsatisfiable);
+        }
+
         let zero = F::zero();
-        let domain =
-            D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain_dim = num_constraints
+            .checked_add(num_inputs)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain = D::new(domain_dim).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_size = domain.size();
 
         let mut a = vec![zero; domain_size];
@@ -86,7 +98,9 @@ impl R1CSToQAP for CircomReduction {
         domain.ifft_in_place(&mut b);
 
         let root_of_unity = {
-            let domain_size_double = 2 * domain_size;
+            let domain_size_double = domain_size
+                .checked_mul(2)
+                .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             let domain_double =
                 D::new(domain_size_double).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             domain_double.element(1)
@@ -118,7 +132,11 @@ impl R1CSToQAP for CircomReduction {
     ) -> Result<Vec<F>, SynthesisError> {
         // The usual H query has domain-1 powers and Z has domain powers, so
         // HZ has 2*domain-1.
-        let mut scalars = (0..2 * max_power + 1)
+        let num_scalars = max_power
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let mut scalars = (0..num_scalars)
             .map(|i| delta_inverse * t.pow([i as u64]))
             .collect::<Vec<_>>();
         let domain_size = scalars.len();
@@ -139,6 +157,7 @@ mod tests {
     use ark_bn254::{Bn254, Fr};
     use ark_ff::{BigInteger, PrimeField};
     use ark_groth16::{Groth16, ProvingKey};
+    use ark_poly::GeneralEvaluationDomain;
     use ark_serialize::CanonicalDeserialize;
     use ark_snark::SNARK;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
