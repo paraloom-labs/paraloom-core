@@ -565,10 +565,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -644,6 +642,7 @@ pub mod paraloom_program {
             let signer_seeds = &[&seeds[..]];
 
             // Payout to the recipient token account (bound into the proof).
+            let recipient_before = ctx.accounts.recipient_token_account.amount;
             token_interface::transfer_checked(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
@@ -659,11 +658,24 @@ pub mod paraloom_program {
                 ctx.accounts.mint.decimals,
             )?;
 
+            // Reject fee-on-transfer mints: the recipient must have received
+            // exactly `payout`. Reload to read the realized post-transfer balance.
+            ctx.accounts.recipient_token_account.reload()?;
+            let realized_payout = ctx
+                .accounts
+                .recipient_token_account
+                .amount
+                .checked_sub(recipient_before)
+                .ok_or(BridgeError::InvalidAmount)?;
+            require!(realized_payout == payout, BridgeError::InvalidAmount);
+
             // Settling-validator fee, paid in the withdrawn asset to the
             // validator's own token account (constrained to `authority` in the
             // accounts struct). The native path credits lamport `pending_rewards`
             // for a later claim; here the token fee is paid inline.
             if fee > 0 {
+                ctx.accounts.fee_token_account.reload()?;
+                let fee_before = ctx.accounts.fee_token_account.amount;
                 token_interface::transfer_checked(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -678,6 +690,17 @@ pub mod paraloom_program {
                     fee,
                     ctx.accounts.mint.decimals,
                 )?;
+
+                // Reject fee-on-transfer mints on fee payout: the fee token account
+                // must have received exactly `fee`.
+                ctx.accounts.fee_token_account.reload()?;
+                let realized_fee = ctx
+                    .accounts
+                    .fee_token_account
+                    .amount
+                    .checked_sub(fee_before)
+                    .ok_or(BridgeError::InvalidAmount)?;
+                require!(realized_fee == fee, BridgeError::InvalidAmount);
             }
         }
 
