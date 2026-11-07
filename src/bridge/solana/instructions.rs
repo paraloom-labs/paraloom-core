@@ -545,7 +545,11 @@ fn append_quorum_accounts(
     quorum_validators: &[Pubkey],
     accounts: &mut Vec<AccountMeta>,
 ) {
+    let mut seen = std::collections::HashSet::new();
     for v in quorum_validators {
+        if !seen.insert(*v) {
+            continue;
+        }
         let (vpda, _) = derive_validator_account(program_id, v);
         accounts.push(AccountMeta::new_readonly(*v, true));
         accounts.push(AccountMeta::new_readonly(vpda, false));
@@ -573,6 +577,22 @@ pub fn create_transact_instruction(
     proof: Vec<u8>,
     quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
+    if nullifiers[0] == nullifiers[1] {
+        return Err(BridgeError::InvalidTransaction(
+            "duplicate input nullifier in transact".to_string(),
+        ));
+    }
+    if ext_amount > 0 {
+        return Err(BridgeError::InvalidTransaction(
+            "ext_amount must be <= 0 in transact".to_string(),
+        ));
+    }
+    if proof.is_empty() || proof.len() > 256 {
+        return Err(BridgeError::InvalidTransaction(
+            "transact proof must be 1..=256 bytes".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
     let (validator_registry_pda, _) =
@@ -641,6 +661,22 @@ pub fn create_transact_spl_instruction(
     proof: Vec<u8>,
     quorum_validators: &[Pubkey],
 ) -> Result<Instruction> {
+    if nullifiers[0] == nullifiers[1] {
+        return Err(BridgeError::InvalidTransaction(
+            "duplicate input nullifier in transact_spl".to_string(),
+        ));
+    }
+    if ext_amount > 0 {
+        return Err(BridgeError::InvalidTransaction(
+            "ext_amount must be <= 0 in transact_spl".to_string(),
+        ));
+    }
+    if proof.is_empty() || proof.len() > 256 {
+        return Err(BridgeError::InvalidTransaction(
+            "transact_spl proof must be 1..=256 bytes".to_string(),
+        ));
+    }
+
     let (bridge_state_pda, _) = derive_bridge_state(program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
     let (validator_registry_pda, _) =
@@ -703,6 +739,11 @@ pub fn create_deposit_note_instruction(
     pubkey: [u8; 32],
     blinding: [u8; 32],
 ) -> Result<Instruction> {
+    if amount == 0 {
+        return Err(BridgeError::InvalidTransaction(
+            "deposit_note amount must be > 0".to_string(),
+        ));
+    }
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
 
@@ -1310,5 +1351,70 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_transact_and_deposit_note_validation_and_quorum_dedup() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let bridge_vault = Pubkey::new_unique();
+        let cosigner = Pubkey::new_unique();
+
+        // Duplicate quorum validators are deduplicated.
+        let ix = create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -500,
+            vec![0u8; 256],
+            &[authority, cosigner, cosigner],
+        )
+        .expect("build transact instruction");
+        assert_eq!(ix.accounts.len(), 10 + 4);
+
+        // Duplicate nullifiers rejected.
+        assert!(create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [1u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -500,
+            vec![0u8; 256],
+            &[authority, cosigner],
+        )
+        .is_err());
+
+        // Positive ext_amount rejected.
+        assert!(create_transact_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            [9u8; 32],
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            100,
+            vec![0u8; 256],
+            &[authority, cosigner],
+        )
+        .is_err());
+
+        // Zero deposit_note amount rejected.
+        assert!(create_deposit_note_instruction(
+            &program_id,
+            &authority,
+            &bridge_vault,
+            0,
+            [7u8; 32],
+            [8u8; 32],
+        )
+        .is_err());
     }
 }
