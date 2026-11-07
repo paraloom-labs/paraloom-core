@@ -89,6 +89,21 @@ pub fn verify_transact(
         Err(_) => return false,
     };
 
+    let is_canonical = |b: &[u8; 32]| {
+        let reduced = Fr::from_le_bytes_mod_order(b);
+        reduced.into_bigint().to_bytes_le().as_slice() == b.as_slice()
+    };
+    if !is_canonical(root)
+        || !is_canonical(public_amount)
+        || !is_canonical(asset_id)
+        || !is_canonical(nullifier0)
+        || !is_canonical(nullifier1)
+        || !is_canonical(out_commitment0)
+        || !is_canonical(out_commitment1)
+    {
+        return false;
+    }
+
     let le = |b: &[u8; 32]| fr_to_be(&Fr::from_le_bytes_mod_order(b));
     let public_inputs: [[u8; 32]; NUM_PUBLIC_INPUTS] = [
         le(root),
@@ -218,5 +233,20 @@ mod tests {
     #[test]
     fn wrong_length_rejected() {
         assert!(!verify_fixture(&[0u8; 255]));
+    }
+
+    #[test]
+    fn non_canonical_public_input_rejected() {
+        assert!(!verify_transact(
+            &[0xFFu8; 32],
+            &fx::FIXTURE_PUBLIC_AMOUNT,
+            &fx::FIXTURE_EXT_DATA_HASH,
+            &fx::FIXTURE_ASSET_ID,
+            &fx::FIXTURE_NULLIFIER_0,
+            &fx::FIXTURE_NULLIFIER_1,
+            &fx::FIXTURE_COMMITMENT_0,
+            &fx::FIXTURE_COMMITMENT_1,
+            &fixture_proof(),
+        ));
     }
 }

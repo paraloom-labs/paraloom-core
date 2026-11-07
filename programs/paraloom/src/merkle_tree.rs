@@ -194,10 +194,13 @@ impl IncrementalMerkleTree {
         let mut current_hash = leaf;
         for i in 0..TREE_DEPTH {
             if current_index % 2 == 0 {
-                // Even index: current node is a left child; record it and pair
-                // with the empty-subtree hash on the right.
+                // Even index: current node is a left child; validate and hash
+                // with the empty-subtree hash on the right BEFORE mutating
+                // filled_subtrees[i] so a failing poseidon2 call never corrupts
+                // tree state.
+                let next_hash = poseidon2(&current_hash, &ZERO_HASHES[i])?;
                 self.filled_subtrees[i] = current_hash;
-                current_hash = poseidon2(&current_hash, &ZERO_HASHES[i])?;
+                current_hash = next_hash;
             } else {
                 // Odd index: pair against the stored left sibling.
                 current_hash = poseidon2(&self.filled_subtrees[i], &current_hash)?;
@@ -221,7 +224,7 @@ impl IncrementalMerkleTree {
         if root == [0u8; 32] {
             return false;
         }
-        let start = self.root_index as usize;
+        let start = (self.root_index as usize) % ROOT_HISTORY_SIZE;
         let mut i = start;
         loop {
             if self.root_history[i] == root {
@@ -462,5 +465,21 @@ mod tests {
             t.append(leaf).is_err(),
             "append past 2^TREE_DEPTH must be rejected"
         );
+    }
+
+    #[test]
+    fn append_non_canonical_leaf_preserves_filled_subtrees_and_root_index_bounds() {
+        let mut t = empty();
+        let before_subtrees = t.filled_subtrees;
+        // [0xFF; 32] exceeds the BN254 scalar field modulus, so poseidon2 fails.
+        assert!(t.append([0xFFu8; 32]).is_err());
+        assert_eq!(
+            t.filled_subtrees, before_subtrees,
+            "failed append must not corrupt filled_subtrees[0]"
+        );
+
+        // Out-of-bounds root_index must not panic in is_known_root.
+        t.root_index = (ROOT_HISTORY_SIZE as u64) + 17;
+        assert!(t.is_known_root(ZERO_HASHES[TREE_DEPTH]));
     }
 }
