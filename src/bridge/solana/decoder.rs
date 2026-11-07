@@ -52,6 +52,20 @@ pub fn extract_deposit_events(
             );
             return Vec::new();
         }
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(loaded) =
+            &meta.loaded_addresses
+        {
+            if !loaded.writable.is_empty() || !loaded.readonly.is_empty() {
+                log::warn!(
+                    target: "paraloom::bridge::solana",
+                    "tx {} uses address-table lookups ({} writable, {} readonly); skipping",
+                    signature,
+                    loaded.writable.len(),
+                    loaded.readonly.len()
+                );
+                return Vec::new();
+            }
+        }
     }
 
     let ui_tx = match &confirmed.transaction.transaction {
@@ -77,6 +91,18 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    if let Some(lookups) = &raw.address_table_lookups {
+        if !lookups.is_empty() {
+            log::warn!(
+                target: "paraloom::bridge::solana",
+                "tx {} contains {} address-table lookups; skipping",
+                signature,
+                lookups.len()
+            );
+            return Vec::new();
+        }
+    }
 
     let account_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
@@ -211,6 +237,9 @@ fn decode_compiled_deposit(
 
     let payload = &raw_data[8..];
     let data = DepositInstructionData::try_from_slice(payload).ok()?;
+    if data.amount == 0 {
+        return None;
+    }
 
     let depositor_index = *compiled.accounts.get(depositor_index)? as usize;
     let depositor = account_keys.get(depositor_index)?;
@@ -515,5 +544,17 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn ignores_zero_amount_deposit() {
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let account_keys = vec![program_id, program_id, depositor, program_id];
+        let ix = make_compiled_ix(3, 2, encode_deposit_data(0, [1u8; 32], [2u8; 32]));
+        assert!(
+            decode_compiled_deposit(&ix, &account_keys, &program_id).is_none(),
+            "zero-amount deposits must be rejected"
+        );
     }
 }

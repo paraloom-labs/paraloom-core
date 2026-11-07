@@ -84,10 +84,30 @@ where
         |peer| {
             let send = &send;
             let request = request.clone();
+            let expected_wallet = peers
+                .iter()
+                .find_map(|(w, n)| if *n == peer { Some(*w) } else { None });
             async move {
-                let response = send(peer, request).await?;
+                let expected_wallet = expected_wallet?;
+                let response = send(peer, request.clone()).await?;
+                if response.request_id != request.request_id {
+                    log::warn!(
+                        "ignoring co-sign response with mismatched request_id {} (expected {})",
+                        response.request_id,
+                        request.request_id
+                    );
+                    return None;
+                }
                 let sig = response.signature?;
                 let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
+                if wallet != expected_wallet {
+                    log::warn!(
+                        "ignoring co-sign response claiming wallet {} from peer expected to use {}",
+                        wallet,
+                        expected_wallet
+                    );
+                    return None;
+                }
                 Some((wallet, sig))
             }
         },
@@ -195,5 +215,49 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn ignores_mismatched_request_id_and_spoofed_peer_wallet() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey(), p2.pubkey()];
+        let peers = vec![
+            (p1.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+        ];
+
+        // Peer 1 returns a stale request_id; peer 2 returns p1's wallet+sig.
+        // Both must be rejected so the 2-of-3 threshold is not met.
+        let result = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            2,
+            |peer, request| {
+                let p1 = &p1;
+                async move {
+                    let mut resp = honest_response(p1, &request);
+                    if peer == NodeId(vec![1]) {
+                        resp.request_id = "stale-req".to_string();
+                    }
+                    Some(resp)
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "mismatched request_id or peer wallet spoofing must be rejected"
+        );
     }
 }
