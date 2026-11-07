@@ -40,6 +40,15 @@ pub enum ContributeError {
 
     #[error("transcript chain rejected the new contribution: {0}")]
     Transcript(#[from] TranscriptError),
+
+    #[error("transcript circuit ({transcript:?}) does not match requested circuit ({requested:?})")]
+    CircuitMismatch {
+        transcript: CircuitId,
+        requested: CircuitId,
+    },
+
+    #[error("transcript initial_srs_hash does not match supplied initial_srs_hash")]
+    InitialSrsHashMismatch,
 }
 
 /// Apply one contribution and return the updated proving key plus
@@ -69,6 +78,18 @@ pub fn contribute<R: RngCore + CryptoRng>(
     attestation: String,
     rng: &mut R,
 ) -> Result<(ProvingKey<Bn254>, Phase2Transcript), ContributeError> {
+    if let Some(ref existing) = prior_transcript {
+        if existing.circuit != circuit {
+            return Err(ContributeError::CircuitMismatch {
+                transcript: existing.circuit.clone(),
+                requested: circuit,
+            });
+        }
+        if existing.initial_srs_hash != initial_srs_hash {
+            return Err(ContributeError::InitialSrsHashMismatch);
+        }
+    }
+
     let delta_i = Fr::rand(rng);
     let proof = apply_contribution(&mut prior_pk, delta_i, rng)?;
 
@@ -240,5 +261,50 @@ mod tests {
         assert_ne!(after_pk_2.delta_g1, initial_pk.delta_g1);
         verify_phase2_transcript(&initial_pk, &transcript_2)
             .expect("two-link chain verifies end-to-end");
+    }
+
+    #[test]
+    fn contribute_rejects_mismatched_circuit_and_initial_srs_hash() {
+        let initial_pk = fresh_initial_pk();
+        let mut rng = rng();
+
+        let (after_pk_1, transcript_1) = contribute(
+            initial_pk,
+            None,
+            CircuitId::Transfer,
+            [0x11u8; 64],
+            NodeId(vec![0x01]),
+            "first contributor".to_string(),
+            &mut rng,
+        )
+        .expect("first contribution succeeds");
+
+        let bad_circuit = contribute(
+            after_pk_1.clone(),
+            Some(transcript_1.clone()),
+            CircuitId::Withdraw,
+            [0x11u8; 64],
+            NodeId(vec![0x02]),
+            "wrong circuit".to_string(),
+            &mut rng,
+        );
+        assert!(
+            matches!(bad_circuit, Err(ContributeError::CircuitMismatch { .. })),
+            "mismatched circuit must be rejected"
+        );
+
+        let bad_hash = contribute(
+            after_pk_1,
+            Some(transcript_1),
+            CircuitId::Transfer,
+            [0x22u8; 64],
+            NodeId(vec![0x02]),
+            "wrong initial hash".to_string(),
+            &mut rng,
+        );
+        assert!(
+            matches!(bad_hash, Err(ContributeError::InitialSrsHashMismatch)),
+            "mismatched initial_srs_hash must be rejected"
+        );
     }
 }

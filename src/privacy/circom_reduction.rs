@@ -50,9 +50,20 @@ impl R1CSToQAP for CircomReduction {
         full_assignment: &[F],
     ) -> Result<Vec<F>, SynthesisError> {
         let zero = F::zero();
-        let domain =
-            D::new(num_constraints + num_inputs).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        if full_assignment.len() < num_inputs
+            || matrices.a.len() < num_constraints
+            || matrices.b.len() < num_constraints
+        {
+            return Err(SynthesisError::AssignmentMissing);
+        }
+        let domain_order = num_constraints
+            .checked_add(num_inputs)
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let domain = D::new(domain_order).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
         let domain_size = domain.size();
+        if domain_size < domain_order {
+            return Err(SynthesisError::PolynomialDegreeTooLarge);
+        }
 
         let mut a = vec![zero; domain_size];
         let mut b = vec![zero; domain_size];
@@ -86,7 +97,9 @@ impl R1CSToQAP for CircomReduction {
         domain.ifft_in_place(&mut b);
 
         let root_of_unity = {
-            let domain_size_double = 2 * domain_size;
+            let domain_size_double = domain_size
+                .checked_mul(2)
+                .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             let domain_double =
                 D::new(domain_size_double).ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
             domain_double.element(1)
@@ -118,7 +131,11 @@ impl R1CSToQAP for CircomReduction {
     ) -> Result<Vec<F>, SynthesisError> {
         // The usual H query has domain-1 powers and Z has domain powers, so
         // HZ has 2*domain-1.
-        let mut scalars = (0..2 * max_power + 1)
+        let count = max_power
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(SynthesisError::PolynomialDegreeTooLarge)?;
+        let mut scalars = (0..count)
             .map(|i| delta_inverse * t.pow([i as u64]))
             .collect::<Vec<_>>();
         let domain_size = scalars.len();
@@ -238,6 +255,41 @@ mod tests {
     ///   artifacts/transact_v3_ceremony_dryrun.key
     /// cargo test --lib circom_reduction -- --ignored --nocapture
     /// ```
+    #[test]
+    fn witness_map_and_h_query_reject_short_assignments_and_overflow() {
+        use ark_poly::GeneralEvaluationDomain;
+        let matrices = ConstraintMatrices::<Fr> {
+            num_instance_variables: 2,
+            num_witness_variables: 0,
+            num_constraints: 1,
+            a_num_non_zero: 0,
+            b_num_non_zero: 0,
+            c_num_non_zero: 0,
+            a: vec![vec![]],
+            b: vec![vec![]],
+            c: vec![vec![]],
+        };
+        let short_res = CircomReduction::witness_map_from_matrices::<
+            Fr,
+            GeneralEvaluationDomain<Fr>,
+        >(&matrices, 2, 1, &[Fr::from(1u64)]);
+        assert!(
+            matches!(short_res, Err(SynthesisError::AssignmentMissing)),
+            "short full_assignment must return AssignmentMissing instead of panicking"
+        );
+
+        let overflow_res = CircomReduction::h_query_scalars::<Fr, GeneralEvaluationDomain<Fr>>(
+            usize::MAX,
+            Fr::from(2u64),
+            Fr::from(1u64),
+            Fr::from(1u64),
+        );
+        assert!(
+            matches!(overflow_res, Err(SynthesisError::PolynomialDegreeTooLarge)),
+            "overflowing max_power must return PolynomialDegreeTooLarge"
+        );
+    }
+
     #[test]
     #[ignore = "needs a snarkjs-produced key converted to arkworks; see the doc comment"]
     fn ceremony_key_proves_and_verifies_under_the_circom_reduction() {

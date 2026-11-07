@@ -86,6 +86,12 @@ pub enum PolicyError {
     )]
     FinalKeyUnchanged,
 
+    #[error("transcript version {got} is not supported (expected {expected})")]
+    UnsupportedVersion { got: u32, expected: u32 },
+
+    #[error("the pinned initial SRS hash is all zeros; a real initial key hash is required")]
+    ZeroInitialSrsHash,
+
     #[error(
         "the transcript's last contribution does not match the pinned chain-tip \
          hash; the chain differs from the one the coordinator verified"
@@ -107,6 +113,15 @@ pub fn enforce_finalize_policy(
     final_pk: &ProvingKey<Bn254>,
     transcript: &Phase2Transcript,
 ) -> Result<(), PolicyError> {
+    if transcript.version != super::transcript::TRANSCRIPT_VERSION {
+        return Err(PolicyError::UnsupportedVersion {
+            got: transcript.version,
+            expected: super::transcript::TRANSCRIPT_VERSION,
+        });
+    }
+    if policy.initial_srs_hash == [0u8; 64] {
+        return Err(PolicyError::ZeroInitialSrsHash);
+    }
     if transcript.is_empty() {
         return Err(PolicyError::EmptyTranscript);
     }
@@ -125,7 +140,7 @@ pub fn enforce_finalize_policy(
         return Err(PolicyError::InitialKeyHashMismatch);
     }
 
-    if final_pk.delta_g1 == initial_pk.delta_g1 && final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
+    if final_pk.delta_g1 == initial_pk.delta_g1 || final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
         return Err(PolicyError::FinalKeyUnchanged);
     }
 
@@ -299,5 +314,45 @@ mod tests {
         let tail = hash_contribution(t.contributions.last().unwrap());
         enforce_finalize_policy(&policy(4, Some(tail)), &PINNED, &initial, &final_pk, &t)
             .expect("exact-count policy with the true tail pin passes");
+    }
+
+    #[test]
+    fn partial_delta_unchanged_version_mismatch_and_zero_srs_are_rejected() {
+        let initial = pk_from_seed(1);
+        let mut partial_final = pk_from_seed(2);
+        partial_final.delta_g1 = initial.delta_g1;
+        let t = dummy_transcript(PINNED, 2);
+        assert!(
+            matches!(
+                enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &partial_final, &t),
+                Err(PolicyError::FinalKeyUnchanged)
+            ),
+            "unchanged delta_g1 alone must be rejected"
+        );
+
+        let final_pk = pk_from_seed(2);
+        let mut bad_ver = dummy_transcript(PINNED, 2);
+        bad_ver.version = 99;
+        assert!(
+            matches!(
+                enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &bad_ver),
+                Err(PolicyError::UnsupportedVersion { .. })
+            ),
+            "unsupported transcript version must be rejected"
+        );
+
+        let zero_pol = FinalizePolicy {
+            min_contributions: 1,
+            initial_srs_hash: [0u8; 64],
+            final_contribution_hash: None,
+        };
+        let zero_t = dummy_transcript([0u8; 64], 1);
+        assert!(
+            matches!(
+                enforce_finalize_policy(&zero_pol, &[0u8; 64], &initial, &final_pk, &zero_t),
+                Err(PolicyError::ZeroInitialSrsHash)
+            ),
+            "all-zero initial_srs_hash must be rejected"
+        );
     }
 }
