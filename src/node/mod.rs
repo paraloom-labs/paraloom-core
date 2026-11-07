@@ -2601,12 +2601,13 @@ impl Node {
 
             // Also update the coordinator with capacity info
             if let Some(coordinator) = &self.compute_coordinator {
+                let current_load = coordinator.get_validator_load(&capacity.validator_id).await;
                 let announcement = crate::compute::CapacityAnnouncement {
                     validator_id: capacity.validator_id.clone(),
                     cpu_cores: capacity.cpu_cores,
                     memory_mb: capacity.memory_mb,
                     max_concurrent_jobs: capacity.max_concurrent_jobs,
-                    current_load: 0,
+                    current_load,
                 };
                 coordinator.update_validator_capacity(announcement).await;
             }
@@ -2644,8 +2645,22 @@ impl Node {
 
                 // Convert ValidatorId (String) to NodeId
                 // ValidatorId is expected to be the hex representation of NodeId
-                let node_id = self.validator_id_to_node_id(&assignment.validator_id)?;
-                self.network.send_message(node_id, message).await?;
+                let send_res = match self.validator_id_to_node_id(&assignment.validator_id) {
+                    Ok(node_id) => self.network.send_message(node_id, message).await,
+                    Err(e) => Err(e),
+                };
+
+                if let Err(e) = send_res {
+                    log::warn!(
+                        "Failed to send compute job {} to validator {}: {}, removing assignment",
+                        job_id,
+                        assignment.validator_id,
+                        e
+                    );
+                    let _ = coordinator.remove_assignment(&job_id).await;
+                    return Err(e);
+                }
+
                 Ok(job_id)
             } else {
                 Err(anyhow::anyhow!(

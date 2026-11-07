@@ -129,6 +129,14 @@ impl VerificationCoordinator {
         validator_id: ValidatorId,
         result: JobResult,
     ) -> Result<()> {
+        if result.job_id != *job_id {
+            return Err(anyhow!(
+                "Mismatched result job_id '{}' for target job_id '{}'",
+                result.job_id,
+                job_id
+            ));
+        }
+
         // Bind the result to the job's assigned validator set: only a validator
         // this job was actually assigned to may contribute a result. Without
         // this, any peer could inject results toward the consensus tally for a
@@ -564,5 +572,28 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_submit_result_rejects_mismatched_job_id() {
+        let coordinator = VerificationCoordinator::new();
+        let job_id = "job1".to_string();
+        let validators = vec!["v1".to_string(), "v2".to_string(), "v3".to_string()];
+
+        coordinator
+            .create_verification_request(job_id.clone(), validators)
+            .await
+            .unwrap();
+
+        let mismatched_result = JobResult::success("job2".to_string(), vec![42], 100, 1024, 50000);
+        let err = coordinator
+            .submit_result(&job_id, "v1".to_string(), mismatched_result)
+            .await;
+
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("Mismatched result job_id"));
     }
 }

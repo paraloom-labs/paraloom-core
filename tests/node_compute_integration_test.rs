@@ -155,3 +155,76 @@ fn test_node_compute_api_methods_exist() {
 
     println!("All compute API methods compile successfully");
 }
+
+#[tokio::test]
+async fn test_submit_compute_job_to_network_cleans_up_assignment_on_send_failure() {
+    use paraloom::compute::{ComputeJob, ResourceLimits, ValidatorCapacity};
+
+    let mut settings = Settings::development();
+    settings.node.node_type = "Coordinator".to_string();
+    settings.network.listen_address = "/ip4/127.0.0.1/tcp/0".to_string();
+
+    let node = Node::new(settings).expect("Failed to create Coordinator node");
+
+    // "validator-invalid" is not valid hex, so validator_id_to_node_id will fail
+    let capacity = ValidatorCapacity::new("validator-invalid".to_string(), 4, 8192, 2);
+    node.register_compute_validator(capacity)
+        .await
+        .expect("Failed to register validator");
+
+    let coordinator = node.compute_coordinator().unwrap();
+    let stats_before = coordinator.get_stats().await;
+    assert_eq!(stats_before.pending_assignments, 0);
+
+    let job = ComputeJob::new(vec![1, 2, 3], vec![], ResourceLimits::default());
+    let res = node.submit_compute_job_to_network(job).await;
+    assert!(
+        res.is_err(),
+        "send should fail for invalid validator node ID"
+    );
+
+    // Pending assignment must NOT leak
+    let stats_after = coordinator.get_stats().await;
+    assert_eq!(
+        stats_after.pending_assignments, 0,
+        "pending assignment must be removed on send failure"
+    );
+}
+
+#[tokio::test]
+async fn test_register_compute_validator_preserves_load_on_reregister() {
+    use paraloom::compute::ValidatorCapacity;
+
+    let mut settings = Settings::development();
+    settings.node.node_type = "Coordinator".to_string();
+    settings.network.listen_address = "/ip4/127.0.0.1/tcp/0".to_string();
+
+    let node = Node::new(settings).expect("Failed to create Coordinator node");
+
+    let capacity = ValidatorCapacity::new("v1".to_string(), 4, 8192, 5);
+    node.register_compute_validator(capacity)
+        .await
+        .expect("Failed to register validator");
+
+    let coordinator = node.compute_coordinator().unwrap();
+    // Assign a job so v1 has active pending assignment
+    coordinator
+        .assign_job("job-1".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(coordinator.get_validator_load(&"v1".to_string()).await, 1);
+
+    // Re-register validator v1 with updated specs
+    let updated_capacity = ValidatorCapacity::new("v1".to_string(), 8, 16384, 5);
+    node.register_compute_validator(updated_capacity)
+        .await
+        .expect("Failed to re-register validator");
+
+    let validators = coordinator.get_validators().await;
+    let v1 = validators.iter().find(|v| v.validator_id == "v1").unwrap();
+    assert_eq!(
+        v1.current_load, 1,
+        "current_load must be preserved upon re-registration"
+    );
+}
