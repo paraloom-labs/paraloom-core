@@ -65,6 +65,11 @@ pub struct VoteTally {
     /// Votes, keyed by the voter's on-chain co-sign wallet (base58).
     pub votes: Arc<RwLock<HashMap<String, VoteRecord>>>,
 
+    /// Wallets that have equivocated in this round and must be excluded from
+    /// quorum and co-signing even if the caller's `eligible_wallets` snapshot
+    /// still includes them.
+    pub equivocated: Arc<RwLock<HashSet<String>>>,
+
     /// When consensus started
     pub started_at: u64,
 
@@ -92,9 +97,10 @@ impl VoteTally {
         Self {
             request_id,
             votes: Arc::new(RwLock::new(HashMap::new())),
+            equivocated: Arc::new(RwLock::new(HashSet::new())),
             started_at: now,
             deadline: now + 30, // 30 second deadline
-            min_validators_for_consensus,
+            min_validators_for_consensus: min_validators_for_consensus.max(1),
             total_validators,
         }
     }
@@ -132,6 +138,7 @@ impl VoteTally {
                 previous_signature: previous.signature.clone(),
                 new_signature: signature,
             };
+            self.equivocated.write().await.insert(wallet);
             return Ok(Some(evidence));
         }
         votes.insert(
@@ -157,12 +164,14 @@ impl VoteTally {
         now > self.deadline
     }
 
-    /// Number of submitted votes whose wallet is in `eligible_wallets`.
+    /// Number of submitted votes whose wallet is in `eligible_wallets` and has
+    /// not equivocated in this round.
     async fn count_eligible_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
         let votes = self.votes.read().await;
+        let equivocated = self.equivocated.read().await;
         votes
             .keys()
-            .filter(|wallet| eligible_wallets.contains(*wallet))
+            .filter(|wallet| eligible_wallets.contains(*wallet) && !equivocated.contains(*wallet))
             .count()
     }
 
@@ -176,11 +185,12 @@ impl VoteTally {
         eligible_wallets: &HashSet<String>,
     ) -> Result<VerificationVote> {
         let votes = self.votes.read().await;
+        let equivocated = self.equivocated.read().await;
 
         let mut eligible: Vec<&VerificationVote> = Vec::with_capacity(votes.len());
         let mut excluded = 0usize;
         for (wallet, rec) in votes.iter() {
-            if eligible_wallets.contains(wallet) {
+            if eligible_wallets.contains(wallet) && !equivocated.contains(wallet) {
                 eligible.push(&rec.vote);
             } else {
                 excluded += 1;
@@ -232,9 +242,13 @@ impl VoteTally {
     /// under exactly the NodeId its signed vote arrived on.
     pub async fn valid_voters(&self, eligible_wallets: &HashSet<String>) -> Vec<NodeId> {
         let votes = self.votes.read().await;
+        let equivocated = self.equivocated.read().await;
         let mut out = Vec::new();
         for (wallet, rec) in votes.iter() {
-            if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
+            if rec.vote.is_valid()
+                && eligible_wallets.contains(wallet)
+                && !equivocated.contains(wallet)
+            {
                 out.push(rec.node_id.clone());
             }
         }
@@ -357,5 +371,19 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+
+        // Even if the caller's eligible set still lists W1, VoteTally itself
+        // must exclude the equivocator from quorum and valid_voters.
+        let eligible = wallets(&["W1"]);
+        assert!(!tally.has_consensus(&eligible).await);
+        assert!(tally.valid_voters(&eligible).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_min_validators_is_clamped_to_one() {
+        let tally = VoteTally::new("req-zero-min".to_string(), 0, 3);
+        let eligible = wallets(&["W1", "W2"]);
+        assert!(!tally.has_consensus(&eligible).await);
+        assert!(tally.consensus_result(&eligible).await.is_err());
     }
 }

@@ -271,6 +271,9 @@ pub struct MerklePath {
     pub indices: Vec<bool>,
 }
 
+/// Maximum supported Merkle authentication path depth.
+pub const MAX_MERKLE_PATH_DEPTH: usize = 256;
+
 impl MerklePath {
     /// Create an empty path
     pub fn empty() -> Self {
@@ -288,10 +291,10 @@ impl MerklePath {
     /// gadget. Any divergence between these three paths would break
     /// inclusion proofs.
     pub fn verify(&self, leaf: &[u8; 32], root: &[u8; 32]) -> bool {
-        // A well-formed path carries exactly one direction bit per sibling.
-        // Reject a length mismatch outright rather than letting `zip` silently
-        // verify only `min(len)` levels against the root.
-        if self.path.len() != self.indices.len() {
+        // A well-formed path carries exactly one direction bit per sibling and
+        // stays within MAX_MERKLE_PATH_DEPTH so a network-supplied path cannot
+        // trigger unbounded Poseidon hashing.
+        if self.path.len() != self.indices.len() || self.path.len() > MAX_MERKLE_PATH_DEPTH {
             return false;
         }
 
@@ -516,6 +519,12 @@ mod tests {
         let root = root_for(&leaf, &path, &indices);
         let mp = MerklePath { path, indices };
         assert!(mp.verify(&leaf, &root));
+
+        let over_depth = MerklePath {
+            path: vec![[0u8; 32]; MAX_MERKLE_PATH_DEPTH + 1],
+            indices: vec![false; MAX_MERKLE_PATH_DEPTH + 1],
+        };
+        assert!(!over_depth.verify(&leaf, &root));
     }
 
     // ── Property-based tests via `proptest` (#71) ─────────────────────

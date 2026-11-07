@@ -51,11 +51,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Validator Registry PDA: {}", validator_registry_pda);
 
     // Read registry state to extract minimum_stake, stake_mint, and min_token_stake.
-    let registry_data = client.get_account_data(&validator_registry_pda)?;
+    let registry_account = client.get_account(&validator_registry_pda)?;
+    if registry_account.owner != program_id {
+        return Err(format!(
+            "Validator registry PDA {} is owned by {}, expected program {}",
+            validator_registry_pda, registry_account.owner, program_id
+        )
+        .into());
+    }
+    let registry_data = registry_account.data;
     if registry_data.len() < 112 {
         return Err(
             "Validator registry data too short (< 112 bytes); predates dual-stake layout".into(),
         );
+    }
+    const VALIDATOR_REGISTRY_DISCRIMINATOR: [u8; 8] = [150, 180, 114, 15, 249, 129, 232, 185];
+    if registry_data[..8] != VALIDATOR_REGISTRY_DISCRIMINATOR {
+        return Err("Validator registry account discriminator mismatch".into());
     }
 
     // Registry layout after the 8-byte discriminator:
@@ -92,6 +104,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(val) => val.parse::<u64>()?,
         Err(_) => reg_min_token_stake,
     };
+
+    if stake_amount == 0 || stake_amount < reg_min_stake {
+        return Err(format!(
+            "stake_amount ({}) is below registry minimum_stake ({})",
+            stake_amount, reg_min_stake
+        )
+        .into());
+    }
+    if token_stake_amount < reg_min_token_stake {
+        return Err(format!(
+            "token_stake_amount ({}) is below registry min_token_stake ({})",
+            token_stake_amount, reg_min_token_stake
+        )
+        .into());
+    }
 
     println!("Stake Mint: {}", stake_mint);
     println!(
