@@ -398,6 +398,9 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
 
         let asset_in = request.asset_in;
         let asset_out = request.asset_out;
+        if request.min_out_amount == Some(0) {
+            return Err(RelayerError::InvalidAmount(0));
+        }
         let in_leg = WithdrawLeg::for_asset(asset_in);
         let fresh_address = ephemeral.pubkey().to_bytes();
 
@@ -489,6 +492,11 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
     ///
     /// [`execute_swap_out`]: Self::execute_swap_out
     pub async fn execute(&self, request: PrivateSwapRequest) -> Result<PrivateSwapResult> {
+        if request.reshield_recipient.0 == [0u8; 32] {
+            return Err(RelayerError::SubmissionFailed(
+                "reshield_recipient must not be all-zero".to_string(),
+            ));
+        }
         // A brand-new keypair per swap — nothing on-chain links it to the user.
         // This is the relayer-layer expression of the link-severing property
         // that the withdrawal nullifier enforces on-chain.
@@ -977,5 +985,27 @@ mod tests {
         );
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
+    }
+
+    #[tokio::test]
+    async fn zero_min_out_or_zero_reshield_recipient_is_rejected_before_withdraw() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let mut bad_min = request(native_note(1_000_000), [0x11u8; 32], 0);
+        bad_min.min_out_amount = Some(0);
+        let err = relayer.execute(bad_min).await.unwrap_err();
+        assert!(matches!(err, RelayerError::InvalidAmount(0)));
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "zero min_out_amount must be rejected before burning the input note"
+        );
+
+        let mut bad_recipient = request(native_note(1_000_000), [0x11u8; 32], 0);
+        bad_recipient.reshield_recipient = ShieldedAddress::from_bytes([0u8; 32]);
+        let err = relayer.execute(bad_recipient).await.unwrap_err();
+        assert!(matches!(err, RelayerError::SubmissionFailed(_)));
+        assert!(
+            relayer.submitter.recorded().is_empty(),
+            "all-zero reshield_recipient must be rejected before burning the input note"
+        );
     }
 }

@@ -36,7 +36,17 @@ pub fn check_bearer(headers: &HeaderMap, token: &IngressToken) -> Result<(), (St
     let presented = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| {
+            let v = v.trim();
+            let (scheme, rest) = v.split_once(char::is_whitespace)?;
+            if scheme.eq_ignore_ascii_case("Bearer") {
+                let tok = rest.trim();
+                if !tok.is_empty() {
+                    return Some(tok);
+                }
+            }
+            None
+        });
     match presented {
         Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => Err((
@@ -46,16 +56,15 @@ pub fn check_bearer(headers: &HeaderMap, token: &IngressToken) -> Result<(), (St
     }
 }
 
-/// Constant-time byte-slice equality. The length is not treated as secret (a
-/// bearer token's length is low-entropy), but the content comparison does not
-/// short-circuit on the first mismatch, so it does not leak the token through
-/// per-byte timing.
+/// Constant-time byte-slice equality. Iterates across the full expected token
+/// length even on a length mismatch so neither the content nor the exact length
+/// is leaked through early-return timing.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let mut diff = if a.len() == b.len() { 0u8 } else { 1u8 };
+    let max_len = a.len().max(b.len());
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
     diff == 0
@@ -86,13 +95,16 @@ mod tests {
         let token = token_from_config("  s3cret  "); // trimmed
         assert_eq!(token.as_deref(), Some("s3cret"));
 
-        // Correct token passes.
+        // Correct token passes (including case-insensitive scheme and surrounding whitespace).
         assert!(check_bearer(&headers_with(Some("Bearer s3cret")), &token).is_ok());
+        assert!(check_bearer(&headers_with(Some("bearer s3cret")), &token).is_ok());
+        assert!(check_bearer(&headers_with(Some("BEARER   s3cret  ")), &token).is_ok());
 
         // Missing, wrong, or malformed headers are all 401.
         for bad in [
             None,
             Some("Bearer wrong"),
+            Some("Bearer "),
             Some("s3cret"),
             Some("Basic s3cret"),
         ] {
