@@ -116,7 +116,7 @@ impl JobManager {
     }
 
     /// Register a validator with the manager
-    pub fn register_validator(&self, capacity: ValidatorCapacity) -> Result<()> {
+    pub fn register_validator(&self, mut capacity: ValidatorCapacity) -> Result<()> {
         let validator_id = capacity.validator_id.clone();
 
         info!(
@@ -125,6 +125,9 @@ impl JobManager {
         );
 
         let mut validators = self.validators.lock().unwrap();
+        if let Some(existing) = validators.get(&validator_id) {
+            capacity.active_jobs = existing.active_jobs;
+        }
         validators.insert(validator_id, capacity);
 
         Ok(())
@@ -303,7 +306,11 @@ impl JobManager {
 
         let total_validators = validators.len();
         let active_validators = validators.values().filter(|v| v.is_alive()).count();
-        let total_capacity: usize = validators.values().map(|v| v.max_concurrent_jobs).sum();
+        let total_capacity: usize = validators
+            .values()
+            .filter(|v| v.is_alive())
+            .map(|v| v.max_concurrent_jobs)
+            .sum();
         let active_jobs: usize = validators.values().map(|v| v.active_jobs).sum();
 
         ManagerStats {
@@ -483,5 +490,42 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_get_stats_excludes_dead_validators_from_total_capacity() {
+        let manager = JobManager::new();
+
+        let mut live = ValidatorCapacity::new("live".to_string(), 4, 8192, 5);
+        live.last_heartbeat = current_timestamp();
+
+        let mut dead = ValidatorCapacity::new("dead".to_string(), 4, 8192, 10);
+        dead.last_heartbeat = current_timestamp() - 35_000; // > 30 seconds ago
+
+        manager.register_validator(live).unwrap();
+        {
+            let mut validators = manager.validators.lock().unwrap();
+            validators.insert("dead".to_string(), dead);
+        }
+
+        let stats = manager.get_stats();
+        assert_eq!(stats.total_validators, 2);
+        assert_eq!(stats.active_validators, 1);
+        assert_eq!(stats.total_capacity, 5); // Excludes dead validator's 10 capacity
+    }
+
+    #[test]
+    fn test_register_validator_preserves_active_jobs_on_re_register() {
+        let manager = JobManager::new();
+        let mut cap = ValidatorCapacity::new("v1".to_string(), 4, 8192, 5);
+        cap.active_jobs = 3;
+        manager.register_validator(cap).unwrap();
+
+        let re_cap = ValidatorCapacity::new("v1".to_string(), 8, 16384, 5);
+        assert_eq!(re_cap.active_jobs, 0);
+        manager.register_validator(re_cap).unwrap();
+
+        let stats = manager.get_stats();
+        assert_eq!(stats.active_jobs, 3);
     }
 }
