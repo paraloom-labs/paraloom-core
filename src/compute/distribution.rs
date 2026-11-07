@@ -205,19 +205,39 @@ impl JobCoordinator {
     /// Assign a job to the best available validator
     pub async fn assign_job(&self, job_id: JobId) -> Result<Option<JobAssignment>> {
         let validators = self.validators.read().await;
+        let pending = self.pending_assignments.read().await;
+        let active = self.active_assignments.read().await;
+
+        let effective_load = |v: &CapacityAnnouncement| -> usize {
+            let assigned = pending
+                .values()
+                .filter(|a| a.validator_id == v.validator_id)
+                .count()
+                + active
+                    .values()
+                    .filter(|a| a.validator_id == v.validator_id)
+                    .count();
+            v.current_load.max(assigned)
+        };
 
         // Find validator with lowest load factor and available capacity
         let best_validator = validators
             .values()
-            .filter(|v| v.available_capacity() > 0)
+            .filter(|v| effective_load(v) < v.max_concurrent_jobs)
             .min_by(|a, b| {
-                a.load_factor()
-                    .partial_cmp(&b.load_factor())
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let lf_a = effective_load(a) as f64 / a.max_concurrent_jobs as f64;
+                let lf_b = effective_load(b) as f64 / b.max_concurrent_jobs as f64;
+                lf_a.partial_cmp(&lf_b).unwrap_or(std::cmp::Ordering::Equal)
             });
 
         if let Some(validator) = best_validator {
-            let assignment = JobAssignment::new(job_id.clone(), validator.validator_id.clone());
+            let validator_id = validator.validator_id.clone();
+            let load_pct =
+                (effective_load(validator) as f64 / validator.max_concurrent_jobs as f64) * 100.0;
+            drop(active);
+            drop(pending);
+
+            let assignment = JobAssignment::new(job_id.clone(), validator_id.clone());
 
             // Store as pending assignment
             let mut pending = self.pending_assignments.write().await;
@@ -225,9 +245,7 @@ impl JobCoordinator {
 
             debug!(
                 "Assigned job {} to validator {} (load: {:.1}%)",
-                job_id,
-                validator.validator_id,
-                validator.load_factor() * 100.0
+                job_id, validator_id, load_pct
             );
 
             Ok(Some(assignment))
@@ -300,6 +318,7 @@ impl JobCoordinator {
                     if old_assignment.retry_count < MAX_JOB_RETRIES {
                         // Find best validator with available capacity
                         let validators = self.validators.read().await;
+                        let active = self.active_assignments.read().await;
                         let mut best_validator: Option<&CapacityAnnouncement> = None;
                         let mut best_load = usize::MAX;
 
@@ -309,7 +328,11 @@ impl JobCoordinator {
                                     .values()
                                     .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
-                                pending_count
+                                let active_count = active
+                                    .values()
+                                    .filter(|a| a.validator_id == validator.validator_id)
+                                    .count();
+                                validator.current_load.max(pending_count + active_count)
                             };
 
                             if current_load < validator.max_concurrent_jobs
@@ -452,6 +475,7 @@ impl JobCoordinator {
                     if old_assignment.retry_count < MAX_JOB_RETRIES {
                         // Find best validator with available capacity
                         let validators = self.validators.read().await;
+                        let active = self.active_assignments.read().await;
                         let mut best_validator: Option<&CapacityAnnouncement> = None;
                         let mut best_load = usize::MAX;
 
@@ -461,7 +485,11 @@ impl JobCoordinator {
                                     .values()
                                     .filter(|a| a.validator_id == validator.validator_id)
                                     .count();
-                                pending_count
+                                let active_count = active
+                                    .values()
+                                    .filter(|a| a.validator_id == validator.validator_id)
+                                    .count();
+                                validator.current_load.max(pending_count + active_count)
                             };
 
                             if current_load < validator.max_concurrent_jobs
@@ -917,5 +945,60 @@ mod tests {
         // Job should be removed from pending
         let stats = coordinator.get_stats().await;
         assert_eq!(stats.pending_assignments, 0);
+    }
+
+    #[tokio::test]
+    async fn assign_job_and_timeout_reassignment_account_for_pending_and_active_load() {
+        let coordinator = JobCoordinator::new();
+
+        // Register v1 with max_concurrent_jobs = 1 and v2 with max_concurrent_jobs = 1
+        let cap1 = ValidatorCapacity::new("v1".to_string(), 4, 8192, 1);
+        let cap2 = ValidatorCapacity::new("v2".to_string(), 4, 8192, 1);
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(cap1, 0))
+            .await;
+        coordinator
+            .update_validator_capacity(CapacityAnnouncement::new(cap2, 0))
+            .await;
+
+        // First job takes one validator's sole slot; second job must go to the other validator;
+        // third job must see both full and return None.
+        let a1 = coordinator
+            .assign_job("j1".to_string())
+            .await
+            .unwrap()
+            .expect("first job assigned");
+        let a2 = coordinator
+            .assign_job("j2".to_string())
+            .await
+            .unwrap()
+            .expect("second job assigned");
+        assert_ne!(
+            a1.validator_id, a2.validator_id,
+            "second job must not over-assign a validator whose 1 slot is already pending"
+        );
+        assert!(
+            coordinator
+                .assign_job("j3".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "third job must be refused when all validator slots are occupied by pending assignments"
+        );
+
+        // Mark j2 fetched (moves to active_assignments), then time out j1 on its validator
+        // after removing that validator: handle_timeouts must see that the other validator's
+        // slot is occupied by an active job and refuse to over-assign it.
+        coordinator.mark_job_fetched(&"j2".to_string()).await.unwrap();
+        coordinator.remove_validator(&a1.validator_id).await;
+        {
+            let mut pending = coordinator.pending_assignments.write().await;
+            pending.get_mut("j1").unwrap().timeout_at = 0;
+        }
+        let reassigned = coordinator.handle_timeouts().await.unwrap();
+        assert!(
+            reassigned.is_empty(),
+            "pending timeout reassignment must respect active_assignments on candidate validators"
+        );
     }
 }

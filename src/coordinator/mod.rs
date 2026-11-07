@@ -625,13 +625,34 @@ impl Coordinator {
     }
 
     /// Handle task error
-    pub async fn handle_task_error(&self, task_id: String, error: String) -> Result<()> {
-        info!("Task error: {} - {}", task_id, error);
+    pub async fn handle_task_error(
+        &self,
+        source: &NodeId,
+        task_id: String,
+        error: String,
+    ) -> Result<()> {
+        info!(
+            "Task error: {} from {:?} - {}",
+            task_id, source, error
+        );
 
         let mut active = self.active_tasks.lock().await;
-        if let Some(task) = active.get_mut(&task_id) {
-            task.status = TaskStatus::Failed { error };
+        let task = active
+            .get_mut(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("error for unknown or inactive task {}", task_id))?;
+        if task.assigned_to.as_deref() != Some(format!("{:?}", source).as_str()) {
+            return Err(anyhow::anyhow!(
+                "error for {} from a peer it was not assigned to",
+                task_id
+            ));
         }
+        if matches!(task.status, TaskStatus::Completed) {
+            return Err(anyhow::anyhow!(
+                "task {} already completed; ignoring late error",
+                task_id
+            ));
+        }
+        task.status = TaskStatus::Failed { error };
 
         Ok(())
     }
@@ -853,6 +874,17 @@ mod tests {
             .is_ok());
         assert!(coordinator
             .handle_task_result(&assignee, make_result())
+            .await
+            .is_err());
+
+        // A completed task cannot be overwritten to Failed by handle_task_error,
+        // and an unassigned peer cannot fail an active task.
+        assert!(coordinator
+            .handle_task_error(&attacker, "t1".to_string(), "forged".to_string())
+            .await
+            .is_err());
+        assert!(coordinator
+            .handle_task_error(&assignee, "t1".to_string(), "late err".to_string())
             .await
             .is_err());
     }

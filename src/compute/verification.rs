@@ -100,15 +100,22 @@ impl VerificationCoordinator {
         job_id: JobId,
         validators: Vec<ValidatorId>,
     ) -> Result<VerificationRequest> {
-        if validators.len() < VERIFICATION_VALIDATOR_COUNT {
+        let mut unique_validators = Vec::with_capacity(validators.len());
+        let mut seen = std::collections::HashSet::with_capacity(validators.len());
+        for v in validators {
+            if !v.trim().is_empty() && seen.insert(v.clone()) {
+                unique_validators.push(v);
+            }
+        }
+        if unique_validators.len() < VERIFICATION_VALIDATOR_COUNT {
             return Err(anyhow!(
-                "Insufficient validators: need {}, got {}",
+                "Insufficient distinct validators: need {}, got {}",
                 VERIFICATION_VALIDATOR_COUNT,
-                validators.len()
+                unique_validators.len()
             ));
         }
 
-        let request = VerificationRequest::new(job_id.clone(), validators);
+        let request = VerificationRequest::new(job_id.clone(), unique_validators);
 
         let mut requests = self.requests.write().await;
         requests.insert(job_id.clone(), request.clone());
@@ -205,13 +212,21 @@ impl VerificationCoordinator {
         let mut result_groups: HashMap<Vec<u8>, Vec<&ValidatorResult>> = HashMap::new();
 
         for validator_result in job_results {
-            // Use output data as key (deterministic WASM should produce same output)
-            let key = match &validator_result.result.output_data {
-                Some(data) => data.clone(),
-                None => vec![], // Failed results group together
-            };
+            if validator_result.result.status != super::job::JobStatus::Completed {
+                continue;
+            }
+            if let Some(data) = &validator_result.result.output_data {
+                result_groups
+                    .entry(data.clone())
+                    .or_default()
+                    .push(validator_result);
+            }
+        }
 
-            result_groups.entry(key).or_default().push(validator_result);
+        if result_groups.is_empty() {
+            return Ok(ConsensusResult::Disagreed {
+                results: job_results.clone(),
+            });
         }
 
         // Find largest group (majority)
@@ -564,5 +579,38 @@ mod tests {
             .submit_result(&"ghost".to_string(), "v1".to_string(), result)
             .await;
         assert!(rejected.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_validators_and_failed_results_do_not_reach_agreed_consensus() {
+        let coordinator = VerificationCoordinator::new();
+        // 3 duplicate entries of the same validator must be rejected.
+        let dup = vec!["v1".to_string(), "v1".to_string(), "v1".to_string()];
+        assert!(coordinator
+            .create_verification_request("job-dup".to_string(), dup)
+            .await
+            .is_err());
+
+        // 2 failed results must yield Disagreed, not Agreed(Failed).
+        let job_id = "job-fail-consensus".to_string();
+        coordinator
+            .create_verification_request(
+                job_id.clone(),
+                vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+            )
+            .await
+            .unwrap();
+        for v in ["v1", "v2"] {
+            let failed = JobResult::failure(job_id.clone(), "oom".to_string(), 10);
+            coordinator
+                .submit_result(&job_id, v.to_string(), failed)
+                .await
+                .unwrap();
+        }
+        let consensus = coordinator.check_consensus(&job_id).await.unwrap();
+        assert!(
+            matches!(consensus, ConsensusResult::Disagreed { .. }),
+            "failed results must not reach Agreed consensus"
+        );
     }
 }

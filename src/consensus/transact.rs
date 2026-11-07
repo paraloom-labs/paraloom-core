@@ -865,6 +865,22 @@ impl TransactVerificationCoordinator {
             return Ok(());
         }
 
+        // Match the validator's advertised wallet against `result.wallet_pubkey`
+        // when known, so a peer cannot attribute a vote to another validator's
+        // co-sign wallet.
+        if let Some(known_wallet) = self.validator_wallet(&result.validator).await {
+            if known_wallet != result.wallet_pubkey {
+                log::warn!(
+                    "dropping vote for {}: validator {:?} advertised wallet {} != vote wallet {}",
+                    result.request_id,
+                    result.validator,
+                    known_wallet,
+                    result.wallet_pubkey
+                );
+                return Ok(());
+            }
+        }
+
         // Eligibility: while the on-chain wallet set is known, only a staked
         // co-sign wallet may be counted (fail-open only while it is empty, as
         // the registration gate does).
@@ -875,6 +891,20 @@ impl TransactVerificationCoordinator {
                     "dropping vote from non-staked wallet {} for {}",
                     result.wallet_pubkey,
                     result.request_id
+                );
+                return Ok(());
+            }
+            if onchain.is_empty()
+                && !self
+                    .validators
+                    .read()
+                    .await
+                    .iter()
+                    .any(|v| v == &result.validator)
+            {
+                log::warn!(
+                    "dropping vote from unregistered validator {:?} while onchain_wallets is empty",
+                    result.validator
                 );
                 return Ok(());
             }
@@ -984,6 +1014,7 @@ impl TransactVerificationCoordinator {
     /// Remove a completed verification's state.
     pub async fn cleanup(&self, request_id: &str) -> Result<()> {
         self.pending.write().await.remove(request_id);
+        self.emitted.write().await.remove(request_id);
         log::debug!("Cleaned up transact verification: {}", request_id);
         Ok(())
     }
@@ -1422,6 +1453,34 @@ mod tests {
         assert!(
             approvals.try_recv().is_ok(),
             "after clear_emitted the same canonical id can be re-approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_clears_emitted_and_submit_result_enforces_wallet_and_registered_validator_guards(
+    ) {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req.clone()).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+
+        // Node 1 registered with wallet W1 cannot submit a vote claiming wallet W0.
+        coord.submit_result(vote(&id, 1, "W0", true)).await.unwrap();
+        assert!(approvals.try_recv().is_err());
+
+        // Valid vote from Node 1 with W1 settles.
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok());
+
+        // cleanup() must also clear `emitted` so a re-started round for `id` can emit again.
+        coord.cleanup(&id).await.unwrap();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "cleanup must clear emitted so a restarted round can be approved"
         );
     }
 
