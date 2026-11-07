@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::bridge::solana::{
     build_settlement_message, derive_bridge_vault, CoSignPayload, SettlementParams,
@@ -141,7 +142,7 @@ pub struct Node {
     /// legitimate blockhash-expiry retries. Keyed on the nullifiers rather than
     /// the request id, so randomized proofs of the same spend cannot each claim
     /// a fresh budget.
-    cosign_counts: Arc<Mutex<HashMap<String, u32>>>,
+    cosign_counts: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
 }
 
 /// Build the compute-job authorization policy (F3) from `[compute]` settings.
@@ -185,14 +186,20 @@ fn build_compute_auth_policy(cfg: &crate::config::ComputeSettings) -> ComputeAut
 /// limit in practice.
 const MAX_VERIFIED_CACHE: usize = 1024;
 
-/// Maximum times this node will co-sign one spend, keyed on its input
-/// nullifiers (#593/#606).
+/// Maximum times this node will co-sign one spend within the budget window,
+/// keyed on its input nullifiers (#593/#606/#1505).
 /// The co-sign signature is the node's Solana fee-payer signature, so an
 /// unbounded count lets a peer reuse a single cached approval to extract fresh
-/// fee-payer signatures and burn the hot authority's SOL on replays. A small
-/// cap still covers the leader rebuilding with a fresh blockhash when the
-/// previous one expires before the quorum submits.
-const MAX_COSIGNS_PER_SETTLEMENT: u32 = 4;
+/// fee-payer signatures and burn the hot authority's SOL on replays.
+/// Set to 16 to comfortably accommodate multiple approval lifecycles (each
+/// running MAX_SETTLE_ATTEMPTS = 3 retry attempts) while bounding the rate
+/// of fee-payer signature issuance.
+const MAX_COSIGNS_PER_SETTLEMENT: u32 = 16;
+
+/// Time window after which the per-nullifier co-sign budget resets (#1505).
+/// Prevents a spend from being permanently bricked across the node's process
+/// lifetime if earlier approvals failed due to network or blockhash timeouts.
+const COSIGN_BUDGET_WINDOW: Duration = Duration::from_secs(300);
 
 /// Upper bound on the number of per-nullifier co-sign counters retained (#626).
 /// The counter map is never explicitly cleared, so without a ceiling it grows
@@ -943,7 +950,7 @@ async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
-    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -1078,12 +1085,24 @@ async fn cosign_settlement(
     // per note, so this never restricts distinct legitimate spends. Only a
     // settlement we approved and could rebuild reaches here, so a mismatched or
     // undecodable request is declined earlier and never spends the budget.
+    #[allow(clippy::unnecessary_map_or)]
     {
         let mut counts = cosign_counts.lock().await;
-        if cap_nullifiers
-            .iter()
-            .any(|nf| counts.get(nf).copied().unwrap_or(0) >= MAX_COSIGNS_PER_SETTLEMENT)
-        {
+        let now = Instant::now();
+        if cap_nullifiers.iter().any(|nf| {
+            if let Some((count, window_start)) = counts.get(nf) {
+                if now
+                    .checked_duration_since(*window_start)
+                    .map_or(true, |d| d < COSIGN_BUDGET_WINDOW)
+                {
+                    *count >= MAX_COSIGNS_PER_SETTLEMENT
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }) {
             return declined("co-sign count limit reached for an input nullifier");
         }
         for nf in cap_nullifiers {
@@ -1097,7 +1116,20 @@ async fn cosign_settlement(
                     counts.remove(&victim);
                 }
             }
-            *counts.entry(nf).or_insert(0) += 1;
+            counts
+                .entry(nf)
+                .and_modify(|(count, window_start)| {
+                    if now
+                        .checked_duration_since(*window_start)
+                        .map_or(false, |d| d >= COSIGN_BUDGET_WINDOW)
+                    {
+                        *count = 1;
+                        *window_start = now;
+                    } else {
+                        *count += 1;
+                    }
+                })
+                .or_insert((1, now));
         }
     }
 
@@ -3322,6 +3354,73 @@ mod tests {
         assert!(
             counts.lock().await.len() <= MAX_COSIGN_COUNTS,
             "cosign_counts must stay bounded"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cosign_cap_resets_after_window_preventing_permanent_spend_brick() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        tas.lock().await.insert(
+            "req-1".to_string(),
+            ta_request("req-1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        // Exhaust the budget in the current window (comfortably covers multiple retry attempts).
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                cosign_req("req-1", SettlementKind::Transact, &payload),
+            )
+            .await;
+            assert!(resp.signature.is_some());
+        }
+
+        // Immediately afterwards in the same window, further co-signs are declined.
+        let declined_resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("req-1", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(declined_resp.signature, None);
+
+        // Advance time past the budget window (#1505).
+        tokio::time::advance(COSIGN_BUDGET_WINDOW + Duration::from_secs(1)).await;
+
+        // The budget has reset: co-signing is accepted again, preventing permanent bricking.
+        let fresh_resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("req-1", SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert!(
+            fresh_resp.signature.is_some(),
+            "co-sign budget must refresh after window to prevent permanently bricking spends"
         );
     }
 
