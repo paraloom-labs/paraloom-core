@@ -93,29 +93,56 @@ pub fn extract_deposit_events(
 
     let mut events = Vec::new();
 
-    // Top-level instructions are already compiled — JSON encoding for
-    // an unparsed program drops the `UiInstruction` wrapper.
-    for compiled in &raw.instructions {
+    let inner_sets =
+        confirmed
+            .transaction
+            .meta
+            .as_ref()
+            .and_then(|meta| match &meta.inner_instructions {
+                solana_transaction_status::option_serializer::OptionSerializer::Some(inner) => {
+                    Some(inner.as_slice())
+                }
+                _ => None,
+            });
+
+    // Walk top-level instructions in execution order and interleave any CPI
+    // `inner_instructions` belonging to top-level instruction `idx` immediately
+    // after `raw.instructions[idx]`. On the Solana runtime, all inner CPIs
+    // invoked by top-level instruction `idx` complete (and append their leaves
+    // to the on-chain Merkle tree) before top-level instruction `idx + 1` runs.
+    for (idx, compiled) in raw.instructions.iter().enumerate() {
         if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id) {
             events.push(build_event(signature, confirmed, decoded));
         }
-    }
 
-    // Inner instructions (CPI from another program into ours) come back
-    // through the meta field as `UiInstruction`, which needs the match
-    // because parsed instructions can also appear there.
-    if let Some(meta) = &confirmed.transaction.meta {
-        if let solana_transaction_status::option_serializer::OptionSerializer::Some(inner) =
-            &meta.inner_instructions
-        {
-            for inner_set in inner {
+        if let Some(inner) = inner_sets {
+            for inner_set in inner.iter().filter(|set| usize::from(set.index) == idx) {
                 for instruction in &inner_set.instructions {
-                    if let UiInstruction::Compiled(compiled) = instruction {
+                    if let UiInstruction::Compiled(inner_compiled) = instruction {
                         if let Some(decoded) =
-                            decode_compiled_deposit(compiled, &account_keys, program_id)
+                            decode_compiled_deposit(inner_compiled, &account_keys, program_id)
                         {
                             events.push(build_event(signature, confirmed, decoded));
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(inner) = inner_sets {
+        let mut trailing: Vec<_> = inner
+            .iter()
+            .filter(|set| usize::from(set.index) >= raw.instructions.len())
+            .collect();
+        trailing.sort_by_key(|set| set.index);
+        for inner_set in trailing {
+            for instruction in &inner_set.instructions {
+                if let UiInstruction::Compiled(inner_compiled) = instruction {
+                    if let Some(decoded) =
+                        decode_compiled_deposit(inner_compiled, &account_keys, program_id)
+                    {
+                        events.push(build_event(signature, confirmed, decoded));
                     }
                 }
             }
@@ -515,5 +542,173 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn extract_deposit_events_interleaves_inner_cpi_deposits_in_execution_order() {
+        use crate::privacy::merkle::MerkleTree;
+        use crate::privacy::poseidon_circom::v3_commit;
+        use crate::privacy::types::{fr_to_bytes_32, Commitment};
+        use ark_bn254::Fr;
+        use ark_ff::PrimeField;
+        use solana_sdk::hash::Hash;
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedTransactionWithStatusMeta, UiInnerInstructions, UiRawMessage, UiTransaction,
+            UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let router_program = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        // Account layout for deposit_note:
+        // 0: bridge_state, 1: bridge_vault, 2: merkle_tree, 3: depositor,
+        // 4: paraloom program_id, 5: router_program.
+        let account_keys = vec![
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            depositor.to_string(),
+            program_id.to_string(),
+            router_program.to_string(),
+        ];
+
+        let encode_note = |amount: u64, pubkey: [u8; 32], blinding: [u8; 32]| -> String {
+            let payload = DepositNoteInstructionData {
+                amount,
+                pubkey,
+                blinding,
+            };
+            let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+            bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+            bs58::encode(bytes).into_string()
+        };
+
+        // Top-level ix 0: router/wrapper call that invokes `deposit_note` via CPI (1_000_000).
+        let router_ix_0 = UiCompiledInstruction {
+            program_id_index: 5,
+            accounts: vec![0, 1, 2, 3],
+            data: bs58::encode([0xAA, 0xBB]).into_string(),
+            stack_height: None,
+        };
+        let cpi_deposit_0 = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: encode_note(1_000_000, [1u8; 32], [2u8; 32]),
+            stack_height: Some(2),
+        };
+
+        // Top-level ix 1: direct `deposit_note` instruction (2_000_000).
+        let direct_deposit_1 = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: encode_note(2_000_000, [3u8; 32], [4u8; 32]),
+            stack_height: None,
+        };
+
+        // Top-level ix 2: second router call that invokes `deposit_note` via CPI (3_000_000).
+        let router_ix_2 = UiCompiledInstruction {
+            program_id_index: 5,
+            accounts: vec![0, 1, 2, 3],
+            data: bs58::encode([0xCC, 0xDD]).into_string(),
+            stack_height: None,
+        };
+        let cpi_deposit_2 = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: encode_note(3_000_000, [5u8; 32], [6u8; 32]),
+            stack_height: Some(2),
+        };
+
+        let raw = UiRawMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            account_keys,
+            recent_blockhash: Hash::default().to_string(),
+            instructions: vec![router_ix_0, direct_deposit_1, router_ix_2],
+            address_table_lookups: None,
+        };
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 42,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig_interleaved".to_string()],
+                    message: UiMessage::Raw(raw),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    status: Ok(()),
+                    err: None,
+                    fee: 5000,
+                    pre_balances: vec![],
+                    post_balances: vec![],
+                    // Provide inner_instructions out of index order as well to verify
+                    // extraction follows top-level instruction index rather than Vec order.
+                    inner_instructions: OptionSerializer::Some(vec![
+                        UiInnerInstructions {
+                            index: 2,
+                            instructions: vec![UiInstruction::Compiled(cpi_deposit_2)],
+                        },
+                        UiInnerInstructions {
+                            index: 0,
+                            instructions: vec![UiInstruction::Compiled(cpi_deposit_0)],
+                        },
+                    ]),
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::None,
+                    post_token_balances: OptionSerializer::None,
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::None,
+                    return_data: OptionSerializer::None,
+                    compute_units_consumed: OptionSerializer::None,
+                    cost_units: OptionSerializer::None,
+                }),
+                version: None,
+            },
+            block_time: Some(1_700_000_000),
+        };
+
+        let events = extract_deposit_events("sig_interleaved", &confirmed, &program_id);
+        let amounts: Vec<u64> = events.iter().map(|e| e.amount).collect();
+        assert_eq!(
+            amounts,
+            vec![1_000_000, 2_000_000, 3_000_000],
+            "deposits must be emitted in exact on-chain execution order (ix 0 CPI -> ix 1 top-level -> ix 2 CPI) so the off-chain Merkle tree appends leaves in the same order as the program"
+        );
+
+        let leaf_of = |ev: &DepositEvent| -> Commitment {
+            Commitment(fr_to_bytes_32(v3_commit(
+                Fr::from(ev.amount),
+                Fr::from_le_bytes_mod_order(&ev.recipient),
+                Fr::from_le_bytes_mod_order(&ev.randomness),
+                Fr::from_le_bytes_mod_order(&ev.asset_id),
+            )))
+        };
+
+        let extracted_tree = MerkleTree::new();
+        for ev in &events {
+            extracted_tree.insert(&leaf_of(ev)).await.unwrap();
+        }
+
+        // On-chain IncrementalMerkleTree appends leaf 0 (ix 0 CPI), leaf 1 (ix 1 direct),
+        // then leaf 2 (ix 2 CPI). Inserting top-level first and inner CPIs after forks the root.
+        let wrong_order_tree = MerkleTree::new();
+        for idx in [1usize, 2, 0] {
+            wrong_order_tree
+                .insert(&leaf_of(&events[idx]))
+                .await
+                .unwrap();
+        }
+        assert_ne!(
+            extracted_tree.root().await,
+            wrong_order_tree.root().await,
+            "reordering top-level and inner CPI deposits produces a divergent Merkle root"
+        );
     }
 }
