@@ -31,7 +31,7 @@ pub use instructions::{
 };
 pub use keypair::{load_keypair_from_file, pubkey_from_file};
 pub use listener::EventListener;
-pub use program::ProgramInterface;
+pub use program::{parse_is_known_root, ProgramInterface};
 pub use rpc::{BridgeRpc, RealBridgeRpc};
 
 use crate::bridge::{BridgeConfig, BridgeStats, Result};
@@ -110,6 +110,11 @@ impl SolanaBridge {
     /// Whether a nullifier's PDA already exists on chain (#703).
     pub async fn is_nullifier_spent(&self, nullifier: &[u8; 32]) -> bool {
         self.program.is_nullifier_spent(nullifier).await
+    }
+
+    /// Whether a Merkle root is known to the on-chain tree.
+    pub async fn is_known_root(&self, root: &[u8; 32]) -> bool {
+        self.program.is_known_root(root).await
     }
 
     /// Active validators' on-chain stakes (wallet → lamports), for the consensus

@@ -39,6 +39,34 @@ fn parse_program_version(data: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Check whether `root` is known from raw on-chain `IncrementalMerkleTree` account bytes.
+///
+/// Layout in Anchor (with 8-byte discriminator):
+/// - 0..8: Discriminator
+/// - 8..16: next_index (u64)
+/// - 16..24: root_index (u64)
+/// - 24..56: root ([u8; 32])
+/// - 56..1080: filled_subtrees ([[u8; 32]; 32])
+/// - 1080..3128: root_history ([[u8; 32]; 64])
+/// Total account length: 3128 bytes.
+pub fn parse_is_known_root(data: &[u8], root: &[u8; 32]) -> bool {
+    if root == &[0u8; 32] || data.len() < 3128 {
+        return false;
+    }
+    // Check current root
+    if &data[24..56] == root {
+        return true;
+    }
+    // Check root history ring buffer (64 entries of 32 bytes)
+    let history = &data[1080..3128];
+    for chunk in history.chunks_exact(32) {
+        if chunk == root {
+            return true;
+        }
+    }
+    false
+}
+
 /// Interface to Paraloom Solana program
 pub struct ProgramInterface {
     /// Solana RPC behind the trait so tests can substitute a mock.
@@ -199,6 +227,24 @@ impl ProgramInterface {
         let (pda, _) = Pubkey::find_program_address(&[b"nullifier", nullifier], &self.program_id);
         match self.rpc.get_account(&pda).await {
             Ok(account) => account.owner == self.program_id,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether `root` is known to the on-chain Merkle tree (current root or in recent history).
+    pub async fn is_known_root(&self, root: &[u8; 32]) -> bool {
+        if root == &[0u8; 32] {
+            return false;
+        }
+        let (tree_pda, _) =
+            crate::bridge::solana::instructions::derive_merkle_tree(&self.program_id);
+        match self.rpc.get_account(&tree_pda).await {
+            Ok(account) => {
+                if account.owner != self.program_id {
+                    return false;
+                }
+                parse_is_known_root(&account.data, root)
+            }
             Err(_) => false,
         }
     }
@@ -481,5 +527,78 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    fn synth_merkle_tree_account(root: [u8; 32], history: &[[u8; 32]]) -> Vec<u8> {
+        let mut buf = vec![0xBB; 8]; // Discriminator
+        buf.extend_from_slice(&10u64.to_le_bytes()); // next_index
+        buf.extend_from_slice(&0u64.to_le_bytes()); // root_index
+        buf.extend_from_slice(&root); // current root (32 bytes)
+        buf.extend_from_slice(&[0u8; 32 * 32]); // filled_subtrees (1024 bytes)
+        let mut hist_buf = vec![0u8; 64 * 32];
+        for (i, h) in history.iter().take(64).enumerate() {
+            hist_buf[i * 32..(i + 1) * 32].copy_from_slice(h);
+        }
+        buf.extend_from_slice(&hist_buf);
+        buf
+    }
+
+    #[test]
+    fn parse_is_known_root_matches_current_or_history() {
+        let cur = [0x11; 32];
+        let h1 = [0x22; 32];
+        let h2 = [0x33; 32];
+        let unknown = [0x99; 32];
+        let data = synth_merkle_tree_account(cur, &[h1, h2]);
+
+        assert!(
+            parse_is_known_root(&data, &cur),
+            "current root must be known"
+        );
+        assert!(
+            parse_is_known_root(&data, &h1),
+            "history root 1 must be known"
+        );
+        assert!(
+            parse_is_known_root(&data, &h2),
+            "history root 2 must be known"
+        );
+        assert!(
+            !parse_is_known_root(&data, &unknown),
+            "unknown root rejected"
+        );
+        assert!(
+            !parse_is_known_root(&data, &[0u8; 32]),
+            "all-zero root rejected"
+        );
+        assert!(
+            !parse_is_known_root(&data[..2000], &cur),
+            "short buffer rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_known_root_checks_on_chain_account() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let cur = [0x44; 32];
+        let program_id = "11111111111111111111111111111111"
+            .parse::<Pubkey>()
+            .unwrap();
+        let account = Account {
+            lamports: 1_000_000,
+            data: synth_merkle_tree_account(cur, &[]),
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+        *mock.next_get_account.lock().unwrap() = Some(Ok(account));
+        let config = BridgeConfig {
+            program_id: program_id.to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        assert!(program.is_known_root(&cur).await);
+        assert!(!program.is_known_root(&[0x99; 32]).await);
+        assert!(!program.is_known_root(&[0u8; 32]).await);
     }
 }
