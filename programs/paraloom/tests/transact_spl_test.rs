@@ -68,7 +68,13 @@ fn bake_mint_at(pt: &mut ProgramTest, mint: Pubkey) {
 }
 
 /// Bake an initialized SPL token account at a FIXED address.
-fn bake_token_account_at(pt: &mut ProgramTest, addr: Pubkey, mint: Pubkey, owner: Pubkey, amount: u64) {
+fn bake_token_account_at(
+    pt: &mut ProgramTest,
+    addr: Pubkey,
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) {
     use anchor_lang::solana_program::program_option::COption;
     let mut data = vec![0u8; spl_token::state::Account::LEN];
     spl_token::state::Account {
@@ -95,7 +101,9 @@ fn bake_token_account_at(pt: &mut ProgramTest, addr: Pubkey, mint: Pubkey, owner
 }
 
 fn token_amount(account: &Account) -> u64 {
-    spl_token::state::Account::unpack(&account.data).unwrap().amount
+    spl_token::state::Account::unpack(&account.data)
+        .unwrap()
+        .amount
 }
 
 #[tokio::test]
@@ -123,8 +131,7 @@ async fn transact_spl_settles_a_token_withdrawal() {
             rent_epoch: 0,
         },
     );
-    let cosigner_token =
-        add_token_account(&mut pt, stake_mint, cosigner.pubkey(), TEST_TOKEN_FUND);
+    let cosigner_token = add_token_account(&mut pt, stake_mint, cosigner.pubkey(), TEST_TOKEN_FUND);
 
     // The shielded SPL asset, its depositor, the payout recipient, and the fee
     // account — all keyed to the fixture's fixed mint/recipient addresses.
@@ -149,7 +156,13 @@ async fn transact_spl_settles_a_token_withdrawal() {
     );
     // Payout destination at the fixture's bound token-account address.
     let recipient_token = Pubkey::new_from_array(fx::SPL_FIXTURE_RECIPIENT_TOKEN_ACCOUNT);
-    bake_token_account_at(&mut pt, recipient_token, asset_mint, Pubkey::new_unique(), 0);
+    bake_token_account_at(
+        &mut pt,
+        recipient_token,
+        asset_mint,
+        Pubkey::new_unique(),
+        0,
+    );
     // The settling validator's fee account for the withdrawn asset.
     let fee_token = add_token_account(&mut pt, asset_mint, upgrade_authority.pubkey(), 0);
 
@@ -170,10 +183,14 @@ async fn transact_spl_settles_a_token_withdrawal() {
         Pubkey::find_program_address(&[b"asset_vault_authority"], &program_id);
     let (asset_config, _) =
         Pubkey::find_program_address(&[b"asset_config", asset_mint.as_ref()], &program_id);
-    let (nf0_pda, _) =
-        Pubkey::find_program_address(&[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_0.as_ref()], &program_id);
-    let (nf1_pda, _) =
-        Pubkey::find_program_address(&[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_1.as_ref()], &program_id);
+    let (nf0_pda, _) = Pubkey::find_program_address(
+        &[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_0.as_ref()],
+        &program_id,
+    );
+    let (nf1_pda, _) = Pubkey::find_program_address(
+        &[b"nullifier", fx::SPL_FIXTURE_NULLIFIER_1.as_ref()],
+        &program_id,
+    );
 
     // 1. initialize bridge state.
     send(
@@ -225,7 +242,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
             data: instruction::InitializeValidatorRegistry {}.data(),
             accounts: accounts::InitializeValidatorRegistry {
                 stake_mint,
-                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
                 stake_vault_authority: Pubkey::find_program_address(
                     &[b"stake_vault_authority"],
                     &program_id,
@@ -300,7 +321,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
                 stake_mint,
                 validator_account: validator_pda,
                 validator_token_account: authority_token,
-                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
                 token_program: spl_token::id(),
                 validator_registry: registry_pda,
                 validator: upgrade_authority.pubkey(),
@@ -326,7 +351,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
                 stake_mint,
                 validator_account: cosigner_pda,
                 validator_token_account: cosigner_token,
-                stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+                stake_token_vault: Pubkey::find_program_address(
+                    &[b"stake_token_vault"],
+                    &program_id,
+                )
+                .0,
                 token_program: spl_token::id(),
                 validator_registry: registry_pda,
                 validator: cosigner.pubkey(),
@@ -370,11 +399,16 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let tree = IncrementalMerkleTree::try_deserialize(&mut tree_raw.data.as_slice()).unwrap();
     assert_eq!(tree.next_index, 1, "one note deposited");
     assert_eq!(
-        tree.root, fx::SPL_FIXTURE_ROOT,
+        tree.root,
+        fx::SPL_FIXTURE_ROOT,
         "on-chain tree root must equal the host circuit root the proof proves"
     );
     let vault_before = token_amount(&banks.get_account(asset_vault).await.unwrap().unwrap());
-    assert_eq!(vault_before, fx::SPL_FIXTURE_DEPOSIT_AMOUNT, "vault funded by deposit");
+    assert_eq!(
+        vault_before,
+        fx::SPL_FIXTURE_DEPOSIT_AMOUNT,
+        "vault funded by deposit"
+    );
 
     // 7. transact_spl: spend the note, pay the token withdraw out of the vault.
     let transact_ix = Instruction {
@@ -438,7 +472,10 @@ async fn transact_spl_settles_a_token_withdrawal() {
 
     // Recipient token account received the payout net of the fee.
     let recipient_after = token_amount(&banks.get_account(recipient_token).await.unwrap().unwrap());
-    assert_eq!(recipient_after, payout, "recipient token account gains |ext| - fee");
+    assert_eq!(
+        recipient_after, payout,
+        "recipient token account gains |ext| - fee"
+    );
     // The fee landed in the settling validator's token account.
     let fee_after = token_amount(&banks.get_account(fee_token).await.unwrap().unwrap());
     assert_eq!(fee_after, fee, "fee paid to the validator's token account");
@@ -451,7 +488,11 @@ async fn transact_spl_settles_a_token_withdrawal() {
         (nf0_pda, fx::SPL_FIXTURE_NULLIFIER_0),
         (nf1_pda, fx::SPL_FIXTURE_NULLIFIER_1),
     ] {
-        let raw = banks.get_account(pda).await.unwrap().expect("nullifier PDA exists");
+        let raw = banks
+            .get_account(pda)
+            .await
+            .unwrap()
+            .expect("nullifier PDA exists");
         let nul = NullifierAccount::try_deserialize(&mut raw.data.as_slice()).unwrap();
         assert_eq!(nul.nullifier, expected);
         assert_eq!(nul.withdrawal_id, 1);
@@ -467,4 +508,16 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+
+    let val_raw = banks.get_account(validator_pda).await.unwrap().unwrap();
+    let val =
+        paraloom_program::ValidatorAccount::try_deserialize(&mut val_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        val.total_earnings, fee,
+        "inline SPL withdrawal fee must credit validator_account.total_earnings"
+    );
+    assert_eq!(
+        val.pending_rewards, 0,
+        "inline SPL withdrawal fee must not touch lamport pending_rewards"
+    );
 }
