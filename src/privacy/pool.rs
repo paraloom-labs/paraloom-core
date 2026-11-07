@@ -134,8 +134,31 @@ impl ShieldedPool {
         // rather than by anything built fresh at construction. The note carries
         // fresh randomness per deposit, so an equal commitment means the same
         // deposit, not a distinct one.
+        if note.amount != amount {
+            return Err(anyhow!(
+                "note amount ({}) does not match credited amount ({})",
+                note.amount,
+                amount
+            ));
+        }
+        if note.asset_id != asset_id {
+            return Err(anyhow!(
+                "note asset_id does not match credited asset_id"
+            ));
+        }
+
         if self.deposited.read().await.contains(&commitment) {
             return Ok(commitment);
+        }
+
+        // Pre-validate supply addition before mutating the commitment tree so
+        // an overflowing deposit never leaves an orphan leaf in the tree.
+        {
+            let supplies = self.supplies.read().await;
+            let current = supplies.get(&asset_id).copied().unwrap_or(0);
+            current
+                .checked_add(amount)
+                .ok_or_else(|| anyhow!("shielded asset supply overflow"))?;
         }
 
         // Add to commitment tree (auto-persists if storage available).
@@ -153,12 +176,15 @@ impl ShieldedPool {
 
         // Credit this asset's supply
         let mut supplies = self.supplies.write().await;
-        let supply = supplies.entry(asset_id).or_insert(0);
-        *supply += amount;
+        let current = supplies.get(&asset_id).copied().unwrap_or(0);
+        let new_supply = current
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("shielded asset supply overflow"))?;
+        supplies.insert(asset_id, new_supply);
 
         // Persist the asset's supply to storage if available
         if let Some(storage) = &self.storage {
-            storage.set_asset_supply(&asset_id, *supply)?;
+            storage.set_asset_supply(&asset_id, new_supply)?;
         }
 
         Ok(commitment)
@@ -487,5 +513,46 @@ mod tests {
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+    }
+
+    #[tokio::test]
+    async fn credit_commitment_rejects_mismatched_note_and_prechecks_supply_overflow() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([4u8; 32]);
+        let usdc: AssetId = [0xBBu8; 32];
+
+        // Mismatched amount is rejected without inserting into tree
+        let note_bad_amount = Note::new_native(addr.clone(), 500, [1u8; 32]);
+        assert!(pool
+            .credit_commitment(note_bad_amount.commitment(), note_bad_amount, 1000, NATIVE_SOL_ASSET)
+            .await
+            .is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // Mismatched asset_id is rejected without inserting into tree
+        let note_bad_asset = Note::new(addr.clone(), 500, [2u8; 32], usdc);
+        assert!(pool
+            .credit_commitment(note_bad_asset.commitment(), note_bad_asset, 500, NATIVE_SOL_ASSET)
+            .await
+            .is_err());
+        assert_eq!(pool.commitment_count().await, 0);
+
+        // Supply overflow is rejected BEFORE inserting into commitment_tree
+        let max_note = Note::new(addr.clone(), u64::MAX, [3u8; 32], usdc);
+        pool.credit_commitment(max_note.commitment(), max_note, u64::MAX, usdc)
+            .await
+            .unwrap();
+        assert_eq!(pool.commitment_count().await, 1);
+
+        let overflow_note = Note::new(addr, 1, [4u8; 32], usdc);
+        assert!(pool
+            .credit_commitment(overflow_note.commitment(), overflow_note, 1, usdc)
+            .await
+            .is_err());
+        assert_eq!(
+            pool.commitment_count().await,
+            1,
+            "failed overflow deposit must not append an orphan commitment leaf"
+        );
     }
 }
