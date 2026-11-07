@@ -569,7 +569,27 @@ impl PrivateJobCoordinator {
         // Step 3: Check multi-validator consensus (if enabled)
         if let Some(coordinator) = &self.verification_coordinator {
             match coordinator.check_consensus(&result.job_id).await? {
-                crate::compute::ConsensusResult::Agreed(_) => {
+                crate::compute::ConsensusResult::Agreed(agreed) => {
+                    let agreed_output = match &agreed.output_data {
+                        Some(data) => data,
+                        None => {
+                            log::warn!(
+                                "Consensus agreed result has no output data for job {}",
+                                result.job_id
+                            );
+                            return Ok(false);
+                        }
+                    };
+                    let agreed_hash = PrivateComputeJob::hash_data(agreed_output);
+                    if agreed_hash != result.output_hash {
+                        log::warn!(
+                            "Consensus output hash mismatch for job {}: consensus hash {}, result has {}",
+                            result.job_id,
+                            agreed_hash,
+                            result.output_hash
+                        );
+                        return Ok(false);
+                    }
                     log::info!(
                         "Multi-validator consensus reached for job {}",
                         result.job_id
@@ -953,6 +973,70 @@ mod tests {
         let verified = coordinator.verify_result(&private_result).await;
         assert!(verified.is_ok());
         assert!(verified.unwrap()); // Should pass with 2/3 agreement
+    }
+
+    #[tokio::test]
+    async fn test_consensus_output_hash_mismatch_rejection() {
+        use crate::compute::{JobResult, JobStatus, VerificationCoordinator};
+
+        let pool = Arc::new(ShieldedPool::new());
+        let verifier = Arc::new(VerificationCoordinator::new());
+        let coordinator = PrivateJobCoordinator::with_verification(pool, verifier.clone());
+
+        let job_id = "test-consensus-hash-mismatch".to_string();
+        let owner_address = ShieldedAddress([77u8; 32]);
+
+        let validators = vec![
+            "validator-1".to_string(),
+            "validator-2".to_string(),
+            "validator-3".to_string(),
+        ];
+        verifier
+            .create_verification_request(job_id.clone(), validators.clone())
+            .await
+            .unwrap();
+
+        // 2 validators agree on output A
+        let output_a = vec![1, 2, 3, 4];
+        let output_b = vec![9, 9, 9, 9];
+
+        for validator_id in validators.iter().take(2) {
+            let result = JobResult {
+                job_id: job_id.clone(),
+                status: JobStatus::Completed,
+                output_data: Some(output_a.clone()),
+                error: None,
+                execution_time_ms: 100,
+                memory_used_bytes: 1024,
+                instructions_executed: 50000,
+            };
+            verifier
+                .submit_result(&job_id, validator_id.clone(), result)
+                .await
+                .unwrap();
+        }
+
+        // The private result claims output B (hash of output B)
+        let job_result_b = JobResult {
+            job_id: job_id.clone(),
+            status: JobStatus::Completed,
+            output_data: Some(output_b),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1024,
+            instructions_executed: 50000,
+        };
+        let private_result =
+            PrivateJobResult::from_job_result(job_id.clone(), job_result_b, &owner_address)
+                .unwrap();
+
+        // Verify should fail because consensus output hash does not match private_result.output_hash
+        let verified = coordinator.verify_result(&private_result).await;
+        assert!(verified.is_ok());
+        assert!(
+            !verified.unwrap(),
+            "consensus hash mismatch must reject result"
+        );
     }
 
     #[tokio::test]

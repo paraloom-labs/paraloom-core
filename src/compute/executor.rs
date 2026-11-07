@@ -70,6 +70,18 @@ impl JobExecutor {
         info!("Submitting job {} to execution queue", job_id);
 
         let mut pending = self.pending_jobs.lock().unwrap();
+
+        // Reject duplicate jobs across pending, active, and completed queues
+        if pending.iter().any(|j| j.id == job_id) {
+            return Err(anyhow::anyhow!("job {} already exists", job_id));
+        }
+        if self.active_jobs.lock().unwrap().contains_key(&job_id) {
+            return Err(anyhow::anyhow!("job {} already exists", job_id));
+        }
+        if self.completed_results.lock().unwrap().contains_key(&job_id) {
+            return Err(anyhow::anyhow!("job {} already exists", job_id));
+        }
+
         // Bound the pending queue: a peer whose per-job limits are authorized
         // could otherwise enqueue unique jobs faster than the (fixed
         // concurrency) executor drains them, growing memory without bound
@@ -158,28 +170,27 @@ impl JobExecutor {
                 let active_count = active_jobs.lock().unwrap().len();
 
                 if active_count < MAX_CONCURRENT_JOBS {
-                    // Get next job from queue
+                    // Get next job from queue and atomically move to active jobs
                     let next_job = {
                         let mut pending = pending_jobs.lock().unwrap();
-                        pending.pop_front()
+                        if let Some(mut job) = pending.pop_front() {
+                            job.mark_running();
+                            let mut active = active_jobs.lock().unwrap();
+                            active.insert(job.id.clone(), job.clone());
+                            Some(job)
+                        } else {
+                            None
+                        }
                     };
 
-                    if let Some(mut job) = next_job {
-                        info!("Starting execution of job {}", job.id);
-
-                        // Mark as running
-                        job.mark_running();
+                    if let Some(job) = next_job {
                         let job_id = job.id.clone();
-
-                        // Add to active jobs
-                        {
-                            let mut active = active_jobs.lock().unwrap();
-                            active.insert(job_id.clone(), job.clone());
-                        }
+                        info!("Starting execution of job {}", job_id);
 
                         // Execute in separate task
                         let engine_clone = engine.clone();
                         let active_jobs_clone = active_jobs.clone();
+                        let completed_results_clone = completed_results.clone();
                         let result_tx_clone = result_tx.clone();
 
                         task::spawn(async move {
@@ -200,6 +211,14 @@ impl JobExecutor {
                                 "Job {} execution completed with status: {:?}",
                                 job_id, result.status
                             );
+
+                            // Store result into completed_results BEFORE removing from
+                            // active_jobs so get_job_status never observes None during
+                            // the active-to-completed transition.
+                            {
+                                let mut completed = completed_results_clone.lock().unwrap();
+                                Self::store_completed_result(&mut completed, result.clone());
+                            }
 
                             // Remove from active jobs
                             {
@@ -227,6 +246,19 @@ impl JobExecutor {
         Ok(())
     }
 
+    /// Helper to store a result into completed_results with bounding
+    fn store_completed_result(completed: &mut HashMap<JobId, JobResult>, result: JobResult) {
+        // Bound the retained results so they cannot grow without limit as
+        // jobs finish (#610): evict an arbitrary older result before adding
+        // a new job id past the ceiling.
+        if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
+            if let Some(victim) = completed.keys().next().cloned() {
+                completed.remove(&victim);
+            }
+        }
+        completed.insert(result.job_id.clone(), result);
+    }
+
     /// Process completed job results
     async fn process_results(
         result_rx: Arc<Mutex<mpsc::UnboundedReceiver<JobResult>>>,
@@ -238,15 +270,7 @@ impl JobExecutor {
             debug!("Processing result for job {}", result.job_id);
 
             let mut completed = completed_results.lock().unwrap();
-            // Bound the retained results so they cannot grow without limit as
-            // jobs finish (#610): evict an arbitrary older result before adding
-            // a new job id past the ceiling.
-            if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
-                if let Some(victim) = completed.keys().next().cloned() {
-                    completed.remove(&victim);
-                }
-            }
-            completed.insert(result.job_id.clone(), result);
+            Self::store_completed_result(&mut completed, result);
         }
     }
 
@@ -406,5 +430,84 @@ mod tests {
         // bound (#610).
         let overflow = ComputeJob::new(vec![], vec![], ResourceLimits::default());
         assert!(executor.submit_job(overflow).is_err());
+    }
+
+    #[tokio::test]
+    async fn submit_job_rejects_duplicate_job_id() {
+        let executor = JobExecutor::new().unwrap();
+
+        let job = ComputeJob::new(
+            vec![0x00, 0x61, 0x73, 0x6d],
+            vec![1, 2, 3],
+            ResourceLimits::default(),
+        );
+        let dup_job = job.clone();
+
+        // 1. Duplicate in pending
+        assert!(executor.submit_job(job).is_ok());
+        let err = executor
+            .submit_job(dup_job)
+            .expect_err("should reject duplicate pending");
+        assert!(err.to_string().contains("already exists"));
+
+        // 2. Duplicate in active
+        let active_job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+        executor
+            .active_jobs
+            .lock()
+            .unwrap()
+            .insert(active_job.id.clone(), active_job.clone());
+        let err2 = executor
+            .submit_job(active_job)
+            .expect_err("should reject duplicate active");
+        assert!(err2.to_string().contains("already exists"));
+
+        // 3. Duplicate in completed
+        let completed_job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+        let res = JobResult::success(completed_job.id.clone(), vec![], 1, 1, 1);
+        executor
+            .completed_results
+            .lock()
+            .unwrap()
+            .insert(completed_job.id.clone(), res);
+        let err3 = executor
+            .submit_job(completed_job)
+            .expect_err("should reject duplicate completed");
+        assert!(err3.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn get_job_status_active_to_completed_transition() {
+        let executor = JobExecutor::new().unwrap();
+        let job = ComputeJob::new(
+            vec![0x00, 0x61, 0x73, 0x6d],
+            vec![],
+            ResourceLimits::default(),
+        );
+        let job_id = job.id.clone();
+
+        executor.submit_job(job).unwrap();
+        executor.start().await.unwrap();
+
+        // Monitor status continuously until completed: it must never return None!
+        let start = std::time::Instant::now();
+        let mut saw_completed = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            let status = executor.get_job_status(&job_id);
+            assert!(
+                status.is_some(),
+                "get_job_status returned None for submitted job {}",
+                job_id
+            );
+            if let Some(JobStatus::Completed | JobStatus::Failed { .. }) = status {
+                saw_completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_completed,
+            "Job should reach terminal status without returning None"
+        );
     }
 }
