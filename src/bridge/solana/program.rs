@@ -230,6 +230,12 @@ impl ProgramInterface {
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
         let account = self.rpc.get_account(&state_pda).await?;
+        if account.owner != self.program_id {
+            return Err(BridgeError::ConfigError(format!(
+                "BridgeState account owner mismatch: expected {}, got {}",
+                self.program_id, account.owner
+            )));
+        }
         parse_program_version(&account.data)
     }
 
@@ -450,6 +456,22 @@ mod tests {
             .await
             .expect_err("mismatch");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn program_version_rejects_owner_mismatch() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut account = bridge_state_account(crate::bridge::EXPECTED_PROGRAM_VERSION);
+        account.owner = Pubkey::new_unique();
+        *mock.next_get_account.lock().unwrap() = Some(Ok(account));
+
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        let err = program.program_version().await.expect_err("owner mismatch");
+        assert!(matches!(err, BridgeError::ConfigError(msg) if msg.contains("owner mismatch")));
     }
 
     #[test]

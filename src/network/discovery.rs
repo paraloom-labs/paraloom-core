@@ -122,14 +122,27 @@ impl PeerRegistry {
     /// Mark a peer as actively connected. If the peer was in
     /// backoff, the failure counter resets so a future disconnect
     /// starts the backoff sequence from the beginning.
+    ///
+    /// Forgotten peers are permanently ignored and will not be resurrected.
     pub fn mark_connected(&mut self, node_id: NodeId) {
+        if let Some(entry) = self.peers.get_mut(&node_id) {
+            if entry.state == PeerState::Forgotten {
+                return;
+            }
+            let now = (self.clock)();
+            entry.state = PeerState::Connected { last_seen: now };
+            entry.slow_responses = 0;
+            return;
+        }
+
         let now = (self.clock)();
-        let entry = self.peers.entry(node_id).or_insert(PeerEntry {
-            state: PeerState::Connected { last_seen: now },
-            slow_responses: 0,
-        });
-        entry.state = PeerState::Connected { last_seen: now };
-        entry.slow_responses = 0;
+        self.peers.insert(
+            node_id,
+            PeerEntry {
+                state: PeerState::Connected { last_seen: now },
+                slow_responses: 0,
+            },
+        );
     }
 
     /// Update `last_seen` without changing connection state. Useful
@@ -148,6 +161,9 @@ impl PeerRegistry {
     /// per-peer summary; the connection state is not changed.
     pub fn record_response(&mut self, node_id: &NodeId, latency: Duration) {
         if let Some(entry) = self.peers.get_mut(node_id) {
+            if entry.state == PeerState::Forgotten {
+                return;
+            }
             if let PeerState::Connected { ref mut last_seen } = entry.state {
                 *last_seen = (self.clock)();
             }
@@ -166,7 +182,14 @@ impl PeerRegistry {
 
     /// Mark a peer as disconnected and schedule the next reconnect
     /// attempt according to [`RECONNECT_BACKOFF`].
+    ///
+    /// Forgotten peers are permanently ignored and will not be resurrected into backoff.
     pub fn mark_disconnected(&mut self, node_id: NodeId) {
+        if let Some(entry) = self.peers.get(&node_id) {
+            if entry.state == PeerState::Forgotten {
+                return;
+            }
+        }
         let now = (self.clock)();
         let entry = self.peers.entry(node_id.clone()).or_insert(PeerEntry {
             state: PeerState::Backoff {
@@ -205,6 +228,14 @@ impl PeerRegistry {
             slow_responses: 0,
         });
         entry.state = PeerState::Forgotten;
+    }
+
+    /// Whether a peer is marked as permanently forgotten.
+    pub fn is_forgotten(&self, node_id: &NodeId) -> bool {
+        matches!(
+            self.peers.get(node_id).map(|e| &e.state),
+            Some(PeerState::Forgotten)
+        )
     }
 
     /// IDs of every peer in `Backoff` whose `retry_at` has elapsed.
@@ -443,6 +474,41 @@ mod tests {
         advance(&clock, Duration::from_secs(60 * 60));
         assert!(registry.peers_due_for_reconnect().is_empty());
         assert_eq!(registry.counts().forgotten, 1);
+    }
+
+    /// A forgotten peer cannot be resurrected by subsequent mark_connected,
+    /// mark_disconnected, or record_response calls.
+    #[test]
+    fn forgotten_peers_cannot_be_resurrected() {
+        let (mut registry, clock) = registry_with_fake_clock();
+        let peer = node(60);
+
+        registry.mark_connected(peer.clone());
+        assert_eq!(registry.counts().connected, 1);
+
+        registry.forget(peer.clone());
+        assert_eq!(registry.counts().forgotten, 1);
+        assert_eq!(registry.counts().connected, 0);
+        assert!(registry.is_forgotten(&peer));
+
+        // mark_disconnected should not resurrect into Backoff
+        registry.mark_disconnected(peer.clone());
+        assert_eq!(registry.counts().forgotten, 1);
+        assert_eq!(registry.counts().backoff, 0);
+
+        // mark_connected should not resurrect into Connected
+        registry.mark_connected(peer.clone());
+        assert_eq!(registry.counts().forgotten, 1);
+        assert_eq!(registry.counts().connected, 0);
+
+        // record_response should not modify slow_responses or state
+        registry.record_response(&peer, Duration::from_secs(10));
+        assert_eq!(registry.summaries()[0].slow_responses, 0);
+
+        // Advancing time should never schedule reconnect
+        advance(&clock, Duration::from_secs(3600));
+        assert!(registry.peers_due_for_reconnect().is_empty());
+        assert!(registry.is_forgotten(&peer));
     }
 
     /// A custom slow-response threshold is honoured.
