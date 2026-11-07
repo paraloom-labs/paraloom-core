@@ -17,8 +17,8 @@
 
 use ark_bn254::{Bn254, Fr, G1Affine, G1Projective, G2Affine};
 use ark_ec::pairing::Pairing;
-use ark_ec::{CurveGroup, VariableBaseMSM};
-use ark_ff::{One, PrimeField};
+use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
+use ark_ff::{One, PrimeField, Zero};
 use ark_groth16::ProvingKey;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use sha2::{Digest, Sha512};
@@ -142,7 +142,11 @@ pub fn verify_final_pk(
         None => (initial_pk.delta_g1, initial_pk.vk.delta_g2),
     };
 
-    if final_pk.delta_g1 != expected_g1 || final_pk.vk.delta_g2 != expected_g2 {
+    if final_pk.delta_g1.is_zero()
+        || final_pk.vk.delta_g2.is_zero()
+        || final_pk.delta_g1 != expected_g1
+        || final_pk.vk.delta_g2 != expected_g2
+    {
         return Err(VerifyError::FinalPkDeltaMismatch);
     }
     Ok(())
@@ -186,6 +190,21 @@ pub fn verify_final_pk_consistency(
     initial_pk: &ProvingKey<Bn254>,
     final_pk: &ProvingKey<Bn254>,
 ) -> Result<(), VerifyError> {
+    if initial_pk.delta_g1.is_zero()
+        || initial_pk.vk.delta_g2.is_zero()
+        || final_pk.delta_g1.is_zero()
+        || final_pk.vk.delta_g2.is_zero()
+    {
+        return Err(VerifyError::FinalPkDeltaMismatch);
+    }
+    // Verify that final_pk.delta_g1 and final_pk.vk.delta_g2 moved by the exact
+    // same scalar ratio relative to initial_pk.
+    let delta_lhs = Bn254::pairing(final_pk.delta_g1, initial_pk.vk.delta_g2);
+    let delta_rhs = Bn254::pairing(initial_pk.delta_g1, final_pk.vk.delta_g2);
+    if delta_lhs != delta_rhs {
+        return Err(VerifyError::FinalPkDeltaMismatch);
+    }
+
     // 1. Every δ-independent element must survive a contribution untouched.
     if final_pk.vk.alpha_g1 != initial_pk.vk.alpha_g1 {
         return Err(VerifyError::KeyElementAltered {
@@ -319,7 +338,9 @@ fn fiat_shamir_rho(
 ) -> Fr {
     let mut hasher = Sha512::new();
     hasher.update(b"paraloom-ceremony-query-consistency-v1");
+    hasher.update((domain.len() as u64).to_le_bytes());
     hasher.update(domain.as_bytes());
+    hasher.update((initial.len() as u64).to_le_bytes());
     write_canonical(&mut hasher, initial_delta_g2);
     write_canonical(&mut hasher, final_delta_g2);
     for point in initial {
@@ -329,7 +350,12 @@ fn fiat_shamir_rho(
         write_canonical(&mut hasher, point);
     }
     let digest = hasher.finalize();
-    Fr::from_le_bytes_mod_order(&digest[..])
+    let rho = Fr::from_le_bytes_mod_order(&digest[..]);
+    if rho.is_zero() {
+        Fr::one()
+    } else {
+        rho
+    }
 }
 
 fn write_canonical<T: CanonicalSerialize>(hasher: &mut Sha512, value: &T) {
@@ -613,6 +639,31 @@ mod tests {
         match verify_final_pk(&initial_pk, &transcript, &other_pk) {
             Err(VerifyError::FinalPkDeltaMismatch) => {}
             other => panic!("expected FinalPkDeltaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tampered_final_delta_g1_or_identity_delta_is_rejected() {
+        let (initial_pk, _transcript, mut final_pk) = build_real_transcript(2);
+        let mut rng = StdRng::seed_from_u64(0x7777_u64);
+        let bogus = Fr::rand(&mut rng);
+        final_pk.delta_g1 = (final_pk.delta_g1 * bogus).into_affine();
+        match verify_final_pk_consistency(&initial_pk, &final_pk) {
+            Err(VerifyError::FinalPkDeltaMismatch) => {}
+            other => panic!(
+                "expected FinalPkDeltaMismatch on tampered delta_g1, got {:?}",
+                other
+            ),
+        }
+
+        let mut zero_delta_pk = initial_pk.clone();
+        zero_delta_pk.vk.delta_g2 = G2Affine::identity();
+        match verify_final_pk_consistency(&initial_pk, &zero_delta_pk) {
+            Err(VerifyError::FinalPkDeltaMismatch) => {}
+            other => panic!(
+                "expected FinalPkDeltaMismatch on identity delta_g2, got {:?}",
+                other
+            ),
         }
     }
 }
