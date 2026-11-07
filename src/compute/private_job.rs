@@ -83,12 +83,13 @@ impl PrivateComputeJob {
         // Compute code hash
         let code_hash: [u8; 32] = Sha256::digest(&wasm_code).into();
 
-        // Create commitment to input data
-        // Hash the data first to get a u64 value
-        let data_hash = Self::hash_data(&input_data);
+        // Create Poseidon commitment to input data matching `ComputeCircuit::compute_commitment`
         let randomness = crate::privacy::pedersen::generate_randomness();
+        let input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&input_data);
+        let input_commitment_fr =
+            crate::compute::ComputeCircuit::compute_commitment(input_hash, &randomness, &[0u8; 32]);
         let input_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+            Commitment(crate::privacy::types::fr_to_bytes_32(input_commitment_fr));
 
         // Seal the input to the owner's X25519 public key with crypto_box
         // (X25519 + XSalsa20-Poly1305, via note_crypto::seal). Only the holder
@@ -201,11 +202,17 @@ impl PrivateJobResult {
             .output_data
             .ok_or_else(|| anyhow!("No output data in result"))?;
 
-        // Create commitment to output
+        // Create Poseidon commitment to output matching `ComputeCircuit::compute_commitment`
         let data_hash = PrivateComputeJob::hash_data(&output_data);
         let randomness = crate::privacy::pedersen::generate_randomness();
+        let output_data_hash = crate::compute::ComputeCircuit::hash_data_to_field(&output_data);
+        let output_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+            output_data_hash,
+            &randomness,
+            &[0u8; 32],
+        );
         let output_commitment =
-            crate::privacy::commitment::CommitmentGenerator::commit(data_hash, &randomness);
+            Commitment(crate::privacy::types::fr_to_bytes_32(output_commitment_fr));
 
         // Encrypt output
         let encrypted_output = PrivateComputeJob::encrypt_data(&output_data, owner_address)?;
@@ -1076,6 +1083,72 @@ mod tests {
         assert!(
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
+        );
+    }
+
+    #[test]
+    fn test_real_groth16_proof_verifies_against_poseidon_output_commitment() {
+        use ark_groth16::Groth16;
+        use ark_snark::SNARK;
+        use ark_std::rand::{rngs::StdRng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let (pk, vk) = crate::compute::ComputeProofSystem::setup(&mut rng).expect("setup");
+
+        let output_data = b"verified-wasm-output".to_vec();
+        let randomness = [7u8; 32];
+        let output_data_hash = crate::compute::ComputeCircuit::hash_data_to_field(&output_data);
+        let output_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+            output_data_hash,
+            &randomness,
+            &[0u8; 32],
+        );
+        let output_commitment =
+            Commitment(crate::privacy::types::fr_to_bytes_32(output_commitment_fr));
+
+        let dummy_code_hash = [0u8; 32];
+        let dummy_input = vec![0u8];
+        let dummy_input_randomness = [0u8; 32];
+        let dummy_owner = [0u8; 32];
+        let dummy_spending_key = [0u8; 32];
+        let dummy_input_hash = crate::compute::ComputeCircuit::hash_data_to_field(&dummy_input);
+        let dummy_input_commitment_fr = crate::compute::ComputeCircuit::compute_commitment(
+            dummy_input_hash,
+            &dummy_input_randomness,
+            &dummy_owner,
+        );
+        let input_nullifier_fr = crate::compute::ComputeCircuit::compute_nullifier(
+            dummy_input_commitment_fr,
+            &dummy_spending_key,
+        );
+
+        let circuit = crate::compute::ComputeCircuit::with_witness(
+            dummy_code_hash,
+            dummy_input_commitment_fr,
+            output_commitment_fr,
+            input_nullifier_fr,
+            dummy_input,
+            dummy_input_randomness,
+            output_data,
+            randomness,
+            dummy_owner,
+            dummy_spending_key,
+        );
+        let proof = Groth16::<ark_bn254::Bn254>::prove(&pk, circuit, &mut rng).expect("prove");
+
+        let lifted_output_commitment =
+            ark_bn254::Fr::from_le_bytes_mod_order(output_commitment.as_bytes());
+        assert_eq!(lifted_output_commitment, output_commitment_fr);
+
+        let public_inputs = vec![
+            ark_bn254::Fr::from_le_bytes_mod_order(&dummy_code_hash),
+            dummy_input_commitment_fr,
+            lifted_output_commitment,
+            input_nullifier_fr,
+        ];
+        assert!(
+            Groth16::<ark_bn254::Bn254>::verify(&vk, &public_inputs, &proof).expect("verify"),
+            "Poseidon output_commitment stored in PrivateJobResult must verify against real Groth16 VK"
         );
     }
 }

@@ -102,6 +102,11 @@ impl Submitter for OnChainSubmitter {
             let sk_fr = Fr::from_le_bytes_mod_order(&sk);
             let blinding_fr = Fr::from_le_bytes_mod_order(&blinding);
             let note_pk_fr = Fr::from_le_bytes_mod_order(&note_pubkey);
+            if crate::privacy::poseidon_circom::v3_pubkey(sk_fr) != note_pk_fr {
+                return Err(transact_submit::TransactSubmitError::Prove(
+                    "note_pubkey does not match v3_pubkey(sk)".to_string(),
+                ));
+            }
             let commitment = v3_commit(Fr::from(amount), note_pk_fr, blinding_fr, Fr::from(0u64));
             let membership =
                 transact_submit::read_membership(&client, &program_id, leaf_index, commitment)?;

@@ -817,16 +817,21 @@ impl TransactVerificationCoordinator {
             self.total_validators,
         );
 
-        // Insert-if-absent: a duplicate start for an already in-flight canonical
-        // id (a client retry or a re-broadcast) must not discard the votes
-        // already collected for this round. The id is content-bound
-        // (`canonical_id`), so an existing entry is the same settlement — keep
-        // collecting on it rather than resetting the tally.
-        self.pending
-            .write()
-            .await
-            .entry(request_id.clone())
-            .or_insert(consensus);
+        // Insert-if-absent for an active in-flight round, or replace if the
+        // previous round with the same canonical id has already timed out so a
+        // client retry after expiry is not stuck behind a dead tally.
+        {
+            let mut pending = self.pending.write().await;
+            let replace = pending
+                .get(&request_id)
+                .is_some_and(|existing| existing.tally.is_timed_out());
+            if replace {
+                pending.insert(request_id.clone(), consensus);
+                self.emitted.write().await.remove(&request_id);
+            } else {
+                pending.entry(request_id.clone()).or_insert(consensus);
+            }
+        }
 
         log::info!("Started transact verification: {}", request_id);
         Ok(request_id)
@@ -841,6 +846,14 @@ impl TransactVerificationCoordinator {
         let consensus = pending
             .get(&result.request_id)
             .ok_or_else(|| anyhow!("Request not found: {}", result.request_id))?;
+
+        if consensus.tally.is_timed_out() {
+            log::warn!(
+                "dropping late vote for timed-out transact verification {}",
+                result.request_id
+            );
+            return Err(anyhow!("Verification timed out: {}", result.request_id));
+        }
 
         // REPLAY invariant on the counting path: the id we count under must be
         // the content-bound canonical id of the settlement in flight. (Signed
@@ -1571,5 +1584,44 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_round_rejects_late_votes_and_can_be_restarted_without_sweep() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req.clone()).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+
+        // Force the round's deadline into the past before cleanup_timeouts runs.
+        {
+            let mut pending = coord.pending.write().await;
+            pending.get_mut(&id).unwrap().tally.deadline = 0;
+        }
+
+        // A late vote arriving after timeout must be rejected and must NOT emit an approval.
+        assert!(
+            coord.submit_result(vote(&id, 1, "W1", true)).await.is_err(),
+            "late vote after deadline must be rejected"
+        );
+        assert!(
+            approvals.try_recv().is_err(),
+            "timed-out round must never emit an ApprovedTransact"
+        );
+
+        // Retrying start_verification for the same canonical id before cleanup_timeouts runs
+        // must replace the expired round with a fresh tally and deadline.
+        coord.start_verification(req).await.unwrap();
+        assert!(
+            coord.check_consensus(&id).await.unwrap().is_none(),
+            "restarted round must have a fresh non-expired deadline"
+        );
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "restarted round must settle normally once fresh votes arrive"
+        );
     }
 }
