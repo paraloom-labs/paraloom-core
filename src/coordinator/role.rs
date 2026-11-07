@@ -41,11 +41,13 @@ impl CoordinatorRole {
     /// last-heartbeat timestamp is anchored at `now`, so the standby
     /// will not promote for at least `stall_threshold` after start
     /// even if the primary has been silent the whole time.
+    /// Clamps a zero `stall_threshold` to 1ms so a misconfigured standby
+    /// does not immediately self-promote into split-brain.
     pub fn standby_of(primary: NodeId, stall_threshold: Duration, now: Instant) -> Self {
         CoordinatorRole::Standby {
             primary,
             last_heartbeat_at: now,
-            stall_threshold,
+            stall_threshold: stall_threshold.max(Duration::from_millis(1)),
         }
     }
 
@@ -79,13 +81,16 @@ impl CoordinatorRole {
 
     /// Update the standby's last-heartbeat timestamp. No-op for
     /// primary, since a primary tracking its own heartbeats would be
-    /// meaningless.
+    /// meaningless. Never moves `last_heartbeat_at` backwards on out-of-order
+    /// or non-monotonic timestamps.
     pub fn record_heartbeat(&mut self, now: Instant) {
         if let CoordinatorRole::Standby {
             last_heartbeat_at, ..
         } = self
         {
-            *last_heartbeat_at = now;
+            if now > *last_heartbeat_at {
+                *last_heartbeat_at = now;
+            }
         }
     }
 
@@ -164,5 +169,24 @@ mod tests {
         let mut role = CoordinatorRole::Primary;
         role.record_heartbeat(Instant::now());
         assert!(role.is_primary());
+    }
+
+    #[test]
+    fn zero_stall_threshold_is_clamped_and_heartbeat_is_monotonic() {
+        let t0 = Instant::now();
+        let role = CoordinatorRole::standby_of(nodeid(1), Duration::ZERO, t0);
+        assert!(
+            !role.is_stalled(t0),
+            "zero stall_threshold must be clamped so standby does not stall at t0"
+        );
+
+        let mut role2 = CoordinatorRole::standby_of(nodeid(1), Duration::from_secs(30), t0);
+        role2.record_heartbeat(t0 + Duration::from_secs(20));
+        // An out-of-order earlier timestamp must not move last_heartbeat_at backwards.
+        role2.record_heartbeat(t0 + Duration::from_secs(5));
+        assert!(
+            !role2.is_stalled(t0 + Duration::from_secs(45)),
+            "record_heartbeat must not move last_heartbeat_at backwards"
+        );
     }
 }

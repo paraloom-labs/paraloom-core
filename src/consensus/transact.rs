@@ -797,6 +797,22 @@ impl TransactVerificationCoordinator {
             ));
         }
 
+        // Reject an all-zero mint: `mint == None` is the canonical native-SOL
+        // representation, so `Some([0u8; 32])` is never a valid SPL mint and
+        // would collide with the non-canonical `Some([0u8; 32])` sentinel or
+        // bypass SPL vault derivation.
+        if request.mint == Some([0u8; 32]) {
+            return Err(anyhow!("SPL mint must not be all-zero"));
+        }
+
+        // Reject duplicate input nullifiers at consensus start: the on-chain
+        // `transact`/`transact_spl` instructions reject `nullifiers[0] == nullifiers[1]`
+        // with `DuplicateNullifier` (and the two nullifier PDAs collide on `init`),
+        // so starting a verification round on identical nullifiers can never settle.
+        if request.nullifiers[0] == request.nullifiers[1] {
+            return Err(anyhow!("duplicate input nullifier in transact request"));
+        }
+
         let validators = self.validators.read().await;
 
         if validators.is_empty() {
@@ -1434,6 +1450,30 @@ mod tests {
         assert!(
             coordinator.start_verification(req).await.is_err(),
             "a request whose id is not its canonical id must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_verification_rejects_duplicate_nullifiers_and_zero_mint() {
+        let coordinator = TransactVerificationCoordinator::new();
+        for i in 1..=7u8 {
+            coordinator.register_validator(NodeId(vec![i])).await;
+        }
+
+        let mut dup_nf = sample_request();
+        dup_nf.nullifiers = [[5u8; 32], [5u8; 32]];
+        dup_nf.request_id = dup_nf.canonical_id();
+        assert!(
+            coordinator.start_verification(dup_nf).await.is_err(),
+            "duplicate input nullifiers must be rejected at consensus start"
+        );
+
+        let mut zero_mint = sample_request();
+        zero_mint.mint = Some([0u8; 32]);
+        zero_mint.request_id = zero_mint.canonical_id();
+        assert!(
+            coordinator.start_verification(zero_mint).await.is_err(),
+            "all-zero SPL mint must be rejected at consensus start"
         );
     }
 
