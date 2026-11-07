@@ -210,6 +210,11 @@ impl ShieldedPool {
         self.nullifier_set.contains(nullifier).await
     }
 
+    /// Check if all nullifiers in a batch are unspent (#1503).
+    pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
+        self.nullifier_set.check_batch(nullifiers).await
+    }
+
     /// Record input nullifiers as spent once their settlement has landed on
     /// chain, so a later `check_batch` pre-filters replays of that spend before
     /// they reach consensus (#624). The on-chain nullifier PDAs remain the
