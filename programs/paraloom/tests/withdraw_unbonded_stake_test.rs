@@ -30,7 +30,7 @@ use solana_sdk::{
 mod common;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix, TEST_TOKEN_FUND,
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
@@ -79,6 +79,16 @@ async fn load_validator(ctx: &mut ProgramTestContext, pda: Pubkey) -> ValidatorA
         .expect("rpc")
         .expect("validator account exists");
     ValidatorAccount::try_deserialize(&mut raw.data.as_slice()).expect("deserialize validator")
+}
+
+async fn token_balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
+    let acc = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .expect("get account")
+        .expect("token account exists");
+    u64::from_le_bytes(acc.data[64..72].try_into().expect("token balance slice"))
 }
 
 #[tokio::test]
@@ -465,6 +475,14 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         acc.unbonding_amount, MIN_VALIDATOR_STAKE,
         "the full stake must be routed into unbonding, not stranded"
     );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake zeroed on deactivate"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "the full token stake must be routed into unbonding, not stranded in the vault"
+    );
     assert!(
         acc.unbonding_slot >= UNBONDING_SLOTS,
         "unbonding_slot = deactivation-era slot + UNBONDING_SLOTS"
@@ -508,6 +526,19 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         wallet_after > wallet_before,
         "wallet credited by the released stake + refunded rent"
     );
+
+    let (stake_token_vault, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);
+    let token_bal_after = token_balance(&mut ctx, validator_token).await;
+    assert_eq!(
+        token_bal_after, TEST_TOKEN_FUND,
+        "validator token account must be refunded the unbonded token stake"
+    );
+    let vault_bal_after = token_balance(&mut ctx, stake_token_vault).await;
+    assert_eq!(
+        vault_bal_after, 0,
+        "stake_token_vault must be drained of the unbonded token collateral"
+    );
+
     let closed = ctx
         .banks_client
         .get_account(validator_pda)
@@ -517,4 +548,103 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         closed.is_none() || closed.unwrap().lamports == 0,
         "PDA must be closed after withdraw"
     );
+}
+
+/// Test that calling `deactivate_validator` on a validator that was already
+/// marked inactive but still had residual `token_stake_amount` routes that
+/// token collateral into `token_unbonding_amount` so it can be reclaimed.
+#[tokio::test]
+async fn deactivate_reconciles_previously_stranded_token_stake() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let mut ctx = pt.start_with_context().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await
+    .expect("init registry");
+
+    send(
+        &mut ctx,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await
+    .expect("register");
+
+    // First deactivate call
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("first deactivate");
+
+    // Second deactivate call (idempotent / self-healing on inactive account)
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("second deactivate");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert_eq!(acc.token_stake_amount, 0);
+    assert_eq!(acc.token_unbonding_amount, TOKEN_STAKE);
+
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    send(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect("withdraw succeeds");
+
+    let token_bal_after = token_balance(&mut ctx, validator_token).await;
+    assert_eq!(token_bal_after, TEST_TOKEN_FUND);
 }
