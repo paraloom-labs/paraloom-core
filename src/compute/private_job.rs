@@ -569,7 +569,24 @@ impl PrivateJobCoordinator {
         // Step 3: Check multi-validator consensus (if enabled)
         if let Some(coordinator) = &self.verification_coordinator {
             match coordinator.check_consensus(&result.job_id).await? {
-                crate::compute::ConsensusResult::Agreed(_) => {
+                crate::compute::ConsensusResult::Agreed(agreed_result) => {
+                    let Some(agreed_output) = &agreed_result.output_data else {
+                        log::warn!(
+                            "Consensus result for job {} has no output data",
+                            result.job_id
+                        );
+                        return Ok(false);
+                    };
+                    let agreed_hash = PrivateComputeJob::hash_data(agreed_output);
+                    if agreed_hash != result.output_hash {
+                        log::warn!(
+                            "PrivateJobResult output_hash ({}) does not match consensus output hash ({}) for job {}",
+                            result.output_hash,
+                            agreed_hash,
+                            result.job_id
+                        );
+                        return Ok(false);
+                    }
                     log::info!(
                         "Multi-validator consensus reached for job {}",
                         result.job_id
@@ -953,6 +970,24 @@ mod tests {
         let verified = coordinator.verify_result(&private_result).await;
         assert!(verified.is_ok());
         assert!(verified.unwrap()); // Should pass with 2/3 agreement
+
+        // A forged PrivateJobResult carrying validator 3's minority output must be rejected
+        // even though consensus was reached on `output_correct`.
+        let forged_job_result = JobResult {
+            job_id: job_id.clone(),
+            status: JobStatus::Completed,
+            output_data: Some(output_wrong),
+            error: None,
+            execution_time_ms: 100,
+            memory_used_bytes: 1024,
+            instructions_executed: 50000,
+        };
+        let forged_private_result =
+            PrivateJobResult::from_job_result(job_id, forged_job_result, &owner_address).unwrap();
+        assert!(
+            !coordinator.verify_result(&forged_private_result).await.unwrap(),
+            "verify_result must reject a PrivateJobResult whose output_hash diverges from consensus"
+        );
     }
 
     #[tokio::test]

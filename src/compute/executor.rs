@@ -66,10 +66,20 @@ impl JobExecutor {
     /// Submit a new job for execution
     pub fn submit_job(&self, job: ComputeJob) -> Result<JobId> {
         let job_id = job.id.clone();
+        if job_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("job id must not be empty"));
+        }
 
         info!("Submitting job {} to execution queue", job_id);
 
         let mut pending = self.pending_jobs.lock().unwrap();
+        if pending.iter().any(|j| j.id == job_id)
+            || self.active_jobs.lock().unwrap().contains_key(&job_id)
+            || self.completed_results.lock().unwrap().contains_key(&job_id)
+        {
+            return Err(anyhow::anyhow!("duplicate job id: {}", job_id));
+        }
+
         // Bound the pending queue: a peer whose per-job limits are authorized
         // could otherwise enqueue unique jobs faster than the (fixed
         // concurrency) executor drains them, growing memory without bound
@@ -92,6 +102,23 @@ impl JobExecutor {
         Ok(job_id)
     }
 
+    /// Drain any pending results from `result_rx` into `completed_results`.
+    fn drain_result_channel(&self) {
+        let Ok(mut rx) = self.result_rx.try_lock() else {
+            return;
+        };
+        let mut completed = self.completed_results.lock().unwrap();
+        while let Ok(result) = rx.try_recv() {
+            debug!("Processing result for job {}", result.job_id);
+            if !completed.contains_key(&result.job_id) && completed.len() >= MAX_COMPLETED_RESULTS {
+                if let Some(victim) = completed.keys().next().cloned() {
+                    completed.remove(&victim);
+                }
+            }
+            completed.insert(result.job_id.clone(), result);
+        }
+    }
+
     /// Whether the pending queue has room for another job (#610). Callers check
     /// this before committing any per-job state so a rejected job leaves no
     /// residue in the coordinator map or storage.
@@ -101,6 +128,8 @@ impl JobExecutor {
 
     /// Get job status
     pub fn get_job_status(&self, job_id: &JobId) -> Option<JobStatus> {
+        self.drain_result_channel();
+
         // Check pending jobs
         {
             let pending = self.pending_jobs.lock().unwrap();
@@ -130,12 +159,14 @@ impl JobExecutor {
 
     /// Get job result (if completed)
     pub fn get_job_result(&self, job_id: &JobId) -> Option<JobResult> {
+        self.drain_result_channel();
         let completed = self.completed_results.lock().unwrap();
         completed.get(job_id).cloned()
     }
 
     /// Get all completed job results
     pub fn get_all_results(&self) -> Vec<JobResult> {
+        self.drain_result_channel();
         let completed = self.completed_results.lock().unwrap();
         completed.values().cloned().collect()
     }
@@ -406,5 +437,32 @@ mod tests {
         // bound (#610).
         let overflow = ComputeJob::new(vec![], vec![], ResourceLimits::default());
         assert!(executor.submit_job(overflow).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_job_status_drains_result_channel_and_submit_job_rejects_duplicates() {
+        let executor = JobExecutor::new().unwrap();
+        let job = ComputeJob::new(vec![], vec![], ResourceLimits::default());
+        let job_id = job.id.clone();
+
+        executor.submit_job(job.clone()).unwrap();
+        assert!(
+            executor.submit_job(job).is_err(),
+            "duplicate job_id must be rejected"
+        );
+
+        // Simulate worker finishing and removing from active_jobs while sending to result_tx
+        // before the 100ms background loop tick runs.
+        {
+            let mut pending = executor.pending_jobs.lock().unwrap();
+            pending.clear();
+        }
+        executor
+            .result_tx
+            .send(JobResult::success(job_id.clone(), vec![7], 5, 128, 10))
+            .unwrap();
+
+        assert_eq!(executor.get_job_status(&job_id), Some(JobStatus::Completed));
+        assert!(executor.get_job_result(&job_id).is_some());
     }
 }
