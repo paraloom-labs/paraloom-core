@@ -21,8 +21,14 @@ pub fn serialize_proof(proof: &Groth16Proof) -> Result<Vec<u8>> {
 /// Deserialize a Groth16 proof from bytes
 pub fn deserialize_proof(bytes: &[u8]) -> Result<Groth16Proof> {
     let mut cursor = Cursor::new(bytes);
-    Proof::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let proof = Proof::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(
+            "trailing bytes in proof buffer".to_string(),
+        ));
+    }
+    Ok(proof)
 }
 
 /// Serialize a verifying key to bytes
@@ -36,8 +42,14 @@ pub fn serialize_vk(vk: &Groth16VerifyingKey) -> Result<Vec<u8>> {
 /// Deserialize a verifying key from bytes
 pub fn deserialize_vk(bytes: &[u8]) -> Result<Groth16VerifyingKey> {
     let mut cursor = Cursor::new(bytes);
-    VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(
+            "trailing bytes in verifying key buffer".to_string(),
+        ));
+    }
+    Ok(vk)
 }
 
 /// Convert field element to bytes (32 bytes, big-endian)
@@ -56,8 +68,14 @@ pub fn field_to_bytes(field: &Fr) -> [u8; 32] {
 /// Convert bytes to field element
 pub fn bytes_to_field(bytes: &[u8]) -> Result<Fr> {
     let mut cursor = Cursor::new(bytes);
-    Fr::deserialize_compressed(&mut cursor)
-        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))
+    let field = Fr::deserialize_compressed(&mut cursor)
+        .map_err(|e| crate::privacy::PrivacyError::SerializationError(e.to_string()))?;
+    if cursor.position() as usize != bytes.len() {
+        return Err(crate::privacy::PrivacyError::SerializationError(
+            "trailing bytes in field element buffer".to_string(),
+        ));
+    }
+    Ok(field)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -152,6 +170,7 @@ pub fn split_tagged_proof(wire: &[u8]) -> Result<(ProofSuite, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_bn254::{G1Affine, G2Affine};
     use ark_std::rand::{RngCore, SeedableRng};
     use ark_std::UniformRand;
 
@@ -284,6 +303,41 @@ mod tests {
     fn bytes_to_field_above_modulus_errors() {
         let buf = [0xFFu8; 32];
         assert!(bytes_to_field(&buf).is_err());
+    }
+
+    #[test]
+    fn bytes_to_field_rejects_trailing_bytes() {
+        let mut rng = ark_std::test_rng();
+        let field = Fr::rand(&mut rng);
+        let mut bytes = field_to_bytes(&field).to_vec();
+        bytes.push(0x42);
+        assert!(bytes_to_field(&bytes).is_err());
+    }
+
+    #[test]
+    fn deserialize_proof_rejects_trailing_bytes() {
+        let proof = Proof::<Bn254> {
+            a: G1Affine::default(),
+            b: G2Affine::default(),
+            c: G1Affine::default(),
+        };
+        let mut bytes = serialize_proof(&proof).unwrap();
+        bytes.push(0xAA);
+        assert!(deserialize_proof(&bytes).is_err());
+    }
+
+    #[test]
+    fn deserialize_vk_rejects_trailing_bytes() {
+        let vk = VerifyingKey::<Bn254> {
+            alpha_g1: G1Affine::default(),
+            beta_g2: G2Affine::default(),
+            gamma_g2: G2Affine::default(),
+            delta_g2: G2Affine::default(),
+            gamma_abc_g1: vec![G1Affine::default()],
+        };
+        let mut bytes = serialize_vk(&vk).unwrap();
+        bytes.push(0xAA);
+        assert!(deserialize_vk(&bytes).is_err());
     }
 
     // ── Proof-suite envelope ──────────────────────────────────────────
