@@ -32,6 +32,9 @@ pub enum VerifyError {
     #[error("transcript chain is broken or malformed: {0}")]
     Chain(#[from] TranscriptError),
 
+    #[error("transcript has an unsupported wire version {0}")]
+    UnsupportedVersion(u32),
+
     #[error("contribution {position}: delta_after_g1 bytes are not a valid G1Affine")]
     MalformedDeltaG1 { position: usize },
 
@@ -82,18 +85,36 @@ pub fn verify_phase2_transcript(
     initial_pk: &ProvingKey<Bn254>,
     transcript: &Phase2Transcript,
 ) -> Result<(), VerifyError> {
+    if transcript.version != super::transcript::TRANSCRIPT_VERSION {
+        return Err(VerifyError::UnsupportedVersion(transcript.version));
+    }
     transcript.verify_chain()?;
 
     let mut delta_before_g1 = initial_pk.delta_g1;
     let mut delta_before_g2 = initial_pk.vk.delta_g2;
+    let mut seen_deltas_g1 = vec![delta_before_g1];
+    let mut seen_deltas_g2 = vec![delta_before_g2];
 
     for (position, contribution) in transcript.contributions.iter().enumerate() {
-        let delta_after_g1 = G1Affine::deserialize_compressed(&contribution.delta_after_g1[..])
-            .map_err(|_| VerifyError::MalformedDeltaG1 { position })?;
-        let delta_after_g2 = G2Affine::deserialize_compressed(&contribution.delta_after_g2[..])
-            .map_err(|_| VerifyError::MalformedDeltaG2 { position })?;
+        let mut cursor_g1 = &contribution.delta_after_g1[..];
+        let delta_after_g1 = G1Affine::deserialize_compressed(&mut cursor_g1)
+            .ok()
+            .filter(|_| cursor_g1.is_empty())
+            .ok_or(VerifyError::MalformedDeltaG1 { position })?;
+        let mut cursor_g2 = &contribution.delta_after_g2[..];
+        let delta_after_g2 = G2Affine::deserialize_compressed(&mut cursor_g2)
+            .ok()
+            .filter(|_| cursor_g2.is_empty())
+            .ok_or(VerifyError::MalformedDeltaG2 { position })?;
         let proof = DleqProof::from_bytes(&contribution.dleq_proof)
             .map_err(|source| VerifyError::MalformedDleq { position, source })?;
+
+        if seen_deltas_g1.contains(&delta_after_g1) || seen_deltas_g2.contains(&delta_after_g2) {
+            return Err(VerifyError::DleqRejected {
+                position,
+                source: BgmError::ZeroContribution,
+            });
+        }
 
         verify_contribution_deltas(
             &delta_before_g1,
@@ -104,6 +125,8 @@ pub fn verify_phase2_transcript(
         )
         .map_err(|source| VerifyError::DleqRejected { position, source })?;
 
+        seen_deltas_g1.push(delta_after_g1);
+        seen_deltas_g2.push(delta_after_g2);
         delta_before_g1 = delta_after_g1;
         delta_before_g2 = delta_after_g2;
     }
@@ -133,10 +156,16 @@ pub fn verify_final_pk(
     let (expected_g1, expected_g2) = match transcript.contributions.last() {
         Some(last) => {
             let position = transcript.contributions.len() - 1;
-            let g1 = G1Affine::deserialize_compressed(&last.delta_after_g1[..])
-                .map_err(|_| VerifyError::MalformedDeltaG1 { position })?;
-            let g2 = G2Affine::deserialize_compressed(&last.delta_after_g2[..])
-                .map_err(|_| VerifyError::MalformedDeltaG2 { position })?;
+            let mut cursor_g1 = &last.delta_after_g1[..];
+            let g1 = G1Affine::deserialize_compressed(&mut cursor_g1)
+                .ok()
+                .filter(|_| cursor_g1.is_empty())
+                .ok_or(VerifyError::MalformedDeltaG1 { position })?;
+            let mut cursor_g2 = &last.delta_after_g2[..];
+            let g2 = G2Affine::deserialize_compressed(&mut cursor_g2)
+                .ok()
+                .filter(|_| cursor_g2.is_empty())
+                .ok_or(VerifyError::MalformedDeltaG2 { position })?;
             (g1, g2)
         }
         None => (initial_pk.delta_g1, initial_pk.vk.delta_g2),
@@ -614,5 +643,24 @@ mod tests {
             Err(VerifyError::FinalPkDeltaMismatch) => {}
             other => panic!("expected FinalPkDeltaMismatch, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn verify_phase2_transcript_rejects_unsupported_version_and_trailing_delta_bytes() {
+        let (initial_pk, mut transcript, _) = build_real_transcript(1);
+
+        let mut bad_ver = transcript.clone();
+        bad_ver.version = 99;
+        assert!(matches!(
+            verify_phase2_transcript(&initial_pk, &bad_ver),
+            Err(VerifyError::UnsupportedVersion(99))
+        ));
+
+        // Append a trailing garbage byte to delta_after_g1 and recompute chain if needed
+        transcript.contributions[0].delta_after_g1.push(0xFF);
+        assert!(matches!(
+            verify_phase2_transcript(&initial_pk, &transcript),
+            Err(VerifyError::MalformedDeltaG1 { position: 0 })
+        ));
     }
 }

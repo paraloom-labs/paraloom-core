@@ -55,6 +55,33 @@ impl Validator {
 
     /// Handle incoming task request
     pub async fn handle_task_request(&self, task: Task, coordinator_id: NodeId) -> Result<()> {
+        if let Some(expected_coord) = &self.coordinator_id {
+            if &coordinator_id != expected_coord {
+                log::warn!(
+                    "Ignoring task {} from unauthorized coordinator {:?} (expected {:?})",
+                    task.id,
+                    coordinator_id,
+                    expected_coord
+                );
+                return Ok(());
+            }
+        }
+        let local_id = self.network.local_peer_id();
+        let expected_assignee = format!("{:?}", local_id);
+        let assigned_to_self = match task.assigned_to.as_deref() {
+            Some(assignee) => assignee == expected_assignee || assignee == local_id.to_string(),
+            None => false,
+        };
+        if !assigned_to_self {
+            log::debug!(
+                "Ignoring task {} assigned to {:?} (local validator is {:?})",
+                task.id,
+                task.assigned_to,
+                local_id
+            );
+            return Ok(());
+        }
+
         info!("Validator received task: {} from coordinator", task.id);
 
         // Execute task
@@ -164,5 +191,45 @@ mod tests {
     fn hash_count_rejects_oversized_and_inverted_ranges() {
         assert!(checked_hash_count(0, MAX_HASH_TASK_ITEMS).is_err());
         assert!(checked_hash_count(5, 4).is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_task_request_ignores_unassigned_and_wrong_coordinator_tasks() {
+        use crate::config::Settings;
+        use crate::task::{Task, TaskType};
+
+        let net = std::sync::Arc::new(
+            crate::network::NetworkManager::new(&Settings::development()).unwrap(),
+        );
+        let local_id = net.local_peer_id();
+        let expected_coord = crate::types::NodeId(vec![0xAA]);
+        let wrong_coord = crate::types::NodeId(vec![0xBB]);
+
+        let mut validator = super::Validator::new(net);
+        validator.set_coordinator(expected_coord.clone());
+
+        // Task assigned to a different validator is ignored without erroring or sending network messages.
+        let mut other_task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "unsupported-algo".to_string(),
+        });
+        other_task.assigned_to = Some(format!("{:?}", crate::types::NodeId(vec![0x99])));
+        assert!(validator
+            .handle_task_request(other_task, expected_coord)
+            .await
+            .is_ok());
+
+        // Task assigned to self but from a wrong coordinator is also ignored.
+        let mut self_task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "unsupported-algo".to_string(),
+        });
+        self_task.assigned_to = Some(format!("{:?}", local_id));
+        assert!(validator
+            .handle_task_request(self_task, wrong_coord)
+            .await
+            .is_ok());
     }
 }
