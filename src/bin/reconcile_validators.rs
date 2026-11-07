@@ -85,12 +85,19 @@ struct ValidatorRow {
     stake_amount: u64,
 }
 
-fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
+fn decode(program_id: &Pubkey, pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
+    if &acc.owner != program_id {
+        return None;
+    }
     let d = &acc.data;
     if d.len() < 89 || d[0..8] != VALIDATOR_DISC {
         return None;
     }
     let wallet = Pubkey::new_from_array(d[8..40].try_into().ok()?);
+    let (expected_pda, _) = derive_validator_account(program_id, &wallet);
+    if expected_pda != pda {
+        return None;
+    }
     let stake_amount = u64::from_le_bytes(d[40..48].try_into().ok()?);
     let is_active = d[88] != 0; // offset: disc(8)+pubkey(32)+5*u64/i64(40)+... = byte 88
     Some(ValidatorRow {
@@ -197,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rows: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     rows.sort_by_key(|r| r.wallet.to_bytes());
 
@@ -313,17 +320,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refreshed: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     let active_sum: u64 = refreshed
         .iter()
         .filter(|r| r.is_active)
-        .map(|r| r.stake_amount)
-        .sum();
+        .fold(0u64, |acc, r| acc.saturating_add(r.stake_amount));
     let active_count = refreshed.iter().filter(|r| r.is_active).count();
 
     let (registry_pda, _) = derive_validator_registry(&program_id);
     let reg = client.get_account(&registry_pda)?;
+    if reg.data.len() < 72 {
+        return Err("validator registry account data shorter than 72 bytes".into());
+    }
     // ValidatorRegistry: disc(8) + authority(32) + total(8) + active(8) + min(8) + total_active_stake(8)
     let reg_active = u64::from_le_bytes(reg.data[48..56].try_into()?);
     let reg_stake = u64::from_le_bytes(reg.data[64..72].try_into()?);
@@ -342,6 +351,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ✓ invariant holds (total_active_stake == Σ active stake).");
     } else {
         println!("  ✗ INVARIANT MISMATCH — do NOT unpause; investigate before any settlement.");
+        return Err(format!(
+            "registry invariant mismatch: registry=({reg_active} active, {reg_stake} lamports) vs PDAs=({active_count} active, {active_sum} lamports)"
+        )
+        .into());
     }
     println!(
         "\nReconcile complete. Smoke-test a >=2-independent-co-signer settlement before unpausing."

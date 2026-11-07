@@ -20,6 +20,7 @@ use paraloom::ceremony::{
 };
 use paraloom::types::NodeId;
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha512};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -75,12 +76,6 @@ fn main() -> Result<()> {
 
     let circuit =
         CircuitId::from_str(&args.circuit).map_err(|e| anyhow::anyhow!("--circuit: {}", e))?;
-    let initial_srs_hash = match args.initial_srs_hash.as_deref() {
-        Some(hex) => {
-            try_hash_from_hex(hex).map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?
-        }
-        None => [0u8; 64],
-    };
     let contributor =
         NodeId::from_str(&args.contributor_hex).context("--contributor-hex is not valid hex")?;
 
@@ -88,6 +83,37 @@ fn main() -> Result<()> {
     let prior_transcript = match &args.prior_transcript {
         Some(path) => Some(read_transcript(path)?),
         None => None,
+    };
+
+    let prior_pk_file_hash = || -> Result<[u8; 64]> {
+        let bytes =
+            std::fs::read(&args.prior_pk).context("failed to read --prior-pk for hashing")?;
+        let digest = Sha512::digest(&bytes);
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&digest[..]);
+        Ok(out)
+    };
+
+    let initial_srs_hash = match args.initial_srs_hash.as_deref() {
+        Some(hex) => {
+            let parsed =
+                try_hash_from_hex(hex).map_err(|e| anyhow::anyhow!("--initial-srs-hash: {}", e))?;
+            if prior_transcript.is_none() {
+                let actual = prior_pk_file_hash()?;
+                anyhow::ensure!(
+                    parsed == actual,
+                    "--initial-srs-hash does not match SHA-512 of --prior-pk"
+                );
+            }
+            parsed
+        }
+        None => {
+            if prior_transcript.is_none() {
+                prior_pk_file_hash()?
+            } else {
+                [0u8; 64]
+            }
+        }
     };
 
     let mut rng = OsRng;

@@ -101,9 +101,10 @@ pub fn poseidon_hash_bytes(data: &[u8]) -> Fr {
     let config = get_poseidon_config();
     let mut sponge = PoseidonSponge::<Fr>::new(config);
 
-    // Convert bytes to field elements
-    // Pack bytes into field elements (31 bytes per element for safety)
-    let mut field_elements = Vec::new();
+    // Prepend byte length so empty/trailing-zero inputs of different lengths
+    // never collide under 31-byte chunk zero-padding or rate-2 sponge padding.
+    let mut field_elements = Vec::with_capacity(data.len().div_ceil(31) + 1);
+    field_elements.push(Fr::from(data.len() as u64));
     for chunk in data.chunks(31) {
         let mut bytes = [0u8; 32];
         bytes[..chunk.len()].copy_from_slice(chunk);
@@ -534,6 +535,21 @@ mod tests {
         assert_ne!(
             hash1, hash3,
             "Different inputs should produce different hashes"
+        );
+
+        // Trailing-zero and empty-vs-zero inputs must not collide.
+        assert_ne!(poseidon_hash_bytes(b""), poseidon_hash_bytes(&[0u8]));
+        assert_ne!(
+            poseidon_hash_bytes(&[1u8]),
+            poseidon_hash_bytes(&[1u8, 0u8])
+        );
+        assert_ne!(
+            poseidon_hash_bytes(&[1u8; 31]),
+            poseidon_hash_bytes(&{
+                let mut v = vec![1u8; 31];
+                v.push(0u8);
+                v
+            })
         );
     }
 
