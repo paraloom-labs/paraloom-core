@@ -61,6 +61,25 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Check if an ingress binding configuration is considered safe (either loopback or authenticated).
+pub fn is_safe_ingress_bind(addr: &std::net::SocketAddr, token: &IngressToken) -> bool {
+    addr.ip().is_loopback() || token.is_some()
+}
+
+/// Emit a prominent security warning if the ingress server is bound to a
+/// non-loopback address without an ingress token configured.
+pub fn warn_on_non_loopback_unauthenticated(addr: &std::net::SocketAddr, token: &IngressToken) {
+    if !is_safe_ingress_bind(addr, token) {
+        log::warn!(
+            target: "paraloom::node::transact_ingress",
+            "SECURITY WARNING: Transact ingress is bound to non-loopback address {} without an ingress_token! \
+             Anyone with network access can submit arbitrary transacts and trigger Groth16 verification and consensus rounds. \
+             Configure 'bridge.ingress_token' or bind to a loopback address (e.g. 127.0.0.1).",
+            addr
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +90,37 @@ mod tests {
             h.insert(AUTHORIZATION, a.parse().unwrap());
         }
         h
+    }
+
+    #[test]
+    fn loopback_bind_checks() {
+        let none_token: IngressToken = None;
+        let some_token: IngressToken = Some(Arc::from("secret"));
+
+        let loopback_v4: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let loopback_v6: std::net::SocketAddr = "[::1]:8080".parse().unwrap();
+        let non_loopback_unspecified: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let non_loopback_public: std::net::SocketAddr = "198.51.100.1:8080".parse().unwrap();
+
+        // Loopback binds are safe even without token
+        assert!(is_safe_ingress_bind(&loopback_v4, &none_token));
+        assert!(is_safe_ingress_bind(&loopback_v6, &none_token));
+        assert!(is_safe_ingress_bind(&loopback_v4, &some_token));
+
+        // Non-loopback binds are unsafe without token
+        assert!(!is_safe_ingress_bind(
+            &non_loopback_unspecified,
+            &none_token
+        ));
+        assert!(!is_safe_ingress_bind(&non_loopback_public, &none_token));
+
+        // Non-loopback binds are safe with token
+        assert!(is_safe_ingress_bind(&non_loopback_unspecified, &some_token));
+        assert!(is_safe_ingress_bind(&non_loopback_public, &some_token));
+
+        // Warn helper doesn't panic
+        warn_on_non_loopback_unauthenticated(&non_loopback_unspecified, &none_token);
+        warn_on_non_loopback_unauthenticated(&loopback_v4, &none_token);
     }
 
     #[test]
