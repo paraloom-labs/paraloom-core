@@ -91,12 +91,23 @@ pub fn read_membership(
     leaf_index: u64,
     commitment: Fr,
 ) -> Result<Membership> {
+    if leaf_index >= (1u64 << TX_LEVELS) {
+        return Err(TransactSubmitError::RootMismatch { leaf_index });
+    }
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], program_id);
     let raw = client
         .get_account_data(&tree_pda)
         .map_err(|e| TransactSubmitError::Rpc(e.to_string()))?;
     if raw.len() < 56 + TX_LEVELS * 32 {
         return Err(TransactSubmitError::ShortAccount("merkle_tree"));
+    }
+    let next_index = u64::from_le_bytes(
+        raw[8..16]
+            .try_into()
+            .map_err(|_| TransactSubmitError::ShortAccount("merkle_tree next_index"))?,
+    );
+    if leaf_index >= next_index {
+        return Err(TransactSubmitError::RootMismatch { leaf_index });
     }
     let root_onchain: [u8; 32] = raw[24..56]
         .try_into()
@@ -168,6 +179,30 @@ pub fn prove_withdraw_to_fresh(
     membership: &Membership,
     recipient: &[u8; 32],
 ) -> Result<WithdrawToFresh> {
+    if amount == 0 {
+        return Err(TransactSubmitError::Prove(
+            "withdrawal amount must be greater than zero".to_string(),
+        ));
+    }
+    let amount_i64 = i64::try_from(amount).map_err(|_| {
+        TransactSubmitError::Prove(format!(
+            "withdrawal amount {amount} exceeds i64::MAX ({})",
+            i64::MAX
+        ))
+    })?;
+    if membership.path.len() != TX_LEVELS {
+        return Err(TransactSubmitError::Prove(format!(
+            "membership path length {} does not match TX_LEVELS ({TX_LEVELS})",
+            membership.path.len()
+        )));
+    }
+    if membership.leaf_index >= (1u64 << TX_LEVELS) {
+        return Err(TransactSubmitError::Prove(format!(
+            "membership leaf_index {} exceeds 2^TX_LEVELS",
+            membership.leaf_index
+        )));
+    }
+
     let root = Fr::from_le_bytes_mod_order(&membership.root);
     let commitment = v3_commit(Fr::from(amount), note_pubkey, blinding, Fr::from(0u64));
     let leaf_index = membership.leaf_index;
@@ -185,7 +220,7 @@ pub fn prove_withdraw_to_fresh(
     let oc0 = v3_commit(Fr::from(0u64), note_pubkey, ob0, Fr::from(0u64));
     let oc1 = v3_commit(Fr::from(0u64), note_pubkey, ob1, Fr::from(0u64));
 
-    let ext_amount: i64 = -(amount as i64);
+    let ext_amount: i64 = -amount_i64;
     let ext_data_hash: [u8; 32] = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -299,16 +334,24 @@ pub fn wait_for_settlement(
     timeout: Duration,
 ) -> Result<u64> {
     let (nf_pda, _) = derive_nullifier_account(program_id, nf0);
-    let deadline = std::time::Instant::now() + timeout;
+    let start = std::time::Instant::now();
     let step = Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(step);
+    loop {
         let bal = client.get_balance(recipient).unwrap_or(0);
-        if bal > 0 && client.get_account(&nf_pda).is_ok() {
-            return Ok(bal);
+        if bal > 0 {
+            if let Ok(acct) = client.get_account(&nf_pda) {
+                if acct.owner == *program_id && acct.data.len() >= 56 && acct.data[8..40] == nf0[..]
+                {
+                    return Ok(bal);
+                }
+            }
         }
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(TransactSubmitError::SettlementTimeout(timeout));
+        }
+        std::thread::sleep(step.min(timeout.saturating_sub(elapsed)));
     }
-    Err(TransactSubmitError::SettlementTimeout(timeout))
 }
 
 /// Whether the transact ingress has a validator quorum available (the registry
@@ -316,9 +359,110 @@ pub fn wait_for_settlement(
 /// with a clear reason rather than after a 60s+ settlement wait.
 pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
     let (registry, _) = derive_validator_registry(program_id);
-    match client.get_account_data(&registry) {
+    match client.get_account(&registry) {
         // active_validators is the u64 at [48..56] after the 8-byte discriminator.
-        Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
+        Ok(acct) if acct.owner == *program_id && acct.data.len() >= 72 => {
+            u64::from_le_bytes(acct.data[48..56].try_into().unwrap_or([0; 8])) >= 2
+        }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_membership() -> Membership {
+        Membership {
+            leaf_index: 0,
+            root: [0u8; 32],
+            path: vec![[0u8; 32]; TX_LEVELS],
+        }
+    }
+
+    #[test]
+    fn prove_withdraw_to_fresh_rejects_zero_and_overflow_amount_and_bad_membership() {
+        use ark_groth16::Groth16;
+        use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+        use ark_snark::SNARK;
+        use ark_std::rand::{rngs::StdRng, SeedableRng};
+
+        struct DummyCircuit;
+        impl ConstraintSynthesizer<Fr> for DummyCircuit {
+            fn generate_constraints(
+                self,
+                _cs: ConstraintSystemRef<Fr>,
+            ) -> std::result::Result<(), SynthesisError> {
+                Ok(())
+            }
+        }
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let (pk, _) = Groth16::<ark_bn254::Bn254>::circuit_specific_setup(DummyCircuit, &mut rng)
+            .expect("dummy pk");
+        let recipient = [1u8; 32];
+        let m = dummy_membership();
+
+        // Zero amount rejected
+        assert!(matches!(
+            prove_withdraw_to_fresh(
+                &pk,
+                Fr::from(1u64),
+                Fr::from(2u64),
+                Fr::from(3u64),
+                0,
+                &m,
+                &recipient
+            ),
+            Err(TransactSubmitError::Prove(_))
+        ));
+
+        // Amount > i64::MAX rejected without panic or wrap
+        for bad_amount in [(i64::MAX as u64) + 1, u64::MAX] {
+            assert!(matches!(
+                prove_withdraw_to_fresh(
+                    &pk,
+                    Fr::from(1u64),
+                    Fr::from(2u64),
+                    Fr::from(3u64),
+                    bad_amount,
+                    &m,
+                    &recipient
+                ),
+                Err(TransactSubmitError::Prove(_))
+            ));
+        }
+
+        // Wrong path length rejected
+        let mut bad_path = dummy_membership();
+        bad_path.path.pop();
+        assert!(matches!(
+            prove_withdraw_to_fresh(
+                &pk,
+                Fr::from(1u64),
+                Fr::from(2u64),
+                Fr::from(3u64),
+                1000,
+                &bad_path,
+                &recipient
+            ),
+            Err(TransactSubmitError::Prove(_))
+        ));
+
+        // Out-of-range leaf_index >= 2^TX_LEVELS rejected
+        let mut bad_idx = dummy_membership();
+        bad_idx.leaf_index = 1u64 << TX_LEVELS;
+        assert!(matches!(
+            prove_withdraw_to_fresh(
+                &pk,
+                Fr::from(1u64),
+                Fr::from(2u64),
+                Fr::from(3u64),
+                1000,
+                &bad_idx,
+                &recipient
+            ),
+            Err(TransactSubmitError::Prove(_))
+        ));
     }
 }

@@ -25,7 +25,8 @@ use anchor_lang::prelude::*;
 /// by stake rather than head count is what stops a permissionless registry from
 /// being Sybil-forged with many tiny validators.
 pub fn quorum_threshold(total_active_stake: u64) -> u64 {
-    total_active_stake.saturating_mul(2) / 3 + 1
+    let raw = ((total_active_stake as u128) * 2) / 3 + 1;
+    u64::try_from(raw).unwrap_or(u64::MAX)
 }
 
 /// Verify that a stake-weighted supermajority of registered, active validators
@@ -39,6 +40,7 @@ pub fn verify_validator_quorum(
     authority_active_stake: u64,
     quorum_accounts: &[AccountInfo],
 ) -> Result<()> {
+    require!(quorum_accounts.len() % 2 == 0, BridgeError::QuorumNotMet);
     // The settlement authority is not an independent second factor: its own
     // stake counts toward neither the tally nor the denominator. Subtracting it
     // keeps the threshold a supermajority of exactly the stake that can be
@@ -46,7 +48,8 @@ pub fn verify_validator_quorum(
     // supermajority to settle.
     let eligible_stake = registry
         .total_active_stake
-        .saturating_sub(authority_active_stake);
+        .checked_sub(authority_active_stake)
+        .ok_or(error!(BridgeError::QuorumNotMet))?;
     let threshold = quorum_threshold(eligible_stake);
     let mut counted_stake: u64 = 0;
     let mut seen: Vec<Pubkey> = Vec::new();
@@ -394,6 +397,44 @@ mod tests {
             &registry_with_stake(2, 2_000_000_000),
             &Pubkey::default(),
             0,
+            &[s, a]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn high_stake_threshold_does_not_saturate_and_odd_or_diverged_quorum_rejected() {
+        let high_stake = (u64::MAX / 2) + 3_000_000_000;
+        let expected = (((high_stake as u128) * 2) / 3 + 1) as u64;
+        assert_eq!(quorum_threshold(high_stake), expected);
+
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        let w = Pubkey::new_unique();
+        let (pda, _) = Pubkey::find_program_address(&[b"validator", w.as_ref()], &p);
+        let mut d = validator_data(w, true);
+        let (mut l, mut lp, mut l_extra) = (0u64, 0u64, 0u64);
+        let (mut e, mut e_extra) = ([0u8; 0], [0u8; 0]);
+        let s = AccountInfo::new(&w, true, false, &mut l, &mut e, &sys, false, 0);
+        let a = AccountInfo::new(&pda, false, false, &mut lp, &mut d, &p, false, 0);
+        let extra = AccountInfo::new(&w, false, false, &mut l_extra, &mut e_extra, &sys, false, 0);
+
+        // Trailing odd account in remaining_accounts is rejected.
+        assert!(verify_validator_quorum(
+            &p,
+            &registry(1),
+            &Pubkey::default(),
+            0,
+            &[s.clone(), a.clone(), extra]
+        )
+        .is_err());
+
+        // authority_active_stake > registry.total_active_stake is rejected.
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(1, 1_000_000_000),
+            &Pubkey::new_unique(),
+            2_000_000_000,
             &[s, a]
         )
         .is_err());
