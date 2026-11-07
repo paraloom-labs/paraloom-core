@@ -647,7 +647,8 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         return Ok(());
                     }
 
-                    let job = crate::compute::ComputeJob::new(wasm_code, input_data, limits);
+                    let job =
+                        crate::compute::ComputeJob::with_id(job_id, wasm_code, input_data, limits);
                     let actual_job_id = job.id.clone();
 
                     // Store coordinator for result reporting
@@ -689,6 +690,11 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                         }
                         Err(e) => {
                             log::error!("Failed to submit compute job: {}", e);
+
+                            {
+                                let mut coordinators = self.job_coordinators.lock().await;
+                                coordinators.remove(&actual_job_id);
+                            }
 
                             // Remove from pending storage on failure
                             if let Some(storage) = &self.compute_storage {

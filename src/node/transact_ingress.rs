@@ -175,7 +175,19 @@ async fn submit_handler(
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
+    if nullifiers[0] == nullifiers[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "nullifiers must be distinct".to_string(),
+        ));
+    }
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
+    if output_commitments[0] == output_commitments[1] {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "output_commitments must be distinct".to_string(),
+        ));
+    }
     let root = parse_hex32("root", &req.root)?;
 
     let proof_hex = req.proof.strip_prefix("0x").unwrap_or(&req.proof);
@@ -198,6 +210,7 @@ async fn submit_handler(
             "ciphertexts must have exactly 2 entries".to_string(),
         ));
     }
+    let mut normalized_ciphertexts = [String::new(), String::new()];
     for (i, c) in req.ciphertexts.iter().enumerate() {
         let trimmed = c.strip_prefix("0x").unwrap_or(c);
         let bytes = hex::decode(trimmed).map_err(|_| {
@@ -208,8 +221,9 @@ async fn submit_handler(
         })?;
         crate::privacy::note_crypto::check_relayable(&bytes)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("ciphertexts[{i}]: {e}")))?;
+        normalized_ciphertexts[i] = hex::encode(&bytes);
     }
-    let ciphertexts = [req.ciphertexts[0].clone(), req.ciphertexts[1].clone()];
+    let ciphertexts = normalized_ciphertexts;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -557,5 +571,35 @@ mod tests {
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_nullifiers_or_commitments_are_400_and_ciphertexts_normalized() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let dup_nullifiers = well_formed_body().replace(
+            &format!(r#""{}""#, "22".repeat(32)),
+            &format!(r#""{}""#, "11".repeat(32)),
+        );
+        let resp = app.oneshot(post_json(&dup_nullifiers)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let dup_commitments = well_formed_body().replace(
+            &format!(r#""{}""#, "44".repeat(32)),
+            &format!(r#""{}""#, "33".repeat(32)),
+        );
+        let resp = app.oneshot(post_json(&dup_commitments)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let ct0 = v1_ciphertext_hex(0xab);
+        let prefixed = well_formed_body().replace(&ct0, &format!("0x{}", ct0.to_uppercase()));
+        let resp = app.oneshot(post_json(&prefixed)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = stub.seen.lock().await.clone().unwrap();
+        assert_eq!(seen.ciphertexts[0], ct0);
     }
 }

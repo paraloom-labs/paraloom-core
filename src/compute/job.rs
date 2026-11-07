@@ -117,9 +117,25 @@ impl ComputeJob {
     /// Create a new compute job
     pub fn new(wasm_code: Vec<u8>, input_data: Vec<u8>, limits: ResourceLimits) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
+        Self::with_id(id, wasm_code, input_data, limits)
+    }
+
+    /// Create a new compute job preserving a caller/coordinator-supplied `id`.
+    /// Falls back to a fresh UUID v4 if `id` is empty/whitespace.
+    pub fn with_id(
+        id: JobId,
+        wasm_code: Vec<u8>,
+        input_data: Vec<u8>,
+        limits: ResourceLimits,
+    ) -> Self {
+        let id = if id.trim().is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            id
+        };
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
 
         Self {
@@ -271,5 +287,16 @@ mod tests {
         assert!(matches!(result.status, JobStatus::Failed { .. }));
         assert!(result.output_data.is_none());
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn test_compute_job_with_id_preserves_caller_id_and_falls_back_on_empty() {
+        let limits = ResourceLimits::default();
+        let job = ComputeJob::with_id("coord-job-42".to_string(), vec![], vec![], limits.clone());
+        assert_eq!(job.id, "coord-job-42");
+
+        let fallback = ComputeJob::with_id("   ".to_string(), vec![], vec![], limits);
+        assert!(!fallback.id.trim().is_empty());
+        assert_ne!(fallback.id, "   ");
     }
 }
