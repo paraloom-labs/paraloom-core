@@ -438,7 +438,18 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // carried in the request), so verification needs no pool
                 // state; the pool gate below only keeps non-bridge nodes from
                 // voting on settlements they do not participate in.
-                let vote = if already_verified {
+                let nullifiers_unspent = self
+                    .are_transact_nullifiers_unspent(&request.nullifiers)
+                    .await;
+                let vote = if !nullifiers_unspent {
+                    log::warn!(
+                        "Transact {} rejected: input nullifier already spent (replay)",
+                        request.request_id
+                    );
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "input nullifier already spent (replay)".to_string(),
+                    }
+                } else if already_verified {
                     info!(
                         "Transact {} already verified Valid; reusing cached result",
                         request.request_id
@@ -2233,6 +2244,14 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
+
+        // Pre-filter replays: verify that input nullifiers are unspent before consensus (#1503).
+        if !self
+            .are_transact_nullifiers_unspent(&request.nullifiers)
+            .await
+        {
+            return Err(anyhow!("input nullifier already spent (replay)"));
+        }
         // Register self into the validator set BEFORE start_verification, which
         // rejects an empty set with "No validators available". The initiator
         // never receives its own gossip broadcast, so on a single-node cohort (a
@@ -2681,6 +2700,38 @@ impl Node {
         self.compute_executor.clone()
     }
 
+    /// Check whether any of the transact's input nullifiers have already been
+    /// spent, consulting the local shielded pool's nullifier set and (when
+    /// available) the on-chain nullifier accounts (#1503).
+    pub async fn are_transact_nullifiers_unspent(&self, nullifiers: &[[u8; 32]; 2]) -> bool {
+        // 1. Check local shielded pool nullifier set
+        if let Some(pool) = &self.shielded_pool {
+            let nfs = [
+                crate::privacy::Nullifier(nullifiers[0]),
+                crate::privacy::Nullifier(nullifiers[1]),
+            ];
+            if !pool.check_batch(&nfs).await {
+                return false;
+            }
+        }
+
+        // 2. Check on-chain nullifier PDAs if bridge is configured
+        if let Some(bridge) = &self.bridge {
+            let bridge_guard = bridge.lock().await;
+            if bridge_guard.is_nullifier_spent(&nullifiers[0]).await
+                || bridge_guard.is_nullifier_spent(&nullifiers[1]).await
+            {
+                // Synchronize the off-chain set so future checks hit the local cache directly
+                if let Some(pool) = &self.shielded_pool {
+                    pool.record_spent(*nullifiers).await;
+                }
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Verify a v3 unified-transact zkSNARK proof (#350).
     ///
     /// Deliberately NOT verified against `pool.root().await`: the v3 proof is
@@ -2693,6 +2744,18 @@ impl Node {
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
     ) -> Result<bool> {
+        // Pre-filter replays: verify that input nullifiers are unspent (#1503).
+        if !self
+            .are_transact_nullifiers_unspent(&request.nullifiers)
+            .await
+        {
+            log::warn!(
+                "transact proof rejected for {}: input nullifier already spent (replay)",
+                request.request_id
+            );
+            return Ok(false);
+        }
+
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
@@ -3633,5 +3696,55 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn transact_replays_with_spent_nullifiers_are_rejected_before_consensus() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let pool = node
+            .shielded_pool
+            .as_ref()
+            .expect("pool must exist when bridge is enabled");
+
+        let nullifiers = [[11u8; 32], [12u8; 32]];
+
+        // 1. Fresh nullifiers are unspent
+        assert!(
+            node.are_transact_nullifiers_unspent(&nullifiers).await,
+            "fresh nullifiers must be unspent"
+        );
+
+        // 2. Once marked spent (e.g. after settlement on-chain or locally), they are filtered (#1503)
+        pool.record_spent(nullifiers).await;
+
+        assert!(
+            !node.are_transact_nullifiers_unspent(&nullifiers).await,
+            "recorded spent nullifiers must be detected as spent"
+        );
+
+        let req = ta_request(
+            "replay-req",
+            [9u8; 32],
+            nullifiers,
+            [[5u8; 32], [6u8; 32]],
+            [2u8; 32],
+            -1_000_000_000i64,
+        );
+
+        // 3. verify_transact_proof rejects spent nullifiers as invalid
+        let valid = node.verify_transact_proof(&req).await.expect("verify call");
+        assert!(
+            !valid,
+            "verify_transact_proof must reject replays with spent nullifiers"
+        );
+
+        // 4. initiate_transact_verification refuses to broadcast replays
+        let init_res = node.initiate_transact_verification(req).await;
+        assert!(
+            init_res.is_err(),
+            "initiate_transact_verification must decline replays with spent nullifiers"
+        );
     }
 }
