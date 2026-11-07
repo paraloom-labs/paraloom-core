@@ -142,7 +142,7 @@ impl Coordinator {
         }
 
         let mut sequence_slot = self.heartbeat_sequence.lock().await;
-        if request.sequence <= *sequence_slot && *sequence_slot != 0 {
+        if request.sequence <= *sequence_slot {
             return HeartbeatResponse {
                 accepted: false,
                 last_applied_sequence: *sequence_slot,
@@ -412,28 +412,40 @@ impl Coordinator {
                 end,
                 algorithm,
             } => {
+                if start > end {
+                    return Err(anyhow::anyhow!(
+                        "invalid hash calculation range: start ({}) > end ({})",
+                        start,
+                        end
+                    ));
+                }
                 let validators = self.validators.lock().await;
                 let num_validators = validators.len().max(1);
-                let total = end - start + 1;
-                let chunk_size = total.div_ceil(num_validators as u64);
+                let span = *end - *start;
+                let total = (span as u128) + 1;
+                let chunk_size =
+                    total.div_ceil(num_validators as u128).min(u64::MAX as u128) as u64;
 
                 let mut chunks = Vec::new();
                 let mut current_start = *start;
 
                 for i in 0..num_validators {
-                    let chunk_end = (current_start + chunk_size - 1).min(*end);
+                    let chunk_end = current_start
+                        .saturating_add(chunk_size.saturating_sub(1))
+                        .min(*end);
 
-                    if current_start <= *end {
-                        let mut chunk = Task::new(TaskType::HashCalculation {
-                            start: current_start,
-                            end: chunk_end,
-                            algorithm: algorithm.clone(),
-                        });
-                        chunk.id = format!("{}-chunk-{}", task.id, i);
+                    let mut chunk = Task::new(TaskType::HashCalculation {
+                        start: current_start,
+                        end: chunk_end,
+                        algorithm: algorithm.clone(),
+                    });
+                    chunk.id = format!("{}-chunk-{}", task.id, i);
 
-                        chunks.push(chunk);
-                        current_start = chunk_end + 1;
+                    chunks.push(chunk);
+                    if chunk_end >= *end {
+                        break;
                     }
+                    current_start = chunk_end + 1;
                 }
 
                 Ok(chunks)
@@ -780,6 +792,59 @@ mod tests {
         let resp2 = standby.apply_heartbeat(&NodeId(vec![0x01]), req1).await;
         assert!(!resp2.accepted);
         assert_eq!(resp2.last_applied_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn split_task_rejects_inverted_range_and_handles_u64_max_and_sequence_zero() {
+        let coordinator = Coordinator::new(make_test_network());
+        coordinator.register_validator(NodeId(vec![0x01])).await;
+        coordinator.register_validator(NodeId(vec![0x02])).await;
+
+        // Inverted range (start > end) must return Err instead of underflow panic.
+        let inverted = Task::new(TaskType::HashCalculation {
+            start: 10,
+            end: 5,
+            algorithm: "sha256".to_string(),
+        });
+        assert!(coordinator.split_task(&inverted).await.is_err());
+
+        // Range touching u64::MAX must split cleanly without overflow panic.
+        let near_max = Task::new(TaskType::HashCalculation {
+            start: u64::MAX - 1,
+            end: u64::MAX,
+            algorithm: "sha256".to_string(),
+        });
+        let chunks = coordinator
+            .split_task(&near_max)
+            .await
+            .expect("splits near u64::MAX");
+        assert_eq!(chunks.len(), 2);
+
+        // Full [0, u64::MAX] range must not overflow `end - start + 1`.
+        let full_range = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: u64::MAX,
+            algorithm: "sha256".to_string(),
+        });
+        let full_chunks = coordinator
+            .split_task(&full_range)
+            .await
+            .expect("splits full u64 range");
+        assert_eq!(full_chunks.len(), 2);
+
+        // Sequence 0 heartbeat must be rejected by a fresh standby.
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+        let zero_hb = HeartbeatRequest {
+            primary: NodeId(vec![0x01]),
+            sequence: 0,
+            snapshot: CoordinatorSnapshot::default(),
+        };
+        let resp = standby.apply_heartbeat(&NodeId(vec![0x01]), zero_hb).await;
+        assert!(!resp.accepted);
     }
 
     #[tokio::test]
