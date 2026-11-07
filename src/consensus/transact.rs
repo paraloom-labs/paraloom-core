@@ -522,8 +522,14 @@ impl TransactVerificationCoordinator {
     /// `active_snapshot()` NodeId set at every tally call site.
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
+        let onchain_stakes = self.onchain_stakes.read().await;
         let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        onchain
+            .iter()
+            .filter(|w| onchain_stakes.get(*w).copied().unwrap_or(0) > 0)
+            .filter(|w| !equivocators.contains(*w))
+            .cloned()
+            .collect()
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -702,17 +708,33 @@ impl TransactVerificationCoordinator {
     ) {
         // Refresh the registration allowlist + the wallet-keyed stake numerator
         // to exactly the on-chain swap-validator wallets. These map keys ARE the
-        // ValidatorRegistry set; compute ResourceProviders have no
-        // ValidatorAccount so are absent, which keeps them out of the quorum.
-        // An empty snapshot (RPC returned nothing) is NOT trusted to clear the
-        // allowlist/stakes — that would fail-open the gate; keep the previous
-        // set (and the previous registry total, updated only alongside a
-        // non-empty snapshot so numerator and denominator move together).
-        if !stakes.is_empty() {
-            *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
-            *self.onchain_registry_total.write().await = registry_total_active_stake;
-            *self.onchain_stakes.write().await = stakes.clone();
+        // ValidatorRegistry set; compute ResourceProviders and deactivated
+        // validators carry 0 stake so are absent, which keeps them out of the
+        // quorum.
+        // An empty or all-zero snapshot (RPC returned nothing or all validators
+        // deactivated/unavailable) is NOT trusted to clear the allowlist/stakes —
+        // that would fail-open the gate; keep the previous set (and the previous
+        // registry total, updated only alongside a non-empty snapshot so numerator
+        // and denominator move together).
+        let active_wallets: HashSet<String> = stakes
+            .iter()
+            .filter(|(_, &s)| s > 0)
+            .map(|(w, _)| w.clone())
+            .collect();
+
+        if active_wallets.is_empty() || registry_total_active_stake == 0 {
+            log::warn!(
+                target: "paraloom::consensus::transact",
+                "ignoring empty or all-zero on-chain stake snapshot ({} wallets, registry_total={}) to preserve allowlist and stakes",
+                stakes.len(),
+                registry_total_active_stake
+            );
+            return;
         }
+
+        *self.onchain_wallets.write().await = active_wallets;
+        *self.onchain_registry_total.write().await = registry_total_active_stake;
+        *self.onchain_stakes.write().await = stakes.clone();
 
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.apply_onchain_stakes(&stakes);
@@ -1571,5 +1593,118 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn sync_onchain_stakes_ignores_empty_or_all_zero_snapshot_and_preserves_state() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1wallet".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL2wallet".to_string()))
+            .await;
+        coordinator
+            .sync_onchain_stakes(
+                stakes(&[("VAL1wallet", 1_000_000_000), ("VAL2wallet", 2_000_000_000)]),
+                3_000_000_000,
+            )
+            .await;
+
+        {
+            let sel = coordinator.leader_selector.read().await;
+            assert_eq!(
+                sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+                1_000_000_000
+            );
+            assert_eq!(
+                sel.get_validator(&NodeId(vec![2])).unwrap().stake_amount,
+                2_000_000_000
+            );
+        }
+
+        // 1. Empty snapshot: must NOT wipe onchain_wallets or leader_selector stakes
+        coordinator.sync_onchain_stakes(HashMap::new(), 0).await;
+        {
+            let allow = coordinator.onchain_wallets.read().await;
+            assert_eq!(allow.len(), 2, "empty snapshot must not clear allowlist");
+            assert!(allow.contains("VAL1wallet"));
+            assert!(allow.contains("VAL2wallet"));
+
+            let sel = coordinator.leader_selector.read().await;
+            assert_eq!(
+                sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+                1_000_000_000,
+                "empty snapshot must not zero leader stakes"
+            );
+        }
+
+        // 2. All-zero / deactivated snapshot: must NOT clear allowlist or zero leader stakes
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1wallet", 0), ("VAL2wallet", 0)]), 0)
+            .await;
+        {
+            let allow = coordinator.onchain_wallets.read().await;
+            assert_eq!(allow.len(), 2, "all-zero snapshot must not clear allowlist");
+            let sel = coordinator.leader_selector.read().await;
+            assert_eq!(
+                sel.get_validator(&NodeId(vec![1])).unwrap().stake_amount,
+                1_000_000_000,
+                "all-zero snapshot must not zero leader stakes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deactivated_zero_stake_wallet_excluded_from_eligible_wallets_and_quorum() {
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+
+        // W2 has 0 stake (deactivated)
+        c.sync_onchain_stakes(
+            stakes(&[("W0", 1_000_000_000), ("W1", 1_000_000_000), ("W2", 0)]),
+            2_000_000_000,
+        )
+        .await;
+
+        let eligible = c.eligible_wallets().await;
+        assert!(eligible.contains("W0"));
+        assert!(eligible.contains("W1"));
+        assert!(
+            !eligible.contains("W2"),
+            "deactivated 0-stake wallet must not be eligible"
+        );
+
+        let mut approvals = rx;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // Authority votes Valid
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        assert!(approvals.try_recv().is_err());
+
+        // Deactivated wallet W2 votes Valid -> dropped, cannot form quorum
+        c.submit_result(vote(&id, 2, "W2", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "vote from 0-stake deactivated wallet must not complete quorum"
+        );
+
+        // Active wallet W1 votes Valid -> completes quorum
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "active wallet completes the quorum"
+        );
     }
 }

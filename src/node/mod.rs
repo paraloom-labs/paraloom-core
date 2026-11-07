@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::bridge::solana::{
     build_settlement_message, derive_bridge_vault, CoSignPayload, SettlementParams,
+    MAX_QUORUM_COSIGNERS,
 };
 use crate::bridge::Bridge;
 use crate::compute::{ComputeAuthPolicy, JobCoordinator, JobExecutor, JobManager};
@@ -971,6 +972,39 @@ async fn cosign_settlement(
     // into a cross-program signing oracle for its settlement wallet.
     if payload.program_id != expected_program_id.to_bytes() {
         return declined("payload program id does not match our configured program");
+    }
+
+    // Validate bridge_vault matches our derived PDA from the configured program:
+    // an attacker supplying a rogue vault could burn the per-nullifier cap
+    // budget under the leader's authority (#723).
+    let (expected_vault, _) = derive_bridge_vault(expected_program_id);
+    if payload.bridge_vault != expected_vault.to_bytes() {
+        return declined("payload bridge vault does not match our derived vault PDA");
+    }
+
+    // Validate quorum_validators: must be non-empty, within size bounds,
+    // contain no default/zero pubkeys, contain no duplicates, and must
+    // explicitly include our own co-signer keypair (#260).
+    if payload.quorum_validators.is_empty() {
+        return declined("payload quorum_validators is empty");
+    }
+    if payload.quorum_validators.len() > MAX_QUORUM_COSIGNERS {
+        return declined("payload quorum_validators exceeds MAX_QUORUM_COSIGNERS");
+    }
+    if payload.quorum_validators.contains(&[0u8; 32]) {
+        return declined("payload quorum_validators contains a default/zero pubkey");
+    }
+    let our_wallet = keypair.pubkey().to_bytes();
+    if !payload.quorum_validators.contains(&our_wallet) {
+        return declined("payload quorum_validators does not contain our co-signer key");
+    }
+    let mut seen_validators = HashSet::new();
+    if !payload
+        .quorum_validators
+        .iter()
+        .all(|pk| seen_validators.insert(*pk))
+    {
+        return declined("payload quorum_validators contains duplicate entries");
     }
 
     // Match the payload against a settlement we verified Valid, by request id
@@ -2925,10 +2959,11 @@ mod tests {
         root: [u8; 32],
         ext_amount: i64,
     ) -> CoSignPayload {
+        let (bridge_vault, _) = derive_bridge_vault(&configured_program());
         CoSignPayload {
-            program_id: [1u8; 32],
+            program_id: configured_program().to_bytes(),
             authority,
-            bridge_vault: [3u8; 32],
+            bridge_vault: bridge_vault.to_bytes(),
             blockhash: [4u8; 32],
             quorum_validators: vec![authority],
             params: SettlementParams::Transact {
@@ -3097,7 +3132,7 @@ mod tests {
 
         // The forger floods well past the cap under its own authority, reusing
         // the real spend's params.
-        let forged = ta_payload(
+        let mut forged = ta_payload(
             forger_authority,
             recipient,
             nullifiers,
@@ -3105,6 +3140,7 @@ mod tests {
             root,
             ext_amount,
         );
+        forged.quorum_validators = vec![forger_authority, kp.pubkey().to_bytes()];
         for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
             let _ = cosign_settlement(
                 Some(&kp),
@@ -3119,7 +3155,7 @@ mod tests {
         // The legitimate leader, under a different authority, still gets signed:
         // its (nullifier, authority) budget was never touched. Before #723 the
         // cap was keyed on the nullifier alone, so this request was declined.
-        let legit = ta_payload(
+        let mut legit = ta_payload(
             leader_authority,
             recipient,
             nullifiers,
@@ -3127,6 +3163,7 @@ mod tests {
             root,
             ext_amount,
         );
+        legit.quorum_validators = vec![leader_authority, kp.pubkey().to_bytes()];
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
@@ -3383,6 +3420,178 @@ mod tests {
             resp.signature, None,
             "a substituted ext_amount must be declined"
         );
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_tampered_bridge_vault_and_invalid_quorum_validators() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        // 1. Tampered bridge vault: must be declined without spending co-sign budget (#723)
+        let mut tampered_vault = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        tampered_vault.bridge_vault = [0xEE; 32];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &tampered_vault),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "tampered bridge_vault must be declined"
+        );
+        assert!(
+            counts.lock().await.is_empty(),
+            "cap budget must not be consumed on validation failure"
+        );
+
+        // 2. Empty quorum_validators: must be declined
+        let mut empty_quorum = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        empty_quorum.quorum_validators = vec![];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &empty_quorum),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "empty quorum_validators must be declined"
+        );
+        assert!(counts.lock().await.is_empty());
+
+        // 3. Quorum validators containing default/zero pubkey: must be declined
+        let mut zero_quorum = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        zero_quorum.quorum_validators = vec![kp.pubkey().to_bytes(), [0u8; 32]];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &zero_quorum),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "zero pubkey in quorum_validators must be declined"
+        );
+        assert!(counts.lock().await.is_empty());
+
+        // 4. Quorum validators not containing our co-signer key: must be declined
+        let other_kp = Keypair::new();
+        let mut missing_self = ta_payload(
+            other_kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        missing_self.quorum_validators = vec![other_kp.pubkey().to_bytes()];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &missing_self),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "quorum missing our co-signer key must be declined"
+        );
+        assert!(counts.lock().await.is_empty());
+
+        // 5. Quorum validators containing duplicate entries: must be declined
+        let mut dup_quorum = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        dup_quorum.quorum_validators = vec![kp.pubkey().to_bytes(), kp.pubkey().to_bytes()];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &dup_quorum),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "duplicate pubkeys in quorum_validators must be declined"
+        );
+        assert!(counts.lock().await.is_empty());
+
+        // 6. Quorum validators exceeding MAX_QUORUM_COSIGNERS: must be declined
+        let mut big_quorum = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        big_quorum.quorum_validators = (0..MAX_QUORUM_COSIGNERS + 1)
+            .map(|i| {
+                let mut pk = [0u8; 32];
+                pk[0..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                pk
+            })
+            .collect();
+        big_quorum.quorum_validators[0] = kp.pubkey().to_bytes();
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            cosign_req("t1", SettlementKind::Transact, &big_quorum),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "oversized quorum_validators must be declined"
+        );
+        assert!(counts.lock().await.is_empty());
     }
 
     fn ta_approval(id: &str) -> ApprovedTransact {
