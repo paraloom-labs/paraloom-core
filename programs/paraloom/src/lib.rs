@@ -219,19 +219,23 @@ pub mod paraloom_program {
         require_canonical_field(&pubkey, BridgeError::NonCanonicalFieldElement)?;
         require_canonical_field(&blinding, BridgeError::NonCanonicalFieldElement)?;
 
-        // TVL cap: refuse any deposit that would push the vault's *current*
-        // balance past `deposit_cap`, bounding total funds-at-risk to the cap.
-        // Checked against the live vault balance (not cumulative deposits) and
-        // before moving funds, so a rejected deposit never touches the vault.
+        // TVL cap: refuse any deposit that would push the pool's active
+        // liabilities past `deposit_cap`, bounding total funds-at-risk to the cap.
+        // Checked against recorded net liabilities (`total_deposited - total_withdrawn`)
+        // rather than the raw live vault balance so permissionless donations directly
+        // to the vault PDA or retained protocol fees cannot grief deposit liveness (#1507).
+        // Withdrawals increment `total_withdrawn`, freeing headroom under the cap.
         // Cap starts at 0 (deposits closed) until the cold authority raises it.
-        let projected_vault_balance = ctx
+        let active_liabilities = ctx
             .accounts
-            .bridge_vault
-            .lamports()
+            .bridge_state
+            .total_deposited
+            .saturating_sub(ctx.accounts.bridge_state.total_withdrawn);
+        let projected_liabilities = active_liabilities
             .checked_add(amount)
             .ok_or(BridgeError::InvalidAmount)?;
         require!(
-            projected_vault_balance <= ctx.accounts.bridge_state.deposit_cap,
+            projected_liabilities <= ctx.accounts.bridge_state.deposit_cap,
             BridgeError::DepositCapExceeded
         );
 
@@ -565,10 +569,8 @@ pub mod paraloom_program {
         // The asset is bound separately via the `asset` public input below, and
         // the recipient token account address is mint-specific, so a proof for
         // one asset cannot redirect another's vault.
-        let ext_data_hash = transact_ext_data_hash(
-            &ctx.accounts.recipient_token_account.key(),
-            ext_amount,
-        );
+        let ext_data_hash =
+            transact_ext_data_hash(&ctx.accounts.recipient_token_account.key(), ext_amount);
         let public_amount = public_amount_bytes(ext_amount);
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
@@ -2668,11 +2670,12 @@ pub struct BridgeState {
     /// `BridgeState` account layout byte-compatible with already-deployed
     /// state; do not reintroduce a reader.
     pub merkle_root: [u8; 32],
-    /// Maximum the vault's **current** lamport balance may reach via deposits
-    /// (the TVL cap). Bounds total funds-at-risk: no bug can lose more than the
-    /// vault can hold, and `deposit_note` refuses any deposit that would push
-    /// the live balance past this. It is the *current* value, not cumulative
-    /// deposits, so withdrawals free headroom and the ceiling tracks live TVL.
+    /// Maximum the pool's active liability (`total_deposited - total_withdrawn`)
+    /// may reach via deposits (the TVL cap). Bounds total funds-at-risk: no bug
+    /// can lose more than the active pool liability, and `deposit_note` refuses
+    /// any deposit that would push liabilities past this. It tracks the net
+    /// active value rather than cumulative deposits or raw lamports, so withdrawals
+    /// free headroom and permissionless donations cannot grief deposit liveness (#1507).
     /// Initialised to `0` (deposits closed) — the cold authority opens the pool
     /// to a chosen ceiling via `set_deposit_cap`. Appended last to keep the
     /// fixed `program_version` offset the L2 reads unchanged.
