@@ -40,10 +40,7 @@ pub fn verify_validator_quorum(
     authority_active_stake: u64,
     quorum_accounts: &[AccountInfo],
 ) -> Result<()> {
-    require!(
-        quorum_accounts.len() % 2 == 0,
-        BridgeError::QuorumNotMet
-    );
+    require!(quorum_accounts.len() % 2 == 0, BridgeError::QuorumNotMet);
     // The settlement authority is not an independent second factor: its own
     // stake counts toward neither the tally nor the denominator. Subtracting it
     // keeps the threshold a supermajority of exactly the stake that can be
