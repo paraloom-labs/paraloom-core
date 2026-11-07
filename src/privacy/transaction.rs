@@ -39,6 +39,15 @@ impl ShieldedTransaction {
             ShieldedTransaction::Withdraw(tx) => tx.fee,
         }
     }
+
+    /// Verify transaction integrity
+    pub fn verify(&self) -> bool {
+        match self {
+            ShieldedTransaction::Deposit(tx) => tx.verify(),
+            ShieldedTransaction::Transfer(tx) => tx.verify_structure(),
+            ShieldedTransaction::Withdraw(tx) => tx.verify(),
+        }
+    }
 }
 
 /// Deposit transaction: Public -> Private
@@ -98,12 +107,12 @@ impl DepositTx {
         asset_id: crate::privacy::types::AssetId,
     ) -> Self {
         let tx_id = uuid::Uuid::new_v4().to_string();
-        let output_note = Note::new(recipient, amount - fee, randomness, asset_id);
+        let output_note = Note::new(recipient, amount.saturating_sub(fee), randomness, asset_id);
         let output_commitment = output_note.commitment();
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         DepositTx {
@@ -119,8 +128,12 @@ impl DepositTx {
 
     /// Verify deposit transaction
     pub fn verify(&self) -> bool {
-        // Check amount covers fee
-        if self.amount < self.fee {
+        // Check amount is non-zero and covers fee
+        if self.amount == 0 || self.amount < self.fee {
+            return false;
+        }
+
+        if self.from_public.is_empty() {
             return false;
         }
 
@@ -182,7 +195,7 @@ impl TransferTx {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         TransferTx {
@@ -202,6 +215,22 @@ impl TransferTx {
         // Must have inputs and outputs
         if self.input_nullifiers.is_empty() || self.output_commitments.is_empty() {
             return false;
+        }
+
+        // Input nullifiers must not contain duplicates
+        let mut seen_nullifiers = std::collections::HashSet::new();
+        for nullifier in &self.input_nullifiers {
+            if !seen_nullifiers.insert(nullifier) {
+                return false;
+            }
+        }
+
+        // Output commitments must not contain duplicates
+        let mut seen_commitments = std::collections::HashSet::new();
+        for commitment in &self.output_commitments {
+            if !seen_commitments.insert(commitment) {
+                return false;
+            }
         }
 
         // Outputs and notes must match
@@ -261,7 +290,7 @@ impl WithdrawTx {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         WithdrawTx {
@@ -278,8 +307,8 @@ impl WithdrawTx {
 
     /// Verify withdraw transaction
     pub fn verify(&self) -> bool {
-        // Amount must cover fee
-        if self.amount < self.fee {
+        // Amount must be non-zero and cover fee
+        if self.amount == 0 || self.amount < self.fee {
             return false;
         }
 
@@ -445,5 +474,67 @@ mod tests {
         );
 
         assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn test_transfer_duplicate_nullifiers() {
+        let nullifier = Nullifier([1u8; 32]);
+        let note = Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
+        let tx = TransferTx::new(
+            vec![nullifier.clone(), nullifier],
+            vec![note],
+            [0u8; 32],
+            10,
+        );
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn test_transfer_duplicate_commitments() {
+        let n1 = Nullifier([1u8; 32]);
+        let n2 = Nullifier([2u8; 32]);
+        let note1 = Note::new_native(ShieldedAddress([1u8; 32]), 100, [1u8; 32]);
+        let note2 = note1.clone();
+        let tx = TransferTx::new(vec![n1, n2], vec![note1, note2], [0u8; 32], 10);
+        assert!(!tx.verify_structure());
+    }
+
+    #[test]
+    fn test_deposit_zero_amount_or_empty_from_public() {
+        let tx = DepositTx::new(vec![1u8; 32], 0, ShieldedAddress([2u8; 32]), [3u8; 32], 0);
+        assert!(!tx.verify());
+
+        let tx2 = DepositTx::new(vec![], 100, ShieldedAddress([2u8; 32]), [3u8; 32], 10);
+        assert!(!tx2.verify());
+    }
+
+    #[test]
+    fn test_withdraw_zero_amount_or_empty_recipient() {
+        let tx = WithdrawTx::new(Nullifier([1u8; 32]), 0, vec![5u8; 32], [0u8; 32], 0);
+        assert!(!tx.verify());
+
+        let tx2 = WithdrawTx::new(Nullifier([1u8; 32]), 100, vec![], [0u8; 32], 10);
+        assert!(!tx2.verify());
+    }
+
+    #[test]
+    fn test_shielded_transaction_verify() {
+        let dep = ShieldedTransaction::Deposit(DepositTx::new(
+            vec![1u8; 32],
+            1000,
+            ShieldedAddress([2u8; 32]),
+            [3u8; 32],
+            10,
+        ));
+        assert!(dep.verify());
+
+        let with_zero = ShieldedTransaction::Withdraw(WithdrawTx::new(
+            Nullifier([1u8; 32]),
+            0,
+            vec![5u8; 32],
+            [0u8; 32],
+            0,
+        ));
+        assert!(!with_zero.verify());
     }
 }
