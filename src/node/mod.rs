@@ -2063,6 +2063,14 @@ impl Node {
                     }
                     drop(coordinators);
 
+                    // Prune already-reported entries from job_coordinators so the
+                    // map does not grow unboundedly or re-broadcast old results
+                    // when reported_jobs is cleared.
+                    if !reported_jobs.is_empty() {
+                        let mut coordinators = coordinators_clone.lock().await;
+                        coordinators.retain(|job_id, _| !reported_jobs.contains(job_id));
+                    }
+
                     // Clean up old reported jobs
                     if reported_jobs.len() > 1000 {
                         reported_jobs.clear();
@@ -2606,7 +2614,7 @@ impl Node {
                     cpu_cores: capacity.cpu_cores,
                     memory_mb: capacity.memory_mb,
                     max_concurrent_jobs: capacity.max_concurrent_jobs,
-                    current_load: 0,
+                    current_load: capacity.active_jobs,
                 };
                 coordinator.update_validator_capacity(announcement).await;
             }
@@ -2644,8 +2652,17 @@ impl Node {
 
                 // Convert ValidatorId (String) to NodeId
                 // ValidatorId is expected to be the hex representation of NodeId
-                let node_id = self.validator_id_to_node_id(&assignment.validator_id)?;
-                self.network.send_message(node_id, message).await?;
+                let node_id = match self.validator_id_to_node_id(&assignment.validator_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = coordinator.remove_assignment(&job_id).await;
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = self.network.send_message(node_id, message).await {
+                    let _ = coordinator.remove_assignment(&job_id).await;
+                    return Err(e);
+                }
                 Ok(job_id)
             } else {
                 Err(anyhow::anyhow!(
@@ -3633,5 +3650,39 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_compute_validator_preserves_active_load_and_failed_submit_rolls_back_assignment(
+    ) {
+        let mut settings = Settings::development();
+        settings.node.node_type = "Coordinator".to_string();
+        let node = Node::new(settings).expect("construct coordinator node");
+
+        let mut cap =
+            crate::compute::ValidatorCapacity::new("not-valid-hex".to_string(), 4, 8192, 4);
+        cap.active_jobs = 2;
+        node.register_compute_validator(cap).await.unwrap();
+
+        let coord = node.compute_coordinator().unwrap();
+        let validators = coord.get_validators().await;
+        assert_eq!(validators.len(), 1);
+        assert_eq!(
+            validators[0].current_load, 2,
+            "register_compute_validator must forward capacity.active_jobs into CapacityAnnouncement"
+        );
+
+        let job = crate::compute::ComputeJob::new(
+            vec![0x00, 0x61, 0x73, 0x6d],
+            vec![],
+            crate::compute::ResourceLimits::default(),
+        );
+        let err = node.submit_compute_job_to_network(job).await;
+        assert!(err.is_err(), "invalid validator hex must fail dispatch");
+        assert_eq!(
+            coord.get_stats().await.pending_assignments,
+            0,
+            "failed dispatch must roll back the pending assignment in JobCoordinator"
+        );
     }
 }
