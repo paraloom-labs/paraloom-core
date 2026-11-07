@@ -161,7 +161,17 @@ impl WasmEngine {
         let input_len = job.input_data.len() as i32;
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                warn!(
+                    "Failed to write input data into WASM memory for job {}: {}",
+                    job.id, e
+                );
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("WASM input memory write failed: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
@@ -185,7 +195,17 @@ impl WasmEngine {
 
                 let mut output_data = vec![0u8; output_len];
                 if output_len > 0 {
-                    memory.read(&store, output_ptr as usize, &mut output_data)?;
+                    if let Err(e) = memory.read(&store, output_ptr as usize, &mut output_data) {
+                        warn!(
+                            "Failed to read output data from WASM memory for job {}: {}",
+                            job.id, e
+                        );
+                        return Ok(JobResult::failure(
+                            job.id.clone(),
+                            format!("WASM output memory read failed: {}", e),
+                            start_time.elapsed().as_millis() as u64,
+                        ));
+                    }
                 }
 
                 let execution_time = start_time.elapsed().as_millis() as u64;
@@ -267,19 +287,25 @@ impl WasmEngine {
         input_len: i32,
         timeout: Duration,
     ) -> Result<i32> {
-        // Set epoch deadline for timeout
-        // Deadline is current epoch + timeout in ticks (1 tick = 1ms approximately)
-        let timeout_ticks = timeout.as_millis() as u64;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        // Set epoch deadline for timeout (at least 1 tick; 1 tick ~= 1ms)
+        let timeout_ticks = (timeout.as_millis() as u64).max(1);
         store.set_epoch_deadline(timeout_ticks);
 
-        // Start epoch incrementing in background
+        // Start epoch incrementing in background until the call finishes or times out
         let engine_handle = self.engine.clone();
-        let timeout_duration = timeout;
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = Arc::clone(&done);
         let epoch_thread = std::thread::spawn(move || {
-            let start = Instant::now();
-            while start.elapsed() < timeout_duration {
-                engine_handle.increment_epoch();
+            let mut ticks = 0u64;
+            while !done_clone.load(Ordering::Relaxed) && ticks <= timeout_ticks {
                 std::thread::sleep(Duration::from_millis(1));
+                engine_handle.increment_epoch();
+                ticks = ticks.saturating_add(1);
             }
         });
 
@@ -292,7 +318,8 @@ impl WasmEngine {
             }
         });
 
-        // Clean up epoch thread (it will finish naturally)
+        // Signal epoch thread to stop immediately so fast jobs don't leak sleeping threads
+        done.store(true, Ordering::Relaxed);
         drop(epoch_thread);
 
         result
@@ -391,5 +418,27 @@ mod tests {
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn execute_job_returns_failed_result_when_input_exceeds_memory() {
+        let engine = WasmEngine::new().unwrap();
+
+        // 0-page initial memory so writing non-empty input_data fails memory.write
+        let wat = r#"
+            (module
+                (memory (export "memory") 0 0)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+        let job = ComputeJob::new(wasm_bytes, vec![1, 2, 3, 4], ResourceLimits::default());
+
+        let result = engine
+            .execute_job(&job)
+            .expect("oversized input must return Ok(JobResult::failure), not Err");
+        assert!(matches!(result.status, JobStatus::Failed { .. }));
     }
 }

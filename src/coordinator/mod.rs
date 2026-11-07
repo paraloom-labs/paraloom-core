@@ -324,6 +324,11 @@ impl Coordinator {
 
     /// Submit a new task
     pub async fn submit_task(&self, task_type: TaskType) -> Result<TaskId> {
+        if !self.is_primary().await {
+            return Err(anyhow::anyhow!(
+                "Standby coordinator cannot accept task submissions before promotion"
+            ));
+        }
         let task = Task::new(task_type.clone());
         let parent_id = task.id.clone();
 
@@ -543,8 +548,21 @@ impl Coordinator {
                 .map(|(_, result)| result.clone())
                 .collect();
 
-            // Sort by task_id to ensure consistent ordering
-            chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            // Sort by numeric chunk index so >= 10 chunks stay in ascending range order
+            chunk_results.sort_by(|a, b| {
+                let idx_a = a
+                    .task_id
+                    .rsplit_once("-chunk-")
+                    .and_then(|(_, s)| s.parse::<usize>().ok());
+                let idx_b = b
+                    .task_id
+                    .rsplit_once("-chunk-")
+                    .and_then(|(_, s)| s.parse::<usize>().ok());
+                match (idx_a, idx_b) {
+                    (Some(ia), Some(ib)) => ia.cmp(&ib),
+                    _ => a.task_id.cmp(&b.task_id),
+                }
+            });
             chunk_results
         }; // Locks are dropped here
 
@@ -1015,6 +1033,28 @@ mod tests {
             post_promotion.parent_tasks.len(),
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_rejects_submit_task_before_promotion() {
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+        standby.register_validator(NodeId(vec![0xAA])).await;
+
+        let err = standby
+            .submit_task(TaskType::HashCalculation {
+                start: 0,
+                end: 10,
+                algorithm: "sha256".to_string(),
+            })
+            .await;
+        assert!(
+            err.is_err(),
+            "standby coordinator must reject task submission before promotion"
         );
     }
 }

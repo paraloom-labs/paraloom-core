@@ -268,6 +268,15 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 task,
                 coordinator_id,
             } => {
+                if coordinator_id != source {
+                    log::warn!(
+                        "Dropping TaskRequest {}: claimed coordinator {:?} != authenticated sender {:?}",
+                        task.id,
+                        coordinator_id,
+                        source
+                    );
+                    return Ok(());
+                }
                 if let Some(validator) = &self.validator {
                     let validator = validator.lock().await;
                     validator.handle_task_request(task, coordinator_id).await?;
