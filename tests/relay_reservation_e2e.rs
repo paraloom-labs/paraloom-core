@@ -156,3 +156,26 @@ async fn nated_node_reserves_circuit_on_relay_server() {
         "node B did not obtain a /p2p-circuit reservation on the relay within 30s"
     );
 }
+
+#[tokio::test]
+async fn test_listen_via_relay_rejects_chained_circuit_and_normalizes_trailing() {
+    let settings = Settings::development();
+    let mgr = NetworkManager::new(&settings).expect("network manager");
+
+    // Relay address with trailing /p2p-circuit should be normalized and accepted
+    let valid_with_trailing =
+        "/ip4/127.0.0.1/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit";
+    let res = mgr.listen_via_relay(valid_with_trailing).await;
+    assert!(
+        res.is_ok(),
+        "listen_via_relay must accept and normalize trailing /p2p-circuit"
+    );
+
+    // Relayed target multiaddr must be rejected
+    let chained = "/ip4/127.0.0.1/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWPjTkTNryMrGiDhdaURWmUGLVaC2trb19z2w9fM2r1g9R";
+    let err = mgr.listen_via_relay(chained).await;
+    assert!(
+        err.is_err(),
+        "listen_via_relay must reject chained circuit address"
+    );
+}
