@@ -91,6 +91,12 @@ pub enum PolicyError {
          hash; the chain differs from the one the coordinator verified"
     )]
     FinalContributionMismatch,
+
+    #[error("unsupported transcript version: got {got}, expected {expected}")]
+    UnsupportedVersion { got: u32, expected: u32 },
+
+    #[error("zero hash is not allowed; all ceremony hashes must be non-zero")]
+    ZeroHash,
 }
 
 /// Enforce a [`FinalizePolicy`] against the files a finalize run read.
@@ -118,6 +124,21 @@ pub fn enforce_finalize_policy(
         });
     }
 
+    if transcript.version != super::transcript::TRANSCRIPT_VERSION {
+        return Err(PolicyError::UnsupportedVersion {
+            got: transcript.version,
+            expected: super::transcript::TRANSCRIPT_VERSION,
+        });
+    }
+
+    const ZERO_HASH: TranscriptHash = [0u8; 64];
+    if policy.initial_srs_hash == ZERO_HASH
+        || transcript.initial_srs_hash == ZERO_HASH
+        || *initial_pk_file_hash == ZERO_HASH
+    {
+        return Err(PolicyError::ZeroHash);
+    }
+
     if transcript.initial_srs_hash != policy.initial_srs_hash {
         return Err(PolicyError::TranscriptSrsHashMismatch);
     }
@@ -125,11 +146,14 @@ pub fn enforce_finalize_policy(
         return Err(PolicyError::InitialKeyHashMismatch);
     }
 
-    if final_pk.delta_g1 == initial_pk.delta_g1 && final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
+    if final_pk.delta_g1 == initial_pk.delta_g1 || final_pk.vk.delta_g2 == initial_pk.vk.delta_g2 {
         return Err(PolicyError::FinalKeyUnchanged);
     }
 
     if let Some(pinned_tail) = &policy.final_contribution_hash {
+        if *pinned_tail == ZERO_HASH {
+            return Err(PolicyError::ZeroHash);
+        }
         let tip = transcript
             .contributions
             .last()
@@ -299,5 +323,102 @@ mod tests {
         let tail = hash_contribution(t.contributions.last().unwrap());
         enforce_finalize_policy(&policy(4, Some(tail)), &PINNED, &initial, &final_pk, &t)
             .expect("exact-count policy with the true tail pin passes");
+    }
+
+    #[test]
+    fn final_key_with_unchanged_g1_or_g2_is_rejected() {
+        let initial = pk_from_seed(1);
+        let genuine_final = pk_from_seed(2);
+        let t = dummy_transcript(PINNED, 2);
+
+        // Case 1: G1 is unchanged from initial, G2 changed
+        let mut unchanged_g1 = genuine_final.clone();
+        unchanged_g1.delta_g1 = initial.delta_g1;
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &unchanged_g1, &t) {
+            Err(PolicyError::FinalKeyUnchanged) => {}
+            other => panic!(
+                "expected FinalKeyUnchanged for unchanged G1, got {:?}",
+                other
+            ),
+        }
+
+        // Case 2: G2 is unchanged from initial, G1 changed
+        let mut unchanged_g2 = genuine_final;
+        unchanged_g2.vk.delta_g2 = initial.vk.delta_g2;
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &unchanged_g2, &t) {
+            Err(PolicyError::FinalKeyUnchanged) => {}
+            other => panic!(
+                "expected FinalKeyUnchanged for unchanged G2, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn unsupported_transcript_version_is_rejected() {
+        let initial = pk_from_seed(1);
+        let final_pk = pk_from_seed(2);
+        let mut t = dummy_transcript(PINNED, 2);
+        t.version = 0;
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::UnsupportedVersion {
+                got: 0,
+                expected: 1,
+            }) => {}
+            other => panic!("expected UnsupportedVersion(0, 1), got {:?}", other),
+        }
+
+        t.version = 2;
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::UnsupportedVersion {
+                got: 2,
+                expected: 1,
+            }) => {}
+            other => panic!("expected UnsupportedVersion(2, 1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn zero_hash_is_rejected() {
+        let initial = pk_from_seed(1);
+        let final_pk = pk_from_seed(2);
+        let t = dummy_transcript(PINNED, 2);
+        let zero_hash: TranscriptHash = [0u8; 64];
+
+        // 1. Zero initial_srs_hash in policy
+        let pol_zero = FinalizePolicy {
+            min_contributions: 2,
+            initial_srs_hash: zero_hash,
+            final_contribution_hash: None,
+        };
+        match enforce_finalize_policy(&pol_zero, &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::ZeroHash) => {}
+            other => panic!("expected ZeroHash, got {:?}", other),
+        }
+
+        // 2. Zero initial_pk_file_hash
+        match enforce_finalize_policy(&policy(2, None), &zero_hash, &initial, &final_pk, &t) {
+            Err(PolicyError::ZeroHash) => {}
+            other => panic!("expected ZeroHash, got {:?}", other),
+        }
+
+        // 3. Zero transcript initial_srs_hash
+        let mut t_zero = dummy_transcript(PINNED, 2);
+        t_zero.initial_srs_hash = zero_hash;
+        match enforce_finalize_policy(&policy(2, None), &PINNED, &initial, &final_pk, &t_zero) {
+            Err(PolicyError::ZeroHash) => {}
+            other => panic!("expected ZeroHash, got {:?}", other),
+        }
+
+        // 4. Zero final_contribution_hash in policy
+        let pol_zero_tail = FinalizePolicy {
+            min_contributions: 2,
+            initial_srs_hash: PINNED,
+            final_contribution_hash: Some(zero_hash),
+        };
+        match enforce_finalize_policy(&pol_zero_tail, &PINNED, &initial, &final_pk, &t) {
+            Err(PolicyError::ZeroHash) => {}
+            other => panic!("expected ZeroHash, got {:?}", other),
+        }
     }
 }
