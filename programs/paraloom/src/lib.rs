@@ -1629,8 +1629,8 @@ pub mod paraloom_program {
     /// set — e.g. `is_active` PDAs left behind by an earlier
     /// `reset_validator_registry` that rebuilt the counters but did not
     /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// stale-low quorum denominator. It routes both the SOL and token stake
+    /// into unbonding, reclaimable via `withdraw_unbonded_stake` after the delay.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -1641,15 +1641,32 @@ pub mod paraloom_program {
             v.is_active = false;
             // Route the stake into unbonding rather than stranding it: a
             // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
-            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
-            // the delay, same as unregister.
+            // is_active), so without this both its lamports and token stake
+            // would have no exit and be frozen forever. Reclaimable via
+            // `withdraw_unbonded_stake` after the delay, same as unregister.
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
+        } else {
+            // Self-healing: if the validator was already marked inactive but still
+            // holds stranded token stake (e.g. from an earlier deactivation),
+            // route it into unbonding so the collateral is not permanently frozen.
+            let v = &mut ctx.accounts.validator_account;
+            let token_stake = v.token_stake_amount;
+            if token_stake > 0 {
+                let now_slot = Clock::get()?.slot;
+                v.token_stake_amount = 0;
+                v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+                if v.unbonding_slot == 0 {
+                    v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+                }
+            }
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
