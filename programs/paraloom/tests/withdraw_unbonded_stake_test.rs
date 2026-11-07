@@ -14,6 +14,7 @@
 //! window without waiting ~216k real slots.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::{
     accounts, instruction, BridgeError, ValidatorAccount, ValidatorRegistry, MIN_VALIDATOR_STAKE,
@@ -69,6 +70,18 @@ async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
         .get_balance(key)
         .await
         .expect("get balance")
+}
+
+async fn token_balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
+    let account = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .expect("rpc")
+        .expect("token account exists");
+    spl_token::state::Account::unpack(&account.data)
+        .expect("unpack token account")
+        .amount
 }
 
 async fn load_validator(ctx: &mut ProgramTestContext, pda: Pubkey) -> ValidatorAccount {
@@ -508,6 +521,128 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         wallet_after > wallet_before,
         "wallet credited by the released stake + refunded rent"
     );
+    let closed = ctx
+        .banks_client
+        .get_account(validator_pda)
+        .await
+        .expect("rpc");
+    assert!(
+        closed.is_none() || closed.unwrap().lamports == 0,
+        "PDA must be closed after withdraw"
+    );
+}
+
+/// Regression (#1447): `deactivate_validator` must route `token_stake_amount`
+/// into `token_unbonding_amount` alongside `stake_amount`. Without this,
+/// a deactivated validator's token collateral is stranded in `stake_token_vault`
+/// because `unregister_validator` requires `is_active == true`, and when the
+/// unbonding window elapses, `withdraw_unbonded_stake` reads `token_unbonding_amount`
+/// (which stayed 0) and closes the PDA without returning any tokens.
+#[tokio::test]
+async fn deactivate_routes_token_stake_to_unbonding_then_withdraws() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let mut ctx = pt.start_with_context().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    let initial_token_balance = token_balance(&mut ctx, validator_token).await;
+
+    // 1. Registry init (upgrade authority, #204).
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await
+    .expect("init registry");
+
+    // 2. Register — dual stake (SOL + SPL tokens).
+    send(
+        &mut ctx,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await
+    .expect("register");
+
+    let post_reg_token_balance = token_balance(&mut ctx, validator_token).await;
+    assert_eq!(
+        post_reg_token_balance,
+        initial_token_balance - TOKEN_STAKE,
+        "token stake locked into vault"
+    );
+
+    // 3. Deactivate — admin-signed. Must route BOTH SOL and token stake into unbonding.
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivate");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active, "deactivate must clear is_active");
+    assert_eq!(acc.stake_amount, 0, "active SOL stake zeroed on deactivate");
+    assert_eq!(
+        acc.unbonding_amount, MIN_VALIDATOR_STAKE,
+        "SOL stake routed into unbonding"
+    );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake must be zeroed on deactivate (#1447)"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "token stake must be routed into token_unbonding_amount, not stranded (#1447)"
+    );
+
+    // 4. Warp past the unbonding window and withdraw.
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    send(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect("withdraw unbonded stake");
+
+    // The validator token account must receive the returned token collateral.
+    let final_token_balance = token_balance(&mut ctx, validator_token).await;
+    assert_eq!(
+        final_token_balance, initial_token_balance,
+        "validator token account must be refunded the full token collateral after unbonding"
+    );
+
     let closed = ctx
         .banks_client
         .get_account(validator_pda)
