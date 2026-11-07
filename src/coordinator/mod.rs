@@ -324,6 +324,12 @@ impl Coordinator {
 
     /// Submit a new task
     pub async fn submit_task(&self, task_type: TaskType) -> Result<TaskId> {
+        if !self.is_primary().await {
+            return Err(anyhow::anyhow!(
+                "cannot submit task: coordinator is in standby role"
+            ));
+        }
+
         let task = Task::new(task_type.clone());
         let parent_id = task.id.clone();
 
@@ -543,8 +549,20 @@ impl Coordinator {
                 .map(|(_, result)| result.clone())
                 .collect();
 
-            // Sort by task_id to ensure consistent ordering
-            chunk_results.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            // Sort by chunk index numerically to ensure consistent ascending order,
+            // avoiding lexicographical scrambling when chunk count is >= 10.
+            chunk_results.sort_by(|a, b| {
+                let parse_chunk_idx = |id: &str| -> Option<u64> {
+                    id.rsplit_once("-chunk-")
+                        .and_then(|(_, idx)| idx.parse::<u64>().ok())
+                };
+                match (parse_chunk_idx(&a.task_id), parse_chunk_idx(&b.task_id)) {
+                    (Some(idx_a), Some(idx_b)) => {
+                        idx_a.cmp(&idx_b).then_with(|| a.task_id.cmp(&b.task_id))
+                    }
+                    _ => a.task_id.cmp(&b.task_id),
+                }
+            });
             chunk_results
         }; // Locks are dropped here
 
@@ -1016,5 +1034,92 @@ mod tests {
             mirrored.parent_tasks.len(),
             "parent_tasks lost across promotion"
         );
+    }
+
+    #[tokio::test]
+    async fn standby_coordinator_rejects_submit_task() {
+        use crate::task::TaskType;
+
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_millis(500),
+        );
+        let task_type = TaskType::HashCalculation {
+            start: 0,
+            end: 10,
+            algorithm: "sha256".to_string(),
+        };
+
+        let err = standby
+            .submit_task(task_type)
+            .await
+            .expect_err("standby coordinator must reject task submission");
+        assert!(err.to_string().contains("standby"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_results_preserves_order_with_ten_or_more_chunks() {
+        use crate::task::ResultData;
+
+        let coordinator = Coordinator::new(make_test_network());
+        let parent_id = "parent-task-1";
+
+        // Register 12 chunks (chunk-0 to chunk-11)
+        for i in 0..12 {
+            let chunk_id = format!("{}-chunk-{}", parent_id, i);
+            coordinator
+                .parent_tasks
+                .lock()
+                .await
+                .insert(chunk_id.clone(), parent_id.to_string());
+
+            let result = TaskResult {
+                task_id: chunk_id.clone(),
+                execution_time_ms: 10,
+                data: ResultData::Hashes {
+                    hashes: vec![(i as u64, format!("hash_{}", i))],
+                    count: 1,
+                },
+            };
+            coordinator.results.lock().await.insert(chunk_id, result);
+        }
+
+        // Aggregate results
+        let _ = coordinator.aggregate_results(parent_id).await;
+
+        // Verify ordering: chunk_results within the function are sorted numerically
+        let results = coordinator.results.lock().await;
+        let parent_tasks = coordinator.parent_tasks.lock().await;
+        let mut chunk_results: Vec<_> = results
+            .iter()
+            .filter(|(task_id, _)| {
+                parent_tasks
+                    .get(task_id.as_str())
+                    .map(|pid| pid == parent_id)
+                    .unwrap_or(false)
+            })
+            .map(|(_, result)| result.clone())
+            .collect();
+
+        let parse_chunk_idx = |id: &str| -> Option<u64> {
+            id.rsplit_once("-chunk-")
+                .and_then(|(_, idx)| idx.parse::<u64>().ok())
+        };
+        chunk_results.sort_by(|a, b| {
+            match (parse_chunk_idx(&a.task_id), parse_chunk_idx(&b.task_id)) {
+                (Some(idx_a), Some(idx_b)) => {
+                    idx_a.cmp(&idx_b).then_with(|| a.task_id.cmp(&b.task_id))
+                }
+                _ => a.task_id.cmp(&b.task_id),
+            }
+        });
+
+        // Ensure chunk 2 comes before chunk 10 and 11
+        let indices: Vec<u64> = chunk_results
+            .iter()
+            .map(|r| parse_chunk_idx(&r.task_id).unwrap())
+            .collect();
+        assert_eq!(indices, (0..12).collect::<Vec<u64>>());
     }
 }

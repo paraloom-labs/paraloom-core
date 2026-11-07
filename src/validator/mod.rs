@@ -1,7 +1,7 @@
 //! Validator node logic
 
 use crate::network::{Message, NetworkManager, ResultRequest};
-use crate::task::{ResultData, Task, TaskResult, TaskType};
+use crate::task::{ResultData, Task, TaskResult, TaskStatus, TaskType};
 use crate::types::NodeId;
 use anyhow::Result;
 use log::info;
@@ -53,9 +53,54 @@ impl Validator {
         self.coordinator_id = Some(coordinator_id);
     }
 
+    /// Get configured coordinator ID
+    pub fn coordinator_id(&self) -> Option<&NodeId> {
+        self.coordinator_id.as_ref()
+    }
+
     /// Handle incoming task request
     pub async fn handle_task_request(&self, task: Task, coordinator_id: NodeId) -> Result<()> {
         info!("Validator received task: {} from coordinator", task.id);
+
+        // Verify coordinator ID if configured to reject spoofed coordinator IDs
+        if let Some(ref expected) = self.coordinator_id {
+            if &coordinator_id != expected {
+                return Err(anyhow::anyhow!(
+                    "rejected task {} from spoofed coordinator_id {:?} (expected {:?})",
+                    task.id,
+                    coordinator_id,
+                    expected
+                ));
+            }
+        }
+
+        // Validate task assignment: reject unassigned tasks or tasks assigned to other nodes
+        let my_id = self.network.local_peer_id();
+        let my_debug = format!("{:?}", my_id);
+        let my_display = format!("{}", my_id);
+        let my_base58 = self.network.peer_id_base58();
+        match &task.assigned_to {
+            None => {
+                return Err(anyhow::anyhow!(
+                    "refusing to execute unassigned task {}",
+                    task.id
+                ));
+            }
+            Some(assignee) => {
+                if assignee != &my_debug && assignee != &my_display && assignee != &my_base58 {
+                    return Err(anyhow::anyhow!(
+                        "refusing to execute task {} assigned to {:?} (this validator is {:?})",
+                        task.id,
+                        assignee,
+                        my_id
+                    ));
+                }
+            }
+        }
+
+        if matches!(task.status, TaskStatus::Completed) {
+            return Err(anyhow::anyhow!("task {} is already completed", task.id));
+        }
 
         // Execute task
         info!("Executing task: {}", task.id);
@@ -164,5 +209,94 @@ mod tests {
     fn hash_count_rejects_oversized_and_inverted_ranges() {
         assert!(checked_hash_count(0, MAX_HASH_TASK_ITEMS).is_err());
         assert!(checked_hash_count(5, 4).is_err());
+    }
+
+    use crate::config::Settings;
+    use crate::network::NetworkManager;
+    use crate::task::{Task, TaskStatus, TaskType};
+    use crate::types::NodeId;
+    use crate::validator::Validator;
+    use std::sync::Arc;
+
+    fn make_test_validator() -> Validator {
+        let network =
+            Arc::new(NetworkManager::new(&Settings::development()).expect("test network"));
+        Validator::new(network)
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_unassigned_task() {
+        let validator = make_test_validator();
+        let task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 1,
+            algorithm: "sha256".to_string(),
+        });
+        assert!(task.assigned_to.is_none());
+        let res = validator
+            .handle_task_request(task, NodeId(vec![0xAA]))
+            .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("unassigned"));
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_task_assigned_to_another_peer() {
+        let validator = make_test_validator();
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 1,
+            algorithm: "sha256".to_string(),
+        });
+        task.assigned_to = Some(format!("{:?}", NodeId(vec![0xBB])));
+        let res = validator
+            .handle_task_request(task, NodeId(vec![0xAA]))
+            .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("assigned to"));
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_spoofed_coordinator() {
+        let mut validator = make_test_validator();
+        let trusted_coordinator = NodeId(vec![0xCC]);
+        validator.set_coordinator(trusted_coordinator.clone());
+
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 1,
+            algorithm: "sha256".to_string(),
+        });
+        let local_id = validator.network.local_peer_id();
+        task.assigned_to = Some(format!("{:?}", local_id));
+
+        let spoofed_coordinator = NodeId(vec![0xDD]);
+        let res = validator
+            .handle_task_request(task, spoofed_coordinator)
+            .await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("spoofed coordinator_id"));
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_already_completed_task() {
+        let validator = make_test_validator();
+        let mut task = Task::new(TaskType::HashCalculation {
+            start: 0,
+            end: 1,
+            algorithm: "sha256".to_string(),
+        });
+        let local_id = validator.network.local_peer_id();
+        task.assigned_to = Some(format!("{:?}", local_id));
+        task.status = TaskStatus::Completed;
+
+        let res = validator
+            .handle_task_request(task, NodeId(vec![0xAA]))
+            .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("already completed"));
     }
 }

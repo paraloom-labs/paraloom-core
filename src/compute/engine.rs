@@ -5,6 +5,8 @@
 
 use anyhow::{anyhow, Result};
 use log::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::*;
 
@@ -161,7 +163,17 @@ impl WasmEngine {
         let input_len = job.input_data.len() as i32;
 
         if !job.input_data.is_empty() {
-            memory.write(&mut store, input_ptr as usize, &job.input_data)?;
+            if let Err(e) = memory.write(&mut store, input_ptr as usize, &job.input_data) {
+                warn!(
+                    "Failed to write input data to WASM memory in job {}: {}",
+                    job.id, e
+                );
+                return Ok(JobResult::failure(
+                    job.id.clone(),
+                    format!("Failed to write input data to WASM memory: {}", e),
+                    start_time.elapsed().as_millis() as u64,
+                ));
+            }
         }
 
         // Get initial fuel to calculate consumption
@@ -185,7 +197,17 @@ impl WasmEngine {
 
                 let mut output_data = vec![0u8; output_len];
                 if output_len > 0 {
-                    memory.read(&store, output_ptr as usize, &mut output_data)?;
+                    if let Err(e) = memory.read(&store, output_ptr as usize, &mut output_data) {
+                        warn!(
+                            "Failed to read output data from WASM memory in job {}: {}",
+                            job.id, e
+                        );
+                        return Ok(JobResult::failure(
+                            job.id.clone(),
+                            format!("Failed to read output data from WASM memory: {}", e),
+                            start_time.elapsed().as_millis() as u64,
+                        ));
+                    }
                 }
 
                 let execution_time = start_time.elapsed().as_millis() as u64;
@@ -272,12 +294,14 @@ impl WasmEngine {
         let timeout_ticks = timeout.as_millis() as u64;
         store.set_epoch_deadline(timeout_ticks);
 
-        // Start epoch incrementing in background
+        // Start epoch incrementing in background with termination signal
         let engine_handle = self.engine.clone();
         let timeout_duration = timeout;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_flag);
         let epoch_thread = std::thread::spawn(move || {
             let start = Instant::now();
-            while start.elapsed() < timeout_duration {
+            while !stop_clone.load(Ordering::Relaxed) && start.elapsed() < timeout_duration {
                 engine_handle.increment_epoch();
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -292,8 +316,9 @@ impl WasmEngine {
             }
         });
 
-        // Clean up epoch thread (it will finish naturally)
-        drop(epoch_thread);
+        // Clean up epoch thread
+        stop_flag.store(true, Ordering::Relaxed);
+        let _ = epoch_thread.join();
 
         result
     }
@@ -391,5 +416,41 @@ mod tests {
 
         let result = engine.execute_job(&job).unwrap();
         assert_eq!(result.status, JobStatus::Completed);
+    }
+
+    #[test]
+    fn test_memory_write_failure_returns_job_result_failure_not_err() {
+        let engine = WasmEngine::new().unwrap();
+
+        // 1 page of memory = 65536 bytes
+        let wat = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "execute") (param i32 i32) (result i32)
+                    i32.const 0
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat).unwrap();
+
+        // Input data exceeding 65536 bytes (e.g. 100,000 bytes) will cause memory.write to fail out-of-bounds
+        let oversized_input = vec![0x42u8; 100_000];
+        let job = ComputeJob::new(
+            wasm_bytes,
+            oversized_input,
+            ResourceLimits {
+                max_memory_bytes: 10 * 1024 * 1024,
+                max_instructions: 1_000_000,
+                timeout_secs: 5,
+            },
+        );
+
+        let result = engine
+            .execute_job(&job)
+            .expect("execute_job must return Ok(JobResult), not Err, on memory.write failure");
+        assert!(matches!(result.status, JobStatus::Failed { .. }));
+        if let JobStatus::Failed { error } = result.status {
+            assert!(error.contains("memory") || error.contains("out of bounds"));
+        }
     }
 }

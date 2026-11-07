@@ -30,6 +30,7 @@
 
 use crate::types::NodeId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Wire-format version stamped on every transcript. A verifier
 /// reading a transcript with a higher version refuses to validate
@@ -288,11 +289,16 @@ impl Phase2Transcript {
     /// method only checks the data-layer chain integrity.
     pub fn verify_chain(&self) -> Result<(), TranscriptError> {
         let mut expected = self.initial_srs_hash;
+        let mut seen = HashSet::new();
+        seen.insert(expected);
         for (i, contribution) in self.contributions.iter().enumerate() {
             if contribution.prior_hash != expected {
                 return Err(TranscriptError::ChainBroken { position: i });
             }
             expected = hash_contribution(contribution);
+            if !seen.insert(expected) {
+                return Err(TranscriptError::CycleDetected { position: i });
+            }
         }
         Ok(())
     }
@@ -320,6 +326,9 @@ pub fn hash_contribution(contribution: &Contribution) -> TranscriptHash {
 pub enum TranscriptError {
     #[error("transcript chain broken at position {position}: prior_hash does not match the previous contribution")]
     ChainBroken { position: usize },
+
+    #[error("cycle detected in transcript chain at position {position}")]
+    CycleDetected { position: usize },
 }
 
 // Bring the digest trait into scope locally so the public API
