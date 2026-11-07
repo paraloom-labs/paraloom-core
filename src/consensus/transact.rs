@@ -912,13 +912,35 @@ impl TransactVerificationCoordinator {
                 log::warn!("could not penalise equivocator {:?}: {}", validator, e);
             }
             self.slashing_tracker.record(validator, evidence).await;
+            return Ok(());
         }
 
         // Emit the approval the first time this vote completes a `Valid` quorum.
         // Counting is by the on-chain staked wallet set (minus equivocators), NOT
         // the flap-prone active NodeId set.
+        let eligible = self.eligible_wallets().await;
+        if consensus.tally.has_consensus(&eligible).await {
+            if let Ok(decision) = consensus.tally.consensus_result(&eligible).await {
+                // Update validator reputation for aligned vs disagreed votes once
+                // consensus is reached and the decision is valid (or Invalid).
+                let is_final = !matches!(decision, VerificationVote::Valid)
+                    || self.stake_quorum_met(&consensus.tally).await;
+                if is_final {
+                    let votes = consensus.tally.votes.read().await;
+                    for (wallet, rec) in votes.iter() {
+                        if !eligible.contains(wallet) {
+                            continue;
+                        }
+                        if rec.vote.is_valid() == decision.is_valid() {
+                            let _ = self.reputation_tracker.record_success(&rec.node_id).await;
+                        } else {
+                            let _ = self.reputation_tracker.record_failure(&rec.node_id).await;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(tx) = &self.approval_tx {
-            let eligible = self.eligible_wallets().await;
             let mut emitted = self.emitted.write().await;
             if !emitted.contains(&result.request_id)
                 && consensus.tally.has_consensus(&eligible).await
@@ -999,8 +1021,41 @@ impl TransactVerificationCoordinator {
             .map(|(id, _)| id.clone())
             .collect();
         let count = timed_out.len();
+        let registered = self.validators.read().await.clone();
         for id in timed_out {
-            pending.remove(&id);
+            if let Some(consensus) = pending.remove(&id) {
+                let voted_nodes: HashSet<NodeId> = consensus
+                    .tally
+                    .votes
+                    .read()
+                    .await
+                    .values()
+                    .map(|r| r.node_id.clone())
+                    .collect();
+                for v in &registered {
+                    if !voted_nodes.contains(v) {
+                        let _ = self.reputation_tracker.record_timeout(v).await;
+                        let streak = {
+                            let mut streaks = self.timeout_streaks.write().await;
+                            let entry = streaks.entry(v.clone()).or_insert(0);
+                            *entry = entry.saturating_add(1);
+                            *entry
+                        };
+                        const UNAVAILABILITY_STREAK_THRESHOLD: u64 = 3;
+                        if streak >= UNAVAILABILITY_STREAK_THRESHOLD {
+                            self.slashing_tracker
+                                .record(
+                                    v.clone(),
+                                    crate::consensus::slashing::SlashingEvidence::PersistentUnavailability {
+                                        streak_length: streak,
+                                        threshold: UNAVAILABILITY_STREAK_THRESHOLD,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
             // A content-bound canonical id that timed out must be re-approvable
             // if the client re-proves it, so drop any stale emitted mark too.
             self.emitted.write().await.remove(&id);
@@ -1569,7 +1624,60 @@ mod tests {
             let sel = coordinator.leader_selector.read().await;
             let info = sel.get_validator(&NodeId(vec![2])).unwrap();
             assert!(info.is_active);
-            assert_eq!(info.stake_amount, 1_000_000_000);
+        assert_eq!(
+            info.stake_amount, 1_000_000_000,
+        );
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_timeouts_penalises_non_voters_and_records_unavailability_streak() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_consensus_thresholds(2, 2);
+        let active_voter = NodeId(vec![1]);
+        let offline_validator = NodeId(vec![2]);
+        coordinator
+            .register_validator_with_wallet(active_voter.clone(), Some("W1".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(offline_validator.clone(), Some("W2".to_string()))
+            .await;
+
+        for round in 0..3u8 {
+            let mut req = sample_request();
+            req.nullifiers[0][0] = round;
+            req.request_id = req.canonical_id();
+            let id = req.request_id.clone();
+            coordinator.start_verification(req).await.unwrap();
+            // Only active_voter votes; offline_validator misses all 3 rounds.
+            coordinator
+                .submit_result(vote(&id, 1, "W1", true))
+                .await
+                .unwrap();
+            {
+                let mut pending = coordinator.pending.write().await;
+                pending.get_mut(&id).unwrap().tally.deadline = 0;
+            }
+            assert_eq!(coordinator.cleanup_timeouts().await.unwrap(), 1);
+        }
+
+        let offline_rep = coordinator
+            .reputation_tracker
+            .get_reputation(&offline_validator)
+            .await
+            .unwrap();
+        assert!(
+            offline_rep < crate::consensus::reputation::BASE_REPUTATION,
+            "missing timed-out rounds must penalise validator reputation"
+        );
+        let records = coordinator
+            .slashing_tracker()
+            .for_validator(&offline_validator)
+            .await;
+        assert_eq!(
+            records.len(),
+            1,
+            "3 consecutive missed rounds must record PersistentUnavailability slashing evidence"
+        );
     }
 }
