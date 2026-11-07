@@ -213,6 +213,9 @@ impl VoteTally {
 
     /// Get completion percentage
     pub async fn completion_percentage(&self) -> f64 {
+        if self.total_validators == 0 {
+            return 0.0;
+        }
         let votes = self.votes.read().await;
         (votes.len() as f64 / self.total_validators as f64) * 100.0
     }
@@ -231,13 +234,30 @@ impl VoteTally {
     /// co-sign set equal to the counted set: a wallet that was counted is dialed
     /// under exactly the NodeId its signed vote arrived on.
     pub async fn valid_voters(&self, eligible_wallets: &HashSet<String>) -> Vec<NodeId> {
+        self.valid_voter_wallets(eligible_wallets)
+            .await
+            .into_iter()
+            .map(|(_, node_id)| node_id)
+            .collect()
+    }
+
+    /// The `(wallet_pubkey, node_id)` pairs of the wallets that voted `Valid`
+    /// **and** are in `eligible_wallets`, sorted deterministically by wallet.
+    /// Preserves the authenticated `wallet` key alongside its `node_id` so the
+    /// co-sign round leader does not need to re-resolve `NodeId -> wallet` via
+    /// the flap-prone `leader_selector` registry.
+    pub async fn valid_voter_wallets(
+        &self,
+        eligible_wallets: &HashSet<String>,
+    ) -> Vec<(String, NodeId)> {
         let votes = self.votes.read().await;
         let mut out = Vec::new();
         for (wallet, rec) in votes.iter() {
             if rec.vote.is_valid() && eligible_wallets.contains(wallet) {
-                out.push(rec.node_id.clone());
+                out.push((wallet.clone(), rec.node_id.clone()));
             }
         }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 }
@@ -357,5 +377,40 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+    }
+
+    #[tokio::test]
+    async fn valid_voter_wallets_returns_sorted_wallet_and_node_pairs_and_guards_zero_total() {
+        let tally = VoteTally::new("req-zero".to_string(), 1, 0);
+        assert_eq!(tally.completion_percentage().await, 0.0);
+
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Valid,
+                vec![2],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
+            )
+            .await
+            .unwrap();
+
+        let eligible = wallets(&["W1", "W2"]);
+        let pairs = tally.valid_voter_wallets(&eligible).await;
+        assert_eq!(
+            pairs,
+            vec![
+                ("W1".to_string(), NodeId(vec![1])),
+                ("W2".to_string(), NodeId(vec![2])),
+            ]
+        );
     }
 }

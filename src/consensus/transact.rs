@@ -388,6 +388,18 @@ impl TransactVerificationCoordinator {
         if let Some(path) = &self.equivocators_path {
             match serde_json::to_vec(set) {
                 Ok(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                log::warn!(
+                                    "could not create parent dir for equivocators {:?}: {}",
+                                    parent,
+                                    e
+                                );
+                                return;
+                            }
+                        }
+                    }
                     if let Err(e) = std::fs::write(path, bytes) {
                         log::warn!("could not persist equivocators to {:?}: {}", path, e);
                     }
@@ -607,6 +619,16 @@ impl TransactVerificationCoordinator {
                 }
             }
         }
+        if let Some(wallet) = &wallet_pubkey {
+            if self.equivocators.read().await.contains(wallet) {
+                log::warn!(
+                    "transact registration rejected (wallet {} is banned for equivocation): {:?}",
+                    wallet,
+                    validator
+                );
+                return;
+            }
+        }
 
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
@@ -745,6 +767,21 @@ impl TransactVerificationCoordinator {
         }
     }
 
+    /// The `(wallet_pubkey, node_id)` pairs of eligible validators that voted
+    /// `Valid` on `request_id`. Preserves the signed vote's `wallet_pubkey`
+    /// directly so the co-sign round leader does not drop voters whose
+    /// `Discovery` has not yet populated `leader_selector`.
+    pub async fn valid_voter_wallets(&self, request_id: &str) -> Vec<(String, NodeId)> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => {
+                let eligible = self.eligible_wallets().await;
+                consensus.tally.valid_voter_wallets(&eligible).await
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
     /// flap-surviving driver-auth check (replaces `is_registered_validator`,
     /// which used the flap-prone `self.validators`). The leader_selector entry
@@ -756,8 +793,9 @@ impl TransactVerificationCoordinator {
         if onchain.is_empty() {
             return true;
         }
+        let equivocators = self.equivocators.read().await;
         match self.validator_wallet(node_id).await {
-            Some(wallet) => onchain.contains(&wallet),
+            Some(wallet) => onchain.contains(&wallet) && !equivocators.contains(&wallet),
             None => false,
         }
     }
@@ -907,6 +945,26 @@ impl TransactVerificationCoordinator {
                 let mut eq = self.equivocators.write().await;
                 eq.insert(result.wallet_pubkey.clone());
                 self.persist_equivocators(&eq).await;
+            }
+            {
+                let mut validators = self.validators.write().await;
+                let mut leader_selector = self.leader_selector.write().await;
+                let banned_wallet = result.wallet_pubkey.as_str();
+                let mut to_deactivate = vec![validator.clone()];
+                validators.retain(|v| {
+                    let matches_banned = v == &validator
+                        || leader_selector
+                            .get_validator(v)
+                            .and_then(|info| info.wallet_pubkey.as_deref())
+                            == Some(banned_wallet);
+                    if matches_banned {
+                        to_deactivate.push(v.clone());
+                    }
+                    !matches_banned
+                });
+                for node in &to_deactivate {
+                    leader_selector.deactivate_validator(node);
+                }
             }
             if let Err(e) = self.reputation_tracker.record_failure(&validator).await {
                 log::warn!("could not penalise equivocator {:?}: {}", validator, e);
@@ -1382,6 +1440,52 @@ mod tests {
         assert!(
             c.slashing_tracker().total_count().await > 0,
             "equivocation must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn equivocation_persists_to_missing_parent_dir_and_blocks_reregistration() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_rep = dir.path().join("sub").join("dir").join("reputation.json");
+        let expected_eq = dir.path().join("sub").join("dir").join("equivocators.json");
+
+        let (c, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string())
+            .with_reputation_persistence(nested_rep);
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 9, "W1", false)).await.unwrap();
+
+        assert!(
+            expected_eq.exists(),
+            "persist_equivocators must create missing parent directories"
+        );
+        assert!(
+            !c.is_registered_validator(&NodeId(vec![1])).await,
+            "equivocating validator must be removed from active validator set"
+        );
+
+        // Attempting to re-register W1 under a fresh NodeId must be rejected.
+        c.register_validator_with_wallet(NodeId(vec![99]), Some("W1".to_string()))
+            .await;
+        assert!(
+            !c.is_registered_validator(&NodeId(vec![99])).await,
+            "banned equivocator wallet must not re-enter via NodeId rotation"
         );
     }
 

@@ -991,6 +991,7 @@ async fn cosign_settlement(
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -2417,21 +2418,28 @@ impl Node {
         let (vault, _) = derive_bridge_vault(&program_id);
 
         // The validators that approved this transact become the co-signer
-        // quorum, mapped to their advertised settlement wallets; the leader
+        // quorum, mapped directly from their signed vote records; the leader
         // signs as itself and is excluded from the peers it requests from.
         let self_id = self.node_info.id.clone();
+        let leader_pubkey = leader.pubkey();
         let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&request.request_id).await {
+        for (wallet, voter) in coordinator.valid_voter_wallets(&request.request_id).await {
             if voter == self_id {
                 continue;
             }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+            if let Ok(pubkey) = wallet.parse::<Pubkey>() {
+                if pubkey != leader_pubkey && !peers.iter().any(|(w, _)| *w == pubkey) {
                     peers.push((pubkey, voter));
                 }
             }
         }
-        let mut quorum_wallets = vec![leader.pubkey()];
+        if peers.is_empty() {
+            return Err(anyhow!(
+                "no independent co-signer peers available for {}",
+                request.request_id
+            ));
+        }
+        let mut quorum_wallets = vec![leader_pubkey];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
         let threshold = quorum_wallets.len();
 
@@ -3633,5 +3641,70 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_settlement_rejects_native_transact_for_cached_spl_spend() {
+        let kp = Arc::new(Keypair::new());
+        let program_id = Pubkey::new_unique();
+        let (vault, _) = derive_bridge_vault(&program_id);
+        let verified_transacts = Arc::new(Mutex::new(HashMap::new()));
+        let cosign_counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut spl_req = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [6u8; 32],
+            mint: Some([0xABu8; 32]),
+            nullifiers: [[1u8; 32], [2u8; 32]],
+            output_commitments: [[3u8; 32], [4u8; 32]],
+            root: [5u8; 32],
+            ext_amount: -1_000,
+            proof: vec![1u8; 193],
+            ciphertexts: [String::new(), String::new()],
+            timestamp: 1,
+        };
+        spl_req.request_id = spl_req.canonical_id();
+        verified_transacts
+            .lock()
+            .await
+            .insert(spl_req.request_id.clone(), spl_req.clone());
+
+        // Attempt to co-sign a NATIVE SettlementParams::Transact against the cached SPL spend:
+        // must be declined without consuming the per-nullifier co-sign budget.
+        let native_payload = CoSignPayload {
+            program_id: program_id.to_bytes(),
+            authority: kp.pubkey().to_bytes(),
+            bridge_vault: vault.to_bytes(),
+            blockhash: [9u8; 32],
+            quorum_validators: vec![kp.pubkey().to_bytes()],
+            params: SettlementParams::Transact {
+                recipient: spl_req.recipient,
+                nullifiers: spl_req.nullifiers,
+                output_commitments: spl_req.output_commitments,
+                root: spl_req.root,
+                ext_amount: spl_req.ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+        let resp = cosign_settlement(
+            Some(&kp),
+            &program_id,
+            &verified_transacts,
+            &cosign_counts,
+            CoSignRequest {
+                request_id: spl_req.request_id.clone(),
+                kind: SettlementKind::Transact,
+                message: native_payload.to_bytes().unwrap(),
+            },
+        )
+        .await;
+        assert!(
+            resp.signature.is_none(),
+            "native SettlementParams::Transact must be declined when cached spend is SPL"
+        );
+        assert!(
+            cosign_counts.lock().await.is_empty(),
+            "declined cross-path request must not consume co-sign budget"
+        );
     }
 }
