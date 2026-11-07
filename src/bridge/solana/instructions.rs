@@ -370,8 +370,8 @@ pub fn create_register_validator_instruction(
 
 /// Build an `init_stake_token_vault` instruction — the dual-stake vault migration
 /// for a registry that predates the vault. Upgrade-authority-signed. Account
-/// order matches the on-chain `InitStakeTokenVault` context: authority,
-/// stake_mint, stake_token_vault, stake_vault_authority, program_data,
+/// order matches the on-chain `InitStakeTokenVault` context: validator_registry,
+/// authority, stake_mint, stake_token_vault, stake_vault_authority, program_data,
 /// token_program, system_program, rent. `token_program` must be the program that
 /// owns `stake_mint` (classic SPL Token or Token-2022).
 pub fn create_init_stake_token_vault_instruction(
@@ -380,6 +380,7 @@ pub fn create_init_stake_token_vault_instruction(
     stake_mint: &Pubkey,
     token_program: &Pubkey,
 ) -> Result<Instruction> {
+    let (validator_registry, _) = derive_validator_registry(program_id);
     let (stake_token_vault, _) = derive_stake_token_vault(program_id);
     let (stake_vault_authority, _) =
         Pubkey::find_program_address(&[b"stake_vault_authority"], program_id);
@@ -388,6 +389,7 @@ pub fn create_init_stake_token_vault_instruction(
     Ok(Instruction {
         program_id: *program_id,
         accounts: vec![
+            AccountMeta::new_readonly(validator_registry, false),
             AccountMeta::new(*authority, true),
             AccountMeta::new_readonly(*stake_mint, false),
             AccountMeta::new(stake_token_vault, false),
@@ -795,6 +797,11 @@ pub fn create_set_bridge_authority_instruction(
     authority: &Pubkey,
     new_authority: &Pubkey,
 ) -> Result<Instruction> {
+    if *new_authority == Pubkey::default() {
+        return Err(BridgeError::InvalidTransaction(
+            "new_authority must not be Pubkey::default() (all-zero system program id)".to_string(),
+        ));
+    }
     let (bridge_state_pda, _bump) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
     #[derive(BorshSerialize)]
@@ -1310,5 +1317,61 @@ mod tests {
         assert_eq!(ix.accounts[6].pubkey, token_program);
         assert!(!ix.accounts[6].is_writable);
         assert_eq!(&ix.data[..8], &discriminators::WITHDRAW_UNBONDED_STAKE);
+    }
+
+    #[test]
+    fn test_create_init_stake_token_vault_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = SPL_TOKEN_PROGRAM_ID;
+
+        let ix = create_init_stake_token_vault_instruction(
+            &program_id,
+            &authority,
+            &stake_mint,
+            &token_program,
+        )
+        .expect("build init_stake_token_vault instruction");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 9);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(!ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, authority);
+        assert!(ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, stake_mint);
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            derive_stake_token_vault(&program_id).0
+        );
+        assert!(ix.accounts[3].is_writable);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            derive_stake_vault_authority(&program_id).0
+        );
+        assert_eq!(ix.accounts[5].pubkey, derive_program_data(&program_id).0);
+        assert_eq!(ix.accounts[6].pubkey, token_program);
+        assert_eq!(ix.data, discriminators::INIT_STAKE_TOKEN_VAULT.to_vec());
+    }
+
+    #[test]
+    fn test_create_set_bridge_authority_rejects_default_pubkey() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let err =
+            create_set_bridge_authority_instruction(&program_id, &authority, &Pubkey::default())
+                .expect_err("default/zero new_authority must be rejected");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+
+        let new_authority = Pubkey::new_unique();
+        let ix = create_set_bridge_authority_instruction(&program_id, &authority, &new_authority)
+            .expect("valid new_authority succeeds");
+        assert_eq!(&ix.data[..8], &discriminators::SET_BRIDGE_AUTHORITY);
+        assert_eq!(&ix.data[8..40], &new_authority.to_bytes());
     }
 }

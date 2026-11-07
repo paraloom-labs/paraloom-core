@@ -74,7 +74,9 @@ impl PrivacyStorage {
 
         // Create directory if it doesn't exist
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         // Configure RocksDB options
@@ -267,20 +269,24 @@ impl PrivacyStorage {
         Ok(())
     }
 
-    /// Check if all nullifiers in batch are unspent (don't exist)
+    /// Check if all nullifiers in batch are unspent (don't exist) and distinct
     pub fn check_nullifiers_batch(&self, nullifiers: &[Nullifier]) -> Result<bool> {
         let cf = self
             .db
             .cf_handle(CF_NULLIFIER_SET)
             .ok_or_else(|| anyhow!("Nullifier set CF not found"))?;
 
+        let mut seen = std::collections::HashSet::with_capacity(nullifiers.len());
         for nullifier in nullifiers {
+            if !seen.insert(nullifier) {
+                return Ok(false); // Intra-batch duplicate nullifier
+            }
             if self.db.get_cf(cf, nullifier.as_bytes())?.is_some() {
                 return Ok(false); // Found spent nullifier
             }
         }
 
-        Ok(true) // All unspent
+        Ok(true) // All unspent and distinct
     }
 
     /// Get total number of spent nullifiers
@@ -566,6 +572,11 @@ mod tests {
 
         // All unspent initially
         assert!(storage.check_nullifiers_batch(&nullifiers).unwrap());
+
+        // Intra-batch duplicate unspent nullifiers must fail
+        assert!(!storage
+            .check_nullifiers_batch(&[nullifiers[0].clone(), nullifiers[0].clone()])
+            .unwrap());
 
         // Spend one
         storage.insert_nullifier(&nullifiers[0]).unwrap();

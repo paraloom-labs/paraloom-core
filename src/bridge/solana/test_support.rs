@@ -46,6 +46,7 @@ pub struct MockBridgeRpc {
     pub get_transactions: Mutex<HashMap<Signature, EncodedConfirmedTransactionWithStatusMeta>>,
     pub next_get_latest_blockhash: Mutex<Option<Result<Hash>>>,
     pub next_send_and_confirm: Mutex<Option<Result<Signature>>>,
+    pub next_get_program_accounts: Mutex<Option<Result<Vec<(Pubkey, Account)>>>>,
 }
 
 impl MockBridgeRpc {
@@ -193,6 +194,9 @@ impl BridgeRpc for MockBridgeRpc {
         _program_id: &Pubkey,
         _config: solana_client::rpc_config::RpcProgramAccountsConfig,
     ) -> Result<Vec<(Pubkey, Account)>> {
+        if let Some(res) = self.next_get_program_accounts.lock().unwrap().take() {
+            return res;
+        }
         Ok(Vec::new())
     }
 

@@ -33,6 +33,10 @@ pub struct WebNodeInfo {
     pub uptime: u64,
 }
 
+/// Upper bound on retained dashboard node entries so repeated registrations
+/// cannot grow in-memory state without bound.
+const MAX_DASHBOARD_NODES: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct DashboardState {
     pub nodes: Arc<Mutex<HashMap<String, WebNodeInfo>>>,
@@ -64,6 +68,11 @@ impl DashboardState {
         };
 
         let mut nodes = self.nodes.lock().unwrap();
+        if !nodes.contains_key(&web_info.id) && nodes.len() >= MAX_DASHBOARD_NODES {
+            if let Some(victim) = nodes.keys().min().cloned() {
+                nodes.remove(&victim);
+            }
+        }
         nodes.insert(web_info.id.clone(), web_info);
     }
 
@@ -75,12 +84,16 @@ impl DashboardState {
     pub fn get_stats(&self) -> NetworkStats {
         let nodes = self.nodes.lock().unwrap();
 
-        let total_cpu_cores: u32 = nodes.values().map(|n| n.resources.cpu_cores as u32).sum();
-        let total_memory_mb: u64 = nodes.values().map(|n| n.resources.memory_mb).sum();
+        let total_cpu_cores: u32 = nodes.values().fold(0u32, |acc, n| {
+            acc.saturating_add(n.resources.cpu_cores as u32)
+        });
+        let total_memory_mb: u64 = nodes
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(n.resources.memory_mb));
 
         NetworkStats {
             total_nodes: nodes.len(),
-            active_connections: if nodes.len() > 1 { nodes.len() - 1 } else { 0 },
+            active_connections: nodes.len().saturating_sub(1),
             total_cpu_cores,
             total_memory_mb,
             uptime_seconds: self.start_time.elapsed().as_secs(),
@@ -94,8 +107,18 @@ async fn get_stats(Extension(state): Extension<DashboardState>) -> Json<NetworkS
 }
 
 async fn get_nodes(Extension(state): Extension<DashboardState>) -> Json<Vec<WebNodeInfo>> {
+    let uptime = state.start_time.elapsed().as_secs();
     let nodes = state.nodes.lock().unwrap();
-    Json(nodes.values().cloned().collect())
+    let mut list: Vec<WebNodeInfo> = nodes
+        .values()
+        .cloned()
+        .map(|mut n| {
+            n.uptime = uptime;
+            n
+        })
+        .collect();
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(list)
 }
 
 async fn dashboard() -> Html<String> {
@@ -158,4 +181,47 @@ pub async fn start_dashboard_with_coordinator(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{NodeId, NodeType};
+
+    fn make_node_info(id: Vec<u8>, cpu_cores: u8, memory_mb: u64) -> NodeInfo {
+        NodeInfo {
+            id: NodeId(id),
+            node_type: NodeType::ResourceProvider,
+            resources: ResourceContribution {
+                cpu_cores,
+                memory_mb,
+                storage_mb: 1024,
+                bandwidth_kbps: 1000,
+            },
+            address: "/ip4/127.0.0.1/tcp/9000".to_string(),
+            wallet_pubkey: None,
+        }
+    }
+
+    #[test]
+    fn get_stats_saturates_instead_of_panicking_on_u64_overflow() {
+        let state = DashboardState::new();
+        state.add_node(&make_node_info(vec![1], 16, u64::MAX - 10));
+        state.add_node(&make_node_info(vec![2], 32, 100));
+
+        let stats = state.get_stats();
+        assert_eq!(stats.total_nodes, 2);
+        assert_eq!(stats.active_connections, 1);
+        assert_eq!(stats.total_cpu_cores, 48);
+        assert_eq!(stats.total_memory_mb, u64::MAX);
+    }
+
+    #[test]
+    fn add_node_bounds_retained_entries() {
+        let state = DashboardState::new();
+        for i in 0..(MAX_DASHBOARD_NODES + 10) {
+            state.add_node(&make_node_info((i as u32).to_be_bytes().to_vec(), 4, 1024));
+        }
+        assert_eq!(state.get_stats().total_nodes, MAX_DASHBOARD_NODES);
+    }
 }
