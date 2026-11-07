@@ -63,14 +63,14 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
-        if proofs.is_empty() {
-            return BatchVerificationResult::AllValid;
-        }
-
         if proofs.len() != public_inputs.len() {
             return BatchVerificationResult::Error {
                 reason: "Mismatched number of proofs and public inputs".to_string(),
             };
+        }
+
+        if proofs.is_empty() {
+            return BatchVerificationResult::AllValid;
         }
 
         // For small batches, verify individually
@@ -79,12 +79,12 @@ impl BatchVerifier {
             return self.verify_individually(vk, public_inputs, proofs);
         }
 
-        // Prepare verifying key if not cached
+        // Prepare verifying key if not cached or if cached key belongs to a different VK
         use ark_groth16::Groth16;
         let owned_pvk;
         let pvk = match &self.pvk {
-            Some(pvk) => pvk,
-            None => {
+            Some(pvk) if &pvk.vk == vk => pvk,
+            _ => {
                 owned_pvk = match Groth16::<Bn254>::process_vk(vk) {
                     Ok(pvk) => pvk,
                     Err(_) => {
@@ -131,6 +131,12 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
         let mut invalid_indices = Vec::new();
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
@@ -196,6 +202,12 @@ impl AdaptiveBatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
         match proofs.len() {
             0 => BatchVerificationResult::AllValid,
             1..=2 => self.verifier.verify_individually(vk, public_inputs, proofs),
@@ -327,5 +339,25 @@ mod tests {
         // Large batch should also work
         let result = verifier.verify_batch(&vk, &[], &[]);
         assert_eq!(result, BatchVerificationResult::AllValid);
+    }
+
+    #[test]
+    fn test_empty_proofs_with_nonempty_inputs_and_adaptive_mismatch_rejected() {
+        let mut rng = StdRng::seed_from_u64(0u64);
+        let circuit = DepositCircuitV2::new();
+        let (_, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+
+        let verifier = BatchVerifier::new();
+        let adaptive = AdaptiveBatchVerifier::new();
+
+        // Empty proofs with non-empty public_inputs must be rejected as Error.
+        let res_batch = verifier.verify_batch(&vk, &[vec![Fr::from(1u64)]], &[]);
+        assert!(matches!(res_batch, BatchVerificationResult::Error { .. }));
+
+        let res_adaptive = adaptive.verify(&vk, &[vec![Fr::from(1u64)]], &[]);
+        assert!(matches!(
+            res_adaptive,
+            BatchVerificationResult::Error { .. }
+        ));
     }
 }

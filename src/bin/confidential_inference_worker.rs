@@ -96,7 +96,11 @@ async fn infer(
 /// `TEE_ATTESTATION_TOKEN` for local development.
 async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
     if let Ok(token) = std::env::var("TEE_ATTESTATION_TOKEN") {
-        return Ok(token.into_bytes());
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("TEE_ATTESTATION_TOKEN must not be empty"));
+        }
+        return Ok(trimmed.as_bytes().to_vec());
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -106,8 +110,12 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
             anyhow!("no TEE attestation socket at {TEE_TOKEN_SOCKET} (set TEE_ATTESTATION_TOKEN for local dev): {e}")
         })?;
 
-    let body =
-        format!(r#"{{"audience":"{audience}","token_type":"OIDC","nonces":["{nonce_hex}"]}}"#);
+    let body = serde_json::json!({
+        "audience": audience,
+        "token_type": "OIDC",
+        "nonces": [nonce_hex],
+    })
+    .to_string();
     let request = format!(
         "POST /v1/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -129,11 +137,20 @@ async fn fetch_attestation(nonce_hex: &str, audience: &str) -> Result<Vec<u8>> {
     }
 
     let resp = String::from_utf8_lossy(&resp);
-    let token = resp
+    let (headers, body) = resp
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.trim().to_string())
-        .filter(|t| !t.is_empty())
         .ok_or_else(|| anyhow!("attestation response had no token body"))?;
+    let status_line = headers.lines().next().unwrap_or("");
+    let status_code = status_line.split_whitespace().nth(1).unwrap_or("");
+    if status_code != "200" {
+        return Err(anyhow!(
+            "TEE launcher returned non-200 status: {status_line}"
+        ));
+    }
+    let token = body.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("attestation response had empty token body"));
+    }
     Ok(token.into_bytes())
 }
 
@@ -146,9 +163,17 @@ async fn main() -> Result<()> {
     env_logger::try_init().ok();
 
     let audience = env_or("TEE_AUDIENCE", "paraloom-inference");
+    if audience.trim().is_empty() {
+        return Err(anyhow!("TEE_AUDIENCE must not be empty"));
+    }
     let llama_endpoint = env_or("LLAMA_ENDPOINT", "http://127.0.0.1:8080");
     let listen: std::net::SocketAddr = env_or("LISTEN_ADDR", "0.0.0.0:9000").parse()?;
-    let max_tokens: u32 = env_or("MAX_TOKENS", "256").parse().unwrap_or(256);
+    let max_tokens: u32 = env_or("MAX_TOKENS", "256")
+        .parse::<u32>()
+        .map_err(|e| anyhow!("invalid MAX_TOKENS: {e}"))?;
+    if max_tokens == 0 {
+        return Err(anyhow!("MAX_TOKENS must be greater than 0"));
+    }
 
     // Fresh channel per enclave session; its public key is bound into the token.
     let channel = EnclaveChannel::generate();

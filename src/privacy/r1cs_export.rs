@@ -72,8 +72,22 @@ fn section(out: &mut impl Write, kind: u32, body: &[u8]) -> io::Result<()> {
 /// Write `matrices` to `out` as a circom `.r1cs` file.
 pub fn write_r1cs(out: &mut impl Write, matrices: &ConstraintMatrices<Fr>) -> io::Result<()> {
     let num_instance = matrices.num_instance_variables;
+    if num_instance == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "constraint system must have at least 1 instance variable (constant-one wire)",
+        ));
+    }
     let num_witness = matrices.num_witness_variables;
-    let num_wires = num_instance + num_witness;
+    let num_wires = num_instance
+        .checked_add(num_witness)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "wire count overflows usize"))?;
+    if num_wires > u32::MAX as usize || matrices.num_constraints > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wire or constraint count exceeds circom u32 limit",
+        ));
+    }
 
     out.write_all(MAGIC)?;
     out.write_all(&VERSION.to_le_bytes())?;
@@ -283,5 +297,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn write_r1cs_rejects_zero_instance_variables() {
+        let mut matrices = transact_v3_matrices();
+        matrices.num_instance_variables = 0;
+        let mut bytes = Vec::new();
+        let err = write_r1cs(&mut bytes, &matrices).expect_err("0 instance vars must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
