@@ -2433,7 +2433,12 @@ impl Node {
         }
         let mut quorum_wallets = vec![leader.pubkey()];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
+        let candidate_wallets: Vec<String> = quorum_wallets.iter().map(|p| p.to_string()).collect();
+        let threshold = coordinator
+            .required_cosign_threshold(&candidate_wallets)
+            .await
+            .max(1)
+            .min(quorum_wallets.len());
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
         // wire form; strip the L2 suite tag and convert the compressed body.
