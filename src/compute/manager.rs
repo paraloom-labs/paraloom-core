@@ -182,7 +182,8 @@ impl JobManager {
         let jobs_to_assign: Vec<_> = pending.drain(..).collect();
         drop(pending); // Release lock
 
-        for job in jobs_to_assign {
+        let mut jobs_iter = jobs_to_assign.into_iter();
+        while let Some(job) = jobs_iter.next() {
             if let Some(validator) = available_validators.first() {
                 let assignment = JobAssignment {
                     job_id: job.id.clone(),
@@ -223,10 +224,13 @@ impl JobManager {
                 available_validators
                     .sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
             } else {
-                // No available validators, put job back in queue
+                // No available validators, put this job and all remaining jobs back in queue
                 warn!("No available validators for job {}", job.id);
                 let mut pending = self.pending_jobs.lock().unwrap();
-                pending.push(job);
+                let mut remaining = vec![job];
+                remaining.extend(jobs_iter);
+                remaining.extend(pending.drain(..));
+                *pending = remaining;
                 break;
             }
         }
@@ -483,5 +487,45 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn test_assign_jobs_does_not_drop_queued_jobs_on_full_capacity() {
+        let manager = JobManager::new();
+
+        // 1 validator that can only accept 1 job
+        manager
+            .register_validator(ValidatorCapacity::new("validator1".to_string(), 4, 8192, 1))
+            .unwrap();
+
+        // Submit 4 jobs
+        let mut job_ids = Vec::new();
+        for i in 0..4 {
+            let job = ComputeJob::new(vec![i], vec![], ResourceLimits::default());
+            job_ids.push(job.id.clone());
+            manager.submit_job(job).unwrap();
+        }
+
+        // First assign: 1 assigned, 3 remaining in pending queue
+        let assignments1 = manager.assign_jobs().unwrap();
+        assert_eq!(assignments1.len(), 1);
+        assert_eq!(assignments1[0].job_id, job_ids[0]);
+
+        let stats1 = manager.get_stats();
+        assert_eq!(stats1.active_jobs, 1);
+        assert_eq!(stats1.pending_jobs, 3);
+
+        // Submit result to free up validator
+        let result1 = JobResult::success(job_ids[0].clone(), vec![1], 10, 100, 1000);
+        manager.submit_result(result1).unwrap();
+
+        // Second assign: next job should be assigned, 2 remaining
+        let assignments2 = manager.assign_jobs().unwrap();
+        assert_eq!(assignments2.len(), 1);
+        assert_eq!(assignments2[0].job_id, job_ids[1]);
+
+        let stats2 = manager.get_stats();
+        assert_eq!(stats2.active_jobs, 1);
+        assert_eq!(stats2.pending_jobs, 2);
     }
 }
