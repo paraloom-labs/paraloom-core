@@ -428,10 +428,8 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
         // Swapping the gross amount would exceed the fresh address's balance and
         // fail *after* the nullifier is already burned, stranding the funds —
         // so the swap trades the realized post-fee amount.
-        let withdrawal_fee = amount_in
-            .checked_mul(WITHDRAWAL_FEE_BPS)
-            .map(|x| x / 10_000)
-            .ok_or(RelayerError::InvalidAmount(amount_in))?;
+        let withdrawal_fee =
+            (amount_in as u128 * WITHDRAWAL_FEE_BPS as u128 / 10_000) as u64;
         let withdrawn = amount_in
             .checked_sub(withdrawal_fee)
             .filter(|&a| a > 0)
@@ -977,5 +975,18 @@ mod tests {
         );
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
+    }
+
+    #[tokio::test]
+    async fn large_amount_above_u64_max_div_25_computes_withdrawal_fee_without_overflow() {
+        let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
+        let large_amount = u64::MAX / 10; // > u64::MAX / 25, previously overflowed checked_mul(25)
+        let req = request(native_note(large_amount), NATIVE_SOL_ASSET, 0);
+        let out = relayer
+            .execute(req)
+            .await
+            .expect("large u64 note must not overflow 25bps fee calculation");
+        let expected_fee = (large_amount as u128 * 25 / 10_000) as u64;
+        assert_eq!(out.net_out_amount, large_amount - expected_fee);
     }
 }
