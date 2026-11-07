@@ -31,15 +31,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .parse()?;
     let jupiter_base_url =
         std::env::var("JUPITER_BASE_URL").unwrap_or_else(|_| DEFAULT_JUPITER_BASE_URL.to_string());
-    let slippage_bps: u16 = std::env::var("SLIPPAGE_BPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    let platform_fee_bps: u16 = std::env::var("PLATFORM_FEE_BPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let fee_account = std::env::var("FEE_ACCOUNT").ok();
+    let slippage_bps: u16 = match std::env::var("SLIPPAGE_BPS") {
+        Ok(s) => s
+            .parse::<u16>()
+            .map_err(|e| format!("invalid SLIPPAGE_BPS '{s}': {e}"))?,
+        Err(_) => 50,
+    };
+    if slippage_bps > 10_000 {
+        return Err("SLIPPAGE_BPS cannot exceed 10000".into());
+    }
+    let platform_fee_bps: u16 = match std::env::var("PLATFORM_FEE_BPS") {
+        Ok(s) => s
+            .parse::<u16>()
+            .map_err(|e| format!("invalid PLATFORM_FEE_BPS '{s}': {e}"))?,
+        Err(_) => 0,
+    };
+    if platform_fee_bps > 10_000 {
+        return Err("PLATFORM_FEE_BPS cannot exceed 10000".into());
+    }
+    let fee_account = match std::env::var("FEE_ACCOUNT") {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err("FEE_ACCOUNT cannot be empty when set".into());
+            }
+            Some(trimmed.to_string())
+        }
+        Err(_) => None,
+    };
 
     // The submitter is never invoked on the routing path (the service only
     // builds unsigned transactions), but the provider type needs one; give it a
