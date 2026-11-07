@@ -454,6 +454,9 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if platform_fee_bps > 10_000 {
             return Err(RelayerError::FeeTooHigh(platform_fee_bps));
         }
+        if slippage_bps > 10_000 {
+            return Err(RelayerError::SlippageTooHigh(slippage_bps));
+        }
         Ok(Self {
             http,
             submitter,
@@ -514,9 +517,13 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         if quote.route_plan.is_empty() {
             return Err(RelayerError::NoRoute("empty routePlan".into()));
         }
-        quote.out_amount.parse::<u64>().map_err(|e| {
+        let out_amount = quote.out_amount.parse::<u64>().map_err(|e| {
             RelayerError::SwapFailed(format!("bad outAmount '{}': {e}", quote.out_amount))
-        })
+        })?;
+        if out_amount == 0 {
+            return Err(RelayerError::NoRoute("zero outAmount in quote".into()));
+        }
+        Ok(out_amount)
     }
 
     /// Decode Jupiter's base64 `swapTransaction` into a [`VersionedTransaction`].
@@ -646,6 +653,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
                 .await?
                 .unwrap_or(out_amount)
         };
+
+        if out_amount == 0 {
+            return Err(RelayerError::SwapFailed(
+                "realized output amount is zero".into(),
+            ));
+        }
 
         Ok(SwapResult { out_amount })
     }
@@ -785,6 +798,31 @@ mod tests {
     }
 
     // --- Slippage / fee plumbing ---------------------------------------
+
+    #[test]
+    fn slippage_over_100_percent_is_rejected() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let res = JupiterSwapProvider::new(http, RecordingSubmitter::default(), 10_001, 0, None);
+        match res {
+            Err(RelayerError::SlippageTooHigh(10_001)) => {}
+            Err(other) => panic!("expected SlippageTooHigh(10_001), got {other:?}"),
+            Ok(_) => panic!("slippage > 100% must be rejected"),
+        }
+    }
+
+    #[test]
+    fn zero_out_amount_quote_is_rejected() {
+        let quote = serde_json::json!({
+            "inputMint": WRAPPED_SOL_MINT,
+            "outAmount": "0",
+            "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "slippageBps": 50,
+            "routePlan": [ { "swapInfo": { "label": "Orca" }, "percent": 100 } ]
+        });
+        let err = JupiterSwapProvider::<CannedClient, RecordingSubmitter>::parse_quote(&quote)
+            .expect_err("zero outAmount must be rejected");
+        assert!(matches!(err, RelayerError::NoRoute(_)));
+    }
 
     #[test]
     fn slippage_and_fee_are_threaded_into_the_quote_query() {
