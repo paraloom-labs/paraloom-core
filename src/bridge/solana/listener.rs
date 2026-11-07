@@ -363,14 +363,24 @@ impl EventListener {
 
         let (cursor_advance, failed) = Self::contiguous_cursor(&outcomes);
 
-        // Un-see the failed signatures so the next poll re-fetches and retries
-        // them. The cursor stays below the first failure, so the re-fetch's
-        // `until` boundary actually returns them; re-processing is idempotent at
-        // the pool, so the successes after a failure are no-ops on retry.
+        // Un-see the failed signatures (and any later signatures in the same
+        // batch that succeeded after the first failure) so the next poll
+        // re-fetches and retries the whole tail. The cursor stays below the
+        // first failure, so the re-fetch's `until` boundary returns them;
+        // re-processing is idempotent at the pool, and re-including the trailing
+        // successes in the next poll's `outcomes` lets `last_signature` advance
+        // all the way to the newest signature once the failure clears.
         if !failed.is_empty() {
+            let failed_set: HashSet<Signature> = failed.iter().copied().collect();
             let mut seen = state.seen_signatures.write().await;
-            for sig in &failed {
-                seen.remove(sig);
+            let mut after_first_failure = false;
+            for (sig, _) in &outcomes {
+                if failed_set.contains(sig) {
+                    after_first_failure = true;
+                }
+                if after_first_failure {
+                    seen.remove(sig);
+                }
             }
         }
 
@@ -1545,5 +1555,91 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_events_unsees_trailing_successes_after_earlier_deposit_failure_so_cursor_advances(
+    ) {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let older = Signature::new_unique();
+        let newer = Signature::new_unique();
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+
+        // Seed outcomes where `older` failed process_deposit and `newer` succeeded:
+        // after un-seeing, both `older` and `newer` must be removed from `seen_signatures`
+        // so the retry poll advances `last_signature` all the way to `newer`.
+        state.seen_signatures.write().await.insert(older);
+        state.seen_signatures.write().await.insert(newer);
+
+        mock.get_transactions.lock().unwrap().insert(
+            older,
+            synth_deposit_tx(
+                older,
+                7,
+                &program_id,
+                &depositor,
+                1_000,
+                [7u8; 32],
+                [13u8; 32],
+            ),
+        );
+        mock.get_transactions.lock().unwrap().insert(
+            newer,
+            synth_deposit_tx(
+                newer,
+                8,
+                &program_id,
+                &depositor,
+                2_000,
+                [9u8; 32],
+                [11u8; 32],
+            ),
+        );
+
+        let outcomes = vec![(older, false), (newer, true)];
+        let (cursor_advance, failed) = EventListener::contiguous_cursor(&outcomes);
+        assert_eq!(cursor_advance, None);
+        assert_eq!(failed, vec![older]);
+
+        {
+            let failed_set: HashSet<Signature> = failed.iter().copied().collect();
+            let mut seen = state.seen_signatures.write().await;
+            let mut after_first_failure = false;
+            for (sig, _) in &outcomes {
+                if failed_set.contains(sig) {
+                    after_first_failure = true;
+                }
+                if after_first_failure {
+                    seen.remove(sig);
+                }
+            }
+        }
+
+        assert!(!state.seen_signatures.read().await.contains(&older));
+        assert!(
+            !state.seen_signatures.read().await.contains(&newer),
+            "trailing success after an earlier failure must also be un-seen so retry advances cursor to tip"
+        );
+
+        *mock.next_get_signatures.lock().unwrap() =
+            Some(Ok(vec![status(&newer, 8), status(&older, 7)]));
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 2);
+        assert_eq!(*state.last_signature.read().await, Some(newer));
     }
 }

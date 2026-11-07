@@ -675,16 +675,25 @@ impl NetworkManager {
                                     let mut registry = peer_registry.lock().await;
                                     registry.mark_connected(NodeId(peer_id.to_bytes()));
                                 }
-                                libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                                    info!("Connection closed with peer: {} (cause: {:?})", peer_id, cause);
+                                libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
+                                    info!(
+                                        "Connection closed with peer: {} (remaining: {}, cause: {:?})",
+                                        peer_id, num_established, cause
+                                    );
 
-                                    // Remove from connected peers list
-                                    let mut peers = connected_peers.lock().await;
-                                    peers.retain(|p| p != &peer_id);
-                                    drop(peers);
+                                    // Only evict the peer when its last connection closes:
+                                    // libp2p permits multiple concurrent connections per peer
+                                    // (e.g. relay circuit + direct DCUtR upgrade or simultaneous
+                                    // dial), and closing a redundant socket while `num_established > 0`
+                                    // must not mark a still-connected peer as disconnected.
+                                    if num_established == 0 {
+                                        let mut peers = connected_peers.lock().await;
+                                        peers.retain(|p| p != &peer_id);
+                                        drop(peers);
 
-                                    let mut registry = peer_registry.lock().await;
-                                    registry.mark_disconnected(NodeId(peer_id.to_bytes()));
+                                        let mut registry = peer_registry.lock().await;
+                                        registry.mark_disconnected(NodeId(peer_id.to_bytes()));
+                                    }
                                 }
                                 libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
                                     info!("Incoming connection");
@@ -717,16 +726,18 @@ impl NetworkManager {
                                                 match bincode::deserialize::<Message>(&message.data) {
                                                     Ok(msg) => {
                                                         // Gossipsub runs in Signed mode, so `message.source`
-                                                        // is the authenticated original publisher. Prefer it
-                                                        // over `propagation_source` (the last forwarding hop)
-                                                        // so a relayed message is attributed to its real
-                                                        // author — this is what lets the consensus layer
-                                                        // reject a vote whose self-declared validator does not
-                                                        // match the authenticated sender (audit).
-                                                        let source = match message.source {
-                                                            Some(author) => NodeId(author.to_bytes()),
-                                                            None => NodeId(peer_id.to_bytes()),
+                                                        // is the authenticated original publisher. Refuse any
+                                                        // message without an authenticated author rather than
+                                                        // attributing it to `propagation_source` (the last
+                                                        // forwarding hop).
+                                                        let Some(author) = message.source else {
+                                                            log::warn!(
+                                                                "Dropping gossipsub message from {} with no authenticated source",
+                                                                peer_id
+                                                            );
+                                                            continue;
                                                         };
+                                                        let source = NodeId(author.to_bytes());
                                                         let handler_lock = handler.lock().await;
                                                         if let Some(h) = handler_lock.as_ref() {
                                                             if let Err(e) = h.handle_message(source, msg).await {

@@ -503,8 +503,20 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     balance as f64 / LAMPORTS_PER_SOL as f64
                 );
 
+                if !amount.is_finite() || amount <= 0.0 {
+                    anyhow::bail!(
+                        "Deposit amount must be a positive finite number, got {}",
+                        amount
+                    );
+                }
                 let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
-                if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
+                if deposit_lamports == 0 {
+                    anyhow::bail!("Deposit amount is too small (< 1 lamport)");
+                }
+                let required_lamports = deposit_lamports
+                    .checked_add(LAMPORTS_PER_SOL / 100)
+                    .context("Deposit amount overflow")?;
+                if balance < required_lamports {
                     anyhow::bail!(
                         "Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)",
                         amount
@@ -817,17 +829,12 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
         WalletCommands::NewAddress { label } => {
             println!("Generating new shielded address...\n");
 
-            // Generate random keypair (32 bytes for private key)
+            // Generate random X25519 keypair (32 bytes for secret key)
             let private_key: [u8; 32] = rand::random();
+            let secret_key = crypto_box::SecretKey::from(private_key);
+            let public_key = *secret_key.public_key().as_bytes();
 
-            // Generate public key (in production, this would be derived from private key)
-            // For now, we'll use a simple hash as placeholder
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(private_key);
-            let public_key = hasher.finalize();
-
-            // Create address (paraloom1 + hex encoded public key)
+            // Create address (paraloom1 + hex encoded X25519 public key)
             let address = format!("paraloom1{}", hex::encode(&public_key[..]));
 
             println!("[OK] New address created!");
@@ -851,7 +858,18 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             }
 
             let filename = if let Some(label_text) = &label {
-                format!("{}.key", label_text.replace(" ", "_"))
+                let sanitized = label_text.trim().replace(' ', "_");
+                if sanitized.is_empty()
+                    || sanitized.contains('/')
+                    || sanitized.contains('\\')
+                    || sanitized.contains("..")
+                {
+                    anyhow::bail!(
+                        "Invalid address label {:?}: must not be empty or contain path separators",
+                        label_text
+                    );
+                }
+                format!("{}.key", sanitized)
             } else {
                 format!("key_{}.key", hex::encode(&public_key[..4]))
             };
