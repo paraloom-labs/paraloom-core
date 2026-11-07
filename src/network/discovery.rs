@@ -121,8 +121,15 @@ impl PeerRegistry {
 
     /// Mark a peer as actively connected. If the peer was in
     /// backoff, the failure counter resets so a future disconnect
-    /// starts the backoff sequence from the beginning.
+    /// starts the backoff sequence from the beginning. A peer
+    /// explicitly marked `Forgotten` stays forgotten.
     pub fn mark_connected(&mut self, node_id: NodeId) {
+        if matches!(
+            self.peers.get(&node_id).map(|e| &e.state),
+            Some(PeerState::Forgotten)
+        ) {
+            return;
+        }
         let now = (self.clock)();
         let entry = self.peers.entry(node_id).or_insert(PeerEntry {
             state: PeerState::Connected { last_seen: now },
@@ -165,8 +172,15 @@ impl PeerRegistry {
     }
 
     /// Mark a peer as disconnected and schedule the next reconnect
-    /// attempt according to [`RECONNECT_BACKOFF`].
+    /// attempt according to [`RECONNECT_BACKOFF`]. A `Forgotten`
+    /// peer stays forgotten and is never moved back into `Backoff`.
     pub fn mark_disconnected(&mut self, node_id: NodeId) {
+        if matches!(
+            self.peers.get(&node_id).map(|e| &e.state),
+            Some(PeerState::Forgotten)
+        ) {
+            return;
+        }
         let now = (self.clock)();
         let entry = self.peers.entry(node_id.clone()).or_insert(PeerEntry {
             state: PeerState::Backoff {
@@ -438,7 +452,11 @@ mod tests {
         let (mut registry, clock) = registry_with_fake_clock();
         let peer = node(6);
         registry.mark_disconnected(peer.clone());
-        registry.forget(peer);
+        registry.forget(peer.clone());
+
+        // Subsequent disconnect or connect events must not resurrect a forgotten peer.
+        registry.mark_disconnected(peer.clone());
+        registry.mark_connected(peer);
 
         advance(&clock, Duration::from_secs(60 * 60));
         assert!(registry.peers_due_for_reconnect().is_empty());

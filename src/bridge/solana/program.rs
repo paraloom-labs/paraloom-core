@@ -230,6 +230,12 @@ impl ProgramInterface {
     pub async fn program_version(&self) -> Result<u32> {
         let (state_pda, _) = super::derive_bridge_state(&self.program_id);
         let account = self.rpc.get_account(&state_pda).await?;
+        if account.owner != self.program_id {
+            return Err(BridgeError::ConfigError(format!(
+                "BridgeState PDA {} is owned by {}, expected program {}",
+                state_pda, account.owner, self.program_id
+            )));
+        }
         parse_program_version(&account.data)
     }
 
@@ -480,6 +486,20 @@ mod tests {
     #[test]
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
+        assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn program_version_rejects_wrong_account_owner() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        let mut acc = bridge_state_account(crate::bridge::EXPECTED_PROGRAM_VERSION);
+        acc.owner = Pubkey::new_unique();
+        *mock.next_get_account.lock().unwrap() = Some(Ok(acc));
+        let program = program_with_mock(mock);
+        let err = program
+            .verify_program_version()
+            .await
+            .expect_err("wrong owner must be rejected");
         assert!(matches!(err, BridgeError::ConfigError(_)));
     }
 }
