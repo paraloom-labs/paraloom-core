@@ -678,6 +678,10 @@ pub mod paraloom_program {
                     fee,
                     ctx.accounts.mint.decimals,
                 )?;
+                validator_account.total_earnings = validator_account
+                    .total_earnings
+                    .checked_add(fee)
+                    .ok_or(BridgeError::InvalidAmount)?;
             }
         }
 
@@ -1237,6 +1241,25 @@ pub mod paraloom_program {
     /// account, and the registry's pinned mint to all agree.
     pub fn init_stake_token_vault(ctx: Context<InitStakeTokenVault>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let registry_ai = ctx.accounts.validator_registry.to_account_info();
+        require!(registry_ai.owner == &crate::ID, BridgeError::UnauthorizedInit);
+        let data = registry_ai.try_borrow_data()?;
+        require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+        require!(
+            data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
+            BridgeError::UnauthorizedInit
+        );
+        if data.len() >= 8 + ValidatorRegistry::INIT_SPACE {
+            let registry = ValidatorRegistry::try_deserialize(&mut &data[..])?;
+            if registry.stake_mint != Pubkey::default() {
+                require!(
+                    ctx.accounts.stake_mint.key() == registry.stake_mint,
+                    BridgeError::UnauthorizedInit
+                );
+            }
+        }
+
         msg!(
             "Stake token vault initialized (mint {})",
             ctx.accounts.stake_mint.key()
@@ -2203,6 +2226,14 @@ pub struct InitStakeTokenVault<'info> {
     /// CHECK: address pinned by seeds; used only as the vault's token authority.
     #[account(seeds = [b"stake_vault_authority"], bump)]
     pub stake_vault_authority: UncheckedAccount<'info>,
+
+    /// The validator registry PDA, verified to ensure the vault mint matches
+    /// the registry's pinned stake_mint if already migrated to dual-stake.
+    ///
+    /// CHECK: address pinned by seeds; owner, discriminator, and stake_mint
+    /// validated in the body.
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: UncheckedAccount<'info>,
 
     /// Upgrade-authority gate (#204), same as the other `initialize_*`.
     ///
