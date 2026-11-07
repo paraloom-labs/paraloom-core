@@ -155,7 +155,9 @@ impl PrivacyStorage {
 
         let mut batch = rocksdb::WriteBatch::default();
         for (i, commitment) in commitments.iter().enumerate() {
-            let index = start_index + i as u64;
+            let index = start_index
+                .checked_add(i as u64)
+                .ok_or_else(|| anyhow!("Commitment batch index overflow at offset {}", i))?;
             let key = index.to_le_bytes();
             batch.put_cf(cf, key, commitment.as_bytes());
         }
@@ -213,6 +215,15 @@ impl PrivacyStorage {
         }
 
         indexed.sort_by_key(|(index, _)| *index);
+        for (expected_idx, (index, _)) in indexed.iter().enumerate() {
+            if *index != expected_idx as u64 {
+                return Err(anyhow!(
+                    "Non-contiguous commitment index in storage: expected {}, got {}",
+                    expected_idx,
+                    index
+                ));
+            }
+        }
         Ok(indexed.into_iter().map(|(_, c)| c).collect())
     }
 
@@ -700,5 +711,26 @@ mod tests {
                  follow numeric index order, not RocksDB bytewise key order"
             );
         }
+    }
+
+    #[test]
+    fn insert_commitments_batch_rejects_index_overflow_and_sparse_commitments_error() {
+        let dir = tempdir().unwrap();
+        let storage = PrivacyStorage::open(dir.path().join("privacy.db")).unwrap();
+
+        let commitments = vec![Commitment([1u8; 32]), Commitment([2u8; 32])];
+        assert!(storage
+            .insert_commitments_batch(u64::MAX, &commitments)
+            .is_err());
+        assert_eq!(storage.commitment_count().unwrap(), 0);
+
+        // Sparse index gap (0 and 2, missing 1) must be rejected by get_all_commitments
+        storage
+            .insert_commitment(0, &Commitment([1u8; 32]))
+            .unwrap();
+        storage
+            .insert_commitment(2, &Commitment([2u8; 32]))
+            .unwrap();
+        assert!(storage.get_all_commitments().is_err());
     }
 }

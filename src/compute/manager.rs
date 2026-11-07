@@ -176,13 +176,18 @@ impl JobManager {
         };
 
         // Sort by load factor (least loaded first)
-        available_validators.sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
+        available_validators.sort_by(|a, b| {
+            a.load_factor()
+                .partial_cmp(&b.load_factor())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Assign jobs to validators
         let jobs_to_assign: Vec<_> = pending.drain(..).collect();
         drop(pending); // Release lock
 
-        for job in jobs_to_assign {
+        let mut jobs_iter = jobs_to_assign.into_iter();
+        while let Some(job) = jobs_iter.next() {
             if let Some(validator) = available_validators.first() {
                 let assignment = JobAssignment {
                     job_id: job.id.clone(),
@@ -220,13 +225,17 @@ impl JobManager {
                         .cloned()
                         .collect()
                 };
-                available_validators
-                    .sort_by(|a, b| a.load_factor().partial_cmp(&b.load_factor()).unwrap());
+                available_validators.sort_by(|a, b| {
+                    a.load_factor()
+                        .partial_cmp(&b.load_factor())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             } else {
-                // No available validators, put job back in queue
+                // No available validators, put current and all remaining jobs back in queue
                 warn!("No available validators for job {}", job.id);
                 let mut pending = self.pending_jobs.lock().unwrap();
                 pending.push(job);
+                pending.extend(jobs_iter);
                 break;
             }
         }
@@ -320,24 +329,30 @@ impl JobManager {
     pub fn cleanup_stale_validators(&self) -> usize {
         let mut validators = self.validators.lock().unwrap();
         let now = current_timestamp();
-        let mut removed = 0;
+        let mut removed_ids = Vec::new();
 
         validators.retain(|id, v| {
-            let age = now - v.last_heartbeat;
+            let age = now.saturating_sub(v.last_heartbeat);
             if age > 60_000 {
                 // 60 seconds
                 warn!(
                     "Removing stale validator {} (last heartbeat: {}ms ago)",
                     id, age
                 );
-                removed += 1;
+                removed_ids.push(id.clone());
                 false
             } else {
                 true
             }
         });
+        drop(validators);
 
-        removed
+        if !removed_ids.is_empty() {
+            let mut assignments = self.assignments.lock().unwrap();
+            assignments.retain(|_, assignment| !removed_ids.contains(&assignment.validator_id));
+        }
+
+        removed_ids.len()
     }
 }
 
@@ -483,5 +498,53 @@ mod tests {
         assert!(capacity.can_accept_job());
         assert_eq!(capacity.load_factor(), 0.0);
         assert!(capacity.is_alive());
+    }
+
+    #[test]
+    fn assign_jobs_preserves_all_remaining_pending_jobs_when_capacity_fills() {
+        let manager = JobManager::new();
+        manager
+            .register_validator(ValidatorCapacity::new("v1".to_string(), 4, 8192, 1))
+            .unwrap();
+
+        let job1 = ComputeJob::new(vec![1], vec![], ResourceLimits::default());
+        let job2 = ComputeJob::new(vec![2], vec![], ResourceLimits::default());
+        let job3 = ComputeJob::new(vec![3], vec![], ResourceLimits::default());
+        let id1 = job1.id.clone();
+        let id2 = job2.id.clone();
+        let id3 = job3.id.clone();
+
+        manager.submit_job(job1).unwrap();
+        manager.submit_job(job2).unwrap();
+        manager.submit_job(job3).unwrap();
+
+        let assigned = manager.assign_jobs().unwrap();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned[0].job_id, id1);
+        assert_eq!(manager.get_stats().pending_jobs, 2);
+        assert_eq!(manager.get_job_status(&id2), Some(JobStatus::Pending));
+        assert_eq!(manager.get_job_status(&id3), Some(JobStatus::Pending));
+    }
+
+    #[test]
+    fn cleanup_stale_validators_clears_orphaned_assignments() {
+        let manager = JobManager::new();
+        let cap = ValidatorCapacity::new("v1".to_string(), 4, 8192, 2);
+        manager.register_validator(cap).unwrap();
+
+        let job = ComputeJob::new(vec![1], vec![], ResourceLimits::default());
+        let job_id = job.id.clone();
+        manager.submit_job(job).unwrap();
+        assert_eq!(manager.assign_jobs().unwrap().len(), 1);
+        assert_eq!(manager.get_job_status(&job_id), Some(JobStatus::Running));
+
+        {
+            let mut validators = manager.validators.lock().unwrap();
+            validators.get_mut("v1").unwrap().last_heartbeat =
+                current_timestamp().saturating_sub(120_000);
+        }
+
+        assert_eq!(manager.cleanup_stale_validators(), 1);
+        assert_eq!(manager.get_job_status(&job_id), None);
     }
 }
