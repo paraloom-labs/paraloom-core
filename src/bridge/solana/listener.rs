@@ -526,11 +526,12 @@ impl EventListener {
             if batch_len == 0 {
                 break;
             }
-            // The batch is newest-first, so its last entry is the oldest — the
-            // boundary for the next, older page.
+            // The batch is newest-first, so its last valid entry is the oldest —
+            // the boundary for the next, older page.
             let oldest = batch
-                .last()
-                .and_then(|s| s.signature.parse::<Signature>().ok());
+                .iter()
+                .rev()
+                .find_map(|s| s.signature.parse::<Signature>().ok());
             signatures.extend(batch);
             pages += 1;
 
@@ -544,17 +545,20 @@ impl EventListener {
                 break;
             }
             if pages >= MAX_SIGNATURE_PAGES {
-                log::warn!(
-                    target: "paraloom::bridge::solana",
-                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
+                return Err(BridgeError::RpcError(format!(
+                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching cursor {}; refusing to index out-of-order window or advance cursor across gap",
                     MAX_SIGNATURE_PAGES,
-                    MAX_SIGNATURE_PAGES * state.batch_limit
-                );
-                break;
+                    MAX_SIGNATURE_PAGES * state.batch_limit,
+                    effective_cursor.expect("checked is_some")
+                )));
             }
             match oldest {
                 Some(sig) => before = Some(sig),
-                None => break,
+                None => {
+                    return Err(BridgeError::RpcError(
+                        "deposit listener received a full signature page with no parseable signatures".to_string(),
+                    ));
+                }
             }
         }
 

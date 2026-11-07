@@ -523,6 +523,16 @@ impl TransactVerificationCoordinator {
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
         let equivocators = self.equivocators.read().await;
+        if onchain.is_empty() {
+            let leader_selector = self.leader_selector.read().await;
+            return leader_selector
+                .get_validators()
+                .values()
+                .filter_map(|v| v.wallet_pubkey.as_ref())
+                .filter(|w| !equivocators.contains(*w))
+                .cloned()
+                .collect();
+        }
         onchain.difference(&equivocators).cloned().collect()
     }
 
@@ -712,6 +722,11 @@ impl TransactVerificationCoordinator {
             *self.onchain_wallets.write().await = stakes.keys().cloned().collect();
             *self.onchain_registry_total.write().await = registry_total_active_stake;
             *self.onchain_stakes.write().await = stakes.clone();
+        } else if registry_total_active_stake == 0 && !self.onchain_stakes.read().await.is_empty() {
+            *self.onchain_registry_total.write().await = 0;
+            for stake in self.onchain_stakes.write().await.values_mut() {
+                *stake = 0;
+            }
         }
 
         let mut leader_selector = self.leader_selector.write().await;
