@@ -136,6 +136,13 @@ impl LeaderSelector {
         self.validators.insert(validator.node_id.clone(), validator);
     }
 
+    /// Update a validator's reputation score.
+    pub fn update_reputation(&mut self, node_id: &NodeId, reputation: u64) {
+        if let Some(v) = self.validators.get_mut(node_id) {
+            v.reputation = reputation;
+        }
+    }
+
     /// Set each validator's stake to its real on-chain value, keyed by co-sign
     /// wallet. A validator whose wallet has no active on-chain `ValidatorAccount`
     /// (unknown/unadvertised wallet, or unregistered/inactive) is set to 0: it
@@ -235,6 +242,11 @@ impl LeaderSelector {
     /// Get validator info
     pub fn get_validator(&self, node_id: &NodeId) -> Option<&ValidatorInfo> {
         self.validators.get(node_id)
+    }
+
+    /// Get all registered validators (active and deactivated).
+    pub fn all_validators(&self) -> Vec<ValidatorInfo> {
+        self.validators.values().cloned().collect()
     }
 
     /// Get all active validators sorted by weight (descending)

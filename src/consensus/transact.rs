@@ -15,7 +15,7 @@
 
 use crate::consensus::leader::{LeaderSelector, ValidatorInfo};
 use crate::consensus::reputation::ReputationTracker;
-use crate::consensus::slashing::SlashingTracker;
+use crate::consensus::slashing::{SlashingEvidence, SlashingTracker};
 use crate::consensus::vote_tally::{VerificationVote, VoteTally};
 use crate::types::NodeId;
 
@@ -32,6 +32,10 @@ pub const DEFAULT_TOTAL_VALIDATORS: usize = 10;
 /// Default reputation floor for consensus participation. A validator below this
 /// may still submit a vote, but the result is computed as if it had not.
 pub const DEFAULT_MIN_REPUTATION_FOR_CONSENSUS: u64 = 200;
+
+/// Number of consecutive verification timeouts before a validator is flagged
+/// for persistent unavailability.
+pub const PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK: u64 = 3;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -269,6 +273,9 @@ pub struct TransactVerificationCoordinator {
     /// Per-validator timeout streaks
     timeout_streaks: Arc<RwLock<HashMap<NodeId, u64>>>,
 
+    /// Reputation floor for consensus participation
+    min_reputation_for_consensus: u64,
+
     /// Minimum eligible-vote count for the BFT quorum
     min_validators_for_consensus: usize,
 
@@ -334,6 +341,7 @@ impl TransactVerificationCoordinator {
             reputation_tracker: Arc::new(ReputationTracker::new()),
             slashing_tracker: Arc::new(SlashingTracker::new()),
             timeout_streaks: Arc::new(RwLock::new(HashMap::new())),
+            min_reputation_for_consensus: DEFAULT_MIN_REPUTATION_FOR_CONSENSUS,
             min_validators_for_consensus: DEFAULT_MIN_VALIDATORS_FOR_CONSENSUS,
             total_validators: DEFAULT_TOTAL_VALIDATORS,
             approval_tx: None,
@@ -469,13 +477,13 @@ impl TransactVerificationCoordinator {
         }
         let threshold = eligible_stake.saturating_mul(2) / 3 + 1;
 
-        let equivocators = self.equivocators.read().await;
+        let eligible = self.eligible_wallets().await;
         let votes = tally.votes.read().await;
         let mut counted_stake: u64 = 0;
         for (wallet, rec) in votes.iter() {
             if wallet == local
                 || !rec.vote.is_valid()
-                || equivocators.contains(wallet)
+                || !eligible.contains(wallet)
                 || !onchain_stakes.contains_key(wallet)
             {
                 continue;
@@ -518,12 +526,34 @@ impl TransactVerificationCoordinator {
     }
 
     /// The eligibility basis for counting: the staked on-chain co-sign wallets
-    /// minus any banned for equivocation. Replaces the flap-prone
-    /// `active_snapshot()` NodeId set at every tally call site.
+    /// minus any banned for equivocation, and minus any whose tracked reputation
+    /// has fallen below the configured consensus reputation floor. Replaces the
+    /// flap-prone `active_snapshot()` NodeId set at every tally call site.
     async fn eligible_wallets(&self) -> HashSet<String> {
         let onchain = self.onchain_wallets.read().await;
         let equivocators = self.equivocators.read().await;
-        onchain.difference(&equivocators).cloned().collect()
+        let mut eligible: HashSet<String> = onchain.difference(&equivocators).cloned().collect();
+
+        if self.min_reputation_for_consensus == 0 {
+            return eligible;
+        }
+
+        let leader_selector = self.leader_selector.read().await;
+        for validator in leader_selector.all_validators() {
+            if let Some(wallet) = &validator.wallet_pubkey {
+                if let Some(rep) = self
+                    .reputation_tracker
+                    .get_reputation(&validator.node_id)
+                    .await
+                {
+                    if rep < self.min_reputation_for_consensus {
+                        eligible.remove(wallet);
+                    }
+                }
+            }
+        }
+
+        eligible
     }
 
     /// Create a coordinator that emits approved transacts on a channel.
@@ -534,6 +564,21 @@ impl TransactVerificationCoordinator {
         let mut coordinator = Self::new();
         coordinator.approval_tx = Some(tx);
         (coordinator, rx)
+    }
+
+    /// Override the reputation floor for consensus eligibility.
+    pub fn set_min_reputation_for_consensus(&mut self, min_reputation: u64) {
+        self.min_reputation_for_consensus = min_reputation;
+    }
+
+    /// Reputation floor for consensus eligibility.
+    pub fn min_reputation_for_consensus(&self) -> u64 {
+        self.min_reputation_for_consensus
+    }
+
+    /// Access the reputation tracker.
+    pub fn reputation_tracker(&self) -> Arc<ReputationTracker> {
+        Arc::clone(&self.reputation_tracker)
     }
 
     /// Override the BFT thresholds. Falls back to defaults on an invalid
@@ -645,8 +690,15 @@ impl TransactVerificationCoordinator {
                 // `ValidatorAccount`. The old placeholder gave every connected
                 // peer a fixed stake, collapsing the stake-weighted quorum into
                 // head-count and making it Sybil-forgeable.
+                // Seed initial reputation from the tracker (persisted score if
+                // known, else default 1000).
+                let initial_rep = self
+                    .reputation_tracker
+                    .get_reputation(&validator)
+                    .await
+                    .unwrap_or(1000);
                 leader_selector.register_validator(
-                    ValidatorInfo::new(validator, 0, 1000).with_wallet(wallet_pubkey),
+                    ValidatorInfo::new(validator, 0, initial_rep).with_wallet(wallet_pubkey),
                 );
             }
         }
@@ -784,6 +836,46 @@ impl TransactVerificationCoordinator {
             .insert(validator.clone(), 0);
     }
 
+    /// Sync a validator's reputation from the tracker into leader selection.
+    pub async fn sync_validator_reputation(&self, validator: &NodeId) {
+        if let Some(rep) = self.reputation_tracker.get_reputation(validator).await {
+            let mut leader_selector = self.leader_selector.write().await;
+            leader_selector.update_reputation(validator, rep);
+        }
+    }
+
+    /// Record a verification timeout for a validator, updating streaks and reputation.
+    pub async fn record_timeout(&self, validator: &NodeId) {
+        let mut streaks = self.timeout_streaks.write().await;
+        let streak = streaks.entry(validator.clone()).or_insert(0);
+        *streak += 1;
+        let current = *streak;
+        drop(streaks);
+
+        if current >= PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK {
+            self.slashing_tracker
+                .record(
+                    validator.clone(),
+                    SlashingEvidence::PersistentUnavailability {
+                        streak_length: current,
+                        threshold: PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK,
+                    },
+                )
+                .await;
+        }
+
+        if let Err(e) = self.reputation_tracker.record_timeout(validator).await {
+            log::debug!(
+                target: "paraloom::consensus",
+                "skipping reputation timeout for {:?}: {}",
+                validator,
+                e
+            );
+        } else {
+            self.sync_validator_reputation(validator).await;
+        }
+    }
+
     /// Start verification for a transact request. Errors if there are not
     /// enough registered validators to reach the configured quorum.
     pub async fn start_verification(&self, request: TransactVerificationRequest) -> Result<String> {
@@ -910,8 +1002,12 @@ impl TransactVerificationCoordinator {
             }
             if let Err(e) = self.reputation_tracker.record_failure(&validator).await {
                 log::warn!("could not penalise equivocator {:?}: {}", validator, e);
+            } else {
+                self.sync_validator_reputation(&validator).await;
             }
-            self.slashing_tracker.record(validator, evidence).await;
+            self.slashing_tracker
+                .record(validator.clone(), evidence)
+                .await;
         }
 
         // Emit the approval the first time this vote completes a `Valid` quorum.
@@ -933,7 +1029,32 @@ impl TransactVerificationCoordinator {
                 };
                 if tx.send(approved).is_ok() {
                     emitted.insert(result.request_id.clone());
+                    // Update reputations for voters in this settled round
+                    let votes = consensus.tally.votes.read().await;
+                    for rec in votes.values() {
+                        if rec.vote.is_valid() {
+                            let _ = self.reputation_tracker.record_success(&rec.node_id).await;
+                        } else {
+                            let _ = self.reputation_tracker.record_failure(&rec.node_id).await;
+                        }
+                        self.sync_validator_reputation(&rec.node_id).await;
+                    }
                 }
+            }
+        }
+
+        // If approval was already emitted for this request, this vote arrived after
+        // consensus was reached. Reward or penalize the late voter based on
+        // whether their vote aligned with the emitted Valid consensus.
+        {
+            let emitted = self.emitted.read().await;
+            if emitted.contains(&result.request_id) {
+                if result.vote.is_valid() {
+                    let _ = self.reputation_tracker.record_success(&validator).await;
+                } else {
+                    let _ = self.reputation_tracker.record_failure(&validator).await;
+                }
+                self.sync_validator_reputation(&validator).await;
             }
         }
 
@@ -1000,7 +1121,16 @@ impl TransactVerificationCoordinator {
             .collect();
         let count = timed_out.len();
         for id in timed_out {
-            pending.remove(&id);
+            if let Some(consensus) = pending.remove(&id) {
+                let votes = consensus.tally.votes.read().await;
+                let registered = self.validators.read().await;
+                for v in registered.iter() {
+                    let voted = votes.values().any(|rec| &rec.node_id == v);
+                    if !voted {
+                        self.record_timeout(v).await;
+                    }
+                }
+            }
             // A content-bound canonical id that timed out must be re-approvable
             // if the client re-proves it, so drop any stale emitted mark too.
             self.emitted.write().await.remove(&id);
@@ -1571,5 +1701,140 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    // ---- reputation floor / consensus wiring ----
+
+    #[test]
+    fn default_min_reputation_for_consensus_is_200() {
+        let coordinator = TransactVerificationCoordinator::new();
+        assert_eq!(
+            coordinator.min_reputation_for_consensus(),
+            DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+        );
+        assert_eq!(coordinator.min_reputation_for_consensus(), 200);
+    }
+
+    #[test]
+    fn set_min_reputation_for_consensus_updates_floor() {
+        let mut coordinator = TransactVerificationCoordinator::new();
+        coordinator.set_min_reputation_for_consensus(500);
+        assert_eq!(coordinator.min_reputation_for_consensus(), 500);
+        coordinator.set_min_reputation_for_consensus(0);
+        assert_eq!(coordinator.min_reputation_for_consensus(), 0);
+    }
+
+    #[tokio::test]
+    async fn validator_below_reputation_floor_excluded_from_consensus() {
+        let (c, mut rx) = coord_2of2().await;
+        // W0 is local authority, W1 is peer co-signer.
+        // Initially both have reputation 1000 >= 200.
+        let eligible_initial = c.eligible_wallets().await;
+        assert!(eligible_initial.contains("W0"));
+        assert!(eligible_initial.contains("W1"));
+
+        // Penalize W1 below the 200 floor (e.g. 100 via repeated failures).
+        let tracker = c.reputation_tracker();
+        for _ in 0..17 {
+            let _ = tracker.record_failure(&NodeId(vec![1])).await;
+        }
+        let rep = tracker.get_reputation(&NodeId(vec![1])).await.unwrap();
+        assert!(
+            rep < 200,
+            "W1's reputation should be below floor (got {})",
+            rep
+        );
+        c.sync_validator_reputation(&NodeId(vec![1])).await;
+
+        // W1 should now be excluded from eligible_wallets.
+        let eligible = c.eligible_wallets().await;
+        assert!(eligible.contains("W0"));
+        assert!(
+            !eligible.contains("W1"),
+            "penalized validator must be excluded from eligible wallets"
+        );
+
+        // Submit vote from W1: because it is below the reputation floor,
+        // it cannot complete the 2-of-2 quorum.
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a vote from a validator below the reputation floor must not count toward approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_floor_override_restores_eligibility() {
+        let (mut c, mut rx) = coord_2of2().await;
+        let tracker = c.reputation_tracker();
+        for _ in 0..17 {
+            let _ = tracker.record_failure(&NodeId(vec![1])).await;
+        }
+        c.sync_validator_reputation(&NodeId(vec![1])).await;
+
+        // At default floor 200, W1 is excluded.
+        assert!(!c.eligible_wallets().await.contains("W1"));
+
+        // Lower the floor to 50: W1 (at 100) becomes eligible again.
+        c.set_min_reputation_for_consensus(50);
+        assert!(c.eligible_wallets().await.contains("W1"));
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        c.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "once reputation floor is lowered, the validator's vote counts and settles"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_rewards_and_penalties_synced_on_transact_approval() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let tracker = coord.reputation_tracker();
+        let rep_before = tracker.get_reputation(&NodeId(vec![1])).await.unwrap();
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok());
+
+        let rep_after = tracker.get_reputation(&NodeId(vec![1])).await.unwrap();
+        assert!(
+            rep_after > rep_before,
+            "successful consensus verification must reward validator reputation"
+        );
+        let sel = coord.leader_selector.read().await;
+        let info = sel.get_validator(&NodeId(vec![1])).unwrap();
+        assert_eq!(
+            info.reputation, rep_after,
+            "leader selector reputation must be synchronized with tracker score"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_timeout_tracks_streak_and_persistent_unavailability() {
+        let coord = TransactVerificationCoordinator::new();
+        let val = NodeId(vec![42]);
+        coord.register_validator(val.clone()).await;
+
+        for _ in 0..PERSISTENT_UNAVAILABILITY_TIMEOUT_STREAK {
+            coord.record_timeout(&val).await;
+        }
+
+        assert!(
+            coord.slashing_tracker().total_count().await > 0,
+            "persistent unavailability must be recorded in slashing tracker after timeout streak"
+        );
     }
 }

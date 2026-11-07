@@ -1499,6 +1499,9 @@ impl Node {
             ) {
                 coord.set_consensus_thresholds(min, total);
             }
+            if let Some(rep) = settings.bridge.consensus_min_reputation {
+                coord.set_min_reputation_for_consensus(rep);
+            }
             (Some(Arc::new(coord)), Some(rx))
         } else {
             (None, None)
@@ -1557,6 +1560,15 @@ impl Node {
     ) -> Self {
         if let Some(coordinator) = self.transact_coordinator.as_mut().and_then(Arc::get_mut) {
             coordinator.set_consensus_thresholds(min_validators, total_validators);
+        }
+        self
+    }
+
+    /// Override the transact-consensus minimum reputation floor.
+    /// Must be called right after `new()`, before `run()` clones the node.
+    pub fn with_transact_consensus_min_reputation(mut self, min_reputation: u64) -> Self {
+        if let Some(coordinator) = self.transact_coordinator.as_mut().and_then(Arc::get_mut) {
+            coordinator.set_min_reputation_for_consensus(min_reputation);
         }
         self
     }
@@ -3633,5 +3645,38 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[test]
+    fn transact_consensus_defaults_to_rep200() {
+        let mut settings = Settings::development();
+        settings.node.node_type = "Validator".to_string();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let coord = node.transact_coordinator.as_ref().expect("coordinator");
+        assert_eq!(coord.min_reputation_for_consensus(), 200);
+    }
+
+    #[test]
+    fn transact_consensus_min_reputation_config_wires_to_coordinator() {
+        let mut settings = Settings::development();
+        settings.node.node_type = "Validator".to_string();
+        settings.bridge.enabled = true;
+        settings.bridge.consensus_min_reputation = Some(350);
+        let node = Node::new(settings).expect("construct node");
+        let coord = node.transact_coordinator.as_ref().expect("coordinator");
+        assert_eq!(coord.min_reputation_for_consensus(), 350);
+    }
+
+    #[test]
+    fn with_transact_consensus_min_reputation_overrides_coordinator() {
+        let mut settings = Settings::development();
+        settings.node.node_type = "Validator".to_string();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings)
+            .expect("construct node")
+            .with_transact_consensus_min_reputation(450);
+        let coord = node.transact_coordinator.as_ref().expect("coordinator");
+        assert_eq!(coord.min_reputation_for_consensus(), 450);
     }
 }
