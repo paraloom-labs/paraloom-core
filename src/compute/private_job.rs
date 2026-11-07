@@ -505,6 +505,12 @@ pub struct PrivateJobCoordinator {
 
     /// Multi-validator verification coordinator (optional)
     verification_coordinator: Option<Arc<crate::compute::VerificationCoordinator>>,
+
+    /// Submitted private jobs keyed by job_id
+    submitted_jobs: tokio::sync::RwLock<std::collections::HashMap<JobId, PrivateComputeJob>>,
+
+    /// Finalized private job results keyed by job_id
+    finalized_results: tokio::sync::RwLock<std::collections::HashMap<JobId, PrivateJobResult>>,
 }
 
 impl PrivateJobCoordinator {
@@ -513,6 +519,8 @@ impl PrivateJobCoordinator {
         Self {
             pool,
             verification_coordinator: None,
+            submitted_jobs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            finalized_results: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -524,22 +532,45 @@ impl PrivateJobCoordinator {
         Self {
             pool,
             verification_coordinator: Some(verification_coordinator),
+            submitted_jobs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            finalized_results: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     /// Submit a private compute job
     pub async fn submit_private_job(&self, job: PrivateComputeJob) -> Result<JobId> {
-        // Create a deposit transaction to register input commitment
+        if job.job_id.trim().is_empty() {
+            return Err(anyhow!("Private job_id must not be empty"));
+        }
+        {
+            let submitted = self.submitted_jobs.read().await;
+            if submitted.contains_key(&job.job_id) {
+                return Err(anyhow!("Private job {} is already submitted", job.job_id));
+            }
+        }
+
+        // Register the job's actual `input_commitment` in the shielded pool
         let randomness = crate::privacy::pedersen::generate_randomness();
         let amount = job.encrypted_input.len() as u64; // Use size as "amount"
+        let note = Note::new_native(job.owner_address.clone(), amount, randomness);
 
-        let note = Note::new_native(job.owner_address, amount, randomness);
+        self.pool
+            .credit_commitment(
+                job.input_commitment.clone(),
+                note,
+                amount,
+                crate::privacy::types::NATIVE_SOL_ASSET,
+            )
+            .await?;
 
-        // Deposit into shielded pool
-        self.pool.deposit(note.clone(), amount).await?;
+        let job_id = job.job_id.clone();
+        self.submitted_jobs
+            .write()
+            .await
+            .insert(job_id.clone(), job);
 
-        log::info!("Private job submitted: {}", job.job_id);
-        Ok(job.job_id.clone())
+        log::info!("Private job submitted: {}", job_id);
+        Ok(job_id)
     }
 
     /// Verify a private job result
@@ -550,6 +581,14 @@ impl PrivateJobCoordinator {
     /// 3. Multi-validator consensus (if enabled)
     pub async fn verify_result(&self, result: &PrivateJobResult) -> Result<bool> {
         log::info!("Verifying private job result: {}", result.job_id);
+
+        if result.job_id.trim().is_empty() || result.output_commitment.0 == [0u8; 32] {
+            log::warn!(
+                "Invalid job_id or zero output_commitment for job {}",
+                result.job_id
+            );
+            return Ok(false);
+        }
 
         // Step 1: Verify zkSNARK proof
         let proof_valid = PrivateJobResult::verify_execution_proof(result)?;
@@ -594,26 +633,74 @@ impl PrivateJobCoordinator {
     ///
     /// Should only be called after verify_result() returns true.
     pub async fn finalize_result(&self, result: PrivateJobResult) -> Result<()> {
+        if self
+            .finalized_results
+            .read()
+            .await
+            .contains_key(&result.job_id)
+        {
+            return Err(anyhow!(
+                "Private job {} is already finalized",
+                result.job_id
+            ));
+        }
+
         // Verify before finalizing
         if !self.verify_result(&result).await? {
             return Err(anyhow!("Result verification failed"));
         }
 
-        // Register output commitment in shielded pool
-        // This allows the job owner to later withdraw/decrypt the result
-        // TODO: Create proper note for output commitment
-        log::info!("Private job result finalized: {}", result.job_id);
+        // Register output commitment in shielded pool so the job owner can
+        // authenticate and retrieve the finalized output commitment.
+        let owner_address = self
+            .submitted_jobs
+            .read()
+            .await
+            .get(&result.job_id)
+            .map(|j| j.owner_address.clone())
+            .unwrap_or(ShieldedAddress([0u8; 32]));
+        let randomness = crate::privacy::pedersen::generate_randomness();
+        let amount = result.encrypted_output.len() as u64;
+        let output_note = Note::new_native(owner_address, amount, randomness);
+        self.pool
+            .credit_commitment(
+                result.output_commitment.clone(),
+                output_note,
+                amount,
+                crate::privacy::types::NATIVE_SOL_ASSET,
+            )
+            .await?;
+
+        let job_id = result.job_id.clone();
+        self.finalized_results
+            .write()
+            .await
+            .insert(job_id.clone(), result);
+
+        log::info!("Private job result finalized: {}", job_id);
         Ok(())
     }
 
-    /// Retrieve a private result (requires ownership proof)
+    /// Retrieve a private result (requires ownership check against the job's owner_address)
     pub async fn retrieve_result(
         &self,
-        _job_id: &JobId,
-        _owner_address: &ShieldedAddress,
+        job_id: &JobId,
+        owner_address: &ShieldedAddress,
     ) -> Result<PrivateJobResult> {
-        // TODO: Verify ownership and retrieve from pool
-        Err(anyhow!("Result retrieval not yet implemented"))
+        if let Some(job) = self.submitted_jobs.read().await.get(job_id) {
+            if &job.owner_address != owner_address {
+                return Err(anyhow!(
+                    "Unauthorized: caller is not the owner of private job {}",
+                    job_id
+                ));
+            }
+        }
+        self.finalized_results
+            .read()
+            .await
+            .get(job_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Finalized result not found for job {}", job_id))
     }
 }
 
@@ -1076,6 +1163,76 @@ mod tests {
         assert!(
             decrypted_wrong.is_err(),
             "Wrong key should fail decryption (authenticated encryption)"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_job_coordinator_credits_commitments_and_enforces_owner_on_retrieve() {
+        use crate::compute::{JobResult, JobStatus};
+
+        let pool = Arc::new(ShieldedPool::new());
+        let coordinator = PrivateJobCoordinator::new(pool.clone());
+
+        let (owner_address, owner_secret) = owner_keypair();
+        let (other_address, _) = owner_keypair();
+        let job = PrivateComputeJob::new(
+            vec![0x00, 0x61, 0x73, 0x6d],
+            vec![10, 20, 30],
+            owner_address.clone(),
+            ResourceLimits::default(),
+        )
+        .unwrap();
+        let job_id = job.job_id.clone();
+        let input_commitment = job.input_commitment.clone();
+
+        coordinator.submit_private_job(job.clone()).await.unwrap();
+        assert!(
+            pool.get_note(&input_commitment).await.is_some(),
+            "submit_private_job must register job.input_commitment in the shielded pool"
+        );
+        assert!(
+            coordinator.submit_private_job(job).await.is_err(),
+            "duplicate job submission must be rejected"
+        );
+
+        let job_result = JobResult {
+            job_id: job_id.clone(),
+            status: JobStatus::Completed,
+            output_data: Some(vec![99, 88, 77]),
+            error: None,
+            execution_time_ms: 10,
+            memory_used_bytes: 512,
+            instructions_executed: 1000,
+        };
+        let private_result =
+            PrivateJobResult::from_job_result(job_id.clone(), job_result, &owner_address).unwrap();
+        let output_commitment = private_result.output_commitment.clone();
+
+        coordinator
+            .finalize_result(private_result.clone())
+            .await
+            .unwrap();
+        assert!(
+            pool.get_note(&output_commitment).await.is_some(),
+            "finalize_result must register result.output_commitment in the shielded pool"
+        );
+        assert!(
+            coordinator.finalize_result(private_result).await.is_err(),
+            "duplicate finalization must be rejected"
+        );
+
+        // Unauthorized caller cannot retrieve the result; owner can retrieve and decrypt it.
+        assert!(coordinator
+            .retrieve_result(&job_id, &other_address)
+            .await
+            .is_err());
+        let retrieved = coordinator
+            .retrieve_result(&job_id, &owner_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            retrieved.decrypt_output(&owner_secret).unwrap(),
+            vec![99, 88, 77]
         );
     }
 }
