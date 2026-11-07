@@ -264,6 +264,18 @@ impl JobCoordinator {
             .collect()
     }
 
+    /// Look up the validator currently assigned to `job_id` (pending or active).
+    pub async fn assigned_validator(&self, job_id: &JobId) -> Option<ValidatorId> {
+        if let Some(a) = self.pending_assignments.read().await.get(job_id) {
+            return Some(a.validator_id.clone());
+        }
+        self.active_assignments
+            .read()
+            .await
+            .get(job_id)
+            .map(|a| a.validator_id.clone())
+    }
+
     /// Remove a completed job assignment
     pub async fn remove_assignment(&self, job_id: &JobId) -> Result<()> {
         let mut pending = self.pending_assignments.write().await;

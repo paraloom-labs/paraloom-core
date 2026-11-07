@@ -608,7 +608,29 @@ impl TransactVerificationCoordinator {
             }
         }
 
+        // Evict any prior NodeId that claimed the same co-sign wallet so one
+        // on-chain wallet cannot register multiple Sybil NodeIds to inflate
+        // validator_count or leader-selection weight.
+        let mut stale_ids: Vec<NodeId> = Vec::new();
+        if let Some(ref wallet) = wallet_pubkey {
+            let sel = self.leader_selector.read().await;
+            let current = self.validators.read().await;
+            for existing_id in current.iter() {
+                if existing_id != &validator
+                    && sel
+                        .get_validator(existing_id)
+                        .and_then(|v| v.wallet_pubkey.as_ref())
+                        == Some(wallet)
+                {
+                    stale_ids.push(existing_id.clone());
+                }
+            }
+        }
+
         let mut validators = self.validators.write().await;
+        if !stale_ids.is_empty() {
+            validators.retain(|v| !stale_ids.contains(v));
+        }
         if !validators.contains(&validator) {
             log::info!(
                 "Validator registered for transact consensus: {:?} (wallet: {:?})",
@@ -1571,5 +1593,27 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_wallet_registration_evicts_stale_node_id_in_coordinator() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1wallet", 1_000_000_000)]), 1_000_000_000)
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("VAL1wallet".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("VAL1wallet".to_string()))
+            .await;
+
+        assert_eq!(
+            coordinator.validator_count().await,
+            1,
+            "registering the same wallet under a new NodeId must evict the stale NodeId"
+        );
+        assert!(!coordinator.is_registered_validator(&NodeId(vec![1])).await);
+        assert!(coordinator.is_registered_validator(&NodeId(vec![2])).await);
     }
 }

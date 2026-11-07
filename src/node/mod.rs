@@ -227,6 +227,14 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 info!("Received Pong from {}", source);
             }
             Message::Discovery { node_info } => {
+                if node_info.id != source {
+                    log::warn!(
+                        "Dropping Discovery with mismatched node_info.id {:?} != sender {:?}",
+                        node_info.id,
+                        source
+                    );
+                    return Ok(());
+                }
                 info!("Discovered node {}: {:?}", source, node_info);
 
                 // If we're a coordinator, register this validator
@@ -421,16 +429,36 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     request.request_id
                 );
 
+                // Reject replays of already-spent nullifiers against the local
+                // ShieldedPool before reusing cached approvals or running Groth16.
+                let nullifier_spent = match &self.shielded_pool {
+                    Some(pool) => {
+                        pool.is_spent(&crate::privacy::types::Nullifier(request.nullifiers[0]))
+                            .await
+                            || pool
+                                .is_spent(&crate::privacy::types::Nullifier(request.nullifiers[1]))
+                                .await
+                    }
+                    None => false,
+                };
+                if nullifier_spent {
+                    self.verified_transacts
+                        .lock()
+                        .await
+                        .remove(&request.request_id);
+                }
+
                 // Short-circuit a request we have already verified `Valid` rather
                 // than re-running the proof (#726). `verified_transacts` only holds
                 // `Valid` results, so a cache hit is a proven-valid repeat; reusing
                 // it stops a valid transact re-broadcast from re-triggering the
                 // full Groth16 verification on every honest validator.
-                let already_verified = self
-                    .verified_transacts
-                    .lock()
-                    .await
-                    .contains_key(&request.request_id);
+                let already_verified = !nullifier_spent
+                    && self
+                        .verified_transacts
+                        .lock()
+                        .await
+                        .contains_key(&request.request_id);
 
                 // Verify the transact zkSNARK proof, mirroring the transfer
                 // path (#350). Unlike a transfer, the v3 proof binds
@@ -438,7 +466,15 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // carried in the request), so verification needs no pool
                 // state; the pool gate below only keeps non-bridge nodes from
                 // voting on settlements they do not participate in.
-                let vote = if already_verified {
+                let vote = if nullifier_spent {
+                    log::warn!(
+                        "Transact {} spends an already-spent nullifier; voting Invalid",
+                        request.request_id
+                    );
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "Input nullifier already spent".to_string(),
+                    }
+                } else if already_verified {
                     info!(
                         "Transact {} already verified Valid; reusing cached result",
                         request.request_id
@@ -729,6 +765,27 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     source, job_id, accepted, message
                 );
 
+                if let Some(coordinator) = &self.compute_coordinator {
+                    if let Some(assigned_val) = coordinator.assigned_validator(&job_id).await {
+                        if self.validator_id_to_node_id(&assigned_val).ok().as_ref()
+                            != Some(&source)
+                        {
+                            log::warn!(
+                                "Dropping ComputeJobResponse for {} from unassigned peer {} (assigned to {})",
+                                job_id,
+                                source,
+                                assigned_val
+                            );
+                            return Ok(());
+                        }
+                    }
+                    if accepted {
+                        let _ = coordinator.mark_job_fetched(&job_id).await;
+                    } else {
+                        let _ = coordinator.remove_assignment(&job_id).await;
+                    }
+                }
+
                 // If we have a manager (coordinator node), notify it
                 if let Some(_manager) = &self.compute_manager {
                     if accepted {
@@ -780,6 +837,23 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     "Received compute job result from {}: job_id={}, status={:?}",
                     source, job_id, status
                 );
+
+                if let Some(coordinator) = &self.compute_coordinator {
+                    if let Some(assigned_val) = coordinator.assigned_validator(&job_id).await {
+                        if self.validator_id_to_node_id(&assigned_val).ok().as_ref()
+                            != Some(&source)
+                        {
+                            log::warn!(
+                                "Dropping ComputeJobResult for {} from unassigned peer {} (assigned to {})",
+                                job_id,
+                                source,
+                                assigned_val
+                            );
+                            return Ok(());
+                        }
+                        let _ = coordinator.remove_assignment(&job_id).await;
+                    }
+                }
 
                 // Store result and update job status
                 let result = crate::compute::JobResult {
@@ -2323,6 +2397,8 @@ impl Node {
                     Message::TransactVerificationRequest { request },
                 )
                 .await?;
+        } else {
+            let _ = coordinator.cleanup(&request_id).await;
         }
         info!("initiated transact verification: {}", request_id);
         Ok(request_id)
@@ -2693,6 +2769,22 @@ impl Node {
         &self,
         request: &crate::consensus::transact::TransactVerificationRequest,
     ) -> Result<bool> {
+        if let Some(pool) = &self.shielded_pool {
+            if pool
+                .is_spent(&crate::privacy::types::Nullifier(request.nullifiers[0]))
+                .await
+                || pool
+                    .is_spent(&crate::privacy::types::Nullifier(request.nullifiers[1]))
+                    .await
+            {
+                log::warn!(
+                    "transact proof rejected for {}: input nullifier already spent in local pool",
+                    request.request_id
+                );
+                return Ok(false);
+            }
+        }
+
         // Override seam (#350): use the injected verifier when present.
         if let Some(verifier) = &self.transact_proof_verifier_override {
             return Ok(verifier(request));
@@ -3633,5 +3725,121 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn compute_job_response_and_result_enforce_assigned_validator_and_update_coordinator() {
+        use crate::network::protocol::NetworkEventHandler;
+
+        let mut settings = Settings::development();
+        settings.node.node_type = "Coordinator".to_string();
+        let node = Node::new(settings).expect("construct coordinator node");
+
+        let assigned = NodeId(vec![0x11, 0x22]);
+        let imposter = NodeId(vec![0x99, 0x88]);
+        let assigned_hex = hex::encode(&assigned.0);
+
+        let cap = crate::compute::ValidatorCapacity::new(assigned_hex.clone(), 4, 8192, 2);
+        node.register_compute_validator(cap).await.unwrap();
+
+        let coord = node.compute_coordinator().unwrap();
+        let job_id = "job-test-1".to_string();
+        coord.assign_job(job_id.clone()).await.unwrap();
+        assert_eq!(coord.get_stats().await.pending_assignments, 1);
+
+        // Spoofed rejection from an unassigned peer must be ignored.
+        node.handle_message(
+            imposter.clone(),
+            Message::ComputeJobResponse {
+                job_id: job_id.clone(),
+                accepted: false,
+                message: "spoof".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(coord.get_stats().await.pending_assignments, 1);
+
+        // Authentic acceptance moves the job from pending to active.
+        node.handle_message(
+            assigned.clone(),
+            Message::ComputeJobResponse {
+                job_id: job_id.clone(),
+                accepted: true,
+                message: "ok".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(coord.get_stats().await.pending_assignments, 0);
+        assert_eq!(coord.get_stats().await.active_assignments, 1);
+
+        // Spoofed result from imposter must not clear the active assignment.
+        node.handle_message(
+            imposter,
+            Message::ComputeJobResult {
+                job_id: job_id.clone(),
+                status: crate::compute::JobStatus::Completed,
+                output_data: Some(vec![1, 2, 3]),
+                execution_time_ms: 10,
+                memory_used_bytes: 1024,
+                instructions_executed: 100,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(coord.get_stats().await.active_assignments, 1);
+
+        // Authentic result from assigned validator clears the active assignment.
+        node.handle_message(
+            assigned,
+            Message::ComputeJobResult {
+                job_id: job_id.clone(),
+                status: crate::compute::JobStatus::Completed,
+                output_data: Some(vec![4, 5, 6]),
+                execution_time_ms: 10,
+                memory_used_bytes: 1024,
+                instructions_executed: 100,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(coord.get_stats().await.active_assignments, 0);
+    }
+
+    #[tokio::test]
+    async fn verify_transact_proof_rejects_already_spent_nullifiers() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings)
+            .expect("construct node")
+            .with_transact_proof_verifier(Arc::new(|_| true));
+
+        let mut req = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [1u8; 32],
+            mint: None,
+            nullifiers: [[0xAAu8; 32], [0xBBu8; 32]],
+            output_commitments: [[3u8; 32], [4u8; 32]],
+            root: [5u8; 32],
+            ext_amount: -100,
+            proof: vec![1u8; 193],
+            ciphertexts: [String::new(), String::new()],
+            timestamp: 1,
+        };
+        req.request_id = req.canonical_id();
+
+        assert!(node.verify_transact_proof(&req).await.unwrap());
+
+        node.shielded_pool
+            .as_ref()
+            .unwrap()
+            .record_spent(req.nullifiers)
+            .await;
+
+        assert!(
+            !node.verify_transact_proof(&req).await.unwrap(),
+            "verify_transact_proof must reject a transact spending an already-spent nullifier"
+        );
     }
 }

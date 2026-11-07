@@ -86,6 +86,11 @@ impl LeaderSelector {
 
     /// Register a validator
     pub fn register_validator(&mut self, validator: ValidatorInfo) {
+        if let Some(ref wallet) = validator.wallet_pubkey {
+            self.validators.retain(|id, existing| {
+                id == &validator.node_id || existing.wallet_pubkey.as_ref() != Some(wallet)
+            });
+        }
         log::info!(
             "Registering validator for leader selection: {:?} (stake: {}, reputation: {})",
             validator.node_id,
@@ -133,6 +138,11 @@ impl LeaderSelector {
 
     /// Update validator info
     pub fn update_validator(&mut self, validator: ValidatorInfo) {
+        if let Some(ref wallet) = validator.wallet_pubkey {
+            self.validators.retain(|id, existing| {
+                id == &validator.node_id || existing.wallet_pubkey.as_ref() != Some(wallet)
+            });
+        }
         self.validators.insert(validator.node_id.clone(), validator);
     }
 
@@ -491,5 +501,36 @@ mod tests {
         selector.unregister_validator(&NodeId(vec![1]));
 
         assert_eq!(selector.active_validator_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_wallet_registration_replaces_stale_node_id() {
+        let mut selector = LeaderSelector::new();
+        selector.register_validator(
+            ValidatorInfo::new(NodeId(vec![1]), 10_000_000_000, 1000)
+                .with_wallet(Some("WALLET_A".to_string())),
+        );
+        selector.register_validator(
+            ValidatorInfo::new(NodeId(vec![2]), 10_000_000_000, 1000)
+                .with_wallet(Some("WALLET_A".to_string())),
+        );
+
+        let mut onchain = HashMap::new();
+        onchain.insert("WALLET_A".to_string(), 10_000_000_000u64);
+        selector.apply_onchain_stakes(&onchain);
+
+        assert_eq!(
+            selector.active_validator_count(),
+            1,
+            "one wallet must not occupy multiple active leader-selector slots"
+        );
+        assert!(selector.get_validator(&NodeId(vec![1])).is_none());
+        assert_eq!(
+            selector
+                .get_validator(&NodeId(vec![2]))
+                .unwrap()
+                .stake_amount,
+            10_000_000_000
+        );
     }
 }
