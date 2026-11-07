@@ -94,11 +94,23 @@ impl VerificationChunk {
                     };
                 }
 
-                // Commitments must be non-zero
+                // Commitments must be non-zero, canonical field encodings, and unique
+                use std::collections::HashSet;
+                let mut seen = HashSet::new();
                 for commitment in commitments {
                     if commitment.as_bytes() == &[0u8; 32] {
                         return VerificationResult::Invalid {
                             reason: "Zero commitment detected".to_string(),
+                        };
+                    }
+                    if !is_canonical_le(commitment.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "Non-canonical output commitment encoding".to_string(),
+                        };
+                    }
+                    if !seen.insert(commitment) {
+                        return VerificationResult::Invalid {
+                            reason: "Duplicate output commitment in chunk".to_string(),
                         };
                     }
                 }
@@ -113,10 +125,20 @@ impl VerificationChunk {
                     };
                 }
 
-                // Check for duplicates within batch
+                // Check for zero, non-canonical field encodings, and duplicates within batch
                 use std::collections::HashSet;
                 let mut seen = HashSet::new();
                 for nullifier in nullifiers {
+                    if nullifier.as_bytes() == &[0u8; 32] {
+                        return VerificationResult::Invalid {
+                            reason: "Zero nullifier detected".to_string(),
+                        };
+                    }
+                    if !is_canonical_le(nullifier.as_bytes()) {
+                        return VerificationResult::Invalid {
+                            reason: "Non-canonical nullifier encoding".to_string(),
+                        };
+                    }
                     if !seen.insert(nullifier) {
                         return VerificationResult::Invalid {
                             reason: "Duplicate nullifier in transaction".to_string(),
@@ -128,6 +150,16 @@ impl VerificationChunk {
             }
 
             VerificationChunk::MerkleProof { leaf, path, root } => {
+                if !is_canonical_le(leaf) || !is_canonical_le(root) {
+                    return VerificationResult::Invalid {
+                        reason: "Non-canonical Merkle leaf or root encoding".to_string(),
+                    };
+                }
+                if !path.path.iter().all(is_canonical_le) {
+                    return VerificationResult::Invalid {
+                        reason: "Non-canonical Merkle sibling encoding".to_string(),
+                    };
+                }
                 // Verify path
                 if path.verify(leaf, root) {
                     VerificationResult::Valid
@@ -311,6 +343,11 @@ impl ProofVerifier {
                     reason: "non-canonical output commitment encoding".to_string(),
                 };
             }
+        }
+        if output_commitments[0] == output_commitments[1] {
+            return VerificationResult::Invalid {
+                reason: "duplicate output commitment".to_string(),
+            };
         }
 
         // The blob is `suite_tag(1) || body` (see `proof_codec::ProofSuite`).
@@ -579,6 +616,47 @@ mod tests {
         let chunk = VerificationChunk::NullifierUniqueness { nullifiers };
 
         assert!(!chunk.verify().is_valid());
+    }
+
+    #[test]
+    fn chunk_and_transact_parts_reject_duplicate_or_non_canonical_commitments_and_zero_nullifier() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus = [0u8; 32];
+        modulus[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let dup_commit_chunk = VerificationChunk::OutputCommitments {
+            commitments: vec![Commitment([1u8; 32]), Commitment([1u8; 32])],
+        };
+        assert!(!dup_commit_chunk.verify().is_valid());
+
+        let non_canon_commit_chunk = VerificationChunk::OutputCommitments {
+            commitments: vec![Commitment(modulus)],
+        };
+        assert!(!non_canon_commit_chunk.verify().is_valid());
+
+        let zero_nf_chunk = VerificationChunk::NullifierUniqueness {
+            nullifiers: vec![Nullifier([0u8; 32])],
+        };
+        assert!(!zero_nf_chunk.verify().is_valid());
+
+        let non_canon_nf_chunk = VerificationChunk::NullifierUniqueness {
+            nullifiers: vec![Nullifier(modulus)],
+        };
+        assert!(!non_canon_nf_chunk.verify().is_valid());
+
+        let dup_out = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+            &[[9u8; 32], [9u8; 32]],
+            &[0u8; 64],
+        );
+        assert!(matches!(
+            dup_out,
+            VerificationResult::Invalid { reason } if reason.contains("duplicate output commitment")
+        ));
     }
 
     #[test]

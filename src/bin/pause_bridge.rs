@@ -33,7 +33,23 @@ fn read_paused(
     let (bridge_state, _) =
         solana_sdk::pubkey::Pubkey::find_program_address(&[b"bridge_state"], program_id);
     let acc = client.get_account(&bridge_state)?;
-    Ok(acc.data.get(PAUSED_OFFSET).copied().unwrap_or(0) != 0)
+    if &acc.owner != program_id {
+        return Err(format!(
+            "bridge_state {} is owned by {}, expected {}",
+            bridge_state, acc.owner, program_id
+        )
+        .into());
+    }
+    const BRIDGE_STATE_DISCRIMINATOR: [u8; 8] = [23, 224, 166, 200, 16, 130, 102, 31];
+    if acc.data.len() <= PAUSED_OFFSET || acc.data[..8] != BRIDGE_STATE_DISCRIMINATOR {
+        return Err(format!(
+            "bridge_state {} has invalid length ({}) or discriminator",
+            bridge_state,
+            acc.data.len()
+        )
+        .into());
+    }
+    Ok(acc.data[PAUSED_OFFSET] != 0)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
