@@ -31,6 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program_id = Pubkey::from_str(&std::env::var("SOLANA_PROGRAM_ID")?)?;
     let authority = load_keypair_from_file(&std::env::var("BRIDGE_AUTHORITY_KEYPAIR_PATH")?)?;
     let new_authority = Pubkey::from_str(&std::env::var("NEW_BRIDGE_AUTHORITY")?)?;
+    if new_authority == Pubkey::default() {
+        return Err("NEW_BRIDGE_AUTHORITY must not be the all-zero system program address".into());
+    }
 
     let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
