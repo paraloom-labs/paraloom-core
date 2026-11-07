@@ -169,6 +169,15 @@ impl ProgramInterface {
         self.rpc.get_balance(&Pubkey::new_from_array(address)).await
     }
 
+    /// The program that owns an account. For a mint this is its token
+    /// program (classic SPL Token or Token-2022), which the settlement
+    /// builder must know to derive ATAs and name the `transfer_checked`
+    /// CPI program (#1337). A mint's owner is fixed at creation, so every
+    /// node that asks the chain gets the same answer.
+    pub async fn account_owner(&self, pubkey: &Pubkey) -> Result<Pubkey> {
+        Ok(self.rpc.get_account(pubkey).await?.owner)
+    }
+
     /// Check if program is deployed
     pub async fn is_program_deployed(&self) -> Result<bool> {
         match self.rpc.get_account(&self.program_id).await {
