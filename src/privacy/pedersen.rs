@@ -134,16 +134,20 @@ impl PedersenCommitment {
         Commitment(commitment_bytes)
     }
 
-    /// Verify that a commitment opens to a specific value
+    /// Verify that a commitment opens to a specific value in constant time
     pub fn verify(&self, commitment: &Commitment, value: u64, randomness: &[u8; 32]) -> bool {
         let recomputed = self.commit(value, randomness);
-        commitment == &recomputed
+        let mut diff = 0u8;
+        for (a, b) in commitment.0.iter().zip(recomputed.0.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
 
     /// Generate cryptographically secure randomness
     pub fn generate_randomness() -> [u8; 32] {
-        let mut rng = ark_std::rand::thread_rng();
-        let random_field = Fr::rand(&mut rng);
+        use ark_std::rand::rngs::OsRng;
+        let random_field = Fr::rand(&mut OsRng);
         let mut bytes = [0u8; 32];
         random_field
             .into_bigint()

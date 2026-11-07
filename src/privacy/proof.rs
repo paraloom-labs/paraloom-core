@@ -312,6 +312,16 @@ impl ProofVerifier {
                 };
             }
         }
+        if !is_canonical_le(asset_id) {
+            return VerificationResult::Invalid {
+                reason: "non-canonical asset_id encoding".to_string(),
+            };
+        }
+        if nullifiers[0] == nullifiers[1] {
+            return VerificationResult::Invalid {
+                reason: "duplicate input nullifier".to_string(),
+            };
+        }
 
         // The blob is `suite_tag(1) || body` (see `proof_codec::ProofSuite`).
         // Dispatch on the tag rather than on "whatever verifying key this build
@@ -485,6 +495,45 @@ mod tests {
                 assert!(reason.contains("non-canonical nullifier"), "{reason}")
             }
             _ => panic!("non-canonical nullifier must be invalid"),
+        }
+    }
+
+    #[test]
+    fn transact_parts_rejects_non_canonical_asset_id_and_duplicate_nullifiers() {
+        let ple = <Fr as PrimeField>::MODULUS.to_bytes_le();
+        let mut modulus = [0u8; 32];
+        modulus[..ple.len().min(32)].copy_from_slice(&ple[..ple.len().min(32)]);
+
+        let r_asset = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &modulus,
+            &[[1u8; 32], [2u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r_asset {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("non-canonical asset_id"), "{reason}")
+            }
+            _ => panic!("non-canonical asset_id must be invalid"),
+        }
+
+        let r_dup = ProofVerifier::verify_transact_parts(
+            &[0u8; 32],
+            &[3u8; 32],
+            -500,
+            &[0u8; 32],
+            &[[7u8; 32], [7u8; 32]],
+            &[[3u8; 32], [4u8; 32]],
+            &[0u8; 64],
+        );
+        match r_dup {
+            VerificationResult::Invalid { reason } => {
+                assert!(reason.contains("duplicate input nullifier"), "{reason}")
+            }
+            _ => panic!("duplicate input nullifier must be invalid"),
         }
     }
 
