@@ -37,13 +37,15 @@ pub struct OnChainSubmitter {
     program_id: Pubkey,
     rpc_url: String,
     ingress_url: String,
+    ingress_token: Option<String>,
     proving_key: Arc<ark_groth16::ProvingKey<Bn254>>,
 }
 
 impl OnChainSubmitter {
     /// Build a submitter over `rpc_url`, the deployed `program_id`, the transact
     /// `ingress_url`, and the v3 transact proving key at `proving_key_path`
-    /// (e.g. `keys/transact_v3_proving.key`).
+    /// (e.g. `keys/transact_v3_proving.key`). Reads `TRANSACT_INGRESS_TOKEN` or
+    /// `BRIDGE_INGRESS_TOKEN` from the environment by default when present.
     pub fn new(
         rpc_url: impl Into<String>,
         program_id: Pubkey,
@@ -58,8 +60,23 @@ impl OnChainSubmitter {
             program_id,
             rpc_url: rpc_url.into(),
             ingress_url: ingress_url.into(),
+            ingress_token: transact_submit::resolve_ingress_token_from_env(),
             proving_key: Arc::new(pk),
         })
+    }
+
+    /// Configure an explicit bearer token (`Authorization: Bearer <token>`) for
+    /// authenticating `POST /transact/submit` requests against a token-gated
+    /// validator ingress (`bridge.ingress_token`). An empty/whitespace string
+    /// clears the token.
+    pub fn with_ingress_token(mut self, token: impl Into<String>) -> Self {
+        let trimmed = token.into().trim().to_string();
+        self.ingress_token = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        self
     }
 
     fn client(&self) -> RpcClient {
@@ -88,6 +105,7 @@ impl Submitter for OnChainSubmitter {
         let program_id = self.program_id;
         let rpc_url = self.rpc_url.clone();
         let ingress = self.ingress_url.clone();
+        let ingress_token = self.ingress_token.clone();
         let pk = self.proving_key.clone();
 
         // The transact_submit helpers are blocking (blocking RpcClient + reqwest).
@@ -123,7 +141,13 @@ impl Submitter for OnChainSubmitter {
                 crate::privacy::note_crypto::seal(&demo_recipient, b"withdraw out 0").to_bytes();
             let ct1 =
                 crate::privacy::note_crypto::seal(&demo_recipient, b"withdraw out 1").to_bytes();
-            transact_submit::post_transact(&ingress, &fresh_address, &w, [ct0, ct1])?;
+            transact_submit::post_transact_with_token(
+                &ingress,
+                &fresh_address,
+                &w,
+                [ct0, ct1],
+                ingress_token.as_deref(),
+            )?;
 
             let recipient_pk = Pubkey::new_from_array(fresh_address);
             transact_submit::wait_for_settlement(

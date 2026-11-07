@@ -23,7 +23,9 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::time::Duration;
 
-use crate::bridge::solana::{derive_nullifier_account, derive_validator_registry};
+use crate::bridge::solana::{
+    derive_merkle_tree, derive_nullifier_account, derive_validator_registry,
+};
 use crate::privacy::circuits::{Groth16ProofSystem, TransactCircuitV3, TX_LEVELS};
 use crate::privacy::poseidon_circom::{
     v3_commit, v3_merkle_pair, v3_nullifier, v3_pubkey, v3_signature,
@@ -91,7 +93,7 @@ pub fn read_membership(
     leaf_index: u64,
     commitment: Fr,
 ) -> Result<Membership> {
-    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], program_id);
+    let (tree_pda, _) = derive_merkle_tree(program_id);
     let raw = client
         .get_account_data(&tree_pda)
         .map_err(|e| TransactSubmitError::Rpc(e.to_string()))?;
@@ -248,15 +250,46 @@ pub fn prove_withdraw_to_fresh(
     })
 }
 
+/// Default HTTP timeout when posting a transact request to the ingress.
+const INGRESS_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve the optional bearer token for the transact ingress from the
+/// environment (`TRANSACT_INGRESS_TOKEN` or `BRIDGE_INGRESS_TOKEN`), returning
+/// `None` when unset or empty/whitespace.
+pub fn resolve_ingress_token_from_env() -> Option<String> {
+    std::env::var("TRANSACT_INGRESS_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("BRIDGE_INGRESS_TOKEN").ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// POST a withdraw-to-fresh transact to the public ingress. `ciphertexts` must
 /// be exactly two well-formed `EncryptedNote` envelopes. Returns the ingress
-/// `request_id`.
+/// `request_id`. Automatically attaches `Authorization: Bearer <token>` when
+/// `TRANSACT_INGRESS_TOKEN` or `BRIDGE_INGRESS_TOKEN` is set in the environment.
 #[allow(clippy::too_many_arguments)]
 pub fn post_transact(
     ingress: &str,
     recipient: &[u8; 32],
     w: &WithdrawToFresh,
     ciphertexts: [Vec<u8>; 2],
+) -> Result<String> {
+    let env_token = resolve_ingress_token_from_env();
+    post_transact_with_token(ingress, recipient, w, ciphertexts, env_token.as_deref())
+}
+
+/// POST a withdraw-to-fresh transact to the ingress with an explicit optional
+/// bearer `ingress_token` (`Authorization: Bearer <token>`) and a bounded HTTP
+/// timeout so a stalled ingress connection cannot block `spawn_blocking`
+/// indefinitely.
+#[allow(clippy::too_many_arguments)]
+pub fn post_transact_with_token(
+    ingress: &str,
+    recipient: &[u8; 32],
+    w: &WithdrawToFresh,
+    ciphertexts: [Vec<u8>; 2],
+    ingress_token: Option<&str>,
 ) -> Result<String> {
     let body = serde_json::json!({
         "recipient": hex::encode(recipient),
@@ -270,9 +303,16 @@ pub fn post_transact(
         "proof": hex::encode(&w.proof),
         "ciphertexts": [hex::encode(&ciphertexts[0]), hex::encode(&ciphertexts[1])],
     });
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{ingress}/transact/submit"))
-        .json(&body)
+    let client = reqwest::blocking::Client::builder()
+        .timeout(INGRESS_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| TransactSubmitError::Http(e.to_string()))?;
+    let url = format!("{}/transact/submit", ingress.trim_end_matches('/'));
+    let mut req = client.post(url).json(&body);
+    if let Some(token) = ingress_token.map(str::trim).filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
         .send()
         .map_err(|e| TransactSubmitError::Http(e.to_string()))?;
     let status = resp.status();
@@ -320,5 +360,141 @@ pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
         // active_validators is the u64 at [48..56] after the 8-byte discriminator.
         Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::transact::TransactVerificationRequest;
+    use crate::node::ingress_auth::token_from_config;
+    use crate::node::transact_ingress::{self, DeliveredNote, TransactIngress};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    struct StubTransactIngress;
+
+    #[async_trait::async_trait]
+    impl TransactIngress for StubTransactIngress {
+        async fn submit_transact(
+            &self,
+            request: TransactVerificationRequest,
+        ) -> anyhow::Result<String> {
+            Ok(request.request_id)
+        }
+
+        async fn delivered_notes(&self) -> Vec<DeliveredNote> {
+            vec![]
+        }
+    }
+
+    fn sample_withdraw() -> (WithdrawToFresh, [Vec<u8>; 2]) {
+        let mut ct0 = vec![crate::privacy::note_crypto::ENVELOPE_TAG_V1];
+        ct0.extend_from_slice(&[0x11u8; 32 + 24 + 16]);
+        let mut ct1 = vec![crate::privacy::note_crypto::ENVELOPE_TAG_V1];
+        ct1.extend_from_slice(&[0x22u8; 32 + 24 + 16]);
+        let w = WithdrawToFresh {
+            proof: vec![1u8; 129],
+            nullifiers: [[1u8; 32], [2u8; 32]],
+            output_commitments: [[3u8; 32], [4u8; 32]],
+            root: [5u8; 32],
+            ext_amount: -100_000,
+        };
+        (w, [ct0, ct1])
+    }
+
+    #[tokio::test]
+    async fn post_transact_with_token_authenticates_against_protected_ingress() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let app = transact_ingress::router(
+            Arc::new(StubTransactIngress),
+            token_from_config("secret-bearer-token"),
+        );
+        let server = axum::Server::from_tcp(listener)
+            .expect("server from tcp")
+            .serve(app.into_make_service());
+        let handle = tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let ingress_url = format!("http://{addr}/");
+        let recipient = [9u8; 32];
+        let (w, cts) = sample_withdraw();
+
+        // 1. Unauthenticated request is rejected with 401 Unauthorized.
+        let unauth_w = WithdrawToFresh {
+            proof: w.proof.clone(),
+            nullifiers: w.nullifiers,
+            output_commitments: w.output_commitments,
+            root: w.root,
+            ext_amount: w.ext_amount,
+        };
+        let unauth_cts = cts.clone();
+        let unauth_url = ingress_url.clone();
+        let unauth_res = tokio::task::spawn_blocking(move || {
+            post_transact_with_token(&unauth_url, &recipient, &unauth_w, unauth_cts, None)
+        })
+        .await
+        .expect("join");
+        assert!(
+            matches!(
+                unauth_res,
+                Err(TransactSubmitError::IngressRejected { status: 401, .. })
+            ),
+            "unauthenticated POST to token-gated ingress must return 401, got {unauth_res:?}"
+        );
+
+        // 2. Authenticated request with matching bearer token succeeds (200 OK).
+        let auth_res = tokio::task::spawn_blocking(move || {
+            post_transact_with_token(
+                &ingress_url,
+                &recipient,
+                &w,
+                cts,
+                Some("  secret-bearer-token  "),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("authenticated POST must succeed");
+        assert!(
+            auth_res.contains("transact-"),
+            "response must contain canonical request_id, got {auth_res}"
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn solana_bridge_reexports_transact_spl_and_merkle_tree_helpers() {
+        let program_id = Pubkey::new_unique();
+        let (tree_pda, _) = crate::bridge::solana::derive_merkle_tree(&program_id);
+        let (expected_tree, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+        assert_eq!(tree_pda, expected_tree);
+
+        let authority = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let recipient_ta = Pubkey::new_unique();
+        let fee_ta = Pubkey::new_unique();
+        let ix = crate::bridge::solana::create_transact_spl_instruction(
+            &program_id,
+            &authority,
+            &mint,
+            &recipient_ta,
+            &fee_ta,
+            &crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [5u8; 32],
+            -500,
+            vec![0u8; 256],
+            &[authority],
+        )
+        .expect("re-exported create_transact_spl_instruction");
+        assert_eq!(
+            &ix.data[..8],
+            &crate::bridge::solana::discriminators::TRANSACT_SPL
+        );
     }
 }
