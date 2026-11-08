@@ -40,6 +40,9 @@ fn rev32(src: &[u8]) -> [u8; 32] {
 
 /// G1 point → 64-byte big-endian `[x || y]`.
 fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
+    if p.infinity {
+        return [0u8; 64];
+    }
     // arkworks uncompressed G1 = `x_le(32) || y_le(32)`.
     let mut le = Vec::with_capacity(64);
     p.serialize_uncompressed(&mut le)
@@ -52,6 +55,9 @@ fn g1_to_wire(p: &G1Affine) -> [u8; 64] {
 
 /// G2 point → 128-byte big-endian `[x.c1 || x.c0 || y.c1 || y.c0]`.
 fn g2_to_wire(p: &G2Affine) -> [u8; 128] {
+    if p.infinity {
+        return [0u8; 128];
+    }
     // arkworks uncompressed G2 = `x.c0_le || x.c1_le || y.c0_le || y.c1_le`.
     // alt_bn128 wants `x.c1_be || x.c0_be || y.c1_be || y.c0_be`.
     let mut le = Vec::with_capacity(128);
@@ -501,5 +507,77 @@ mod tests {
         rust_bytes("FIXTURE_PROOF_A", &wp.a);
         rust_bytes("FIXTURE_PROOF_B", &wp.b);
         rust_bytes("FIXTURE_PROOF_C", &wp.c);
+    }
+
+    #[test]
+    fn infinity_points_serialize_to_zero_wire_encoding_and_verify() {
+        use ark_ec::AffineRepr;
+        use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+
+        let g1_inf = G1Affine::zero();
+        let g2_inf = G2Affine::zero();
+        assert_eq!(
+            g1_to_wire(&g1_inf),
+            [0u8; 64],
+            "G1 point at infinity must encode as 64 zero bytes for alt_bn128 without SWFlags::PointAtInfinity (0x40)"
+        );
+        assert_eq!(
+            g2_to_wire(&g2_inf),
+            [0u8; 128],
+            "G2 point at infinity must encode as 128 zero bytes for alt_bn128 without SWFlags::PointAtInfinity (0x40)"
+        );
+
+        struct SimpleCircuit {
+            pub pub_val: Option<Fr>,
+            pub witness: Option<Fr>,
+        }
+
+        impl ConstraintSynthesizer<Fr> for SimpleCircuit {
+            fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+                use ark_r1cs_std::alloc::AllocVar;
+                use ark_r1cs_std::eq::EqGadget;
+                use ark_r1cs_std::fields::fp::FpVar;
+
+                let used = FpVar::new_input(cs.clone(), || {
+                    self.pub_val.ok_or(SynthesisError::AssignmentMissing)
+                })?;
+                let w = FpVar::new_witness(cs, || {
+                    self.witness.ok_or(SynthesisError::AssignmentMissing)
+                })?;
+                (&w * &w).enforce_equal(&used)?;
+                Ok(())
+            }
+        }
+
+        let mut rng = thread_rng();
+        let (pk, mut vk) = Groth16ProofSystem::setup(
+            SimpleCircuit {
+                pub_val: Some(Fr::from(9u64)),
+                witness: Some(Fr::from(3u64)),
+            },
+            &mut rng,
+        )
+        .expect("setup");
+
+        let proof = Groth16ProofSystem::prove(
+            &pk,
+            SimpleCircuit {
+                pub_val: Some(Fr::from(9u64)),
+                witness: Some(Fr::from(3u64)),
+            },
+            &mut rng,
+        )
+        .expect("prove");
+
+        // Append an identity IC point (G1Affine::zero()) corresponding to a zero-impact public input wire
+        vk.gamma_abc_g1.push(G1Affine::zero());
+        let wire_proof = proof_to_wire(&proof);
+        let wire_vk = WireVerifyingKey::from_arkworks(&vk);
+        let public_inputs = [fr_to_be(&Fr::from(9u64)), fr_to_be(&Fr::from(42u64))];
+
+        assert!(
+            verify(&wire_proof, &public_inputs, &wire_vk.as_verifying_key()),
+            "valid proof with an identity IC point (G1Affine::zero()) must verify through alt_bn128"
+        );
     }
 }
