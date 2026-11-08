@@ -765,6 +765,13 @@ impl ConstraintSynthesizer<Fr> for TransactCircuitV3 {
         // for a non-zero element), i.e. the two nullifiers differ.
         let _ndiff_inv = ndiff.inverse()?;
 
+        // Enforce non-zero value transfer (#1502): a no-op transact where
+        // Σin = 0 and Σout = 0 (and public_amount = 0) is rejected to prevent
+        // Merkle tree pollution and settling validator rent exhaustion.
+        // Enforce `Σin + Σout` is non-zero (invertible in Fr).
+        let total_value = &sum_ins + &sum_outs;
+        let _total_value_inv = total_value.inverse()?;
+
         // Value invariant: Σ in + public_amount = Σ out.
         (&sum_ins + &public_amount_var).enforce_equal(&sum_outs)?;
 
@@ -1634,6 +1641,40 @@ mod tests {
             assert!(!synth(circuit));
         }
 
+        /// A zero-value transact (no-op: in_amounts = [0, 0], out_amounts = [0, 0],
+        /// public_amount = 0) is rejected (#1502) to prevent settling validator rent
+        /// exhaustion and Merkle tree pollution.
+        #[test]
+        fn rejects_zero_value_no_op() {
+            let ins = [
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(11u64),
+                    blinding: Fr::from(1u64),
+                    index: 0,
+                },
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(12u64),
+                    blinding: Fr::from(2u64),
+                    index: 0,
+                },
+            ];
+            let outs = [
+                OutNote {
+                    amount: 0,
+                    pubkey: v3_pubkey(Fr::from(21u64)),
+                    blinding: Fr::from(5u64),
+                },
+                OutNote {
+                    amount: 0,
+                    pubkey: v3_pubkey(Fr::from(22u64)),
+                    blinding: Fr::from(6u64),
+                },
+            ];
+            assert!(!synth(build(ins, outs, asset(), [7u8; 32])));
+        }
+
         /// A real input whose commitment is not in the tree (wrong root) fails
         /// membership.
         #[test]
@@ -1724,7 +1765,7 @@ mod tests {
             // survives a shape change.
             assert_eq!(
                 cs.num_constraints(),
-                18_477,
+                18_478,
                 "constraint count moved: if this is a deliberate circuit change, \
                  confirm input amounts still go through alloc_u64_witness before \
                  updating the number"
@@ -1862,16 +1903,16 @@ mod r1cs_shape {
         // Changing any of these invalidates a live ceremony chain. If a
         // deliberate circuit change lands, update these and treat any
         // in-flight chain as void.
-        assert_eq!(cs.num_constraints(), 18_477, "constraint count moved");
-        assert_eq!(cs.num_witness_variables(), 18_542, "witness count moved");
+        assert_eq!(cs.num_constraints(), 18_478, "constraint count moved");
+        assert_eq!(cs.num_witness_variables(), 18_543, "witness count moved");
         // 8 public inputs plus the constant-one wire, matching the 9 IC
         // points the on-chain verifier expects.
         assert_eq!(cs.num_instance_variables(), 9, "public input count moved");
 
         // The domain the Groth16 setup builds, and therefore the minimum
-        // powers-of-tau size: 18_486 rounds up to 2^15.
+        // powers-of-tau size: 18_487 rounds up to 2^15.
         let domain_input = cs.num_constraints() + cs.num_instance_variables();
-        assert_eq!(domain_input, 18_486);
+        assert_eq!(domain_input, 18_487);
         assert_eq!(domain_input.next_power_of_two(), 32_768);
     }
 }
