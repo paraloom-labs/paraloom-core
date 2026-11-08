@@ -172,9 +172,27 @@ impl ReputationTracker {
     }
 
     fn load_snapshot(path: &Path) -> Option<HashMap<NodeId, ValidatorMetrics>> {
-        let bytes = std::fs::read(path).ok()?;
-        let list: Vec<ValidatorMetrics> = serde_json::from_slice(&bytes).ok()?;
-        Some(list.into_iter().map(|m| (m.node_id.clone(), m)).collect())
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                log::warn!(
+                    "could not read reputation snapshot at {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        match serde_json::from_slice::<Vec<ValidatorMetrics>>(&bytes) {
+            Ok(list) => Some(list.into_iter().map(|m| (m.node_id.clone(), m)).collect()),
+            Err(e) => {
+                log::warn!(
+                    "ignoring unparsable reputation snapshot at {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 
     /// Write the current metrics to `persist_path` (best-effort). Called while
@@ -189,7 +207,7 @@ impl ReputationTracker {
         let list: Vec<&ValidatorMetrics> = metrics.values().collect();
         match serde_json::to_vec(&list) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, &bytes) {
+                if let Err(e) = crate::consensus::atomic_write(path, &bytes) {
                     log::warn!("failed to persist reputation to {}: {e}", path.display());
                 }
             }
@@ -407,6 +425,52 @@ mod tests {
             reloaded.get_reputation(&node).await,
             Some(penalised),
             "penalised reputation must survive a restart (#691)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_atomic_write_prevents_torn_file_on_restart() {
+        // #1539: reputation must be persisted via atomic write (write to sibling .tmp
+        // then rename) so that a crash or kill mid-write never leaves a truncated
+        // or unparsable file that silently resets penalised reputations to BASE_REPUTATION.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation.json");
+        let tmp_path = path.with_extension("tmp");
+        let node = NodeId(vec![4, 5, 6]);
+
+        let tracker = ReputationTracker::with_persistence(path.clone());
+        tracker.register_validator(node.clone()).await;
+        let penalised = tracker.record_failure(&node).await.unwrap();
+        assert!(penalised < BASE_REPUTATION);
+
+        // After successful persist, target file exists and tmp file is cleaned up.
+        assert!(path.exists(), "reputation.json must exist");
+        assert!(!tmp_path.exists(), "temporary file must be renamed away");
+
+        // Simulate a crashed/torn subsequent write to .tmp (e.g. truncated mid-flight)
+        std::fs::write(&tmp_path, b"{\"node_id\": [4, 5, 6], \"reput").unwrap();
+
+        // Restarting while a stale/torn .tmp exists must safely load the intact reputation.json
+        let reloaded = ReputationTracker::with_persistence(path.clone());
+        assert_eq!(
+            reloaded.get_reputation(&node).await,
+            Some(penalised),
+            "valid snapshot must survive without being corrupted by torn tmp file"
+        );
+
+        // Next mutation atomically overwrites the stale .tmp and persists cleanly
+        let further_penalised = reloaded.record_failure(&node).await.unwrap();
+        assert!(further_penalised < penalised);
+        assert!(
+            !tmp_path.exists(),
+            "temporary file must be cleaned up after update"
+        );
+
+        let reloaded2 = ReputationTracker::with_persistence(path);
+        assert_eq!(
+            reloaded2.get_reputation(&node).await,
+            Some(further_penalised),
+            "updated reputation must persist atomically"
         );
     }
 

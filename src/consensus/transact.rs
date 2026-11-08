@@ -373,8 +373,16 @@ impl TransactVerificationCoordinator {
         // not silently restore its counting weight).
         let eq_path = path.with_file_name("equivocators.json");
         if let Ok(bytes) = std::fs::read(&eq_path) {
-            if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&bytes) {
-                self.equivocators = Arc::new(RwLock::new(set));
+            match serde_json::from_slice::<HashSet<String>>(&bytes) {
+                Ok(set) => {
+                    self.equivocators = Arc::new(RwLock::new(set));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "ignoring unparsable equivocator ban set at {}: {e}",
+                        eq_path.display()
+                    );
+                }
             }
         }
         self.equivocators_path = Some(eq_path);
@@ -388,7 +396,7 @@ impl TransactVerificationCoordinator {
         if let Some(path) = &self.equivocators_path {
             match serde_json::to_vec(set) {
                 Ok(bytes) => {
-                    if let Err(e) = std::fs::write(path, bytes) {
+                    if let Err(e) = crate::consensus::atomic_write(path, &bytes) {
                         log::warn!("could not persist equivocators to {:?}: {}", path, e);
                     }
                 }
@@ -403,6 +411,11 @@ impl TransactVerificationCoordinator {
     /// un-approvable (a wedged-until-restart hazard otherwise).
     pub async fn clear_emitted(&self, request_id: &str) {
         self.emitted.write().await.remove(request_id);
+    }
+
+    /// Whether `wallet` is in the equivocator ban set.
+    pub async fn is_equivocator(&self, wallet: &str) -> bool {
+        self.equivocators.read().await.contains(wallet)
     }
 
     /// Whether the `Valid`-voting co-signers hold enough stake for the on-chain
@@ -1382,6 +1395,89 @@ mod tests {
         assert!(
             c.slashing_tracker().total_count().await > 0,
             "equivocation must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn equivocator_ban_persists_atomically_across_restart() {
+        // #1539: equivocators.json must be persisted via atomic write (write to .tmp
+        // then rename) so that a crash or kill mid-write never leaves a truncated
+        // file that silently lifts equivocation bans on restart.
+        let dir = tempfile::tempdir().unwrap();
+        let rep_path = dir.path().join("reputation.json");
+        let eq_path = dir.path().join("equivocators.json");
+        let eq_tmp = eq_path.with_extension("tmp");
+
+        // Set up coordinator with persistence
+        let (c, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string())
+            .with_reputation_persistence(rep_path.clone());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+        // W1 equivocates: Valid then Invalid
+        c.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        c.submit_result(vote(&id, 9, "W1", false)).await.unwrap();
+
+        // Verify equivocators.json exists, contains W1, and no leftover .tmp
+        assert!(
+            eq_path.exists(),
+            "equivocators.json must exist after equivocation"
+        );
+        assert!(!eq_tmp.exists(), "equivocators.tmp must be renamed away");
+        let persisted_bytes = std::fs::read(&eq_path).unwrap();
+        let set: HashSet<String> = serde_json::from_slice(&persisted_bytes).unwrap();
+        assert!(set.contains("W1"));
+
+        // Simulate a crashed/torn write to .tmp
+        std::fs::write(&eq_tmp, b"[\"corrupted_wallet").unwrap();
+
+        // Fresh coordinator (the restart) pointing to the same state
+        let (c2, mut approvals2) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c2 = c2
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string())
+            .with_reputation_persistence(rep_path);
+        c2.set_consensus_thresholds(2, 3);
+        c2.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c2.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c2.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        // Verify W1 is still banned after restart
+        assert!(
+            c2.is_equivocator("W1").await,
+            "W1 must remain banned after restart"
+        );
+
+        // A new verification round: W1 attempts to vote, but is dropped as an equivocator;
+        // W2 votes Valid, but without W1 quorum cannot form.
+        let req2 = canonical_request();
+        let id2 = req2.request_id.clone();
+        c2.start_verification(req2).await.unwrap();
+        c2.submit_result(vote(&id2, 1, "W1", true)).await.unwrap();
+        c2.submit_result(vote(&id2, 2, "W2", true)).await.unwrap();
+        assert!(
+            approvals2.try_recv().is_err(),
+            "banned equivocator must not count after restart"
         );
     }
 
