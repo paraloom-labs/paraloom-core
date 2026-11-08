@@ -84,10 +84,26 @@ where
         |peer| {
             let send = &send;
             let request = request.clone();
+            let leader_pubkey = leader.pubkey();
+            let expected_wallet = peers
+                .iter()
+                .find(|(_, node_id)| node_id == &peer)
+                .map(|(w, _)| *w);
             async move {
+                let expected_wallet = expected_wallet?;
+                if expected_wallet == leader_pubkey {
+                    return None;
+                }
+                let expected_req_id = request.request_id.clone();
                 let response = send(peer, request).await?;
+                if response.request_id != expected_req_id {
+                    return None;
+                }
                 let sig = response.signature?;
                 let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
+                if wallet != expected_wallet {
+                    return None;
+                }
                 Some((wallet, sig))
             }
         },
@@ -195,5 +211,115 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_request_id_and_unbound_peer_wallet() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey(), p2.pubkey()];
+        let peers = vec![
+            (p1.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+        ];
+
+        // Case 1: p1 responds with mismatched request_id ("wrong-req"), p2 responds honestly.
+        // Threshold is 3, so rejection of p1 must cause the round to fail.
+        let result_bad_req = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets.clone(),
+            &peers,
+            3,
+            |peer, request| {
+                let (p1, p2) = (&p1, &p2);
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        let mut resp = honest_response(p1, &request);
+                        resp.request_id = "wrong-req".to_string();
+                        Some(resp)
+                    } else {
+                        Some(honest_response(p2, &request))
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            result_bad_req.is_err(),
+            "mismatched request_id must be rejected"
+        );
+
+        // Case 2: p2 responds with p1's wallet (spoofed / unbound wallet).
+        let result_bad_wallet = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets.clone(),
+            &peers,
+            3,
+            |peer, request| {
+                let (p1, p2) = (&p1, &p2);
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        Some(honest_response(p1, &request))
+                    } else {
+                        // Peer 2 attempts to claim Peer 1's wallet
+                        let mut resp = honest_response(p2, &request);
+                        resp.wallet_pubkey = p1.pubkey().to_string();
+                        Some(resp)
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            result_bad_wallet.is_err(),
+            "unbound wallet pubkey must be rejected"
+        );
+
+        // Case 3: peer wallet configured as leader pubkey is rejected.
+        let peers_with_leader = vec![
+            (leader.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+        ];
+        let result_leader_peer = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers_with_leader,
+            3,
+            |peer, request| {
+                let (leader, p2) = (&leader, &p2);
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        Some(honest_response(leader, &request))
+                    } else {
+                        Some(honest_response(p2, &request))
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            result_leader_peer.is_err(),
+            "peer matching leader pubkey must be rejected"
+        );
     }
 }
