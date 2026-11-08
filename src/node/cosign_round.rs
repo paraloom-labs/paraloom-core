@@ -84,10 +84,26 @@ where
         |peer| {
             let send = &send;
             let request = request.clone();
+            let expected_wallet = peers
+                .iter()
+                .find(|(_, node_id)| *node_id == peer)
+                .map(|(wallet, _)| *wallet);
+            let leader_pubkey = leader.pubkey();
             async move {
+                let expected_wallet = expected_wallet?;
+                if expected_wallet == leader_pubkey {
+                    return None;
+                }
+                let expected_request_id = request.request_id.clone();
                 let response = send(peer, request).await?;
+                if response.request_id != expected_request_id {
+                    return None;
+                }
                 let sig = response.signature?;
                 let wallet = response.wallet_pubkey.parse::<Pubkey>().ok()?;
+                if wallet != expected_wallet {
+                    return None;
+                }
                 Some((wallet, sig))
             }
         },
@@ -110,6 +126,52 @@ mod tests {
             ext_amount: -1_000_000_000,
             proof: vec![0u8; 256],
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_request_id_and_unbound_peer_wallet() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey(), p2.pubkey()];
+        let peers = vec![
+            (p1.pubkey(), NodeId(vec![1])),
+            (p2.pubkey(), NodeId(vec![2])),
+        ];
+
+        // 1. Peer 1 returns a stale/mismatched request_id, while Peer 2 impersonates Peer 1's wallet.
+        let result = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            2,
+            |peer, request| {
+                let (p1, _p2) = (&p1, &p2);
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        let mut resp = honest_response(p1, &request);
+                        resp.request_id = "req-stale-999".to_string();
+                        Some(resp)
+                    } else {
+                        // Peer 2 attempts to submit a signature claiming Peer 1's wallet
+                        Some(honest_response(p1, &request))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "co-sign round must reject responses with mismatched request_id or unbound peer wallet"
+        );
     }
 
     // A co-signer that signs whatever payload it is sent, as an honest validator

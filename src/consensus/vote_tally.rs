@@ -124,12 +124,13 @@ impl VoteTally {
                 // `reason` differs.
                 return Ok(None);
             }
+            let previous = votes.remove(&wallet).expect("checked Some above");
             let evidence = SlashingEvidence::Equivocation {
                 request_id: self.request_id.clone(),
                 wallet_pubkey: wallet.clone(),
-                previous_vote: previous.vote.clone(),
+                previous_vote: previous.vote,
                 new_vote: vote,
-                previous_signature: previous.signature.clone(),
+                previous_signature: previous.signature,
                 new_signature: signature,
             };
             return Ok(Some(evidence));
@@ -357,5 +358,14 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+
+        // Equivocator's tainted initial vote must be purged from the internal vote map
+        // immediately upon equivocation detection even if caller reuses an older eligible set.
+        let snapshot = wallets(&["W1", "W2"]);
+        assert_eq!(
+            tally.valid_voters(&snapshot).await,
+            Vec::<NodeId>::new(),
+            "equivocating validator's first Valid vote must be purged from VoteTally upon equivocation"
+        );
     }
 }
