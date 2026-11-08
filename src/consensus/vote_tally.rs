@@ -105,8 +105,9 @@ impl VoteTally {
     /// identical vote which we treat as idempotent). Returns
     /// `Ok(Some(SlashingEvidence::Equivocation { .. }))` if the wallet has
     /// previously submitted a vote on this request and the new vote disagrees —
-    /// provable misbehaviour surfaced for recording. The new vote is **not**
-    /// installed in that case; the original stands. On the idempotent path the
+    /// provable misbehaviour surfaced for recording. The equivocator's initial
+    /// vote is removed from the tally upon detecting equivocation so tainted
+    /// votes cannot contribute to consensus or co-signing. On the idempotent path the
     /// stored `node_id`/`signature` are deliberately NOT overwritten (both are
     /// signature-bound, so the first authenticated record is authoritative).
     pub async fn submit_vote(
@@ -124,12 +125,13 @@ impl VoteTally {
                 // `reason` differs.
                 return Ok(None);
             }
+            let previous = votes.remove(&wallet).expect("wallet present");
             let evidence = SlashingEvidence::Equivocation {
                 request_id: self.request_id.clone(),
-                wallet_pubkey: wallet.clone(),
-                previous_vote: previous.vote.clone(),
+                wallet_pubkey: wallet,
+                previous_vote: previous.vote,
                 new_vote: vote,
-                previous_signature: previous.signature.clone(),
+                previous_signature: previous.signature,
                 new_signature: signature,
             };
             return Ok(Some(evidence));
@@ -357,5 +359,11 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+
+        // The equivocator's vote must be removed from the tally upon detecting equivocation
+        let eligible = wallets(&["W1"]);
+        assert_eq!(tally.valid_voters(&eligible).await, Vec::<NodeId>::new());
+        assert_eq!(tally.count_eligible_votes(&eligible).await, 0);
+        assert_eq!(tally.vote_counts().await, (0, 0));
     }
 }
