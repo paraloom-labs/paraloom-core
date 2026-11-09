@@ -45,13 +45,28 @@ const PARALOOM_TOPIC: &str = "paraloom/v1";
 /// bare network multiaddr (no /p2p/ suffix) we fall back to dial
 /// only.
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| {
+    addr.iter().rev().find_map(|proto| {
         if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
             Some(peer_id)
         } else {
             None
         }
     })
+}
+
+/// Extract the relay PeerId from a relay multiaddr. If `addr` contains a
+/// `/p2p-circuit` component, returns the `/p2p/<relay>` immediately preceding
+/// it; otherwise falls back to `peer_id_from_multiaddr` for bare relay addresses.
+fn relay_peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    let mut last_p2p = None;
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::P2p(peer_id) => last_p2p = Some(peer_id),
+            libp2p::multiaddr::Protocol::P2pCircuit => return last_p2p,
+            _ => {}
+        }
+    }
+    last_p2p
 }
 
 #[derive(NetworkBehaviour)]
@@ -555,7 +570,7 @@ impl NetworkManager {
             .parse()
             .with_context(|| format!("parsing relay address {}", relay_addr))?;
 
-        let relay_peer = peer_id_from_multiaddr(&relay_addr).ok_or_else(|| {
+        let relay_peer = relay_peer_id_from_multiaddr(&relay_addr).ok_or_else(|| {
             anyhow!(
                 "relay address {} has no /p2p/<peer_id> suffix; cannot reserve a circuit",
                 relay_addr
@@ -1253,6 +1268,17 @@ mod tests {
     fn peer_id_returns_none_for_bare_multiaddr() {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("multiaddr parses");
         assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
+
+    #[test]
+    fn peer_id_takes_the_trailing_p2p_not_the_relay() {
+        let relay = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let target = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/9000/p2p/{relay}/p2p-circuit/p2p/{target}")
+            .parse()
+            .expect("multiaddr parses");
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(target));
+        assert_eq!(relay_peer_id_from_multiaddr(&addr), Some(relay));
     }
 
     #[tokio::test]
