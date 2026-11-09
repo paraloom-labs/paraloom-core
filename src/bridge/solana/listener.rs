@@ -480,9 +480,14 @@ impl EventListener {
         // briefly), the RPC rejects it as a boundary with a "Transaction not
         // found" (-32020) error, and every poll fails forever — the listener
         // stalls and stops indexing deposits. Detect that, drop the stale
-        // cursor, and resume from the latest page (a cold start) so the listener
-        // self-heals. `effective_cursor` may be reset to `None` mid-loop.
+        // cursor, and recover backlog from recent history. Unlike an initial
+        // cold start (`cursor == None`) which stops after the newest page to
+        // avoid scanning all history on first boot, stale-cursor recovery walks
+        // backwards across pages (up to `MAX_SIGNATURE_PAGES`) so deposits in
+        // the gap are not silently dropped.
         let mut effective_cursor = cursor;
+        let is_initial_cold_start = cursor.is_none();
+        let mut is_stale_recovery = false;
         loop {
             let batch = match state
                 .rpc
@@ -507,14 +512,15 @@ impl EventListener {
             {
                 Ok(batch) => batch,
                 Err(e) if effective_cursor.is_some() && Self::is_stale_until_cursor(&e) => {
-                    log::warn!(
+                    log::error!(
                         target: "paraloom::bridge::solana",
-                        "deposit listener cursor {} is no longer resolvable by the RPC ({}); resetting it and resuming from the latest signatures",
+                        "deposit listener cursor {} is no longer resolvable by the RPC ({}); resetting it and recovering backlog across recent pages",
                         effective_cursor.expect("guarded by effective_cursor.is_some()"),
                         e
                     );
                     Self::clear_cursor(state).await;
                     effective_cursor = None;
+                    is_stale_recovery = true;
                     before = None;
                     pages = 0;
                     signatures.clear();
@@ -540,22 +546,41 @@ impl EventListener {
                 break;
             }
             // Cold start: take only the newest page, do not walk all history.
-            if effective_cursor.is_none() {
+            if is_initial_cold_start {
                 break;
             }
             if pages >= MAX_SIGNATURE_PAGES {
-                log::warn!(
-                    target: "paraloom::bridge::solana",
-                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
-                    MAX_SIGNATURE_PAGES,
-                    MAX_SIGNATURE_PAGES * state.batch_limit
-                );
+                if is_stale_recovery {
+                    log::error!(
+                        target: "paraloom::bridge::solana",
+                        "deposit listener hit {}-page scan cap (~{} transactions) during stale-cursor recovery; unindexed deposits older than this window were skipped and may cause the off-chain Merkle tree to permanently diverge",
+                        MAX_SIGNATURE_PAGES,
+                        MAX_SIGNATURE_PAGES * state.batch_limit
+                    );
+                } else {
+                    log::warn!(
+                        target: "paraloom::bridge::solana",
+                        "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
+                        MAX_SIGNATURE_PAGES,
+                        MAX_SIGNATURE_PAGES * state.batch_limit
+                    );
+                }
                 break;
             }
             match oldest {
                 Some(sig) => before = Some(sig),
                 None => break,
             }
+        }
+
+        if is_stale_recovery {
+            state.stats.write().await.deposits_skipped_gap += 1;
+            log::error!(
+                target: "paraloom::bridge::solana",
+                "deposit listener completed stale-cursor recovery: retrieved {} signatures across {} pages; deposits in the aged-out gap before the oldest retrieved signature may have been skipped",
+                signatures.len(),
+                pages
+            );
         }
 
         if signatures.is_empty() {
@@ -918,6 +943,239 @@ mod tests {
             *state.last_signature.read().await,
             None,
             "the stale cursor must be cleared so a restart does not reload it"
+        );
+        assert_eq!(
+            state.stats.read().await.deposits_skipped_gap,
+            1,
+            "stale-cursor recovery must record the gap event in stats"
+        );
+    }
+
+    /// When the cursor ages out, `fetch_events` must not drop deposits that
+    /// confirmed across multiple pages between the stale cursor and the newest page.
+    /// It must walk back through older pages so the backlog is recovered rather than
+    /// silently lost.
+    #[tokio::test]
+    async fn stale_cursor_self_heal_recovers_gap_deposits_across_pages() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let stale = Signature::new_unique();
+        let newest = Signature::new_unique();
+        let second = Signature::new_unique();
+        let gap = Signature::new_unique(); // a deposit confirmed while the cursor was stale
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        {
+            let mut pages = mock.get_signatures_pages.lock().unwrap();
+            // 1) The boundary call with `until = stale` is rejected with -32020.
+            pages.push_back(Err(BridgeError::SolanaRpc(format!(
+                "getSignaturesForAddress: RPC response error -32020: Transaction {stale} not found"
+            ))));
+            // 2) Page 1 of stale-cursor retry: newest and second (full page of limit 2).
+            pages.push_back(Ok(vec![
+                RpcConfirmedTransactionStatusWithSignature {
+                    signature: newest.to_string(),
+                    slot: 9,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                },
+                RpcConfirmedTransactionStatusWithSignature {
+                    signature: second.to_string(),
+                    slot: 8,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                },
+            ]));
+            // 3) Page 2 of stale-cursor retry: gap deposit.
+            pages.push_back(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: gap.to_string(),
+                slot: 7,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        }
+
+        {
+            let mut txs = mock.get_transactions.lock().unwrap();
+            txs.insert(
+                newest,
+                synth_deposit_tx(
+                    newest,
+                    9,
+                    &program_id,
+                    &depositor,
+                    2_000,
+                    [7u8; 32],
+                    [13u8; 32],
+                ),
+            );
+            txs.insert(
+                second,
+                synth_deposit_tx(
+                    second,
+                    8,
+                    &program_id,
+                    &depositor,
+                    3_000,
+                    [9u8; 32],
+                    [15u8; 32],
+                ),
+            );
+            txs.insert(
+                gap,
+                synth_deposit_tx(
+                    gap,
+                    7,
+                    &program_id,
+                    &depositor,
+                    4_000,
+                    [11u8; 32],
+                    [17u8; 32],
+                ),
+            );
+        }
+
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+        state.batch_limit = 2; // two signatures per page
+        *state.last_signature.write().await = Some(stale);
+
+        let events = EventListener::fetch_events(&state, Some(stale))
+            .await
+            .expect("a stale cursor must self-heal, not propagate the error");
+
+        assert_eq!(
+            events.len(),
+            3,
+            "stale-cursor recovery must walk back across pages to recover gap deposits"
+        );
+        assert_eq!(
+            state.stats.read().await.deposits_skipped_gap,
+            1,
+            "stale-cursor recovery must increment deposits_skipped_gap"
+        );
+        assert!(
+            !mock.get_transactions.lock().unwrap().contains_key(&gap),
+            "the deposit in the gap must be fetched and processed"
+        );
+    }
+
+    /// On a genuine initial cold start (`cursor == None`), `fetch_events` must only
+    /// take the newest page and not walk back through historical pages.
+    #[tokio::test]
+    async fn cold_start_only_fetches_newest_page_when_cursor_is_none() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let newest = Signature::new_unique();
+        let second = Signature::new_unique();
+        let old = Signature::new_unique();
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let mock = Arc::new(MockBridgeRpc::new());
+
+        {
+            let mut pages = mock.get_signatures_pages.lock().unwrap();
+            // Page 1: full page of 2 items
+            pages.push_back(Ok(vec![
+                RpcConfirmedTransactionStatusWithSignature {
+                    signature: newest.to_string(),
+                    slot: 9,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                },
+                RpcConfirmedTransactionStatusWithSignature {
+                    signature: second.to_string(),
+                    slot: 8,
+                    err: None,
+                    memo: None,
+                    block_time: None,
+                    confirmation_status: None,
+                },
+            ]));
+            // Page 2: should never be requested
+            pages.push_back(Ok(vec![RpcConfirmedTransactionStatusWithSignature {
+                signature: old.to_string(),
+                slot: 7,
+                err: None,
+                memo: None,
+                block_time: None,
+                confirmation_status: None,
+            }]));
+        }
+
+        {
+            let mut txs = mock.get_transactions.lock().unwrap();
+            txs.insert(
+                newest,
+                synth_deposit_tx(
+                    newest,
+                    9,
+                    &program_id,
+                    &depositor,
+                    2_000,
+                    [7u8; 32],
+                    [13u8; 32],
+                ),
+            );
+            txs.insert(
+                second,
+                synth_deposit_tx(
+                    second,
+                    8,
+                    &program_id,
+                    &depositor,
+                    3_000,
+                    [9u8; 32],
+                    [15u8; 32],
+                ),
+            );
+            txs.insert(
+                old,
+                synth_deposit_tx(
+                    old,
+                    7,
+                    &program_id,
+                    &depositor,
+                    4_000,
+                    [11u8; 32],
+                    [17u8; 32],
+                ),
+            );
+        }
+
+        let mut state = make_state(mock.clone());
+        state.program_id = program_id;
+        state.batch_limit = 2;
+
+        let events = EventListener::fetch_events(&state, None)
+            .await
+            .expect("cold start should succeed");
+
+        assert_eq!(
+            events.len(),
+            2,
+            "cold start must only fetch the single newest page"
+        );
+        assert_eq!(
+            state.stats.read().await.deposits_skipped_gap,
+            0,
+            "cold start is not a stale-cursor recovery and must not increment deposits_skipped_gap"
+        );
+        assert!(
+            mock.get_transactions.lock().unwrap().contains_key(&old),
+            "older transactions must not be fetched on cold start"
         );
     }
 

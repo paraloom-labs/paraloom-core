@@ -326,4 +326,9 @@ pub struct BridgeStats {
     /// `current_slot − last_processed_slot`. Useful as a metric to
     /// drive operator dashboards or pageable alerts.
     pub event_lag_slots: u64,
+
+    /// Count of stale-cursor gap events where the listener may have skipped
+    /// deposits older than the RPC retention window or scan cap.
+    #[serde(default)]
+    pub deposits_skipped_gap: u64,
 }
