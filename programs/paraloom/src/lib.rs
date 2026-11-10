@@ -679,6 +679,13 @@ pub mod paraloom_program {
                     ctx.accounts.mint.decimals,
                 )?;
             }
+
+            // Maintain the public withdrawal-volume aggregate, mirroring
+            // `total_deposited` on the deposit side.
+            bridge_state.total_withdrawn = bridge_state
+                .total_withdrawn
+                .checked_add(gross)
+                .ok_or(BridgeError::InvalidAmount)?;
         }
 
         validator_account.total_tasks_verified =
