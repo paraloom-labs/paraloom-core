@@ -467,4 +467,5 @@ async fn transact_spl_settles_a_token_withdrawal() {
     let state_raw = banks.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+    assert_eq!(state.total_withdrawn, gross, "aggregate total_withdrawn updated by settled SPL withdrawal");
 }
