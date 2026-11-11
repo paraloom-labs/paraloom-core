@@ -199,17 +199,22 @@ async fn main() -> anyhow::Result<()> {
         let amt = v["amount"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("note file missing amount"))?;
+        if amt == 0 {
+            anyhow::bail!("note file amount must be greater than 0");
+        }
+        let in_sk = hex32("in_sk")?;
+        let in_blinding = hex32("in_blinding")?;
+        let in_note_pubkey = hex32("in_note_pubkey")?;
+        let sk_fr = Fr::from_le_bytes_mod_order(&in_sk);
+        let expected_pk = fr_to_le(&v3_pubkey(sk_fr));
+        if in_note_pubkey != expected_pk {
+            anyhow::bail!("in_note_pubkey does not match v3_pubkey(in_sk)");
+        }
         println!(
             "resumed note:      {resume_path} (leaf {li}, {} SOL)",
             amt as f64 / 1e9
         );
-        (
-            hex32("in_sk")?,
-            hex32("in_blinding")?,
-            hex32("in_note_pubkey")?,
-            li,
-            amt,
-        )
+        (in_sk, in_blinding, in_note_pubkey, li, amt)
     } else {
         header("Step 1: shielded deposit (native SOL, deposit_note v3)");
         let sk = rand_fr();
@@ -230,8 +235,13 @@ async fn main() -> anyhow::Result<()> {
 
         // Read the just-appended leaf index from the on-chain tree.
         let raw = client.get_account_data(&tree_pda)?;
+        if raw.len() < 16 {
+            anyhow::bail!("merkle_tree account data too short ({} < 16)", raw.len());
+        }
         let next_index = u64::from_le_bytes(raw[8..16].try_into()?);
-        let leaf_index = next_index - 1;
+        let leaf_index = next_index
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("tree next_index is 0: no leaf appended"))?;
         println!("leaf index:        {leaf_index}");
 
         // Persist the note secret NOW, before the withdraw, so the deposit is
@@ -248,6 +258,11 @@ async fn main() -> anyhow::Result<()> {
             "amount": swap_amount,
         });
         std::fs::write(&note_path, serde_json::to_string_pretty(&note)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&note_path, std::fs::Permissions::from_mode(0o600));
+        }
         println!("note saved:        {note_path}  (retry withdraw with RESUME_NOTE={note_path})");
         (sk_le, blinding_le, pk_le, leaf_index, swap_amount)
     };
@@ -263,6 +278,11 @@ async fn main() -> anyhow::Result<()> {
         &fresh_path,
         serde_json::to_string(&fresh.to_bytes().to_vec())?,
     )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&fresh_path, std::fs::Permissions::from_mode(0o600));
+    }
     println!("fresh address:     {}", fresh.pubkey());
     println!("fresh key saved:   {fresh_path}  (holds the swapped USDC — keep it)");
 

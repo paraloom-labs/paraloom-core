@@ -24,6 +24,9 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 
 /// Convert a hex string to bytes
 pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, &'static str> {
+    if !hex.is_ascii() {
+        return Err("Invalid hex character");
+    }
     if !hex.len().is_multiple_of(2) {
         return Err("Hex string must have an even number of characters");
     }
@@ -35,4 +38,41 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, &'static str> {
     }
 
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_to_bytes_valid() {
+        assert_eq!(hex_to_bytes("00ff").unwrap(), vec![0x00, 0xff]);
+        assert_eq!(
+            hex_to_bytes("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(hex_to_bytes("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_hex_to_bytes_odd_length_rejected() {
+        assert!(hex_to_bytes("0").is_err());
+        assert!(hex_to_bytes("123").is_err());
+    }
+
+    #[test]
+    fn test_hex_to_bytes_invalid_chars_rejected() {
+        assert!(hex_to_bytes("zz").is_err());
+        assert!(hex_to_bytes("0g").is_err());
+    }
+
+    #[test]
+    fn test_hex_to_bytes_multibyte_utf8_does_not_panic() {
+        // "a€" is 4 bytes in UTF-8 (1 byte for 'a', 3 bytes for '€').
+        // Without the is_ascii check, hex[0..2] or hex[i..i+2] panics on char boundary.
+        assert!(hex_to_bytes("a€").is_err());
+        // Emoji crab "🦀" is 4 bytes in UTF-8
+        assert!(hex_to_bytes("🦀").is_err());
+        assert!(hex_to_bytes("12🦀4").is_err());
+    }
 }
