@@ -99,6 +99,9 @@ async fn route_handler(
     if req.amount == 0 {
         return Err((StatusCode::BAD_REQUEST, "amount must be > 0".to_string()));
     }
+    if asset_in == asset_out {
+        return Err((StatusCode::BAD_REQUEST, "input and output assets must be different".to_string()));
+    }
 
     match quoter
         .quote_swap(asset_in, asset_out, req.amount, &user)
