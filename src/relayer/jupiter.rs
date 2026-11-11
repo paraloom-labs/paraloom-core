@@ -207,8 +207,16 @@ pub trait SwapSubmitter: Send + Sync {
     /// balance doubles as the fee asset — so the caller re-shields this balance
     /// minus a small reserve rather than the quote, which an over-quote would
     /// push above the actual balance and strand on a failed re-deposit.
-    async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
-        Ok(None)
+    async fn realized_native(&self, owner: &Pubkey) -> Result<Option<u64>> {
+        let client = solana_client::rpc_client::RpcClient::new(crate::bridge::rpc_url());
+        let balance = client
+            .get_balance(owner)
+            .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))?;
+        if balance > NATIVE_DEPOSIT_RESERVE_LAMPORTS {
+            Ok(Some(balance - NATIVE_DEPOSIT_RESERVE_LAMPORTS))
+        } else {
+            Ok(Some(0))
+        }
     }
 }
 
