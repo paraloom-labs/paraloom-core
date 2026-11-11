@@ -626,16 +626,41 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         // 3. Execute: sign with the fresh keypair and submit.
         self.submitter.sign_and_submit(transaction, signer).await?;
 
-        // 4. Prefer the realized on-chain output over the quote estimate, so the
-        //    re-shield leg deposits exactly what the swap delivered, not a stale
-        //    figure that an over-quote would push above the actual balance and
-        //    strand on a failed re-deposit (audit).
+        // 4. Realized on-chain output = POST minus PRE snapshot of the
+        //    signer's output-side balance. Counting the whole POST balance
+        //    would credit pre-funded gas lamports, WSOL rent refunds, and any
+        //    dust/holders sitting at the signer as swap proceeds — letting a
+        //    degraded or sandwiched fill pass the caller's min_out_amount
+        //    floor (issue #1566). Only what the swap itself delivered counts.
+        //    The PRE read is best-effort: a flaky snapshot degrades to
+        //    pre = 0, the safe direction (a POST-only reading can only
+        //    over-count proceeds, never under-count); the quote fallback is
+        //    unchanged.
+        let pre_out = if asset_out == NATIVE_SOL_ASSET {
+            self.submitter
+                .realized_native(&signer.pubkey())
+                .await
+                .unwrap_or(None)
+        } else {
+            match Pubkey::from_str(&output_mint) {
+                Ok(mint) => self
+                    .submitter
+                    .realized_output(&signer.pubkey(), &mint)
+                    .await
+                    .unwrap_or(None),
+                // Unparseable mint: no PRE baseline; the POST read below
+                // surfaces the real error (unchanged behavior).
+                Err(_) => None,
+            }
+        };
         let out_amount = if asset_out == NATIVE_SOL_ASSET {
-            // Native output: re-shield the ephemeral's actual lamport balance
-            // minus a reserve for the re-deposit fee, falling back to the quote
-            // only when the balance can't be read.
+            // Native output: re-shield the swap's DELTA minus a reserve for
+            // the re-deposit fee, falling back to the quote only when the
+            // POST balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
-                Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
+                Some(post) => post
+                    .saturating_sub(pre_out.unwrap_or(0))
+                    .saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
                 None => out_amount,
             }
         } else {
@@ -644,6 +669,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             self.submitter
                 .realized_output(&signer.pubkey(), &mint)
                 .await?
+                .map(|post| post.saturating_sub(pre_out.unwrap_or(0)))
                 .unwrap_or(out_amount)
         };
 
@@ -909,11 +935,16 @@ mod tests {
     #[tokio::test]
     async fn native_output_reshields_realized_balance_not_the_quote() {
         // Quote says 1_000_000 lamports out, but the ephemeral actually holds
-        // 995_000 (slippage). The relayer must re-shield the realized balance
-        // minus the deposit reserve, never the stale quote — which would exceed
-        // the balance and strand the funds on a failed re-deposit.
+        // 995_000 (slippage). The relayer must re-shield the realized DELTA
+        // (issue #1566: POST minus PRE snapshot — pre-existing balances at the
+        // signer must never count as swap proceeds) minus the deposit reserve,
+        // never the stale quote — which would exceed the balance and strand
+        // the funds on a failed re-deposit. PRE is stubbed to 0 (fresh signer,
+        // nothing pre-held), so delta == full POST balance here.
         struct BalanceSubmitter {
-            lamports: u64,
+            pre_lamports: u64,
+            post_lamports: u64,
+            native_reads: Mutex<u32>,
         }
         #[async_trait::async_trait]
         impl SwapSubmitter for BalanceSubmitter {
@@ -925,7 +956,16 @@ mod tests {
                 Ok("sig".into())
             }
             async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
-                Ok(Some(self.lamports))
+                let read_no = {
+                    let mut g = self.native_reads.lock().unwrap();
+                    *g += 1;
+                    *g
+                };
+                if read_no == 1 {
+                    Ok(Some(self.pre_lamports))
+                } else {
+                    Ok(Some(self.post_lamports))
+                }
             }
         }
 
@@ -934,9 +974,18 @@ mod tests {
             "routePlan": [ { "percent": 100 } ]
         });
         let http = CannedClient::new(quote, sample_swap_tx_json());
-        let provider =
-            JupiterSwapProvider::new(http, BalanceSubmitter { lamports: 995_000 }, 50, 0, None)
-                .unwrap();
+        let provider = JupiterSwapProvider::new(
+            http,
+            BalanceSubmitter {
+                pre_lamports: 0,
+                post_lamports: 995_000,
+                native_reads: Mutex::new(0),
+            },
+            50,
+            0,
+            None,
+        )
+        .unwrap();
 
         // SPL input, native-SOL output.
         let out = provider
@@ -944,6 +993,226 @@ mod tests {
             .await
             .expect("swap executes");
         assert_eq!(out.out_amount, 995_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS);
+    }
+
+    // --- #1566 bypass regressions: pre-existing signer balances ---------
+    //
+    // The floor must judge the POST-minus-PRE delta, never the whole POST
+    // balance: pre-funded gas lamports, WSOL rent refunds, or unsolicited
+    // dust sitting at the fresh signer would otherwise satisfy the caller's
+    // `min_out_amount` on degraded or sandwiched fills. Tests 1-3 run the
+    // REAL provider (canned Jupiter seams) through the orchestration floor
+    // in `withdraw_then_swap`; 4-5 pin the degrade/fallback branches at the
+    // provider level.
+    use crate::privacy::types::ShieldedAddress;
+    use crate::relayer::private_swap::{MockSubmitter, PrivateSwapRelayer, PrivateSwapRequest};
+
+    /// Sequenced output-side balance script: entry 1 answers the PRE
+    /// snapshot read, entry 2 the POST read (issue #1566 delta accounting).
+    /// Reads beyond the script panic — the swap flow must read each side
+    /// exactly twice, and must read the side it scripted (native vs. SPL
+    /// mint). An `Err` entry exercises the best-effort degrade paths.
+    struct ScriptedSubmitter {
+        native: Mutex<Vec<Result<Option<u64>>>>,
+        spl: Mutex<Vec<Result<Option<u64>>>>,
+    }
+
+    impl ScriptedSubmitter {
+        fn spl(script: Vec<Result<Option<u64>>>) -> Self {
+            Self {
+                native: Mutex::new(Vec::new()),
+                spl: Mutex::new(script),
+            }
+        }
+        fn native(script: Vec<Result<Option<u64>>>) -> Self {
+            Self {
+                native: Mutex::new(script),
+                spl: Mutex::new(Vec::new()),
+            }
+        }
+        fn pop(side: &Mutex<Vec<Result<Option<u64>>>>) -> Result<Option<u64>> {
+            let mut script = side.lock().unwrap();
+            if script.is_empty() {
+                panic!("unexpected balance read: script exhausted");
+            }
+            script.remove(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SwapSubmitter for ScriptedSubmitter {
+        async fn sign_and_submit(
+            &self,
+            _transaction: VersionedTransaction,
+            _signer: &Keypair,
+        ) -> Result<String> {
+            Ok("sig".into())
+        }
+        async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+            Self::pop(&self.native)
+        }
+        async fn realized_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+            Self::pop(&self.spl)
+        }
+    }
+
+    fn usdc_asset() -> AssetId {
+        mint_to_asset("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+            .expect("hardcoded USDC mint parses")
+    }
+
+    fn bypass_request(asset_out: AssetId, min_out: u64) -> PrivateSwapRequest {
+        PrivateSwapRequest {
+            amount_in: 1_000_000,
+            asset_in: [0x11u8; 32], // SPL input; its withdraw leg is mocked
+            in_sk: [1u8; 32],
+            in_blinding: [2u8; 32],
+            in_note_pubkey: [3u8; 32],
+            in_leaf_index: 0,
+            asset_out,
+            reshield_recipient: ShieldedAddress::from_bytes([9u8; 32]),
+            reshield_randomness: [5u8; 32],
+            fee_bps: 0,
+            min_out_amount: Some(min_out),
+        }
+    }
+
+    fn routed_quote() -> serde_json::Value {
+        // The route PROMISES 1_000_000; the balances tell the real story.
+        serde_json::json!({ "outAmount": "1000000", "routePlan": [ { "percent": 100 } ] })
+    }
+
+    #[tokio::test]
+    async fn slippage_floor_counts_only_delta_spl() {
+        // Pre-held 50 USDC at the fresh signer + a degraded fill delivering
+        // only 900: the OLD whole-POST reading reported 50_000_900 and a
+        // 1_000 floor PASSED (the #1566 bypass). The delta is 900 — the
+        // floor must fire.
+        let provider = JupiterSwapProvider::new(
+            CannedClient::new(routed_quote(), sample_swap_tx_json()),
+            ScriptedSubmitter::spl(vec![Ok(Some(50_000_000)), Ok(Some(50_000_900))]),
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+        let relayer = PrivateSwapRelayer::new(provider, MockSubmitter::new());
+
+        let err = relayer
+            .execute(bypass_request(usdc_asset(), 1_000))
+            .await
+            .expect_err("pre-held balance must not satisfy the floor");
+        assert!(matches!(
+            err,
+            RelayerError::SlippageExceeded {
+                out_amount: 900,
+                min_out: 1_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn slippage_floor_counts_only_delta_native() {
+        // 9_000_000 lamports of pre-funded gas at the signer; the degraded
+        // swap adds only 50_000. OLD reported post − reserve ≈ 9_040_000 and
+        // a 1_000_000 floor PASSED (the #1566 bypass). The delta minus the
+        // re-deposit reserve is 40_000 — asserted EXACTLY, which also pins
+        // the reserve being taken from the DELTA, not the whole post balance.
+        let provider = JupiterSwapProvider::new(
+            CannedClient::new(routed_quote(), sample_swap_tx_json()),
+            ScriptedSubmitter::native(vec![Ok(Some(9_000_000)), Ok(Some(9_050_000))]),
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+        let relayer = PrivateSwapRelayer::new(provider, MockSubmitter::new());
+
+        let err = relayer
+            .execute(bypass_request(NATIVE_SOL_ASSET, 1_000_000))
+            .await
+            .expect_err("pre-funded gas must not satisfy the floor");
+        let expected_out = 50_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS; // 40_000
+        assert!(
+            matches!(err, RelayerError::SlippageExceeded { out_amount, min_out }
+                if out_amount == expected_out && min_out == 1_000_000),
+            "floor must judge delta-minus-reserve ({expected_out}), not whole post"
+        );
+    }
+
+    #[tokio::test]
+    async fn dust_arriving_midflow_cannot_satisfy_floor() {
+        // 777 lamports of unsolicited dust sitting at the fresh signer
+        // (captured by the PRE snapshot) + a degraded 900 fill: the OLD
+        // whole-POST reading (1_677) cleared a 1_000 floor on dust plus a
+        // bad fill — the #1566 bypass in its sneakiest costume. Delta = 900
+        // → the floor fires.
+        let provider = JupiterSwapProvider::new(
+            CannedClient::new(routed_quote(), sample_swap_tx_json()),
+            ScriptedSubmitter::spl(vec![Ok(Some(777)), Ok(Some(1_677))]),
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+        let relayer = PrivateSwapRelayer::new(provider, MockSubmitter::new());
+
+        let err = relayer
+            .execute(bypass_request(usdc_asset(), 1_000))
+            .await
+            .expect_err("dust at the signer must not satisfy the floor");
+        assert!(matches!(
+            err,
+            RelayerError::SlippageExceeded {
+                out_amount: 900,
+                min_out: 1_000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_read_failure_degrades_to_post_only_not_abort() {
+        // A flaky RPC on the PRE snapshot must NOT abort a good swap (that
+        // would be a new DoS): pre degrades to 0 via the best-effort
+        // `unwrap_or(None)` and the swap proceeds on the POST-only reading —
+        // the safe direction (POST-only can only OVER-count proceeds).
+        let provider = JupiterSwapProvider::new(
+            CannedClient::new(routed_quote(), sample_swap_tx_json()),
+            ScriptedSubmitter::spl(vec![
+                Err(RelayerError::SwapFailed("flaky pre-read".into())),
+                Ok(Some(4_200)),
+            ]),
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+        let out = provider
+            .swap([0x33u8; 32], usdc_asset(), 1_000_000, &Keypair::new())
+            .await
+            .expect("flaky PRE read degrades, never aborts");
+        assert_eq!(out.out_amount, 4_200);
+    }
+
+    #[tokio::test]
+    async fn quote_fallback_when_post_unreadable() {
+        // POST balance unreadable (`Ok(None)`) → the quote remains the
+        // reported out_amount — the unchanged pre-existing fallback, pinned
+        // so the delta refactor cannot silently break it. Native path (the
+        // PRE snapshot is irrelevant once POST is unreadable).
+        let provider = JupiterSwapProvider::new(
+            CannedClient::new(routed_quote(), sample_swap_tx_json()),
+            ScriptedSubmitter::native(vec![Ok(None), Ok(None)]),
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+        let out = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .expect("POST-unreadable falls back to the quote");
+        assert_eq!(out.out_amount, 1_000_000);
     }
 
     #[tokio::test]
