@@ -626,16 +626,41 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         // 3. Execute: sign with the fresh keypair and submit.
         self.submitter.sign_and_submit(transaction, signer).await?;
 
-        // 4. Prefer the realized on-chain output over the quote estimate, so the
-        //    re-shield leg deposits exactly what the swap delivered, not a stale
-        //    figure that an over-quote would push above the actual balance and
-        //    strand on a failed re-deposit (audit).
+        // 4. Realized on-chain output = POST minus PRE snapshot of the
+        //    signer's output-side balance. Counting the whole POST balance
+        //    would credit pre-funded gas lamports, WSOL rent refunds, and any
+        //    dust/holders sitting at the signer as swap proceeds — letting a
+        //    degraded or sandwiched fill pass the caller's min_out_amount
+        //    floor (issue #1566). Only what the swap itself delivered counts.
+        //    The PRE read is best-effort: a flaky snapshot degrades to
+        //    pre = 0, the safe direction (a POST-only reading can only
+        //    over-count proceeds, never under-count); the quote fallback is
+        //    unchanged.
+        let pre_out = if asset_out == NATIVE_SOL_ASSET {
+            self.submitter
+                .realized_native(&signer.pubkey())
+                .await
+                .unwrap_or(None)
+        } else {
+            match Pubkey::from_str(&output_mint) {
+                Ok(mint) => self
+                    .submitter
+                    .realized_output(&signer.pubkey(), &mint)
+                    .await
+                    .unwrap_or(None),
+                // Unparseable mint: no PRE baseline; the POST read below
+                // surfaces the real error (unchanged behavior).
+                Err(_) => None,
+            }
+        };
         let out_amount = if asset_out == NATIVE_SOL_ASSET {
-            // Native output: re-shield the ephemeral's actual lamport balance
-            // minus a reserve for the re-deposit fee, falling back to the quote
-            // only when the balance can't be read.
+            // Native output: re-shield the swap's DELTA minus a reserve for
+            // the re-deposit fee, falling back to the quote only when the
+            // POST balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
-                Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
+                Some(post) => post
+                    .saturating_sub(pre_out.unwrap_or(0))
+                    .saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
                 None => out_amount,
             }
         } else {
@@ -644,6 +669,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             self.submitter
                 .realized_output(&signer.pubkey(), &mint)
                 .await?
+                .map(|post| post.saturating_sub(pre_out.unwrap_or(0)))
                 .unwrap_or(out_amount)
         };
 
@@ -909,11 +935,16 @@ mod tests {
     #[tokio::test]
     async fn native_output_reshields_realized_balance_not_the_quote() {
         // Quote says 1_000_000 lamports out, but the ephemeral actually holds
-        // 995_000 (slippage). The relayer must re-shield the realized balance
-        // minus the deposit reserve, never the stale quote — which would exceed
-        // the balance and strand the funds on a failed re-deposit.
+        // 995_000 (slippage). The relayer must re-shield the realized DELTA
+        // (issue #1566: POST minus PRE snapshot — pre-existing balances at the
+        // signer must never count as swap proceeds) minus the deposit reserve,
+        // never the stale quote — which would exceed the balance and strand
+        // the funds on a failed re-deposit. PRE is stubbed to 0 (fresh signer,
+        // nothing pre-held), so delta == full POST balance here.
         struct BalanceSubmitter {
-            lamports: u64,
+            pre_lamports: u64,
+            post_lamports: u64,
+            native_reads: Mutex<u32>,
         }
         #[async_trait::async_trait]
         impl SwapSubmitter for BalanceSubmitter {
@@ -925,7 +956,16 @@ mod tests {
                 Ok("sig".into())
             }
             async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
-                Ok(Some(self.lamports))
+                let read_no = {
+                    let mut g = self.native_reads.lock().unwrap();
+                    *g += 1;
+                    *g
+                };
+                if read_no == 1 {
+                    Ok(Some(self.pre_lamports))
+                } else {
+                    Ok(Some(self.post_lamports))
+                }
             }
         }
 
@@ -934,9 +974,18 @@ mod tests {
             "routePlan": [ { "percent": 100 } ]
         });
         let http = CannedClient::new(quote, sample_swap_tx_json());
-        let provider =
-            JupiterSwapProvider::new(http, BalanceSubmitter { lamports: 995_000 }, 50, 0, None)
-                .unwrap();
+        let provider = JupiterSwapProvider::new(
+            http,
+            BalanceSubmitter {
+                pre_lamports: 0,
+                post_lamports: 995_000,
+                native_reads: Mutex::new(0),
+            },
+            50,
+            0,
+            None,
+        )
+        .unwrap();
 
         // SPL input, native-SOL output.
         let out = provider
