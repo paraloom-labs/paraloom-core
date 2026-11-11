@@ -190,6 +190,26 @@ pub trait SwapSubmitter: Send + Sync {
         signer: &Keypair,
     ) -> Result<String>;
 
+    /// Pre-swap output-token balance on `owner`'s associated token account
+    /// before the swap is submitted, or `None` when it is not tracked (the
+    /// default for stateless mock submitters). Sampling the pre-swap balance
+    /// lets [`JupiterSwapProvider::swap`] measure the balance delta delivered
+    /// by THIS trade rather than conflating any pre-existing ATA balance on a
+    /// reused or dusted fresh address into the swap output.
+    async fn pre_swap_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Pre-swap native (lamport) balance of `owner` before the swap is
+    /// submitted, or `None` when it is not tracked (the default for stateless
+    /// mock submitters). Sampling the pre-swap balance lets
+    /// [`JupiterSwapProvider::swap`] deduct pre-funded gas/rent lamports (and
+    /// any unswapped native overhead) instead of counting them as realized SOL
+    /// swap proceeds.
+    async fn pre_swap_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// The realized output-token balance on `owner`'s associated token account
     /// after the swap settled, or `None` when it can't be read cheaply (the
     /// default). A Jupiter quote is computed against current liquidity; the
@@ -356,6 +376,74 @@ impl SwapSubmitter for RpcSwapSubmitter {
                 .send_and_confirm_transaction(&signed)
                 .map(|sig| sig.to_string())
                 .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn pre_swap_output(&self, owner: &Pubkey, mint: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let ata = crate::bridge::solana::derive_associated_token_address(
+            owner,
+            mint,
+            &crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
+        );
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // Distinguish a non-existent ATA (`value: None` -> 0 pre-swap tokens,
+            // the standard fresh-address case) from an RPC transport failure
+            // (`Err` -> abort before signing/submitting so a flaky pre-read
+            // cannot default to 0 and conflate an existing ATA balance into
+            // swap proceeds).
+            let resp = client
+                .get_account_with_commitment(&ata, CommitmentConfig::confirmed())
+                .map_err(|e| {
+                    RelayerError::SubmissionFailed(format!(
+                        "pre-swap token account fetch failed: {e}"
+                    ))
+                })?;
+            match resp.value {
+                None => Ok(Some(0)),
+                Some(account) => {
+                    // SPL Token account layout: mint[0..32], owner[32..64], amount[64..72] (u64 LE).
+                    if account.data.len() < 72 {
+                        return Err(RelayerError::SubmissionFailed(format!(
+                            "malformed pre-swap token account {}: {} bytes (< 72)",
+                            ata,
+                            account.data.len()
+                        )));
+                    }
+                    let amount = u64::from_le_bytes(
+                        account.data[64..72]
+                            .try_into()
+                            .expect("8-byte token amount slice"),
+                    );
+                    Ok(Some(amount))
+                }
+            }
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn pre_swap_native(&self, owner: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let owner = *owner;
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            // `get_balance` returns `Ok(0)` for an unfunded account and `Err`
+            // only when the RPC itself fails; fail before signing/submitting
+            // rather than defaulting a failed pre-read to 0.
+            let lamports = client.get_balance(&owner).map_err(|e| {
+                RelayerError::SubmissionFailed(format!("pre-swap balance fetch failed: {e}"))
+            })?;
+            Ok(Some(lamports))
         })
         .await
         .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
@@ -618,33 +706,69 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         //      address, routing the platform fee to the relayer's fee account
         //      (shared with the non-custodial `build_swap` path).
         let output_mint = asset_to_mint(asset_out);
+        let output_mint_pk = if asset_out == NATIVE_SOL_ASSET {
+            None
+        } else {
+            Some(
+                Pubkey::from_str(&output_mint)
+                    .map_err(|e| RelayerError::SwapFailed(format!("bad output mint: {e}")))?,
+            )
+        };
         let (out_amount, swap_raw) = self
             .quote_and_swap_raw(asset_in, asset_out, amount, &signer.pubkey())
             .await?;
         let transaction = Self::decode_swap_tx(&swap_raw)?;
 
-        // 3. Execute: sign with the fresh keypair and submit.
+        // 3. Snapshot `signer`'s pre-swap output balance right before executing
+        //    so step 5 measures the balance delta delivered by THIS swap rather
+        //    than counting pre-funded gas/rent lamports, unswapped native
+        //    overhead, or an existing/dusted ATA balance on a fresh address as
+        //    swap output (which would otherwise mask shortfalls past
+        //    `PrivateSwapRequest::min_out_amount` and over-sweep funds on
+        //    re-deposit).
+        let pre_balance = match &output_mint_pk {
+            None => self
+                .submitter
+                .pre_swap_native(&signer.pubkey())
+                .await?
+                .unwrap_or(0),
+            Some(mint) => self
+                .submitter
+                .pre_swap_output(&signer.pubkey(), mint)
+                .await?
+                .unwrap_or(0),
+        };
+
+        // 4. Execute: sign with the fresh keypair and submit.
         self.submitter.sign_and_submit(transaction, signer).await?;
 
-        // 4. Prefer the realized on-chain output over the quote estimate, so the
-        //    re-shield leg deposits exactly what the swap delivered, not a stale
-        //    figure that an over-quote would push above the actual balance and
-        //    strand on a failed re-deposit (audit).
-        let out_amount = if asset_out == NATIVE_SOL_ASSET {
-            // Native output: re-shield the ephemeral's actual lamport balance
-            // minus a reserve for the re-deposit fee, falling back to the quote
-            // only when the balance can't be read.
-            match self.submitter.realized_native(&signer.pubkey()).await? {
-                Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
-                None => out_amount,
+        // 5. Prefer the realized on-chain output delta over the quote estimate,
+        //    so `min_out_amount` checks and the re-shield leg act on exactly
+        //    what the swap delivered, not a stale quote or pre-existing balance.
+        let out_amount = match &output_mint_pk {
+            None => {
+                // Native output: exclude any pre-swap lamports that were not
+                // spent as swap input (pre-funded gas on an SPL -> SOL trade, or
+                // unswapped `native_swap_overhead` on a native-in trade), while
+                // always retaining at least `NATIVE_DEPOSIT_RESERVE_LAMPORTS`
+                // for the re-deposit transaction's own fee.
+                let unswapped_native = if asset_in == NATIVE_SOL_ASSET {
+                    pre_balance.saturating_sub(amount)
+                } else {
+                    pre_balance
+                };
+                let reserve = unswapped_native.max(NATIVE_DEPOSIT_RESERVE_LAMPORTS);
+                match self.submitter.realized_native(&signer.pubkey()).await? {
+                    Some(bal) => bal.saturating_sub(reserve),
+                    None => out_amount,
+                }
             }
-        } else {
-            let mint = Pubkey::from_str(&output_mint)
-                .map_err(|e| RelayerError::SwapFailed(format!("bad output mint: {e}")))?;
-            self.submitter
-                .realized_output(&signer.pubkey(), &mint)
+            Some(mint) => self
+                .submitter
+                .realized_output(&signer.pubkey(), mint)
                 .await?
-                .unwrap_or(out_amount)
+                .map(|bal| bal.saturating_sub(pre_balance))
+                .unwrap_or(out_amount),
         };
 
         Ok(SwapResult { out_amount })
@@ -973,5 +1097,273 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn spl_output_deducts_pre_existing_ata_balance() {
+        // A reused or dusted `fresh` address already holds 50_000_000 base units
+        // of the output token before the swap executes, and the swap itself
+        // delivers 95_000_000 (leaving 145_000_000 total on the ATA). `swap`
+        // must report the 95_000_000 delta delivered by THIS trade — never the
+        // 145_000_000 post-swap total, which would mask a bad fill past
+        // `min_out_amount` and over-report/over-sweep proceeds.
+        struct PreFundedSplSubmitter {
+            pre_ata: u64,
+            post_ata: u64,
+        }
+        #[async_trait::async_trait]
+        impl SwapSubmitter for PreFundedSplSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn pre_swap_output(
+                &self,
+                _owner: &Pubkey,
+                _mint: &Pubkey,
+            ) -> Result<Option<u64>> {
+                Ok(Some(self.pre_ata))
+            }
+            async fn realized_output(
+                &self,
+                _owner: &Pubkey,
+                _mint: &Pubkey,
+            ) -> Result<Option<u64>> {
+                Ok(Some(self.post_ata))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "145000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider = JupiterSwapProvider::new(
+            http,
+            PreFundedSplSubmitter {
+                pre_ata: 50_000_000,
+                post_ata: 145_000_000,
+            },
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+
+        let out = provider
+            .swap(
+                NATIVE_SOL_ASSET,
+                [0x55u8; 32],
+                1_000_000_000,
+                &Keypair::new(),
+            )
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 95_000_000);
+    }
+
+    #[tokio::test]
+    async fn native_output_deducts_pre_funded_gas_lamports() {
+        // On Solana an SPL -> SOL swap requires `signer` to hold pre-funded SOL
+        // (e.g. 10_000_000 lamports) to pay transaction fees and temporary WSOL
+        // account rent. When the swap delivers 42_000_000 net lamports (leaving
+        // 52_000_000 total), `swap` must report 42_000_000 — preserving the
+        // 10_000_000 gas reserve rather than counting it as swap proceeds.
+        struct PreFundedNativeSubmitter {
+            pre_lamports: u64,
+            post_lamports: u64,
+        }
+        #[async_trait::async_trait]
+        impl SwapSubmitter for PreFundedNativeSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn pre_swap_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(self.pre_lamports))
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(self.post_lamports))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "50000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider = JupiterSwapProvider::new(
+            http,
+            PreFundedNativeSubmitter {
+                pre_lamports: 10_000_000,
+                post_lamports: 52_000_000,
+            },
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+
+        let out = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 42_000_000);
+    }
+
+    #[tokio::test]
+    async fn native_in_native_out_deducts_only_unswapped_overhead() {
+        // When `asset_in == NATIVE_SOL_ASSET`, `amount` of `pre_lamports` is
+        // traded into the swap while `pre_lamports - amount` is the unswapped
+        // overhead reserve retained on `signer`. Only that unswapped reserve
+        // (never the swapped `amount` itself) is excluded from realized output.
+        struct OverheadNativeSubmitter {
+            pre_lamports: u64,
+            post_lamports: u64,
+        }
+        #[async_trait::async_trait]
+        impl SwapSubmitter for OverheadNativeSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn pre_swap_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(self.pre_lamports))
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(self.post_lamports))
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "992500",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        // `signer` holds 10_992_500 lamports (992_500 swap_amount + 10_000_000
+        // overhead); the swap trades 992_500 -> 990_000, leaving 10_990_000.
+        let provider = JupiterSwapProvider::new(
+            http,
+            OverheadNativeSubmitter {
+                pre_lamports: 10_992_500,
+                post_lamports: 10_990_000,
+            },
+            50,
+            0,
+            None,
+        )
+        .unwrap();
+
+        let out = provider
+            .swap(NATIVE_SOL_ASSET, NATIVE_SOL_ASSET, 992_500, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 990_000);
+    }
+
+    #[tokio::test]
+    async fn rpc_submitter_pre_swap_queries_distinguish_missing_funded_and_rpc_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Spin up a one-shot HTTP response server on localhost for deterministic
+        // JSON-RPC testing of `RpcSwapSubmitter` with zero external network I/O.
+        fn serve_once(status: &str, body: String) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+            let addr = listener.local_addr().expect("local addr");
+            let status = status.to_string();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        let owner = Keypair::new().pubkey();
+        let mint = Pubkey::new_unique();
+
+        // 1. Non-existent ATA (`value: null`) -> Some(0), not an error.
+        let url_missing = serve_once(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":null},"id":1}"#.into(),
+        );
+        assert_eq!(
+            RpcSwapSubmitter::new(url_missing)
+                .pre_swap_output(&owner, &mint)
+                .await
+                .expect("missing ATA succeeds"),
+            Some(0)
+        );
+
+        // 2. Funded 165-byte SPL Token ATA -> parses u64 LE amount at [64..72].
+        let mut spl_data = vec![0u8; 165];
+        spl_data[0..32].copy_from_slice(mint.as_ref());
+        spl_data[32..64].copy_from_slice(owner.as_ref());
+        spl_data[64..72].copy_from_slice(&50_000_000u64.to_le_bytes());
+        let b64_data = base64::engine::general_purpose::STANDARD.encode(&spl_data);
+        let url_funded = serve_once(
+            "200 OK",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "context": { "slot": 1 },
+                    "value": {
+                        "data": [b64_data, "base64"],
+                        "executable": false,
+                        "lamports": 2_039_280,
+                        "owner": crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_string(),
+                        "rentEpoch": 0
+                    }
+                },
+                "id": 1
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            RpcSwapSubmitter::new(url_funded)
+                .pre_swap_output(&owner, &mint)
+                .await
+                .expect("funded ATA succeeds"),
+            Some(50_000_000)
+        );
+
+        // 3. Pre-swap native balance returns lamports at confirmed commitment.
+        let url_native = serve_once(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":10000000},"id":1}"#.into(),
+        );
+        assert_eq!(
+            RpcSwapSubmitter::new(url_native)
+                .pre_swap_native(&owner)
+                .await
+                .expect("native balance succeeds"),
+            Some(10_000_000)
+        );
+
+        // 4. RPC failure aborts with `SubmissionFailed` rather than silently
+        //    defaulting `pre_balance` to 0 before submitting the swap.
+        let url_err = serve_once("500 Internal Server Error", "rpc down".into());
+        assert!(matches!(
+            RpcSwapSubmitter::new(url_err)
+                .pre_swap_output(&owner, &mint)
+                .await,
+            Err(RelayerError::SubmissionFailed(_))
+        ));
     }
 }

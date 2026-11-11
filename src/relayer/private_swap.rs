@@ -898,6 +898,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_existing_balance_on_fresh_cannot_mask_slippage_floor_shortfall() {
+        // End-to-end across `PrivateSwapRelayer` + `JupiterSwapProvider`:
+        // `fresh` already holds 50_000_000 USDC (e.g. a reused output wallet or
+        // third-party dust sent once `submit_withdraw_to_fresh` exposes `fresh`
+        // on-chain). The caller sets `min_out_amount = Some(140_000_000)`, and
+        // the Jupiter swap fills at only 95_000_000 USDC (`post_ata = 145_000_000`).
+        // Counting total ATA balance instead of the swap delta would pass
+        // `145_000_000 >= 140_000_000` and bypass `SlippageExceeded`.
+        use crate::relayer::jupiter::{JupiterHttpClient, JupiterSwapProvider, SwapSubmitter};
+        use solana_sdk::{
+            message::{Message, VersionedMessage},
+            pubkey::Pubkey,
+            transaction::VersionedTransaction,
+        };
+
+        struct StaticQuoteHttp;
+        #[async_trait::async_trait]
+        impl JupiterHttpClient for StaticQuoteHttp {
+            async fn get_quote(&self, _query: &str) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({
+                    "outAmount": "145000000",
+                    "routePlan": [ { "percent": 100 } ]
+                }))
+            }
+            async fn post_swap(&self, _body: &serde_json::Value) -> Result<serde_json::Value> {
+                let payer = Keypair::new();
+                #[allow(deprecated)]
+                let ix = solana_sdk::system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Keypair::new().pubkey(),
+                    1,
+                );
+                let tx = VersionedTransaction {
+                    signatures: vec![Default::default()],
+                    message: VersionedMessage::Legacy(Message::new(&[ix], Some(&payer.pubkey()))),
+                };
+                let b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bincode::serialize(&tx).unwrap(),
+                );
+                Ok(serde_json::json!({ "swapTransaction": b64 }))
+            }
+        }
+
+        struct FundedFreshSubmitter;
+        #[async_trait::async_trait]
+        impl SwapSubmitter for FundedFreshSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _tx: VersionedTransaction,
+                _signer: &Keypair,
+            ) -> Result<String> {
+                Ok("swap-sig".into())
+            }
+            async fn pre_swap_output(
+                &self,
+                _owner: &Pubkey,
+                _mint: &Pubkey,
+            ) -> Result<Option<u64>> {
+                Ok(Some(50_000_000))
+            }
+            async fn realized_output(
+                &self,
+                _owner: &Pubkey,
+                _mint: &Pubkey,
+            ) -> Result<Option<u64>> {
+                Ok(Some(145_000_000))
+            }
+        }
+
+        let jupiter = JupiterSwapProvider::new(StaticQuoteHttp, FundedFreshSubmitter, 50, 0, None)
+            .expect("provider builds");
+        let relayer = PrivateSwapRelayer::new(jupiter, MockSubmitter::new());
+        let usdc: AssetId = [0x55u8; 32];
+        let req = PrivateSwapRequest {
+            min_out_amount: Some(140_000_000),
+            ..request(native_note(1_000_000_000), usdc, 0)
+        };
+
+        let err = relayer
+            .execute_swap_out(req, &Keypair::new())
+            .await
+            .expect_err("pre-existing ATA balance must not bypass min_out_amount");
+        assert!(matches!(
+            err,
+            RelayerError::SlippageExceeded {
+                out_amount: 95_000_000,
+                min_out: 140_000_000,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_native_output_excludes_prefunded_gas_from_slippage_and_redeposit() {
+        // Round-trip `execute()` on an SPL -> Native SOL trade where the
+        // ephemeral swap signer holds 10_000_000 pre-funded gas lamports and the
+        // swap delivers 42_000_000 net lamports (`post_lamports = 52_000_000`):
+        //   1. A `min_out_amount` of 45_000_000 must reject with `SlippageExceeded`
+        //      (the 10_000_000 gas reserve cannot pad `out_amount` to 51_990_000).
+        //   2. A `min_out_amount` of 40_000_000 must succeed and re-deposit only
+        //      the 42_000_000 swap proceeds (minus relayer fee), never sweeping
+        //      the pre-funded gas reserve into `submit_deposit_from_fresh`.
+        use crate::relayer::jupiter::{JupiterHttpClient, JupiterSwapProvider, SwapSubmitter};
+        use solana_sdk::{
+            message::{Message, VersionedMessage},
+            pubkey::Pubkey,
+            transaction::VersionedTransaction,
+        };
+
+        struct StaticQuoteHttp;
+        #[async_trait::async_trait]
+        impl JupiterHttpClient for StaticQuoteHttp {
+            async fn get_quote(&self, _query: &str) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({
+                    "outAmount": "50000000",
+                    "routePlan": [ { "percent": 100 } ]
+                }))
+            }
+            async fn post_swap(&self, _body: &serde_json::Value) -> Result<serde_json::Value> {
+                let payer = Keypair::new();
+                #[allow(deprecated)]
+                let ix = solana_sdk::system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Keypair::new().pubkey(),
+                    1,
+                );
+                let tx = VersionedTransaction {
+                    signatures: vec![Default::default()],
+                    message: VersionedMessage::Legacy(Message::new(&[ix], Some(&payer.pubkey()))),
+                };
+                let b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bincode::serialize(&tx).unwrap(),
+                );
+                Ok(serde_json::json!({ "swapTransaction": b64 }))
+            }
+        }
+
+        struct GasFundedNativeSubmitter;
+        #[async_trait::async_trait]
+        impl SwapSubmitter for GasFundedNativeSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _tx: VersionedTransaction,
+                _signer: &Keypair,
+            ) -> Result<String> {
+                Ok("swap-sig".into())
+            }
+            async fn pre_swap_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(10_000_000))
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(Some(52_000_000))
+            }
+        }
+
+        let usdc: AssetId = [0x33u8; 32];
+        let note = spl_note(usdc, 100_000_000);
+
+        // 1. Shortfall against 45_000_000 floor must fail before re-deposit.
+        let relayer_reject = PrivateSwapRelayer::new(
+            JupiterSwapProvider::new(StaticQuoteHttp, GasFundedNativeSubmitter, 50, 0, None)
+                .unwrap(),
+            MockSubmitter::new(),
+        );
+        let reject_req = PrivateSwapRequest {
+            min_out_amount: Some(45_000_000),
+            ..request(note.clone(), NATIVE_SOL_ASSET, 0)
+        };
+        let err = relayer_reject
+            .execute(reject_req)
+            .await
+            .expect_err("pre-funded gas lamports must not mask native min_out_amount shortfall");
+        assert!(matches!(
+            err,
+            RelayerError::SlippageExceeded {
+                out_amount: 42_000_000,
+                min_out: 45_000_000,
+            }
+        ));
+        assert_eq!(relayer_reject.submitter.recorded().len(), 1);
+
+        // 2. Valid fill against 40_000_000 floor re-shields only the 42_000_000
+        //    swap delta (never sweeping the 10_000_000 pre-funded gas lamports).
+        let relayer_ok = PrivateSwapRelayer::new(
+            JupiterSwapProvider::new(StaticQuoteHttp, GasFundedNativeSubmitter, 50, 0, None)
+                .unwrap(),
+            MockSubmitter::new(),
+        );
+        let ok_req = PrivateSwapRequest {
+            min_out_amount: Some(40_000_000),
+            ..request(note, NATIVE_SOL_ASSET, 0)
+        };
+        let res = relayer_ok.execute(ok_req).await.expect("swap succeeds");
+        assert_eq!(res.gross_out_amount, 42_000_000);
+        assert_eq!(res.net_out_amount, 42_000_000);
+        assert_eq!(res.deposit_leg.amount, 42_000_000);
+        assert_eq!(res.output_note.amount, 42_000_000);
+    }
+
+    #[tokio::test]
     async fn zero_amount_note_is_rejected() {
         let relayer = PrivateSwapRelayer::new(MockSwapProvider::identity(), MockSubmitter::new());
         let err = relayer
