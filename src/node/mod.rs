@@ -1169,69 +1169,121 @@ fn reconcile_deactivations(
     deactivate
 }
 
-/// Drain the transact coordinator's approval channel and settle each approved
-/// unified transact on-chain (#350). The approval channel is local to the
+/// Drain the transact coordinator's approval channel and settle approved unified
+/// transacts on-chain (#350, #1580). The approval channel is local to the
 /// coordinator that reached quorum, so exactly one node settles.
+///
+/// Settlements are executed concurrently (bounded by MAX_CONCURRENT_SETTLEMENTS)
+/// so that a slow co-sign round, transient RPC error, or offline validator on
+/// one settlement does not cause head-of-line blocking for healthy settlements
+/// queued behind it (#1580).
 /// A per-message failure — including a replay whose nullifier is already spent —
 /// is logged and skipped so it cannot stall later approvals.
-async fn settle_approved_transacts<F, Fut>(
-    mut rx: mpsc::UnboundedReceiver<ApprovedTransact>,
-    mut submit: F,
+const MAX_CONCURRENT_SETTLEMENTS: usize = 16;
+const MAX_SETTLE_ATTEMPTS: u32 = 3;
+const SETTLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+async fn settle_single_transact<F, Fut>(
+    approved: ApprovedTransact,
+    submit: Arc<F>,
     coordinator: Option<Arc<TransactVerificationCoordinator>>,
 ) where
-    F: FnMut(ApprovedTransact) -> Fut,
+    F: Fn(ApprovedTransact) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>,
 {
-    // A settlement that fails on a transient error — an expired blockhash, a
-    // co-signer briefly offline, a co-sign wallet not yet gossiped — must not be
-    // dropped: the approval is emitted exactly once and never re-emitted, so
-    // dropping it strands the transact permanently (recoverable only by the
-    // client re-proving into a new canonical id). Retry the whole cosign+submit
-    // a few times with a short backoff. Re-settling an attempt that actually
-    // landed on-chain is safe — its nullifier is already spent, so the retry
-    // returns a replay error and is skipped here.
-    const MAX_SETTLE_ATTEMPTS: u32 = 3;
-    const SETTLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
-    while let Some(approved) = rx.recv().await {
-        let request_id = approved.request.request_id.clone();
-        for attempt in 1..=MAX_SETTLE_ATTEMPTS {
-            match submit(approved.clone()).await {
-                Ok(sig) => {
-                    info!("on-chain transact settled for {}: {}", request_id, sig);
-                    break;
+    let request_id = approved.request.request_id.clone();
+    for attempt in 1..=MAX_SETTLE_ATTEMPTS {
+        match submit(approved.clone()).await {
+            Ok(sig) => {
+                info!("on-chain transact settled for {}: {}", request_id, sig);
+                break;
+            }
+            Err(e) if is_replay_error(&e) => {
+                log::debug!(
+                    "transact {} already settled (nullifier spent), skipping",
+                    request_id
+                );
+                break;
+            }
+            Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
+                log::warn!(
+                    "transact {} submit attempt {}/{} failed, retrying: {}",
+                    request_id,
+                    attempt,
+                    MAX_SETTLE_ATTEMPTS,
+                    e
+                );
+                tokio::time::sleep(SETTLE_RETRY_BACKOFF).await;
+            }
+            Err(e) => {
+                log::warn!(
+                    "transact {} submit failed after {} attempts: {}",
+                    request_id,
+                    MAX_SETTLE_ATTEMPTS,
+                    e
+                );
+                // Un-emit so the client can re-prove the identical canonical
+                // id and have it approved again, instead of it being wedged
+                // (approved-once, never settled) until a restart.
+                if let Some(coord) = &coordinator {
+                    coord.clear_emitted(&request_id).await;
                 }
-                Err(e) if is_replay_error(&e) => {
-                    log::debug!(
-                        "transact {} already settled (nullifier spent), skipping",
-                        request_id
-                    );
-                    break;
-                }
-                Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
-                    log::warn!(
-                        "transact {} submit attempt {}/{} failed, retrying: {}",
-                        request_id,
-                        attempt,
-                        MAX_SETTLE_ATTEMPTS,
-                        e
-                    );
-                    tokio::time::sleep(SETTLE_RETRY_BACKOFF).await;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "transact {} submit failed after {} attempts: {}",
-                        request_id,
-                        MAX_SETTLE_ATTEMPTS,
-                        e
-                    );
-                    // Un-emit so the client can re-prove the identical canonical
-                    // id and have it approved again, instead of it being wedged
-                    // (approved-once, never settled) until a restart.
-                    if let Some(coord) = &coordinator {
-                        coord.clear_emitted(&request_id).await;
+            }
+        }
+    }
+}
+
+async fn settle_approved_transacts<F, Fut>(
+    mut rx: mpsc::UnboundedReceiver<ApprovedTransact>,
+    submit: F,
+    coordinator: Option<Arc<TransactVerificationCoordinator>>,
+) where
+    F: Fn(ApprovedTransact) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::result::Result<String, crate::bridge::BridgeError>>
+        + Send
+        + 'static,
+{
+    let submit = Arc::new(submit);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SETTLEMENTS));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            msg = rx.recv() => {
+                match msg {
+                    Some(approved) => {
+                        let submit = submit.clone();
+                        let coordinator = coordinator.clone();
+                        let semaphore = semaphore.clone();
+                        join_set.spawn(async move {
+                            let _permit = match semaphore.acquire().await {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            };
+                            settle_single_transact(approved, submit, coordinator).await;
+                        });
+                    }
+                    None => {
+                        // Channel drained/closed
+                        break;
                     }
                 }
             }
+
+            Some(res) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = res {
+                    log::error!("settle task panicked: {e}");
+                }
+            }
+        }
+    }
+
+    // Await all remaining in-flight settlements to complete before returning
+    while let Some(res) = join_set.join_next().await {
+        if let Err(e) = res {
+            log::error!("settle task panicked: {e}");
         }
     }
 }
@@ -2765,7 +2817,7 @@ impl Clone for Node {
 mod tests {
     use super::*;
     use crate::config::Settings;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // --- connectivity reconciler hysteresis (reconcile_deactivations) ---
 
@@ -3525,6 +3577,113 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    // Head-of-line blocking is prevented (#1580): a slow/failing settlement that
+    // retries with backoff does not block a healthy settlement queued behind it.
+    #[tokio::test(start_paused = true)]
+    async fn settle_queue_hol_blocking_prevented() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("slow-failing")).unwrap();
+        tx.send(ta_approval("fast-healthy")).unwrap();
+        drop(tx);
+
+        let slow_attempts = Arc::new(AtomicUsize::new(0));
+        let fast_completed = Arc::new(AtomicBool::new(false));
+        let fast_finished_before_slow_retry_finished = Arc::new(AtomicBool::new(false));
+
+        let slow_c = slow_attempts.clone();
+        let fast_c = fast_completed.clone();
+        let hol_c = fast_finished_before_slow_retry_finished.clone();
+
+        settle_approved_transacts(
+            rx,
+            move |approved| {
+                let slow_c = slow_c.clone();
+                let fast_c = fast_c.clone();
+                let hol_c = hol_c.clone();
+                async move {
+                    if approved.request.request_id == "slow-failing" {
+                        let attempt = slow_c.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt < 3 {
+                            Err(crate::bridge::BridgeError::InvalidTransaction(
+                                "temporary network error".to_string(),
+                            ))
+                        } else {
+                            // On attempt 3, check if fast-healthy has ALREADY completed
+                            if fast_c.load(Ordering::SeqCst) {
+                                hol_c.store(true, Ordering::SeqCst);
+                            }
+                            Ok("slow-sig".to_string())
+                        }
+                    } else {
+                        // fast-healthy succeeds on the first attempt
+                        fast_c.store(true, Ordering::SeqCst);
+                        Ok("fast-sig".to_string())
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(slow_attempts.load(Ordering::SeqCst), 3);
+        assert!(fast_completed.load(Ordering::SeqCst));
+        assert!(
+            fast_finished_before_slow_retry_finished.load(Ordering::SeqCst),
+            "healthy settlement behind stuck settlement should finish before the stuck one finishes retrying"
+        );
+    }
+
+    // Settlements run concurrently bounded by MAX_CONCURRENT_SETTLEMENTS (#1580).
+    #[tokio::test(start_paused = true)]
+    async fn settle_queue_concurrency_bounded_by_semaphore() {
+        let total = 32;
+        let (tx, rx) = mpsc::unbounded_channel();
+        for i in 0..total {
+            tx.send(ta_approval(&format!("burst-{i}"))).unwrap();
+        }
+        drop(tx);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let active_c = active.clone();
+        let max_active_c = max_active.clone();
+        let completed_c = completed.clone();
+
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let active_c = active_c.clone();
+                let max_active_c = max_active_c.clone();
+                let completed_c = completed_c.clone();
+                async move {
+                    let cur = active_c.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active_c.fetch_max(cur, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    active_c.fetch_sub(1, Ordering::SeqCst);
+                    completed_c.fetch_add(1, Ordering::SeqCst);
+                    Ok("burst-sig".to_string())
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), total);
+        assert!(
+            max_active.load(Ordering::SeqCst) <= MAX_CONCURRENT_SETTLEMENTS,
+            "max active concurrency {} exceeded limit {}",
+            max_active.load(Ordering::SeqCst),
+            MAX_CONCURRENT_SETTLEMENTS
+        );
+        assert!(
+            max_active.load(Ordering::SeqCst) > 1,
+            "settlements should execute concurrently, but max active was {}",
+            max_active.load(Ordering::SeqCst)
+        );
     }
 
     // With the bridge disabled (the default), a node owns neither a
