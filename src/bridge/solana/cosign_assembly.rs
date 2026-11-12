@@ -41,6 +41,36 @@ where
     F: Fn(NodeId) -> Fut,
     Fut: Future<Output = Option<(Pubkey, Vec<u8>)>>,
 {
+    gather_signatures_with_failures(message, own, peers, threshold, request, |_| async {}).await
+}
+
+/// Collect co-signatures for `message` until `threshold` distinct, verified
+/// signatures are held (#260, #1578).
+///
+/// Seeded with the leader's own `(wallet, signature)`. For each other approving
+/// validator it calls `request(peer)`; a returned `(wallet, signature)` is kept
+/// only if the wallet is one of the expected `peers`, the signature verifies
+/// over `message`, and the wallet is not already counted. Stops as soon as the
+/// threshold is reached; errors if the peers are exhausted first.
+///
+/// When a peer fails to provide a valid signature (declines, times out, returns
+/// an unexpected wallet, or returns an invalid signature), `on_failure` is invoked
+/// with the peer's `NodeId` so the consensus reputation tracker can record the
+/// failure and penalize the refusing validator (#1578).
+pub async fn gather_signatures_with_failures<F, Fut, OF, OFut>(
+    message: &Message,
+    own: (Pubkey, Vec<u8>),
+    peers: &[(Pubkey, NodeId)],
+    threshold: usize,
+    request: F,
+    on_failure: OF,
+) -> Result<HashMap<Pubkey, Vec<u8>>>
+where
+    F: Fn(NodeId) -> Fut,
+    Fut: Future<Output = Option<(Pubkey, Vec<u8>)>>,
+    OF: Fn(NodeId) -> OFut,
+    OFut: Future<Output = ()>,
+{
     let message_bytes = message.serialize();
     let expected: std::collections::HashSet<Pubkey> = peers.iter().map(|(w, _)| *w).collect();
 
@@ -59,13 +89,16 @@ where
             break;
         }
         let Some((wallet, sig)) = request(peer.clone()).await else {
+            on_failure(peer.clone()).await;
             continue; // declined or timed out
         };
         if !expected.contains(&wallet) || collected.contains_key(&wallet) {
+            on_failure(peer.clone()).await;
             continue; // unexpected or duplicate signer
         }
         if !signature_is_valid(&wallet, &sig, &message_bytes) {
             log::warn!("co-sign signature from {wallet} did not verify; ignoring");
+            on_failure(peer.clone()).await;
             continue;
         }
         collected.insert(wallet, sig);
@@ -252,5 +285,46 @@ mod tests {
             result.is_err(),
             "a forged signature must not count toward the quorum"
         );
+    }
+
+    #[tokio::test]
+    async fn gather_calls_on_failure_for_declined_and_invalid_signatures() {
+        let leader = Keypair::new();
+        let v1 = Keypair::new();
+        let v2 = Keypair::new();
+        let message = two_signer_message(&leader.pubkey(), &v1.pubkey());
+        let own = sign(&leader, &message);
+        let peers = vec![
+            (v1.pubkey(), NodeId(vec![1])),
+            (v2.pubkey(), NodeId(vec![2])),
+        ];
+
+        let failed = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let failed_clone = failed.clone();
+
+        let v2_pubkey = v2.pubkey();
+        let _ = gather_signatures_with_failures(
+            &message,
+            own,
+            &peers,
+            3,
+            move |peer| async move {
+                if peer == NodeId(vec![1]) {
+                    None
+                } else {
+                    Some((v2_pubkey, vec![0u8; 64]))
+                }
+            },
+            move |peer| {
+                let failed = failed_clone.clone();
+                async move {
+                    failed.lock().await.push(peer);
+                }
+            },
+        )
+        .await;
+
+        let recorded = failed.lock().await;
+        assert_eq!(*recorded, vec![NodeId(vec![1]), NodeId(vec![2])]);
     }
 }

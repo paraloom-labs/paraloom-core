@@ -11,7 +11,7 @@
 //! swarm; the live caller wires it to `NetworkManager::send_cosign_request`.
 
 use crate::bridge::solana::{
-    assemble_transaction, build_settlement_message, gather_signatures, CoSignPayload,
+    assemble_transaction, build_settlement_message, gather_signatures_with_failures, CoSignPayload,
     SettlementParams,
 };
 use crate::bridge::Result;
@@ -37,11 +37,13 @@ use std::future::Future;
 ///   (the on-chain quorum size).
 /// - `send` performs one co-sign request, yielding the peer's response or
 ///   `None` on decline/timeout.
+/// - `on_failure` is called for any peer that declines, times out, or returns
+///   an invalid signature, allowing reputation tracking to penalize refusers (#1578).
 ///
 /// Errors if the message cannot be built, the threshold is not reached, or the
 /// assembled transaction fails to verify.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_cosign_round<S, Fut>(
+pub async fn run_cosign_round<S, Fut, OF, OFut>(
     leader: &Keypair,
     program_id: Pubkey,
     bridge_vault: Pubkey,
@@ -53,10 +55,13 @@ pub async fn run_cosign_round<S, Fut>(
     peers: &[(Pubkey, NodeId)],
     threshold: usize,
     send: S,
+    on_failure: OF,
 ) -> Result<Transaction>
 where
     S: Fn(NodeId, CoSignRequest) -> Fut,
     Fut: Future<Output = Option<CoSignResponse>>,
+    OF: Fn(NodeId) -> OFut,
+    OFut: Future<Output = ()>,
 {
     let payload = CoSignPayload {
         program_id: program_id.to_bytes(),
@@ -76,7 +81,7 @@ where
         message: payload.to_bytes()?,
     };
 
-    let collected = gather_signatures(
+    let collected = gather_signatures_with_failures(
         &message,
         (leader.pubkey(), own_sig),
         peers,
@@ -91,6 +96,7 @@ where
                 Some((wallet, sig))
             }
         },
+        on_failure,
     )
     .await?;
 
@@ -155,6 +161,7 @@ mod tests {
                     Some(honest_response(kp, &request))
                 }
             },
+            |_peer| async {},
         )
         .await
         .expect("round completes");
@@ -191,9 +198,46 @@ mod tests {
             &peers,
             2,
             |_peer, _request| async move { None },
+            |_peer| async {},
         )
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn calls_on_failure_when_co_signer_declines() {
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey()];
+        let peers = vec![(p1.pubkey(), NodeId(vec![1]))];
+
+        let failed_peers = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let failed_clone = failed_peers.clone();
+
+        let _ = run_cosign_round(
+            &leader,
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            [4u8; 32],
+            "req-1",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &peers,
+            2,
+            |_peer, _request| async move { None },
+            move |peer| {
+                let failed_peers = failed_clone.clone();
+                async move {
+                    failed_peers.lock().await.push(peer);
+                }
+            },
+        )
+        .await;
+
+        let recorded = failed_peers.lock().await;
+        assert_eq!(*recorded, vec![NodeId(vec![1])]);
     }
 }
