@@ -242,13 +242,18 @@ async fn submit_handler(
     Ok(Json(SubmitResponse { request_id: id }))
 }
 
-/// `GET /transact/scan` (#196) — every encrypted note this node has seen. A
+/// `GET /transact/scan` (#196, #1574) — every encrypted note this node has seen. A
 /// recipient polls it and trial-decrypts each ciphertext with its viewing key,
 /// keeping the ones that decrypt. Failed decrypts are silent.
+/// When an ingress token is configured, callers must authenticate with a bearer
+/// token to prevent unauthorized note archive scraping (#1574).
 async fn scan_handler(
     Extension(node): Extension<Arc<dyn TransactIngress>>,
-) -> Json<Vec<DeliveredNote>> {
-    Json(node.delivered_notes().await)
+    Extension(token): Extension<IngressToken>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<DeliveredNote>>, (StatusCode, String)> {
+    check_bearer(&headers, &token)?;
+    Ok(Json(node.delivered_notes().await))
 }
 
 /// Build the ingress router. Exposed separately from [`serve`] so it can be
@@ -262,7 +267,7 @@ pub fn router(node: Arc<dyn TransactIngress>, token: IngressToken) -> Router {
 }
 
 /// Bind the ingress server on `addr` and serve until the task is dropped.
-/// `token` gates the write endpoint when configured (see
+/// `token` gates the endpoints when configured (see
 /// [`crate::node::ingress_auth`]).
 pub async fn serve(
     node: Arc<dyn TransactIngress>,
@@ -467,7 +472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_token_gates_submit_but_not_scan() {
+    async fn configured_token_gates_submit_and_scan() {
         let token = crate::node::ingress_auth::token_from_config("s3cret");
 
         // Submit without a bearer token → 401, never reaching the node.
@@ -487,16 +492,29 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The read-only scan route is not a consensus write surface, so the
-        // token does not gate it: an unauthenticated GET still succeeds.
-        let app = router(Arc::new(ScanStub), token);
+        // Scan without a bearer token when token is configured → 401 (#1574).
+        let app = router(Arc::new(ScanStub), token.clone());
         let req = Request::builder()
             .method("GET")
             .uri("/transact/scan")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Scan with the correct bearer token → handled normally (200).
+        let app = router(Arc::new(ScanStub), token);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/transact/scan")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let notes: Vec<DeliveredNote> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(notes.len(), 1);
     }
 
     /// Stub that serves a fixed delivered note, to exercise the scan route.
