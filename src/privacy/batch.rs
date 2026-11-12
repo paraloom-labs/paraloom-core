@@ -131,6 +131,12 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
         let mut invalid_indices = Vec::new();
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
@@ -196,6 +202,11 @@ impl AdaptiveBatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
         match proofs.len() {
             0 => BatchVerificationResult::AllValid,
             1..=2 => self.verifier.verify_individually(vk, public_inputs, proofs),
@@ -327,5 +338,97 @@ mod tests {
         // Large batch should also work
         let result = verifier.verify_batch(&vk, &[], &[]);
         assert_eq!(result, BatchVerificationResult::AllValid);
+    }
+
+    #[test]
+    fn test_adaptive_verifier_missing_length_check() {
+        use crate::privacy::poseidon::poseidon_commit_spend;
+        use ark_ff::{BigInteger, PrimeField};
+
+        let mut rng = StdRng::seed_from_u64(0u64);
+        let circuit = DepositCircuitV2::new();
+        let (pk, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+
+        let value = 100u64;
+        let blinding = [2u8; 32];
+        let recipient_pubkey = [3u8; 32];
+        let asset = [0u8; 32];
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&recipient_pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+        let bytes = commitment_fr.into_bigint().to_bytes_le();
+        let mut commitment = [0u8; 32];
+        let len = bytes.len().min(32);
+        commitment[..len].copy_from_slice(&bytes[..len]);
+
+        let circuit1 =
+            DepositCircuitV2::with_witness(commitment, value, blinding, recipient_pubkey, asset);
+        let proof1 = Groth16ProofSystem::prove(&pk, circuit1, &mut rng).unwrap();
+
+        let adaptive_verifier = AdaptiveBatchVerifier::new();
+
+        // 1 proof with 0 inputs on AdaptiveBatchVerifier
+        let res1 = adaptive_verifier.verify(&vk, &[], &[proof1.clone()]);
+        assert!(
+            !res1.is_valid(),
+            "1 proof with 0 inputs must fail, got {:?}",
+            res1
+        );
+        assert!(
+            matches!(res1, BatchVerificationResult::Error { .. }),
+            "expected Error variant, got {:?}",
+            res1
+        );
+
+        // 2 proofs with 1 input on AdaptiveBatchVerifier (small batch path 1..=2)
+        let res2 = adaptive_verifier.verify(
+            &vk,
+            &[vec![Fr::from(1u64)]],
+            &[proof1.clone(), proof1.clone()],
+        );
+        assert!(
+            !res2.is_valid(),
+            "2 proofs with 1 input must fail, got {:?}",
+            res2
+        );
+        assert!(
+            matches!(res2, BatchVerificationResult::Error { .. }),
+            "expected Error variant, got {:?}",
+            res2
+        );
+
+        // 0 proofs with 1 input on AdaptiveBatchVerifier
+        let res3 = adaptive_verifier.verify(&vk, &[vec![Fr::from(1u64)]], &[]);
+        assert!(
+            !res3.is_valid(),
+            "0 proofs with 1 input must fail, got {:?}",
+            res3
+        );
+        assert!(
+            matches!(res3, BatchVerificationResult::Error { .. }),
+            "expected Error variant, got {:?}",
+            res3
+        );
+
+        // Also test verify_individually directly on BatchVerifier
+        let batch_verifier = BatchVerifier::new();
+        let res4 = batch_verifier.verify_individually(
+            &vk,
+            &[vec![Fr::from(1u64)]],
+            &[proof1.clone(), proof1],
+        );
+        assert!(
+            !res4.is_valid(),
+            "verify_individually with mismatched lengths must fail, got {:?}",
+            res4
+        );
+        assert!(
+            matches!(res4, BatchVerificationResult::Error { .. }),
+            "expected Error variant, got {:?}",
+            res4
+        );
     }
 }
