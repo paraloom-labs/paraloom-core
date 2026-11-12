@@ -94,6 +94,12 @@ async fn route_handler(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("input_mint: {e}")))?;
     let asset_out = mint_to_asset(&req.output_mint)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("output_mint: {e}")))?;
+    if asset_in == asset_out {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input_mint and output_mint resolve to the same asset".to_string(),
+        ));
+    }
     let user = Pubkey::from_str(&req.user_public_key)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("user_public_key: {e}")))?;
     if req.amount == 0 {
@@ -264,6 +270,41 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn identical_mint_is_400_and_never_hits_the_quoter() {
+        let mut b = valid_body();
+        b["output_mint"] = serde_json::json!("SOL");
+        // Quoter would panic if called, proving the guard short-circuits.
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("input_mint and output_mint resolve to the same asset"));
+    }
+
+    #[tokio::test]
+    async fn sol_wsol_alias_is_400_and_never_hits_the_quoter() {
+        let mut b = valid_body();
+        b["input_mint"] = serde_json::json!("SOL");
+        b["output_mint"] = serde_json::json!("So11111111111111111111111111111111111111112");
+        // Quoter would panic if called, proving the guard short-circuits.
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("input_mint and output_mint resolve to the same asset"));
     }
 
     #[tokio::test]
