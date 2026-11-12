@@ -91,32 +91,56 @@ pub fn extract_deposit_events(
         }
     };
 
-    let mut events = Vec::new();
-
-    // Top-level instructions are already compiled — JSON encoding for
-    // an unparsed program drops the `UiInstruction` wrapper.
-    for compiled in &raw.instructions {
-        if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id) {
-            events.push(build_event(signature, confirmed, decoded));
-        }
-    }
-
-    // Inner instructions (CPI from another program into ours) come back
-    // through the meta field as `UiInstruction`, which needs the match
-    // because parsed instructions can also appear there.
+    let mut inner_by_index: std::collections::BTreeMap<usize, Vec<&UiInstruction>> =
+        std::collections::BTreeMap::new();
     if let Some(meta) = &confirmed.transaction.meta {
         if let solana_transaction_status::option_serializer::OptionSerializer::Some(inner) =
             &meta.inner_instructions
         {
             for inner_set in inner {
+                let parent_idx = usize::from(inner_set.index);
                 for instruction in &inner_set.instructions {
-                    if let UiInstruction::Compiled(compiled) = instruction {
-                        if let Some(decoded) =
-                            decode_compiled_deposit(compiled, &account_keys, program_id)
-                        {
-                            events.push(build_event(signature, confirmed, decoded));
-                        }
+                    inner_by_index
+                        .entry(parent_idx)
+                        .or_default()
+                        .push(instruction);
+                }
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+
+    // Top-level instructions and inner CPI instructions execute in depth-first order
+    // per top-level instruction index `idx`: top-level instruction `raw.instructions[idx]`
+    // executes, followed immediately by all inner CPI instructions recorded under
+    // `inner_set.index == idx`, before top-level instruction `raw.instructions[idx + 1]` runs.
+    for (idx, compiled) in raw.instructions.iter().enumerate() {
+        if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id) {
+            events.push(build_event(signature, confirmed, decoded));
+        }
+
+        if let Some(inner_list) = inner_by_index.remove(&idx) {
+            for instruction in inner_list {
+                if let UiInstruction::Compiled(compiled) = instruction {
+                    if let Some(decoded) =
+                        decode_compiled_deposit(compiled, &account_keys, program_id)
+                    {
+                        events.push(build_event(signature, confirmed, decoded));
                     }
+                }
+            }
+        }
+    }
+
+    // Defensive fallback: if any inner instruction set has an index >= raw.instructions.len()
+    // (e.g. synthetic test data), process in ascending order of parent index.
+    for (_parent_idx, inner_list) in inner_by_index {
+        for instruction in inner_list {
+            if let UiInstruction::Compiled(compiled) = instruction {
+                if let Some(decoded) = decode_compiled_deposit(compiled, &account_keys, program_id)
+                {
+                    events.push(build_event(signature, confirmed, decoded));
                 }
             }
         }
@@ -515,5 +539,117 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn extract_deposit_events_interleaves_inner_cpi_deposits_in_execution_order() {
+        use solana_sdk::message::MessageHeader;
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
+            UiInnerInstructions, UiRawMessage, UiTransaction, UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let other_program = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let dummy = Pubkey::new_unique();
+
+        let account_keys = vec![
+            dummy.to_string(),         // 0: bridge_state
+            dummy.to_string(),         // 1: bridge_vault
+            depositor.to_string(),     // 2: depositor
+            dummy.to_string(),         // 3: system_program
+            program_id.to_string(),    // 4: paraloom program
+            other_program.to_string(), // 5: router/wrapper program
+        ];
+
+        // Top-level instruction 0: non-deposit router call that invokes CPI
+        let ix0_router = UiCompiledInstruction {
+            program_id_index: 5,
+            accounts: vec![0, 1, 2, 3],
+            data: "dummy".to_string(),
+            stack_height: None,
+        };
+
+        // Top-level instruction 1: direct deposit of 2_000_000
+        let ix1_direct_deposit = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: encode_deposit_data(2_000_000, [1u8; 32], [2u8; 32]),
+            stack_height: None,
+        };
+
+        // Inner CPI instruction executed during instruction 0: deposit of 1_000_000
+        let inner_cpi_deposit = UiInstruction::Compiled(UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: encode_deposit_data(1_000_000, [3u8; 32], [4u8; 32]),
+            stack_height: None,
+        });
+
+        let inner_set = UiInnerInstructions {
+            index: 0,
+            instructions: vec![inner_cpi_deposit],
+        };
+
+        let raw = UiRawMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            account_keys,
+            recent_blockhash: "11111111111111111111111111111111".to_string(),
+            instructions: vec![ix0_router, ix1_direct_deposit],
+            address_table_lookups: None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            status: Ok(()),
+            err: None,
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::Some(vec![inner_set]),
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::None,
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 100,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig123".to_string()],
+                    message: UiMessage::Raw(raw),
+                }),
+                meta: Some(meta),
+                version: None,
+            },
+            block_time: Some(1_700_000_000),
+        };
+
+        let events = extract_deposit_events("sig123", &confirmed, &program_id);
+        assert_eq!(
+            events.len(),
+            2,
+            "must extract both inner and top-level deposits"
+        );
+
+        // The inner CPI deposit from instruction 0 must appear BEFORE top-level instruction 1
+        assert_eq!(
+            events[0].amount, 1_000_000,
+            "inner CPI deposit at index 0 must be first"
+        );
+        assert_eq!(
+            events[1].amount, 2_000_000,
+            "top-level deposit at index 1 must be second"
+        );
     }
 }
