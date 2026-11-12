@@ -14,6 +14,7 @@
 //! window without waiting ~216k real slots.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::{
     accounts, instruction, BridgeError, ValidatorAccount, ValidatorRegistry, MIN_VALIDATOR_STAKE,
@@ -30,7 +31,8 @@ use solana_sdk::{
 mod common;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+    register_validator_ix, slash_validator_ix, stake_vault_pdas, withdraw_unbonded_ix,
+    TEST_TOKEN_FUND,
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
@@ -228,6 +230,32 @@ async fn stake_unbonds_then_withdraws_after_delay() {
     assert!(
         closed.is_none() || closed.unwrap().lamports == 0,
         "PDA must be closed after withdraw"
+    );
+
+    // Both the SOL and SPL token stakes must be fully released — no tokens stranded in vault.
+    let (vault_pda, _) = stake_vault_pdas(program_id);
+    let vault_raw = ctx
+        .banks_client
+        .get_account(vault_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_state = spl_token::state::Account::unpack(&vault_raw.data).unwrap();
+    assert_eq!(
+        vault_state.amount, 0,
+        "stake token vault emptied after unbonded withdrawal"
+    );
+
+    let vt_raw = ctx
+        .banks_client
+        .get_account(validator_token)
+        .await
+        .unwrap()
+        .unwrap();
+    let vt_state = spl_token::state::Account::unpack(&vt_raw.data).unwrap();
+    assert_eq!(
+        vt_state.amount, TEST_TOKEN_FUND,
+        "validator token balance restored after unbonded withdrawal"
     );
 
     // 7. The freed address can be registered again — the #392 lockout is gone.
@@ -465,6 +493,14 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         acc.unbonding_amount, MIN_VALIDATOR_STAKE,
         "the full stake must be routed into unbonding, not stranded"
     );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "token stake zeroed on deactivate"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "the full token stake must be routed into unbonding alongside SOL"
+    );
     assert!(
         acc.unbonding_slot >= UNBONDING_SLOTS,
         "unbonding_slot = deactivation-era slot + UNBONDING_SLOTS"
@@ -516,5 +552,31 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     assert!(
         closed.is_none() || closed.unwrap().lamports == 0,
         "PDA must be closed after withdraw"
+    );
+
+    // Both the SOL and SPL token stakes must be fully released — no tokens stranded in vault.
+    let (vault_pda, _) = stake_vault_pdas(program_id);
+    let vault_raw = ctx
+        .banks_client
+        .get_account(vault_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_state = spl_token::state::Account::unpack(&vault_raw.data).unwrap();
+    assert_eq!(
+        vault_state.amount, 0,
+        "stake token vault emptied after unbonded withdrawal"
+    );
+
+    let vt_raw = ctx
+        .banks_client
+        .get_account(validator_token)
+        .await
+        .unwrap()
+        .unwrap();
+    let vt_state = spl_token::state::Account::unpack(&vt_raw.data).unwrap();
+    assert_eq!(
+        vt_state.amount, TEST_TOKEN_FUND,
+        "validator token balance restored after unbonded withdrawal"
     );
 }
