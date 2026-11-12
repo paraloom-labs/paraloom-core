@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -928,22 +928,28 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             &expected_program_id,
             &self.verified_transacts,
             &self.cosign_counts,
+            self.transact_coordinator.as_ref(),
             request,
         )
         .await)
     }
 }
 
-/// Produce a co-sign response for `request` (#260): sign the rebuilt settlement
+/// Produce a co-sign response for `request` (#260, #1576): sign the rebuilt settlement
 /// message iff we hold a keypair and the payload matches — by request id and
 /// binding parameters — a settlement we verified `Valid`; otherwise decline
-/// (`signature: None`). Free-standing so the security-critical decision can be
-/// unit-tested without standing up a full node.
+/// (`signature: None`). When a `TransactVerificationCoordinator` is supplied,
+/// additionally verifies that the consensus tally reached a Valid quorum, the tally
+/// has not timed out, and every proposed signer in `quorum_validators` was approved
+/// by the tally and clears the reputation floor (#1576).
+/// Free-standing so the security-critical decision can be unit-tested without
+/// standing up a full node.
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    coordinator: Option<&Arc<TransactVerificationCoordinator>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -1050,6 +1056,46 @@ async fn cosign_settlement(
     };
     if !approved {
         return declined("parameters do not match a settlement we verified");
+    }
+
+    // When a transact coordinator is supplied, verify that:
+    // 1. The consensus tally reached a Valid quorum and has not timed out (#1576).
+    // 2. The proposed quorum_validators only includes approved validators from
+    //    the tally that clear the reputation floor (#1576).
+    if let Some(coord) = coordinator {
+        match coord.check_consensus(&request_id).await {
+            Ok(Some(crate::consensus::vote_tally::VerificationVote::Valid)) => {}
+            Ok(Some(crate::consensus::vote_tally::VerificationVote::Invalid { reason })) => {
+                return declined(&format!("consensus tally rejected settlement: {reason}"));
+            }
+            Ok(None) => {
+                return declined("consensus tally has not approved settlement");
+            }
+            Err(e) => {
+                return declined(&format!("consensus tally check failed: {e}"));
+            }
+        }
+
+        // Verify proposed quorum_validators: every validator must be either the authority
+        // or one of the valid voters approved by the tally (which also satisfies the reputation floor).
+        let valid_voters = coord.valid_voters(&request_id).await;
+        let mut allowed_signers: HashSet<[u8; 32]> = HashSet::new();
+        allowed_signers.insert(payload.authority);
+        for voter in valid_voters {
+            if let Some(wallet_str) = coord.validator_wallet(&voter).await {
+                if let Ok(pubkey) = wallet_str.parse::<Pubkey>() {
+                    allowed_signers.insert(pubkey.to_bytes());
+                }
+            }
+        }
+
+        for signer in &payload.quorum_validators {
+            if !allowed_signers.contains(signer) {
+                return declined(
+                    "proposed quorum_validators contains non-approved signer or voter below reputation floor",
+                );
+            }
+        }
     }
 
     // Rebuild the exact settlement message ourselves and sign it.
@@ -2861,6 +2907,7 @@ mod tests {
             &configured_program(),
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
+            None,
             cosign_req("nope", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2876,6 +2923,7 @@ mod tests {
             &configured_program(),
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
+            None,
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2887,6 +2935,7 @@ mod tests {
             &Pubkey::new_from_array([2u8; 32]),
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
+            None,
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -2970,6 +3019,7 @@ mod tests {
             &configured_program(),
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
+            None,
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -3020,6 +3070,7 @@ mod tests {
                 &configured_program(),
                 &tas,
                 &counts,
+                None,
                 cosign_req("t1", SettlementKind::Transact, &payload),
             )
             .await;
@@ -3032,6 +3083,7 @@ mod tests {
             &configured_program(),
             &tas,
             &counts,
+            None,
             cosign_req("t1", SettlementKind::Transact, &payload),
         )
         .await;
@@ -3060,6 +3112,7 @@ mod tests {
             &configured_program(),
             &tas,
             &counts,
+            None,
             cosign_req("t2", SettlementKind::Transact, &other_payload),
         )
         .await;
@@ -3111,6 +3164,7 @@ mod tests {
                 &configured_program(),
                 &tas,
                 &counts,
+                None,
                 cosign_req("t1", SettlementKind::Transact, &forged),
             )
             .await;
@@ -3132,6 +3186,7 @@ mod tests {
             &configured_program(),
             &tas,
             &counts,
+            None,
             cosign_req("t1", SettlementKind::Transact, &legit),
         )
         .await;
@@ -3177,6 +3232,7 @@ mod tests {
                 &configured_program(),
                 &tas,
                 &counts,
+                None,
                 cosign_req("proof-a", SettlementKind::Transact, &payload),
             )
             .await;
@@ -3194,6 +3250,7 @@ mod tests {
             &configured_program(),
             &tas,
             &counts,
+            None,
             cosign_req("proof-b", SettlementKind::Transact, &payload),
         )
         .await;
@@ -3240,6 +3297,7 @@ mod tests {
                 &configured_program(),
                 &tas,
                 &counts,
+                None,
                 cosign_req("a", SettlementKind::Transact, &payload_a),
             )
             .await;
@@ -3266,6 +3324,7 @@ mod tests {
             &configured_program(),
             &tas,
             &counts,
+            None,
             cosign_req("b", SettlementKind::Transact, &payload_b),
         )
         .await;
@@ -3314,6 +3373,7 @@ mod tests {
                 &configured_program(),
                 &tas,
                 &counts,
+                None,
                 cosign_req(&id, SettlementKind::Transact, &payload),
             )
             .await;
@@ -3354,6 +3414,7 @@ mod tests {
             &configured_program(),
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
+            None,
             cosign_req("t1", SettlementKind::Transact, &tampered_recipient),
         )
         .await;
@@ -3376,6 +3437,7 @@ mod tests {
             &configured_program(),
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
+            None,
             cosign_req("t1", SettlementKind::Transact, &tampered_ext),
         )
         .await;
@@ -3633,5 +3695,196 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_with_coordinator_validates_tally_outcome_and_signer_set() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+
+        let mut req = ta_request("t1", recipient, nullifiers, outputs, root, ext_amount);
+        let id = req.canonical_id();
+        req.request_id = id.clone();
+        tas.lock().await.insert(id.clone(), req.clone());
+
+        // Setup a 2-of-2 coordinator
+        let (c, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet(kp.pubkey().to_string());
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some(kp.pubkey().to_string()))
+            .await;
+        c.register_validator_with_wallet(
+            NodeId(vec![1]),
+            Some(Keypair::new().pubkey().to_string()),
+        )
+        .await;
+        let mut stakes = HashMap::new();
+        stakes.insert(kp.pubkey().to_string(), 1_000_000_000);
+        c.sync_onchain_stakes(stakes, 2_000_000_000).await;
+        let coord = Arc::new(c);
+
+        coord.start_verification(req.clone()).await.unwrap();
+
+        // 1. Consensus not reached yet -> declined
+        let payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&coord),
+            cosign_req(&id, SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(resp.signature, None, "unapproved tally must be declined");
+
+        // 2. Tally rejected (Invalid vote from validator) -> declined
+        coord
+            .submit_result(crate::consensus::transact::TransactVerificationResult {
+                request_id: id.clone(),
+                validator: NodeId(vec![0]),
+                vote: crate::consensus::vote_tally::VerificationVote::Invalid {
+                    reason: "bad".into(),
+                },
+                timestamp: 1,
+                wallet_pubkey: kp.pubkey().to_string(),
+                signature: vec![1],
+            })
+            .await
+            .unwrap();
+
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&coord),
+            cosign_req(&id, SettlementKind::Transact, &payload),
+        )
+        .await;
+        assert_eq!(resp.signature, None, "rejected tally must be declined");
+    }
+
+    #[tokio::test]
+    async fn cosign_with_coordinator_declines_unapproved_quorum_validators() {
+        let kp = Arc::new(Keypair::new());
+        let val1_kp = Keypair::new();
+        let rogue_kp = Keypair::new();
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+
+        let mut req = ta_request("t1", recipient, nullifiers, outputs, root, ext_amount);
+        let id = req.canonical_id();
+        req.request_id = id.clone();
+        tas.lock().await.insert(id.clone(), req.clone());
+
+        let (c, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet(kp.pubkey().to_string());
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some(kp.pubkey().to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some(val1_kp.pubkey().to_string()))
+            .await;
+        let mut stakes = HashMap::new();
+        stakes.insert(kp.pubkey().to_string(), 1_000_000_000);
+        stakes.insert(val1_kp.pubkey().to_string(), 1_000_000_000);
+        c.sync_onchain_stakes(stakes, 2_000_000_000).await;
+        let coord = Arc::new(c);
+
+        coord.start_verification(req.clone()).await.unwrap();
+        coord
+            .submit_result(crate::consensus::transact::TransactVerificationResult {
+                request_id: id.clone(),
+                validator: NodeId(vec![0]),
+                vote: crate::consensus::vote_tally::VerificationVote::Valid,
+                timestamp: 1,
+                wallet_pubkey: kp.pubkey().to_string(),
+                signature: vec![1],
+            })
+            .await
+            .unwrap();
+        coord
+            .submit_result(crate::consensus::transact::TransactVerificationResult {
+                request_id: id.clone(),
+                validator: NodeId(vec![1]),
+                vote: crate::consensus::vote_tally::VerificationVote::Valid,
+                timestamp: 1,
+                wallet_pubkey: val1_kp.pubkey().to_string(),
+                signature: vec![1],
+            })
+            .await
+            .unwrap();
+
+        // Check 1: Proposed payload contains rogue validator not in valid_voters -> declined
+        let mut bad_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        bad_payload.quorum_validators = vec![kp.pubkey().to_bytes(), rogue_kp.pubkey().to_bytes()];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&coord),
+            cosign_req(&id, SettlementKind::Transact, &bad_payload),
+        )
+        .await;
+        assert_eq!(
+            resp.signature, None,
+            "quorum_validators with unapproved signer must be declined"
+        );
+
+        // Check 2: Proposed payload matches approved valid voters -> accepted and signed
+        let mut good_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        good_payload.quorum_validators = vec![kp.pubkey().to_bytes(), val1_kp.pubkey().to_bytes()];
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&coord),
+            cosign_req(&id, SettlementKind::Transact, &good_payload),
+        )
+        .await;
+        assert!(
+            resp.signature.is_some(),
+            "quorum_validators matching approved tally voters must be signed"
+        );
     }
 }
