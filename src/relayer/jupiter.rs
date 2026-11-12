@@ -190,6 +190,18 @@ pub trait SwapSubmitter: Send + Sync {
         signer: &Keypair,
     ) -> Result<String>;
 
+    /// Pre-swap output-token balance snapshot on `owner`'s associated token account
+    /// before the swap executes, or `None` when unreadable or not supported (default).
+    async fn pre_swap_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Pre-swap native (lamport) balance of `owner` before the swap executes,
+    /// or `None` when unreadable or not supported (default).
+    async fn pre_swap_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// The realized output-token balance on `owner`'s associated token account
     /// after the swap settled, or `None` when it can't be read cheaply (the
     /// default). A Jupiter quote is computed against current liquidity; the
@@ -356,6 +368,58 @@ impl SwapSubmitter for RpcSwapSubmitter {
                 .send_and_confirm_transaction(&signed)
                 .map(|sig| sig.to_string())
                 .map_err(|e| RelayerError::SubmissionFailed(e.to_string()))
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn pre_swap_output(&self, owner: &Pubkey, mint: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let ata = crate::bridge::solana::derive_associated_token_address(
+            owner,
+            mint,
+            &crate::bridge::solana::SPL_TOKEN_PROGRAM_ID,
+        );
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            match client.get_account_with_commitment(&ata, CommitmentConfig::confirmed()) {
+                Ok(resp) => match resp.value {
+                    Some(account) => {
+                        if account.data.len() >= 72 {
+                            let amount_bytes: [u8; 8] = account.data[64..72].try_into().unwrap();
+                            Ok(Some(u64::from_le_bytes(amount_bytes)))
+                        } else {
+                            Ok(Some(0))
+                        }
+                    }
+                    None => Ok(Some(0)),
+                },
+                Err(e) => Err(RelayerError::SubmissionFailed(format!(
+                    "pre-swap token balance fetch failed: {e}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
+    }
+
+    async fn pre_swap_native(&self, owner: &Pubkey) -> Result<Option<u64>> {
+        use solana_client::rpc_client::RpcClient;
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let rpc_url = self.rpc_url.clone();
+        let owner = *owner;
+        tokio::task::spawn_blocking(move || {
+            let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+            match client.get_balance(&owner) {
+                Ok(lamports) => Ok(Some(lamports)),
+                Err(e) => Err(RelayerError::SubmissionFailed(format!(
+                    "pre-swap native balance fetch failed: {e}"
+                ))),
+            }
         })
         .await
         .map_err(|e| RelayerError::SubmissionFailed(format!("join error: {e}")))?
@@ -623,6 +687,19 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             .await?;
         let transaction = Self::decode_swap_tx(&swap_raw)?;
 
+        // Pre-swap snapshot of signer's output asset balance right before
+        // signing and submitting, so pre-existing funds or gas reserves do
+        // not inflate realized swap proceeds (#1566).
+        let pre_balance = if asset_out == NATIVE_SOL_ASSET {
+            self.submitter.pre_swap_native(&signer.pubkey()).await?
+        } else {
+            let mint = Pubkey::from_str(&output_mint)
+                .map_err(|e| RelayerError::SwapFailed(format!("bad output mint: {e}")))?;
+            self.submitter
+                .pre_swap_output(&signer.pubkey(), &mint)
+                .await?
+        };
+
         // 3. Execute: sign with the fresh keypair and submit.
         self.submitter.sign_and_submit(transaction, signer).await?;
 
@@ -630,12 +707,24 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         //    re-shield leg deposits exactly what the swap delivered, not a stale
         //    figure that an over-quote would push above the actual balance and
         //    strand on a failed re-deposit (audit).
+        //    Deduct the pre-swap balance so pre-funded gas lamports, WSOL rent
+        //    refunds, or pre-existing token holdings cannot satisfy min_out_amount
+        //    or inflate re-shield deposits (#1566).
         let out_amount = if asset_out == NATIVE_SOL_ASSET {
-            // Native output: re-shield the ephemeral's actual lamport balance
-            // minus a reserve for the re-deposit fee, falling back to the quote
+            // Native output: re-shield the ephemeral's actual lamport delta
+            // minus the reserve for re-deposit fee, falling back to the quote
             // only when the balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
-                Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
+                Some(bal) => {
+                    let pre = pre_balance.unwrap_or(0);
+                    let unswapped_native = if asset_in == NATIVE_SOL_ASSET {
+                        pre.saturating_sub(amount)
+                    } else {
+                        pre
+                    };
+                    let reserve = unswapped_native.max(NATIVE_DEPOSIT_RESERVE_LAMPORTS);
+                    bal.saturating_sub(reserve)
+                }
                 None => out_amount,
             }
         } else {
@@ -644,6 +733,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             self.submitter
                 .realized_output(&signer.pubkey(), &mint)
                 .await?
+                .map(|bal| bal.saturating_sub(pre_balance.unwrap_or(0)))
                 .unwrap_or(out_amount)
         };
 
@@ -973,5 +1063,105 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RelayerError::InvalidAmount(0)));
         assert!(provider.http.seen_query.lock().unwrap().is_none());
+    }
+
+    struct DeltaSubmitter {
+        pre_spl: Option<u64>,
+        post_spl: Option<u64>,
+        pre_native: Option<u64>,
+        post_native: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SwapSubmitter for DeltaSubmitter {
+        async fn sign_and_submit(&self, _t: VersionedTransaction, _s: &Keypair) -> Result<String> {
+            Ok("sig".into())
+        }
+
+        async fn pre_swap_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+            Ok(self.pre_spl)
+        }
+
+        async fn pre_swap_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+            Ok(self.pre_native)
+        }
+
+        async fn realized_output(&self, _owner: &Pubkey, _mint: &Pubkey) -> Result<Option<u64>> {
+            Ok(self.post_spl)
+        }
+
+        async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+            Ok(self.post_native)
+        }
+    }
+
+    #[tokio::test]
+    async fn spl_output_deducts_pre_existing_ata_balance() {
+        let quote = serde_json::json!({
+            "outAmount": "100000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let submitter = DeltaSubmitter {
+            pre_spl: Some(50_000_000),
+            post_spl: Some(145_000_000),
+            pre_native: None,
+            post_native: None,
+        };
+        let provider = JupiterSwapProvider::new(http, submitter, 50, 0, None).unwrap();
+        let out = provider
+            .swap(NATIVE_SOL_ASSET, [0x11u8; 32], 1_000_000, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 95_000_000);
+    }
+
+    #[tokio::test]
+    async fn native_output_deducts_pre_funded_gas_lamports() {
+        let quote = serde_json::json!({
+            "outAmount": "45000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let submitter = DeltaSubmitter {
+            pre_spl: None,
+            post_spl: None,
+            pre_native: Some(10_000_000),
+            post_native: Some(52_000_000),
+        };
+        let provider = JupiterSwapProvider::new(http, submitter, 50, 0, None).unwrap();
+        // SPL input -> Native SOL output
+        let out = provider
+            .swap([0x11u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 42_000_000);
+    }
+
+    #[tokio::test]
+    async fn native_in_native_out_deducts_only_unswapped_overhead() {
+        let quote = serde_json::json!({
+            "outAmount": "990000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let submitter = DeltaSubmitter {
+            pre_spl: None,
+            post_spl: None,
+            pre_native: Some(10_000_000),
+            post_native: Some(1_990_000),
+        };
+        let provider = JupiterSwapProvider::new(http, submitter, 50, 0, None).unwrap();
+        // Native SOL in -> Native SOL out (amount = 9_000_000, unswapped = 1_000_000)
+        let out = provider
+            .swap(
+                NATIVE_SOL_ASSET,
+                NATIVE_SOL_ASSET,
+                9_000_000,
+                &Keypair::new(),
+            )
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 990_000);
     }
 }
