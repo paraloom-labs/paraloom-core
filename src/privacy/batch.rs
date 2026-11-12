@@ -63,14 +63,14 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
-        if proofs.is_empty() {
-            return BatchVerificationResult::AllValid;
-        }
-
         if proofs.len() != public_inputs.len() {
             return BatchVerificationResult::Error {
                 reason: "Mismatched number of proofs and public inputs".to_string(),
             };
+        }
+
+        if proofs.is_empty() {
+            return BatchVerificationResult::AllValid;
         }
 
         // For small batches, verify individually
@@ -131,6 +131,12 @@ impl BatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
         let mut invalid_indices = Vec::new();
 
         for (i, (proof, inputs)) in proofs.iter().zip(public_inputs.iter()).enumerate() {
@@ -196,6 +202,12 @@ impl AdaptiveBatchVerifier {
         public_inputs: &[Vec<Fr>],
         proofs: &[Proof<Bn254>],
     ) -> BatchVerificationResult {
+        if proofs.len() != public_inputs.len() {
+            return BatchVerificationResult::Error {
+                reason: "Mismatched number of proofs and public inputs".to_string(),
+            };
+        }
+
         match proofs.len() {
             0 => BatchVerificationResult::AllValid,
             1..=2 => self.verifier.verify_individually(vk, public_inputs, proofs),
@@ -327,5 +339,61 @@ mod tests {
         // Large batch should also work
         let result = verifier.verify_batch(&vk, &[], &[]);
         assert_eq!(result, BatchVerificationResult::AllValid);
+    }
+
+    /// Verifies that `AdaptiveBatchVerifier::verify` rejects mismatched lengths
+    /// of `proofs` and `public_inputs` on the `1..=2` individual-verification branch
+    /// as well as the batch branch, preventing silent truncation.
+    #[test]
+    fn test_adaptive_verifier_mismatched_inputs_and_proofs() {
+        use crate::privacy::poseidon::poseidon_commit_spend;
+        use ark_ff::{BigInteger, PrimeField};
+
+        let mut rng = StdRng::seed_from_u64(0u64);
+        let circuit = DepositCircuitV2::new();
+        let (pk, vk) = Groth16ProofSystem::setup(circuit, &mut rng).unwrap();
+
+        let value = 100u64;
+        let blinding = [2u8; 32];
+        let recipient_pubkey = [3u8; 32];
+        let asset = [0u8; 32];
+        let commitment_fr = poseidon_commit_spend(
+            Fr::from(value),
+            Fr::from_le_bytes_mod_order(&recipient_pubkey),
+            Fr::from_le_bytes_mod_order(&blinding),
+            Fr::from_le_bytes_mod_order(&asset),
+        );
+        let bytes = commitment_fr.into_bigint().to_bytes_le();
+        let mut commitment = [0u8; 32];
+        let len = bytes.len().min(32);
+        commitment[..len].copy_from_slice(&bytes[..len]);
+
+        let circuit1 =
+            DepositCircuitV2::with_witness(commitment, value, blinding, recipient_pubkey, asset);
+        let proof1 = Groth16ProofSystem::prove(&pk, circuit1, &mut rng).unwrap();
+
+        let correct_inputs = vec![commitment_fr, Fr::from(0u64)];
+
+        let adaptive = AdaptiveBatchVerifier::new();
+
+        // 2 proofs vs 1 public-input vector (exercises 1..=2 branch)
+        let r1 = adaptive.verify(
+            &vk,
+            &[correct_inputs.clone()],
+            &[proof1.clone(), proof1.clone()],
+        );
+        assert!(
+            matches!(r1, BatchVerificationResult::Error { .. }),
+            "adaptive verifier must return Error on mismatched proofs and inputs (2 proofs, 1 input), got {:?}",
+            r1
+        );
+
+        // 1 proof vs 2 public-input vectors
+        let r2 = adaptive.verify(&vk, &[correct_inputs.clone(), correct_inputs], &[proof1]);
+        assert!(
+            matches!(r2, BatchVerificationResult::Error { .. }),
+            "adaptive verifier must return Error on mismatched proofs and inputs (1 proof, 2 inputs), got {:?}",
+            r2
+        );
     }
 }
