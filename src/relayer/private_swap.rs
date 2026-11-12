@@ -88,11 +88,16 @@ pub enum RelayerError {
     /// (`min_out_amount`). Checked the instant the swap leg returns, before any
     /// fee accounting or re-deposit/delivery, so a bad fill aborts the swap
     /// instead of silently re-shielding (or handing over) less than the caller
-    /// was willing to accept. The provider's own slippage bound is the on-chain
-    /// first line of defense; this is the orchestration layer's independent
-    /// check, which the provider setting alone did not give a single request.
-    #[error("swap output {out_amount} is below the caller minimum {min_out}")]
-    SlippageExceeded { out_amount: u64, min_out: u64 },
+    /// was willing to accept. The ephemeral keypair bytes and address are returned
+    /// so the funds sitting at the fresh address can be recovered rather than permanently
+    /// stranded.
+    #[error("swap output {out_amount} is below caller minimum {min_out}; ephemeral key returned for recovery")]
+    SlippageExceeded {
+        out_amount: u64,
+        min_out: u64,
+        ephemeral_keypair_bytes: Vec<u8>,
+        fresh_address: [u8; 32],
+    },
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -466,6 +471,8 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
                 return Err(RelayerError::SlippageExceeded {
                     out_amount: swap.out_amount,
                     min_out,
+                    ephemeral_keypair_bytes: ephemeral.to_bytes().to_vec(),
+                    fresh_address: ephemeral.pubkey().to_bytes(),
                 });
             }
         }
@@ -852,13 +859,22 @@ mod tests {
             .execute(req)
             .await
             .expect_err("below-min fill must error");
-        assert!(matches!(
-            err,
+        match &err {
             RelayerError::SlippageExceeded {
-                out_amount: 997_500,
-                min_out: 1_000_000
+                out_amount,
+                min_out,
+                ephemeral_keypair_bytes,
+                fresh_address,
+            } => {
+                assert_eq!(*out_amount, 997_500);
+                assert_eq!(*min_out, 1_000_000);
+                assert_eq!(ephemeral_keypair_bytes.len(), 64);
+                let recovered = Keypair::try_from(ephemeral_keypair_bytes.as_slice())
+                    .expect("ephemeral keypair must be recoverable");
+                assert_eq!(&recovered.pubkey().to_bytes(), fresh_address);
             }
-        ));
+            other => panic!("expected SlippageExceeded, got {other:?}"),
+        }
         // The withdraw leg settled, but the check fires before the re-deposit —
         // so no deposit leg was ever submitted.
         let legs = relayer.submitter.recorded();

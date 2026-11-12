@@ -636,7 +636,7 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
             // only when the balance can't be read.
             match self.submitter.realized_native(&signer.pubkey()).await? {
                 Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
-                None => out_amount,
+                None => out_amount.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
             }
         } else {
             let mint = Pubkey::from_str(&output_mint)
@@ -944,6 +944,40 @@ mod tests {
             .await
             .expect("swap executes");
         assert_eq!(out.out_amount, 995_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS);
+    }
+
+    #[tokio::test]
+    async fn native_output_fallback_deducts_deposit_reserve() {
+        // When realized_native returns None (e.g. RPC read error or cache miss),
+        // fallback to the quote MUST still deduct NATIVE_DEPOSIT_RESERVE_LAMPORTS
+        // so the subsequent re-deposit transaction does not fail with InsufficientFundsForFee.
+        struct NoneSubmitter;
+        #[async_trait::async_trait]
+        impl SwapSubmitter for NoneSubmitter {
+            async fn sign_and_submit(
+                &self,
+                _t: VersionedTransaction,
+                _s: &Keypair,
+            ) -> Result<String> {
+                Ok("sig".into())
+            }
+            async fn realized_native(&self, _owner: &Pubkey) -> Result<Option<u64>> {
+                Ok(None)
+            }
+        }
+
+        let quote = serde_json::json!({
+            "outAmount": "1000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider = JupiterSwapProvider::new(http, NoneSubmitter, 50, 0, None).unwrap();
+
+        let out = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 1_000_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS);
     }
 
     #[tokio::test]
