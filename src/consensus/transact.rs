@@ -732,14 +732,45 @@ impl TransactVerificationCoordinator {
             .and_then(|v| v.wallet_pubkey.clone())
     }
 
+    /// Record a verification or co-signing failure for a validator (#1578),
+    /// penalizing its reputation score in `reputation_tracker` and updating its
+    /// leader selection weight.
+    pub async fn record_failure(&self, validator: &NodeId) -> Result<u64> {
+        let rep = self.reputation_tracker.record_failure(validator).await?;
+        let mut ls = self.leader_selector.write().await;
+        if let Some(mut info) = ls.get_validator(validator).cloned() {
+            info.reputation = rep;
+            ls.update_validator(info);
+        }
+        Ok(rep)
+    }
+
     /// The validators that voted `Valid` on a transact (#260) — the eligible
     /// co-signers for its settlement. Empty if the request is unknown here.
+    /// Excludes any validator whose reputation has dropped below
+    /// `DEFAULT_MIN_REPUTATION_FOR_CONSENSUS` (#1578).
     pub async fn valid_voters(&self, request_id: &str) -> Vec<NodeId> {
         let pending = self.pending.read().await;
         match pending.get(request_id) {
             Some(consensus) => {
                 let eligible = self.eligible_wallets().await;
-                consensus.tally.valid_voters(&eligible).await
+                let raw_voters = consensus.tally.valid_voters(&eligible).await;
+                let mut out = Vec::new();
+                for voter in raw_voters {
+                    if let Some(rep) = self.reputation_tracker.get_reputation(&voter).await {
+                        if rep < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS {
+                            log::warn!(
+                                "excluding voter {:?} with reputation {} below consensus floor {}",
+                                voter,
+                                rep,
+                                DEFAULT_MIN_REPUTATION_FOR_CONSENSUS
+                            );
+                            continue;
+                        }
+                    }
+                    out.push(voter);
+                }
+                out
             }
             None => Vec::new(),
         }
@@ -1423,6 +1454,34 @@ mod tests {
             approvals.try_recv().is_ok(),
             "after clear_emitted the same canonical id can be re-approved"
         );
+    }
+
+    #[tokio::test]
+    async fn valid_voters_excludes_voters_below_reputation_floor() {
+        let (coord, _) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+
+        let voters = coord.valid_voters(&id).await;
+        assert_eq!(voters.len(), 2);
+
+        // Penalize validator 1 until its reputation drops below the floor (200).
+        // Each failure decreases reputation by 50.
+        for _ in 0..17 {
+            coord.record_failure(&NodeId(vec![1])).await.unwrap();
+        }
+        let rep = coord
+            .reputation_tracker
+            .get_reputation(&NodeId(vec![1]))
+            .await
+            .unwrap();
+        assert!(rep < DEFAULT_MIN_REPUTATION_FOR_CONSENSUS);
+
+        let voters = coord.valid_voters(&id).await;
+        assert_eq!(voters, vec![NodeId(vec![0])]);
     }
 
     #[tokio::test]

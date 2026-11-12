@@ -2475,6 +2475,7 @@ impl Node {
         };
 
         let network = self.network.clone();
+        let coordinator = self.transact_coordinator.clone();
         cosign_round::run_cosign_round(
             leader,
             program_id,
@@ -2489,6 +2490,16 @@ impl Node {
             |peer, request| {
                 let network = network.clone();
                 async move { network.send_cosign_request(peer, request).await.ok() }
+            },
+            |peer| {
+                let coordinator = coordinator.clone();
+                async move {
+                    if let Some(coord) = &coordinator {
+                        if let Err(e) = coord.record_failure(&peer).await {
+                            log::warn!("could not record co-sign failure for {:?}: {e}", peer);
+                        }
+                    }
+                }
             },
         )
         .await
