@@ -173,7 +173,17 @@ impl ReputationTracker {
 
     fn load_snapshot(path: &Path) -> Option<HashMap<NodeId, ValidatorMetrics>> {
         let bytes = std::fs::read(path).ok()?;
-        let list: Vec<ValidatorMetrics> = serde_json::from_slice(&bytes).ok()?;
+        let list: Vec<ValidatorMetrics> = match serde_json::from_slice(&bytes) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!(
+                    "failed to parse reputation snapshot at {}: {}",
+                    path.display(),
+                    e
+                );
+                return None;
+            }
+        };
         Some(list.into_iter().map(|m| (m.node_id.clone(), m)).collect())
     }
 
@@ -182,6 +192,8 @@ impl ReputationTracker {
     /// The map is small (one entry per validator) and writes are event-driven,
     /// so a synchronous write is cheap; a failure is logged, not propagated,
     /// because losing a snapshot must never abort a verification.
+    /// Writes to a sibling temp file (`<path>.tmp`) with flush/sync and renames
+    /// over `path` so a crash mid-write cannot leave a truncated file (#1539).
     fn persist_locked(&self, metrics: &HashMap<NodeId, ValidatorMetrics>) {
         let Some(path) = &self.persist_path else {
             return;
@@ -189,7 +201,16 @@ impl ReputationTracker {
         let list: Vec<&ValidatorMetrics> = metrics.values().collect();
         match serde_json::to_vec(&list) {
             Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, &bytes) {
+                let tmp = path.with_extension("tmp");
+                let write_res = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&tmp)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                    std::fs::rename(&tmp, path)?;
+                    Ok(())
+                })();
+                if let Err(e) = write_res {
                     log::warn!("failed to persist reputation to {}: {e}", path.display());
                 }
             }
@@ -598,5 +619,40 @@ mod tests {
         // Reputation should have decayed
         assert!(metrics.reputation < old_reputation);
         assert!(metrics.reputation >= MIN_REPUTATION);
+    }
+
+    #[tokio::test]
+    async fn test_reputation_persistence_atomic_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation.json");
+        let node_id = NodeId(vec![42]);
+
+        {
+            let tracker = ReputationTracker::with_persistence(path.clone());
+            tracker.register_validator(node_id.clone()).await;
+            let _ = tracker.record_failure(&node_id).await;
+            let rep = tracker.get_reputation(&node_id).await.unwrap();
+            assert!(rep < BASE_REPUTATION);
+        }
+
+        // Target file exists, sibling tmp file does not exist after rename
+        assert!(path.exists());
+        assert!(!path.with_extension("tmp").exists());
+
+        // Restart with the same persistence path
+        let reloaded = ReputationTracker::with_persistence(path);
+        let rep = reloaded.get_reputation(&node_id).await.unwrap();
+        assert!(rep < BASE_REPUTATION);
+        assert_eq!(reloaded.validator_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_snapshot_corrupted_file_handles_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reputation.json");
+        std::fs::write(&path, b"invalid-torn-json").unwrap();
+
+        let tracker = ReputationTracker::with_persistence(path);
+        assert_eq!(tracker.validator_count().await, 0);
     }
 }
