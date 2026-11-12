@@ -23,6 +23,7 @@ use solana_program_test::{processor, tokio, BanksClientError, ProgramTest, Progr
 use solana_sdk::{
     account::Account,
     instruction::{Instruction, InstructionError},
+    program_pack::Pack,
     signature::{Keypair, Signer},
     transaction::{Transaction, TransactionError},
 };
@@ -69,6 +70,17 @@ async fn balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
         .get_balance(key)
         .await
         .expect("get balance")
+}
+
+async fn token_balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
+    let raw = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .expect("rpc")
+        .expect("token account exists");
+    let state = spl_token::state::Account::unpack(&raw.data).expect("unpack token account");
+    state.amount
 }
 
 async fn load_validator(ctx: &mut ProgramTestContext, pda: Pubkey) -> ValidatorAccount {
@@ -465,6 +477,14 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         acc.unbonding_amount, MIN_VALIDATOR_STAKE,
         "the full stake must be routed into unbonding, not stranded"
     );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake zeroed on deactivate"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "the full token stake must be routed into unbonding, not stranded"
+    );
     assert!(
         acc.unbonding_slot >= UNBONDING_SLOTS,
         "unbonding_slot = deactivation-era slot + UNBONDING_SLOTS"
@@ -493,6 +513,7 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         .expect("warp to unbonding slot");
 
     let wallet_before = balance(&mut ctx, validator.pubkey()).await;
+    let token_before = token_balance(&mut ctx, validator_token).await;
     send(
         &mut ctx,
         &validator,
@@ -507,6 +528,12 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     assert!(
         wallet_after > wallet_before,
         "wallet credited by the released stake + refunded rent"
+    );
+    let token_after = token_balance(&mut ctx, validator_token).await;
+    assert_eq!(
+        token_after,
+        token_before + TOKEN_STAKE,
+        "validator token balance credited by released token stake"
     );
     let closed = ctx
         .banks_client

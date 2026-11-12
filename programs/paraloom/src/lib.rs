@@ -1629,8 +1629,8 @@ pub mod paraloom_program {
     /// set — e.g. `is_active` PDAs left behind by an earlier
     /// `reset_validator_registry` that rebuilt the counters but did not
     /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// stale-low quorum denominator. Both staked lamports and dual-stake tokens
+    /// are routed into unbonding and returned through `withdraw_unbonded_stake`.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -1647,6 +1647,14 @@ pub mod paraloom_program {
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            // The token half unbonds in lockstep with the SOL half, matching
+            // unregister_validator: without this, token_stake_amount remains
+            // permanently stranded in the shared vault since an inactive validator
+            // cannot call unregister_validator and withdraw_unbonded_stake
+            // only releases token_unbonding_amount.
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
