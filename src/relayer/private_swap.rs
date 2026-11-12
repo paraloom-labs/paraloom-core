@@ -978,4 +978,52 @@ mod tests {
         let mint: AssetId = [0xABu8; 32];
         assert_eq!(WithdrawLeg::for_asset(mint), WithdrawLeg::Spl(mint));
     }
+
+    #[tokio::test]
+    async fn pre_existing_balance_on_fresh_cannot_mask_slippage_floor_shortfall() {
+        // Mock provider that simulates a Jupiter swap with pre-existing balance deduction:
+        // fresh already held 50_000_000, swap delivered 95_000_000, so net out_amount = 95_000_000.
+        // Caller specified min_out_amount = Some(140_000_000).
+        // Without deducting pre-existing balance, post balance (145_000_000) would falsely satisfy min_out.
+        // With pre-balance deduction, out_amount is 95_000_000 and SlippageExceeded is returned.
+        struct DeltaMockProvider {
+            realized_delta: u64,
+        }
+        #[async_trait::async_trait]
+        impl SwapProvider for DeltaMockProvider {
+            async fn swap(
+                &self,
+                _asset_in: AssetId,
+                _asset_out: AssetId,
+                _amount: u64,
+                _signer: &Keypair,
+            ) -> Result<SwapResult> {
+                Ok(SwapResult {
+                    out_amount: self.realized_delta,
+                })
+            }
+        }
+
+        let provider = DeltaMockProvider {
+            realized_delta: 95_000_000,
+        };
+        let relayer = PrivateSwapRelayer::new(provider, MockSubmitter::new());
+        let fresh = Keypair::new();
+        let usdc: AssetId = [0x55u8; 32];
+        let mut req = request(native_note(1_000_000), usdc, 0);
+        req.min_out_amount = Some(140_000_000);
+
+        let err = relayer
+            .execute_swap_out(req, &fresh)
+            .await
+            .expect_err("pre-existing balance must not satisfy slippage floor");
+
+        assert!(matches!(
+            err,
+            RelayerError::SlippageExceeded {
+                out_amount: 95_000_000,
+                min_out: 140_000_000
+            }
+        ));
+    }
 }
