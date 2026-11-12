@@ -1629,8 +1629,9 @@ pub mod paraloom_program {
     /// set — e.g. `is_active` PDAs left behind by an earlier
     /// `reset_validator_registry` that rebuilt the counters but did not
     /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// stale-low quorum denominator. It routes both the SOL and SPL token
+    /// stakes into unbonding so they can be reclaimed via
+    /// `withdraw_unbonded_stake` after the unbonding delay (same as unregister).
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -1639,12 +1640,15 @@ pub mod paraloom_program {
             let now_slot = Clock::get()?.slot;
             let v = &mut ctx.accounts.validator_account;
             v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
+            // Route the dual-stake into unbonding rather than stranding it: a
             // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
+            // is_active), so without this its stake would have no exit and be
             // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
             // the delay, same as unregister.
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
