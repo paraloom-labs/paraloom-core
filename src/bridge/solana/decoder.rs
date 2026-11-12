@@ -33,9 +33,9 @@ pub const LISTENER_TX_ENCODING: UiTransactionEncoding = UiTransactionEncoding::J
 ///
 /// Returns an empty vector if the transaction does not target the
 /// Paraloom program, the encoding is not the expected raw JSON form,
-/// or no instruction matches the deposit discriminator. Address-table-
-/// lookup transactions are skipped with a warning — none of the deposit
-/// flows in v0.3 are expected to use LUTs.
+/// or no instruction matches the deposit discriminator. Dynamic accounts
+/// loaded via Address Lookup Tables (LUTs) in v0 transactions are resolved
+/// and appended from `meta.loaded_addresses` (#1581).
 pub fn extract_deposit_events(
     signature: &str,
     confirmed: &EncodedConfirmedTransactionWithStatusMeta,
@@ -78,7 +78,7 @@ pub fn extract_deposit_events(
         }
     };
 
-    let account_keys = match parse_account_keys(&raw.account_keys) {
+    let mut account_keys = match parse_account_keys(&raw.account_keys) {
         Ok(keys) => keys,
         Err(bad) => {
             log::warn!(
@@ -90,6 +90,22 @@ pub fn extract_deposit_events(
             return Vec::new();
         }
     };
+
+    // For v0 transactions using Address Lookup Tables (ALTs), dynamically loaded
+    // addresses from `meta.loaded_addresses` (writable + readonly) must be resolved
+    // and appended to the account keys list (#1581).
+    if let Some(meta) = &confirmed.transaction.meta {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(loaded) =
+            &meta.loaded_addresses
+        {
+            if let Ok(writable) = parse_account_keys(&loaded.writable) {
+                account_keys.extend(writable);
+            }
+            if let Ok(readonly) = parse_account_keys(&loaded.readonly) {
+                account_keys.extend(readonly);
+            }
+        }
+    }
 
     let mut events = Vec::new();
 
@@ -515,5 +531,94 @@ mod tests {
         };
 
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
+    }
+
+    #[test]
+    fn decodes_deposit_with_address_lookup_tables() {
+        use solana_transaction_status::option_serializer::OptionSerializer;
+        use solana_transaction_status::{
+            UiLoadedAddresses, UiMessage, UiRawMessage, UiTransaction, UiTransactionStatusMeta,
+        };
+
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique(); // Account loaded dynamically via Address Lookup Table
+
+        // Static keys only include the first 4 keys: bridge_state(0), bridge_vault(1), merkle_tree(2), program_id(3)
+        let static_keys = vec![
+            other.to_string(),
+            other.to_string(),
+            other.to_string(),
+            program_id.to_string(),
+        ];
+
+        let amount = 1_000_000_000u64;
+        let pubkey = [7u8; 32];
+        let blinding = [9u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        // Account index 4 is the depositor, which sits in loaded_addresses (index 4 in resolved keys)
+        let ix = UiCompiledInstruction {
+            program_id_index: 3,
+            accounts: vec![0, 1, 2, 4],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let raw_msg = UiRawMessage {
+            header: solana_transaction_status::UiMessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: static_keys,
+            recent_blockhash: "11111111111111111111111111111111".to_string(),
+            instructions: vec![ix],
+            address_table_lookups: None,
+        };
+
+        let meta = UiTransactionStatusMeta {
+            err: None,
+            status: Ok(()),
+            fee: 5000,
+            pre_balances: vec![],
+            post_balances: vec![],
+            inner_instructions: OptionSerializer::None,
+            log_messages: OptionSerializer::None,
+            pre_token_balances: OptionSerializer::None,
+            post_token_balances: OptionSerializer::None,
+            rewards: OptionSerializer::None,
+            loaded_addresses: OptionSerializer::Some(UiLoadedAddresses {
+                writable: vec![depositor.to_string()],
+                readonly: vec![],
+            }),
+            return_data: OptionSerializer::None,
+            compute_units_consumed: OptionSerializer::None,
+            cost_units: OptionSerializer::None,
+        };
+
+        let confirmed = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 100,
+            transaction: solana_transaction_status::EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig123".to_string()],
+                    message: UiMessage::Raw(raw_msg),
+                }),
+                meta: Some(meta),
+                version: Some(solana_transaction_status::TransactionVersion::Number(0)),
+            },
+            block_time: Some(1700000000),
+        };
+
+        let events = extract_deposit_events("sig123", &confirmed, &program_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, amount);
+        assert_eq!(events[0].depositor, depositor);
     }
 }
