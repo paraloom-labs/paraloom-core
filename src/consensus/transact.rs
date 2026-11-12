@@ -373,8 +373,17 @@ impl TransactVerificationCoordinator {
         // not silently restore its counting weight).
         let eq_path = path.with_file_name("equivocators.json");
         if let Ok(bytes) = std::fs::read(&eq_path) {
-            if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&bytes) {
-                self.equivocators = Arc::new(RwLock::new(set));
+            match serde_json::from_slice::<HashSet<String>>(&bytes) {
+                Ok(set) => {
+                    self.equivocators = Arc::new(RwLock::new(set));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "failed to parse equivocators from {}: {}",
+                        eq_path.display(),
+                        e
+                    );
+                }
             }
         }
         self.equivocators_path = Some(eq_path);
@@ -384,11 +393,22 @@ impl TransactVerificationCoordinator {
 
     /// Best-effort persist of the equivocator ban set. Called while holding the
     /// write lock so the on-disk set never lags the in-memory one.
+    /// Writes to a sibling temp file (`<path>.tmp`) with flush/sync and renames
+    /// over `path` so a crash mid-write cannot leave a truncated file (#1539).
     async fn persist_equivocators(&self, set: &HashSet<String>) {
         if let Some(path) = &self.equivocators_path {
             match serde_json::to_vec(set) {
                 Ok(bytes) => {
-                    if let Err(e) = std::fs::write(path, bytes) {
+                    let tmp = path.with_extension("tmp");
+                    let write_res = (|| -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut file = std::fs::File::create(&tmp)?;
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                        std::fs::rename(&tmp, path)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = write_res {
                         log::warn!("could not persist equivocators to {:?}: {}", path, e);
                     }
                 }
@@ -1571,5 +1591,26 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn test_equivocators_persistence_atomic_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let rep_path = dir.path().join("reputation.json");
+        let eq_path = dir.path().join("equivocators.json");
+
+        let coordinator =
+            TransactVerificationCoordinator::new().with_reputation_persistence(rep_path.clone());
+        let mut set = HashSet::new();
+        set.insert("equivocating_wallet_123".to_string());
+        coordinator.persist_equivocators(&set).await;
+
+        assert!(eq_path.exists());
+        assert!(!eq_path.with_extension("tmp").exists());
+
+        // Reload coordinator with persistence
+        let reloaded = TransactVerificationCoordinator::new().with_reputation_persistence(rep_path);
+        let loaded_set = reloaded.equivocators.read().await;
+        assert!(loaded_set.contains("equivocating_wallet_123"));
     }
 }
