@@ -170,11 +170,17 @@ impl LeaderSelector {
     /// # Returns
     /// Selected leader's NodeId
     pub fn select_leader(&self, seed: &[u8]) -> Result<NodeId> {
-        let active_validators: Vec<_> = self.validators.values().filter(|v| v.is_active).collect();
+        let mut active_validators: Vec<_> =
+            self.validators.values().filter(|v| v.is_active).collect();
 
         if active_validators.is_empty() {
             return Err(anyhow!("No active validators available"));
         }
+
+        // Sort active validators by NodeId bytes to guarantee deterministic
+        // traversal order across independent nodes and instances, regardless of
+        // process-specific HashMap iteration ordering (#706).
+        active_validators.sort_by(|a, b| a.node_id.0.cmp(&b.node_id.0));
 
         // Calculate total weight
         let total_weight: u128 = active_validators.iter().map(|v| v.selection_weight()).sum();
@@ -188,7 +194,7 @@ impl LeaderSelector {
 
         // Select validator based on weighted random
         let mut cumulative_weight = 0u128;
-        for validator in active_validators {
+        for validator in &active_validators {
             cumulative_weight += validator.selection_weight();
             if random_value < cumulative_weight {
                 log::debug!(
@@ -201,11 +207,8 @@ impl LeaderSelector {
             }
         }
 
-        // Fallback to last validator (should never happen due to cumulative math)
-        Ok(self
-            .validators
-            .values()
-            .filter(|v| v.is_active)
+        // Fallback to last validator in canonical order (should never happen due to cumulative math)
+        Ok(active_validators
             .last()
             .ok_or_else(|| anyhow!("No active validators"))?
             .node_id
@@ -364,6 +367,42 @@ mod tests {
 
         assert_eq!(leader1, leader2);
         assert_eq!(leader2, leader3);
+    }
+
+    /// Verifies that two distinct `LeaderSelector` instances populated in different
+    /// orders agree on the exact same leader across multiple seeds (#706).
+    #[test]
+    fn test_leader_selection_cross_instance_determinism() {
+        let mut s1 = LeaderSelector::new();
+        let mut s2 = LeaderSelector::new();
+
+        let v1 = ValidatorInfo::new(NodeId(vec![10]), 10_000_000_000, 1000);
+        let v2 = ValidatorInfo::new(NodeId(vec![20]), 20_000_000_000, 1000);
+        let v3 = ValidatorInfo::new(NodeId(vec![30]), 30_000_000_000, 1000);
+        let v4 = ValidatorInfo::new(NodeId(vec![40]), 40_000_000_000, 1000);
+
+        // Populate in forward order in s1
+        s1.register_validator(v1.clone());
+        s1.register_validator(v2.clone());
+        s1.register_validator(v3.clone());
+        s1.register_validator(v4.clone());
+
+        // Populate in reversed order in s2
+        s2.register_validator(v4);
+        s2.register_validator(v2);
+        s2.register_validator(v1);
+        s2.register_validator(v3);
+
+        for i in 0..100 {
+            let seed = format!("consensus_round_seed_{}", i);
+            let leader1 = s1.select_leader(seed.as_bytes()).unwrap();
+            let leader2 = s2.select_leader(seed.as_bytes()).unwrap();
+            assert_eq!(
+                leader1, leader2,
+                "independent selectors must select the same leader for seed {}",
+                seed
+            );
+        }
     }
 
     #[test]
