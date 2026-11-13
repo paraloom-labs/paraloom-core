@@ -22,6 +22,7 @@ use libp2p::{
 };
 use log::{debug, info};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -167,12 +168,70 @@ pub trait NetworkEventHandler: Send + Sync {
     }
 }
 
+/// Commands dispatched to the swarm event loop so `Swarm<ParaloomBehaviour>`
+/// stays single-owned inside `run_event_loop` without holding a mutex across
+/// `swarm.next().await`.
+enum NetworkCommand {
+    ConnectBootstrap {
+        bootstrap_nodes: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
+    RedialCoValidators {
+        addrs: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
+    AddExternalAddress {
+        addr: Multiaddr,
+        reply: oneshot::Sender<()>,
+    },
+    ListenViaRelay {
+        relay_addr: Multiaddr,
+        relay_peer: PeerId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    SendResultRequest {
+        peer_id: PeerId,
+        request: ResultRequest,
+        reply: oneshot::Sender<()>,
+    },
+    SendHeartbeatRequest {
+        peer_id: PeerId,
+        request: HeartbeatRequest,
+        reply: oneshot::Sender<()>,
+    },
+    SendCosignRequest {
+        peer_id: PeerId,
+        request: CoSignRequest,
+        waiter: oneshot::Sender<CoSignResponse>,
+    },
+    ListenAddresses {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    RelayServerEnabled {
+        reply: oneshot::Sender<bool>,
+    },
+    StartKadBootstrapRefresh {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+type SwarmSlot = Arc<Mutex<Option<Swarm<ParaloomBehaviour>>>>;
+type CommandReceiverSlot = Arc<Mutex<Option<mpsc::Receiver<NetworkCommand>>>>;
+type MessageReceiverSlot = Arc<Mutex<Option<mpsc::Receiver<(NodeId, Message)>>>>;
+
 /// Network manager
 pub struct NetworkManager {
     peer_id: PeerId,
-    swarm: Arc<Mutex<Swarm<ParaloomBehaviour>>>,
+    relay_server_enabled: bool,
+    /// Holds the `Swarm` only until `start()` moves ownership exclusively into
+    /// `run_event_loop`; afterwards this is `None` and external operations go
+    /// through `command_sender`.
+    swarm: SwarmSlot,
+    event_loop_started: Arc<AtomicBool>,
+    command_sender: mpsc::Sender<NetworkCommand>,
+    command_receiver: CommandReceiverSlot,
     message_sender: mpsc::Sender<(NodeId, Message)>,
-    message_receiver: Arc<Mutex<mpsc::Receiver<(NodeId, Message)>>>,
+    message_receiver: MessageReceiverSlot,
     handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
     connected_peers: Arc<Mutex<Vec<PeerId>>>,
     /// Peer state machine introduced in #69. The swarm event loop
@@ -181,12 +240,6 @@ pub struct NetworkManager {
     /// The slow / offline distinction in #65's acceptance criteria
     /// is enforced here.
     peer_registry: Arc<Mutex<PeerRegistry>>,
-    /// Outstanding co-sign requests this node sent as round leader (#260),
-    /// keyed by the libp2p outbound request id. `send_cosign_request` inserts a
-    /// oneshot here and awaits it; the event loop completes it when the matching
-    /// response arrives, or drops it on outbound failure / timeout so the
-    /// awaiter errors instead of hanging.
-    cosign_waiters: Arc<Mutex<HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>>>,
 }
 
 /// Load a libp2p ed25519 identity from `path` (protobuf-encoded, the format
@@ -347,8 +400,9 @@ impl NetworkManager {
                 .with_agent_version(format!("paraloom/{}", env!("CARGO_PKG_VERSION"))),
         );
 
-        // Set up message channel
+        // Set up message and swarm-command channels
         let (tx, rx) = mpsc::channel(100);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
         // Build the swarm via SwarmBuilder rather than Swarm::new so
         // the relay *client* transport can be woven into the stack
@@ -404,14 +458,209 @@ impl NetworkManager {
 
         Ok(NetworkManager {
             peer_id: local_peer_id,
-            swarm: Arc::new(Mutex::new(swarm)),
+            relay_server_enabled: settings.network.enable_relay_server,
+            swarm: Arc::new(Mutex::new(Some(swarm))),
+            event_loop_started: Arc::new(AtomicBool::new(false)),
+            command_sender: cmd_tx,
+            command_receiver: Arc::new(Mutex::new(Some(cmd_rx))),
             message_sender: tx,
-            message_receiver: Arc::new(Mutex::new(rx)),
+            message_receiver: Arc::new(Mutex::new(Some(rx))),
             handler: Arc::new(Mutex::new(None)),
             connected_peers: Arc::new(Mutex::new(Vec::new())),
             peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
-            cosign_waiters: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Execute a swarm command directly against `swarm` before `start()`, or
+    /// enqueue it on `command_sender` once `run_event_loop` owns the swarm.
+    async fn execute_or_dispatch(&self, cmd: NetworkCommand) -> Result<()> {
+        if !self.event_loop_started.load(Ordering::Acquire) {
+            let mut swarm_guard = self.swarm.lock().await;
+            if let Some(swarm) = swarm_guard.as_mut() {
+                if matches!(cmd, NetworkCommand::SendCosignRequest { .. }) {
+                    return Err(anyhow!("network event loop has not been started"));
+                }
+                Self::execute_swarm_command(swarm, None, cmd);
+                return Ok(());
+            }
+        }
+        self.command_sender
+            .send(cmd)
+            .await
+            .map_err(|_| anyhow!("network event loop is not running"))
+    }
+
+    /// Apply a `NetworkCommand` to the exclusively owned `Swarm`.
+    fn execute_swarm_command(
+        swarm: &mut Swarm<ParaloomBehaviour>,
+        cosign_waiters: Option<&mut HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>>,
+        cmd: NetworkCommand,
+    ) {
+        match cmd {
+            NetworkCommand::ConnectBootstrap {
+                bootstrap_nodes,
+                reply,
+            } => {
+                for addr_str in bootstrap_nodes {
+                    match addr_str.parse::<Multiaddr>() {
+                        Ok(addr) => {
+                            // Extract /p2p/<peer_id> if present so the
+                            // address can also be registered in Kademlia's
+                            // routing table. Without the suffix the dial
+                            // still works, but the DHT cannot use the
+                            // bootstrap as a query target. Operators are
+                            // expected to publish full multiaddrs
+                            // including /p2p/<peer_id>; an address without
+                            // the suffix gets a warn log and is dialled
+                            // but not added to kad.
+                            let peer_id = peer_id_from_multiaddr(&addr);
+                            if let Some(pid) = peer_id {
+                                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                                info!("Registered bootstrap {} in Kademlia routing table", pid);
+                            } else {
+                                log::warn!(
+                                    "Bootstrap address {} has no /p2p/<peer_id>; dialled but not in kad",
+                                    addr
+                                );
+                            }
+                            info!("Dialing bootstrap node: {}", addr);
+                            if let Err(e) = swarm.dial(addr.clone()) {
+                                log::warn!("Failed to dial {}: {}", addr, e);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Invalid bootstrap address {}: {}", addr_str, e);
+                        }
+                    }
+                }
+                let _ = reply.send(());
+            }
+            NetworkCommand::RedialCoValidators { addrs, reply } => {
+                for addr_str in addrs {
+                    let addr = match addr_str.parse::<Multiaddr>() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::warn!("Invalid co_validator address {}: {}", addr_str, e);
+                            continue;
+                        }
+                    };
+                    if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                        if swarm.is_connected(&pid) {
+                            continue; // already connected — nothing to do
+                        }
+                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                    }
+                    match swarm.dial(addr.clone()) {
+                        Ok(()) => log::info!("co-validator keep-alive: re-dialing {}", addr),
+                        Err(e) => log::debug!(
+                            "co-validator redial to {} failed (will retry): {}",
+                            addr,
+                            e
+                        ),
+                    }
+                }
+                let _ = reply.send(());
+            }
+            NetworkCommand::AddExternalAddress { addr, reply } => {
+                swarm.add_external_address(addr.clone());
+                info!("Declared external address {}", addr);
+                let _ = reply.send(());
+            }
+            NetworkCommand::ListenViaRelay {
+                relay_addr,
+                relay_peer,
+                reply,
+            } => {
+                // Register the relay in Kademlia so the relay-client behaviour
+                // can resolve the relay's address when it dials (it builds its
+                // reservation dial with `extend_addresses_through_behaviour`).
+                // We deliberately do NOT dial the relay ourselves: listening on
+                // the circuit triggers the relay-client behaviour to open its
+                // own dial and pin the pending reservation to that connection.
+                // A second, explicit dial to the same peer races with it and
+                // gets coalesced, dropping the reservation's listener channel —
+                // the listener then closes cleanly before any reservation is
+                // made. Letting the behaviour own the dial is the supported path.
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(&relay_peer, relay_addr.clone());
+
+                // Listening on `<relay>/p2p-circuit` is what actually requests
+                // the reservation and starts accepting relayed inbound
+                // connections.
+                let circuit_addr = relay_addr
+                    .clone()
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                let res = swarm
+                    .listen_on(circuit_addr.clone())
+                    .with_context(|| format!("listening on relay circuit {}", circuit_addr));
+                if res.is_ok() {
+                    info!(
+                        "Reserving relay slot on {} and listening via circuit {}",
+                        relay_addr, circuit_addr
+                    );
+                }
+                let _ = reply.send(res.map(|_| ()));
+            }
+            NetworkCommand::SendResultRequest {
+                peer_id,
+                request,
+                reply,
+            } => {
+                info!("=== SENDING RESULT REQUEST ===");
+                info!("Target peer: {}", peer_id);
+                info!("Task ID: {}", request.result.task_id);
+                let is_connected = swarm.is_connected(&peer_id);
+                info!("Is peer connected? {}", is_connected);
+                let request_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer_id, request);
+                info!("Request ID: {:?}", request_id);
+                info!("=== REQUEST SENT ===");
+                let _ = reply.send(());
+            }
+            NetworkCommand::SendHeartbeatRequest {
+                peer_id,
+                request,
+                reply,
+            } => {
+                swarm
+                    .behaviour_mut()
+                    .heartbeat
+                    .send_request(&peer_id, request);
+                let _ = reply.send(());
+            }
+            NetworkCommand::SendCosignRequest {
+                peer_id,
+                request,
+                waiter,
+            } => {
+                if let Some(waiters) = cosign_waiters {
+                    let request_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
+                    waiters.insert(request_id, waiter);
+                }
+            }
+            NetworkCommand::ListenAddresses { reply } => {
+                let addrs = swarm.listeners().map(|a| a.to_string()).collect();
+                let _ = reply.send(addrs);
+            }
+            NetworkCommand::RelayServerEnabled { reply } => {
+                let _ = reply.send(swarm.behaviour().relay.is_enabled());
+            }
+            NetworkCommand::StartKadBootstrapRefresh { reply } => {
+                match swarm.behaviour_mut().kad.bootstrap() {
+                    Ok(query_id) => {
+                        debug!("kad bootstrap refresh kicked off ({:?})", query_id);
+                    }
+                    Err(e) => {
+                        log::warn!("kad bootstrap refresh failed to start: {}", e);
+                    }
+                }
+                let _ = reply.send(());
+            }
+        }
     }
 
     /// Borrow the peer registry. Public so operational tooling
@@ -434,42 +683,14 @@ impl NetworkManager {
             return Ok(());
         }
 
-        let mut swarm = self.swarm.lock().await;
-
-        for addr_str in bootstrap_nodes {
-            match addr_str.parse::<Multiaddr>() {
-                Ok(addr) => {
-                    // Extract /p2p/<peer_id> if present so the
-                    // address can also be registered in Kademlia's
-                    // routing table. Without the suffix the dial
-                    // still works, but the DHT cannot use the
-                    // bootstrap as a query target. Operators are
-                    // expected to publish full multiaddrs
-                    // including /p2p/<peer_id>; an address without
-                    // the suffix gets a warn log and is dialled
-                    // but not added to kad.
-                    let peer_id = peer_id_from_multiaddr(&addr);
-                    if let Some(pid) = peer_id {
-                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
-                        info!("Registered bootstrap {} in Kademlia routing table", pid);
-                    } else {
-                        log::warn!(
-                            "Bootstrap address {} has no /p2p/<peer_id>; dialled but not in kad",
-                            addr
-                        );
-                    }
-                    info!("Dialing bootstrap node: {}", addr);
-                    if let Err(e) = swarm.dial(addr.clone()) {
-                        log::warn!("Failed to dial {}: {}", addr, e);
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Invalid bootstrap address {}: {}", addr_str, e);
-                }
-            }
-        }
-
-        Ok(())
+        let (tx, rx) = oneshot::channel();
+        self.execute_or_dispatch(NetworkCommand::ConnectBootstrap {
+            bootstrap_nodes,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| anyhow!("network event loop terminated before completing bootstrap dial"))
     }
 
     /// Keep-alive for the swap co-validator link: re-dial any of `addrs` (full
@@ -485,33 +706,16 @@ impl NetworkManager {
         if addrs.is_empty() {
             return;
         }
-        let connected: std::collections::HashSet<Vec<u8>> = {
-            self.connected_peers
-                .lock()
-                .await
-                .iter()
-                .map(|p| p.to_bytes())
-                .collect()
-        };
-        let mut swarm = self.swarm.lock().await;
-        for addr_str in addrs {
-            let addr = match addr_str.parse::<Multiaddr>() {
-                Ok(a) => a,
-                Err(e) => {
-                    log::warn!("Invalid co_validator address {}: {}", addr_str, e);
-                    continue;
-                }
-            };
-            if let Some(pid) = peer_id_from_multiaddr(&addr) {
-                if connected.contains(&pid.to_bytes()) {
-                    continue; // already connected — nothing to do
-                }
-                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
-            }
-            match swarm.dial(addr.clone()) {
-                Ok(()) => log::info!("co-validator keep-alive: re-dialing {}", addr),
-                Err(e) => log::debug!("co-validator redial to {} failed (will retry): {}", addr, e),
-            }
+        let (tx, rx) = oneshot::channel();
+        if self
+            .execute_or_dispatch(NetworkCommand::RedialCoValidators {
+                addrs: addrs.to_vec(),
+                reply: tx,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
         }
     }
 
@@ -531,10 +735,11 @@ impl NetworkManager {
         let addr: Multiaddr = addr
             .parse()
             .with_context(|| format!("parsing external address {}", addr))?;
-        let mut swarm = self.swarm.lock().await;
-        swarm.add_external_address(addr.clone());
-        info!("Declared external address {}", addr);
-        Ok(())
+        let (tx, rx) = oneshot::channel();
+        self.execute_or_dispatch(NetworkCommand::AddExternalAddress { addr, reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| anyhow!("network event loop terminated before adding external address"))
     }
 
     /// Reserve a slot on a circuit-relay v2 server and listen on the
@@ -562,47 +767,27 @@ impl NetworkManager {
             )
         })?;
 
-        let mut swarm = self.swarm.lock().await;
-
-        // Register the relay in Kademlia so the relay-client behaviour
-        // can resolve the relay's address when it dials (it builds its
-        // reservation dial with `extend_addresses_through_behaviour`).
-        // We deliberately do NOT dial the relay ourselves: listening on
-        // the circuit triggers the relay-client behaviour to open its
-        // own dial and pin the pending reservation to that connection.
-        // A second, explicit dial to the same peer races with it and
-        // gets coalesced, dropping the reservation's listener channel —
-        // the listener then closes cleanly before any reservation is
-        // made. Letting the behaviour own the dial is the supported path.
-        swarm
-            .behaviour_mut()
-            .kad
-            .add_address(&relay_peer, relay_addr.clone());
-
-        // Listening on `<relay>/p2p-circuit` is what actually requests
-        // the reservation and starts accepting relayed inbound
-        // connections.
-        let circuit_addr = relay_addr
-            .clone()
-            .with(libp2p::multiaddr::Protocol::P2pCircuit);
-        swarm
-            .listen_on(circuit_addr.clone())
-            .with_context(|| format!("listening on relay circuit {}", circuit_addr))?;
-
-        info!(
-            "Reserving relay slot on {} and listening via circuit {}",
-            relay_addr, circuit_addr
-        );
-        Ok(())
+        let (tx, rx) = oneshot::channel();
+        self.execute_or_dispatch(NetworkCommand::ListenViaRelay {
+            relay_addr,
+            relay_peer,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| anyhow!("network event loop terminated before reserving relay circuit"))?
     }
 
     /// Start the network manager
     pub async fn start(&self, listen_address: Multiaddr) -> Result<()> {
-        let mut swarm = self.swarm.lock().await;
+        let mut swarm_guard = self.swarm.lock().await;
+        let swarm_ref = swarm_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("network manager already started"))?;
 
         // Subscribe to the paraloom topic
         let topic = IdentTopic::new(PARALOOM_TOPIC);
-        swarm
+        swarm_ref
             .behaviour_mut()
             .gossipsub
             .subscribe(&topic)
@@ -610,26 +795,41 @@ impl NetworkManager {
         info!("Subscribed to topic: {}", PARALOOM_TOPIC);
 
         // Listen on the given address
-        swarm.listen_on(listen_address.clone())?;
+        swarm_ref.listen_on(listen_address.clone())?;
         info!("Listening on {}", listen_address);
 
-        // Clone values for the task
-        let swarm_clone = self.swarm.clone();
-        let receiver_clone = self.message_receiver.clone();
+        let swarm = swarm_guard
+            .take()
+            .ok_or_else(|| anyhow!("network manager already started"))?;
+        let command_rx = self
+            .command_receiver
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| anyhow!("network command receiver already taken"))?;
+        let message_rx = self
+            .message_receiver
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| anyhow!("network message receiver already taken"))?;
+
+        self.event_loop_started.store(true, Ordering::Release);
+        drop(swarm_guard);
+
         let handler_clone = self.handler.clone();
         let connected_peers_clone = self.connected_peers.clone();
         let peer_registry_clone = self.peer_registry.clone();
-        let cosign_waiters_clone = self.cosign_waiters.clone();
 
         // Spawn task to handle events
         tokio::spawn(async move {
             Self::run_event_loop(
-                swarm_clone,
-                receiver_clone,
+                swarm,
+                command_rx,
+                message_rx,
                 handler_clone,
                 connected_peers_clone,
                 peer_registry_clone,
-                cosign_waiters_clone,
             )
             .await;
         });
@@ -637,431 +837,57 @@ impl NetworkManager {
         Ok(())
     }
 
-    /// Run the event loop
+    /// Run the event loop with exclusive ownership of the `Swarm`.
     async fn run_event_loop(
-        swarm: Arc<Mutex<Swarm<ParaloomBehaviour>>>,
-        receiver: Arc<Mutex<mpsc::Receiver<(NodeId, Message)>>>,
+        mut swarm: Swarm<ParaloomBehaviour>,
+        mut command_rx: mpsc::Receiver<NetworkCommand>,
+        mut message_rx: mpsc::Receiver<(NodeId, Message)>,
         handler: Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
         connected_peers: Arc<Mutex<Vec<PeerId>>>,
         peer_registry: Arc<Mutex<PeerRegistry>>,
-        cosign_waiters: Arc<Mutex<HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>>>,
     ) {
         info!("Starting network event loop");
+        let mut cosign_waiters: HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>> =
+            HashMap::new();
 
         loop {
             tokio::select! {
                 // Handle Swarm events
-                event = async {
-                    let mut swarm_lock = swarm.lock().await;
-                    swarm_lock.next().await
-                } => {
+                event = swarm.next() => {
                     match event {
                         Some(event) => {
-                            // Log important events at info level
-                            match event {
-                                libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                                    info!("Connection established with peer: {}", peer_id);
+                            Self::handle_swarm_event(
+                                &mut swarm,
+                                &handler,
+                                &connected_peers,
+                                &peer_registry,
+                                &mut cosign_waiters,
+                                event,
+                            )
+                            .await;
+                        }
+                        None => break,
+                    }
+                },
 
-                                    // Add to connected peers list
-                                    let mut peers = connected_peers.lock().await;
-                                    if !peers.contains(&peer_id) {
-                                        peers.push(peer_id);
-                                    }
-                                    drop(peers);
-
-                                    // Mirror into the PeerRegistry state
-                                    // machine so the slow / offline
-                                    // distinction has live data.
-                                    let mut registry = peer_registry.lock().await;
-                                    registry.mark_connected(NodeId(peer_id.to_bytes()));
-                                }
-                                libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                                    info!("Connection closed with peer: {} (cause: {:?})", peer_id, cause);
-
-                                    // Remove from connected peers list
-                                    let mut peers = connected_peers.lock().await;
-                                    peers.retain(|p| p != &peer_id);
-                                    drop(peers);
-
-                                    let mut registry = peer_registry.lock().await;
-                                    registry.mark_disconnected(NodeId(peer_id.to_bytes()));
-                                }
-                                libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
-                                    info!("Incoming connection");
-                                }
-                                libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                                    log::warn!("Outgoing connection error to {:?}: {}", peer_id, error);
-                                }
-                                libp2p::swarm::SwarmEvent::Dialing { peer_id, connection_id: _ } => {
-                                    info!("Dialing peer: {:?}", peer_id);
-                                }
-                                libp2p::swarm::SwarmEvent::NewExternalAddrCandidate { address } => {
-                                    // AutoNAT will probe this candidate; promotion to
-                                    // a confirmed external address surfaces below.
-                                    debug!("New external address candidate: {}", address);
-                                }
-                                libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-                                    info!("External address confirmed: {}", address);
-                                }
-                                libp2p::swarm::SwarmEvent::Behaviour(behaviour_event) => {
-                                    match behaviour_event {
-                                        ParaloomBehaviourEvent::Gossipsub(gossip_event) => {
-                                            if let gossipsub::Event::Message {
-                                                propagation_source: peer_id,
-                                                message,
-                                                ..
-                                            } = gossip_event {
-                                                info!("Received gossipsub message from peer: {}", peer_id);
-
-                                                // Deserialize the message
-                                                match bincode::deserialize::<Message>(&message.data) {
-                                                    Ok(msg) => {
-                                                        // Gossipsub runs in Signed mode, so `message.source`
-                                                        // is the authenticated original publisher. Prefer it
-                                                        // over `propagation_source` (the last forwarding hop)
-                                                        // so a relayed message is attributed to its real
-                                                        // author — this is what lets the consensus layer
-                                                        // reject a vote whose self-declared validator does not
-                                                        // match the authenticated sender (audit).
-                                                        let source = match message.source {
-                                                            Some(author) => NodeId(author.to_bytes()),
-                                                            None => NodeId(peer_id.to_bytes()),
-                                                        };
-                                                        let handler_lock = handler.lock().await;
-                                                        if let Some(h) = handler_lock.as_ref() {
-                                                            if let Err(e) = h.handle_message(source, msg).await {
-                                                                log::error!("Error handling message: {}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::error!("Failed to deserialize message: {}", e);
-                                                    }
-                                                }
-                                            } else {
-                                                debug!("Gossipsub event: {:?}", gossip_event);
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::RequestResponse(req_resp_event) => {
-                                            match req_resp_event {
-                                                RequestResponseEvent::Message { peer, message, connection_id: _ } => {
-                                                    match message {
-                                                        RequestResponseMessage::Request { request, channel, .. } => {
-                                                            info!("=== RECEIVED RESULT REQUEST ===");
-                                                            info!("From validator: {}", peer);
-                                                            info!("Task ID: {}", request.result.task_id);
-
-                                                            let source = NodeId(peer.to_bytes());
-                                                            let handler_lock = handler.lock().await;
-
-                                                            let response = if let Some(h) = handler_lock.as_ref() {
-                                                                match h.handle_result_request(source, request).await {
-                                                                    Ok(resp) => {
-                                                                        info!("Handler processed result successfully");
-                                                                        resp
-                                                                    }
-                                                                    Err(e) => {
-                                                                        log::error!("Error handling result request: {}", e);
-                                                                        ResultResponse {
-                                                                            success: false,
-                                                                            message: format!("Error: {}", e),
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                log::warn!("No handler registered");
-                                                                ResultResponse {
-                                                                    success: false,
-                                                                    message: "No handler registered".to_string(),
-                                                                }
-                                                            };
-
-                                                            info!("Sending response: success={}", response.success);
-                                                            let mut swarm_lock = swarm.lock().await;
-                                                            if let Err(e) = swarm_lock.behaviour_mut().request_response.send_response(channel, response) {
-                                                                log::error!("Failed to send response: {:?}", e);
-                                                            } else {
-                                                                info!("=== RESPONSE SENT ===");
-                                                            }
-                                                        }
-
-                                                        RequestResponseMessage::Response { response, .. } => {
-                                                            info!("=== RECEIVED RESPONSE FROM COORDINATOR ===");
-                                                            info!("Success: {}, Message: {}", response.success, response.message);
-                                                        }
-                                                    }
-                                                }
-                                                RequestResponseEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
-                                                    log::error!("=== REQUEST-RESPONSE OUTBOUND FAILURE ===");
-                                                    log::error!("Peer: {:?}", peer);
-                                                    log::error!("Request ID: {:?}", request_id);
-                                                    log::error!("Error: {:?}", error);
-                                                }
-                                                RequestResponseEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
-                                                    log::error!("=== REQUEST-RESPONSE INBOUND FAILURE ===");
-                                                    log::error!("Peer: {:?}", peer);
-                                                    log::error!("Request ID: {:?}", request_id);
-                                                    log::error!("Error: {:?}", error);
-                                                }
-                                                RequestResponseEvent::ResponseSent { peer, request_id, connection_id: _ } => {
-                                                    info!("=== RESPONSE SENT SUCCESSFULLY ===");
-                                                    info!("To peer: {}", peer);
-                                                    info!("Request ID: {:?}", request_id);
-                                                }
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::Heartbeat(hb_event) => {
-                                            match hb_event {
-                                                RequestResponseEvent::Message { peer, message, connection_id: _ } => {
-                                                    match message {
-                                                        RequestResponseMessage::Request { request, channel, .. } => {
-                                                            let source = NodeId(peer.to_bytes());
-                                                            let handler_lock = handler.lock().await;
-                                                            let response = if let Some(h) = handler_lock.as_ref() {
-                                                                match h.handle_heartbeat_request(source, request).await {
-                                                                    Ok(resp) => resp,
-                                                                    Err(e) => {
-                                                                        log::error!("heartbeat handler error: {}", e);
-                                                                        HeartbeatResponse {
-                                                                            accepted: false,
-                                                                            last_applied_sequence: 0,
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                HeartbeatResponse {
-                                                                    accepted: false,
-                                                                    last_applied_sequence: 0,
-                                                                }
-                                                            };
-                                                            drop(handler_lock);
-                                                            let mut swarm_lock = swarm.lock().await;
-                                                            if let Err(e) = swarm_lock.behaviour_mut().heartbeat.send_response(channel, response) {
-                                                                log::error!("Failed to send heartbeat response: {:?}", e);
-                                                            }
-                                                        }
-                                                        RequestResponseMessage::Response { response, .. } => {
-                                                            debug!(
-                                                                "heartbeat response: accepted={}, last_applied={}",
-                                                                response.accepted, response.last_applied_sequence
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                RequestResponseEvent::OutboundFailure { peer, error, .. } => {
-                                                    log::warn!(
-                                                        "heartbeat outbound failure to {:?}: {:?}",
-                                                        peer, error
-                                                    );
-                                                }
-                                                RequestResponseEvent::InboundFailure { peer, error, .. } => {
-                                                    log::warn!(
-                                                        "heartbeat inbound failure from {:?}: {:?}",
-                                                        peer, error
-                                                    );
-                                                }
-                                                RequestResponseEvent::ResponseSent { peer, .. } => {
-                                                    debug!("heartbeat response sent to {}", peer);
-                                                }
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::Cosign(cosign_event) => {
-                                            match cosign_event {
-                                                RequestResponseEvent::Message { peer, message, connection_id: _ } => {
-                                                    match message {
-                                                        RequestResponseMessage::Request { request, channel, .. } => {
-                                                            let source = NodeId(peer.to_bytes());
-                                                            let request_id = request.request_id.clone();
-                                                            let handler_lock = handler.lock().await;
-                                                            let response = if let Some(h) = handler_lock.as_ref() {
-                                                                match h.handle_cosign_request(source, request).await {
-                                                                    Ok(resp) => resp,
-                                                                    Err(e) => {
-                                                                        log::error!("cosign handler error: {}", e);
-                                                                        CoSignResponse {
-                                                                            request_id,
-                                                                            wallet_pubkey: String::new(),
-                                                                            signature: None,
-                                                                        }
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                CoSignResponse {
-                                                                    request_id,
-                                                                    wallet_pubkey: String::new(),
-                                                                    signature: None,
-                                                                }
-                                                            };
-                                                            drop(handler_lock);
-                                                            let mut swarm_lock = swarm.lock().await;
-                                                            if let Err(e) = swarm_lock.behaviour_mut().cosign.send_response(channel, response) {
-                                                                log::error!("Failed to send cosign response: {:?}", e);
-                                                            }
-                                                        }
-                                                        RequestResponseMessage::Response { request_id, response, .. } => {
-                                                            // Complete the leader-side waiter registered by
-                                                            // send_cosign_request (#260).
-                                                            if let Some(tx) = cosign_waiters.lock().await.remove(&request_id) {
-                                                                let _ = tx.send(response);
-                                                            } else {
-                                                                debug!("cosign response with no waiter: {:?}", request_id);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                RequestResponseEvent::OutboundFailure { peer, request_id, error, .. } => {
-                                                    log::warn!(
-                                                        "cosign outbound failure to {:?}: {:?}",
-                                                        peer, error
-                                                    );
-                                                    // Drop the waiter so the awaiting leader errors
-                                                    // out instead of hanging past the timeout.
-                                                    cosign_waiters.lock().await.remove(&request_id);
-                                                }
-                                                RequestResponseEvent::InboundFailure { peer, error, .. } => {
-                                                    log::warn!(
-                                                        "cosign inbound failure from {:?}: {:?}",
-                                                        peer, error
-                                                    );
-                                                }
-                                                RequestResponseEvent::ResponseSent { peer, .. } => {
-                                                    debug!("cosign response sent to {}", peer);
-                                                }
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::Kad(kad_event) => {
-                                            match kad_event {
-                                                KadEvent::RoutingUpdated { peer, .. } => {
-                                                    debug!("kad routing table updated with peer {}", peer);
-                                                }
-                                                KadEvent::OutboundQueryProgressed { id, result, .. } => {
-                                                    debug!("kad query {:?} progressed: {:?}", id, result);
-                                                }
-                                                other => {
-                                                    debug!("kad event: {:?}", other);
-                                                }
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::Ping(ping_event) => {
-                                            match ping_event {
-                                                PingEvent { peer, result: Ok(rtt), .. } => {
-                                                    debug!("ping ok: peer {} rtt {:?}", peer, rtt);
-                                                    // Feed the rtt into the
-                                                    // PeerRegistry so the
-                                                    // slow-vs-offline
-                                                    // distinction has data.
-                                                    let mut registry = peer_registry.lock().await;
-                                                    registry.record_response(
-                                                        &NodeId(peer.to_bytes()),
-                                                        rtt,
-                                                    );
-                                                }
-                                                PingEvent { peer, result: Err(e), .. } => {
-                                                    log::warn!("ping failed: peer {} error {:?}", peer, e);
-                                                    // libp2p will close the
-                                                    // connection on repeated
-                                                    // ping failures, which
-                                                    // surfaces as a
-                                                    // ConnectionClosed event
-                                                    // and triggers the
-                                                    // mark_disconnected path
-                                                    // above. No direct call
-                                                    // here to avoid double-
-                                                    // counting transient
-                                                    // failures.
-                                                }
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::Autonat(autonat_event) => {
-                                            match autonat_event {
-                                                autonat::Event::StatusChanged { old, new } => {
-                                                    info!(
-                                                        "AutoNAT reachability changed: {:?} -> {:?}",
-                                                        old, new
-                                                    );
-                                                    // When a probe confirms we are
-                                                    // publicly reachable, register the
-                                                    // address as external so the swarm
-                                                    // advertises it to peers (and PR-B
-                                                    // can prefer a direct dial over a
-                                                    // relay circuit).
-                                                    if let autonat::NatStatus::Public(addr) = &new {
-                                                        let mut swarm_lock = swarm.lock().await;
-                                                        swarm_lock.add_external_address(addr.clone());
-                                                        info!("Confirmed publicly reachable at {}", addr);
-                                                    }
-                                                }
-                                                other => {
-                                                    debug!("autonat event: {:?}", other);
-                                                }
-                                            }
-                                        }
-
-                                        ParaloomBehaviourEvent::Relay(relay_event) => {
-                                            // Relay-server activity (reservations,
-                                            // circuit open/close) is low-volume, so
-                                            // log at info: it makes the anchor's relay
-                                            // role observable without a debug build.
-                                            // Only emitted when enable_relay_server is
-                                            // on; the Toggle is silent otherwise.
-                                            info!("relay server event: {:?}", relay_event);
-                                        }
-
-                                        ParaloomBehaviourEvent::RelayClient(relay_client_event) => {
-                                            // Client side of #226: reservations we hold
-                                            // on a relay and circuits opened through it.
-                                            // Low-volume; info-level so a NATed node's
-                                            // path to reachability is observable.
-                                            info!("relay client event: {:?}", relay_client_event);
-                                        }
-
-                                        ParaloomBehaviourEvent::Dcutr(dcutr_event) => {
-                                            // Hole-punch attempt to upgrade a relayed
-                                            // circuit to a direct connection. The event
-                                            // carries the peer and a Result; log the
-                                            // whole event so both success and the
-                                            // failure cause are visible.
-                                            info!("dcutr hole-punch event: {:?}", dcutr_event);
-                                        }
-
-                                        ParaloomBehaviourEvent::Identify(identify_event) => {
-                                            // The behaviour reports observed addresses
-                                            // to the swarm on its own (as external-addr
-                                            // candidates that AutoNAT confirms and DCUtR
-                                            // consumes); we just log at debug for
-                                            // visibility into the peer handshake.
-                                            debug!("identify event: {:?}", identify_event);
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    debug!("Swarm event: {:?}", event);
-                                }
-                            }
+                // Handle external Swarm commands without mutex starvation
+                command = command_rx.recv() => {
+                    match command {
+                        Some(cmd) => {
+                            Self::execute_swarm_command(&mut swarm, Some(&mut cosign_waiters), cmd);
                         }
                         None => break,
                     }
                 },
 
                 // Handle outgoing messages - publish to gossipsub
-                message = async {
-                    let mut receiver = receiver.lock().await;
-                    receiver.recv().await
-                } => {
+                message = message_rx.recv() => {
                     match message {
                         Some((_target, message)) => {
-                            // Serialize the message
                             match bincode::serialize(&message) {
                                 Ok(data) => {
                                     let topic = IdentTopic::new(PARALOOM_TOPIC);
-                                    let mut swarm_lock = swarm.lock().await;
-                                    if let Err(e) = swarm_lock.behaviour_mut().gossipsub.publish(topic, data) {
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
                                         log::error!("Failed to publish message: {}", e);
                                     } else {
                                         info!("Published message to gossipsub");
@@ -1071,7 +897,7 @@ impl NetworkManager {
                                     log::error!("Failed to serialize message: {}", e);
                                 }
                             }
-                        },
+                        }
                         None => break,
                     }
                 }
@@ -1079,6 +905,432 @@ impl NetworkManager {
         }
 
         info!("Network event loop terminated");
+    }
+
+    async fn handle_swarm_event(
+        swarm: &mut Swarm<ParaloomBehaviour>,
+        handler: &Arc<Mutex<Option<Arc<dyn NetworkEventHandler>>>>,
+        connected_peers: &Arc<Mutex<Vec<PeerId>>>,
+        peer_registry: &Arc<Mutex<PeerRegistry>>,
+        cosign_waiters: &mut HashMap<OutboundRequestId, oneshot::Sender<CoSignResponse>>,
+        event: libp2p::swarm::SwarmEvent<ParaloomBehaviourEvent>,
+    ) {
+        match event {
+            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                info!("Connection established with peer: {}", peer_id);
+
+                // Add to connected peers list
+                let mut peers = connected_peers.lock().await;
+                if !peers.contains(&peer_id) {
+                    peers.push(peer_id);
+                }
+                drop(peers);
+
+                // Mirror into the PeerRegistry state
+                // machine so the slow / offline
+                // distinction has live data.
+                let mut registry = peer_registry.lock().await;
+                registry.mark_connected(NodeId(peer_id.to_bytes()));
+            }
+            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                info!(
+                    "Connection closed with peer: {} (cause: {:?})",
+                    peer_id, cause
+                );
+
+                // Remove from connected peers list
+                let mut peers = connected_peers.lock().await;
+                peers.retain(|p| p != &peer_id);
+                drop(peers);
+
+                let mut registry = peer_registry.lock().await;
+                registry.mark_disconnected(NodeId(peer_id.to_bytes()));
+            }
+            libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
+                info!("Incoming connection");
+            }
+            libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                log::warn!("Outgoing connection error to {:?}: {}", peer_id, error);
+            }
+            libp2p::swarm::SwarmEvent::Dialing {
+                peer_id,
+                connection_id: _,
+            } => {
+                info!("Dialing peer: {:?}", peer_id);
+            }
+            libp2p::swarm::SwarmEvent::NewExternalAddrCandidate { address } => {
+                // AutoNAT will probe this candidate; promotion to
+                // a confirmed external address surfaces below.
+                debug!("New external address candidate: {}", address);
+            }
+            libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
+                info!("External address confirmed: {}", address);
+            }
+            libp2p::swarm::SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
+                ParaloomBehaviourEvent::Gossipsub(gossip_event) => {
+                    if let gossipsub::Event::Message {
+                        propagation_source: peer_id,
+                        message,
+                        ..
+                    } = gossip_event
+                    {
+                        info!("Received gossipsub message from peer: {}", peer_id);
+
+                        // Deserialize the message
+                        match bincode::deserialize::<Message>(&message.data) {
+                            Ok(msg) => {
+                                // Gossipsub runs in Signed mode, so `message.source`
+                                // is the authenticated original publisher. Prefer it
+                                // over `propagation_source` (the last forwarding hop)
+                                // so a relayed message is attributed to its real
+                                // author — this is what lets the consensus layer
+                                // reject a vote whose self-declared validator does not
+                                // match the authenticated sender (audit).
+                                let source = match message.source {
+                                    Some(author) => NodeId(author.to_bytes()),
+                                    None => NodeId(peer_id.to_bytes()),
+                                };
+                                let handler_lock = handler.lock().await;
+                                if let Some(h) = handler_lock.as_ref() {
+                                    if let Err(e) = h.handle_message(source, msg).await {
+                                        log::error!("Error handling message: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to deserialize message: {}", e);
+                            }
+                        }
+                    } else {
+                        debug!("Gossipsub event: {:?}", gossip_event);
+                    }
+                }
+
+                ParaloomBehaviourEvent::RequestResponse(req_resp_event) => match req_resp_event {
+                    RequestResponseEvent::Message {
+                        peer,
+                        message,
+                        connection_id: _,
+                    } => match message {
+                        RequestResponseMessage::Request {
+                            request, channel, ..
+                        } => {
+                            info!("=== RECEIVED RESULT REQUEST ===");
+                            info!("From validator: {}", peer);
+                            info!("Task ID: {}", request.result.task_id);
+
+                            let source = NodeId(peer.to_bytes());
+                            let handler_lock = handler.lock().await;
+
+                            let response = if let Some(h) = handler_lock.as_ref() {
+                                match h.handle_result_request(source, request).await {
+                                    Ok(resp) => {
+                                        info!("Handler processed result successfully");
+                                        resp
+                                    }
+                                    Err(e) => {
+                                        log::error!("Error handling result request: {}", e);
+                                        ResultResponse {
+                                            success: false,
+                                            message: format!("Error: {}", e),
+                                        }
+                                    }
+                                }
+                            } else {
+                                log::warn!("No handler registered");
+                                ResultResponse {
+                                    success: false,
+                                    message: "No handler registered".to_string(),
+                                }
+                            };
+                            drop(handler_lock);
+
+                            info!("Sending response: success={}", response.success);
+                            if let Err(e) = swarm
+                                .behaviour_mut()
+                                .request_response
+                                .send_response(channel, response)
+                            {
+                                log::error!("Failed to send response: {:?}", e);
+                            } else {
+                                info!("=== RESPONSE SENT ===");
+                            }
+                        }
+
+                        RequestResponseMessage::Response { response, .. } => {
+                            info!("=== RECEIVED RESPONSE FROM COORDINATOR ===");
+                            info!(
+                                "Success: {}, Message: {}",
+                                response.success, response.message
+                            );
+                        }
+                    },
+                    RequestResponseEvent::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        connection_id: _,
+                    } => {
+                        log::error!("=== REQUEST-RESPONSE OUTBOUND FAILURE ===");
+                        log::error!("Peer: {:?}", peer);
+                        log::error!("Request ID: {:?}", request_id);
+                        log::error!("Error: {:?}", error);
+                    }
+                    RequestResponseEvent::InboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        connection_id: _,
+                    } => {
+                        log::error!("=== REQUEST-RESPONSE INBOUND FAILURE ===");
+                        log::error!("Peer: {:?}", peer);
+                        log::error!("Request ID: {:?}", request_id);
+                        log::error!("Error: {:?}", error);
+                    }
+                    RequestResponseEvent::ResponseSent {
+                        peer,
+                        request_id,
+                        connection_id: _,
+                    } => {
+                        info!("=== RESPONSE SENT SUCCESSFULLY ===");
+                        info!("To peer: {}", peer);
+                        info!("Request ID: {:?}", request_id);
+                    }
+                },
+
+                ParaloomBehaviourEvent::Heartbeat(hb_event) => match hb_event {
+                    RequestResponseEvent::Message {
+                        peer,
+                        message,
+                        connection_id: _,
+                    } => match message {
+                        RequestResponseMessage::Request {
+                            request, channel, ..
+                        } => {
+                            let source = NodeId(peer.to_bytes());
+                            let handler_lock = handler.lock().await;
+                            let response = if let Some(h) = handler_lock.as_ref() {
+                                match h.handle_heartbeat_request(source, request).await {
+                                    Ok(resp) => resp,
+                                    Err(e) => {
+                                        log::error!("heartbeat handler error: {}", e);
+                                        HeartbeatResponse {
+                                            accepted: false,
+                                            last_applied_sequence: 0,
+                                        }
+                                    }
+                                }
+                            } else {
+                                HeartbeatResponse {
+                                    accepted: false,
+                                    last_applied_sequence: 0,
+                                }
+                            };
+                            drop(handler_lock);
+                            if let Err(e) = swarm
+                                .behaviour_mut()
+                                .heartbeat
+                                .send_response(channel, response)
+                            {
+                                log::error!("Failed to send heartbeat response: {:?}", e);
+                            }
+                        }
+                        RequestResponseMessage::Response { response, .. } => {
+                            debug!(
+                                "heartbeat response: accepted={}, last_applied={}",
+                                response.accepted, response.last_applied_sequence
+                            );
+                        }
+                    },
+                    RequestResponseEvent::OutboundFailure { peer, error, .. } => {
+                        log::warn!("heartbeat outbound failure to {:?}: {:?}", peer, error);
+                    }
+                    RequestResponseEvent::InboundFailure { peer, error, .. } => {
+                        log::warn!("heartbeat inbound failure from {:?}: {:?}", peer, error);
+                    }
+                    RequestResponseEvent::ResponseSent { peer, .. } => {
+                        debug!("heartbeat response sent to {}", peer);
+                    }
+                },
+
+                ParaloomBehaviourEvent::Cosign(cosign_event) => match cosign_event {
+                    RequestResponseEvent::Message {
+                        peer,
+                        message,
+                        connection_id: _,
+                    } => match message {
+                        RequestResponseMessage::Request {
+                            request, channel, ..
+                        } => {
+                            let source = NodeId(peer.to_bytes());
+                            let request_id = request.request_id.clone();
+                            let handler_lock = handler.lock().await;
+                            let response = if let Some(h) = handler_lock.as_ref() {
+                                match h.handle_cosign_request(source, request).await {
+                                    Ok(resp) => resp,
+                                    Err(e) => {
+                                        log::error!("cosign handler error: {}", e);
+                                        CoSignResponse {
+                                            request_id,
+                                            wallet_pubkey: String::new(),
+                                            signature: None,
+                                        }
+                                    }
+                                }
+                            } else {
+                                CoSignResponse {
+                                    request_id,
+                                    wallet_pubkey: String::new(),
+                                    signature: None,
+                                }
+                            };
+                            drop(handler_lock);
+                            if let Err(e) = swarm
+                                .behaviour_mut()
+                                .cosign
+                                .send_response(channel, response)
+                            {
+                                log::error!("Failed to send cosign response: {:?}", e);
+                            }
+                        }
+                        RequestResponseMessage::Response {
+                            request_id,
+                            response,
+                            ..
+                        } => {
+                            // Complete the leader-side waiter registered by
+                            // send_cosign_request (#260).
+                            if let Some(tx) = cosign_waiters.remove(&request_id) {
+                                let _ = tx.send(response);
+                            } else {
+                                debug!("cosign response with no waiter: {:?}", request_id);
+                            }
+                        }
+                    },
+                    RequestResponseEvent::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    } => {
+                        log::warn!("cosign outbound failure to {:?}: {:?}", peer, error);
+                        // Drop the waiter so the awaiting leader errors
+                        // out instead of hanging past the timeout.
+                        cosign_waiters.remove(&request_id);
+                    }
+                    RequestResponseEvent::InboundFailure { peer, error, .. } => {
+                        log::warn!("cosign inbound failure from {:?}: {:?}", peer, error);
+                    }
+                    RequestResponseEvent::ResponseSent { peer, .. } => {
+                        debug!("cosign response sent to {}", peer);
+                    }
+                },
+
+                ParaloomBehaviourEvent::Kad(kad_event) => match kad_event {
+                    KadEvent::RoutingUpdated { peer, .. } => {
+                        debug!("kad routing table updated with peer {}", peer);
+                    }
+                    KadEvent::OutboundQueryProgressed { id, result, .. } => {
+                        debug!("kad query {:?} progressed: {:?}", id, result);
+                    }
+                    other => {
+                        debug!("kad event: {:?}", other);
+                    }
+                },
+
+                ParaloomBehaviourEvent::Ping(ping_event) => match ping_event {
+                    PingEvent {
+                        peer,
+                        result: Ok(rtt),
+                        ..
+                    } => {
+                        debug!("ping ok: peer {} rtt {:?}", peer, rtt);
+                        // Feed the rtt into the
+                        // PeerRegistry so the
+                        // slow-vs-offline
+                        // distinction has data.
+                        let mut registry = peer_registry.lock().await;
+                        registry.record_response(&NodeId(peer.to_bytes()), rtt);
+                    }
+                    PingEvent {
+                        peer,
+                        result: Err(e),
+                        ..
+                    } => {
+                        log::warn!("ping failed: peer {} error {:?}", peer, e);
+                        // libp2p will close the
+                        // connection on repeated
+                        // ping failures, which
+                        // surfaces as a
+                        // ConnectionClosed event
+                        // and triggers the
+                        // mark_disconnected path
+                        // above. No direct call
+                        // here to avoid double-
+                        // counting transient
+                        // failures.
+                    }
+                },
+
+                ParaloomBehaviourEvent::Autonat(autonat_event) => match autonat_event {
+                    autonat::Event::StatusChanged { old, new } => {
+                        info!("AutoNAT reachability changed: {:?} -> {:?}", old, new);
+                        // When a probe confirms we are
+                        // publicly reachable, register the
+                        // address as external so the swarm
+                        // advertises it to peers (and PR-B
+                        // can prefer a direct dial over a
+                        // relay circuit).
+                        if let autonat::NatStatus::Public(addr) = &new {
+                            swarm.add_external_address(addr.clone());
+                            info!("Confirmed publicly reachable at {}", addr);
+                        }
+                    }
+                    other => {
+                        debug!("autonat event: {:?}", other);
+                    }
+                },
+
+                ParaloomBehaviourEvent::Relay(relay_event) => {
+                    // Relay-server activity (reservations,
+                    // circuit open/close) is low-volume, so
+                    // log at info: it makes the anchor's relay
+                    // role observable without a debug build.
+                    // Only emitted when enable_relay_server is
+                    // on; the Toggle is silent otherwise.
+                    info!("relay server event: {:?}", relay_event);
+                }
+
+                ParaloomBehaviourEvent::RelayClient(relay_client_event) => {
+                    // Client side of #226: reservations we hold
+                    // on a relay and circuits opened through it.
+                    // Low-volume; info-level so a NATed node's
+                    // path to reachability is observable.
+                    info!("relay client event: {:?}", relay_client_event);
+                }
+
+                ParaloomBehaviourEvent::Dcutr(dcutr_event) => {
+                    // Hole-punch attempt to upgrade a relayed
+                    // circuit to a direct connection. The event
+                    // carries the peer and a Result; log the
+                    // whole event so both success and the
+                    // failure cause are visible.
+                    info!("dcutr hole-punch event: {:?}", dcutr_event);
+                }
+
+                ParaloomBehaviourEvent::Identify(identify_event) => {
+                    // The behaviour reports observed addresses
+                    // to the swarm on its own (as external-addr
+                    // candidates that AutoNAT confirms and DCUtR
+                    // consumes); we just log at debug for
+                    // visibility into the peer handshake.
+                    debug!("identify event: {:?}", identify_event);
+                }
+            },
+            _ => {
+                debug!("Swarm event: {:?}", event);
+            }
+        }
     }
 
     /// Send a message to a peer (broadcasts via gossipsub)
@@ -1091,25 +1343,15 @@ impl NetworkManager {
 
     pub async fn send_result_request(&self, peer: NodeId, request: ResultRequest) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
-
-        info!("=== SENDING RESULT REQUEST ===");
-        info!("Target peer: {}", peer_id);
-        info!("Task ID: {}", request.result.task_id);
-
-        let mut swarm = self.swarm.lock().await;
-
-        // Check if peer is connected
-        let is_connected = swarm.is_connected(&peer_id);
-        info!("Is peer connected? {}", is_connected);
-
-        let request_id = swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&peer_id, request);
-
-        info!("Request ID: {:?}", request_id);
-        info!("=== REQUEST SENT ===");
-        Ok(())
+        let (tx, rx) = oneshot::channel();
+        self.execute_or_dispatch(NetworkCommand::SendResultRequest {
+            peer_id,
+            request,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| anyhow!("network event loop terminated before sending result request"))
     }
 
     /// Send a coordinator-HA heartbeat to a standby. Fire-and-forget
@@ -1123,12 +1365,15 @@ impl NetworkManager {
         request: HeartbeatRequest,
     ) -> Result<()> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
-        let mut swarm = self.swarm.lock().await;
-        swarm
-            .behaviour_mut()
-            .heartbeat
-            .send_request(&peer_id, request);
-        Ok(())
+        let (tx, rx) = oneshot::channel();
+        self.execute_or_dispatch(NetworkCommand::SendHeartbeatRequest {
+            peer_id,
+            request,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| anyhow!("network event loop terminated before sending heartbeat"))
     }
 
     /// Send a settlement co-sign request to a validator and await its response
@@ -1145,11 +1390,12 @@ impl NetworkManager {
     ) -> Result<CoSignResponse> {
         let peer_id = PeerId::from_bytes(&peer.0).map_err(|e| anyhow!("Invalid peer ID: {}", e))?;
         let (tx, rx) = oneshot::channel();
-        {
-            let mut swarm = self.swarm.lock().await;
-            let request_id = swarm.behaviour_mut().cosign.send_request(&peer_id, request);
-            self.cosign_waiters.lock().await.insert(request_id, tx);
-        }
+        self.execute_or_dispatch(NetworkCommand::SendCosignRequest {
+            peer_id,
+            request,
+            waiter: tx,
+        })
+        .await?;
         rx.await
             .map_err(|_| anyhow!("cosign request to {} failed or timed out", peer_id))
     }
@@ -1174,8 +1420,15 @@ impl NetworkManager {
     /// local transport addresses. Exposed for operational tooling and
     /// for tests that assert a relay circuit came up.
     pub async fn listen_addresses(&self) -> Vec<String> {
-        let swarm = self.swarm.lock().await;
-        swarm.listeners().map(|a| a.to_string()).collect()
+        let (tx, rx) = oneshot::channel();
+        if self
+            .execute_or_dispatch(NetworkCommand::ListenAddresses { reply: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Whether this node is running a circuit-relay v2 server (#226).
@@ -1183,8 +1436,15 @@ impl NetworkManager {
     /// tooling (the /metrics endpoint, status CLIs) can report the
     /// node's relay role without reaching into the swarm.
     pub async fn relay_server_enabled(&self) -> bool {
-        let swarm = self.swarm.lock().await;
-        swarm.behaviour().relay.is_enabled()
+        let (tx, rx) = oneshot::channel();
+        if self
+            .execute_or_dispatch(NetworkCommand::RelayServerEnabled { reply: tx })
+            .await
+            .is_err()
+        {
+            return self.relay_server_enabled;
+        }
+        rx.await.unwrap_or(self.relay_server_enabled)
     }
 
     /// Get connected peers
@@ -1221,15 +1481,16 @@ impl NetworkManager {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let mut swarm = self.swarm.lock().await;
-                match swarm.behaviour_mut().kad.bootstrap() {
-                    Ok(query_id) => {
-                        debug!("kad bootstrap refresh kicked off ({:?})", query_id);
-                    }
-                    Err(e) => {
-                        log::warn!("kad bootstrap refresh failed to start: {}", e);
-                    }
+                let (tx, rx) = oneshot::channel();
+                if self
+                    .execute_or_dispatch(NetworkCommand::StartKadBootstrapRefresh { reply: tx })
+                    .await
+                    .is_err()
+                {
+                    debug!("kad bootstrap refresh stopping: network event loop unavailable");
+                    break;
                 }
+                let _ = rx.await;
             }
         })
     }
@@ -1238,6 +1499,7 @@ impl NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::SettlementKind;
 
     #[test]
     fn peer_id_extracted_from_multiaddr_with_p2p_suffix() {
@@ -1375,5 +1637,32 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn send_cosign_request_before_start_returns_error() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let target = mgr.local_peer_id();
+        let req = CoSignRequest {
+            request_id: "pre-start-check".to_string(),
+            kind: SettlementKind::Transact,
+            message: vec![1, 2, 3],
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mgr.send_cosign_request(target, req),
+        )
+        .await
+        .expect("pre-start send_cosign_request must not hang");
+        assert!(res.is_err(), "pre-start send_cosign_request must error");
+    }
+
+    #[tokio::test]
+    async fn double_start_returns_error() {
+        let mgr = NetworkManager::new(&Settings::development()).expect("network manager");
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().expect("multiaddr");
+        mgr.start(addr.clone()).await.expect("first start succeeds");
+        let second = mgr.start(addr).await;
+        assert!(second.is_err(), "second start must fail cleanly");
     }
 }
