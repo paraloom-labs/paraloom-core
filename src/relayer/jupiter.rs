@@ -633,10 +633,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapProvider for JupiterSwapProvide
         let out_amount = if asset_out == NATIVE_SOL_ASSET {
             // Native output: re-shield the ephemeral's actual lamport balance
             // minus a reserve for the re-deposit fee, falling back to the quote
-            // only when the balance can't be read.
+            // only when the balance can't be read. Even on fallback we reserve
+            // `NATIVE_DEPOSIT_RESERVE_LAMPORTS` so the subsequent re-deposit tx
+            // from `signer` does not fail with `InsufficientFundsForFee`.
             match self.submitter.realized_native(&signer.pubkey()).await? {
                 Some(bal) => bal.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
-                None => out_amount,
+                None => out_amount.saturating_sub(NATIVE_DEPOSIT_RESERVE_LAMPORTS),
             }
         } else {
             let mint = Pubkey::from_str(&output_mint)
@@ -944,6 +946,28 @@ mod tests {
             .await
             .expect("swap executes");
         assert_eq!(out.out_amount, 995_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS);
+    }
+
+    #[tokio::test]
+    async fn native_output_fallback_reserves_deposit_fee_when_realized_balance_unavailable() {
+        // When `realized_native` returns `Ok(None)` (e.g. default trait impl or
+        // transient RPC read miss), `swap` falls back to the quoted `outAmount`
+        // and MUST still subtract `NATIVE_DEPOSIT_RESERVE_LAMPORTS` so the
+        // subsequent re-deposit transaction from the ephemeral keypair has
+        // enough lamports to pay its transaction fee.
+        let quote = serde_json::json!({
+            "outAmount": "1000000",
+            "routePlan": [ { "percent": 100 } ]
+        });
+        let http = CannedClient::new(quote, sample_swap_tx_json());
+        let provider =
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 50, 0, None).unwrap();
+
+        let out = provider
+            .swap([0x33u8; 32], NATIVE_SOL_ASSET, 1_000_000, &Keypair::new())
+            .await
+            .expect("swap executes");
+        assert_eq!(out.out_amount, 1_000_000 - NATIVE_DEPOSIT_RESERVE_LAMPORTS);
     }
 
     #[tokio::test]
