@@ -92,7 +92,18 @@ pub enum RelayerError {
     /// first line of defense; this is the orchestration layer's independent
     /// check, which the provider setting alone did not give a single request.
     #[error("swap output {out_amount} is below the caller minimum {min_out}")]
-    SlippageExceeded { out_amount: u64, min_out: u64 },
+    SlippageExceeded {
+        out_amount: u64,
+        min_out: u64,
+        /// The 64-byte keypair (`Keypair::to_bytes()`) of the fresh ephemeral
+        /// address holding the post-swap proceeds (`out_amount` of `asset_out`)
+        /// so the caller can sweep/recover the funds after the input note's
+        /// nullifier has already been burned on-chain.
+        ephemeral_keypair_bytes: Vec<u8>,
+        /// Public key (`[u8; 32]`) of the fresh ephemeral address holding the
+        /// post-swap output.
+        fresh_address: [u8; 32],
+    },
 }
 
 /// Crate-local result alias for relayer orchestration.
@@ -466,6 +477,8 @@ impl<S: SwapProvider, T: Submitter> PrivateSwapRelayer<S, T> {
                 return Err(RelayerError::SlippageExceeded {
                     out_amount: swap.out_amount,
                     min_out,
+                    ephemeral_keypair_bytes: ephemeral.to_bytes().to_vec(),
+                    fresh_address,
                 });
             }
         }
@@ -852,18 +865,24 @@ mod tests {
             .execute(req)
             .await
             .expect_err("below-min fill must error");
-        assert!(matches!(
-            err,
+        let (rescued_kp_bytes, rescued_addr) = match err {
             RelayerError::SlippageExceeded {
                 out_amount: 997_500,
-                min_out: 1_000_000
-            }
-        ));
+                min_out: 1_000_000,
+                ephemeral_keypair_bytes,
+                fresh_address,
+            } => (ephemeral_keypair_bytes, fresh_address),
+            other => panic!("expected SlippageExceeded, got {other:?}"),
+        };
         // The withdraw leg settled, but the check fires before the re-deposit —
-        // so no deposit leg was ever submitted.
+        // so no deposit leg was ever submitted, AND the returned ephemeral
+        // keypair reconstructs the exact fresh address that received the funds.
         let legs = relayer.submitter.recorded();
         assert_eq!(legs.len(), 1);
         assert_eq!(legs[0].leg, WithdrawLeg::Native);
+        let recovered_kp = Keypair::from_bytes(&rescued_kp_bytes).expect("valid 64-byte keypair");
+        assert_eq!(recovered_kp.pubkey().to_bytes(), rescued_addr);
+        assert_eq!(legs[0].fresh_address, rescued_addr);
     }
 
     #[tokio::test]
