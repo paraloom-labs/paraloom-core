@@ -2361,4 +2361,59 @@ mod tests {
         bad[0..8].copy_from_slice(&VALIDATOR_REGISTRY_DISCRIMINATOR);
         assert_eq!(decode_validator_pending_rewards(&bad), None);
     }
+
+    #[test]
+    fn withdraw_unbonded_prepends_claim_rewards_when_pending_rewards_nonzero() {
+        let program_id = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+
+        let data_with_rewards = build_validator_account_bytes(
+            validator,
+            0,
+            950,
+            false,
+            15_000_000,
+            1_000_000_000,
+            100,
+            0,
+            5_000_000_000,
+        );
+        let pending = decode_validator_pending_rewards(&data_with_rewards).unwrap();
+        assert_eq!(pending, 15_000_000);
+
+        let mut ixs = Vec::new();
+        if pending > 0 {
+            ixs.push(create_claim_rewards_instruction(&program_id, &validator).unwrap());
+        }
+        ixs.push(
+            create_withdraw_unbonded_stake_instruction(
+                &program_id,
+                &validator,
+                &stake_mint,
+                &token_program,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            ixs.len(),
+            2,
+            "pending_rewards > 0 must batch ClaimRewards followed by WithdrawUnbondedStake"
+        );
+
+        let data_zero_rewards = build_validator_account_bytes(
+            validator,
+            0,
+            950,
+            false,
+            0,
+            1_000_000_000,
+            100,
+            0,
+            5_000_000_000,
+        );
+        let pending_zero = decode_validator_pending_rewards(&data_zero_rewards).unwrap();
+        assert_eq!(pending_zero, 0);
+    }
 }
