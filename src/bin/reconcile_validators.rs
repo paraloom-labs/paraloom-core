@@ -360,7 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reg_pre = client.get_account(&registry_pda)?;
         if registry_needs_pre_reset(&reg_pre.data, &authority.pubkey()) {
             println!(
-                "[1b/4] pre-growing legacy registry ({} -> {REGISTRY_NEW_LEN} bytes) before deactivation...",
+                "[2a/4] Pre-dual-stake registry detected ({} -> {REGISTRY_NEW_LEN} bytes). Expanding layout with zero-state reset before deactivation...",
                 reg_pre.data.len()
             );
             send(
@@ -369,16 +369,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 create_reset_validator_registry_instruction(
                     &program_id,
                     &authority.pubkey(),
-                    &keep_wallets,
+                    &[], // Zero-state expansion before deactivations so Step 2b cannot underflow keep_wallets counters
                     &stake_mint,
-                    keep_wallets.len() as u64,
+                    0,
                 )?,
             )?;
         }
     }
 
     // 2. deactivate orphans (routes stake to unbonding, #377 B1).
-    println!("[2/4] deactivating {} orphans...", to_deactivate.len());
+    println!("[2b/4] deactivating {} orphans...", to_deactivate.len());
     for r in &to_deactivate {
         println!("  deactivate {}", r.wallet);
         send(
@@ -568,5 +568,24 @@ mod tests {
 
         let wrong_mint = Pubkey::new_unique();
         assert!(verify_reconciled_state(&rows, &ok_reg, &wrong_mint).is_err());
+    }
+
+    #[test]
+    fn step_2a_zero_state_expansion_instruction_uses_empty_slice() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let stake_mint = Pubkey::new_unique();
+        let expand_ix = create_reset_validator_registry_instruction(
+            &program_id,
+            &authority,
+            &[],
+            &stake_mint,
+            0,
+        )
+        .expect("zero-state expansion instruction must build");
+        // 4 base accounts (validator_registry, authority, program_data, system_program) + 0 remaining accounts
+        assert_eq!(expand_ix.accounts.len(), 4);
+        // Trailing 8 bytes of instruction data encode expected_active_validators = 0u64 LE
+        assert_eq!(&expand_ix.data[expand_ix.data.len() - 8..], &0u64.to_le_bytes());
     }
 }
