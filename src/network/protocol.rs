@@ -20,7 +20,7 @@ use libp2p::{
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Swarm},
     tcp, yamux, Multiaddr, PeerId,
 };
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -621,8 +621,8 @@ impl NetworkManager {
         let peer_registry_clone = self.peer_registry.clone();
         let cosign_waiters_clone = self.cosign_waiters.clone();
 
-        // Spawn task to handle events
-        tokio::spawn(async move {
+        // Spawn task to handle events and supervise against unhandled panics (#1612)
+        let event_loop_handle = tokio::spawn(async move {
             Self::run_event_loop(
                 swarm_clone,
                 receiver_clone,
@@ -632,6 +632,24 @@ impl NetworkManager {
                 cosign_waiters_clone,
             )
             .await;
+        });
+
+        tokio::spawn(async move {
+            match event_loop_handle.await {
+                Ok(()) => {
+                    info!("Network event loop exited cleanly");
+                }
+                Err(e) if e.is_panic() => {
+                    error!(
+                        "FATAL: Network event loop panicked: {:?}. Exiting process to avoid silent desync.",
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    warn!("Network event loop task terminated or aborted: {:?}", e);
+                }
+            }
         });
 
         Ok(())
@@ -1235,6 +1253,28 @@ impl NetworkManager {
     }
 }
 
+/// Validate whether an address is safe for AutoNAT dial-back (#1612).
+/// Rejects UDP/QUIC transports to prevent steering the node into vulnerable QUIC stacks,
+/// permitting only standard TCP multiaddrs.
+pub fn is_safe_autonat_dial_address(addr: &Multiaddr) -> bool {
+    let mut has_tcp = false;
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Udp(_) | libp2p::multiaddr::Protocol::QuicV1 => {
+                return false;
+            }
+            libp2p::multiaddr::Protocol::Tcp(_) => {
+                has_tcp = true;
+            }
+            libp2p::multiaddr::Protocol::P2pCircuit => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    has_tcp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,5 +1415,17 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn autonat_dial_address_safety_validation() {
+        let tcp_addr: Multiaddr = "/ip4/192.168.1.1/tcp/9000".parse().unwrap();
+        assert!(is_safe_autonat_dial_address(&tcp_addr));
+
+        let quic_addr: Multiaddr = "/ip4/192.168.1.1/udp/9000/quic-v1".parse().unwrap();
+        assert!(!is_safe_autonat_dial_address(&quic_addr));
+
+        let circuit_addr: Multiaddr = "/ip4/192.168.1.1/tcp/9000/p2p-circuit".parse().unwrap();
+        assert!(!is_safe_autonat_dial_address(&circuit_addr));
     }
 }
