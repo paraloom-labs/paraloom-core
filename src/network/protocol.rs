@@ -20,7 +20,7 @@ use libp2p::{
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Swarm},
     tcp, yamux, Multiaddr, PeerId,
 };
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -621,8 +621,8 @@ impl NetworkManager {
         let peer_registry_clone = self.peer_registry.clone();
         let cosign_waiters_clone = self.cosign_waiters.clone();
 
-        // Spawn task to handle events
-        tokio::spawn(async move {
+        // Spawn task to handle events and supervise against unhandled panics (#1610)
+        let event_loop_handle = tokio::spawn(async move {
             Self::run_event_loop(
                 swarm_clone,
                 receiver_clone,
@@ -632,6 +632,24 @@ impl NetworkManager {
                 cosign_waiters_clone,
             )
             .await;
+        });
+
+        tokio::spawn(async move {
+            match event_loop_handle.await {
+                Ok(()) => {
+                    info!("Network event loop exited cleanly");
+                }
+                Err(e) if e.is_panic() => {
+                    error!(
+                        "FATAL: Network event loop panicked: {:?}. Exiting process to avoid silent desync.",
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    warn!("Network event loop task terminated or aborted: {:?}", e);
+                }
+            }
         });
 
         Ok(())
@@ -1235,6 +1253,13 @@ impl NetworkManager {
     }
 }
 
+/// Ensure incoming yamux window updates do not exceed allowable u32 bounds before accumulation (#1610).
+pub fn validate_window_update(current_window: u32, credit: u32) -> Result<u32, &'static str> {
+    current_window
+        .checked_add(credit)
+        .ok_or("send window update credit exceeds u32::MAX")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,5 +1400,23 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn yamux_oversized_window_update_credit_rejected() {
+        let default_window = 262_144u32;
+        // 4,294,705,152 is the exact boundary where default_window + credit overflows u32::MAX
+        let overflow_credit = 4_294_705_152u32;
+        assert!(validate_window_update(default_window, overflow_credit).is_err());
+
+        let max_credit = u32::MAX;
+        assert!(validate_window_update(default_window, max_credit).is_err());
+
+        // Valid credit accumulates safely
+        let valid_credit = 1024u32;
+        assert_eq!(
+            validate_window_update(default_window, valid_credit).unwrap(),
+            263_168u32
+        );
     }
 }
