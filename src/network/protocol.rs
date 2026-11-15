@@ -20,7 +20,7 @@ use libp2p::{
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, Swarm},
     tcp, yamux, Multiaddr, PeerId,
 };
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -621,8 +621,8 @@ impl NetworkManager {
         let peer_registry_clone = self.peer_registry.clone();
         let cosign_waiters_clone = self.cosign_waiters.clone();
 
-        // Spawn task to handle events
-        tokio::spawn(async move {
+        // Spawn task to handle events and supervise against unhandled panics (#1609)
+        let event_loop_handle = tokio::spawn(async move {
             Self::run_event_loop(
                 swarm_clone,
                 receiver_clone,
@@ -632,6 +632,24 @@ impl NetworkManager {
                 cosign_waiters_clone,
             )
             .await;
+        });
+
+        tokio::spawn(async move {
+            match event_loop_handle.await {
+                Ok(()) => {
+                    info!("Network event loop exited cleanly");
+                }
+                Err(e) if e.is_panic() => {
+                    error!(
+                        "FATAL: Network event loop panicked: {:?}. Exiting process to avoid silent desync.",
+                        e
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    warn!("Network event loop task terminated or aborted: {:?}", e);
+                }
+            }
         });
 
         Ok(())
@@ -1235,6 +1253,16 @@ impl NetworkManager {
     }
 }
 
+/// Maximum allowable gossipsub PRUNE backoff duration (1 week) to prevent Instant overflow.
+pub const MAX_ALLOWED_BACKOFF_SECS: u64 = 7 * 24 * 3600;
+
+/// Sanitize and validate peer-supplied PRUNE backoff duration to guarantee safe arithmetic without panics (#1609).
+pub fn sanitize_prune_backoff(backoff_secs: u64) -> Option<std::time::Instant> {
+    let sanitized_secs = backoff_secs.min(MAX_ALLOWED_BACKOFF_SECS);
+    let backoff_duration = std::time::Duration::from_secs(sanitized_secs);
+    std::time::Instant::now().checked_add(backoff_duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,5 +1403,28 @@ mod tests {
             "corrupted identity must error, not regenerate"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn prune_max_backoff_sanitization_prevents_instant_overflow() {
+        let max_backoff = u64::MAX;
+        let result = sanitize_prune_backoff(max_backoff);
+        assert!(
+            result.is_some(),
+            "Expected valid Instant return via checked_add clamping"
+        );
+        let now = std::time::Instant::now();
+        assert!(
+            result.unwrap() <= now + std::time::Duration::from_secs(MAX_ALLOWED_BACKOFF_SECS + 5),
+            "Sanitized backoff instant must be clamped to upper bound"
+        );
+
+        let zero_backoff = 0u64;
+        let zero_result = sanitize_prune_backoff(zero_backoff);
+        assert!(zero_result.is_some());
+
+        let normal_backoff = 60u64;
+        let normal_result = sanitize_prune_backoff(normal_backoff);
+        assert!(normal_result.is_some());
     }
 }
