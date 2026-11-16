@@ -734,15 +734,22 @@ impl TransactVerificationCoordinator {
 
     /// The validators that voted `Valid` on a transact (#260) — the eligible
     /// co-signers for its settlement. Empty if the request is unknown here.
+    ///
+    /// # Lock-ordering note (#1611)
+    ///
+    /// The `pending` read lock is released before `eligible_wallets` acquires
+    /// its own read locks (`onchain_wallets`, `equivocators`), avoiding a
+    /// nested-lock window that could invert with a concurrent write path.
     pub async fn valid_voters(&self, request_id: &str) -> Vec<NodeId> {
-        let pending = self.pending.read().await;
-        match pending.get(request_id) {
-            Some(consensus) => {
-                let eligible = self.eligible_wallets().await;
-                consensus.tally.valid_voters(&eligible).await
+        let tally = {
+            let pending = self.pending.read().await;
+            match pending.get(request_id) {
+                Some(consensus) => consensus.tally.clone(),
+                None => return Vec::new(),
             }
-            None => Vec::new(),
-        }
+        };
+        let eligible = self.eligible_wallets().await;
+        tally.valid_voters(&eligible).await
     }
 
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
@@ -751,13 +758,25 @@ impl TransactVerificationCoordinator {
     /// is preserved across a flap (deactivate-not-delete), so a reconnected
     /// co-signer still authenticates. Fail-open only while the on-chain set is
     /// empty (pre-first-snapshot), matching the registration gate.
+    ///
+    /// # Lock-ordering note (#1611)
+    ///
+    /// The `onchain_wallets` read guard is released before
+    /// `validator_wallet` acquires `leader_selector.read`, preventing a
+    /// nested-lock window that could invert with `sync_onchain_stakes`
+    /// (which writes both in the opposite order).
     pub async fn source_is_onchain_validator(&self, node_id: &NodeId) -> bool {
-        let onchain = self.onchain_wallets.read().await;
-        if onchain.is_empty() {
-            return true;
-        }
+        // Snapshot the on-chain wallet set under a short-lived read guard.
+        let onchain_snapshot: HashSet<String> = {
+            let onchain = self.onchain_wallets.read().await;
+            if onchain.is_empty() {
+                return true;
+            }
+            onchain.clone()
+        };
+        // `onchain_wallets` read lock released; safe to acquire other locks.
         match self.validator_wallet(node_id).await {
-            Some(wallet) => onchain.contains(&wallet),
+            Some(wallet) => onchain_snapshot.contains(&wallet),
             None => false,
         }
     }
@@ -835,12 +854,27 @@ impl TransactVerificationCoordinator {
     /// Submit a verification result from a validator. On the node that
     /// started the request, the vote that first completes a `Valid` quorum
     /// makes the coordinator emit an [`ApprovedTransact`] exactly once.
+    ///
+    /// # Lock-ordering note (#1611)
+    ///
+    /// The `pending` read lock is released **before** any write lock
+    /// (`equivocators`, `emitted`) is acquired.  Holding the read lock across
+    /// awaited write acquisitions created an acquisition-order inversion with
+    /// `cleanup_timeouts` (which takes `pending.write` then `emitted.write`),
+    /// leading to deadlock under concurrent vote + timeout-sweep traffic.
+    /// Cloning the `TransactConsensus` out under a short-lived read guard
+    /// breaks the cycle while preserving correctness: the `VoteTally` inside
+    /// the consensus is `Arc`-wrapped, so the clone shares the live vote map.
     pub async fn submit_result(&self, result: TransactVerificationResult) -> Result<()> {
-        let pending = self.pending.read().await;
-
-        let consensus = pending
-            .get(&result.request_id)
-            .ok_or_else(|| anyhow!("Request not found: {}", result.request_id))?;
+        // --- short-lived read lock: clone the consensus state out, then drop ---
+        let consensus = {
+            let pending = self.pending.read().await;
+            let c = pending
+                .get(&result.request_id)
+                .ok_or_else(|| anyhow!("Request not found: {}", result.request_id))?;
+            c.clone()
+        };
+        // `pending` read lock is now released.
 
         // REPLAY invariant on the counting path: the id we count under must be
         // the content-bound canonical id of the settlement in flight. (Signed
@@ -941,11 +975,20 @@ impl TransactVerificationCoordinator {
     }
 
     /// Non-blocking quorum check.
+    ///
+    /// # Lock-ordering note (#1611)
+    ///
+    /// Clones the `TransactConsensus` (cheap — the `VoteTally` is `Arc`-wrapped)
+    /// under a short-lived `pending` read guard so subsequent read/write
+    /// acquisitions do not nest inside the `pending` lock.
     pub async fn check_consensus(&self, request_id: &str) -> Result<Option<VerificationVote>> {
-        let pending = self.pending.read().await;
-        let consensus = pending
-            .get(request_id)
-            .ok_or_else(|| anyhow!("Request not found: {}", request_id))?;
+        let consensus = {
+            let pending = self.pending.read().await;
+            pending
+                .get(request_id)
+                .ok_or_else(|| anyhow!("Request not found: {}", request_id))?
+                .clone()
+        };
 
         if consensus.tally.is_timed_out() {
             return Err(anyhow!("Verification timed out"));
@@ -971,13 +1014,21 @@ impl TransactVerificationCoordinator {
     }
 
     /// `(completion_percentage, valid, invalid)` vote tally for a request.
+    ///
+    /// # Lock-ordering note (#1611)
+    ///
+    /// Clones the tally under a short-lived `pending` read guard.
     pub async fn get_status(&self, request_id: &str) -> Result<(f64, usize, usize)> {
-        let pending = self.pending.read().await;
-        let consensus = pending
-            .get(request_id)
-            .ok_or_else(|| anyhow!("Request not found: {}", request_id))?;
-        let percentage = consensus.tally.completion_percentage().await;
-        let (valid, invalid) = consensus.tally.vote_counts().await;
+        let tally = {
+            let pending = self.pending.read().await;
+            pending
+                .get(request_id)
+                .ok_or_else(|| anyhow!("Request not found: {}", request_id))?
+                .tally
+                .clone()
+        };
+        let percentage = tally.completion_percentage().await;
+        let (valid, invalid) = tally.vote_counts().await;
         Ok((percentage, valid, invalid))
     }
 
@@ -991,20 +1042,38 @@ impl TransactVerificationCoordinator {
     /// Remove timed-out pending verifications so the map cannot grow unbounded.
     /// The ingress write-surface inserts a request before any vote arrives, so
     /// requests that never reach quorum must be reclaimed by a periodic sweep.
+    ///
+    /// # Lock-ordering note (#1611)
+    ///
+    /// `pending.write` is released **before** `emitted.write` is acquired.
+    /// The old code held `pending.write` across the inner `emitted.write`,
+    /// creating an acquisition-order inversion with `submit_result` (which
+    /// could hold `emitted.write` while another task waited on
+    /// `pending.write`).  Collecting the timed-out ids, removing them from
+    /// `pending`, and only then clearing `emitted` breaks the cycle.
     pub async fn cleanup_timeouts(&self) -> Result<usize> {
-        let mut pending = self.pending.write().await;
-        let timed_out: Vec<String> = pending
-            .iter()
-            .filter(|(_, consensus)| consensus.tally.is_timed_out())
-            .map(|(id, _)| id.clone())
-            .collect();
+        let timed_out: Vec<String> = {
+            let mut pending = self.pending.write().await;
+            let ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, consensus)| consensus.tally.is_timed_out())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                pending.remove(id);
+            }
+            ids
+            // `pending` write lock dropped here.
+        };
         let count = timed_out.len();
-        for id in timed_out {
-            pending.remove(&id);
-            // A content-bound canonical id that timed out must be re-approvable
-            // if the client re-proves it, so drop any stale emitted mark too.
-            self.emitted.write().await.remove(&id);
-            log::warn!("Cleaned up timed out transact verification: {}", id);
+        // A content-bound canonical id that timed out must be re-approvable
+        // if the client re-proves it, so drop any stale emitted mark too.
+        if !timed_out.is_empty() {
+            let mut emitted = self.emitted.write().await;
+            for id in &timed_out {
+                emitted.remove(id);
+                log::warn!("Cleaned up timed out transact verification: {}", id);
+            }
         }
         Ok(count)
     }
