@@ -621,17 +621,23 @@ impl NetworkManager {
         let peer_registry_clone = self.peer_registry.clone();
         let cosign_waiters_clone = self.cosign_waiters.clone();
 
-        // Spawn task to handle events
+        // Spawn supervised task to handle network events (#1612)
         tokio::spawn(async move {
-            Self::run_event_loop(
+            let handle = tokio::spawn(Self::run_event_loop(
                 swarm_clone,
                 receiver_clone,
                 handler_clone,
                 connected_peers_clone,
                 peer_registry_clone,
                 cosign_waiters_clone,
-            )
-            .await;
+            ));
+            if let Err(e) = handle.await {
+                if e.is_panic() {
+                    log::error!("Network event loop task panicked: {:?}", e);
+                } else {
+                    log::error!("Network event loop task terminated: {:?}", e);
+                }
+            }
         });
 
         Ok(())
