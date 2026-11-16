@@ -7,15 +7,16 @@
 //! `withdraw` path was removed in favour of the program-owned-tree `transact`.
 
 use anchor_lang::prelude::*;
-use anchor_lang::{InstructionData, ToAccountMetas};
+use anchor_lang::{AccountSerialize, InstructionData, ToAccountMetas};
 use paraloom_program::transact_fixture_data as fx;
-use paraloom_program::{accounts, instruction, ValidatorAccount};
-use solana_program_test::{processor, tokio, ProgramTest};
+use paraloom_program::{accounts, instruction, BridgeError, BridgeState, ValidatorAccount};
+use solana_program_test::{processor, tokio, BanksClientError, ProgramTest};
 use solana_sdk::{
     account::Account,
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
+    rent::Rent,
     signature::{Keypair, Signer},
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 
 mod common;
@@ -381,4 +382,285 @@ async fn claim_rewards_drains_pending_and_accumulates_earnings() {
     let acc = ValidatorAccount::try_deserialize(&mut acc_raw.data.as_slice()).unwrap();
     assert_eq!(acc.pending_rewards, 0);
     assert_eq!(acc.total_earnings, EXPECTED_FEE);
+}
+
+fn custom_code(err: BanksClientError) -> u32 {
+    let tx_err = match err {
+        BanksClientError::TransactionError(e) => e,
+        BanksClientError::SimulationError { err, .. } => err,
+        other => panic!("expected a transaction error, got {other:?}"),
+    };
+    match tx_err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => code,
+        other => panic!("expected a custom instruction error, got {other:?}"),
+    }
+}
+
+struct TestHarness {
+    banks_client: solana_program_test::BanksClient,
+    recent_blockhash: anchor_lang::solana_program::hash::Hash,
+    validator: Keypair,
+    state_pda: Pubkey,
+    vault_pda: Pubkey,
+    validator_pda: Pubkey,
+    program_id: Pubkey,
+}
+
+async fn setup_claim_rewards_test(vault_lamports: u64, pending_rewards: u64) -> TestHarness {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (_program_data_pda, _upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator = Keypair::new();
+    pt.add_account(
+        validator.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    let bridge_state = BridgeState {
+        program_version: 0x0004_0000,
+        authority: Pubkey::new_unique(),
+        total_deposited: 0,
+        total_withdrawn: 0,
+        deposit_count: 0,
+        withdrawal_count: 0,
+        paused: false,
+        merkle_root: [0u8; 32],
+        deposit_cap: u64::MAX,
+    };
+    let mut state_data = Vec::new();
+    bridge_state
+        .try_serialize(&mut state_data)
+        .expect("serialize bridge_state");
+    pt.add_account(
+        state_pda,
+        Account {
+            lamports: Rent::default().minimum_balance(state_data.len()),
+            data: state_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let validator_account = ValidatorAccount {
+        validator: validator.pubkey(),
+        stake_amount: 1_000_000_000,
+        reputation_score: 1000,
+        total_tasks_verified: 0,
+        successful_verifications: 0,
+        registered_at: 0,
+        last_active: 0,
+        is_active: true,
+        pending_rewards,
+        total_earnings: 0,
+        times_slashed: 0,
+        unbonding_amount: 0,
+        unbonding_slot: 0,
+        token_stake_amount: 0,
+        token_unbonding_amount: 0,
+    };
+    let mut val_data = Vec::new();
+    validator_account
+        .try_serialize(&mut val_data)
+        .expect("serialize validator_account");
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: Rent::default().minimum_balance(val_data.len()),
+            data: val_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    if vault_lamports > 0 {
+        pt.add_account(
+            vault_pda,
+            Account {
+                lamports: vault_lamports,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+
+    let (banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    TestHarness {
+        banks_client,
+        recent_blockhash,
+        validator,
+        state_pda,
+        vault_pda,
+        validator_pda,
+        program_id,
+    }
+}
+
+async fn try_claim_rewards(
+    harness: &mut TestHarness,
+) -> std::result::Result<(), BanksClientError> {
+    let ix = Instruction {
+        program_id: harness.program_id,
+        data: instruction::ClaimRewards {}.data(),
+        accounts: accounts::ClaimRewards {
+            bridge_state: harness.state_pda,
+            validator_account: harness.validator_pda,
+            bridge_vault: harness.vault_pda,
+            validator: harness.validator.pubkey(),
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&harness.validator.pubkey()));
+    tx.sign(&[&harness.validator], harness.recent_blockhash);
+    harness.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn claim_rewards_succeeds_at_exact_rent_floor_boundary() {
+    let rent_floor = Rent::default().minimum_balance(0);
+    let reward = 250_000;
+    let mut h = setup_claim_rewards_test(rent_floor + reward, reward).await;
+
+    try_claim_rewards(&mut h)
+        .await
+        .expect("claim preserving exact rent floor must succeed");
+
+    let vault_acc = h
+        .banks_client
+        .get_account(h.vault_pda)
+        .await
+        .unwrap()
+        .expect("vault account must exist");
+    assert_eq!(
+        vault_acc.lamports, rent_floor,
+        "vault must retain exactly the rent-exempt floor after full reward payout"
+    );
+
+    let val_acc_raw = h
+        .banks_client
+        .get_account(h.validator_pda)
+        .await
+        .unwrap()
+        .expect("validator account must exist");
+    let val_acc = ValidatorAccount::try_deserialize(&mut val_acc_raw.data.as_slice()).unwrap();
+    assert_eq!(val_acc.pending_rewards, 0, "pending rewards must be cleared");
+    assert_eq!(val_acc.total_earnings, reward, "total earnings must accumulate");
+}
+
+#[tokio::test]
+async fn claim_rewards_rejects_when_vault_balance_violates_rent_floor() {
+    let rent_floor = Rent::default().minimum_balance(0);
+    let reward = 250_000;
+    // Vault balance is 1 lamport short of maintaining the rent floor after reward payout
+    let mut h = setup_claim_rewards_test(rent_floor + reward - 1, reward).await;
+
+    let err = try_claim_rewards(&mut h)
+        .await
+        .expect_err("claim drawing vault below rent floor must fail");
+    assert_eq!(
+        custom_code(err),
+        u32::from(BridgeError::InsufficientFunds),
+        "must fail cleanly with InsufficientFunds"
+    );
+
+    let val_acc_raw = h
+        .banks_client
+        .get_account(h.validator_pda)
+        .await
+        .unwrap()
+        .expect("validator account must exist");
+    let val_acc = ValidatorAccount::try_deserialize(&mut val_acc_raw.data.as_slice()).unwrap();
+    assert_eq!(
+        val_acc.pending_rewards, reward,
+        "pending rewards must remain untouched on failure"
+    );
+    assert_eq!(
+        val_acc.total_earnings, 0,
+        "total earnings must not change on failure"
+    );
+}
+
+#[tokio::test]
+async fn claim_rewards_rejects_when_vault_balance_is_at_rent_floor() {
+    let rent_floor = Rent::default().minimum_balance(0);
+    let reward = 100_000;
+    // Vault only has rent floor; transferable lamports are 0
+    let mut h = setup_claim_rewards_test(rent_floor, reward).await;
+
+    let err = try_claim_rewards(&mut h)
+        .await
+        .expect_err("claim when transferable is zero must fail");
+    assert_eq!(
+        custom_code(err),
+        u32::from(BridgeError::InsufficientFunds),
+        "must fail cleanly with InsufficientFunds"
+    );
+}
+
+#[tokio::test]
+async fn claim_rewards_rejects_when_vault_balance_below_rent_floor() {
+    let rent_floor = Rent::default().minimum_balance(0);
+    let reward = 100_000;
+    // Vault is already below rent floor
+    let mut h = setup_claim_rewards_test(rent_floor - 1, reward).await;
+
+    let err = try_claim_rewards(&mut h)
+        .await
+        .expect_err("claim when vault is below rent floor must fail");
+    assert_eq!(
+        custom_code(err),
+        u32::from(BridgeError::InsufficientFunds),
+        "must fail cleanly with InsufficientFunds"
+    );
+}
+
+#[tokio::test]
+async fn claim_rewards_succeeds_with_ample_funds_above_rent_floor() {
+    let rent_floor = Rent::default().minimum_balance(0);
+    let reward = 500_000;
+    let surplus = 10_000_000;
+    let mut h = setup_claim_rewards_test(rent_floor + reward + surplus, reward).await;
+
+    try_claim_rewards(&mut h)
+        .await
+        .expect("claim with surplus above rent floor must succeed");
+
+    let vault_acc = h
+        .banks_client
+        .get_account(h.vault_pda)
+        .await
+        .unwrap()
+        .expect("vault account must exist");
+    assert_eq!(
+        vault_acc.lamports,
+        rent_floor + surplus,
+        "vault must retain rent floor plus remaining surplus"
+    );
+
+    let val_acc_raw = h
+        .banks_client
+        .get_account(h.validator_pda)
+        .await
+        .unwrap()
+        .expect("validator account must exist");
+    let val_acc = ValidatorAccount::try_deserialize(&mut val_acc_raw.data.as_slice()).unwrap();
+    assert_eq!(val_acc.pending_rewards, 0);
+    assert_eq!(val_acc.total_earnings, reward);
 }
