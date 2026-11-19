@@ -187,6 +187,16 @@ async fn submit_handler(
             "proof must not be empty".to_string(),
         ));
     }
+    // Reject malformed/oversized proofs before hashing the request or
+    // broadcasting it to the validator mesh. Verification applies this same
+    // suite/tag and exact-body-length check later, but doing it here avoids
+    // spending consensus and gossip resources on a request that cannot pass.
+    crate::privacy::proof_codec::split_tagged_proof(&proof).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("proof: invalid tagged proof: {e}"),
+        )
+    })?;
 
     // The ciphertexts stay opaque to the node: it relays them and never opens
     // them. Validation is limited to what is invalid under every envelope
