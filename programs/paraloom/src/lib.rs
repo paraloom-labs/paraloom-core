@@ -1488,7 +1488,8 @@ pub mod paraloom_program {
     /// never a theft). Completeness cannot be enforced on-chain (the program
     /// cannot enumerate all PDAs), so it is the upgrade authority's
     /// responsibility; reconcile any active-but-excluded PDA with
-    /// [`deactivate_validator`] before relying on the rebuilt denominator.
+    /// [`reconcile_orphaned_validator`] (or [`deactivate_validator`] *before*
+    /// running reset) before relying on the rebuilt denominator (#1625).
     pub fn reset_validator_registry(
         ctx: Context<ResetValidatorRegistry>,
         stake_mint: Pubkey,
@@ -1625,12 +1626,14 @@ pub mod paraloom_program {
     /// Deactivate a single validator so it can no longer be counted toward the
     /// settlement quorum, keeping the registry invariant
     /// `total_active_stake == Σ active-PDA stake` intact. Admin-only (the
-    /// registry authority). This reconciles validators dropped from the active
-    /// set — e.g. `is_active` PDAs left behind by an earlier
-    /// `reset_validator_registry` that rebuilt the counters but did not
-    /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// registry authority).
+    ///
+    /// NOTE: For validators that were already dropped from the active set by
+    /// an earlier `reset_validator_registry`, use [`reconcile_orphaned_validator`]
+    /// instead. Calling `deactivate_validator` on an account already excluded by
+    /// a reset would double-decrement `total_active_stake` and `active_validators`,
+    /// lowering the registry denominator below the actual active validator stake
+    /// and breaking subsequent settlement quorums (#1625).
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -1639,12 +1642,15 @@ pub mod paraloom_program {
             let now_slot = Clock::get()?.slot;
             let v = &mut ctx.accounts.validator_account;
             v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
+            // Route the dual-stake into unbonding rather than stranding it: a
             // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
+            // is_active), so without this its stake would have no exit and be
             // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
             // the delay, same as unregister.
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
@@ -1652,6 +1658,34 @@ pub mod paraloom_program {
             registry.active_validators = registry.active_validators.saturating_sub(1);
         }
         msg!("Validator deactivated: {}", who);
+        Ok(())
+    }
+
+    /// Reconcile an orphaned active validator PDA dropped/excluded by an earlier
+    /// `reset_validator_registry` (#1625).
+    ///
+    /// Routes the stranded stake into unbonding and flips `is_active` to false,
+    /// so the dropped account cannot cast stale votes or leave stake locked,
+    /// WITHOUT decrementing `total_active_stake` or `active_validators` (which
+    /// were already rebuilt without this account during the reset).
+    pub fn reconcile_orphaned_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
+        let was_active = ctx.accounts.validator_account.is_active;
+        let stake = ctx.accounts.validator_account.stake_amount;
+        let who = ctx.accounts.validator_account.validator;
+        if was_active {
+            let now_slot = Clock::get()?.slot;
+            let v = &mut ctx.accounts.validator_account;
+            v.is_active = false;
+            v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+            v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+            v.stake_amount = 0;
+            // Counters are NOT decremented: reset_validator_registry already
+            // rebuilt total_active_stake and active_validators without this account!
+        }
+        msg!("Orphaned validator reconciled into unbonding: {}", who);
         Ok(())
     }
 
