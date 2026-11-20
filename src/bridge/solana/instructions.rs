@@ -69,6 +69,10 @@ pub mod discriminators {
     /// keeping `total_active_stake == Σ active-PDA stake` so orphaned active
     /// PDAs cannot be counted against a stale-low quorum denominator.
     pub const DEACTIVATE_VALIDATOR: [u8; 8] = [0xbc, 0xe3, 0xe0, 0xbb, 0xe7, 0x34, 0x03, 0x93];
+    /// `sha256("global:reconcile_orphaned_validator")[..8]` (#1625). Admin cleanup
+    /// that deactivates and unbonds an orphaned active PDA already excluded by
+    /// `reset_validator_registry` WITHOUT double-decrementing registry counters.
+    pub const RECONCILE_ORPHANED_VALIDATOR: [u8; 8] = [0x67, 0xa2, 0xba, 0x9e, 0xfa, 0x72, 0xba, 0xc3];
     /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
     /// the on-chain incremental tree.
     pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
@@ -306,6 +310,29 @@ pub fn create_deactivate_validator_instruction(
             AccountMeta::new(*authority, true),
         ],
         data: discriminators::DEACTIVATE_VALIDATOR.to_vec(),
+    })
+}
+
+/// Create a `reconcile_orphaned_validator` instruction (#1625). Admin-only (the registry
+/// authority). Flips `validator_wallet`'s canonical validator PDA to inactive
+/// and routes its stake into unbonding WITHOUT decrementing registry counters
+/// (preventing the double-decrement when reconciling after reset_validator_registry).
+pub fn create_reconcile_orphaned_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator_wallet: &Pubkey,
+) -> Result<Instruction> {
+    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*authority, true),
+        ],
+        data: discriminators::RECONCILE_ORPHANED_VALIDATOR.to_vec(),
     })
 }
 
