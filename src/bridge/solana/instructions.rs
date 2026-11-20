@@ -69,6 +69,10 @@ pub mod discriminators {
     /// keeping `total_active_stake == Σ active-PDA stake` so orphaned active
     /// PDAs cannot be counted against a stale-low quorum denominator.
     pub const DEACTIVATE_VALIDATOR: [u8; 8] = [0xbc, 0xe3, 0xe0, 0xbb, 0xe7, 0x34, 0x03, 0x93];
+    /// `sha256("global:reconcile_orphaned_validator")[..8]`. Reconciles an
+    /// orphaned active validator PDA excluded by `reset_validator_registry`
+    /// without double-decrementing registry counters.
+    pub const RECONCILE_ORPHANED_VALIDATOR: [u8; 8] = [103, 162, 186, 158, 250, 114, 186, 195];
     /// `sha256("global:transact")[..8]` (#350). Unified v3 settlement against
     /// the on-chain incremental tree.
     pub const TRANSACT: [u8; 8] = [217, 149, 130, 143, 221, 52, 252, 119];
@@ -287,9 +291,9 @@ pub fn create_reset_validator_registry_instruction(
 
 /// Create a `deactivate_validator` instruction. Admin-only (the registry
 /// authority). Flips `validator_wallet`'s canonical validator PDA to inactive
-/// and drops its stake from the registry counters, so an orphaned active PDA
-/// (e.g. one dropped from the active set by an earlier reset) can no longer be
-/// counted toward a settlement quorum. Does not move the staked lamports.
+/// and drops its stake from the registry counters. (For reconciling accounts
+/// excluded by an earlier `reset_validator_registry`, use
+/// `create_reconcile_orphaned_validator_instruction` instead).
 pub fn create_deactivate_validator_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
@@ -306,6 +310,29 @@ pub fn create_deactivate_validator_instruction(
             AccountMeta::new(*authority, true),
         ],
         data: discriminators::DEACTIVATE_VALIDATOR.to_vec(),
+    })
+}
+
+/// Create a `reconcile_orphaned_validator` instruction. Admin-only (the registry
+/// authority). Flips `validator_wallet`'s canonical validator PDA to inactive
+/// and routes its stake to unbonding without mutating registry counters,
+/// preventing double-decrement of counters rebuilt by `reset_validator_registry`.
+pub fn create_reconcile_orphaned_validator_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    validator_wallet: &Pubkey,
+) -> Result<Instruction> {
+    let (validator_pda, _) = derive_validator_account(program_id, validator_wallet);
+    let (registry_pda, _) = derive_validator_registry(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(validator_pda, false),
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*authority, true),
+        ],
+        data: discriminators::RECONCILE_ORPHANED_VALIDATOR.to_vec(),
     })
 }
 
@@ -1163,6 +1190,62 @@ mod tests {
         assert_eq!(&ix.data[..8], &discriminators::DEPOSIT_NOTE);
         // amount immediately follows the discriminator (borsh u64 LE).
         assert_eq!(&ix.data[8..16], &1_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_create_deactivate_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let ix = create_deactivate_validator_instruction(&program_id, &authority, &validator)
+            .expect("create deactivate ix");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, authority);
+        assert!(ix.accounts[2].is_signer);
+        assert_eq!(ix.data, discriminators::DEACTIVATE_VALIDATOR.to_vec());
+    }
+
+    #[test]
+    fn test_create_reconcile_orphaned_validator_instruction() {
+        let program_id = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let ix =
+            create_reconcile_orphaned_validator_instruction(&program_id, &authority, &validator)
+                .expect("create reconcile orphaned ix");
+
+        assert_eq!(ix.program_id, program_id);
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            derive_validator_account(&program_id, &validator).0
+        );
+        assert!(ix.accounts[0].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            derive_validator_registry(&program_id).0
+        );
+        assert!(ix.accounts[1].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, authority);
+        assert!(ix.accounts[2].is_signer);
+        assert_eq!(
+            ix.data,
+            discriminators::RECONCILE_ORPHANED_VALIDATOR.to_vec()
+        );
     }
 
     #[test]

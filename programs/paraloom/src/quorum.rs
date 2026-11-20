@@ -398,4 +398,38 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn double_decrement_regression_prevented_by_reconcile() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+
+        // Scenario: 3 validators A, B, C each with 1 SOL.
+        // reset_validator_registry resets to A and B (total_active_stake = 2 SOL).
+        // If an operator used deactivate_validator on C, total_active_stake would drop to 1 SOL.
+        // Then when A and B co-sign settlement (counted_stake = 2 SOL),
+        // counted_stake (2 SOL) > eligible_stake (1 SOL), which bricks settlement with QuorumNotMet:
+        let corrupt_reg = registry_with_stake(1, 1_000_000_000); // corrupted by double-decrement
+        let w_a = Pubkey::new_unique();
+        let w_b = Pubkey::new_unique();
+        let (pda_a, _) = Pubkey::find_program_address(&[b"validator", w_a.as_ref()], &p);
+        let (pda_b, _) = Pubkey::find_program_address(&[b"validator", w_b.as_ref()], &p);
+        let mut d_a = validator_data(w_a, true);
+        let mut d_b = validator_data(w_b, true);
+        let (mut la, mut lb, mut lpa, mut lpb) = (0u64, 0u64, 0u64, 0u64);
+        let (mut ea, mut eb) = ([0u8; 0], [0u8; 0]);
+        let sa = AccountInfo::new(&w_a, true, false, &mut la, &mut ea, &sys, false, 0);
+        let aa = AccountInfo::new(&pda_a, false, false, &mut lpa, &mut d_a, &p, false, 0);
+        let sb = AccountInfo::new(&w_b, true, false, &mut lb, &mut eb, &sys, false, 0);
+        let ab = AccountInfo::new(&pda_b, false, false, &mut lpb, &mut d_b, &p, false, 0);
+        let cosigners = [sa, aa, sb, ab];
+
+        // With corrupted registry, settlement is bricked:
+        assert!(verify_validator_quorum(&p, &corrupt_reg, &Pubkey::default(), 0, &cosigners).is_err());
+
+        // With reconcile_orphaned_validator, total_active_stake is preserved at 2 SOL,
+        // and settlement succeeds:
+        let clean_reg = registry_with_stake(2, 2_000_000_000);
+        assert!(verify_validator_quorum(&p, &clean_reg, &Pubkey::default(), 0, &cosigners).is_ok());
+    }
 }
