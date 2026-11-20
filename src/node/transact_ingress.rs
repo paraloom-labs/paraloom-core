@@ -187,6 +187,18 @@ async fn submit_handler(
             "proof must not be empty".to_string(),
         ));
     }
+    if proof.len() > crate::bridge::solana::cosign_message::MAX_PROOF_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "proof exceeds maximum wire length ({} > {} bytes)",
+                proof.len(),
+                crate::bridge::solana::cosign_message::MAX_PROOF_BYTES
+            ),
+        ));
+    }
+    crate::privacy::split_tagged_proof(&proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("proof: {e}")))?;
 
     // The ciphertexts stay opaque to the node: it relays them and never opens
     // them. Validation is limited to what is invalid under every envelope
@@ -364,7 +376,7 @@ mod tests {
             "44".repeat(32),
             "55".repeat(32),
             ext_amount,
-            "01".repeat(192),
+            "01".repeat(1 + crate::privacy::GROTH16_BN254_COMPRESSED_LEN),
             v1_ciphertext_hex(0xab),
             v1_ciphertext_hex(0xcd)
         )
@@ -398,7 +410,10 @@ mod tests {
         assert_eq!(seen.output_commitments, [[0x33u8; 32], [0x44u8; 32]]);
         assert_eq!(seen.root, [0x55u8; 32]);
         assert_eq!(seen.ext_amount, 0);
-        assert_eq!(seen.proof, vec![0x01u8; 192]);
+        assert_eq!(
+            seen.proof,
+            vec![0x01u8; 1 + crate::privacy::GROTH16_BN254_COMPRESSED_LEN]
+        );
     }
 
     #[tokio::test]
@@ -557,5 +572,46 @@ mod tests {
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_is_400() {
+        for oversized_len in [130usize, 192, 257, 10_000] {
+            let stub = Arc::new(CaptureStub {
+                seen: tokio::sync::Mutex::new(None),
+            });
+            let app = router(stub.clone(), None);
+            let body = well_formed_body().replace(
+                &"01".repeat(1 + crate::privacy::GROTH16_BN254_COMPRESSED_LEN),
+                &"01".repeat(oversized_len),
+            );
+            let resp = app.oneshot(post_json(&body)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "oversized proof of {oversized_len} bytes must be rejected at ingress"
+            );
+            assert!(
+                stub.seen.lock().await.is_none(),
+                "oversized proof must not be forwarded to consensus"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_proof_envelope_is_400() {
+        // Legacy untagged 128-byte proof and unknown suite tag 0x02 must both fail at ingress.
+        for bad_proof in [
+            "01".repeat(crate::privacy::GROTH16_BN254_COMPRESSED_LEN),
+            format!("02{}", "11".repeat(crate::privacy::GROTH16_BN254_COMPRESSED_LEN)),
+        ] {
+            let app = router(Arc::new(StubIngress { accept: true }), None);
+            let body = well_formed_body().replace(
+                &"01".repeat(1 + crate::privacy::GROTH16_BN254_COMPRESSED_LEN),
+                &bad_proof,
+            );
+            let resp = app.oneshot(post_json(&body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }
