@@ -356,9 +356,14 @@ pub mod paraloom_program {
         // Reject an inactive settling validator up front, before any expensive
         // work (quorum + Groth16 verify + tree appends). A deactivated or
         // compromised validator would otherwise burn ~250K CU on a settlement
-        // that fails anyway at the later `is_active` gate (#594).
+        // that fails anyway at the later `is_active` gate (#594). Also verify
+        // the settling validator belongs to the current post-reset roster snapshot (#1623).
         require!(
-            ctx.accounts.validator_account.is_active,
+            ctx.accounts.validator_account.is_active
+                && is_in_roster_filter(
+                    &ctx.accounts.validator_registry.reset_roster_filter,
+                    &ctx.accounts.authority.key(),
+                ),
             BridgeError::ValidatorNotActive
         );
 
@@ -573,7 +578,11 @@ pub mod paraloom_program {
         let asset = crate::merkle_tree::mint_to_asset(&ctx.accounts.mint.key())?;
 
         require!(
-            ctx.accounts.validator_account.is_active,
+            ctx.accounts.validator_account.is_active
+                && is_in_roster_filter(
+                    &ctx.accounts.validator_registry.reset_roster_filter,
+                    &ctx.accounts.authority.key(),
+                ),
             BridgeError::ValidatorNotActive
         );
 
@@ -909,6 +918,12 @@ pub mod paraloom_program {
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_add(stake_amount);
+        if validator_registry.reset_roster_filter != [0u64; 8] {
+            insert_into_roster_filter(
+                &mut validator_registry.reset_roster_filter,
+                &ctx.accounts.validator.key(),
+            );
+        }
 
         emit!(ValidatorRegisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -957,11 +972,16 @@ pub mod paraloom_program {
             .token_unbonding_amount
             .saturating_add(token_stake);
 
-        validator_registry.active_validators =
-            validator_registry.active_validators.saturating_sub(1);
-        validator_registry.total_active_stake = validator_registry
-            .total_active_stake
-            .saturating_sub(stake_amount);
+        if is_in_roster_filter(
+            &validator_registry.reset_roster_filter,
+            &ctx.accounts.validator.key(),
+        ) {
+            validator_registry.active_validators =
+                validator_registry.active_validators.saturating_sub(1);
+            validator_registry.total_active_stake = validator_registry
+                .total_active_stake
+                .saturating_sub(stake_amount);
+        }
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -1094,6 +1114,10 @@ pub mod paraloom_program {
         validator_account.times_slashed = validator_account.times_slashed.saturating_add(1);
 
         if was_active {
+            let in_current_roster = is_in_roster_filter(
+                &ctx.accounts.validator_registry.reset_roster_filter,
+                &validator,
+            );
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
             validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
             // A slash that drops stake below the registry minimum deactivates
@@ -1102,9 +1126,12 @@ pub mod paraloom_program {
             // toward the BFT quorum.
             if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
                 validator_account.is_active = false;
-                let registry = &mut ctx.accounts.validator_registry;
-                registry.active_validators = registry.active_validators.saturating_sub(1);
-                registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                if in_current_roster {
+                    let registry = &mut ctx.accounts.validator_registry;
+                    registry.active_validators = registry.active_validators.saturating_sub(1);
+                    registry.total_active_stake =
+                        registry.total_active_stake.saturating_sub(old_stake);
+                }
                 // The unslashed remainder of BOTH collaterals would otherwise be
                 // stranded — a deactivated validator cannot `unregister` — so
                 // route it into unbonding, reclaimable after the delay. The
@@ -1121,7 +1148,7 @@ pub mod paraloom_program {
                 validator_account.token_stake_amount = 0;
                 validator_account.unbonding_slot =
                     Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
-            } else {
+            } else if in_current_roster {
                 // Still active: only the slashed portion leaves the total.
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.total_active_stake =
@@ -1211,6 +1238,7 @@ pub mod paraloom_program {
         // alike and fail in opposite directions. The authority lowers or
         // raises this deliberately via `set_min_token_stake`.
         registry.min_token_stake = RECOMMENDED_MIN_TOKEN_STAKE;
+        registry.reset_roster_filter = [0u64; 8];
 
         msg!(
             "Validator registry initialized (stake_mint {})",
@@ -1542,31 +1570,76 @@ pub mod paraloom_program {
         registry_ai.resize(new_len)?;
 
         // Rebuild counters from the passed active validator PDAs.
+        // The first `expected_active_validators` accounts in `remaining_accounts`
+        // form the rebuilt active set and are committed into `reset_roster_filter`
+        // so any active PDA omitted from the reset cannot be counted toward a
+        // settlement quorum (#1623). Any trailing accounts passed beyond
+        // `expected_active_validators` must be writable canonical `ValidatorAccount`
+        // PDAs and are atomically deactivated in place (routing both SOL and
+        // token stake into unbonding).
         let mut total_active_stake: u64 = 0;
         let mut active: u64 = 0;
         let mut seen: Vec<Pubkey> = Vec::new();
-        for acc in ctx.remaining_accounts.iter() {
+        let mut reset_roster_filter = [0u64; 8];
+        let now_slot = Clock::get()?.slot;
+        for (idx, acc) in ctx.remaining_accounts.iter().enumerate() {
             require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
-            let data = acc.try_borrow_data()?;
-            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
-            require!(
-                data[0..8] == *ValidatorAccount::DISCRIMINATOR,
-                BridgeError::UnauthorizedInit
-            );
-            let validator = ValidatorAccount::try_deserialize(&mut &data[..])?;
-            // The PDA must be the canonical account for the key it claims.
-            let (expected, _) = Pubkey::find_program_address(
-                &[b"validator", validator.validator.as_ref()],
-                &crate::ID,
-            );
-            require!(&expected == acc.key, BridgeError::UnauthorizedInit);
-            require!(validator.is_active, BridgeError::UnauthorizedInit);
             // Reject a PDA passed twice so it cannot double-count into the stake
             // total and inflate the quorum denominator.
             require!(!seen.contains(acc.key), BridgeError::UnauthorizedInit);
             seen.push(*acc.key);
-            total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
-            active = active.saturating_add(1);
+
+            if (idx as u64) < expected_active_validators {
+                let data = acc.try_borrow_data()?;
+                require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+                require!(
+                    data[0..8] == *ValidatorAccount::DISCRIMINATOR,
+                    BridgeError::UnauthorizedInit
+                );
+                let validator = ValidatorAccount::try_deserialize(&mut &data[..])?;
+                // The PDA must be the canonical account for the key it claims.
+                let (expected, _) = Pubkey::find_program_address(
+                    &[b"validator", validator.validator.as_ref()],
+                    &crate::ID,
+                );
+                require!(&expected == acc.key, BridgeError::UnauthorizedInit);
+                require!(validator.is_active, BridgeError::UnauthorizedInit);
+                total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
+                active = active.saturating_add(1);
+                insert_into_roster_filter(&mut reset_roster_filter, &validator.validator);
+            } else {
+                // Trailing account beyond `expected_active_validators`: must be
+                // writable so it can be atomically deactivated in place (#1623).
+                require!(acc.is_writable, BridgeError::RegistryResetCountMismatch);
+                let mut validator = {
+                    let data = acc.try_borrow_data()?;
+                    require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+                    require!(
+                        data[0..8] == *ValidatorAccount::DISCRIMINATOR,
+                        BridgeError::UnauthorizedInit
+                    );
+                    ValidatorAccount::try_deserialize(&mut &data[..])?
+                };
+                let (expected, _) = Pubkey::find_program_address(
+                    &[b"validator", validator.validator.as_ref()],
+                    &crate::ID,
+                );
+                require!(&expected == acc.key, BridgeError::UnauthorizedInit);
+                if validator.is_active {
+                    let stake = validator.stake_amount;
+                    let token_stake = validator.token_stake_amount;
+                    validator.is_active = false;
+                    validator.unbonding_amount = validator.unbonding_amount.saturating_add(stake);
+                    validator.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+                    validator.stake_amount = 0;
+                    validator.token_unbonding_amount =
+                        validator.token_unbonding_amount.saturating_add(token_stake);
+                    validator.token_stake_amount = 0;
+                    let mut data = acc.try_borrow_mut_data()?;
+                    let mut cursor = std::io::Cursor::new(&mut data[..]);
+                    validator.try_serialize(&mut cursor)?;
+                }
+            }
         }
 
         // Fail loudly on a short list rather than silently understating the
@@ -1601,6 +1674,7 @@ pub mod paraloom_program {
             // means a forgotten step costs a rejected registration rather
             // than a validator slot bought with no token stake.
             min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+            reset_roster_filter,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1634,6 +1708,7 @@ pub mod paraloom_program {
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
+        let token_stake = ctx.accounts.validator_account.token_stake_amount;
         let who = ctx.accounts.validator_account.validator;
         if was_active {
             let now_slot = Clock::get()?.slot;
@@ -1647,9 +1722,13 @@ pub mod paraloom_program {
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+            v.token_stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
+            if is_in_roster_filter(&registry.reset_roster_filter, &who) {
+                registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+                registry.active_validators = registry.active_validators.saturating_sub(1);
+            }
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -2736,6 +2815,41 @@ pub struct ValidatorRegistry {
     /// zero would mean every registration clears the gate, so the gate opens
     /// only when the authority lowers it on purpose.
     pub min_token_stake: u64,
+    /// 512-bit membership filter of the active validator roster established by
+    /// the most recent `reset_validator_registry` call (#1623). All zeros when
+    /// no reset has restricted the active set; when non-zero, only validator
+    /// wallets present in this filter (or registered after the reset) are
+    /// counted by `verify_validator_quorum` or permitted to initiate settlement.
+    pub reset_roster_filter: [u64; 8],
+}
+
+/// Insert a validator wallet into the 512-bit post-reset active roster filter (#1623).
+pub fn insert_into_roster_filter(filter: &mut [u64; 8], wallet: &Pubkey) {
+    let bytes = wallet.to_bytes();
+    for (i, word) in filter.iter_mut().enumerate() {
+        let chunk = &bytes[i * 4..(i + 1) * 4];
+        let h = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let bit = (h ^ (h >> 6) ^ (h >> 12) ^ (h >> 18) ^ (h >> 24)) & 63;
+        *word |= 1u64 << bit;
+    }
+}
+
+/// Check whether a validator wallet belongs to the current post-reset active roster (#1623).
+/// Returns `true` when no subset reset filter is active (`filter == [0; 8]`).
+pub fn is_in_roster_filter(filter: &[u64; 8], wallet: &Pubkey) -> bool {
+    if *filter == [0u64; 8] {
+        return true;
+    }
+    let bytes = wallet.to_bytes();
+    for (i, &word) in filter.iter().enumerate() {
+        let chunk = &bytes[i * 4..(i + 1) * 4];
+        let h = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let bit = (h ^ (h >> 6) ^ (h >> 12) ^ (h >> 18) ^ (h >> 24)) & 63;
+        if (word & (1u64 << bit)) == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[account]
