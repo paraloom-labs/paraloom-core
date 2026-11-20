@@ -1488,7 +1488,7 @@ pub mod paraloom_program {
     /// never a theft). Completeness cannot be enforced on-chain (the program
     /// cannot enumerate all PDAs), so it is the upgrade authority's
     /// responsibility; reconcile any active-but-excluded PDA with
-    /// [`deactivate_validator`] before relying on the rebuilt denominator.
+    /// [`reconcile_orphaned_validator`] before relying on the rebuilt denominator.
     pub fn reset_validator_registry(
         ctx: Context<ResetValidatorRegistry>,
         stake_mint: Pubkey,
@@ -1625,12 +1625,12 @@ pub mod paraloom_program {
     /// Deactivate a single validator so it can no longer be counted toward the
     /// settlement quorum, keeping the registry invariant
     /// `total_active_stake == Σ active-PDA stake` intact. Admin-only (the
-    /// registry authority). This reconciles validators dropped from the active
-    /// set — e.g. `is_active` PDAs left behind by an earlier
-    /// `reset_validator_registry` that rebuilt the counters but did not
-    /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// registry authority). Decrements the registry counters as the validator
+    /// leaves the active set. For reconciling orphaned validators already
+    /// excluded from the active set by an earlier `reset_validator_registry`,
+    /// use [`reconcile_orphaned_validator`] instead so the rebuilt registry
+    /// counters are not double-decremented. It does not move the staked lamports;
+    /// those are returned through `withdraw_unbonded_stake` after the unbonding delay.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
@@ -1647,11 +1647,41 @@ pub mod paraloom_program {
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
         }
         msg!("Validator deactivated: {}", who);
+        Ok(())
+    }
+
+    /// Reconcile an orphaned validator account that was excluded from the active
+    /// set by an earlier `reset_validator_registry`. Admin-only (the registry
+    /// authority).
+    ///
+    /// Unlike `deactivate_validator`, this zeroes the PDA's active state and
+    /// routes its stake to unbonding WITHOUT mutating `total_active_stake` or
+    /// `active_validators` in `ValidatorRegistry`. This prevents double-decrementing
+    /// the registry counters, which were already rebuilt from scratch without
+    /// this validator during the reset.
+    pub fn reconcile_orphaned_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
+        let v = &mut ctx.accounts.validator_account;
+        require!(v.is_active, BridgeError::ValidatorNotActive);
+        let stake = v.stake_amount;
+        let who = v.validator;
+        let now_slot = Clock::get()?.slot;
+        v.is_active = false;
+        v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+        v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+        v.stake_amount = 0;
+        let token_stake = v.token_stake_amount;
+        v.token_stake_amount = 0;
+        v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+        // Do NOT decrement validator_registry counters: they were already rebuilt by reset!
+        msg!("Orphaned validator reconciled: {}", who);
         Ok(())
     }
 

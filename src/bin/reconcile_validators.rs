@@ -10,8 +10,9 @@
 //!      on the old 113-byte layout, so this MUST run before anything else. The
 //!      on-chain `migrate_validator_account` also tops up the incremental rent
 //!      (#377 B2) so the stake stays fully withdrawable.
-//!   2. **Deactivate** every `is_active` PDA NOT in the keep-set. Post-#377 this
-//!      routes the stake into unbonding (recoverable), it is not lost.
+//!   2. **Reconcile** every `is_active` PDA NOT in the keep-set via
+//!      `reconcile_orphaned_validator`. Routes stake into unbonding without
+//!      mutating registry counters, so the rebuilt counters are not double-decremented.
 //!   3. **Reset** the registry LAST to exactly the keep-set. `reset` OVERWRITES
 //!      the counters, so it must be the final counter-mutating op; running it
 //!      before deactivation would leave orphans `is_active` and trip the M5
@@ -252,7 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     println!(
-        "\nPlan:\n  1. migrate {} PDAs (len<{NEW_LEN})\n  2. deactivate {} orphan active PDAs\n  3. reset registry to {} keep-set validators (last)\n",
+        "\nPlan:\n  1. migrate {} PDAs (len<{NEW_LEN})\n  2. reconcile {} orphan active PDAs\n  3. reset registry to {} keep-set validators (last)\n",
         to_migrate.len(),
         to_deactivate.len(),
         keep_wallets.len()
@@ -278,14 +279,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    // 2. deactivate orphans (routes stake to unbonding, #377 B1).
-    println!("[2/4] deactivating {} orphans...", to_deactivate.len());
+    // 2. reconcile orphans without double-decrementing registry counters.
+    println!("[2/4] reconciling {} orphans...", to_deactivate.len());
     for r in &to_deactivate {
-        println!("  deactivate {}", r.wallet);
+        println!("  reconcile {}", r.wallet);
         send(
             &client,
             &authority,
-            create_deactivate_validator_instruction(&program_id, &authority.pubkey(), &r.wallet)?,
+            create_reconcile_orphaned_validator_instruction(
+                &program_id,
+                &authority.pubkey(),
+                &r.wallet,
+            )?,
         )?;
     }
 

@@ -20,6 +20,9 @@ const DEPOSIT_NOTE_DISC: [u8; 8] = [75, 212, 96, 185, 178, 167, 29, 57];
 /// `sha256("global:initialize_merkle_tree")[..8]` — must match
 /// `discriminators::INITIALIZE_MERKLE_TREE`.
 const INITIALIZE_MERKLE_TREE_DISC: [u8; 8] = [67, 143, 80, 157, 177, 227, 11, 238];
+/// `sha256("global:reconcile_orphaned_validator")[..8]` — must match
+/// `discriminators::RECONCILE_ORPHANED_VALIDATOR`.
+const RECONCILE_ORPHANED_VALIDATOR_DISC: [u8; 8] = [103, 162, 186, 158, 250, 114, 186, 195];
 
 #[test]
 fn transact_wire_layout_matches_offchain_builder() {
@@ -71,4 +74,10 @@ fn deposit_note_wire_layout_matches_offchain_builder() {
 fn initialize_merkle_tree_wire_layout_matches_offchain_builder() {
     let data = instruction::InitializeMerkleTree {}.data();
     assert_eq!(data, INITIALIZE_MERKLE_TREE_DISC.to_vec());
+}
+
+#[test]
+fn reconcile_orphaned_validator_wire_layout_matches_offchain_builder() {
+    let data = instruction::ReconcileOrphanedValidator {}.data();
+    assert_eq!(data, RECONCILE_ORPHANED_VALIDATOR_DISC.to_vec());
 }
