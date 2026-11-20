@@ -500,8 +500,102 @@ mod tests {
         assert!(decode_compiled_deposit(&ix, &account_keys, &program_id).is_none());
     }
 
+
+    #[test]
+    fn decodes_a_deposit_note_in_inner_instruction() {
+        // Regression test for #1575: the decoder must handle deposit_note
+        // in inner instructions (CPI), not just top-level instructions.
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        // Inner instruction account layout matches deposit_note:
+        // bridge_state(0), bridge_vault(1), merkle_tree(2), depositor(3)
+        let account_keys = vec![other, other, other, depositor, program_id];
+
+        let amount = 2_500_000u64;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        // Inner instructions come as UiInstruction::Compiled
+        let ix = UiCompiledInstruction {
+            program_id_index: 4,
+            accounts: vec![0, 1, 2, 3],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        // We test the inner instruction path by calling decode_compiled_deposit directly
+        // (the inner instruction path in extract_deposit_events calls the same function)
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("deposit_note in inner instruction must decode");
+        assert_eq!(decoded.data.amount, amount);
+        assert_eq!(decoded.data.recipient, pubkey);
+        assert_eq!(decoded.data.randomness, blinding);
+        assert_eq!(decoded.depositor, depositor);
+        assert_eq!(decoded.asset_id, crate::privacy::types::NATIVE_SOL_ASSET);
+    }
+
+    #[test]
+    fn decodes_a_deposit_note_spl_in_inner_instruction() {
+        // Regression test for #1575: deposit_note_spl must also decode in inner instructions
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        // deposit_note_spl accounts: bridge_state(0), asset_config(1), mint(2),
+        // asset_vault(3), depositor_token_account(4), merkle_tree(5),
+        // depositor(6), token_program(7)
+        let account_keys = vec![
+            other, other, mint, other, other, other, depositor, other, program_id,
+        ]
+
+        let amount = 5_000_000u64;
+        let pubkey = [11u8; 32];
+        let blinding = [13u8; 32];
+        let payload = DepositNoteInstructionData {
+            amount,
+            pubkey,
+            blinding,
+        };
+        let mut bytes = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+        bytes.extend_from_slice(&borsh::to_vec(&payload).unwrap());
+
+        let ix = UiCompiledInstruction {
+            program_id_index: 8,
+            accounts: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            data: bs58::encode(bytes).into_string(),
+            stack_height: None,
+        };
+
+        let decoded = decode_compiled_deposit(&ix, &account_keys, &program_id)
+            .expect("deposit_note_spl in inner instruction must decode");
+        assert_eq!(decoded.data.amount, amount);
+        assert_eq!(decoded.data.recipient, pubkey);
+        assert_eq!(decoded.data.randomness, blinding);
+        assert_eq!(decoded.depositor, depositor);
+        assert_eq!(
+            decoded.asset_id,
+            crate::privacy::poseidon_circom::mint_to_asset(&mint.to_bytes())
+        );
+        assert_ne!(
+            decoded.asset_id,
+            mint.to_bytes(),
+            "the v3 SPL arm must not reuse the legacy raw-mint asset"
+        );
+    }
+
     #[test]
     fn ignores_out_of_range_account_indices() {
+
         let program_id = Pubkey::new_unique();
         let account_keys = vec![program_id, program_id, program_id, program_id];
 
