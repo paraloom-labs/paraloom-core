@@ -86,6 +86,12 @@ pub fn verify_validator_quorum(
         if !validator.is_active || validator.validator != *wallet.key {
             continue;
         }
+        // Reject any validator excluded from the most recent
+        // `reset_validator_registry` snapshot even if its orphaned PDA still
+        // carries `is_active = true` (#1623).
+        if !crate::is_in_roster_filter(&registry.reset_roster_filter, wallet.key) {
+            continue;
+        }
         // Count each validator at most once.
         if seen.contains(wallet.key) {
             continue;
@@ -128,6 +134,7 @@ mod tests {
             total_active_stake,
             stake_mint: Pubkey::default(),
             min_token_stake: 0,
+            reset_roster_filter: [0u64; 8],
         }
     }
 
@@ -397,5 +404,66 @@ mod tests {
             &[s, a]
         )
         .is_err());
+    }
+
+    #[test]
+    fn excluded_validator_after_reset_is_not_counted_in_quorum() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+        // Setup matching #1623: A = 1 SOL (authority), B = 3 SOL, D = 3 SOL,
+        // C = 2 SOL (excluded from reset, but PDA still has is_active = true).
+        let auth_a = Pubkey::new_unique();
+        let val_b = Pubkey::new_unique();
+        let val_d = Pubkey::new_unique();
+        let val_c_excluded = Pubkey::new_unique();
+
+        let mut reg = registry_with_stake(3, 7_000_000_000);
+        crate::insert_into_roster_filter(&mut reg.reset_roster_filter, &auth_a);
+        crate::insert_into_roster_filter(&mut reg.reset_roster_filter, &val_b);
+        crate::insert_into_roster_filter(&mut reg.reset_roster_filter, &val_d);
+
+        let (pda_b, _) = Pubkey::find_program_address(&[b"validator", val_b.as_ref()], &p);
+        let (pda_d, _) = Pubkey::find_program_address(&[b"validator", val_d.as_ref()], &p);
+        let (pda_c, _) = Pubkey::find_program_address(&[b"validator", val_c_excluded.as_ref()], &p);
+
+        let mut d_b = validator_data_staked(val_b, true, 3_000_000_000);
+        let mut d_c = validator_data_staked(val_c_excluded, true, 2_000_000_000);
+        let (mut lb, mut lpb, mut lc, mut lpc) = (0u64, 0u64, 0u64, 0u64);
+        let (mut eb, mut ec) = ([0u8; 0], [0u8; 0]);
+
+        let sb = AccountInfo::new(&val_b, true, false, &mut lb, &mut eb, &sys, false, 0);
+        let ab = AccountInfo::new(&pda_b, false, false, &mut lpb, &mut d_b, &p, false, 0);
+        let sc = AccountInfo::new(&val_c_excluded, true, false, &mut lc, &mut ec, &sys, false, 0);
+        let ac = AccountInfo::new(&pda_c, false, false, &mut lpc, &mut d_c, &p, false, 0);
+
+        // Co-signers [B, C]: C was excluded from the reset, so C's 2 SOL must
+        // not count even though C's PDA still has is_active = true. B's 3 SOL
+        // alone is below the 5 SOL threshold (eligible = 6 SOL), so QuorumNotMet.
+        assert!(verify_validator_quorum(
+            &p,
+            &reg,
+            &auth_a,
+            1_000_000_000,
+            &[sb, ab, sc, ac]
+        )
+        .is_err());
+
+        // Honest in-registry quorum [B, D] (3 + 3 = 6 SOL >= 5 SOL) succeeds.
+        let mut d_b2 = validator_data_staked(val_b, true, 3_000_000_000);
+        let mut d_d2 = validator_data_staked(val_d, true, 3_000_000_000);
+        let (mut lb2, mut lpb2, mut ld2, mut lpd2) = (0u64, 0u64, 0u64, 0u64);
+        let (mut eb2, mut ed2) = ([0u8; 0], [0u8; 0]);
+        let sb2 = AccountInfo::new(&val_b, true, false, &mut lb2, &mut eb2, &sys, false, 0);
+        let ab2 = AccountInfo::new(&pda_b, false, false, &mut lpb2, &mut d_b2, &p, false, 0);
+        let sd2 = AccountInfo::new(&val_d, true, false, &mut ld2, &mut ed2, &sys, false, 0);
+        let ad2 = AccountInfo::new(&pda_d, false, false, &mut lpd2, &mut d_d2, &p, false, 0);
+        assert!(verify_validator_quorum(
+            &p,
+            &reg,
+            &auth_a,
+            1_000_000_000,
+            &[sb2, ab2, sd2, ad2]
+        )
+        .is_ok());
     }
 }
