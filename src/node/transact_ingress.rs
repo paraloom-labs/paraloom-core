@@ -187,6 +187,19 @@ async fn submit_handler(
             "proof must not be empty".to_string(),
         ));
     }
+    // Bound proof size before gossiping or triggering a consensus round.
+    // The on-chain program and settlement cosign enforce MAX_PROOF_BYTES (256);
+    // reject oversized proofs at the door instead of wasting BFT bandwidth.
+    if proof.len() > crate::bridge::solana::MAX_PROOF_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "proof length {} exceeds maximum allowed length of {} bytes",
+                proof.len(),
+                crate::bridge::solana::MAX_PROOF_BYTES
+            ),
+        ));
+    }
 
     // The ciphertexts stay opaque to the node: it relays them and never opens
     // them. Validation is limited to what is invalid under every envelope
@@ -457,6 +470,30 @@ mod tests {
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        // MAX_PROOF_BYTES is 256; send 257 bytes of proof
+        let oversized_proof = "01".repeat(crate::bridge::solana::MAX_PROOF_BYTES + 1);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            oversized_proof,
+            "ab".repeat(88),
+            "cd".repeat(88)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(body_str.contains("exceeds maximum allowed length"));
     }
 
     #[tokio::test]
