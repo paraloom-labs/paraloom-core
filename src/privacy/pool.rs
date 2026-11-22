@@ -14,13 +14,45 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+thread_local! {
+    static THREAD_ACTIVE_NULLIFIER_SETS: std::cell::RefCell<Vec<std::sync::Weak<NullifierSet>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn register_thread_active_nullifier_set(set: &Arc<NullifierSet>) {
+    THREAD_ACTIVE_NULLIFIER_SETS.with(|cell| {
+        let mut sets = cell.borrow_mut();
+        sets.retain(|w| w.strong_count() > 0);
+        sets.push(Arc::downgrade(set));
+    });
+}
+
+/// Check all active [`ShieldedPool`] instances registered on the current thread
+/// via [`NullifierSet::check_batch`] (#624 / #1645). Returns `true` when all
+/// live pools report both nullifiers unspent, `false` if any live pool has
+/// recorded either nullifier as spent.
+pub async fn thread_active_pools_allow_nullifiers(nullifiers: &[[u8; 32]; 2]) -> bool {
+    let active_sets: Vec<Arc<NullifierSet>> = THREAD_ACTIVE_NULLIFIER_SETS.with(|cell| {
+        let mut sets = cell.borrow_mut();
+        sets.retain(|w| w.strong_count() > 0);
+        sets.iter().filter_map(|w| w.upgrade()).collect()
+    });
+    let batch = [Nullifier(nullifiers[0]), Nullifier(nullifiers[1])];
+    for set in active_sets {
+        if !set.check_batch(&batch).await {
+            return false;
+        }
+    }
+    true
+}
+
 /// The shielded pool state
 pub struct ShieldedPool {
     /// Merkle tree tracking all commitments
     commitment_tree: MerkleTree,
 
     /// Nullifier set preventing double-spending
-    nullifier_set: NullifierSet,
+    nullifier_set: Arc<NullifierSet>,
 
     /// Commitments this pool has already credited, seeded from persisted
     /// state on every construction.
@@ -50,9 +82,11 @@ pub struct ShieldedPool {
 impl ShieldedPool {
     /// Create a new empty shielded pool (in-memory only)
     pub fn new() -> Self {
+        let nullifier_set = Arc::new(NullifierSet::new());
+        register_thread_active_nullifier_set(&nullifier_set);
         ShieldedPool {
             commitment_tree: MerkleTree::new(),
-            nullifier_set: NullifierSet::new(),
+            nullifier_set,
             deposited: Arc::new(RwLock::new(HashSet::new())),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(HashMap::new())),
@@ -66,7 +100,8 @@ impl ShieldedPool {
         let commitment_tree = MerkleTree::with_storage(storage.clone()).await?;
 
         // Load nullifier set from storage
-        let nullifier_set = NullifierSet::with_storage(storage.clone()).await?;
+        let nullifier_set = Arc::new(NullifierSet::with_storage(storage.clone()).await?);
+        register_thread_active_nullifier_set(&nullifier_set);
 
         // Load per-asset supplies from storage (native SOL + any SPL assets)
         let supplies = storage.get_all_asset_supplies()?;
@@ -208,6 +243,13 @@ impl ShieldedPool {
     /// Check if a nullifier has been spent
     pub async fn is_spent(&self, nullifier: &Nullifier) -> bool {
         self.nullifier_set.contains(nullifier).await
+    }
+
+    /// Batch-check both input nullifiers of a transact via [`NullifierSet::check_batch`] (#624 / #1645).
+    /// Returns `true` when BOTH nullifiers are unspent, `false` if either is already recorded spent.
+    pub async fn check_nullifiers(&self, nullifiers: &[[u8; 32]; 2]) -> bool {
+        let batch = [Nullifier(nullifiers[0]), Nullifier(nullifiers[1])];
+        self.nullifier_set.check_batch(&batch).await
     }
 
     /// Record input nullifiers as spent once their settlement has landed on
