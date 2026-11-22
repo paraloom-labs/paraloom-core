@@ -26,14 +26,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-#[cfg(feature = "solana-bridge")]
 use ark_bn254::Fr;
-#[cfg(feature = "solana-bridge")]
 use ark_ff::{BigInteger, PrimeField};
+use paraloom::privacy::poseidon_circom::v3_pubkey;
+
 #[cfg(feature = "solana-bridge")]
 use paraloom::bridge::solana::*;
-#[cfg(feature = "solana-bridge")]
-use paraloom::privacy::poseidon_circom::v3_pubkey;
 #[cfg(feature = "solana-bridge")]
 use solana_client::rpc_client::RpcClient;
 #[cfg(feature = "solana-bridge")]
@@ -820,15 +818,21 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             // Generate random keypair (32 bytes for private key)
             let private_key: [u8; 32] = rand::random();
 
-            // Generate public key (in production, this would be derived from private key)
-            // For now, we'll use a simple hash as placeholder
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(private_key);
-            let public_key = hasher.finalize();
+            let fr_to_le = |f: &Fr| -> [u8; 32] {
+                let mut out = [0u8; 32];
+                let le = f.into_bigint().to_bytes_le();
+                out[..le.len().min(32)].copy_from_slice(&le[..le.len().min(32)]);
+                out
+            };
+
+            // Derive public key via Poseidon v3_pubkey (Fr::from_le_bytes_mod_order)
+            // matching the deposit arm and spend verification circuits.
+            let sk_fr = Fr::from_le_bytes_mod_order(&private_key);
+            let note_pubkey = v3_pubkey(sk_fr);
+            let public_key = fr_to_le(&note_pubkey);
 
             // Create address (paraloom1 + hex encoded public key)
-            let address = format!("paraloom1{}", hex::encode(&public_key[..]));
+            let address = format!("paraloom1{}", hex::encode(public_key));
 
             println!("[OK] New address created!");
             println!("  Address: {}", address);
