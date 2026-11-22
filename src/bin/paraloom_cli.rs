@@ -1328,11 +1328,19 @@ fn decode_validator_account(data: &[u8]) -> Option<(Pubkey, f64, u64, u64, bool)
         return None;
     }
     let validator = Pubkey::new_from_array(<[u8; 32]>::try_from(&data[8..40]).ok()?);
-    let stake = u64::from_le_bytes(data[40..48].try_into().ok()?) as f64 / LAMPORTS_PER_SOL as f64;
+    let stake_amount = u64::from_le_bytes(data[40..48].try_into().ok()?);
+    let unbonding_amount = u64::from_le_bytes(data[113..121].try_into().ok()?);
+    let total_stake = stake_amount.saturating_add(unbonding_amount);
+    let stake = total_stake as f64 / LAMPORTS_PER_SOL as f64;
+
     let reputation = u64::from_le_bytes(data[48..56].try_into().ok()?);
     let is_active = data[88] == 1;
-    // Dual-stake token half (base units), at the end of the current layout.
-    let token_stake = u64::from_le_bytes(data[129..137].try_into().ok()?);
+
+    // Dual-stake token half (base units), combining active and unbonding token stake.
+    let token_stake_amount = u64::from_le_bytes(data[129..137].try_into().ok()?);
+    let token_unbonding_amount = u64::from_le_bytes(data[137..145].try_into().ok()?);
+    let token_stake = token_stake_amount.saturating_add(token_unbonding_amount);
+
     Some((validator, stake, token_stake, reputation, is_active))
 }
 
@@ -1674,6 +1682,13 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
 
                 let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
 
+                let (validator_pda, _) = derive_validator_account(&program_id, &validator.pubkey());
+                let account_data = client
+                    .get_account_data(&validator_pda)
+                    .context("Failed to read validator account (is validator registered?)")?;
+                let pending_rewards = decode_validator_pending_rewards(&account_data)
+                    .context("Account exists but is not a valid ValidatorAccount")?;
+
                 // Read registry to discover the pinned stake mint and derive the token account
                 let (validator_registry_pda, _) =
                     Pubkey::find_program_address(&[b"validator_registry"], &program_id);
@@ -1699,19 +1714,32 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     &token_program,
                 );
 
-                let ix = create_withdraw_unbonded_stake_instruction(
+                let mut instructions = Vec::new();
+                if pending_rewards > 0 {
+                    println!(
+                        "Claiming {} SOL ({} lamports) pending settlement rewards before withdrawing unbonded stake...",
+                        pending_rewards as f64 / LAMPORTS_PER_SOL as f64,
+                        pending_rewards
+                    );
+                    instructions.push(create_claim_rewards_instruction(
+                        &program_id,
+                        &validator.pubkey(),
+                    ));
+                }
+
+                instructions.push(create_withdraw_unbonded_stake_instruction(
                     &program_id,
                     &validator.pubkey(),
                     &stake_mint,
                     &validator_token,
                     &token_program,
-                );
+                ));
 
                 let blockhash = client
                     .get_latest_blockhash()
                     .context("Failed to get blockhash")?;
                 let tx = Transaction::new_signed_with_payer(
-                    &[ix],
+                    &instructions,
                     Some(&validator.pubkey()),
                     &[&validator],
                     blockhash,
@@ -1725,6 +1753,12 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                 println!("\n[OK] Unbonded stake withdrawn!");
                 println!("  Transaction: {}", signature);
                 println!("  Validator:   {}", validator.pubkey());
+                if pending_rewards > 0 {
+                    println!(
+                        "  Claimed:     {} SOL pending rewards",
+                        pending_rewards as f64 / LAMPORTS_PER_SOL as f64
+                    );
+                }
                 println!("  Stake released to your wallet.");
                 println!("\nVerify with: paraloom validator list");
             }
@@ -1784,7 +1818,8 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .get_account_data(&validator_pda)
                     .context("Failed to read validator account (is validator registered?)")?;
 
-                let pending_rewards = decode_validator_pending_rewards(&account_data).unwrap_or(0);
+                let pending_rewards = decode_validator_pending_rewards(&account_data)
+                    .context("Account exists but is not a valid ValidatorAccount")?;
                 if pending_rewards == 0 {
                     println!(
                         "No pending rewards to claim for this validator (pending_rewards = 0)."
@@ -2178,4 +2213,108 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "solana-bridge")]
+    fn test_decode_validator_account_active() {
+        let mut data = vec![0u8; 145];
+        data[0..8].copy_from_slice(&VALIDATOR_ACCOUNT_DISCRIMINATOR);
+        let validator_pubkey = Pubkey::new_unique();
+        data[8..40].copy_from_slice(validator_pubkey.as_ref());
+        data[40..48].copy_from_slice(&2_000_000_000u64.to_le_bytes()); // 2 SOL active
+        data[48..56].copy_from_slice(&1200u64.to_le_bytes()); // reputation
+        data[88] = 1; // is_active
+        data[113..121].copy_from_slice(&0u64.to_le_bytes()); // unbonding_amount
+        data[129..137].copy_from_slice(&50_000u64.to_le_bytes()); // active token stake
+        data[137..145].copy_from_slice(&0u64.to_le_bytes()); // unbonding token stake
+
+        let decoded = decode_validator_account(&data).expect("should decode valid active validator");
+        assert_eq!(decoded.0, validator_pubkey);
+        assert!((decoded.1 - 2.0).abs() < 1e-9);
+        assert_eq!(decoded.2, 50_000);
+        assert_eq!(decoded.3, 1200);
+        assert!(decoded.4);
+    }
+
+    #[test]
+    #[cfg(feature = "solana-bridge")]
+    fn test_decode_validator_account_unbonding() {
+        let mut data = vec![0u8; 145];
+        data[0..8].copy_from_slice(&VALIDATOR_ACCOUNT_DISCRIMINATOR);
+        let validator_pubkey = Pubkey::new_unique();
+        data[8..40].copy_from_slice(validator_pubkey.as_ref());
+        data[40..48].copy_from_slice(&0u64.to_le_bytes()); // 0 active SOL
+        data[48..56].copy_from_slice(&1000u64.to_le_bytes()); // reputation
+        data[88] = 0; // inactive / unbonding
+        data[113..121].copy_from_slice(&1_500_000_000u64.to_le_bytes()); // 1.5 SOL unbonding
+        data[129..137].copy_from_slice(&0u64.to_le_bytes()); // 0 active token
+        data[137..145].copy_from_slice(&75_000u64.to_le_bytes()); // 75000 unbonding token
+
+        let decoded = decode_validator_account(&data).expect("should decode unbonding validator");
+        assert_eq!(decoded.0, validator_pubkey);
+        // Must report non-zero stake during unbonding!
+        assert!((decoded.1 - 1.5).abs() < 1e-9, "unbonding SOL stake must not be 0");
+        assert_eq!(decoded.2, 75_000, "unbonding token stake must not be 0");
+        assert_eq!(decoded.3, 1000);
+        assert!(!decoded.4);
+    }
+
+    #[test]
+    #[cfg(feature = "solana-bridge")]
+    fn test_decode_validator_account_mixed() {
+        let mut data = vec![0u8; 145];
+        data[0..8].copy_from_slice(&VALIDATOR_ACCOUNT_DISCRIMINATOR);
+        let validator_pubkey = Pubkey::new_unique();
+        data[8..40].copy_from_slice(validator_pubkey.as_ref());
+        data[40..48].copy_from_slice(&1_000_000_000u64.to_le_bytes()); // 1 SOL active
+        data[48..56].copy_from_slice(&500u64.to_le_bytes());
+        data[88] = 0;
+        data[113..121].copy_from_slice(&500_000_000u64.to_le_bytes()); // 0.5 SOL unbonding
+        data[129..137].copy_from_slice(&10_000u64.to_le_bytes()); // 10000 active token
+        data[137..145].copy_from_slice(&5_000u64.to_le_bytes()); // 5000 unbonding token
+
+        let decoded = decode_validator_account(&data).expect("should decode mixed validator");
+        assert_eq!(decoded.0, validator_pubkey);
+        assert!((decoded.1 - 1.5).abs() < 1e-9);
+        assert_eq!(decoded.2, 15_000);
+    }
+
+    #[test]
+    #[cfg(feature = "solana-bridge")]
+    fn test_decode_validator_account_invalid() {
+        // Wrong discriminator
+        let data = vec![0u8; 145];
+        assert!(decode_validator_account(&data).is_none());
+
+        // Too short
+        let short_data = vec![0u8; 144];
+        assert!(decode_validator_account(&short_data).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "solana-bridge")]
+    fn test_decode_validator_pending_rewards() {
+        let mut data = vec![0u8; 145];
+        data[0..8].copy_from_slice(&VALIDATOR_ACCOUNT_DISCRIMINATOR);
+        data[89..97].copy_from_slice(&250_000u64.to_le_bytes());
+
+        let pending = decode_validator_pending_rewards(&data);
+        assert_eq!(pending, Some(250_000));
+
+        // Zero rewards is valid Some(0)
+        data[89..97].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(decode_validator_pending_rewards(&data), Some(0));
+
+        // Wrong discriminator returns None
+        data[0..8].fill(0);
+        assert_eq!(decode_validator_pending_rewards(&data), None);
+
+        // Too short returns None
+        assert_eq!(decode_validator_pending_rewards(&[0u8; 96]), None);
+    }
 }
