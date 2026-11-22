@@ -2431,9 +2431,14 @@ impl Node {
                 }
             }
         }
+        coordinator.sort_peers_by_stake_desc(&mut peers).await;
+        let peer_wallet_strs: Vec<String> = peers.iter().map(|(w, _)| w.to_string()).collect();
         let mut quorum_wallets = vec![leader.pubkey()];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
+        let threshold = coordinator
+            .required_cosign_threshold(&leader.pubkey().to_string(), &peer_wallet_strs)
+            .await
+            .min(quorum_wallets.len());
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
         // wire form; strip the L2 suite tag and convert the compressed body.
@@ -2475,6 +2480,7 @@ impl Node {
         };
 
         let network = self.network.clone();
+        let coordinator_ref = coordinator.clone();
         cosign_round::run_cosign_round(
             leader,
             program_id,
@@ -2488,7 +2494,16 @@ impl Node {
             threshold,
             |peer, request| {
                 let network = network.clone();
-                async move { network.send_cosign_request(peer, request).await.ok() }
+                let coordinator_ref = coordinator_ref.clone();
+                async move {
+                    match network.send_cosign_request(peer.clone(), request).await {
+                        Ok(resp) if resp.signature.is_some() => Some(resp),
+                        _ => {
+                            coordinator_ref.penalize_cosign_decline(&peer).await;
+                            None
+                        }
+                    }
+                }
             },
         )
         .await

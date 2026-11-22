@@ -745,6 +745,71 @@ impl TransactVerificationCoordinator {
         }
     }
 
+    /// Order co-sign peers by descending on-chain stake so a reduced-quorum
+    /// retry satisfies the on-chain 2/3 stake threshold with the fewest signers (#1639).
+    pub async fn sort_peers_by_stake_desc(
+        &self,
+        peers: &mut [(solana_sdk::pubkey::Pubkey, NodeId)],
+    ) {
+        let stakes = self.onchain_stakes.read().await;
+        if stakes.is_empty() {
+            return;
+        }
+        peers.sort_by(|(w_a, _), (w_b, _)| {
+            let s_a = stakes.get(&w_a.to_string()).copied().unwrap_or(0);
+            let s_b = stakes.get(&w_b.to_string()).copied().unwrap_or(0);
+            s_b.cmp(&s_a)
+        });
+    }
+
+    /// Compute the minimum co-signer threshold (leader + stake-sufficient subset
+    /// of `peer_wallets`) needed to satisfy the on-chain 2/3 stake-weighted
+    /// quorum (#1639). Falls back to `1 + peer_wallets.len()` when no on-chain
+    /// stake snapshot is populated.
+    pub async fn required_cosign_threshold(
+        &self,
+        leader_wallet: &str,
+        peer_wallets: &[String],
+    ) -> usize {
+        let total = *self.onchain_registry_total.read().await;
+        let stakes = self.onchain_stakes.read().await;
+        if total == 0 || stakes.is_empty() {
+            return (1 + peer_wallets.len()).max(2);
+        }
+        let leader_stake = stakes.get(leader_wallet).copied().unwrap_or(0);
+        let eligible_stake = total.saturating_sub(leader_stake);
+        let stake_threshold = eligible_stake.saturating_mul(2) / 3 + 1;
+
+        let mut peer_stakes: Vec<u64> = peer_wallets
+            .iter()
+            .map(|w| stakes.get(w).copied().unwrap_or(0))
+            .collect();
+        peer_stakes.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut acc: u64 = 0;
+        let mut needed_peers: usize = 0;
+        for s in peer_stakes {
+            acc = acc.saturating_add(s);
+            needed_peers += 1;
+            if acc >= stake_threshold {
+                return (1 + needed_peers).max(2);
+            }
+        }
+        (1 + peer_wallets.len()).max(2)
+    }
+
+    /// Log and penalize a validator that voted `Valid` but declined or timed
+    /// out when asked to co-sign settlement (#1639).
+    pub async fn penalize_cosign_decline(&self, validator: &NodeId) {
+        log::warn!(
+            "Validator {:?} declined or timed out on co-sign request after voting Valid; penalizing reputation",
+            validator
+        );
+        self.reputation_tracker
+            .record_verification(validator, false)
+            .await;
+    }
+
     /// Whether `node_id` maps to a wallet in the on-chain staked set — the
     /// flap-surviving driver-auth check (replaces `is_registered_validator`,
     /// which used the flap-prone `self.validators`). The leader_selector entry
