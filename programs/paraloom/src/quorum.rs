@@ -128,6 +128,7 @@ mod tests {
             total_active_stake,
             stake_mint: Pubkey::default(),
             min_token_stake: 0,
+            roster_filter: [0u8; 64],
         }
     }
 
