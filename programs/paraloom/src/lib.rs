@@ -85,6 +85,43 @@ fn check_upgrade_authority(program_data: &UncheckedAccount, expected: &Pubkey) -
     Ok(())
 }
 
+/// Verify membership in the active validator roster from `remaining_accounts`.
+///
+/// When `remaining_accounts` is supplied (e.g. during post-reset reconciliation or when
+/// slashing/deactivating an orphan left behind by `reset_validator_registry`), every passed
+/// account must be an authentic, active, canonical `ValidatorAccount` PDA. Returns `true`
+/// if `target_key` is present among those passed accounts, or `false` if it is an excluded
+/// orphan. When `remaining_accounts` is empty, returns `true` (standard operation assumes
+/// the active validator was counted in the registry counters).
+fn check_roster_membership(
+    target_key: &Pubkey,
+    remaining_accounts: &[AccountInfo],
+) -> Result<bool> {
+    if remaining_accounts.is_empty() {
+        return Ok(true);
+    }
+    let mut seen: Vec<Pubkey> = Vec::new();
+    for acc in remaining_accounts.iter() {
+        require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
+        let data = acc.try_borrow_data()?;
+        require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+        require!(
+            data[0..8] == *ValidatorAccount::DISCRIMINATOR,
+            BridgeError::UnauthorizedInit
+        );
+        let validator = ValidatorAccount::try_deserialize(&mut &data[..])?;
+        let (expected, _) = Pubkey::find_program_address(
+            &[b"validator", validator.validator.as_ref()],
+            &crate::ID,
+        );
+        require!(&expected == acc.key, BridgeError::UnauthorizedInit);
+        require!(validator.is_active, BridgeError::UnauthorizedInit);
+        require!(!seen.contains(acc.key), BridgeError::UnauthorizedInit);
+        seen.push(*acc.key);
+    }
+    Ok(seen.contains(target_key))
+}
+
 /// Reject a non-canonical nullifier encoding (audit: on-chain replay via a
 /// non-injective field lift). The proof's public input is
 /// `Fr::from_le_bytes_mod_order(nullifier)`, which maps both `n` and `n + p`
@@ -1096,15 +1133,31 @@ pub mod paraloom_program {
         if was_active {
             validator_account.stake_amount = old_stake.saturating_sub(slash_amount);
             validator_account.token_stake_amount = old_token.saturating_sub(token_slash);
+
+            // Membership awareness: if the caller passes the active roster in
+            // `remaining_accounts` (e.g. during post-reset reconciliation or when
+            // slashing an orphan left behind by `reset_validator_registry`), only
+            // decrement the registry's counters if this validator was actually
+            // counted in that rebuilt roster. An active-but-excluded orphan's stake
+            // was never part of `total_active_stake`, so decrementing it would
+            // understate the true denominator and break the settlement quorum
+            // (`counted_stake <= eligible_stake` in verify_validator_quorum).
+            let in_current_roster = check_roster_membership(
+                &ctx.accounts.validator_account.key(),
+                ctx.remaining_accounts,
+            )?;
+
             // A slash that drops stake below the registry minimum deactivates
             // the validator: registration requires `stake >= minimum_stake`, so
             // a validator below that bar must stop settling and stop counting
             // toward the BFT quorum.
             if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
                 validator_account.is_active = false;
-                let registry = &mut ctx.accounts.validator_registry;
-                registry.active_validators = registry.active_validators.saturating_sub(1);
-                registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                if in_current_roster {
+                    let registry = &mut ctx.accounts.validator_registry;
+                    registry.active_validators = registry.active_validators.saturating_sub(1);
+                    registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                }
                 // The unslashed remainder of BOTH collaterals would otherwise be
                 // stranded — a deactivated validator cannot `unregister` — so
                 // route it into unbonding, reclaimable after the delay. The
@@ -1123,9 +1176,11 @@ pub mod paraloom_program {
                     Clock::get()?.slot.saturating_add(UNBONDING_SLOTS);
             } else {
                 // Still active: only the slashed portion leaves the total.
-                let registry = &mut ctx.accounts.validator_registry;
-                registry.total_active_stake =
-                    registry.total_active_stake.saturating_sub(slash_amount);
+                if in_current_roster {
+                    let registry = &mut ctx.accounts.validator_registry;
+                    registry.total_active_stake =
+                        registry.total_active_stake.saturating_sub(slash_amount);
+                }
             }
         } else {
             // Already unbonding: burn the slashed portion of the withheld stake.
@@ -1647,9 +1702,15 @@ pub mod paraloom_program {
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
-            let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
+            let in_current_roster = check_roster_membership(
+                &ctx.accounts.validator_account.key(),
+                ctx.remaining_accounts,
+            )?;
+            if in_current_roster {
+                let registry = &mut ctx.accounts.validator_registry;
+                registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+                registry.active_validators = registry.active_validators.saturating_sub(1);
+            }
         }
         msg!("Validator deactivated: {}", who);
         Ok(())

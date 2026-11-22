@@ -398,4 +398,39 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn quorum_halt_when_registry_stake_understates_active_signers() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+
+        // Two honest validators A and B, each with 1 SOL stake.
+        let wa = Pubkey::new_unique();
+        let wb = Pubkey::new_unique();
+        let (pda_a, _) = Pubkey::find_program_address(&[b"validator", wa.as_ref()], &p);
+        let (pda_b, _) = Pubkey::find_program_address(&[b"validator", wb.as_ref()], &p);
+        let mut da = validator_data_staked(wa, true, 1_000_000_000);
+        let mut db = validator_data_staked(wb, true, 1_000_000_000);
+        let (mut la, mut lb, mut lpa, mut lpb) = (0u64, 0u64, 0u64, 0u64);
+        let (mut ea, mut eb) = ([0u8; 0], [0u8; 0]);
+        let sa = AccountInfo::new(&wa, true, false, &mut la, &mut ea, &sys, false, 0);
+        let aa = AccountInfo::new(&pda_a, false, false, &mut lpa, &mut da, &p, false, 0);
+        let sb = AccountInfo::new(&wb, true, false, &mut lb, &mut eb, &sys, false, 0);
+        let ab = AccountInfo::new(&pda_b, false, false, &mut lpb, &mut db, &p, false, 0);
+        let signers = [sa, aa, sb, ab];
+
+        // 1. Control: True registry total = 2 SOL. A + B (2 SOL) clears quorum.
+        let intact_registry = registry_with_stake(2, 2_000_000_000);
+        assert!(verify_validator_quorum(&p, &intact_registry, &Pubkey::default(), 0, &signers).is_ok());
+
+        // 2. Scenario 3A (Issue #1631): Corrupted registry total = 1 SOL (orphan 100% slash decrement).
+        // Counted 2 SOL > eligible 1 SOL -> QuorumNotMet
+        let corrupted_registry_3a = registry_with_stake(1, 1_000_000_000);
+        assert!(verify_validator_quorum(&p, &corrupted_registry_3a, &Pubkey::default(), 0, &signers).is_err());
+
+        // 3. Scenario 3B (Issue #1631): Corrupted registry total = 1.5 SOL (orphan 25% slash decrement of 2 SOL).
+        // Counted 2 SOL > eligible 1.5 SOL -> QuorumNotMet
+        let corrupted_registry_3b = registry_with_stake(2, 1_500_000_000);
+        assert!(verify_validator_quorum(&p, &corrupted_registry_3b, &Pubkey::default(), 0, &signers).is_err());
+    }
 }

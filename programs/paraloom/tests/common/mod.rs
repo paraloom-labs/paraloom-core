@@ -325,6 +325,53 @@ pub fn slash_validator_ix(
     }
 }
 
+/// Build the dual-stake `slash_validator` instruction with an explicit roster in `remaining_accounts`.
+pub fn slash_validator_with_roster_ix(
+    program_id: Pubkey,
+    validator: Pubkey,
+    stake_mint: Pubkey,
+    authority: Pubkey,
+    slash_percentage: u8,
+    roster_pdas: &[Pubkey],
+) -> Instruction {
+    let mut ix = slash_validator_ix(program_id, validator, stake_mint, authority, slash_percentage);
+    for pda in roster_pdas {
+        ix.accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(*pda, false));
+    }
+    ix
+}
+
+/// Build the `reset_validator_registry` instruction with active validators in `remaining_accounts`.
+pub fn reset_validator_registry_ix(
+    program_id: Pubkey,
+    authority: Pubkey,
+    program_data: Pubkey,
+    stake_mint: Pubkey,
+    expected_active_validators: u64,
+    roster_pdas: &[Pubkey],
+) -> Instruction {
+    let (registry, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let mut accounts = paraloom_program::accounts::ResetValidatorRegistry {
+        validator_registry: registry,
+        authority,
+        program_data,
+        system_program: solana_sdk::system_program::ID,
+    }
+    .to_account_metas(None);
+    for pda in roster_pdas {
+        accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(*pda, false));
+    }
+    Instruction {
+        program_id,
+        data: paraloom_program::instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators,
+        }
+        .data(),
+        accounts,
+    }
+}
+
 /// Build the dual-stake `withdraw_unbonded_stake` instruction (`validator` signs).
 pub fn withdraw_unbonded_ix(
     program_id: Pubkey,
