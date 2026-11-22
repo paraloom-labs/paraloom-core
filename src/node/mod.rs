@@ -897,9 +897,13 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         // a co-sign round; the libp2p `source` peer id is cryptographically
         // authenticated by the connection. A node with no transact coordinator
         // is not a settling validator and declines outright.
-        let is_validator = match &self.transact_coordinator {
-            Some(coordinator) => coordinator.source_is_onchain_validator(&source).await,
-            None => false,
+        let (is_validator, requester_wallet) = match &self.transact_coordinator {
+            Some(coordinator) => {
+                let ok = coordinator.source_is_onchain_validator(&source).await;
+                let wallet = coordinator.validator_wallet(&source).await;
+                (ok, wallet)
+            }
+            None => (false, None),
         };
         if !is_validator {
             log::warn!("declining co-sign request from non-validator peer {source:?}");
@@ -923,11 +927,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 });
             }
         };
-        Ok(cosign_settlement(
+        Ok(cosign_settlement_for_requester(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
             &self.verified_transacts,
             &self.cosign_counts,
+            requester_wallet.as_deref(),
             request,
         )
         .await)
@@ -944,6 +949,25 @@ async fn cosign_settlement(
     expected_program_id: &Pubkey,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    request: CoSignRequest,
+) -> CoSignResponse {
+    cosign_settlement_for_requester(
+        cosign_keypair,
+        expected_program_id,
+        verified_transacts,
+        cosign_counts,
+        None,
+        request,
+    )
+    .await
+}
+
+async fn cosign_settlement_for_requester(
+    cosign_keypair: Option<&Arc<Keypair>>,
+    expected_program_id: &Pubkey,
+    verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    requester_wallet: Option<&str>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -971,6 +995,20 @@ async fn cosign_settlement(
     // into a cross-program signing oracle for its settlement wallet.
     if payload.program_id != expected_program_id.to_bytes() {
         return declined("payload program id does not match our configured program");
+    }
+
+    // Bind the requesting peer's registered wallet to `payload.authority`
+    // (#1638 / #1642 / #1643 / #1648): a different registered validator peer
+    // must not be able to send co-sign requests naming the real bridge
+    // authority and exhaust the legitimate round leader's per-nullifier budget.
+    if let Some(req_wallet) = requester_wallet {
+        let payload_authority = Pubkey::new_from_array(payload.authority).to_string();
+        if req_wallet != payload_authority {
+            return declined(&format!(
+                "requester wallet {} does not match payload authority {}",
+                req_wallet, payload_authority
+            ));
+        }
     }
 
     // Match the payload against a settlement we verified Valid, by request id
@@ -3138,6 +3176,80 @@ mod tests {
         assert!(
             resp.signature.is_some(),
             "a forged-authority flood must not exhaust the legitimate leader's budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_rejects_requester_wallet_mismatch_preserving_real_authority_budget() {
+        // #1638 / #1642 / #1643 / #1648: a peer registered under wallet
+        // `attacker_wallet` must not be allowed to send co-sign requests
+        // naming `real_authority` in `payload.authority` to burn the legitimate
+        // leader's per-nullifier budget.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let real_authority = [1u8; 32];
+        let real_authority_str = Pubkey::new_from_array(real_authority).to_string();
+        let attacker_wallet_str = Pubkey::new_from_array([99u8; 32]).to_string();
+
+        for i in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
+            let mut payload = ta_payload(
+                real_authority,
+                recipient,
+                nullifiers,
+                outputs,
+                root,
+                ext_amount,
+            );
+            payload.blockhash = [0xA0 + i as u8; 32];
+            let resp = cosign_settlement_for_requester(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                Some(&attacker_wallet_str),
+                cosign_req("t1", SettlementKind::Transact, &payload),
+            )
+            .await;
+            assert_eq!(
+                resp.signature, None,
+                "attacker peer whose registered wallet != payload.authority must be declined"
+            );
+        }
+
+        // The legitimate leader, whose registered wallet matches payload.authority,
+        // still has its full budget available and gets signed.
+        let legit = ta_payload(
+            real_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement_for_requester(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&real_authority_str),
+            cosign_req("t1", SettlementKind::Transact, &legit),
+        )
+        .await;
+        assert!(
+            resp.signature.is_some(),
+            "legitimate leader matching payload.authority must be signed after attacker flood is rejected"
         );
     }
 

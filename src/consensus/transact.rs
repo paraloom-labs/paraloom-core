@@ -608,6 +608,23 @@ impl TransactVerificationCoordinator {
             }
         }
 
+        // Reject an unauthenticated Discovery claim for a wallet already bound
+        // to a different active validator NodeId (#1638 / #1648).
+        if let Some(ref w) = wallet_pubkey {
+            let sel = self.leader_selector.read().await;
+            if let Some(owner) = sel.active_wallet_owner(w) {
+                if owner != &validator {
+                    log::warn!(
+                        "transact registration rejected (wallet {} already bound to active validator {:?}): {:?}",
+                        w,
+                        owner,
+                        validator
+                    );
+                    return;
+                }
+            }
+        }
+
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
             log::info!(

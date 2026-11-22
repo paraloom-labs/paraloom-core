@@ -237,6 +237,14 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// Return the active `NodeId` currently bound to `wallet`, if any (#1638 / #1648).
+    pub fn active_wallet_owner(&self, wallet: &str) -> Option<&NodeId> {
+        self.validators
+            .values()
+            .find(|v| v.is_active && v.wallet_pubkey.as_deref() == Some(wallet))
+            .map(|v| &v.node_id)
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self
