@@ -438,7 +438,19 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // carried in the request), so verification needs no pool
                 // state; the pool gate below only keeps non-bridge nodes from
                 // voting on settlements they do not participate in.
-                let vote = if already_verified {
+                let nullifiers_spent = match &self.shielded_pool {
+                    Some(pool) => !pool.check_nullifiers(&request.nullifiers).await,
+                    None => false,
+                };
+                let vote = if nullifiers_spent {
+                    log::warn!(
+                        "Transact {} rejected before proof verification: input nullifier already spent off-chain",
+                        request.request_id
+                    );
+                    crate::consensus::vote_tally::VerificationVote::Invalid {
+                        reason: "Input nullifier already spent off-chain".to_string(),
+                    }
+                } else if already_verified {
                     info!(
                         "Transact {} already verified Valid; reusing cached result",
                         request.request_id
@@ -1469,6 +1481,9 @@ impl Node {
         // withdrawal/transfer coordinators were removed).
         let (transact_coordinator, transact_approval_rx) = if runs_bridge {
             let (mut coord, rx) = TransactVerificationCoordinator::new_with_approvals();
+            if let Some(pool) = &shielded_pool {
+                coord = coord.with_shielded_pool(pool.clone());
+            }
             // This node is the settlement authority it would submit under, so
             // the off-chain quorum can mirror the on-chain stake-weighted check
             // and exclude it exactly as the program does (#611).
@@ -2233,6 +2248,16 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
+        // Pre-filter replays of already-settled spends before starting a
+        // consensus round or running Groth16 verification (#624 / #1645).
+        if let Some(pool) = &self.shielded_pool {
+            if !pool.check_nullifiers(&request.nullifiers).await {
+                return Err(anyhow!(
+                    "transact input nullifier already spent off-chain for {}",
+                    request.request_id
+                ));
+            }
+        }
         // Register self into the validator set BEFORE start_verification, which
         // rejects an empty set with "No validators available". The initiator
         // never receives its own gossip broadcast, so on a single-node cohort (a
@@ -2508,6 +2533,14 @@ impl Node {
             .bridge
             .as_ref()
             .ok_or_else(|| BridgeError::ConfigError("no bridge configured".to_string()))?;
+
+        // Pre-filter already-spent nullifiers before running a co-sign round or
+        // paying transaction fees on a doomed submit (#624 / #1645).
+        if let Some(pool) = &self.shielded_pool {
+            if !pool.check_nullifiers(&approved.request.nullifiers).await {
+                return Err(BridgeError::AlreadySettled);
+            }
+        }
 
         let blockhash = bridge.lock().await.latest_blockhash().await?;
         let tx = self

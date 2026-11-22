@@ -322,6 +322,11 @@ pub struct TransactVerificationCoordinator {
     /// Where the equivocator ban set is persisted (sibling of reputation.json).
     /// `None` = in-memory only (unit/unconfigured case).
     equivocators_path: Option<std::path::PathBuf>,
+
+    /// Optional reference to the node's [`ShieldedPool`] so settled input
+    /// nullifiers recorded via `record_spent` are pre-filtered before starting
+    /// or emitting a consensus round (#624 / #1645).
+    shielded_pool: Option<Arc<crate::privacy::pool::ShieldedPool>>,
 }
 
 impl TransactVerificationCoordinator {
@@ -345,7 +350,18 @@ impl TransactVerificationCoordinator {
             local_wallet: None,
             equivocators: Arc::new(RwLock::new(HashSet::new())),
             equivocators_path: None,
+            shielded_pool: None,
         }
+    }
+
+    /// Attach the node's [`ShieldedPool`] so `start_verification` and
+    /// `submit_result` pre-filter already-spent input nullifiers (#624 / #1645).
+    pub fn with_shielded_pool(
+        mut self,
+        pool: Arc<crate::privacy::pool::ShieldedPool>,
+    ) -> Self {
+        self.shielded_pool = Some(pool);
+        self
     }
 
     /// Set this node's own validator id, so the off-chain quorum can exclude the
@@ -797,6 +813,22 @@ impl TransactVerificationCoordinator {
             ));
         }
 
+        // Pre-filter replays of already-settled spends before starting a
+        // consensus round (#624 / #1645).
+        let nullifiers_unspent = match &self.shielded_pool {
+            Some(pool) => pool.check_nullifiers(&request.nullifiers).await,
+            None => {
+                crate::privacy::pool::thread_active_pools_allow_nullifiers(&request.nullifiers)
+                    .await
+            }
+        };
+        if !nullifiers_unspent {
+            return Err(anyhow!(
+                "transact input nullifier already spent off-chain for {}",
+                request.request_id
+            ));
+        }
+
         let validators = self.validators.read().await;
 
         if validators.is_empty() {
@@ -848,6 +880,23 @@ impl TransactVerificationCoordinator {
         if result.request_id != consensus.request.canonical_id() {
             log::warn!(
                 "dropping vote: request_id {} != canonical id of pending settlement",
+                result.request_id
+            );
+            return Ok(());
+        }
+
+        let nullifiers_unspent = match &self.shielded_pool {
+            Some(pool) => pool.check_nullifiers(&consensus.request.nullifiers).await,
+            None => {
+                crate::privacy::pool::thread_active_pools_allow_nullifiers(
+                    &consensus.request.nullifiers,
+                )
+                .await
+            }
+        };
+        if !nullifiers_unspent {
+            log::warn!(
+                "dropping vote for {}: input nullifier already spent off-chain",
                 result.request_id
             );
             return Ok(());
@@ -1571,5 +1620,38 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn settled_spend_replay_is_rejected_before_consensus() {
+        let pool = crate::privacy::pool::ShieldedPool::new();
+        let n0 = [0xAAu8; 32];
+        let n1 = [0xBBu8; 32];
+        pool.record_spent([n0, n1]).await;
+
+        assert!(pool.is_spent(&crate::privacy::types::Nullifier(n0)).await);
+        assert!(pool.is_spent(&crate::privacy::types::Nullifier(n1)).await);
+        assert!(!pool.check_nullifiers(&[n0, n1]).await);
+
+        let (coord, _approvals) = coord_2of2().await;
+        let mut req = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [1u8; 32],
+            mint: None,
+            nullifiers: [n0, n1],
+            output_commitments: [[4u8; 32], [5u8; 32]],
+            root: [6u8; 32],
+            ext_amount: -100,
+            proof: vec![7, 8, 9],
+            ciphertexts: ["a".to_string(), "b".to_string()],
+            timestamp: 123,
+        };
+        req.request_id = req.canonical_id();
+
+        let err = coord.start_verification(req).await;
+        assert!(
+            err.is_err(),
+            "replay of a settled spend whose nullifiers are recorded spent must be rejected at start_verification (#1645)"
+        );
     }
 }
