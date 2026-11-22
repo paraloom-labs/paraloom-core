@@ -2233,6 +2233,17 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
+        // Fail fast (#1654): settlement is exclusively the #260 co-signing
+        // path, and `cosign_settlement_transact_tx` fails immediately without
+        // a keypair — so a node with no settlement keypair can never settle
+        // a transact it accepts. Refusing here keeps `submit_handler`
+        // honest (it maps the error to 503) instead of returning 200 OK for
+        // a doomed request and burning a full consensus round on it.
+        if self.cosign_keypair.is_none() {
+            return Err(anyhow!(
+                "node has no settlement keypair configured and cannot settle a transact"
+            ));
+        }
         // Register self into the validator set BEFORE start_verification, which
         // rejects an empty set with "No validators available". The initiator
         // never receives its own gossip broadcast, so on a single-node cohort (a
