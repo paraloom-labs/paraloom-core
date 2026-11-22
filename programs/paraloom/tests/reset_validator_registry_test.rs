@@ -15,8 +15,8 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
-use paraloom_program::{accounts, instruction, ValidatorRegistry};
-use solana_program_test::{processor, tokio, ProgramTest};
+use paraloom_program::{accounts, instruction, ValidatorAccount, ValidatorRegistry};
+use solana_program_test::{processor, tokio, ProgramTest, ProgramTestBanksClientExt};
 use solana_sdk::{
     account::Account, instruction::AccountMeta, instruction::Instruction, signature::Keypair,
     signature::Signer, system_program, transaction::Transaction,
@@ -303,4 +303,128 @@ async fn reset_rejects_non_upgrade_authority() {
     tx.sign(&[&payer], blockhash);
     let err = banks.process_transaction(tx).await;
     assert!(err.is_err(), "non-authority reset must fail");
+}
+
+#[tokio::test]
+async fn reset_grows_legacy_72_byte_registry_enabling_deactivate() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    let validator_a = Keypair::new();
+    pt.add_account(
+        validator_a.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+
+    // Seed a legacy 72-byte ValidatorRegistry into the test environment.
+    let mut legacy_data = vec![0u8; 72];
+    legacy_data[0..8].copy_from_slice(&ValidatorRegistry::DISCRIMINATOR[..]);
+    legacy_data[8..40].copy_from_slice(upgrade_authority.pubkey().as_ref());
+    legacy_data[40..48].copy_from_slice(&1u64.to_le_bytes()); // total_validators
+    legacy_data[48..56].copy_from_slice(&1u64.to_le_bytes()); // active_validators
+    legacy_data[56..64].copy_from_slice(&MIN_VALIDATOR_STAKE.to_le_bytes()); // minimum_stake
+    legacy_data[64..72].copy_from_slice(&MIN_VALIDATOR_STAKE.to_le_bytes()); // total_active_stake
+    pt.add_account(
+        registry_pda,
+        Account {
+            lamports: 10 * MIN_VALIDATOR_STAKE,
+            data: legacy_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // Seed validator A's PDA at 145 bytes.
+    let (validator_a_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator_a.pubkey().as_ref()], &program_id);
+    let mut val_data = vec![0u8; 145];
+    val_data[0..8].copy_from_slice(&ValidatorAccount::DISCRIMINATOR[..]);
+    val_data[8..40].copy_from_slice(validator_a.pubkey().as_ref());
+    val_data[40..48].copy_from_slice(&MIN_VALIDATOR_STAKE.to_le_bytes()); // stake_amount
+    val_data[88] = 1; // is_active
+    val_data[129..137].copy_from_slice(&paraloom_program::RECOMMENDED_MIN_TOKEN_STAKE.to_le_bytes());
+    pt.add_account(
+        validator_a_pda,
+        Account {
+            lamports: 2 * MIN_VALIDATOR_STAKE,
+            data: val_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let (mut banks, _payer, blockhash) = pt.start().await;
+
+    // Verify calling deactivate directly on 72-byte registry fails (AccountDidNotDeserialize).
+    let deactivate_ix = Instruction {
+        program_id,
+        data: instruction::DeactivateValidator {}.data(),
+        accounts: accounts::DeactivateValidator {
+            validator_account: validator_a_pda,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deactivate_ix.clone()], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    let err = banks.process_transaction(tx).await;
+    assert!(err.is_err(), "deactivate on 72-byte registry must fail with AccountDidNotDeserialize");
+
+    // Now execute reset_validator_registry with validator A.
+    let reset_ix = Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 1,
+        }
+        .data(),
+        accounts: accounts::ResetValidatorRegistry {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut metas = reset_ix.accounts;
+    metas.push(AccountMeta::new_readonly(validator_a_pda, false));
+    let ix = Instruction {
+        program_id,
+        accounts: metas,
+        data: reset_ix.data,
+    };
+    let blockhash2 = banks.get_new_latest_blockhash(&blockhash).await.unwrap();
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash2);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Registry is now grown to 112 bytes.
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    assert_eq!(raw.data.len(), 112);
+    let after = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(after.active_validators, 1);
+    assert_eq!(after.total_active_stake, MIN_VALIDATOR_STAKE);
+
+    // Now deactivate succeeds!
+    let blockhash3 = banks.get_new_latest_blockhash(&blockhash2).await.unwrap();
+    let mut tx = Transaction::new_with_payer(&[deactivate_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash3);
+    banks.process_transaction(tx).await.unwrap();
+
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let after_deact = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(after_deact.active_validators, 0);
+    assert_eq!(after_deact.total_active_stake, 0);
 }

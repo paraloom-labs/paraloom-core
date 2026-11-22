@@ -10,13 +10,21 @@
 //!      on the old 113-byte layout, so this MUST run before anything else. The
 //!      on-chain `migrate_validator_account` also tops up the incremental rent
 //!      (#377 B2) so the stake stays fully withdrawable.
-//!   2. **Deactivate** every `is_active` PDA NOT in the keep-set. Post-#377 this
+//!   2. **Pre-reset** the `ValidatorRegistry` if it is still at the pre-dual-stake
+//!      72-byte layout. Deactivating any orphan in Step 2 typed-loads the registry
+//!      and fails with `AccountDidNotDeserialize` if it has not yet grown to 112 bytes,
+//!      deadlocking before the Step 3 reset. Pre-resetting with all currently-active
+//!      validators grows the PDA to 112 bytes so deactivation succeeds and cleanly
+//!      decrements the active stake/counters.
+//!   3. **Deactivate** every `is_active` PDA NOT in the keep-set. Post-#377 this
 //!      routes the stake into unbonding (recoverable), it is not lost.
-//!   3. **Reset** the registry LAST to exactly the keep-set. `reset` OVERWRITES
+//!   4. **Reset** the registry LAST to exactly the keep-set. `reset` OVERWRITES
 //!      the counters, so it must be the final counter-mutating op; running it
 //!      before deactivation would leave orphans `is_active` and trip the M5
 //!      bound on honest settlements.
-//!   4. **Verify** `total_active_stake == Σ(stake over is_active PDAs)`.
+//!   5. **Verify** `total_active_stake == Σ(stake over is_active PDAs)` and
+//!      `active_validators == active_count`, returning an error and exiting non-zero
+//!      if the invariant fails.
 //!
 //! Dry-run by default (prints the plan only). Set `RECONCILE_EXECUTE=1` to send.
 //! Safe to re-run: migrate no-ops at 129 bytes, deactivate no-ops on already-
@@ -76,7 +84,12 @@ const VALIDATOR_DISC: [u8; 8] = [32, 144, 229, 203, 9, 154, 158, 255];
 // 129-byte PDA as already-migrated and skip it, then deactivate/reset would
 // abort typed-loading a 129-byte account against the 145-byte layout.
 const NEW_LEN: usize = 145;
+/// Current on-chain `ValidatorRegistry` size = 8 (disc) + INIT_SPACE (104) after
+/// dual-stake added stake_mint (32) and min_token_stake (8).
+/// Pre-dual-stake registry layout is 72 bytes.
+const REGISTRY_NEW_LEN: usize = 112;
 
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct ValidatorRow {
     wallet: Pubkey,
     pda: Pubkey,
@@ -85,12 +98,16 @@ struct ValidatorRow {
     stake_amount: u64,
 }
 
-fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
+fn decode(program_id: &Pubkey, pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
     let d = &acc.data;
     if d.len() < 89 || d[0..8] != VALIDATOR_DISC {
         return None;
     }
     let wallet = Pubkey::new_from_array(d[8..40].try_into().ok()?);
+    let (expected_pda, _) = derive_validator_account(program_id, &wallet);
+    if pda != expected_pda {
+        return None;
+    }
     let stake_amount = u64::from_le_bytes(d[40..48].try_into().ok()?);
     let is_active = d[88] != 0; // offset: disc(8)+pubkey(32)+5*u64/i64(40)+... = byte 88
     Some(ValidatorRow {
@@ -100,6 +117,28 @@ fn decode(pda: Pubkey, acc: &Account) -> Option<ValidatorRow> {
         is_active,
         stake_amount,
     })
+}
+
+fn check_reconcile_invariant(
+    reg_data_len: usize,
+    reg_active: u64,
+    reg_stake: u64,
+    active_count: usize,
+    active_sum: u64,
+) -> Result<(), String> {
+    if reg_data_len < REGISTRY_NEW_LEN {
+        return Err(format!(
+            "INVARIANT MISMATCH: registry account unexpectedly short ({reg_data_len} < {REGISTRY_NEW_LEN} bytes)"
+        ));
+    }
+    if reg_stake == active_sum && reg_active as usize == active_count {
+        Ok(())
+    } else {
+        Err(format!(
+            "INVARIANT MISMATCH: registry (active_validators={reg_active}, total_active_stake={reg_stake}) \
+             != on-chain (active_count={active_count}, active_sum={active_sum})"
+        ))
+    }
 }
 
 /// Send one instruction, re-signing with a fresh blockhash on transient
@@ -197,7 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rows: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     rows.sort_by_key(|r| r.wallet.to_bytes());
 
@@ -250,11 +289,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|r| keep.contains(&r.wallet))
         .map(|r| r.wallet)
         .collect();
+    let all_active_wallets: Vec<Pubkey> = rows
+        .iter()
+        .filter(|r| r.is_active)
+        .map(|r| r.wallet)
+        .collect();
+
+    let (registry_pda, _) = derive_validator_registry(&program_id);
+    let reg_acc = client.get_account(&registry_pda)?;
+    let reg_needs_migration = reg_acc.data.len() < REGISTRY_NEW_LEN;
 
     println!(
-        "\nPlan:\n  1. migrate {} PDAs (len<{NEW_LEN})\n  2. deactivate {} orphan active PDAs\n  3. reset registry to {} keep-set validators (last)\n",
+        "\nPlan:\n  1. migrate {} PDAs (len<{NEW_LEN}){}",
         to_migrate.len(),
-        to_deactivate.len(),
+        if reg_needs_migration {
+            format!(
+                "\n  1b. pre-reset registry to grow {} -> {REGISTRY_NEW_LEN} bytes before deactivation",
+                reg_acc.data.len()
+            )
+        } else {
+            String::new()
+        }
+    );
+    println!("  2. deactivate {} orphan active PDAs", to_deactivate.len());
+    println!(
+        "  3. reset registry to {} keep-set validators (last)\n",
         keep_wallets.len()
     );
 
@@ -275,6 +334,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &authority.pubkey(),
                 &r.wallet,
             ),
+        )?;
+    }
+
+    // If the on-chain ValidatorRegistry is pre-dual-stake (< 112 bytes, e.g. 72 bytes),
+    // any call to `deactivate_validator` in Step 2 will fail with AccountDidNotDeserialize
+    // because `DeactivateValidator` typed-loads the 112-byte `ValidatorRegistry`.
+    // To unblock Step 2, pre-reset/grow the registry to the current layout with all
+    // currently-active validators so that `deactivate_validator` can typed-load the registry
+    // and correctly decrement the active count/stake as each orphan is deactivated.
+    let reg_before_deactivate = client.get_account(&registry_pda)?;
+    if reg_before_deactivate.data.len() < REGISTRY_NEW_LEN {
+        println!(
+            "  growing registry ({} < {REGISTRY_NEW_LEN} bytes) with {} active validators...",
+            reg_before_deactivate.data.len(),
+            all_active_wallets.len()
+        );
+        send(
+            &client,
+            &authority,
+            create_reset_validator_registry_instruction(
+                &program_id,
+                &authority.pubkey(),
+                &all_active_wallets,
+                &stake_mint,
+                all_active_wallets.len() as u64,
+            )?,
         )?;
     }
 
@@ -313,7 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refreshed: Vec<ValidatorRow> = client
         .get_program_accounts_with_config(&program_id, validator_accounts_config())?
         .into_iter()
-        .filter_map(|(pda, acc)| decode(pda, &acc))
+        .filter_map(|(pda, acc)| decode(&program_id, pda, &acc))
         .collect();
     let active_sum: u64 = refreshed
         .iter()
@@ -322,8 +407,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     let active_count = refreshed.iter().filter(|r| r.is_active).count();
 
-    let (registry_pda, _) = derive_validator_registry(&program_id);
     let reg = client.get_account(&registry_pda)?;
+    if reg.data.len() < 72 {
+        println!(
+            "  ✗ INVARIANT MISMATCH — registry account unexpectedly short ({} bytes).",
+            reg.data.len()
+        );
+        return Err(format!(
+            "INVARIANT MISMATCH: registry data too short ({} bytes)",
+            reg.data.len()
+        )
+        .into());
+    }
     // ValidatorRegistry: disc(8) + authority(32) + total(8) + active(8) + min(8) + total_active_stake(8)
     let reg_active = u64::from_le_bytes(reg.data[48..56].try_into()?);
     let reg_stake = u64::from_le_bytes(reg.data[64..72].try_into()?);
@@ -338,13 +433,174 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reg_active,
         reg_stake as f64 / 1e9
     );
-    if reg_stake == active_sum && reg_active as usize == active_count {
-        println!("  ✓ invariant holds (total_active_stake == Σ active stake).");
-    } else {
-        println!("  ✗ INVARIANT MISMATCH — do NOT unpause; investigate before any settlement.");
+    match check_reconcile_invariant(
+        reg.data.len(),
+        reg_active,
+        reg_stake,
+        active_count,
+        active_sum,
+    ) {
+        Ok(()) => {
+            println!("  ✓ invariant holds (total_active_stake == Σ active stake).");
+        }
+        Err(e) => {
+            println!("  ✗ INVARIANT MISMATCH — do NOT unpause; investigate before any settlement.");
+            return Err(e.into());
+        }
     }
     println!(
         "\nReconcile complete. Smoke-test a >=2-independent-co-signer settlement before unpausing."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_validator_account_data(
+        wallet: &Pubkey,
+        stake: u64,
+        is_active: bool,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; len];
+        if len >= 8 {
+            data[0..8].copy_from_slice(&VALIDATOR_DISC);
+        }
+        if len >= 40 {
+            data[8..40].copy_from_slice(wallet.as_ref());
+        }
+        if len >= 48 {
+            data[40..48].copy_from_slice(&stake.to_le_bytes());
+        }
+        if len > 88 {
+            data[88] = if is_active { 1 } else { 0 };
+        }
+        data
+    }
+
+    #[test]
+    fn test_decode_canonical_pda() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (canonical_pda, _) = derive_validator_account(&program_id, &wallet);
+        let data = make_validator_account_data(&wallet, 1_500_000_000, true, 145);
+        let acc = Account {
+            lamports: 2_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let row = decode(&program_id, canonical_pda, &acc).expect("should decode canonical PDA");
+        assert_eq!(row.wallet, wallet);
+        assert_eq!(row.pda, canonical_pda);
+        assert_eq!(row.data_len, 145);
+        assert!(row.is_active);
+        assert_eq!(row.stake_amount, 1_500_000_000);
+    }
+
+    #[test]
+    fn test_decode_rejects_non_canonical_pda() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let wrong_pda = Pubkey::new_unique(); // Not derived with [b"validator", wallet]
+        let data = make_validator_account_data(&wallet, 1_000_000_000, true, 145);
+        let acc = Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let res = decode(&program_id, wrong_pda, &acc);
+        assert!(res.is_none(), "decode must reject non-canonical PDA");
+    }
+
+    #[test]
+    fn test_decode_rejects_invalid_discriminator() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (canonical_pda, _) = derive_validator_account(&program_id, &wallet);
+        let mut data = make_validator_account_data(&wallet, 1_000_000_000, true, 145);
+        data[0] ^= 0xff; // Corrupt discriminator
+        let acc = Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let res = decode(&program_id, canonical_pda, &acc);
+        assert!(res.is_none(), "decode must reject invalid discriminator");
+    }
+
+    #[test]
+    fn test_decode_rejects_short_data() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (canonical_pda, _) = derive_validator_account(&program_id, &wallet);
+        let data = make_validator_account_data(&wallet, 1_000_000_000, true, 88); // 88 < 89
+        let acc = Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let res = decode(&program_id, canonical_pda, &acc);
+        assert!(res.is_none(), "decode must reject data shorter than 89 bytes");
+    }
+
+    #[test]
+    fn test_decode_inactive_validator() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let (canonical_pda, _) = derive_validator_account(&program_id, &wallet);
+        let data = make_validator_account_data(&wallet, 1_000_000_000, false, 129);
+        let acc = Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let row = decode(&program_id, canonical_pda, &acc).expect("should decode inactive PDA");
+        assert_eq!(row.wallet, wallet);
+        assert!(!row.is_active);
+        assert_eq!(row.data_len, 129);
+    }
+
+    #[test]
+    fn test_invariant_check_success() {
+        let res = check_reconcile_invariant(112, 3, 3_000_000_000, 3, 3_000_000_000);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_invariant_check_fails_on_short_registry() {
+        let res = check_reconcile_invariant(72, 3, 3_000_000_000, 3, 3_000_000_000);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("registry account unexpectedly short"));
+    }
+
+    #[test]
+    fn test_invariant_check_fails_on_stake_mismatch() {
+        let res = check_reconcile_invariant(112, 3, 2_000_000_000, 3, 3_000_000_000);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("INVARIANT MISMATCH"));
+    }
+
+    #[test]
+    fn test_invariant_check_fails_on_count_mismatch() {
+        let res = check_reconcile_invariant(112, 2, 3_000_000_000, 3, 3_000_000_000);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("INVARIANT MISMATCH"));
+    }
 }
