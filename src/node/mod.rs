@@ -897,11 +897,19 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         // a co-sign round; the libp2p `source` peer id is cryptographically
         // authenticated by the connection. A node with no transact coordinator
         // is not a settling validator and declines outright.
-        let is_validator = match &self.transact_coordinator {
-            Some(coordinator) => coordinator.source_is_onchain_validator(&source).await,
-            None => false,
+        let coordinator = match &self.transact_coordinator {
+            Some(coordinator) => coordinator,
+            None => {
+                log::warn!("declining co-sign request: no transact coordinator");
+                return Ok(CoSignResponse {
+                    request_id: request.request_id,
+                    wallet_pubkey: String::new(),
+                    signature: None,
+                });
+            }
         };
-        if !is_validator {
+
+        if !coordinator.source_is_onchain_validator(&source).await {
             log::warn!("declining co-sign request from non-validator peer {source:?}");
             return Ok(CoSignResponse {
                 request_id: request.request_id,
@@ -909,6 +917,39 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 signature: None,
             });
         }
+
+        // Authenticate the requester's authority (#1638). A registered peer in
+        // the active validator set must only request co-signatures under its
+        // own advertised settlement wallet. Keying the cap on (nullifier, authority)
+        // (#723) isolates budgets across authorities, but without binding the
+        // requester to `payload.authority`, any registered peer could copy a real
+        // spend's parameters, set `payload.authority` to the victim leader's
+        // authority (the on-chain bridge authority), and send
+        // MAX_COSIGNS_PER_SETTLEMENT requests to exhaust the victim's budget under
+        // that authority — bypassing #723.
+        let requester_wallet = match coordinator.validator_wallet(&source).await {
+            Some(w) => match Pubkey::from_str(&w) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    log::warn!("declining co-sign request from {source:?}: unparseable wallet {w}");
+                    return Ok(CoSignResponse {
+                        request_id: request.request_id,
+                        wallet_pubkey: String::new(),
+                        signature: None,
+                    });
+                }
+            },
+            None => {
+                log::warn!(
+                    "declining co-sign request from {source:?}: no advertised settlement wallet"
+                );
+                return Ok(CoSignResponse {
+                    request_id: request.request_id,
+                    wallet_pubkey: String::new(),
+                    signature: None,
+                });
+            }
+        };
 
         // Pin the program to our own config before the signer sees the request:
         // an unparseable configured id means we cannot bind it, so decline
@@ -926,6 +967,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
         Ok(cosign_settlement(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
+            Some(&requester_wallet.to_bytes()),
             &self.verified_transacts,
             &self.cosign_counts,
             request,
@@ -942,6 +984,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
+    expected_authority: Option<&[u8; 32]>,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
     request: CoSignRequest,
@@ -971,6 +1014,18 @@ async fn cosign_settlement(
     // into a cross-program signing oracle for its settlement wallet.
     if payload.program_id != expected_program_id.to_bytes() {
         return declined("payload program id does not match our configured program");
+    }
+
+    // Authenticate the settlement authority (#1638): when an expected authority
+    // is provided (from the requester's connection-authenticated settlement
+    // wallet), payload.authority must match it. A registered peer cannot request
+    // co-signatures on behalf of a different validator or the on-chain bridge
+    // authority, which would let it burn the victim's per-nullifier budget under
+    // that authority (#723 bypass).
+    if let Some(expected_auth) = expected_authority {
+        if payload.authority != *expected_auth {
+            return declined("payload authority does not match requester authority");
+        }
     }
 
     // Match the payload against a settlement we verified Valid, by request id
@@ -2859,6 +2914,7 @@ mod tests {
         let unknown = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("nope", SettlementKind::Transact, &payload),
@@ -2874,6 +2930,7 @@ mod tests {
         let no_key = cosign_settlement(
             None,
             &configured_program(),
+            None,
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &payload),
@@ -2885,6 +2942,7 @@ mod tests {
         let wrong_program = cosign_settlement(
             Some(&kp),
             &Pubkey::new_from_array([2u8; 32]),
+            None,
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &payload),
@@ -2968,6 +3026,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &payload),
@@ -3018,6 +3077,7 @@ mod tests {
             let resp = cosign_settlement(
                 Some(&kp),
                 &configured_program(),
+                None,
                 &tas,
                 &counts,
                 cosign_req("t1", SettlementKind::Transact, &payload),
@@ -3030,6 +3090,7 @@ mod tests {
         let over = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &counts,
             cosign_req("t1", SettlementKind::Transact, &payload),
@@ -3058,6 +3119,7 @@ mod tests {
         let other = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &counts,
             cosign_req("t2", SettlementKind::Transact, &other_payload),
@@ -3109,6 +3171,7 @@ mod tests {
             let _ = cosign_settlement(
                 Some(&kp),
                 &configured_program(),
+                Some(&forger_authority),
                 &tas,
                 &counts,
                 cosign_req("t1", SettlementKind::Transact, &forged),
@@ -3130,6 +3193,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            Some(&leader_authority),
             &tas,
             &counts,
             cosign_req("t1", SettlementKind::Transact, &legit),
@@ -3175,6 +3239,7 @@ mod tests {
             let resp = cosign_settlement(
                 Some(&kp),
                 &configured_program(),
+                None,
                 &tas,
                 &counts,
                 cosign_req("proof-a", SettlementKind::Transact, &payload),
@@ -3192,6 +3257,7 @@ mod tests {
         let bypass = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &counts,
             cosign_req("proof-b", SettlementKind::Transact, &payload),
@@ -3238,6 +3304,7 @@ mod tests {
             let resp = cosign_settlement(
                 Some(&kp),
                 &configured_program(),
+                None,
                 &tas,
                 &counts,
                 cosign_req("a", SettlementKind::Transact, &payload_a),
@@ -3264,6 +3331,7 @@ mod tests {
         let bypass = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &counts,
             cosign_req("b", SettlementKind::Transact, &payload_b),
@@ -3312,6 +3380,7 @@ mod tests {
             let _ = cosign_settlement(
                 Some(&kp),
                 &configured_program(),
+                None,
                 &tas,
                 &counts,
                 cosign_req(&id, SettlementKind::Transact, &payload),
@@ -3352,6 +3421,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &tampered_recipient),
@@ -3374,6 +3444,7 @@ mod tests {
         let resp = cosign_settlement(
             Some(&kp),
             &configured_program(),
+            None,
             &tas,
             &Arc::new(Mutex::new(HashMap::new())),
             cosign_req("t1", SettlementKind::Transact, &tampered_ext),
@@ -3382,6 +3453,139 @@ mod tests {
         assert_eq!(
             resp.signature, None,
             "a substituted ext_amount must be declined"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_rejects_peer_claiming_victim_authority_and_protects_budget() {
+        // #1638: under #723, a registered peer whose authenticated wallet is
+        // `attacker_authority` could send co-sign requests carrying `payload.authority`
+        // set to a victim's authority (e.g. the on-chain bridge authority).
+        // Since `cosign_settlement` keyed the cap on `(nullifier, payload.authority)`,
+        // this burned the victim's budget under the real authority, bypassing #723.
+        //
+        // Requiring `payload.authority` to match the requester's connection-authenticated
+        // wallet ensures a peer cannot co-sign under another validator's authority,
+        // and cannot burn the victim's budget.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let victim_authority = [1u8; 32]; // real bridge authority
+        let attacker_authority = [99u8; 32]; // registered peer's wallet
+
+        // Attacker sets payload.authority to the victim's authority, but its
+        // authenticated connection wallet is attacker_authority.
+        let spoofed = ta_payload(
+            victim_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+
+        // All attempts must be declined:
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                Some(&attacker_authority),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &spoofed),
+            )
+            .await;
+            assert_eq!(
+                resp.signature, None,
+                "a request where payload authority does not match requester wallet must be declined"
+            );
+        }
+
+        // The victim's (nullifier, victim_authority) counter must be zero (never touched):
+        let auth_str = hex::encode(victim_authority);
+        let key0 = format!("{}:{auth_str}", hex::encode(nullifiers[0]));
+        let key1 = format!("{}:{auth_str}", hex::encode(nullifiers[1]));
+        {
+            let lock = counts.lock().await;
+            assert_eq!(lock.get(&key0).copied().unwrap_or(0), 0);
+            assert_eq!(lock.get(&key1).copied().unwrap_or(0), 0);
+        }
+
+        // The legitimate victim leader can now co-sign its full quota without being starved:
+        let legit = ta_payload(
+            victim_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        for i in 0..MAX_COSIGNS_PER_SETTLEMENT {
+            let resp = cosign_settlement(
+                Some(&kp),
+                &configured_program(),
+                Some(&victim_authority),
+                &tas,
+                &counts,
+                cosign_req("t1", SettlementKind::Transact, &legit),
+            )
+            .await;
+            assert!(
+                resp.signature.is_some(),
+                "victim authority must receive signature #{i}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_cosign_request_declines_when_payload_authority_does_not_match_peer_wallet() {
+        use crate::network::protocol::NetworkEventHandler;
+
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        settings.bridge.program_id = Pubkey::new_unique().to_string();
+        let keypair = Keypair::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let keypair_path = format!("{}/validator.json", temp_dir.path().display());
+        std::fs::write(&keypair_path, format!("{:?}", keypair.to_bytes().to_vec())).unwrap();
+        settings.bridge.authority_keypair_path = Some(keypair_path);
+
+        let node = Node::new(settings).expect("construct node");
+        let coord = node.transact_coordinator.as_ref().unwrap();
+
+        let attacker_id = NodeId(vec![1, 2, 3]);
+        let attacker_wallet = Keypair::new().pubkey();
+        coord
+            .register_validator_with_wallet(attacker_id.clone(), Some(attacker_wallet.to_string()))
+            .await;
+
+        let victim_wallet = Keypair::new().pubkey();
+
+        let spoofed = ta_payload(
+            victim_wallet.to_bytes(),
+            [9u8; 32],
+            [[7u8; 32], [8u8; 32]],
+            [[5u8; 32], [6u8; 32]],
+            [2u8; 32],
+            -1_000_000_000i64,
+        );
+
+        let req = cosign_req("t1", SettlementKind::Transact, &spoofed);
+        let resp = node.handle_cosign_request(attacker_id, req).await.unwrap();
+        assert_eq!(
+            resp.signature, None,
+            "handle_cosign_request must decline when payload authority != requester wallet"
         );
     }
 
