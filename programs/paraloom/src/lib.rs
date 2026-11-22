@@ -909,6 +909,7 @@ pub mod paraloom_program {
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_add(stake_amount);
+        validator_registry.add_to_roster_filter(&ctx.accounts.validator.key());
 
         emit!(ValidatorRegisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -957,11 +958,19 @@ pub mod paraloom_program {
             .token_unbonding_amount
             .saturating_add(token_stake);
 
-        validator_registry.active_validators =
-            validator_registry.active_validators.saturating_sub(1);
-        validator_registry.total_active_stake = validator_registry
-            .total_active_stake
-            .saturating_sub(stake_amount);
+        // Only decrement registry active counters if this validator was counted in
+        // the current registry roster (e.g. not an orphan excluded by a prior
+        // reset_validator_registry), preventing quorum denominator corruption (#1630).
+        if validator_registry.is_in_roster_filter(&ctx.accounts.validator.key()) {
+            validator_registry.active_validators =
+                validator_registry.active_validators.saturating_sub(1);
+            validator_registry.total_active_stake = validator_registry
+                .total_active_stake
+                .saturating_sub(stake_amount);
+            if validator_registry.active_validators == 0 {
+                validator_registry.roster_filter = [0u8; 64];
+            }
+        }
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -1103,8 +1112,14 @@ pub mod paraloom_program {
             if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
-                registry.active_validators = registry.active_validators.saturating_sub(1);
-                registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                if registry.is_in_roster_filter(&validator) {
+                    registry.active_validators = registry.active_validators.saturating_sub(1);
+                    registry.total_active_stake =
+                        registry.total_active_stake.saturating_sub(old_stake);
+                    if registry.active_validators == 0 {
+                        registry.roster_filter = [0u8; 64];
+                    }
+                }
                 // The unslashed remainder of BOTH collaterals would otherwise be
                 // stranded — a deactivated validator cannot `unregister` — so
                 // route it into unbonding, reclaimable after the delay. The
@@ -1124,8 +1139,10 @@ pub mod paraloom_program {
             } else {
                 // Still active: only the slashed portion leaves the total.
                 let registry = &mut ctx.accounts.validator_registry;
-                registry.total_active_stake =
-                    registry.total_active_stake.saturating_sub(slash_amount);
+                if registry.is_in_roster_filter(&validator) {
+                    registry.total_active_stake =
+                        registry.total_active_stake.saturating_sub(slash_amount);
+                }
             }
         } else {
             // Already unbonding: burn the slashed portion of the withheld stake.
@@ -1211,6 +1228,7 @@ pub mod paraloom_program {
         // alike and fail in opposite directions. The authority lowers or
         // raises this deliberately via `set_min_token_stake`.
         registry.min_token_stake = RECOMMENDED_MIN_TOKEN_STAKE;
+        registry.roster_filter = [0u8; 64];
 
         msg!(
             "Validator registry initialized (stake_mint {})",
@@ -1545,6 +1563,7 @@ pub mod paraloom_program {
         let mut total_active_stake: u64 = 0;
         let mut active: u64 = 0;
         let mut seen: Vec<Pubkey> = Vec::new();
+        let mut roster_filter = [0u8; 64];
         for acc in ctx.remaining_accounts.iter() {
             require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
             let data = acc.try_borrow_data()?;
@@ -1567,6 +1586,7 @@ pub mod paraloom_program {
             seen.push(*acc.key);
             total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
             active = active.saturating_add(1);
+            ValidatorRegistry::add_pubkey_to_filter(&mut roster_filter, &validator.validator);
         }
 
         // Fail loudly on a short list rather than silently understating the
@@ -1601,6 +1621,7 @@ pub mod paraloom_program {
             // means a forgotten step costs a rejected registration rather
             // than a validator slot bought with no token stake.
             min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+            roster_filter,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1648,8 +1669,13 @@ pub mod paraloom_program {
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
+            if registry.is_in_roster_filter(&who) {
+                registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+                registry.active_validators = registry.active_validators.saturating_sub(1);
+                if registry.active_validators == 0 {
+                    registry.roster_filter = [0u8; 64];
+                }
+            }
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -2736,6 +2762,42 @@ pub struct ValidatorRegistry {
     /// zero would mean every registration clears the gate, so the gate opens
     /// only when the authority lowers it on purpose.
     pub min_token_stake: u64,
+    /// Bloom filter tracking active validator pubkeys in the registry roster.
+    /// Prevents double-decrementing counters when reset-excluded orphan validators exit (#1630).
+    pub roster_filter: [u8; 64],
+}
+
+impl ValidatorRegistry {
+    /// Add a validator pubkey into the 512-bit roster Bloom filter.
+    pub fn add_pubkey_to_filter(filter: &mut [u8; 64], pubkey: &Pubkey) {
+        let hash =
+            anchor_lang::solana_program::hash::hashv(&[b"roster", pubkey.as_ref()]).to_bytes();
+        for i in 0..6 {
+            let bit = (u16::from_le_bytes([hash[2 * i], hash[2 * i + 1]]) % 512) as usize;
+            filter[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+
+    /// Add a validator pubkey to this registry's roster filter.
+    pub fn add_to_roster_filter(&mut self, pubkey: &Pubkey) {
+        Self::add_pubkey_to_filter(&mut self.roster_filter, pubkey);
+    }
+
+    /// Check whether a validator pubkey is present in the roster filter.
+    pub fn is_in_roster_filter(&self, pubkey: &Pubkey) -> bool {
+        if self.active_validators == 0 {
+            return false;
+        }
+        let hash =
+            anchor_lang::solana_program::hash::hashv(&[b"roster", pubkey.as_ref()]).to_bytes();
+        for i in 0..6 {
+            let bit = (u16::from_le_bytes([hash[2 * i], hash[2 * i + 1]]) % 512) as usize;
+            if (self.roster_filter[bit / 8] & (1 << (bit % 8))) == 0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[account]
@@ -2916,4 +2978,42 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_roster_filter_membership() {
+        let mut registry = ValidatorRegistry {
+            authority: Pubkey::new_unique(),
+            total_validators: 2,
+            active_validators: 2,
+            minimum_stake: MIN_VALIDATOR_STAKE,
+            total_active_stake: 2 * MIN_VALIDATOR_STAKE,
+            stake_mint: Pubkey::new_unique(),
+            min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+            roster_filter: [0u8; 64],
+        };
+
+        let val_a = Pubkey::new_unique();
+        let val_b = Pubkey::new_unique();
+        let orphan_c = Pubkey::new_unique();
+
+        assert!(!registry.is_in_roster_filter(&val_a));
+        assert!(!registry.is_in_roster_filter(&val_b));
+        assert!(!registry.is_in_roster_filter(&orphan_c));
+
+        registry.add_to_roster_filter(&val_a);
+        registry.add_to_roster_filter(&val_b);
+
+        assert!(registry.is_in_roster_filter(&val_a));
+        assert!(registry.is_in_roster_filter(&val_b));
+        assert!(!registry.is_in_roster_filter(&orphan_c));
+
+        // When active_validators drops to 0, filter reports false
+        registry.active_validators = 0;
+        assert!(!registry.is_in_roster_filter(&val_a));
+    }
 }
