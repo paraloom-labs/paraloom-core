@@ -2101,6 +2101,11 @@ impl Node {
                             Arc::new(self.clone());
                         let token =
                             ingress_auth::token_from_config(&self.settings.bridge.ingress_token);
+                        if self.cosign_keypair.is_none() {
+                            log::warn!(
+                                "transact ingress started on node without settlement keypair: submissions will be rejected"
+                            );
+                        }
                         let handle = tokio::spawn(async move {
                             if let Err(e) = transact_ingress::serve(ingress, addr, token).await {
                                 log::error!(
@@ -2221,6 +2226,11 @@ impl Node {
         self.coordinator.clone()
     }
 
+    /// Whether this node has a configured settlement keypair (#260/#1654).
+    pub fn has_settlement_keypair(&self) -> bool {
+        self.cosign_keypair.is_some()
+    }
+
     /// Initiate distributed verification of a v3 unified transact (#350).
     /// Records the request with this node's transact coordinator and broadcasts
     /// it over the gossip mesh; validators verify and vote. The approval a
@@ -2233,6 +2243,9 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
+        if self.cosign_keypair.is_none() {
+            anyhow::bail!("no settlement keypair configured");
+        }
         // Register self into the validator set BEFORE start_verification, which
         // rejects an empty set with "No validators available". The initiator
         // never receives its own gossip broadcast, so on a single-node cohort (a
@@ -3633,5 +3646,30 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // A node without a settlement keypair cannot settle transacts (#1654);
+    // initiating transact verification must fail rather than starting a doomed round.
+    #[tokio::test]
+    async fn initiate_transact_verification_requires_settlement_keypair() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        settings.bridge.authority_keypair_path = None;
+        let node = Node::new(settings).expect("construct node");
+        assert!(!node.has_settlement_keypair());
+
+        let req = ta_request(
+            "test-req",
+            [1u8; 32],
+            [[2u8; 32], [3u8; 32]],
+            [[4u8; 32], [5u8; 32]],
+            [6u8; 32],
+            0,
+        );
+        let err = node
+            .initiate_transact_verification(req)
+            .await
+            .expect_err("must fail without settlement keypair");
+        assert!(err.to_string().contains("no settlement keypair configured"));
     }
 }

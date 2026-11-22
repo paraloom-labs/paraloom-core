@@ -20,7 +20,8 @@
 //!   Returns `200 { "request_id": "..." }` once accepted into the mesh,
 //!   `400` on malformed input (including `ext_amount > 0` — deposits go
 //!   through `deposit_note`, never this ingress), or `503` if the node cannot
-//!   start verification (e.g. no validator quorum is registered yet).
+//!   start verification (e.g. no settlement keypair configured, or no
+//!   validator quorum is registered yet).
 
 use async_trait::async_trait;
 use axum::{
@@ -82,6 +83,12 @@ pub trait TransactIngress: Send + Sync {
 
     /// All encrypted notes this node has seen, for recipient scanning (#196).
     async fn delivered_notes(&self) -> Vec<DeliveredNote>;
+
+    /// Whether this node has a configured settlement keypair and can settle
+    /// transacts on-chain (#1654).
+    fn has_settlement_keypair(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -95,6 +102,10 @@ impl TransactIngress for crate::node::Node {
 
     async fn delivered_notes(&self) -> Vec<DeliveredNote> {
         self.delivered_transfer_notes().await
+    }
+
+    fn has_settlement_keypair(&self) -> bool {
+        self.has_settlement_keypair()
     }
 }
 
@@ -157,6 +168,16 @@ async fn submit_handler(
     // This endpoint triggers consensus; reject an unauthenticated caller when a
     // token is configured, before doing any work.
     check_bearer(&headers, &token)?;
+
+    // A node without a settlement keypair cannot co-sign or submit settlements
+    // on-chain (#1654); reject submissions early rather than accepting requests
+    // that can never settle.
+    if !node.has_settlement_keypair() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no settlement keypair configured".to_string(),
+        ));
+    }
 
     // Deposits (`ext_amount > 0`) go through `deposit_note`, never this
     // ingress; the on-chain program rejects them anyway, so fail fast at the
@@ -557,5 +578,50 @@ mod tests {
         let body = well_formed_body().replace(&v1_ciphertext_hex(0xab), "00");
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A node without a settlement keypair cannot settle transacts (#1654);
+    /// submissions must be rejected with 503 rather than returning 200 OK
+    /// for requests that can never settle.
+    #[tokio::test]
+    async fn submission_without_settlement_keypair_is_503() {
+        struct NoKeypairStub;
+
+        #[async_trait]
+        impl TransactIngress for NoKeypairStub {
+            async fn submit_transact(
+                &self,
+                _: TransactVerificationRequest,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("no settlement keypair configured")
+            }
+
+            async fn delivered_notes(&self) -> Vec<DeliveredNote> {
+                vec![]
+            }
+
+            fn has_settlement_keypair(&self) -> bool {
+                false
+            }
+        }
+
+        let app = router(Arc::new(NoKeypairStub), None);
+        let resp = app.oneshot(post_json(&well_formed_body())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("no settlement keypair configured"));
+    }
+
+    #[tokio::test]
+    async fn node_without_settlement_keypair_rejects_submission() {
+        let mut settings = crate::config::Settings::development();
+        settings.bridge.enabled = true;
+        settings.bridge.authority_keypair_path = None;
+        let node = Arc::new(crate::node::Node::new(settings).expect("construct node"));
+        let app = router(node, None);
+        let resp = app.oneshot(post_json(&well_formed_body())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("no settlement keypair configured"));
     }
 }
