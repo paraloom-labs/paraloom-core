@@ -148,6 +148,11 @@ fn parse_hex32_pair(label: &str, items: &[String]) -> Result<[[u8; 32]; 2], (Sta
     ])
 }
 
+/// Upper bound on the proof byte length accepted at ingress. Matches the
+/// on-chain `MAX_PROOF_LEN` and co-sign `MAX_PROOF_BYTES` (256 bytes, the
+/// uncompressed alt_bn128 wire form). Rejects oversized blobs before consensus.
+pub const MAX_PROOF_BYTES: usize = 256;
+
 async fn submit_handler(
     Extension(node): Extension<Arc<dyn TransactIngress>>,
     Extension(token): Extension<IngressToken>,
@@ -185,6 +190,15 @@ async fn submit_handler(
         return Err((
             StatusCode::BAD_REQUEST,
             "proof must not be empty".to_string(),
+        ));
+    }
+    if proof.len() > MAX_PROOF_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "proof is {} bytes, exceeds maximum of {MAX_PROOF_BYTES} bytes",
+                proof.len()
+            ),
         ));
     }
 
@@ -457,6 +471,51 @@ mod tests {
         );
         let resp = app.oneshot(post_json(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_proof_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(MAX_PROOF_BYTES + 1),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let msg = String::from_utf8_lossy(&body);
+        assert!(
+            msg.contains("exceeds maximum"),
+            "expected error message to mention exceeding maximum, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_at_max_bound_is_accepted() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(MAX_PROOF_BYTES),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
