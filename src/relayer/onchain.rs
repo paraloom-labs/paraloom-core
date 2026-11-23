@@ -126,11 +126,14 @@ impl Submitter for OnChainSubmitter {
             transact_submit::post_transact(&ingress, &fresh_address, &w, [ct0, ct1])?;
 
             let recipient_pk = Pubkey::new_from_array(fresh_address);
-            transact_submit::wait_for_settlement(
+            let before_balance = client.get_balance(&recipient_pk).unwrap_or(0);
+            transact_submit::wait_for_settlement_rise(
                 &client,
                 &program_id,
                 &recipient_pk,
                 &w.nullifiers[0],
+                amount,
+                before_balance,
                 SETTLEMENT_TIMEOUT,
             )?;
             // Settlement lands via the quorum, not a single tx we hold — return

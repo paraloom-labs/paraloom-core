@@ -27,3 +27,7 @@ pub use private_swap::{
     RelayerError, SubmittedLeg, Submitter, SwapOutResult, SwapProvider, SwapResult, WithdrawLeg,
 };
 pub use swap_router::SwapQuoter;
+pub use transact_submit::{
+    expected_withdraw_net_amount, has_expected_balance_rise, wait_for_settlement,
+    wait_for_settlement_rise,
+};

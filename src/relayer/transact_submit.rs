@@ -288,6 +288,72 @@ pub fn post_transact(
     Ok(text)
 }
 
+/// On-chain withdrawal fee rate (25 bps = 0.25%), matching `WITHDRAWAL_FEE_BPS`
+/// in `programs/paraloom/src/lib.rs`.
+pub const WITHDRAWAL_FEE_BPS: u64 = 25;
+pub const BPS_DENOMINATOR: u64 = 10_000;
+
+/// Compute the expected net payout (in lamports or token base units) delivered
+/// to the recipient by an on-chain `transact` withdrawal of `gross_amount` after
+/// the 25 bps protocol withdrawal fee (#1632).
+pub fn expected_withdraw_net_amount(gross_amount: u64) -> u64 {
+    if gross_amount == 0 {
+        return 0;
+    }
+    let fee = (gross_amount as u128 * WITHDRAWAL_FEE_BPS as u128 / BPS_DENOMINATOR as u128) as u64;
+    gross_amount.saturating_sub(fee)
+}
+
+/// Check whether the recipient's balance rose by at least the expected net
+/// payout of `gross_withdraw_amount`. Rejects 1-lamport dust or smaller unrelated
+/// transfers that would otherwise trigger a false settlement confirmation and
+/// falsely mark inputs spent with no self-heal (#1632).
+pub fn has_expected_balance_rise(
+    before_balance: u64,
+    current_balance: u64,
+    gross_withdraw_amount: u64,
+) -> bool {
+    if gross_withdraw_amount == 0 {
+        return false;
+    }
+    if current_balance <= before_balance {
+        return false;
+    }
+    let delta = current_balance - before_balance;
+    delta >= expected_withdraw_net_amount(gross_withdraw_amount)
+}
+
+/// Poll on-chain until the quorum settles the withdraw: `recipient` balance rises
+/// by at least the expected net payout (`gross_amount - fee`), and the `nf0`
+/// nullifier PDA is recorded. Returns the recipient's realized balance delta
+/// (lamports actually received).
+///
+/// Binds the settlement signal to the expected payout amount rather than
+/// accepting any arbitrary non-zero balance or dust rise (#1632).
+pub fn wait_for_settlement_rise(
+    client: &RpcClient,
+    program_id: &Pubkey,
+    recipient: &Pubkey,
+    nf0: &[u8; 32],
+    gross_amount: u64,
+    before_balance: u64,
+    timeout: Duration,
+) -> Result<u64> {
+    let (nf_pda, _) = derive_nullifier_account(program_id, nf0);
+    let deadline = std::time::Instant::now() + timeout;
+    let step = Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(step);
+        let bal = client.get_balance(recipient).unwrap_or(0);
+        if has_expected_balance_rise(before_balance, bal, gross_amount)
+            && client.get_account(&nf_pda).is_ok()
+        {
+            return Ok(bal.saturating_sub(before_balance));
+        }
+    }
+    Err(TransactSubmitError::SettlementTimeout(timeout))
+}
+
 /// Poll on-chain until the quorum settles the withdraw: `recipient` funded and
 /// the `nf0` nullifier PDA recorded. Returns the recipient's realized balance
 /// (lamports actually received, i.e. `amount - fee`).
@@ -320,5 +386,63 @@ pub fn quorum_available(client: &RpcClient, program_id: &Pubkey) -> bool {
         // active_validators is the u64 at [48..56] after the 8-byte discriminator.
         Ok(d) if d.len() >= 56 => u64::from_le_bytes(d[48..56].try_into().unwrap_or([0; 8])) >= 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expected_withdraw_net_amount_25_bps() {
+        // 1 SOL = 1_000_000_000 lamports -> fee = 2_500_000 -> net = 997_500_000
+        assert_eq!(expected_withdraw_net_amount(1_000_000_000), 997_500_000);
+        // 500 lamports -> fee = floor(500 * 25 / 10_000) = 1 -> net = 499
+        assert_eq!(expected_withdraw_net_amount(500), 499);
+        // 100 lamports -> fee = floor(100 * 25 / 10_000) = 0 -> net = 100
+        assert_eq!(expected_withdraw_net_amount(100), 100);
+        // 0 lamports
+        assert_eq!(expected_withdraw_net_amount(0), 0);
+    }
+
+    #[test]
+    fn test_has_expected_balance_rise_rejects_dust_and_partial() {
+        let before = 100_000_000;
+        let gross_withdraw = 1_000_000_000; // net expected = 997_500_000
+
+        // 1-lamport dust transfer during the poll window must NOT trigger settlement (#1632)
+        assert!(!has_expected_balance_rise(before, before + 1, gross_withdraw));
+        // Small dust payments
+        assert!(!has_expected_balance_rise(before, before + 1000, gross_withdraw));
+        // 1 lamport short of net payout is still rejected
+        assert!(!has_expected_balance_rise(
+            before,
+            before + 997_499_999,
+            gross_withdraw
+        ));
+        // Unchanged balance is rejected
+        assert!(!has_expected_balance_rise(before, before, gross_withdraw));
+        // Decreased balance is rejected
+        assert!(!has_expected_balance_rise(before, before - 1, gross_withdraw));
+        // Zero gross amount is rejected
+        assert!(!has_expected_balance_rise(before, before + 1_000_000_000, 0));
+    }
+
+    #[test]
+    fn test_has_expected_balance_rise_accepts_valid_payout() {
+        let before = 100_000_000;
+        let gross_withdraw = 1_000_000_000; // net expected = 997_500_000
+        // Exact expected net payout
+        assert!(has_expected_balance_rise(
+            before,
+            before + 997_500_000,
+            gross_withdraw
+        ));
+        // Payout plus additional funds
+        assert!(has_expected_balance_rise(
+            before,
+            before + 1_000_000_000,
+            gross_withdraw
+        ));
     }
 }
