@@ -9,6 +9,24 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-11
+
+- **Client reshield recovery could credit unspendable notes when third parties deposit to fresh exit addresses** (external bug-bounty report, kretozs). #1666 —
+  When recovering reshield notes after a swap (`recoverReshields` in `paraloom-wallet`),
+  the recovery routine scanned transactions at the ephemeral exit address and persisted
+  the first `deposit_note_spl` instruction found without validating that the instruction's
+  `pubkey` field matched the wallet's own spend public key. An attacker who observed a
+  victim's ephemeral swap exit address on-chain could deposit tokens to a different spend
+  key, causing the victim's wallet to record a phantom balance that failed when spent.
+
+  On-chain `deposit_note_spl` intentionally decouples `depositor` (the transaction signer)
+  from `pubkey` (the note's recipient spend key) to enable permissionless transfers and
+  relayed re-shielding. The fix belongs in the client layer: `paraloom-wallet` must verify
+  that `pubkey == expectedSpendPubHex` and recompute the note commitment under the wallet's
+  spend key against the on-chain Merkle tree before persisting recovered reshields. The
+  on-chain contract docs and integration suite (#1666) now explicitly pin and document
+  this invariant.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have

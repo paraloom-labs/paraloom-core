@@ -1304,6 +1304,14 @@ pub mod paraloom_program {
     /// rejected — the realized received amount must equal `amount`, or the
     /// committed note would out-value the vault and the wallet's client-side
     /// commitment (which hashes `amount`) would not match the leaf.
+    ///
+    /// # Recipient Spend Key Decoupling (#1666)
+    /// `pubkey` is the recipient note's spend public key, deliberately decoupled
+    /// from `depositor` (the transaction signer) to support private transfers,
+    /// third-party funding, and relayer re-shielding. Client-side recovery
+    /// implementations (such as `recoverReshields`) must verify that `pubkey`
+    /// matches the recovering wallet's expected spend key before persisting
+    /// or crediting unspent notes.
     pub fn deposit_note_spl(
         ctx: Context<DepositNoteSpl>,
         amount: u64,
