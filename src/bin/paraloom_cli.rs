@@ -841,13 +841,14 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             let keys_dir = std::path::Path::new(".paraloom/keys");
             if !keys_dir.exists() {
                 std::fs::create_dir_all(keys_dir).context("Failed to create keys directory")?;
-                // The directory holds spending keys — restrict it to the owner.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700))
-                        .context("Failed to restrict keys directory permissions")?;
-                }
+            }
+            // The directory holds spending keys — restrict it to the owner (0700)
+            // even if the directory already existed with looser permissions.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700))
+                    .context("Failed to restrict keys directory permissions")?;
             }
 
             let filename = if let Some(label_text) = &label {
@@ -877,7 +878,7 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
             #[cfg(unix)]
             {
                 use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -887,6 +888,8 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     .context("Failed to create key file")?;
                 f.write_all(key_json.as_bytes())
                     .context("Failed to save keypair")?;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .context("Failed to restrict key file permissions")?;
             }
             #[cfg(not(unix))]
             std::fs::write(&key_path, key_json).context("Failed to save keypair")?;
