@@ -289,7 +289,9 @@ pub fn create_reset_validator_registry_instruction(
 /// authority). Flips `validator_wallet`'s canonical validator PDA to inactive
 /// and drops its stake from the registry counters, so an orphaned active PDA
 /// (e.g. one dropped from the active set by an earlier reset) can no longer be
-/// counted toward a settlement quorum. Does not move the staked lamports.
+/// counted toward a settlement quorum. Does not move the staked lamports or
+/// tokens directly; routes both collaterals into unbonding, released by
+/// `withdraw_unbonded_stake` after the delay.
 pub fn create_deactivate_validator_instruction(
     program_id: &Pubkey,
     authority: &Pubkey,
