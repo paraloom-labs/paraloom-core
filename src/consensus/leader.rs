@@ -237,6 +237,13 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// Check whether a wallet pubkey is already registered by any validator other than `node_id`.
+    pub fn is_wallet_registered_by_other(&self, node_id: &NodeId, wallet: &str) -> bool {
+        self.validators
+            .iter()
+            .any(|(id, v)| id != node_id && v.wallet_pubkey.as_deref() == Some(wallet))
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self
