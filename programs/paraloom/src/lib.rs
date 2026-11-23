@@ -909,6 +909,9 @@ pub mod paraloom_program {
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_add(stake_amount);
+        if !validator_registry.active_keys.contains(&validator_account.validator) {
+            validator_registry.active_keys.push(validator_account.validator);
+        }
 
         emit!(ValidatorRegisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -962,6 +965,9 @@ pub mod paraloom_program {
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_sub(stake_amount);
+        validator_registry
+            .active_keys
+            .retain(|k| k != &ctx.accounts.validator.key());
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -1105,6 +1111,7 @@ pub mod paraloom_program {
                 let registry = &mut ctx.accounts.validator_registry;
                 registry.active_validators = registry.active_validators.saturating_sub(1);
                 registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                registry.active_keys.retain(|k| k != &validator);
                 // The unslashed remainder of BOTH collaterals would otherwise be
                 // stranded — a deactivated validator cannot `unregister` — so
                 // route it into unbonding, reclaimable after the delay. The
@@ -1211,6 +1218,7 @@ pub mod paraloom_program {
         // alike and fail in opposite directions. The authority lowers or
         // raises this deliberately via `set_min_token_stake`.
         registry.min_token_stake = RECOMMENDED_MIN_TOKEN_STAKE;
+        registry.active_keys = Vec::new();
 
         msg!(
             "Validator registry initialized (stake_mint {})",
@@ -1545,6 +1553,7 @@ pub mod paraloom_program {
         let mut total_active_stake: u64 = 0;
         let mut active: u64 = 0;
         let mut seen: Vec<Pubkey> = Vec::new();
+        let mut active_keys: Vec<Pubkey> = Vec::new();
         for acc in ctx.remaining_accounts.iter() {
             require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
             let data = acc.try_borrow_data()?;
@@ -1565,6 +1574,7 @@ pub mod paraloom_program {
             // total and inflate the quorum denominator.
             require!(!seen.contains(acc.key), BridgeError::UnauthorizedInit);
             seen.push(*acc.key);
+            active_keys.push(validator.validator);
             total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
             active = active.saturating_add(1);
         }
@@ -1601,6 +1611,7 @@ pub mod paraloom_program {
             // means a forgotten step costs a rejected registration rather
             // than a validator slot bought with no token stake.
             min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+            active_keys,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1647,9 +1658,16 @@ pub mod paraloom_program {
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            let token_stake = v.token_stake_amount;
+            v.token_stake_amount = 0;
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+
             let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
+            if registry.active_keys.contains(&who) {
+                registry.active_keys.retain(|k| k != &who);
+                registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+                registry.active_validators = registry.active_validators.saturating_sub(1);
+            }
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -2736,6 +2754,11 @@ pub struct ValidatorRegistry {
     /// zero would mean every registration clears the gate, so the gate opens
     /// only when the authority lowers it on purpose.
     pub min_token_stake: u64,
+    /// Active validator wallets tracked in the registry. Used by `deactivate_validator`
+    /// to avoid double-decrementing registry stake counters when reconciling accounts
+    /// excluded by `reset_validator_registry`.
+    #[max_len(64)]
+    pub active_keys: Vec<Pubkey>,
 }
 
 #[account]
