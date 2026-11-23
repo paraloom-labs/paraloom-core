@@ -2433,7 +2433,14 @@ impl Node {
         }
         let mut quorum_wallets = vec![leader.pubkey()];
         quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
+
+        // The on-chain program only requires a 2/3 stake-weighted supermajority
+        // (#1639), mirrored off-chain by min_validators_for_consensus.
+        // Do not demand unanimity of all Valid voters; require the minimum quorum
+        // size so a single declining voter cannot veto an approved settlement.
+        let threshold = coordinator
+            .min_validators_for_consensus()
+            .min(quorum_wallets.len());
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
         // wire form; strip the L2 suite tag and convert the compressed body.
@@ -2475,7 +2482,7 @@ impl Node {
         };
 
         let network = self.network.clone();
-        cosign_round::run_cosign_round(
+        let tx = cosign_round::run_cosign_round(
             leader,
             program_id,
             vault,
@@ -2492,7 +2499,16 @@ impl Node {
             },
         )
         .await
-        .map_err(|e| anyhow!("co-signing round failed: {e}"))
+        .map_err(|e| anyhow!("co-signing round failed: {e}"))?;
+
+        // Verify that the final assembled signers satisfy the on-chain stake quorum (#1639).
+        let num_signers = tx.message.header.num_required_signatures as usize;
+        let signers = &tx.message.account_keys[..num_signers];
+        if !coordinator.stake_quorum_met_for_wallets(signers).await {
+            return Err(anyhow!("assembled co-signer subset does not meet on-chain stake quorum"));
+        }
+
+        Ok(tx)
     }
 
     /// Settle a quorum-approved unified transact via the #260 co-signing path,

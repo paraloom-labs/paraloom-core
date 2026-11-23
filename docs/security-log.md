@@ -9,6 +9,19 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-09
+
+- **Co-sign round demanded unanimity of all Valid voters, allowing a single declining voter to veto settlement (#1639)**.
+  The off-chain co-signing round required every voter that voted `Valid` to co-sign
+  (`threshold = quorum_wallets.len()`), whereas the on-chain program only requires a
+  2/3 stake-weighted supermajority. A registered validator could vote `Valid` during
+  consensus and subsequently decline or time out on the co-sign request, causing the
+  round to fail even when the remaining signers exceeded the 2/3 stake threshold.
+  Fixed by setting the co-sign threshold to `min_validators_for_consensus` (capped at
+  available valid voters), enabling automatic reduced-subset retry in `run_cosign_round`
+  when responsive signers satisfy the threshold, and verifying that the final assembled
+  signers clear the on-chain stake quorum.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
