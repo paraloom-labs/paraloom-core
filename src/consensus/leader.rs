@@ -237,6 +237,13 @@ impl LeaderSelector {
         self.validators.get(node_id)
     }
 
+    /// Check whether a wallet pubkey is already associated with another active validator with stake (#1705).
+    pub fn is_wallet_registered_to_other(&self, wallet: &str, node_id: &NodeId) -> bool {
+        self.validators
+            .values()
+            .any(|v| v.is_active && &v.node_id != node_id && v.wallet_pubkey.as_deref() == Some(wallet) && v.stake_amount > 0)
+    }
+
     /// Get all active validators sorted by weight (descending)
     pub fn get_validators_by_weight(&self) -> Vec<ValidatorInfo> {
         let mut validators: Vec<_> = self
