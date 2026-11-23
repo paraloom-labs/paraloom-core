@@ -10,7 +10,7 @@ use crate::privacy::nullifier::NullifierSet;
 use crate::privacy::types::{AssetId, Commitment, Note, Nullifier, NATIVE_SOL_ASSET};
 use crate::storage::PrivacyStorage;
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -21,17 +21,6 @@ pub struct ShieldedPool {
 
     /// Nullifier set preventing double-spending
     nullifier_set: NullifierSet,
-
-    /// Commitments this pool has already credited, seeded from persisted
-    /// state on every construction.
-    ///
-    /// Deposit idempotency hangs on this rather than on `notes`, which is a
-    /// cache with no persistence behind it: reloading a pool would leave it
-    /// empty and let a replayed deposit through, which is exactly the case
-    /// the guard exists for. `commitment_tree` is the authoritative record and
-    /// this is derived from it, so the two cannot disagree — the tree has a
-    /// single insert site, right beside the one that updates this.
-    deposited: Arc<RwLock<HashSet<Commitment>>>,
 
     /// Note storage (commitment -> encrypted note)
     /// In production, notes would be encrypted
@@ -53,7 +42,6 @@ impl ShieldedPool {
         ShieldedPool {
             commitment_tree: MerkleTree::new(),
             nullifier_set: NullifierSet::new(),
-            deposited: Arc::new(RwLock::new(HashSet::new())),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(HashMap::new())),
             storage: None,
@@ -71,15 +59,9 @@ impl ShieldedPool {
         // Load per-asset supplies from storage (native SOL + any SPL assets)
         let supplies = storage.get_all_asset_supplies()?;
 
-        // Seed the idempotency set from the same persisted record the tree is
-        // rebuilt from, so a deposit credited before a restart is still
-        // recognised after one.
-        let deposited: HashSet<Commitment> = storage.get_all_commitments()?.into_iter().collect();
-
         Ok(ShieldedPool {
             commitment_tree,
             nullifier_set,
-            deposited: Arc::new(RwLock::new(deposited)),
             notes: Arc::new(RwLock::new(HashMap::new())),
             supplies: Arc::new(RwLock::new(supplies)),
             storage: Some(storage),
@@ -117,6 +99,11 @@ impl ShieldedPool {
     /// the `Note` instead would use the v2 hash, which is a different
     /// function: the two trees would diverge one leaf at a time and only
     /// surface later, at settlement, as a root nobody recognises.
+    ///
+    /// Every deposit appends a leaf to the tree and credits supply (#1656).
+    /// Depositing the same note multiple times is valid both on chain and
+    /// off chain: each deposit corresponds to a distinct leaf in the Merkle
+    /// tree with independent nullifier derivation based on leaf index.
     pub async fn credit_commitment(
         &self,
         commitment: Commitment,
@@ -124,28 +111,10 @@ impl ShieldedPool {
         amount: u64,
         asset_id: AssetId,
     ) -> Result<Commitment> {
-        // Idempotent: a deposit whose commitment is already credited must not
-        // be inserted or credited again. Two paths replay one: the bridge
-        // listener re-fetches a deposit that failed on a prior poll, and — the
-        // case that matters — it also re-fetches deposits that succeeded after
-        // a failed sibling, because the cursor freezes below the failure. If
-        // the process restarts inside that window the replay arrives against a
-        // reloaded pool, so the check has to be backed by persisted state
-        // rather than by anything built fresh at construction. The note carries
-        // fresh randomness per deposit, so an equal commitment means the same
-        // deposit, not a distinct one.
-        if self.deposited.read().await.contains(&commitment) {
-            return Ok(commitment);
-        }
-
         // Add to commitment tree (auto-persists if storage available).
         // Storage failure leaves the tree's in-memory state untouched
         // and propagates here so the deposit fails atomically.
         let _index = self.commitment_tree.insert(&commitment).await?;
-
-        // Mark it credited before anything else reads the pool, in the same
-        // place the tree is appended.
-        self.deposited.write().await.insert(commitment.clone());
 
         // Store note
         let mut notes = self.notes.write().await;
@@ -199,6 +168,14 @@ impl ShieldedPool {
             .await
             .ok_or_else(|| anyhow!("commitment not found in pool"))?;
 
+        self.commitment_tree
+            .path(index)
+            .await
+            .ok_or_else(|| anyhow!("commitment index {} out of range", index))
+    }
+
+    /// Get the Merkle authentication path for a leaf at the given index (#1656).
+    pub async fn path_at(&self, index: usize) -> Result<crate::privacy::types::MerklePath> {
         self.commitment_tree
             .path(index)
             .await
@@ -290,9 +267,6 @@ impl Clone for ShieldedPool {
         ShieldedPool {
             commitment_tree: self.commitment_tree.clone(),
             nullifier_set: self.nullifier_set.clone(),
-            // Shared, not copied: a clone that kept its own set would stop
-            // recognising deposits the original had already credited.
-            deposited: Arc::clone(&self.deposited),
             notes: Arc::clone(&self.notes),
             supplies: Arc::clone(&self.supplies),
             storage: self.storage.clone(),
@@ -305,17 +279,9 @@ mod tests {
     use super::*;
     use crate::privacy::types::ShieldedAddress;
 
-    /// A deposit credited before a restart must still be recognised after one.
-    ///
-    /// The listener freezes its cursor below the first failed signature in a
-    /// batch, so deposits that succeeded after that failure are re-fetched on
-    /// the next poll — and if the process restarted in between, the replay
-    /// lands on a reloaded pool. Guarding on anything built fresh at
-    /// construction misses exactly this case, which is the one the guard was
-    /// written for: the duplicate would append a second leaf for one deposit
-    /// and count its amount twice.
+    /// Depositing the same note after a restart must append a second leaf and credit supply.
     #[tokio::test]
-    async fn deposit_stays_idempotent_across_a_restart() {
+    async fn deposit_same_note_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("privacy.db");
         let note = Note::new_native(ShieldedAddress([7u8; 32]), 1_000, [9u8; 32]);
@@ -325,6 +291,7 @@ mod tests {
             let pool = ShieldedPool::with_storage(storage).await.unwrap();
             let c = pool.deposit(note.clone(), 1_000).await.unwrap();
             assert_eq!(pool.total_supply().await, 1_000);
+            assert_eq!(pool.commitment_count().await, 1);
             c
         };
 
@@ -336,20 +303,21 @@ mod tests {
             1_000,
             "supply should survive the restart"
         );
+        assert_eq!(pool.commitment_count().await, 1);
 
-        // The listener replays the same deposit.
-        let replayed = pool.deposit(note, 1_000).await.unwrap();
+        // A second deposit with the same note appends a second leaf and credits supply (#1656).
+        let second = pool.deposit(note, 1_000).await.unwrap();
 
-        assert_eq!(replayed, commitment);
+        assert_eq!(second, commitment);
         assert_eq!(
             pool.total_supply().await,
-            1_000,
-            "a replayed deposit must not be credited twice"
+            2_000,
+            "second deposit must credit supply"
         );
         assert_eq!(
             pool.commitment_tree.len().await,
-            1,
-            "a replayed deposit must not append a second leaf"
+            2,
+            "second deposit must append a second leaf"
         );
     }
 
@@ -367,22 +335,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deposit_is_idempotent_for_a_repeated_commitment() {
+    async fn deposit_same_note_twice_appends_distinct_leaves_and_credits_supply() {
         let pool = ShieldedPool::new();
         let addr = ShieldedAddress([7u8; 32]);
-        // The same deposit (same recipient, amount and randomness → same
-        // commitment) processed twice — as the bridge listener does when it
-        // retries a deposit that failed on a prior poll, or replays recent
-        // signatures after a restart.
+        // Depositing the same note (same recipient, amount and randomness -> same
+        // commitment) twice. The on-chain tree appends two leaves and credits
+        // vault funds twice; the off-chain pool must match (#1656).
         let note = Note::new_native(addr, 1000, [9u8; 32]);
         let first = pool.deposit(note.clone(), 1000).await.unwrap();
         let second = pool.deposit(note, 1000).await.unwrap();
 
-        // Same commitment, but the second deposit is a no-op: no duplicate leaf
-        // and no double-credited supply.
+        // Same commitment, but two leaves appended and supply credited twice.
         assert_eq!(first, second);
-        assert_eq!(pool.commitment_count().await, 1);
-        assert_eq!(pool.total_supply().await, 1000);
+        assert_eq!(pool.commitment_count().await, 2);
+        assert_eq!(pool.total_supply().await, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_path_at_for_repeated_commitments() {
+        let pool = ShieldedPool::new();
+        let addr = ShieldedAddress([7u8; 32]);
+        let note = Note::new_native(addr, 1000, [9u8; 32]);
+        let c1 = pool.deposit(note.clone(), 1000).await.unwrap();
+        let c2 = pool.deposit(note, 1000).await.unwrap();
+        assert_eq!(c1, c2);
+
+        let root = pool.root().await;
+        let path0 = pool.path_at(0).await.unwrap();
+        let path1 = pool.path_at(1).await.unwrap();
+
+        assert!(path0.verify(c1.as_bytes(), &root));
+        assert!(path1.verify(c2.as_bytes(), &root));
+        assert_ne!(path0.indices, path1.indices);
+        assert_eq!(path0.indices[0], true);
+        assert_eq!(path1.indices[0], false);
     }
 
     #[tokio::test]
