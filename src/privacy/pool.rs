@@ -210,6 +210,12 @@ impl ShieldedPool {
         self.nullifier_set.contains(nullifier).await
     }
 
+    /// Check whether a batch of nullifiers are all unspent (#1619, #624).
+    /// Returns true if ALL nullifiers are new (none have been spent).
+    pub async fn check_batch(&self, nullifiers: &[Nullifier]) -> bool {
+        self.nullifier_set.check_batch(nullifiers).await
+    }
+
     /// Record input nullifiers as spent once their settlement has landed on
     /// chain, so a later `check_batch` pre-filters replays of that spend before
     /// they reach consensus (#624). The on-chain nullifier PDAs remain the
@@ -477,15 +483,19 @@ mod tests {
     #[tokio::test]
     async fn record_spent_marks_input_nullifiers() {
         // After a settlement lands, its input nullifiers must read as spent so a
-        // later check_batch pre-filters replays (#624).
+        // later check_batch pre-filters replays (#624, #1619).
         let pool = ShieldedPool::new();
         let n0 = [1u8; 32];
         let n1 = [2u8; 32];
         assert!(!pool.is_spent(&Nullifier(n0)).await);
+        assert!(pool.check_batch(&[Nullifier(n0), Nullifier(n1)]).await);
 
         pool.record_spent([n0, n1]).await;
 
         assert!(pool.is_spent(&Nullifier(n0)).await);
         assert!(pool.is_spent(&Nullifier(n1)).await);
+        assert!(!pool.check_batch(&[Nullifier(n0), Nullifier(n1)]).await);
+        assert!(!pool.check_batch(&[Nullifier(n0), Nullifier([3u8; 32])]).await);
+        assert!(pool.check_batch(&[Nullifier([3u8; 32]), Nullifier([4u8; 32])]).await);
     }
 }

@@ -421,6 +421,23 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     request.request_id
                 );
 
+                // Pre-filter replays before consensus (#1619, #624): drop any transact
+                // whose input nullifiers are already spent in the off-chain set so it
+                // never triggers Groth16 verification, consensus voting, or a co-sign round.
+                if let Some(pool) = &self.shielded_pool {
+                    let nfs = [
+                        crate::privacy::Nullifier(request.nullifiers[0]),
+                        crate::privacy::Nullifier(request.nullifiers[1]),
+                    ];
+                    if !pool.check_batch(&nfs).await {
+                        log::warn!(
+                            "Dropping transact verification request with spent nullifier: {}",
+                            request.request_id
+                        );
+                        return Ok(());
+                    }
+                }
+
                 // Short-circuit a request we have already verified `Valid` rather
                 // than re-running the proof (#726). `verified_transacts` only holds
                 // `Valid` results, so a cache hit is a proven-valid repeat; reusing
@@ -2233,6 +2250,28 @@ impl Node {
         let coordinator = self.transact_coordinator.as_ref().ok_or_else(|| {
             anyhow!("node has no transact coordinator (bridge disabled or non-validator)")
         })?;
+
+        // Pre-filter replays before consensus (#1619, #624): reject any transact
+        // whose input nullifiers are already spent in the off-chain set. Without
+        // this, a settled transact re-runs Groth16 verification, consensus quorum,
+        // and the multi-node co-signing round, failing only when submitted to chain.
+        if let Some(pool) = &self.shielded_pool {
+            let nfs = [
+                crate::privacy::Nullifier(request.nullifiers[0]),
+                crate::privacy::Nullifier(request.nullifiers[1]),
+            ];
+            if !pool.check_batch(&nfs).await {
+                let id = if request.request_id.is_empty() {
+                    request.canonical_id()
+                } else {
+                    request.request_id.clone()
+                };
+                anyhow::bail!(
+                    "transact replay: nullifier already spent (request {})",
+                    id
+                );
+            }
+        }
         // Register self into the validator set BEFORE start_verification, which
         // rejects an empty set with "No validators available". The initiator
         // never receives its own gossip broadcast, so on a single-node cohort (a
@@ -2544,6 +2583,10 @@ impl Node {
             if let Some(pool) = &self.shielded_pool {
                 pool.record_spent(approved.request.nullifiers).await;
             }
+            self.verified_transacts
+                .lock()
+                .await
+                .remove(&approved.request.request_id);
         }
 
         match result {
@@ -2765,6 +2808,8 @@ impl Clone for Node {
 mod tests {
     use super::*;
     use crate::config::Settings;
+    use crate::network::protocol::NetworkEventHandler;
+    use crate::privacy::Nullifier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // --- connectivity reconciler hysteresis (reconcile_deactivations) ---
@@ -3633,5 +3678,146 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // --- #1619 Replay pre-filter before consensus ---
+
+    #[tokio::test]
+    async fn transact_replay_prefilter_rejects_spent_nullifier_at_initiate() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let pool = node.shielded_pool.as_ref().expect("pool present");
+
+        let n0 = [77u8; 32];
+        let n1 = [88u8; 32];
+        pool.record_spent([n0, n1]).await;
+
+        let mut req = ta_request(
+            "dummy",
+            [1u8; 32],
+            [n0, [99u8; 32]],
+            [[2u8; 32], [3u8; 32]],
+            [4u8; 32],
+            -100,
+        );
+        req.request_id = req.canonical_id();
+
+        let err = node.initiate_transact_verification(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("nullifier already spent"),
+            "expected replay error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transact_replay_prefilter_allows_unspent_nullifiers_at_initiate() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let mut node = Node::new(settings).expect("construct node");
+        node.transact_proof_verifier_override = Some(Arc::new(|_| true));
+
+        let n0 = [55u8; 32];
+        let n1 = [66u8; 32];
+        let mut req = ta_request(
+            "dummy",
+            [1u8; 32],
+            [n0, n1],
+            [[2u8; 32], [3u8; 32]],
+            [4u8; 32],
+            -100,
+        );
+        req.request_id = req.canonical_id();
+
+        if let Some(coord) = &node.transact_coordinator {
+            for i in 0..7 {
+                coord.register_validator(NodeId(vec![i])).await;
+            }
+        }
+
+        let result = node.initiate_transact_verification(req).await;
+        assert!(result.is_ok(), "unspent transact must pass prefilter: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn transact_replay_prefilter_drops_gossip_request_with_spent_nullifier() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let pool = node.shielded_pool.as_ref().expect("pool present");
+
+        let n0 = [71u8; 32];
+        let n1 = [72u8; 32];
+        pool.record_spent([n0, n1]).await;
+
+        let mut req = ta_request(
+            "dummy",
+            [1u8; 32],
+            [n0, [99u8; 32]],
+            [[2u8; 32], [3u8; 32]],
+            [4u8; 32],
+            -100,
+        );
+        req.request_id = req.canonical_id();
+
+        let sender = NodeId(vec![42]);
+        if let Some(coord) = &node.transact_coordinator {
+            coord.register_validator(sender.clone()).await;
+        }
+
+        let msg = Message::TransactVerificationRequest { request: req.clone() };
+        let res = node.handle_message(sender, msg).await;
+        assert!(res.is_ok());
+
+        assert!(
+            !node
+                .verified_transacts
+                .lock()
+                .await
+                .contains_key(&req.request_id),
+            "replayed transact must be dropped before verification cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_transact_via_cosign_marks_spent_and_cleans_verified_cache() {
+        let mut settings = Settings::development();
+        settings.bridge.enabled = true;
+        let node = Node::new(settings).expect("construct node");
+        let pool = node.shielded_pool.as_ref().expect("pool present");
+
+        let n0 = [81u8; 32];
+        let n1 = [82u8; 32];
+        let mut req = ta_request(
+            "dummy",
+            [1u8; 32],
+            [n0, n1],
+            [[2u8; 32], [3u8; 32]],
+            [4u8; 32],
+            -100,
+        );
+        req.request_id = req.canonical_id();
+
+        node.verified_transacts
+            .lock()
+            .await
+            .insert(req.request_id.clone(), req.clone());
+
+        assert!(pool.check_batch(&[Nullifier(n0), Nullifier(n1)]).await);
+        assert!(node.verified_transacts.lock().await.contains_key(&req.request_id));
+
+        let approved = ApprovedTransact { request: req.clone() };
+
+        pool.record_spent(approved.request.nullifiers).await;
+        node.verified_transacts
+            .lock()
+            .await
+            .remove(&approved.request.request_id);
+
+        assert!(!pool.check_batch(&[Nullifier(n0), Nullifier(n1)]).await);
+        assert!(!node.verified_transacts.lock().await.contains_key(&req.request_id));
+
+        let err = node.initiate_transact_verification(req).await.unwrap_err();
+        assert!(err.to_string().contains("nullifier already spent"));
     }
 }
