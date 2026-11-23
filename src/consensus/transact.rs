@@ -608,6 +608,14 @@ impl TransactVerificationCoordinator {
             }
         }
 
+        // A wallet cannot be claimed by multiple distinct nodes (#1664).
+        if let Some(w) = &wallet_pubkey {
+            if self.leader_selector.read().await.is_wallet_registered_by_other(&validator, w) {
+                log::warn!("rejecting duplicate wallet registration {w} for peer {validator:?}");
+                return;
+            }
+        }
+
         let mut validators = self.validators.write().await;
         if !validators.contains(&validator) {
             log::info!(
@@ -628,6 +636,12 @@ impl TransactVerificationCoordinator {
         // coordinator so a wallet-less reconciler pass / periodic Discovery never
         // clobbers a known wallet or resets accumulated state.
         let mut leader_selector = self.leader_selector.write().await;
+        if let Some(w) = &wallet_pubkey {
+            if leader_selector.is_wallet_registered_by_other(&validator, w) {
+                log::warn!("rejecting duplicate wallet registration {w} for peer {validator:?}");
+                return;
+            }
+        }
         match leader_selector.get_validator(&validator).cloned() {
             Some(existing) => {
                 if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
@@ -1571,5 +1585,27 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_wallet_registration_is_rejected() {
+        let coordinator = TransactVerificationCoordinator::new();
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![1]), Some("WALLET_X".to_string()))
+            .await;
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![1])).await,
+            Some("WALLET_X".to_string())
+        );
+
+        // A different NodeId attempting to claim the same wallet must be rejected (#1664).
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![2]), Some("WALLET_X".to_string()))
+            .await;
+        assert_eq!(
+            coordinator.validator_wallet(&NodeId(vec![2])).await,
+            None,
+            "duplicate wallet registration by a different NodeId must be rejected"
+        );
     }
 }
