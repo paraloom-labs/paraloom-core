@@ -218,10 +218,15 @@ pub fn transact_vote_signing_bytes(
 /// A transact the validator quorum has approved (#350). Emitted on the
 /// approval channel the moment a `Valid` quorum is first reached, carrying
 /// the full request — everything needed to build the on-chain `transact`
-/// instruction.
+/// instruction — plus the leader's co-sign authority for validator-side
+/// authority validation (#1664).
 #[derive(Clone, Debug)]
 pub struct ApprovedTransact {
     pub request: TransactVerificationRequest,
+    /// Base58 Solana wallet pubkey of the leader that assembled this settlement.
+    /// Validators MUST verify that `CoSignPayload.authority` matches this value
+    /// before co-signing (mitigates authority-spoofing per #1664).
+    pub leader_authority: String,
 }
 
 /// Consensus state for one transact verification: the request plus the
@@ -928,8 +933,32 @@ impl TransactVerificationCoordinator {
                     Ok(VerificationVote::Valid)
                 )
             {
+                // Determine the leader for this consensus round and get their co-sign wallet
+                let request_id_bytes = result.request_id.as_bytes();
+                let leader_authority = self
+                    .leader_selector
+                    .read()
+                    .await
+                    .select_leader(request_id_bytes)
+                    .and_then(|leader_id| {
+                        self.leader_selector
+                            .read()
+                            .await
+                            .get_validator(&leader_id)
+                            .and_then(|v| v.wallet_pubkey.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        log::warn!(
+                            target: "paraloom::consensus::transact",
+                            "could not determine leader authority for {}, using empty string",
+                            result.request_id
+                        );
+                        String::new()
+                    });
+
                 let approved = ApprovedTransact {
                     request: consensus.request.clone(),
+                    leader_authority,
                 };
                 if tx.send(approved).is_ok() {
                     emitted.insert(result.request_id.clone());

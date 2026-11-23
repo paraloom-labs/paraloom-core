@@ -70,6 +70,10 @@ pub struct DeliveredNote {
     /// feed, and a node built before it still parses a newer one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mint: Option<String>,
+
+    /// Unix seconds when the note was recorded, used for TTL expiration
+    /// (P-001: bound memory growth of delivered_notes).
+    pub timestamp: u64,
 }
 
 /// The capabilities the ingress needs: hand a transact to the consensus mesh,
