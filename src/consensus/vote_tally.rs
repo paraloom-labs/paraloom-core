@@ -147,8 +147,20 @@ impl VoteTally {
 
     /// Whether consensus has been reached among the eligible wallets — those in
     /// `eligible_wallets` (the staked on-chain co-sign set minus equivocators).
+    ///
+    /// Only `Valid` votes count toward quorum: a quorum of `Invalid` votes is a
+    /// rejection, not consensus. (L-02: previously every eligible vote counted,
+    /// so `min_validators_for_consensus` `Invalid` votes reported "consensus
+    /// reached" and short-circuited the round before `consensus_result` ran.)
     pub async fn has_consensus(&self, eligible_wallets: &HashSet<String>) -> bool {
-        self.count_eligible_votes(eligible_wallets).await >= self.min_validators_for_consensus
+        let votes = self.votes.read().await;
+        votes
+            .iter()
+            .filter(|(wallet, rec)| {
+                eligible_wallets.contains(*wallet) && rec.vote.is_valid()
+            })
+            .count()
+            >= self.min_validators_for_consensus
     }
 
     /// Check if consensus deadline has passed
@@ -287,6 +299,64 @@ mod tests {
         let mut voters = tally.valid_voters(&eligible).await;
         voters.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(voters, vec![NodeId(vec![1]), NodeId(vec![3])]);
+    }
+
+    /// L-02 regression: a quorum of `Invalid` votes must NOT report consensus —
+    /// it is a rejection. Before the fix, every eligible vote counted regardless
+    /// of validity, so 2 `Invalid` votes with `min = 2` returned `true`.
+    #[tokio::test]
+    async fn has_consensus_requires_valid_votes_not_just_eligible_ones() {
+        let tally = VoteTally::new("req-1".to_string(), 2, 3);
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "tampered receipt".to_string(),
+                },
+                vec![1],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "tampered receipt".to_string(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+
+        let eligible = wallets(&["W1", "W2", "W3"]);
+        assert!(
+            !tally.has_consensus(&eligible).await,
+            "quorum of Invalid votes is a rejection, not consensus"
+        );
+
+        // hợp lệ đạt quorum: 2 phiếu Valid (min = 2) — Invalid không ăn góp
+        tally
+            .submit_vote(
+                "W3".into(),
+                NodeId(vec![3]),
+                VerificationVote::Valid,
+                vec![3],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W4".into(),
+                NodeId(vec![4]),
+                VerificationVote::Valid,
+                vec![4],
+            )
+            .await
+            .unwrap();
+        let eligible4 = wallets(&["W1", "W2", "W3", "W4"]);
+        assert!(tally.has_consensus(&eligible4).await);
     }
 
     #[tokio::test]
