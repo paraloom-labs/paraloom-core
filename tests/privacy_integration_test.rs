@@ -177,6 +177,25 @@ async fn test_multiple_deposits_merkle_tree() {
 }
 
 #[tokio::test]
+async fn test_depositing_same_note_twice() {
+    let pool = ShieldedPool::new();
+    let address = ShieldedAddress([7u8; 32]);
+    let randomness = pedersen::generate_randomness();
+    let note = Note::new_native(address, 1000, randomness);
+
+    let c1 = pool.deposit(note.clone(), 1000).await.unwrap();
+    let r1 = pool.root().await;
+
+    let c2 = pool.deposit(note, 1000).await.unwrap();
+    let r2 = pool.root().await;
+
+    assert_eq!(c1, c2);
+    assert_ne!(r1, r2, "Merkle root must change when same note is deposited a second time");
+    assert_eq!(pool.commitment_count().await, 2);
+    assert_eq!(pool.total_supply().await, 2000);
+}
+
+#[tokio::test]
 async fn test_nullifier_uniqueness() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)

@@ -6,7 +6,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
 use paraloom_program::merkle_tree::{IncrementalMerkleTree, TREE_DEPTH, ZERO_HASHES};
 use paraloom_program::{accounts, instruction, BridgeState};
-use solana_program_test::{processor, tokio, ProgramTest};
+use solana_program_test::{processor, tokio, ProgramTest, ProgramTestBanksClientExt};
 use solana_sdk::{
     instruction::Instruction, signature::Signer, system_program, transaction::Transaction,
 };
@@ -438,4 +438,90 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         state.deposit_cap, AMOUNT,
         "cap must be unchanged after a rejected set"
     );
+}
+
+#[tokio::test]
+async fn deposit_note_same_note_twice_appends_distinct_leaves() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    let vault_before = banks
+        .get_account(bridge_vault_pda)
+        .await
+        .unwrap()
+        .map(|a| a.lamports)
+        .unwrap_or(0);
+
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 42;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 99;
+
+    let mut current_blockhash = blockhash;
+    // Send two identical deposit instructions with the same note parameters.
+    for _ in 0..2 {
+        let deposit = Instruction {
+            program_id,
+            data: instruction::DepositNote {
+                amount: AMOUNT,
+                pubkey,
+                blinding,
+            }
+            .data(),
+            accounts: accounts::DepositNote {
+                bridge_state: bridge_state_pda,
+                bridge_vault: bridge_vault_pda,
+                merkle_tree: tree_pda,
+                depositor: payer.pubkey(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        };
+        let mut tx = Transaction::new_with_payer(&[deposit], Some(&payer.pubkey()));
+        tx.sign(&[&payer], current_blockhash);
+        banks.process_transaction(tx).await.unwrap();
+        current_blockhash = banks
+            .get_new_latest_blockhash(&current_blockhash)
+            .await
+            .unwrap();
+    }
+
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 2, "two leaves appended for identical notes");
+    assert!(tree.is_known_root(tree.root));
+
+    let vault_after = banks
+        .get_account(bridge_vault_pda)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert_eq!(
+        vault_after - vault_before,
+        2 * AMOUNT,
+        "both deposits reached the vault"
+    );
+
+    let sraw = banks.get_account(bridge_state_pda).await.unwrap().unwrap();
+    let state = BridgeState::try_deserialize(&mut sraw.data.as_slice()).unwrap();
+    assert_eq!(state.deposit_count, 2);
 }
