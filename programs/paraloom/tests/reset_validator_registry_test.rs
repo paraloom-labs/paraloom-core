@@ -247,6 +247,14 @@ async fn reset_rebuilds_registry_from_passed_validators_only() {
         before.min_token_stake, after.min_token_stake,
         "the floor a fresh registry starts at survives the migration"
     );
+    assert!(
+        paraloom_program::is_in_roster_filter(&after.reset_roster_filter, &validator_a.pubkey()),
+        "kept validator A must be present in the post-reset active roster filter"
+    );
+    assert!(
+        !paraloom_program::is_in_roster_filter(&after.reset_roster_filter, &validator_b.pubkey()),
+        "excluded validator B must be rejected by the post-reset active roster filter (#1623)"
+    );
 }
 
 #[tokio::test]
