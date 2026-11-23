@@ -2420,20 +2420,19 @@ impl Node {
         // quorum, mapped to their advertised settlement wallets; the leader
         // signs as itself and is excluded from the peers it requests from.
         let self_id = self.node_info.id.clone();
-        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
+        let mut raw_peers: Vec<(Pubkey, NodeId)> = Vec::new();
         for voter in coordinator.valid_voters(&request.request_id).await {
             if voter == self_id {
                 continue;
             }
             if let Some(wallet) = coordinator.validator_wallet(&voter).await {
                 if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
+                    raw_peers.push((pubkey, voter));
                 }
             }
         }
-        let mut quorum_wallets = vec![leader.pubkey()];
-        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
+        let (quorum_wallets, peers, threshold) =
+            cosign_round::deduplicate_quorum_wallets(leader.pubkey(), raw_peers);
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
         // wire form; strip the L2 suite tag and convert the compressed body.

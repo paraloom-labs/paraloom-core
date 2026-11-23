@@ -24,6 +24,31 @@ use solana_sdk::{
 };
 use std::future::Future;
 
+/// Deduplicate peers and quorum wallets by settlement wallet pubkey (#1680 / M-08).
+///
+/// If multiple `NodeId`s advertise the same settlement wallet pubkey, or if a
+/// peer advertises the leader's own settlement wallet, deduplicating them here
+/// prevents inflating the quorum threshold beyond the number of distinct
+/// signatures that can ever be collected.
+pub fn deduplicate_quorum_wallets(
+    leader_wallet: Pubkey,
+    raw_peers: impl IntoIterator<Item = (Pubkey, NodeId)>,
+) -> (Vec<Pubkey>, Vec<(Pubkey, NodeId)>, usize) {
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(leader_wallet);
+
+    let mut peers = Vec::new();
+    for (wallet, node_id) in raw_peers {
+        if seen.insert(wallet) {
+            peers.push((wallet, node_id));
+        }
+    }
+    let mut quorum_wallets = vec![leader_wallet];
+    quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
+    let threshold = quorum_wallets.len();
+    (quorum_wallets, peers, threshold)
+}
+
 /// Run the leader-side co-signing round and return the assembled, fully-signed
 /// settlement transaction (#260).
 ///
@@ -100,6 +125,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deduplicates_repeated_settlement_wallets() {
+        let leader = Pubkey::new_unique();
+        let peer_wallet_1 = Pubkey::new_unique();
+        let peer_wallet_2 = Pubkey::new_unique();
+
+        let raw_peers = vec![
+            (peer_wallet_1, NodeId(vec![1])),
+            (peer_wallet_1, NodeId(vec![2])), // Duplicate wallet on different node_id
+            (leader, NodeId(vec![3])),        // Peer claiming leader's wallet
+            (peer_wallet_2, NodeId(vec![4])),
+        ];
+
+        let (quorum_wallets, peers, threshold) =
+            deduplicate_quorum_wallets(leader, raw_peers);
+
+        assert_eq!(quorum_wallets.len(), 3);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(threshold, 3);
+        assert_eq!(quorum_wallets, vec![leader, peer_wallet_1, peer_wallet_2]);
+        assert_eq!(
+            peers,
+            vec![
+                (peer_wallet_1, NodeId(vec![1])),
+                (peer_wallet_2, NodeId(vec![4])),
+            ]
+        );
+    }
 
     fn transact_params() -> SettlementParams {
         SettlementParams::Transact {
