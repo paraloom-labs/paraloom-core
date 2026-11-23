@@ -910,6 +910,73 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             });
         }
 
+        // Validate that the requester is the authentic round leader bound into payload.authority (#1705).
+        // Settlement co-signing is driven exclusively by the round leader (the fee payer whose
+        // authority is signed into the payload). An attacker or unauthenticated peer replaying
+        // a genuine settlement leader's authority must not drive the round or exhaust the
+        // leader's per-(nullifier, authority) co-sign budget.
+        let requester_wallet = match &self.transact_coordinator {
+            Some(coordinator) => coordinator.validator_wallet(&source).await,
+            None => None,
+        };
+
+        let payload = match crate::bridge::solana::CoSignPayload::from_bytes(&request.message) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "declining co-sign request for {} from {source:?}: undecodable payload: {e}",
+                    request.request_id
+                );
+                return Ok(CoSignResponse {
+                    request_id: request.request_id,
+                    wallet_pubkey: String::new(),
+                    signature: None,
+                });
+            }
+        };
+
+        let authority_pk = Pubkey::new_from_array(payload.authority);
+        let authority_str = authority_pk.to_string();
+        if requester_wallet.as_deref() != Some(&authority_str) {
+            log::warn!(
+                "declining co-sign request for {} from {:?}: requester wallet {:?} does not match settlement authority {}",
+                request.request_id,
+                source,
+                requester_wallet,
+                authority_str
+            );
+            return Ok(CoSignResponse {
+                request_id: request.request_id,
+                wallet_pubkey: String::new(),
+                signature: None,
+            });
+        }
+
+        // Cryptographically bound voter check (#1705):
+        // If the coordinator has a consensus tally for this request_id, verify that `source`
+        // matches the NodeId that actually signed a Valid vote with `authority_str`.
+        // A peer advertising the victim's wallet in Discovery without holding its private key
+        // could never produce a signed vote, so `authenticated_node_for_wallet` binds the wallet
+        // to the genuine voter NodeId only.
+        if let Some(coordinator) = &self.transact_coordinator {
+            if let Some(auth_node) = coordinator.authenticated_node_for_wallet(&request.request_id, &authority_str).await {
+                if auth_node != source {
+                    log::warn!(
+                        "declining co-sign request for {} from {:?}: source does not match authenticated voter {:?} for authority {}",
+                        request.request_id,
+                        source,
+                        auth_node,
+                        authority_str
+                    );
+                    return Ok(CoSignResponse {
+                        request_id: request.request_id,
+                        wallet_pubkey: String::new(),
+                        signature: None,
+                    });
+                }
+            }
+        }
+
         // Pin the program to our own config before the signer sees the request:
         // an unparseable configured id means we cannot bind it, so decline
         // rather than sign against a requester-supplied program.
@@ -923,11 +990,12 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 });
             }
         };
-        Ok(cosign_settlement(
+        Ok(cosign_settlement_for_requester(
             self.cosign_keypair.as_ref(),
             &expected_program_id,
             &self.verified_transacts,
             &self.cosign_counts,
+            Some(&source),
             request,
         )
         .await)
@@ -939,11 +1007,36 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 /// binding parameters — a settlement we verified `Valid`; otherwise decline
 /// (`signature: None`). Free-standing so the security-critical decision can be
 /// unit-tested without standing up a full node.
+#[allow(dead_code)]
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
     verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    request: CoSignRequest,
+) -> CoSignResponse {
+    cosign_settlement_for_requester(
+        cosign_keypair,
+        expected_program_id,
+        verified_transacts,
+        cosign_counts,
+        None,
+        request,
+    )
+    .await
+}
+
+/// Produce a co-sign response for `request` with per-(nullifier, authority, requester-leader)
+/// budget accounting (#1705). Keying the co-sign cap on both `payload.authority` and the
+/// cryptographically authenticated libp2p `requester` ensures that an unauthenticated peer
+/// or attacker replaying genuine settlement leader authority cannot burn the genuine leader's
+/// budget partition.
+async fn cosign_settlement_for_requester(
+    cosign_keypair: Option<&Arc<Keypair>>,
+    expected_program_id: &Pubkey,
+    verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
+    requester: Option<&NodeId>,
     request: CoSignRequest,
 ) -> CoSignResponse {
     let request_id = request.request_id.clone();
@@ -1009,9 +1102,12 @@ async fn cosign_settlement(
             // while the cap still bounds the usable signatures one spend yields
             // (they all share the one on-chain authority).
             let auth = hex::encode(payload.authority);
+            let req_tag = requester
+                .map(|r| hex::encode(&r.0))
+                .unwrap_or_else(|| auth.clone());
             let cap_nullifiers = [
-                format!("{}:{auth}", hex::encode(nullifiers[0])),
-                format!("{}:{auth}", hex::encode(nullifiers[1])),
+                format!("{}:{auth}:{req_tag}", hex::encode(nullifiers[0])),
+                format!("{}:{auth}:{req_tag}", hex::encode(nullifiers[1])),
             ];
             (approved, cap_nullifiers)
         }
@@ -1041,9 +1137,12 @@ async fn cosign_settlement(
                     && req.ext_amount == *ext_amount
             });
             let auth = hex::encode(payload.authority);
+            let req_tag = requester
+                .map(|r| hex::encode(&r.0))
+                .unwrap_or_else(|| auth.clone());
             let cap_nullifiers = [
-                format!("{}:{auth}", hex::encode(nullifiers[0])),
-                format!("{}:{auth}", hex::encode(nullifiers[1])),
+                format!("{}:{auth}:{req_tag}", hex::encode(nullifiers[0])),
+                format!("{}:{auth}:{req_tag}", hex::encode(nullifiers[1])),
             ];
             (approved, cap_nullifiers)
         }
@@ -3138,6 +3237,95 @@ mod tests {
         assert!(
             resp.signature.is_some(),
             "a forged-authority flood must not exhaust the legitimate leader's budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_cap_is_per_requester_so_a_replayed_authority_cannot_starve_the_leader() {
+        // #1705: A malicious or unauthenticated peer that copies a real spend's
+        // public parameters and replays the genuine settlement leader's authority
+        // must not drain the budget partition the legitimate leader needs.
+        // Keying the co-sign cap on (nullifier, authority, requester) ensures that
+        // the replayer's requests only consume its own budget partition, leaving
+        // the legitimate leader's co-sign budget intact.
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+        tas.lock().await.insert(
+            "t1".to_string(),
+            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+
+        let leader_authority = [1u8; 32];
+        let attacker_node = NodeId(b"attacker-node-without-stake".to_vec());
+        let leader_node = NodeId(b"honest-leader-node-with-stake".to_vec());
+
+        // The attacker floods well past MAX_COSIGNS_PER_SETTLEMENT replaying the
+        // genuine leader authority.
+        let replayed = ta_payload(
+            leader_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        for _ in 0..MAX_COSIGNS_PER_SETTLEMENT + 2 {
+            let _ = cosign_settlement_for_requester(
+                Some(&kp),
+                &configured_program(),
+                &tas,
+                &counts,
+                Some(&attacker_node),
+                cosign_req("t1", SettlementKind::Transact, &replayed),
+            )
+            .await;
+        }
+
+        // The attacker's own budget partition is now exhausted.
+        let blocked_attacker = cosign_settlement_for_requester(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&attacker_node),
+            cosign_req("t1", SettlementKind::Transact, &replayed),
+        )
+        .await;
+        assert_eq!(
+            blocked_attacker.signature, None,
+            "attacker must be capped after MAX_COSIGNS_PER_SETTLEMENT requests"
+        );
+
+        // The legitimate leader, sending under its own authenticated NodeId with the same
+        // genuine authority, must still receive a valid co-signature because its budget
+        // partition was never touched.
+        let legit = ta_payload(
+            leader_authority,
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let resp = cosign_settlement_for_requester(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &counts,
+            Some(&leader_node),
+            cosign_req("t1", SettlementKind::Transact, &legit),
+        )
+        .await;
+        assert!(
+            resp.signature.is_some(),
+            "a genuine-authority replay by an unauthorized peer must not starve the legitimate leader (#1705)"
         );
     }
 

@@ -628,6 +628,19 @@ impl TransactVerificationCoordinator {
         // coordinator so a wallet-less reconciler pass / periodic Discovery never
         // clobbers a known wallet or resets accumulated state.
         let mut leader_selector = self.leader_selector.write().await;
+
+        // Gate: an unauthenticated peer must not claim or overwrite a wallet pubkey that
+        // is already registered to another active validator (#1705).
+        if let Some(ref wallet) = wallet_pubkey {
+            if leader_selector.is_wallet_registered_to_other(wallet, &validator) {
+                log::warn!(
+                    "rejecting duplicate wallet registration: {:?} attempted to claim already-registered wallet {}",
+                    validator,
+                    wallet
+                );
+                return;
+            }
+        }
         match leader_selector.get_validator(&validator).cloned() {
             Some(existing) => {
                 if wallet_pubkey.is_some() && wallet_pubkey != existing.wallet_pubkey {
@@ -742,6 +755,15 @@ impl TransactVerificationCoordinator {
                 consensus.tally.valid_voters(&eligible).await
             }
             None => Vec::new(),
+        }
+    }
+
+    /// Return the authenticated NodeId that signed a Valid vote with `wallet` for `request_id` (#1705).
+    pub async fn authenticated_node_for_wallet(&self, request_id: &str, wallet: &str) -> Option<NodeId> {
+        let pending = self.pending.read().await;
+        match pending.get(request_id) {
+            Some(consensus) => consensus.tally.voter_for_wallet(wallet).await,
+            None => None,
         }
     }
 

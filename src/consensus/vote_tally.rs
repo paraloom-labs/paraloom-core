@@ -240,6 +240,18 @@ impl VoteTally {
         }
         out
     }
+
+    /// Return the authenticated NodeId that signed a Valid vote with `wallet` (#1705).
+    pub async fn voter_for_wallet(&self, wallet: &str) -> Option<NodeId> {
+        let votes = self.votes.read().await;
+        votes.get(wallet).and_then(|rec| {
+            if rec.vote.is_valid() {
+                Some(rec.node_id.clone())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[cfg(test)]
