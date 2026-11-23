@@ -23,6 +23,7 @@ use solana_program_test::{processor, tokio, BanksClientError, ProgramTest, Progr
 use solana_sdk::{
     account::Account,
     instruction::{Instruction, InstructionError},
+    program_pack::Pack,
     signature::{Keypair, Signer},
     transaction::{Transaction, TransactionError},
 };
@@ -30,7 +31,7 @@ use solana_sdk::{
 mod common;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix, TEST_TOKEN_FUND,
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
@@ -516,5 +517,157 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
     assert!(
         closed.is_none() || closed.unwrap().lamports == 0,
         "PDA must be closed after withdraw"
+    );
+}
+
+/// Read an SPL token account's `amount` from a `banks_client` account.
+async fn token_balance(ctx: &mut ProgramTestContext, account: Pubkey) -> u64 {
+    let raw = ctx
+        .banks_client
+        .get_account(account)
+        .await
+        .expect("rpc")
+        .expect("token account exists");
+    spl_token::state::Account::unpack(&raw.data)
+        .expect("unpack token account")
+        .amount
+}
+
+/// Regression (#1640): `deactivate_validator` must route the TOKEN half of the
+/// dual stake into unbonding, not just the SOL half. A deactivated validator
+/// cannot `unregister` (that path requires `is_active`), so before the fix its
+/// `token_stake_amount` stayed put while `token_unbonding_amount` remained 0 —
+/// `withdraw_unbonded_stake` then closed the PDA and returned only the SOL,
+/// leaving the entire token collateral (at the floor, 1,000,000 PARALOOM)
+/// stranded in the shared `stake_token_vault` forever, returnable by no
+/// instruction. This proves the full exit returns BOTH halves: deactivate
+/// (admin-signed) moves the token stake to unbonding, and a post-window withdraw
+/// credits the validator's token account and empties the shared vault — exactly
+/// like `unregister_validator` and the deactivating `slash_validator` branch.
+#[tokio::test]
+async fn deactivate_returns_token_stake_after_unbonding() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (validator, validator_token) = funded_validator(&mut pt, stake_mint);
+    let mut ctx = pt.start_with_context().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+    let (stake_vault, _) = Pubkey::find_program_address(&[b"stake_token_vault"], &program_id);
+
+    // 1. Registry init (upgrade authority, #204).
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await
+    .expect("init registry");
+
+    // 2. Register — the token half is locked into the shared vault.
+    send(
+        &mut ctx,
+        &validator,
+        register_validator_ix(
+            program_id,
+            validator.pubkey(),
+            stake_mint,
+            validator_token,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await
+    .expect("register");
+
+    // The vault holds exactly the locked token stake; the validator's token
+    // account is down by that amount.
+    assert_eq!(
+        token_balance(&mut ctx, stake_vault).await,
+        TOKEN_STAKE,
+        "vault holds exactly the locked token stake after register"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, validator_token).await,
+        TEST_TOKEN_FUND - TOKEN_STAKE,
+        "validator token account debited by the locked stake"
+    );
+
+    // 3. Deactivate — admin-signed (the registry authority). Routes BOTH halves
+    //    of the dual stake into unbonding instead of stranding the token half.
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivate");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active, "deactivate must clear is_active");
+    assert_eq!(acc.stake_amount, 0, "active SOL stake zeroed on deactivate");
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake zeroed on deactivate"
+    );
+    assert_eq!(
+        acc.unbonding_amount, MIN_VALIDATOR_STAKE,
+        "the full SOL stake must be routed into unbonding"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "the full token stake must be routed into unbonding, not stranded (#1640)"
+    );
+
+    // 4. Warp past the unbonding window and withdraw — the token half must come
+    //    back to the validator and the shared vault must be emptied.
+    ctx.warp_to_slot(acc.unbonding_slot)
+        .expect("warp to unbonding slot");
+
+    send(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect("deactivated validator must be able to withdraw its unbonded stake");
+
+    assert_eq!(
+        token_balance(&mut ctx, validator_token).await,
+        TEST_TOKEN_FUND,
+        "validator's token account must be whole again after a full exit (#1640)"
+    );
+    assert_eq!(
+        token_balance(&mut ctx, stake_vault).await,
+        0,
+        "shared vault must be empty after the only validator exits (#1640)"
+    );
+
+    // The validator PDA is closed by the full withdraw; the token unbonding
+    // balance is gone with it (nothing left stranded).
+    assert!(
+        ctx.banks_client
+            .get_account(validator_pda)
+            .await
+            .expect("rpc")
+            .is_none(),
+        "validator PDA closed after full exit"
     );
 }

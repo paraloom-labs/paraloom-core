@@ -1634,6 +1634,7 @@ pub mod paraloom_program {
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
+        let token_stake = ctx.accounts.validator_account.token_stake_amount;
         let who = ctx.accounts.validator_account.validator;
         if was_active {
             let now_slot = Clock::get()?.slot;
@@ -1645,8 +1646,19 @@ pub mod paraloom_program {
             // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
             // the delay, same as unregister.
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            // The token half unbonds in lockstep with the SOL half: it stays in
+            // the shared vault, slashable through the same window, and is
+            // released by `withdraw_unbonded_stake` when `unbonding_slot`
+            // elapses. Without this the token collateral would be stranded in
+            // the vault forever once the PDA closes (#1640) — the same exit path
+            // `unregister_validator` and the deactivating `slash_validator`
+            // branch already take.
+            v.token_unbonding_amount = v
+                .token_unbonding_amount
+                .saturating_add(token_stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            v.token_stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
