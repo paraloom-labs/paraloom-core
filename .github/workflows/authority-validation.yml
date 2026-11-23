@@ -1,0 +1,114 @@
+name: Authority Validation Tests (#1664)
+
+on:
+  push:
+    branches: [ main, authority-validation-* ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# `mold` is significantly faster than the default `ld` for linking
+# Rust binaries on Linux.
+env:
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+jobs:
+  authority-validation-tests:
+    name: Authority Validation Tests (#1664)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          sudo apt-get clean
+          df -h
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "paraloom-ci"
+
+      - name: Build all features (lib, bins, tests, examples)
+        run: cargo build --all-features --all-targets
+
+      - name: Run authority validation tests (cosign)
+        run: cargo test --lib cosign --all-features -- --nocapture
+
+      - name: Run specific authority validation tests
+        run: |
+          cargo test --lib authority --all-features -- --nocapture
+          cargo test --lib cosign --all-features -- --nocapture
+
+      - name: Run consensus transact tests
+        run: cargo test --lib consensus::transact --all-features -- --nocapture
+
+      - name: Clippy on modified modules
+        run: cargo clippy -p paraloom --lib --all-features -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (All Targets, All Features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          sudo apt-get clean
+          df -h
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "paraloom-ci"
+      - name: Run clippy on all targets
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check

@@ -6,7 +6,7 @@ use log::info;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -132,7 +132,12 @@ pub struct Node {
     /// to sign a transact it never verified, nor one with a substituted
     /// recipient (the recipient is the one every validator saw in the gossiped
     /// request). Bounded by `MAX_VERIFIED_CACHE`; entries are short-lived.
-    verified_transacts: Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    /// 
+    /// Value is a tuple of (TransactVerificationRequest, leader_authority)
+    /// where leader_authority is the base58 co-sign wallet of the consensus
+    /// leader for this request. Used to validate CoSignPayload.authority
+    /// per #1664.
+    verified_transacts: Arc<Mutex<HashMap<String, (TransactVerificationRequest, String)>>>,
 
     /// Per-spend co-sign counter (#593/#606), keyed on the input nullifiers.
     /// The co-sign signature is this node's Solana fee-payer signature; capping
@@ -508,7 +513,7 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                     cache_verified(
                         &self.verified_transacts,
                         request.request_id.clone(),
-                        request.clone(),
+                        (request.clone(), String::new()),
                     )
                     .await;
                 }
@@ -939,10 +944,13 @@ impl crate::network::protocol::NetworkEventHandler for Node {
 /// binding parameters — a settlement we verified `Valid`; otherwise decline
 /// (`signature: None`). Free-standing so the security-critical decision can be
 /// unit-tested without standing up a full node.
+/// 
+/// Authority validation per #1664: validates that `payload.authority` matches
+/// the leader's co-sign wallet recorded when the transact was approved.
 async fn cosign_settlement(
     cosign_keypair: Option<&Arc<Keypair>>,
     expected_program_id: &Pubkey,
-    verified_transacts: &Arc<Mutex<HashMap<String, TransactVerificationRequest>>>,
+    verified_transacts: &Arc<Mutex<HashMap<String, (TransactVerificationRequest, String)>>>,
     cosign_counts: &Arc<Mutex<HashMap<String, u32>>>,
     request: CoSignRequest,
 ) -> CoSignResponse {
@@ -989,31 +997,42 @@ async fn cosign_settlement(
             },
         ) => {
             let cache = verified_transacts.lock().await;
-            let approved = cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient
+            let (approved, leader_authority) = cache.get(&request.request_id).map_or((false, String::new()), |(req, auth)| {
+                let params_match = req.recipient == *recipient
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
-                    && req.ext_amount == *ext_amount
+                    && req.ext_amount == *ext_amount;
+                (params_match, auth.clone())
             });
-            // Cap keys = each input nullifier paired with the payload authority
-            // (#723). The approval match above binds the settlement's public
-            // params but NOT `payload.authority`, and those params are all
-            // observable over gossip, so a registered peer could copy a real
-            // spend's params under its own authority and drain the shared
-            // per-nullifier budget until the legitimate leader's request is
-            // declined. Only the settlement whose authority is the on-chain
-            // bridge authority can ever land (its `has_one`), so keying the cap
-            // on (nullifier, authority) isolates each authority's budget: a
-            // forged-authority request can no longer starve the real leader,
-            // while the cap still bounds the usable signatures one spend yields
-            // (they all share the one on-chain authority).
-            let auth = hex::encode(payload.authority);
+            
+            // Authority validation per #1664: verify payload.authority matches the
+            // approved leader's co-sign wallet. A malicious leader could otherwise
+            // substitute its own authority to drain the per-nullifier cosign budget
+            // of the legitimate leader.
+            let authority_valid = !leader_authority.is_empty() 
+                && Pubkey::new_from_array(payload.authority).to_string() == leader_authority;
+            
+            if !authority_valid {
+                log::warn!(
+                    target: "paraloom::node::cosign",
+                    "declining co-sign for {}: authority mismatch (expected {}, got {})",
+                    request.request_id, leader_authority, Pubkey::new_from_array(payload.authority)
+                );
+            }
+            
+            // Use the APPROVED leader's authority for cap keys (not payload.authority),
+            // so a forged-authority request cannot drain the legitimate leader's budget.
+            let auth = if !leader_authority.is_empty() {
+                leader_authority
+            } else {
+                hex::encode(payload.authority)
+            };
             let cap_nullifiers = [
                 format!("{}:{auth}", hex::encode(nullifiers[0])),
                 format!("{}:{auth}", hex::encode(nullifiers[1])),
             ];
-            (approved, cap_nullifiers)
+            (approved && authority_valid, cap_nullifiers)
         }
         // SPL settlement (#779): the same binding check, but the payload's
         // recipient is the recipient token account and the asset is bound by
@@ -1032,20 +1051,40 @@ async fn cosign_settlement(
             },
         ) => {
             let cache = verified_transacts.lock().await;
-            let approved = cache.get(&request.request_id).is_some_and(|req| {
-                req.recipient == *recipient_token_account
+            let (approved, leader_authority) = cache.get(&request.request_id).map_or((false, String::new()), |(req, auth)| {
+                let params_match = req.recipient == *recipient_token_account
                     && req.mint == Some(*mint)
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
-                    && req.ext_amount == *ext_amount
+                    && req.ext_amount == *ext_amount;
+                (params_match, auth.clone())
             });
-            let auth = hex::encode(payload.authority);
+            
+            // Authority validation per #1664: verify payload.authority matches the
+            // approved leader's co-sign wallet.
+            let authority_valid = !leader_authority.is_empty() 
+                && Pubkey::new_from_array(payload.authority).to_string() == leader_authority;
+            
+            if !authority_valid {
+                log::warn!(
+                    target: "paraloom::node::cosign",
+                    "declining co-sign for {} (SPL): authority mismatch (expected {}, got {})",
+                    request.request_id, leader_authority, Pubkey::new_from_array(payload.authority)
+                );
+            }
+            
+            // Use the APPROVED leader's authority for cap keys.
+            let auth = if !leader_authority.is_empty() {
+                leader_authority
+            } else {
+                hex::encode(payload.authority)
+            };
             let cap_nullifiers = [
                 format!("{}:{auth}", hex::encode(nullifiers[0])),
                 format!("{}:{auth}", hex::encode(nullifiers[1])),
             ];
-            (approved, cap_nullifiers)
+            (approved && authority_valid, cap_nullifiers)
         }
     };
     if !approved {
@@ -2134,11 +2173,25 @@ impl Node {
             self.transact_approval_rx.lock().await.take(),
         ) {
             let node = self.clone();
+            let verified_transacts = node.verified_transacts.clone();
             let handle = tokio::spawn(settle_approved_transacts(
                 rx,
                 move |approved| {
                     let node = node.clone();
-                    async move { node.settle_transact_via_cosign(approved).await }
+                    let verified_transacts = verified_transacts.clone();
+                    async move {
+                        // Store the leader_authority in the verified_transacts cache
+                        // for validator-side authority validation (#1664)
+                        let request_id = approved.request.request_id.clone();
+                        let leader_authority = approved.leader_authority.clone();
+                        if !leader_authority.is_empty() {
+                            let mut cache = verified_transacts.lock().await;
+                            if let Some((req, _)) = cache.get(&request_id) {
+                                cache.insert(request_id, (req.clone(), leader_authority));
+                            }
+                        }
+                        node.settle_transact_via_cosign(approved).await
+                    }
                 },
                 Some(coordinator),
             ));
@@ -2282,7 +2335,7 @@ impl Node {
                     cache_verified(
                         &self.verified_transacts,
                         request_id.clone(),
-                        request.clone(),
+                        (request.clone(), String::new()),
                     )
                     .await;
                     crate::consensus::vote_tally::VerificationVote::Valid
@@ -2340,7 +2393,8 @@ impl Node {
         // Bound the in-memory scan buffer so a high volume of transfers cannot
         // grow it without limit (this records only proof-verified transfers, so
         // it is not cheaply floodable, but the bound is defence in depth).
-        const MAX_DELIVERED_NOTES: usize = 50_000;
+        const MAX_DELIVERED_NOTES: usize = 10_000;
+        const DELIVERED_NOTE_TTL_SECS: u64 = 86_400; // 24 h
 
         // Hex, matching `output_commitment` in the same struct and the `mint`
         // that `/transact/submit` accepts (`parse_hex32`), so one field name has
@@ -2352,11 +2406,16 @@ impl Node {
         let mint = mint.map(hex::encode);
 
         let mut store = self.delivered_notes.lock().await;
+        // Expire entries older than the TTL before inserting, so stale notes
+        // do not count against the cap and are not served to scanners.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        store.retain(|d| now.saturating_sub(d.timestamp) < DELIVERED_NOTE_TTL_SECS);
         for (commitment, ciphertext) in output_commitments.iter().zip(ciphertexts.iter()) {
             let note = transact_ingress::DeliveredNote {
                 output_commitment: hex::encode(commitment),
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
+                timestamp: now,
             };
             if store.iter().any(|d| {
                 d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
@@ -2869,7 +2928,7 @@ mod tests {
         // No keypair configured at all → declined even for a verified request.
         tas.lock().await.insert(
             "t1".to_string(),
-            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), String::new()),
         );
         let no_key = cosign_settlement(
             None,
@@ -2954,7 +3013,7 @@ mod tests {
         let ext_amount = -1_000_000_000i64;
         tas.lock().await.insert(
             "t1".to_string(),
-            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), kp.pubkey().to_string()),
         );
 
         let payload = ta_payload(
@@ -3002,7 +3061,7 @@ mod tests {
         let ext_amount = -1_000_000_000i64;
         tas.lock().await.insert(
             "t1".to_string(),
-            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), String::new()),
         );
         let payload = ta_payload(
             kp.pubkey().to_bytes(),
@@ -3053,7 +3112,7 @@ mod tests {
         );
         tas.lock().await.insert(
             "t2".to_string(),
-            ta_request("t2", recipient, other_nullifiers, outputs, root, ext_amount),
+            (ta_request("t2", recipient, other_nullifiers, outputs, root, ext_amount), String::new()),
         );
         let other = cosign_settlement(
             Some(&kp),
@@ -3089,7 +3148,7 @@ mod tests {
         let ext_amount = -1_000_000_000i64;
         tas.lock().await.insert(
             "t1".to_string(),
-            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), String::new()),
         );
 
         let leader_authority = [1u8; 32];
@@ -3169,7 +3228,7 @@ mod tests {
         // Spend the whole budget under one request id (one proof of the spend).
         tas.lock().await.insert(
             "proof-a".to_string(),
-            ta_request("proof-a", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("proof-a", recipient, nullifiers, outputs, root, ext_amount), String::new()),
         );
         for _ in 0..MAX_COSIGNS_PER_SETTLEMENT {
             let resp = cosign_settlement(
@@ -3187,7 +3246,7 @@ mod tests {
         // different randomized proof) must not reset the budget.
         tas.lock().await.insert(
             "proof-b".to_string(),
-            ta_request("proof-b", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("proof-b", recipient, nullifiers, outputs, root, ext_amount), String::new()),
         );
         let bypass = cosign_settlement(
             Some(&kp),
@@ -3232,7 +3291,7 @@ mod tests {
         );
         tas.lock().await.insert(
             "a".to_string(),
-            ta_request("a", recipient, nullifiers_a, outputs, root, ext_amount),
+            (ta_request("a", recipient, nullifiers_a, outputs, root, ext_amount), String::new()),
         );
         for _ in 0..MAX_COSIGNS_PER_SETTLEMENT {
             let resp = cosign_settlement(
@@ -3259,7 +3318,7 @@ mod tests {
         );
         tas.lock().await.insert(
             "b".to_string(),
-            ta_request("b", recipient, nullifiers_b, outputs, root, ext_amount),
+            (ta_request("b", recipient, nullifiers_b, outputs, root, ext_amount), String::new()),
         );
         let bypass = cosign_settlement(
             Some(&kp),
@@ -3299,7 +3358,7 @@ mod tests {
             let id = format!("s{i}");
             tas.lock().await.insert(
                 id.clone(),
-                ta_request(&id, recipient, nullifiers, outputs, root, ext_amount),
+                (ta_request(&id, recipient, nullifiers, outputs, root, ext_amount), String::new()),
             );
             let payload = ta_payload(
                 kp.pubkey().to_bytes(),
@@ -3337,7 +3396,7 @@ mod tests {
         let ext_amount = -1_000_000_000i64;
         tas.lock().await.insert(
             "t1".to_string(),
-            ta_request("t1", recipient, nullifiers, outputs, root, ext_amount),
+            (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), String::new()),
         );
 
         // Leader tries to redirect the withdrawal leg to a different recipient.
@@ -3634,4 +3693,317 @@ mod tests {
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
     }
+}
+
+// ========================================================================
+// #1664 Authority Validation Tests
+// ========================================================================
+
+/// Test 1: Authority correct - leader approved matches payload authority.
+/// Expected: acceptance and valid signature.
+#[tokio::test]
+async fn cosign_authority_correct_accepts() {
+    let kp = Arc::new(Keypair::new());
+    let tas = Arc::new(Mutex::new(HashMap::new()));
+
+    let recipient = [9u8; 32];
+    let nullifiers = [[7u8; 32], [8u8; 32]];
+    let outputs = [[5u8; 32], [6u8; 32]];
+    let root = [2u8; 32];
+    let ext_amount = -1_000_000_000i64;
+
+    // Insert verified transact with leader_authority matching the leader's keypair
+    tas.lock().await.insert(
+        "t1".to_string(),
+        (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), kp.pubkey().to_string()),
+    );
+
+    let payload = ta_payload(
+        kp.pubkey().to_bytes(), // authority matches leader
+        recipient,
+        nullifiers,
+        outputs,
+        root,
+        ext_amount,
+    );
+
+    let resp = cosign_settlement(
+        Some(&kp),
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("t1", SettlementKind::Transact, &payload),
+    )
+    .await;
+
+    assert_eq!(resp.request_id, "t1");
+    assert_eq!(resp.wallet_pubkey, kp.pubkey().to_string());
+    let sig_bytes = resp.signature.expect("must sign a transact with correct authority");
+    let message = build_settlement_message(&payload).expect("build message");
+    let sig = solana_sdk::signature::Signature::try_from(sig_bytes.as_slice()).expect("sig");
+    assert!(
+        sig.verify(&kp.pubkey().to_bytes(), &message.serialize()),
+        "the returned signature must be valid over the rebuilt settlement message"
+    );
+}
+
+/// Test 2: Authority incorrect - payload authority doesn't match leader_authority.
+/// Expected: rejection, no signature.
+#[tokio::test]
+async fn cosign_authority_mismatch_rejects() {
+    let kp = Arc::new(Keypair::new());
+    let other_kp = Arc::new(Keypair::new()); // Different keypair = different authority
+    let tas = Arc::new(Mutex::new(HashMap::new()));
+
+    let recipient = [9u8; 32];
+    let nullifiers = [[7u8; 32], [8u8; 32]];
+    let outputs = [[5u8; 32], [6u8; 32]];
+    let root = [2u8; 32];
+    let ext_amount = -1_000_000_000i64;
+
+    // Insert verified transact with leader_authority = kp's pubkey
+    tas.lock().await.insert(
+        "t1".to_string(),
+        (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), kp.pubkey().to_string()),
+    );
+
+    // But payload has OTHER_KP's authority (mismatch)
+    let payload = ta_payload(
+        other_kp.pubkey().to_bytes(), // authority DOES NOT match leader
+        recipient,
+        nullifiers,
+        outputs,
+        root,
+        ext_amount,
+    );
+
+    let resp = cosign_settlement(
+        Some(&kp), // kp is the validator, but payload authority is other_kp
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("t1", SettlementKind::Transact, &payload),
+    )
+    .await;
+
+    assert_eq!(resp.signature, None, "must reject when payload authority mismatches leader_authority");
+    assert_eq!(resp.request_id, "t1");
+    assert_eq!(resp.wallet_pubkey, String::new());
+}
+
+/// Test 3: Authority absent/empty - leader_authority not set in cache.
+/// Expected: safe rejection (no signature).
+#[tokio::test]
+async fn cosign_authority_absent_rejects() {
+    let kp = Arc::new(Keypair::new());
+    let tas = Arc::new(Mutex::new(HashMap::new()));
+
+    let recipient = [9u8; 32];
+    let nullifiers = [[7u8; 32], [8u8; 32]];
+    let outputs = [[5u8; 32], [6u8; 32]];
+    let root = [2u8; 32];
+    let ext_amount = -1_000_000_000i64;
+
+    // Insert verified transact WITHOUT leader_authority (empty string)
+    tas.lock().await.insert(
+        "t1".to_string(),
+        (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), String::new()),
+    );
+
+    let payload = ta_payload(
+        kp.pubkey().to_bytes(),
+        recipient,
+        nullifiers,
+        outputs,
+        root,
+        ext_amount,
+    );
+
+    let resp = cosign_settlement(
+        Some(&kp),
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("t1", SettlementKind::Transact, &payload),
+    )
+    .await;
+
+    assert_eq!(resp.signature, None, "must reject when leader_authority is empty");
+    assert_eq!(resp.request_id, "t1");
+    assert_eq!(resp.wallet_pubkey, String::new());
+}
+
+/// Test 4: Authority manipulation / cache tampering - attempt to use a request
+/// whose authority was altered, substituted, or doesn't correspond to the
+/// original approval.
+/// Expected: rejection without signature.
+#[tokio::test]
+async fn cosign_authority_tampered_rejects() {
+    let kp = Arc::new(Keypair::new());
+    let tas = Arc::new(Mutex::new(HashMap::new()));
+
+    let recipient = [9u8; 32];
+    let nullifiers = [[7u8; 32], [8u8; 32]];
+    let outputs = [[5u8; 32], [6u8; 32]];
+    let root = [2u8; 32];
+    let ext_amount = -1_000_000_000i64;
+
+    // Insert legitimate transact with kp's authority
+    tas.lock().await.insert(
+        "t1".to_string(),
+        (ta_request("t1", recipient, nullifiers, outputs, root, ext_amount), kp.pubkey().to_string()),
+    );
+
+    // Attacker tries to substitute authority in payload to a different value
+    // while keeping same request_id and params
+    let attacker_kp = Arc::new(Keypair::new());
+    let payload = ta_payload(
+        attacker_kp.pubkey().to_bytes(), // Different authority!
+        recipient,
+        nullifiers,
+        outputs,
+        root,
+        ext_amount,
+    );
+
+    let resp = cosign_settlement(
+        Some(&kp),
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("t1", SettlementKind::Transact, &payload),
+    )
+    .await;
+
+    assert_eq!(resp.signature, None, "must reject authority tampering attempt");
+    assert_eq!(resp.request_id, "t1");
+    assert_eq!(resp.wallet_pubkey, String::new());
+}
+
+/// Test 5: Authority validation for SPL settlement path.
+/// Verifies that authority validation also works for TransactSpl.
+#[tokio::test]
+async fn cosign_authority_spl_mismatch_rejects() {
+    let kp = Arc::new(Keypair::new());
+    let tas = Arc::new(Mutex::new(HashMap::new()));
+
+    let recipient_token_account = [9u8; 32];
+    let mint = [1u8; 32];
+    let nullifiers = [[7u8; 32], [8u8; 32]];
+    let outputs = [[5u8; 32], [6u8; 32]];
+    let root = [2u8; 32];
+    let ext_amount = -1_000_000_000i64;
+
+    // Insert SPL request with kp's authority
+    tas.lock().await.insert(
+        "t1-spl".to_string(),
+        (
+            TransactVerificationRequest {
+                request_id: "t1-spl".to_string(),
+                recipient: [9u8; 32], // ignored for SPL
+                mint: Some(mint),
+                nullifiers,
+                output_commitments: outputs,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+                ciphertexts: ["ab".repeat(88), "cd".repeat(88)],
+                timestamp: 0,
+            },
+            kp.pubkey().to_string(),
+        ),
+    );
+
+    // Payload with mismatched authority
+    let attacker_kp = Arc::new(Keypair::new());
+    let payload = CoSignPayload {
+        program_id: [1u8; 32],
+        authority: attacker_kp.pubkey().to_bytes(), // MISMATCH
+        bridge_vault: [3u8; 32],
+        blockhash: [4u8; 32],
+        quorum_validators: vec![kp.pubkey().to_bytes()],
+        params: SettlementParams::TransactSpl {
+            recipient_token_account,
+            mint,
+            nullifiers,
+            output_commitments: outputs,
+            root,
+            ext_amount,
+            proof: vec![0u8; 256],
+        },
+    };
+
+    let resp = cosign_settlement(
+        Some(&kp),
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("t1-spl", SettlementKind::Transact, &payload),
+    )
+    .await;
+
+    assert_eq!(resp.signature, None, "must reject SPL authority mismatch");
+}
+
+/// Test 6: Replay attack - same request_id with different authority.
+/// Verifies that replay with different authority is rejected.
+#[tokio::test]
+async fn cosign_replay_different_authority_rejects() {
+    let kp = Arc::new(Keypair::new());
+    let tas = Arc::new(Mutex::new(HashMap::new()));
+
+    let recipient = [9u8; 32];
+    let nullifiers = [[7u8; 32], [8u8; 32]];
+    let outputs = [[5u8; 32], [6u8; 32]];
+    let root = [2u8; 32];
+    let ext_amount = -1_000_000_000i64;
+
+    // First legitimate request
+    tas.lock().await.insert(
+        "replay-test".to_string(),
+        (ta_request("replay-test", recipient, nullifiers, outputs, root, ext_amount), kp.pubkey().to_string()),
+    );
+
+    // First payload with correct authority - should succeed
+    let payload1 = ta_payload(
+        kp.pubkey().to_bytes(),
+        recipient,
+        nullifiers,
+        outputs,
+        root,
+        ext_amount,
+    );
+
+    let resp1 = cosign_settlement(
+        Some(&kp),
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("replay-test", SettlementKind::Transact, &payload1),
+    )
+    .await;
+    assert!(resp1.signature.is_some(), "first request with correct authority should succeed");
+
+    // Replay with different authority - should fail
+    let attacker_kp = Arc::new(Keypair::new());
+    let payload2 = ta_payload(
+        attacker_kp.pubkey().to_bytes(), // Different authority!
+        recipient,
+        nullifiers,
+        outputs,
+        root,
+        ext_amount,
+    );
+
+    let resp2 = cosign_settlement(
+        Some(&kp),
+        &configured_program(),
+        &tas,
+        &Arc::new(Mutex::new(HashMap::new())),
+        cosign_req("replay-test", SettlementKind::Transact, &payload2),
+    )
+    .await;
+
+    assert_eq!(resp2.signature, None, "replay with different authority must be rejected");
+}
 }
