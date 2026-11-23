@@ -116,20 +116,18 @@ async fn init_spl_pool(
     banks.process_transaction(cap_tx).await.unwrap();
 }
 
-fn deposit_spl_ix(
+fn deposit_spl_with_recipient_ix(
     program_id: Pubkey,
     mint: Pubkey,
     depositor: Pubkey,
     depositor_token_account: Pubkey,
     amount: u64,
+    pubkey: [u8; 32],
+    blinding: [u8; 32],
 ) -> Instruction {
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
     let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
     let (asset_vault, _, asset_config) = asset_vault_pdas(program_id, mint);
-    let mut pubkey = [0u8; 32];
-    pubkey[0] = 7;
-    let mut blinding = [0u8; 32];
-    blinding[0] = 9;
     Instruction {
         program_id,
         data: instruction::DepositNoteSpl {
@@ -150,6 +148,28 @@ fn deposit_spl_ix(
         }
         .to_account_metas(None),
     }
+}
+
+fn deposit_spl_ix(
+    program_id: Pubkey,
+    mint: Pubkey,
+    depositor: Pubkey,
+    depositor_token_account: Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 7;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 9;
+    deposit_spl_with_recipient_ix(
+        program_id,
+        mint,
+        depositor,
+        depositor_token_account,
+        amount,
+        pubkey,
+        blinding,
+    )
 }
 
 fn token_balance(account: &Account) -> u64 {
@@ -311,4 +331,69 @@ async fn deposit_note_spl_closed_until_cap_opened() {
     tx.sign(&[&depositor], blockhash);
     let result = banks.process_transaction(tx).await;
     assert!(result.is_err(), "deposits are closed at cap 0");
+}
+
+#[tokio::test]
+async fn deposit_note_spl_allows_recipient_key_distinct_from_depositor() {
+    // Invariant (#1666): deposit_note_spl deliberately decouples the depositor
+    // (transaction signer) from the recipient note's spend public key (`pubkey`).
+    // This allows permissionless transfers / relayer deposits to third parties.
+    // Client recovery routines must independently verify the note recipient
+    // key and commitment before crediting recovered notes.
+    let program_id = paraloom_program::ID;
+    let mut pt = program_test(program_id);
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+
+    let depositor = Keypair::new();
+    pt.add_account(
+        depositor.pubkey(),
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let depositor_token = add_token_account(&mut pt, mint, depositor.pubkey(), DEPOSITOR_FUND);
+
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    init_spl_pool(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        mint,
+        DEPOSIT * 10,
+    )
+    .await;
+
+    // Distinct recipient spend key (e.g. from a separate party / wallet).
+    let mut recipient_pubkey = [0u8; 32];
+    recipient_pubkey[0] = 42;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 99;
+
+    let ix = deposit_spl_with_recipient_ix(
+        program_id,
+        mint,
+        depositor.pubkey(),
+        depositor_token,
+        DEPOSIT,
+        recipient_pubkey,
+        blinding,
+    );
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&depositor.pubkey()));
+    tx.sign(&[&depositor], blockhash);
+    banks
+        .process_transaction(tx)
+        .await
+        .expect("deposit with distinct recipient key must succeed");
+
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 1, "leaf appended for recipient note");
 }
