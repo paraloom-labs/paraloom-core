@@ -147,8 +147,11 @@ impl VoteTally {
 
     /// Whether consensus has been reached among the eligible wallets — those in
     /// `eligible_wallets` (the staked on-chain co-sign set minus equivocators).
+    ///
+    /// Only `Valid` votes count toward reaching consensus; a quorum of `Invalid`
+    /// votes represents consensus rejection rather than agreement on validity.
     pub async fn has_consensus(&self, eligible_wallets: &HashSet<String>) -> bool {
-        self.count_eligible_votes(eligible_wallets).await >= self.min_validators_for_consensus
+        self.count_eligible_valid_votes(eligible_wallets).await >= self.min_validators_for_consensus
     }
 
     /// Check if consensus deadline has passed
@@ -157,12 +160,12 @@ impl VoteTally {
         now > self.deadline
     }
 
-    /// Number of submitted votes whose wallet is in `eligible_wallets`.
-    async fn count_eligible_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
+    /// Number of submitted `Valid` votes whose wallet is in `eligible_wallets`.
+    async fn count_eligible_valid_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
         let votes = self.votes.read().await;
         votes
-            .keys()
-            .filter(|wallet| eligible_wallets.contains(*wallet))
+            .iter()
+            .filter(|(wallet, rec)| eligible_wallets.contains(*wallet) && rec.vote.is_valid())
             .count()
     }
 
@@ -357,5 +360,59 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+    }
+
+    #[tokio::test]
+    async fn has_consensus_counts_only_valid_votes() {
+        let tally = VoteTally::new("req-1".to_string(), 2, 3);
+        // Two eligible wallets vote Invalid
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "invalid proof 1".to_string(),
+                },
+                vec![1],
+            )
+            .await
+            .unwrap();
+        tally
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Invalid {
+                    reason: "invalid proof 2".to_string(),
+                },
+                vec![2],
+            )
+            .await
+            .unwrap();
+
+        let eligible = wallets(&["W1", "W2", "W3"]);
+        // Two invalid votes must NOT trigger has_consensus even with min_validators = 2
+        assert!(!tally.has_consensus(&eligible).await);
+
+        // Submitting two valid votes reaches consensus
+        let tally_valid = VoteTally::new("req-2".to_string(), 2, 3);
+        tally_valid
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
+            )
+            .await
+            .unwrap();
+        tally_valid
+            .submit_vote(
+                "W2".into(),
+                NodeId(vec![2]),
+                VerificationVote::Valid,
+                vec![2],
+            )
+            .await
+            .unwrap();
+        assert!(tally_valid.has_consensus(&eligible).await);
     }
 }
