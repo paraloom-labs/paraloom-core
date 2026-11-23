@@ -1814,13 +1814,27 @@ async fn handle_validator_command(command: ValidatorCommands) -> Result<()> {
                     .send_and_confirm_transaction(&tx)
                     .context("Failed to send transaction")?;
 
+                let remaining_rewards = client
+                    .get_account_data(&validator_pda)
+                    .ok()
+                    .as_deref()
+                    .and_then(decode_validator_pending_rewards)
+                    .unwrap_or(0);
+                let claimed = pending_rewards.saturating_sub(remaining_rewards);
+
                 println!("\n[OK] Rewards claimed successfully!");
                 println!("Signature: {}", signature);
                 println!("Validator: {}", validator.pubkey());
                 println!(
                     "Claimed:   {} SOL",
-                    pending_rewards as f64 / LAMPORTS_PER_SOL as f64
+                    claimed as f64 / LAMPORTS_PER_SOL as f64
                 );
+                if remaining_rewards > 0 {
+                    println!(
+                        "Remaining: {} SOL pending (partial claim due to vault balance)",
+                        remaining_rewards as f64 / LAMPORTS_PER_SOL as f64
+                    );
+                }
             }
 
             #[cfg(not(feature = "solana-bridge"))]

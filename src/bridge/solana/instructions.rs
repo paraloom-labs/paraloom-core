@@ -482,10 +482,11 @@ pub fn create_withdraw_unbonded_stake_instruction(
 
 /// Create a `claim_rewards` instruction.
 ///
-/// Drains accumulated settlement fees (`pending_rewards`) from `bridge_vault`
-/// to the validator wallet and resets `pending_rewards = 0`.
+/// Claims accumulated settlement fees (`pending_rewards`) from `bridge_vault`
+/// to the validator wallet up to the vault's rent-exempt available balance, reducing
+/// `pending_rewards` (or resetting to 0 when fully claimed).
 /// Required before `withdraw_unbonded_stake` can succeed if the validator
-/// ever settled transactions and earned fees (#434, #438).
+/// ever settled transactions and earned fees (#434, #438, #1644).
 /// Account order matches the `ClaimRewards` struct:
 /// bridge_state, validator_account (mut), bridge_vault (mut), validator (mut signer),
 /// system_program. Data is the discriminator only (no args).

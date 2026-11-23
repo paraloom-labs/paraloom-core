@@ -1015,7 +1015,18 @@ pub mod paraloom_program {
             BridgeError::InvalidAmount
         );
 
-        let reward_amount = validator_account.pending_rewards;
+        // The vault is a system account and must stay rent-exempt after payout.
+        // Guard on retained balance: if available funds cannot cover anything,
+        // fail cleanly with InsufficientFunds rather than triggering a runtime error.
+        let vault_balance = ctx.accounts.bridge_vault.lamports();
+        let rent_floor = Rent::get()?.minimum_balance(0);
+        let available = vault_balance.saturating_sub(rent_floor);
+        require!(available > 0, BridgeError::InsufficientFunds);
+
+        // Support partial claims: when the vault cannot cover full pending rewards,
+        // pay out whatever is available so the validator can drain rewards incrementally
+        // and exit without getting stuck.
+        let reward_amount = validator_account.pending_rewards.min(available);
 
         let vault_bump = ctx.bumps.bridge_vault;
         let seeds = &[b"bridge_vault".as_ref(), &[vault_bump]];
@@ -1033,7 +1044,10 @@ pub mod paraloom_program {
             reward_amount,
         )?;
 
-        validator_account.pending_rewards = 0;
+        validator_account.pending_rewards = validator_account
+            .pending_rewards
+            .checked_sub(reward_amount)
+            .ok_or(BridgeError::InvalidAmount)?;
         validator_account.total_earnings = validator_account
             .total_earnings
             .checked_add(reward_amount)
