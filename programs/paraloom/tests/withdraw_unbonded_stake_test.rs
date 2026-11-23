@@ -23,6 +23,7 @@ use solana_program_test::{processor, tokio, BanksClientError, ProgramTest, Progr
 use solana_sdk::{
     account::Account,
     instruction::{Instruction, InstructionError},
+    program_pack::Pack,
     signature::{Keypair, Signer},
     transaction::{Transaction, TransactionError},
 };
@@ -30,7 +31,8 @@ use solana_sdk::{
 mod common;
 use common::{
     add_program_data, add_stake_mint, entry, funded_validator, init_validator_registry_ix,
-    register_validator_ix, slash_validator_ix, withdraw_unbonded_ix,
+    register_validator_ix, slash_validator_ix, stake_vault_pdas, withdraw_unbonded_ix,
+    TEST_TOKEN_FUND,
 };
 
 /// Token half of the dual-stake used across these tests (== MIN_TOKEN_STAKE).
@@ -465,6 +467,14 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         acc.unbonding_amount, MIN_VALIDATOR_STAKE,
         "the full stake must be routed into unbonding, not stranded"
     );
+    assert_eq!(
+        acc.token_stake_amount, 0,
+        "active token stake zeroed on deactivate"
+    );
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "dual-stake token collateral must be routed into unbonding, not stranded"
+    );
     assert!(
         acc.unbonding_slot >= UNBONDING_SLOTS,
         "unbonding_slot = deactivation-era slot + UNBONDING_SLOTS"
@@ -517,4 +527,199 @@ async fn deactivate_routes_stake_to_unbonding_then_withdraws() {
         closed.is_none() || closed.unwrap().lamports == 0,
         "PDA must be closed after withdraw"
     );
+
+    // Verify dual-stake token collateral returned to the validator and vacated the vault (#1640).
+    let vt_raw = ctx
+        .banks_client
+        .get_account(validator_token)
+        .await
+        .unwrap()
+        .unwrap();
+    let vt_state = spl_token::state::Account::unpack(&vt_raw.data).unwrap();
+    assert_eq!(
+        vt_state.amount, TEST_TOKEN_FUND,
+        "validator token balance must be fully restored with returned collateral"
+    );
+    let (vault, _) = stake_vault_pdas(program_id);
+    let vault_raw = ctx
+        .banks_client
+        .get_account(vault)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_state = spl_token::state::Account::unpack(&vault_raw.data).unwrap();
+    assert_eq!(
+        vault_state.amount, 0,
+        "stake vault must release the unbonded token collateral"
+    );
+}
+
+/// Regression (#1640): `deactivate_validator` remediation path for validators
+/// previously deactivated under an older release where dual-stake token collateral
+/// was left stranded on an inactive PDA. Calling `deactivate_validator` again
+/// routes the stranded tokens into `token_unbonding_amount` without double-decrementing
+/// registry counters, allowing the validator to reclaim their collateral via
+/// `withdraw_unbonded_stake`.
+#[tokio::test]
+async fn deactivate_remediates_stranded_tokens_on_inactive_validator() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (_program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let validator = Keypair::new();
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (validator_pda, _) =
+        Pubkey::find_program_address(&[b"validator", validator.pubkey().as_ref()], &program_id);
+
+    // Bake an inactive validator PDA into genesis with stranded token collateral
+    // (simulating a PDA that was deactivated before the fix).
+    let acct_len = 8 + ValidatorAccount::INIT_SPACE;
+    let va = ValidatorAccount {
+        validator: validator.pubkey(),
+        stake_amount: 0,
+        reputation_score: 100,
+        total_tasks_verified: 0,
+        successful_verifications: 0,
+        registered_at: 0,
+        last_active: 0,
+        is_active: false,
+        pending_rewards: 0,
+        total_earnings: 0,
+        times_slashed: 0,
+        unbonding_amount: MIN_VALIDATOR_STAKE,
+        unbonding_slot: 100,
+        token_stake_amount: TOKEN_STAKE,
+        token_unbonding_amount: 0,
+    };
+    let mut data = ValidatorAccount::DISCRIMINATOR.to_vec();
+    va.serialize(&mut data).unwrap();
+    let rent_floor = Rent::default().minimum_balance(acct_len);
+    pt.add_account(
+        validator_pda,
+        Account {
+            lamports: rent_floor + MIN_VALIDATOR_STAKE,
+            data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    // Fund validator wallet for rent/fees.
+    pt.add_account(
+        validator.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let validator_token = common::add_token_account(&mut pt, stake_mint, validator.pubkey(), TEST_TOKEN_FUND - TOKEN_STAKE);
+    common::bake_stake_vault(&mut pt, stake_mint, program_id, TOKEN_STAKE);
+
+    // Bake the registry into genesis (avoiding init collision with pre-baked vault).
+    let reg = ValidatorRegistry {
+        authority: upgrade_authority.pubkey(),
+        total_validators: 1,
+        active_validators: 0,
+        minimum_stake: MIN_VALIDATOR_STAKE,
+        total_active_stake: 0,
+        stake_mint,
+        min_token_stake: TOKEN_STAKE,
+    };
+    let mut reg_data = ValidatorRegistry::DISCRIMINATOR.to_vec();
+    reg.serialize(&mut reg_data).unwrap();
+    let reg_rent = Rent::default().minimum_balance(8 + ValidatorRegistry::INIT_SPACE);
+    pt.add_account(
+        registry_pda,
+        Account {
+            lamports: reg_rent,
+            data: reg_data,
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+
+    // 1. Call deactivate_validator on the inactive account holding stranded tokens.
+    send(
+        &mut ctx,
+        &upgrade_authority,
+        Instruction {
+            program_id,
+            data: instruction::DeactivateValidator {}.data(),
+            accounts: accounts::DeactivateValidator {
+                validator_account: validator_pda,
+                validator_registry: registry_pda,
+                authority: upgrade_authority.pubkey(),
+            }
+            .to_account_metas(None),
+        },
+    )
+    .await
+    .expect("deactivate remediation call");
+
+    let acc = load_validator(&mut ctx, validator_pda).await;
+    assert!(!acc.is_active, "must remain inactive");
+    assert_eq!(acc.token_stake_amount, 0, "stranded token stake cleared");
+    assert_eq!(
+        acc.token_unbonding_amount, TOKEN_STAKE,
+        "stranded token stake moved into token_unbonding_amount"
+    );
+    assert_eq!(
+        acc.unbonding_amount, MIN_VALIDATOR_STAKE,
+        "SOL unbonding preserved"
+    );
+    assert_eq!(
+        acc.unbonding_slot, 100,
+        "pre-existing unbonding_slot preserved"
+    );
+
+    // Registry counters must not underflow or decrement from 0.
+    let registry_raw = ctx
+        .banks_client
+        .get_account(registry_pda)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = ValidatorRegistry::try_deserialize(&mut registry_raw.data.as_slice()).unwrap();
+    assert_eq!(registry.active_validators, 0);
+    assert_eq!(registry.total_active_stake, 0);
+
+    // 3. Warp past unbonding slot and withdraw.
+    ctx.warp_to_slot(100).expect("warp past slot 100");
+
+    send(
+        &mut ctx,
+        &validator,
+        withdraw_unbonded_ix(program_id, validator.pubkey(), stake_mint, validator_token),
+    )
+    .await
+    .expect("withdraw after delay");
+
+    // Verify token balance fully restored to TEST_TOKEN_FUND.
+    let vt_raw = ctx
+        .banks_client
+        .get_account(validator_token)
+        .await
+        .unwrap()
+        .unwrap();
+    let vt_state = spl_token::state::Account::unpack(&vt_raw.data).unwrap();
+    assert_eq!(
+        vt_state.amount, TEST_TOKEN_FUND,
+        "validator token balance restored from remediated unbonding"
+    );
+
+    let (vault, _) = stake_vault_pdas(program_id);
+    let vault_raw = ctx
+        .banks_client
+        .get_account(vault)
+        .await
+        .unwrap()
+        .unwrap();
+    let vault_state = spl_token::state::Account::unpack(&vault_raw.data).unwrap();
+    assert_eq!(vault_state.amount, 0, "stake vault vacated");
 }

@@ -1629,27 +1629,45 @@ pub mod paraloom_program {
     /// set — e.g. `is_active` PDAs left behind by an earlier
     /// `reset_validator_registry` that rebuilt the counters but did not
     /// deactivate the excluded accounts, which would otherwise still clear a
-    /// stale-low quorum denominator. It does not move the staked lamports; those
-    /// are returned through `unregister_validator`.
+    /// stale-low quorum denominator. It routes both SOL stake and dual-stake
+    /// token collateral into the unbonding window (`unbonding_amount` and
+    /// `token_unbonding_amount`), reclaimable via `withdraw_unbonded_stake`
+    /// after `UNBONDING_SLOTS`.
     pub fn deactivate_validator(ctx: Context<DeactivateValidator>) -> Result<()> {
         let was_active = ctx.accounts.validator_account.is_active;
         let stake = ctx.accounts.validator_account.stake_amount;
+        let token_stake = ctx.accounts.validator_account.token_stake_amount;
         let who = ctx.accounts.validator_account.validator;
         if was_active {
             let now_slot = Clock::get()?.slot;
             let v = &mut ctx.accounts.validator_account;
             v.is_active = false;
-            // Route the stake into unbonding rather than stranding it: a
-            // deactivated validator can't `unregister` (that requires
-            // is_active), so without this its lamports would have no exit and be
-            // frozen forever. Reclaimable via `withdraw_unbonded_stake` after
-            // the delay, same as unregister.
+            // Route both SOL stake and dual-stake token collateral into
+            // unbonding rather than stranding them: a deactivated validator can't
+            // `unregister` (that requires is_active), so without this its
+            // lamports and token collateral would have no exit and be frozen
+            // forever. Reclaimable via `withdraw_unbonded_stake` after the delay,
+            // same as unregister.
             v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
+            v.token_stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
             registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
             registry.active_validators = registry.active_validators.saturating_sub(1);
+        } else if token_stake > 0 || stake > 0 {
+            // Remediation for validators previously deactivated before the dual-stake
+            // unbonding fix: route any stranded collateral into the unbonding window.
+            let now_slot = Clock::get()?.slot;
+            let v = &mut ctx.accounts.validator_account;
+            v.unbonding_amount = v.unbonding_amount.saturating_add(stake);
+            v.token_unbonding_amount = v.token_unbonding_amount.saturating_add(token_stake);
+            if v.unbonding_slot == 0 {
+                v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
+            }
+            v.stake_amount = 0;
+            v.token_stake_amount = 0;
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -1673,12 +1691,15 @@ pub mod paraloom_program {
     pub fn withdraw_unbonded_stake(ctx: Context<WithdrawUnbondedStake>) -> Result<()> {
         let validator_account = &mut ctx.accounts.validator_account;
         let amount = validator_account.unbonding_amount;
+        let token_amount = validator_account.token_unbonding_amount;
         let zero_amount_exit_close = amount == 0
+            && token_amount == 0
             && !validator_account.is_active
             && validator_account.stake_amount == 0
+            && validator_account.token_stake_amount == 0
             && validator_account.unbonding_slot > 0;
         require!(
-            amount > 0 || zero_amount_exit_close,
+            amount > 0 || token_amount > 0 || zero_amount_exit_close,
             BridgeError::NothingUnbonding
         );
         require!(
@@ -1711,7 +1732,6 @@ pub mod paraloom_program {
         // Return the token half from the shared vault, signed by the
         // vault-authority PDA. Released together with the SOL unbonding, once
         // the same window has elapsed.
-        let token_amount = validator_account.token_unbonding_amount;
         validator_account.token_unbonding_amount = 0;
         if token_amount > 0 {
             let auth_bump = ctx.bumps.stake_vault_authority;
@@ -2752,17 +2772,18 @@ pub struct ValidatorAccount {
     pub pending_rewards: u64,
     pub total_earnings: u64,
     pub times_slashed: u64,
-    /// Lamports withheld after `unregister_validator` or a deactivating slash,
-    /// pending release by `withdraw_unbonded_stake` (0 when nothing is pending).
+    /// Lamports withheld after `unregister_validator`, `deactivate_validator`,
+    /// or a deactivating slash, pending release by `withdraw_unbonded_stake`
+    /// (0 when nothing is pending).
     pub unbonding_amount: u64,
     /// Earliest slot at which withheld `unbonding_amount` may be withdrawn.
     pub unbonding_slot: u64,
     /// The validator's locked PARALOOM-token stake (the dual-stake token half),
     /// held in the shared `stake_token_vault` and accounted here. Parallels
     /// `stake_amount`: set on register, moved to `token_unbonding_amount` on
-    /// unregister, slashed (burned from the vault) alongside the SOL stake.
+    /// unregister or deactivate, slashed (burned from the vault) alongside the SOL stake.
     pub token_stake_amount: u64,
-    /// Token stake withheld in the vault after unregister/deactivating-slash,
+    /// Token stake withheld in the vault after unregister/deactivate/deactivating-slash,
     /// released to the validator by `withdraw_unbonded_stake` once the same
     /// `unbonding_slot` elapses. Parallels `unbonding_amount` for the token.
     pub token_unbonding_amount: u64,
