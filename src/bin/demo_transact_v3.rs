@@ -278,18 +278,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 5. watch the quorum settle: recipient balance + nullifier PDAs ──────
     println!("[5/5] waiting for the 2-of-2 quorum settlement...");
     let (nf_pda, _) = derive_nullifier_account(&program_id, &fr_to_le(&nf0));
+    let fee = AMOUNT * 25 / 10_000;
+    let expected_net = AMOUNT - fee;
     for i in 0..40 {
         std::thread::sleep(std::time::Duration::from_secs(3));
         let bal = client.get_balance(&recipient.pubkey()).unwrap_or(0);
-        if bal > 0 {
-            let fee = AMOUNT * 25 / 10_000;
+        let nf_exists = client.get_account(&nf_pda).is_ok();
+        if bal >= expected_net && nf_exists {
             println!("\n=== SETTLED ===");
             println!(
                 "recipient balance: {} lamports (expected {})",
                 bal,
-                AMOUNT - fee
+                expected_net
             );
-            let nf_exists = client.get_account(&nf_pda).is_ok();
             println!("nullifier PDA recorded: {nf_exists}");
             let raw = client.get_account_data(&tree_pda)?;
             let ni = u64::from_le_bytes(raw[8..16].try_into()?);
