@@ -465,8 +465,9 @@ pub mod paraloom_program {
                 .ok_or(BridgeError::InvalidAmount)?;
 
             // Maintain the public withdrawal-volume aggregate, mirroring
-            // `total_deposited` on the deposit side. Checked, though a vault
-            // balance this large is unreachable.
+            // `total_deposited` on the deposit side so net pool liability
+            // (`total_deposited - total_withdrawn`) is accurately tracked.
+            // Checked, though a vault balance this large is unreachable.
             bridge_state.total_withdrawn = bridge_state
                 .total_withdrawn
                 .checked_add(gross)
@@ -2654,7 +2655,10 @@ pub struct BridgeState {
     /// the rest of the struct.
     pub program_version: u32,
     pub authority: Pubkey,
+    /// Cumulative lamports deposited into the bridge vault across all `deposit_note` calls.
     pub total_deposited: u64,
+    /// Cumulative gross lamports withdrawn from the bridge vault across all `transact` calls.
+    /// The pool's net outstanding liability is tracked as `total_deposited.saturating_sub(total_withdrawn)`.
     pub total_withdrawn: u64,
     pub deposit_count: u64,
     pub withdrawal_count: u64,

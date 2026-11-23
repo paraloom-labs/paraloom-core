@@ -440,6 +440,15 @@ async fn transact_spends_deposited_note_and_withdraws_net_of_fee() {
     let state_raw = banks_client.get_account(state_pda).await.unwrap().unwrap();
     let state = BridgeState::try_deserialize(&mut state_raw.data.as_slice()).unwrap();
     assert_eq!(state.withdrawal_count, 1);
+    // Pool liability accounting: total_deposited and total_withdrawn track gross flows,
+    // ensuring the net outstanding pool liability (total_deposited - total_withdrawn)
+    // is accurately maintained across withdrawals (#1636).
+    assert_eq!(state.total_deposited, fx::FIXTURE_DEPOSIT_AMOUNT);
     // Withdrawal volume is now tracked (gross = |ext_amount|, was stuck at 0).
     assert_eq!(state.total_withdrawn, gross);
+    assert_eq!(
+        state.total_deposited.saturating_sub(state.total_withdrawn),
+        fx::FIXTURE_DEPOSIT_AMOUNT - gross,
+        "pool net liability must reflect withdrawals"
+    );
 }
