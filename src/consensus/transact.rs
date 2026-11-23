@@ -714,8 +714,21 @@ impl TransactVerificationCoordinator {
             *self.onchain_stakes.write().await = stakes.clone();
         }
 
+        let mut validators = self.validators.write().await;
         let mut leader_selector = self.leader_selector.write().await;
         leader_selector.apply_onchain_stakes(&stakes);
+        if !stakes.is_empty() {
+            validators.retain(|id| {
+                matches!(
+                    leader_selector
+                        .get_validator(id)
+                        .and_then(|v| v.wallet_pubkey.as_deref()),
+                    Some(w) if stakes.contains_key(w)
+                )
+            });
+        }
+        drop(leader_selector);
+        drop(validators);
         log::debug!(
             "Reconciled consensus stakes against on-chain state ({} staked wallets, registry_total={})",
             stakes.len(),
@@ -797,15 +810,17 @@ impl TransactVerificationCoordinator {
             ));
         }
 
-        let validators = self.validators.read().await;
+        let validators_len = self.validators.read().await.len();
+        let eligible_len = self.eligible_wallets().await.len();
+        let available = validators_len.max(eligible_len);
 
-        if validators.is_empty() {
+        if available == 0 {
             return Err(anyhow!("No validators available"));
         }
-        if validators.len() < self.min_validators_for_consensus {
+        if available < self.min_validators_for_consensus {
             return Err(anyhow!(
                 "Not enough validators: {} < {}",
-                validators.len(),
+                available,
                 self.min_validators_for_consensus
             ));
         }
@@ -1571,5 +1586,60 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn flapped_validator_before_start_verification_still_starts_and_settles() {
+        let (coord, mut approvals) = coord_2of2().await;
+        // Co-signer W1 flaps BEFORE start_verification is called on a new spend.
+        coord.unregister_validator(&NodeId(vec![1])).await;
+        assert_eq!(coord.validator_count().await, 1);
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord
+            .start_verification(req)
+            .await
+            .expect("eligible on-chain co-sign wallets must keep start_verification open across a flap");
+
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "staked quorum must settle after starting verification across a flap"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_onchain_stakes_prunes_pre_snapshot_non_validator_peers() {
+        let coordinator = TransactVerificationCoordinator::new();
+        // Before the first RPC snapshot, non-validator peers can enter self.validators.
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![0xC0]), Some("COMPUTEwallet".to_string()))
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![0xC1]), None)
+            .await;
+        coordinator
+            .register_validator_with_wallet(NodeId(vec![0x01]), Some("VAL1wallet".to_string()))
+            .await;
+        assert_eq!(coordinator.validator_count().await, 3);
+
+        coordinator
+            .sync_onchain_stakes(stakes(&[("VAL1wallet", 1_000_000_000)]), 1_000_000_000)
+            .await;
+
+        assert!(
+            !coordinator.is_registered_validator(&NodeId(vec![0xC0])).await,
+            "compute/non-validator peer admitted before first snapshot must be pruned"
+        );
+        assert!(
+            !coordinator.is_registered_validator(&NodeId(vec![0xC1])).await,
+            "wallet-less peer admitted before first snapshot must be pruned"
+        );
+        assert!(
+            coordinator.is_registered_validator(&NodeId(vec![0x01])).await,
+            "on-chain validator must remain registered"
+        );
     }
 }
