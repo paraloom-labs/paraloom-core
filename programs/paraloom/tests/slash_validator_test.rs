@@ -496,3 +496,206 @@ async fn slash_rent_only_ghost_does_not_underflow() {
     assert_eq!(acc.unbonding_amount, 0, "still nothing unbonding");
     assert_eq!(acc.times_slashed, 1, "the slash was recorded");
 }
+
+#[tokio::test]
+async fn slash_reset_excluded_orphan_does_not_double_decrement_registry_counters() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, upgrade_authority.pubkey());
+    let (val_a, token_a) = funded_validator(&mut pt, stake_mint);
+    let (val_b, token_b) = funded_validator(&mut pt, stake_mint);
+    let (val_c_orphan, token_c) = funded_validator(&mut pt, stake_mint);
+    let (val_d_orphan, token_d) = funded_validator(&mut pt, stake_mint);
+    let (mut banks_client, _payer, recent_blockhash) = pt.start().await;
+
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+    let (pda_a, _) =
+        Pubkey::find_program_address(&[b"validator", val_a.pubkey().as_ref()], &program_id);
+    let (pda_b, _) =
+        Pubkey::find_program_address(&[b"validator", val_b.pubkey().as_ref()], &program_id);
+    let (pda_c, _) =
+        Pubkey::find_program_address(&[b"validator", val_c_orphan.pubkey().as_ref()], &program_id);
+    let (pda_d, _) =
+        Pubkey::find_program_address(&[b"validator", val_d_orphan.pubkey().as_ref()], &program_id);
+
+    // Initialize registry
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        init_validator_registry_ix(
+            program_id,
+            upgrade_authority.pubkey(),
+            program_data_pda,
+            stake_mint,
+        ),
+    )
+    .await;
+
+    // Register A (1 SOL), B (1 SOL), C (1 SOL), D (2 SOL)
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &val_a,
+        register_validator_ix(
+            program_id,
+            val_a.pubkey(),
+            stake_mint,
+            token_a,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &val_b,
+        register_validator_ix(
+            program_id,
+            val_b.pubkey(),
+            stake_mint,
+            token_b,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &val_c_orphan,
+        register_validator_ix(
+            program_id,
+            val_c_orphan.pubkey(),
+            stake_mint,
+            token_c,
+            MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await;
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &val_d_orphan,
+        register_validator_ix(
+            program_id,
+            val_d_orphan.pubkey(),
+            stake_mint,
+            token_d,
+            2 * MIN_VALIDATOR_STAKE,
+            TOKEN_STAKE,
+        ),
+    )
+    .await;
+
+    // 4 active validators, 5 SOL total before reset
+    let raw = banks_client.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_before = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_before.active_validators, 4);
+    assert_eq!(reg_before.total_active_stake, 5 * MIN_VALIDATOR_STAKE);
+
+    // Reset registry declaring 2 active validators and passing ONLY [A, B].
+    // C and D are omitted from remaining_accounts.
+    let mut reset_metas = accounts::ResetValidatorRegistry {
+        validator_registry: registry_pda,
+        authority: upgrade_authority.pubkey(),
+        program_data: program_data_pda,
+        system_program: solana_sdk::system_program::ID,
+    }
+    .to_account_metas(None);
+    reset_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(pda_a, false));
+    reset_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(pda_b, false));
+    let reset_ix = Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 2,
+        }
+        .data(),
+        accounts: reset_metas,
+    };
+    send(&mut banks_client, recent_blockhash, &upgrade_authority, reset_ix).await;
+
+    // Post-reset registry: active_validators = 2, total_active_stake = 2 SOL
+    let raw = banks_client.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_post_reset = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_post_reset.active_validators, 2);
+    assert_eq!(reg_post_reset.total_active_stake, 2 * MIN_VALIDATOR_STAKE);
+
+    // C and D are orphans with is_active = true
+    let raw_c = banks_client.get_account(pda_c).await.unwrap().unwrap();
+    let acc_c = ValidatorAccount::try_deserialize(&mut raw_c.data.as_slice()).unwrap();
+    assert!(acc_c.is_active);
+
+    let raw_d = banks_client.get_account(pda_d).await.unwrap().unwrap();
+    let acc_d = ValidatorAccount::try_deserialize(&mut raw_d.data.as_slice()).unwrap();
+    assert!(acc_d.is_active);
+
+    // 1) Test deactivating branch: slash orphan C by 100% (dropping below minimum_stake)
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            val_c_orphan.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            100,
+        ),
+    )
+    .await;
+
+    let raw = banks_client.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_after_c = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        reg_after_c.active_validators, 2,
+        "slashing reset-excluded orphan must not decrement registry active_validators"
+    );
+    assert_eq!(
+        reg_after_c.total_active_stake, 2 * MIN_VALIDATOR_STAKE,
+        "slashing reset-excluded orphan must not decrement registry total_active_stake"
+    );
+
+    // 2) Test non-deactivating branch: slash orphan D (2 SOL) by 25% (stays active at 1.5 SOL >= min_stake)
+    send(
+        &mut banks_client,
+        recent_blockhash,
+        &upgrade_authority,
+        slash_validator_ix(
+            program_id,
+            val_d_orphan.pubkey(),
+            stake_mint,
+            upgrade_authority.pubkey(),
+            25,
+        ),
+    )
+    .await;
+
+    let raw = banks_client.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_after_d = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        reg_after_d.active_validators, 2,
+        "non-deactivating slash of reset-excluded orphan must not decrement registry active_validators"
+    );
+    assert_eq!(
+        reg_after_d.total_active_stake, 2 * MIN_VALIDATOR_STAKE,
+        "non-deactivating slash of reset-excluded orphan must not decrement registry total_active_stake"
+    );
+
+    // Verify account states of C and D
+    let raw_c_final = banks_client.get_account(pda_c).await.unwrap().unwrap();
+    let acc_c_final = ValidatorAccount::try_deserialize(&mut raw_c_final.data.as_slice()).unwrap();
+    assert!(!acc_c_final.is_active);
+    assert_eq!(acc_c_final.stake_amount, 0);
+    assert_eq!(acc_c_final.times_slashed, 1);
+
+    let raw_d_final = banks_client.get_account(pda_d).await.unwrap().unwrap();
+    let acc_d_final = ValidatorAccount::try_deserialize(&mut raw_d_final.data.as_slice()).unwrap();
+    assert!(acc_d_final.is_active);
+    assert_eq!(acc_d_final.stake_amount, 1_500_000_000);
+    assert_eq!(acc_d_final.times_slashed, 1);
+}
