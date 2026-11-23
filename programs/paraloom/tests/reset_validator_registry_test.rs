@@ -15,7 +15,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::{InstructionData, ToAccountMetas};
-use paraloom_program::{accounts, instruction, ValidatorRegistry};
+use paraloom_program::{accounts, instruction, ValidatorAccount, ValidatorRegistry};
 use solana_program_test::{processor, tokio, ProgramTest};
 use solana_sdk::{
     account::Account, instruction::AccountMeta, instruction::Instruction, signature::Keypair,
@@ -303,4 +303,364 @@ async fn reset_rejects_non_upgrade_authority() {
     tx.sign(&[&payer], blockhash);
     let err = banks.process_transaction(tx).await;
     assert!(err.is_err(), "non-authority reset must fail");
+}
+
+#[tokio::test]
+async fn unregister_reset_excluded_orphan_preserves_registry_counters() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator_b = Keypair::new();
+    pt.add_account(
+        validator_b.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let validator_a = Keypair::new();
+    pt.add_account(
+        validator_a.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let token_a = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator_a.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
+    let token_b = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator_b.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    // Init registry.
+    let init_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Register validator A and validator B.
+    let (reg_a, pda_a) = register_ix(
+        program_id,
+        registry_pda,
+        validator_a.pubkey(),
+        stake_mint,
+        token_a,
+    );
+    let mut tx = Transaction::new_with_payer(&[reg_a], Some(&validator_a.pubkey()));
+    tx.sign(&[&validator_a], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let (reg_b, pda_b) = register_ix(
+        program_id,
+        registry_pda,
+        validator_b.pubkey(),
+        stake_mint,
+        token_b,
+    );
+    let mut tx = Transaction::new_with_payer(&[reg_b], Some(&validator_b.pubkey()));
+    tx.sign(&[&validator_b], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify both are counted before reset.
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_before = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_before.active_validators, 2);
+    assert_eq!(reg_before.total_active_stake, 2 * MIN_VALIDATOR_STAKE);
+    assert_eq!(reg_before.active_keys.len(), 2);
+
+    // Reset registry including ONLY validator A.
+    let mut reset_metas = accounts::ResetValidatorRegistry {
+        validator_registry: registry_pda,
+        authority: upgrade_authority.pubkey(),
+        program_data: program_data_pda,
+        system_program: system_program::ID,
+    }
+    .to_account_metas(None);
+    reset_metas.push(AccountMeta::new_readonly(pda_a, false));
+    let reset_ix = Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 1,
+        }
+        .data(),
+        accounts: reset_metas,
+    };
+    let mut tx = Transaction::new_with_payer(&[reset_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify registry counters after reset: only validator A is active.
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_after = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_after.active_validators, 1);
+    assert_eq!(reg_after.total_active_stake, MIN_VALIDATOR_STAKE);
+    assert_eq!(reg_after.active_keys, vec![validator_a.pubkey()]);
+
+    // Validator B is an excluded orphan (is_active is still true on-chain).
+    let raw_b = banks.get_account(pda_b).await.unwrap().unwrap();
+    let acc_b_before = ValidatorAccount::try_deserialize(&mut raw_b.data.as_slice()).unwrap();
+    assert!(acc_b_before.is_active);
+
+    // Now validator B (the reset-excluded orphan) calls unregister_validator.
+    let unreg_b_ix = Instruction {
+        program_id,
+        data: instruction::UnregisterValidator {}.data(),
+        accounts: accounts::UnregisterValidator {
+            validator_account: pda_b,
+            validator_registry: registry_pda,
+            validator: validator_b.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[unreg_b_ix], Some(&validator_b.pubkey()));
+    tx.sign(&[&validator_b], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Crucial assertion: unregistering the orphan deactivates it and routes its
+    // stake into unbonding, BUT does NOT double-decrement the registry counters!
+    let raw_b = banks.get_account(pda_b).await.unwrap().unwrap();
+    let acc_b_after = ValidatorAccount::try_deserialize(&mut raw_b.data.as_slice()).unwrap();
+    assert!(!acc_b_after.is_active);
+    assert_eq!(acc_b_after.unbonding_amount, MIN_VALIDATOR_STAKE);
+
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_after_b = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        reg_after_b.active_validators, 1,
+        "orphan unregister must not decrement active_validators below the reset count"
+    );
+    assert_eq!(
+        reg_after_b.total_active_stake, MIN_VALIDATOR_STAKE,
+        "orphan unregister must not subtract stake from registry"
+    );
+    assert_eq!(reg_after_b.active_keys, vec![validator_a.pubkey()]);
+
+    // Finally, validator A (which IS in the active set) calls unregister_validator.
+    let unreg_a_ix = Instruction {
+        program_id,
+        data: instruction::UnregisterValidator {}.data(),
+        accounts: accounts::UnregisterValidator {
+            validator_account: pda_a,
+            validator_registry: registry_pda,
+            validator: validator_a.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[unreg_a_ix], Some(&validator_a.pubkey()));
+    tx.sign(&[&validator_a], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_final = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_final.active_validators, 0);
+    assert_eq!(reg_final.total_active_stake, 0);
+    assert!(reg_final.active_keys.is_empty());
+}
+
+#[tokio::test]
+async fn deactivate_reset_excluded_orphan_preserves_registry_counters() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+
+    let validator_b = Keypair::new();
+    pt.add_account(
+        validator_b.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let validator_a = Keypair::new();
+    pt.add_account(
+        validator_a.pubkey(),
+        Account {
+            lamports: 5 * MIN_VALIDATOR_STAKE,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let token_a = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator_a.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
+    let token_b = add_token_account(
+        &mut pt,
+        stake_mint,
+        validator_b.pubkey(),
+        common::TEST_TOKEN_FUND,
+    );
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    // Init registry.
+    let init_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            stake_mint,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Register validator A and validator B.
+    let (reg_a, pda_a) = register_ix(
+        program_id,
+        registry_pda,
+        validator_a.pubkey(),
+        stake_mint,
+        token_a,
+    );
+    let mut tx = Transaction::new_with_payer(&[reg_a], Some(&validator_a.pubkey()));
+    tx.sign(&[&validator_a], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let (reg_b, pda_b) = register_ix(
+        program_id,
+        registry_pda,
+        validator_b.pubkey(),
+        stake_mint,
+        token_b,
+    );
+    let mut tx = Transaction::new_with_payer(&[reg_b], Some(&validator_b.pubkey()));
+    tx.sign(&[&validator_b], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Reset registry including ONLY validator A.
+    let mut reset_metas = accounts::ResetValidatorRegistry {
+        validator_registry: registry_pda,
+        authority: upgrade_authority.pubkey(),
+        program_data: program_data_pda,
+        system_program: system_program::ID,
+    }
+    .to_account_metas(None);
+    reset_metas.push(AccountMeta::new_readonly(pda_a, false));
+    let reset_ix = Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint,
+            expected_active_validators: 1,
+        }
+        .data(),
+        accounts: reset_metas,
+    };
+    let mut tx = Transaction::new_with_payer(&[reset_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify registry counters after reset: only validator A is active.
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_after = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_after.active_validators, 1);
+    assert_eq!(reg_after.total_active_stake, MIN_VALIDATOR_STAKE);
+
+    // Authority deactivates validator B (the reset-excluded orphan).
+    let deact_b_ix = Instruction {
+        program_id,
+        data: instruction::DeactivateValidator {}.data(),
+        accounts: accounts::DeactivateValidator {
+            validator_account: pda_b,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deact_b_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Registry counters must remain untouched.
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_after_b = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(
+        reg_after_b.active_validators, 1,
+        "orphan deactivate must not decrement active_validators"
+    );
+    assert_eq!(
+        reg_after_b.total_active_stake, MIN_VALIDATOR_STAKE,
+        "orphan deactivate must not decrement total_active_stake"
+    );
+
+    // Authority deactivates validator A (which was active in registry).
+    let deact_a_ix = Instruction {
+        program_id,
+        data: instruction::DeactivateValidator {}.data(),
+        accounts: accounts::DeactivateValidator {
+            validator_account: pda_a,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deact_a_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg_final = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg_final.active_validators, 0);
+    assert_eq!(reg_final.total_active_stake, 0);
+    assert!(reg_final.active_keys.is_empty());
 }

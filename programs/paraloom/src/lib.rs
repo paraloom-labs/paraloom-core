@@ -909,6 +909,18 @@ pub mod paraloom_program {
         validator_registry.total_active_stake = validator_registry
             .total_active_stake
             .saturating_add(stake_amount);
+        require!(
+            validator_registry.active_keys.len() < 64,
+            BridgeError::RegistryCapacityExceeded
+        );
+        if !validator_registry
+            .active_keys
+            .contains(&ctx.accounts.validator.key())
+        {
+            validator_registry
+                .active_keys
+                .push(ctx.accounts.validator.key());
+        }
 
         emit!(ValidatorRegisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -957,11 +969,25 @@ pub mod paraloom_program {
             .token_unbonding_amount
             .saturating_add(token_stake);
 
-        validator_registry.active_validators =
-            validator_registry.active_validators.saturating_sub(1);
-        validator_registry.total_active_stake = validator_registry
-            .total_active_stake
-            .saturating_sub(stake_amount);
+        let who = ctx.accounts.validator.key();
+        let was_in_registry = if let Some(pos) = validator_registry
+            .active_keys
+            .iter()
+            .position(|k| *k == who)
+        {
+            validator_registry.active_keys.swap_remove(pos);
+            true
+        } else {
+            false
+        };
+
+        if was_in_registry {
+            validator_registry.active_validators =
+                validator_registry.active_validators.saturating_sub(1);
+            validator_registry.total_active_stake = validator_registry
+                .total_active_stake
+                .saturating_sub(stake_amount);
+        }
 
         emit!(ValidatorUnregisteredEvent {
             validator: ctx.accounts.validator.key(),
@@ -1103,8 +1129,20 @@ pub mod paraloom_program {
             if validator_account.stake_amount < ctx.accounts.validator_registry.minimum_stake {
                 validator_account.is_active = false;
                 let registry = &mut ctx.accounts.validator_registry;
-                registry.active_validators = registry.active_validators.saturating_sub(1);
-                registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                let was_in_registry = if let Some(pos) = registry
+                    .active_keys
+                    .iter()
+                    .position(|k| *k == validator_account.validator)
+                {
+                    registry.active_keys.swap_remove(pos);
+                    true
+                } else {
+                    false
+                };
+                if was_in_registry {
+                    registry.active_validators = registry.active_validators.saturating_sub(1);
+                    registry.total_active_stake = registry.total_active_stake.saturating_sub(old_stake);
+                }
                 // The unslashed remainder of BOTH collaterals would otherwise be
                 // stranded — a deactivated validator cannot `unregister` — so
                 // route it into unbonding, reclaimable after the delay. The
@@ -1124,8 +1162,13 @@ pub mod paraloom_program {
             } else {
                 // Still active: only the slashed portion leaves the total.
                 let registry = &mut ctx.accounts.validator_registry;
-                registry.total_active_stake =
-                    registry.total_active_stake.saturating_sub(slash_amount);
+                let in_registry = registry
+                    .active_keys
+                    .contains(&validator_account.validator);
+                if in_registry {
+                    registry.total_active_stake =
+                        registry.total_active_stake.saturating_sub(slash_amount);
+                }
             }
         } else {
             // Already unbonding: burn the slashed portion of the withheld stake.
@@ -1211,6 +1254,7 @@ pub mod paraloom_program {
         // alike and fail in opposite directions. The authority lowers or
         // raises this deliberately via `set_min_token_stake`.
         registry.min_token_stake = RECOMMENDED_MIN_TOKEN_STAKE;
+        registry.active_keys = Vec::new();
 
         msg!(
             "Validator registry initialized (stake_mint {})",
@@ -1545,6 +1589,7 @@ pub mod paraloom_program {
         let mut total_active_stake: u64 = 0;
         let mut active: u64 = 0;
         let mut seen: Vec<Pubkey> = Vec::new();
+        let mut active_wallets: Vec<Pubkey> = Vec::new();
         for acc in ctx.remaining_accounts.iter() {
             require!(acc.owner == &crate::ID, BridgeError::UnauthorizedInit);
             let data = acc.try_borrow_data()?;
@@ -1565,9 +1610,15 @@ pub mod paraloom_program {
             // total and inflate the quorum denominator.
             require!(!seen.contains(acc.key), BridgeError::UnauthorizedInit);
             seen.push(*acc.key);
+            active_wallets.push(validator.validator);
             total_active_stake = total_active_stake.saturating_add(validator.stake_amount);
             active = active.saturating_add(1);
         }
+
+        require!(
+            active <= 64,
+            BridgeError::RegistryCapacityExceeded
+        );
 
         // Fail loudly on a short list rather than silently understating the
         // quorum denominator. `active` counts exactly the PDAs that passed the
@@ -1601,8 +1652,10 @@ pub mod paraloom_program {
             // means a forgotten step costs a rejected registration rather
             // than a validator slot bought with no token stake.
             min_token_stake: RECOMMENDED_MIN_TOKEN_STAKE,
+            active_keys: active_wallets,
         };
         let mut data = registry_ai.try_borrow_mut_data()?;
+        data.fill(0);
         let mut cursor = std::io::Cursor::new(&mut data[..]);
         registry.try_serialize(&mut cursor)?;
 
@@ -1648,8 +1701,20 @@ pub mod paraloom_program {
             v.unbonding_slot = now_slot.saturating_add(UNBONDING_SLOTS);
             v.stake_amount = 0;
             let registry = &mut ctx.accounts.validator_registry;
-            registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
-            registry.active_validators = registry.active_validators.saturating_sub(1);
+            let was_in_registry = if let Some(pos) = registry
+                .active_keys
+                .iter()
+                .position(|k| *k == who)
+            {
+                registry.active_keys.swap_remove(pos);
+                true
+            } else {
+                false
+            };
+            if was_in_registry {
+                registry.total_active_stake = registry.total_active_stake.saturating_sub(stake);
+                registry.active_validators = registry.active_validators.saturating_sub(1);
+            }
         }
         msg!("Validator deactivated: {}", who);
         Ok(())
@@ -2736,6 +2801,13 @@ pub struct ValidatorRegistry {
     /// zero would mean every registration clears the gate, so the gate opens
     /// only when the authority lowers it on purpose.
     pub min_token_stake: u64,
+    /// The explicit set of validator wallet pubkeys currently accounted for in
+    /// `total_active_stake` and `active_validators`. Populated on registration
+    /// and reset. Protects against double-decrementing registry counters when an
+    /// orphan validator excluded by an earlier `reset_validator_registry` later
+    /// calls `unregister_validator` or `deactivate_validator`.
+    #[max_len(64)]
+    pub active_keys: Vec<Pubkey>,
 }
 
 #[account]
@@ -2916,4 +2988,7 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Validator registry active set has reached capacity")]
+    RegistryCapacityExceeded,
 }
