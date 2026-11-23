@@ -12,6 +12,7 @@ pub mod rpc;
 mod test_support;
 
 pub use cosign_assembly::{assemble_transaction, gather_signatures};
+pub(crate) use cosign_assembly::signature_is_valid;
 pub use cosign_message::{build_settlement_message, CoSignPayload, SettlementParams};
 pub use instructions::{
     create_claim_rewards_instruction, create_deactivate_validator_instruction,

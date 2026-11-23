@@ -18,6 +18,7 @@ use crate::consensus::reputation::ReputationTracker;
 use crate::consensus::slashing::SlashingTracker;
 use crate::consensus::vote_tally::{VerificationVote, VoteTally};
 use crate::types::NodeId;
+use solana_sdk::pubkey::Pubkey;
 
 /// Default minimum registered validators that must approve before a transact
 /// settles (7-of-10 BFT). The actual threshold is configurable per
@@ -940,6 +941,46 @@ impl TransactVerificationCoordinator {
         Ok(())
     }
 
+    /// Minimum validator count required for BFT consensus.
+    pub fn min_validators_for_consensus(&self) -> usize {
+        self.min_validators_for_consensus
+    }
+
+    /// Check whether a subset of validator wallets meets the on-chain stake quorum (#1639).
+    pub async fn stake_quorum_met_for_wallets(&self, wallets: &[Pubkey]) -> bool {
+        let local = match &self.local_wallet {
+            Some(w) => w,
+            None => return true,
+        };
+        let onchain_stakes = self.onchain_stakes.read().await;
+        if onchain_stakes.is_empty() {
+            return true;
+        }
+        let registry_total = *self.onchain_registry_total.read().await;
+        let authority_stake = onchain_stakes.get(local).copied().unwrap_or(0);
+        let eligible_stake = registry_total.saturating_sub(authority_stake);
+
+        if eligible_stake == 0 {
+            return true;
+        }
+        let threshold = eligible_stake.saturating_mul(2) / 3 + 1;
+        let equivocators = self.equivocators.read().await;
+
+        let mut counted_stake: u64 = 0;
+        for w in wallets {
+            let s = w.to_string();
+            if &s == local || equivocators.contains(&s) || !onchain_stakes.contains_key(&s) {
+                continue;
+            }
+            counted_stake = counted_stake.saturating_add(onchain_stakes.get(&s).copied().unwrap_or(0));
+        }
+
+        if counted_stake > eligible_stake {
+            return false;
+        }
+        counted_stake >= threshold
+    }
+
     /// Non-blocking quorum check.
     pub async fn check_consensus(&self, request_id: &str) -> Result<Option<VerificationVote>> {
         let pending = self.pending.read().await;
@@ -1571,5 +1612,52 @@ mod tests {
             assert!(info.is_active);
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
+    }
+
+    #[tokio::test]
+    async fn stake_quorum_met_for_wallets_verifies_stake_threshold() {
+        let (c, _) = TransactVerificationCoordinator::new_with_approvals();
+        let c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        // Registry total: 4 SOL (1 SOL authority + 3 SOL eligible)
+        // 2/3 of 3 SOL = 3 * 2 / 3 + 1 = 3 SOL (3_000_000_001 lamports)
+        // Or if total is 3 SOL eligible:
+        // W1 = 2 SOL, W2 = 1 SOL.
+        // Threshold: 3_000_000_000 * 2 / 3 + 1 = 2_000_000_001 lamports.
+        c.sync_onchain_stakes(
+            stakes(&[
+                ("W0", 1_000_000_000),
+                ("W1", 2_000_000_001),
+                ("W2", 999_999_999),
+            ]),
+            4_000_000_000,
+        )
+        .await;
+
+        let pk0 = Pubkey::new_unique();
+        let pk1 = Pubkey::new_unique();
+        let pk2 = Pubkey::new_unique();
+
+        let (c2, _) = TransactVerificationCoordinator::new_with_approvals();
+        let c2 = c2
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet(pk0.to_string());
+        c2.sync_onchain_stakes(
+            stakes(&[
+                (&pk0.to_string(), 1_000_000_000),
+                (&pk1.to_string(), 2_000_000_001),
+                (&pk2.to_string(), 999_999_999),
+            ]),
+            4_000_000_000,
+        )
+        .await;
+
+        // pk1 alone has 2_000_000_001 >= threshold (2_000_000_001) -> true
+        assert!(c2.stake_quorum_met_for_wallets(&[pk0, pk1]).await);
+        // pk2 alone has 999_999_999 < threshold -> false
+        assert!(!c2.stake_quorum_met_for_wallets(&[pk0, pk2]).await);
+        // pk1 + pk2 has 3_000_000_000 >= threshold -> true
+        assert!(c2.stake_quorum_met_for_wallets(&[pk0, pk1, pk2]).await);
     }
 }
