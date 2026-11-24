@@ -23,6 +23,41 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
+// ValidatorRegistry layout (see programs/paraloom/src/lib.rs):
+//   [0..8]   discriminator
+//   [8..40]  authority (Pubkey)
+//   [40..48] total_validators (u64)
+//   [48..56] active_validators (u64)
+//   [56..64] minimum_stake (u64)
+//   [64..72] total_active_stake (u64)
+//   [72..104] stake_mint (Pubkey)  <- the pinned dual-stake mint
+const REGISTRY_STAKE_MINT_OFFSET: usize = 72;
+const REGISTRY_STAKE_MINT_LEN: usize = 32;
+
+/// Defensive pre-flight: refuse to initialize the singleton vault when the
+/// registry already pins a different `stake_mint`. A mismatch would permanently
+/// brick `register_validator` (the vault's immutable mint would not agree with
+/// `registry.stake_mint`).
+fn require_registry_matches_mint(registry_data: &[u8], stake_mint: Pubkey) -> Result<(), Box<dyn std::error::Error>> {
+    if registry_data.len() < REGISTRY_STAKE_MINT_OFFSET + REGISTRY_STAKE_MINT_LEN {
+        return Err(format!(
+            "validator_registry account too short ({} bytes), cannot read stake_mint",
+            registry_data.len()
+        )
+        .into());
+    }
+    let on_chain_mint = Pubkey::try_from(&registry_data
+        [REGISTRY_STAKE_MINT_OFFSET..REGISTRY_STAKE_MINT_OFFSET + REGISTRY_STAKE_MINT_LEN])?;
+    if on_chain_mint != Pubkey::default() && on_chain_mint != stake_mint {
+        return Err(format!(
+            "STAKE_MINT {stake_mint} does not match validator_registry pinned stake_mint {on_chain_mint}; \
+             refusing to initialize the singleton vault"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -52,6 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nVault already exists — nothing to do.");
         return Ok(());
     }
+
+    // Pre-flight: bind the stake mint to the registry's pinned stake_mint so a
+    // mismatched STAKE_MINT cannot permanently brick the singleton vault.
+    let registry_pda = Pubkey::find_program_address(&[b"validator_registry"], &program_id).0;
+    let registry_acct = client.get_account(&registry_pda)?;
+    let registry_data = registry_acct.data;
+    require_registry_matches_mint(&registry_data, stake_mint)?;
 
     let ix = create_init_stake_token_vault_instruction(
         &program_id,

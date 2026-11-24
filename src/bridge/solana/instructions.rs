@@ -384,12 +384,17 @@ pub fn create_init_stake_token_vault_instruction(
     let (stake_vault_authority, _) =
         Pubkey::find_program_address(&[b"stake_vault_authority"], program_id);
     let (program_data_pda, _) = derive_program_data(program_id);
+    // `validator_registry` is a PDA seeded by `[b"validator_registry"]`; the
+    // caller (bin) passes the same PDA for the pre-flight mint check.
+    let (validator_registry_pda, _) =
+        Pubkey::find_program_address(&[b"validator_registry"], program_id);
 
     Ok(Instruction {
         program_id: *program_id,
         accounts: vec![
             AccountMeta::new(*authority, true),
             AccountMeta::new_readonly(*stake_mint, false),
+            AccountMeta::new_readonly(validator_registry_pda, false),
             AccountMeta::new(stake_token_vault, false),
             AccountMeta::new_readonly(stake_vault_authority, false),
             AccountMeta::new_readonly(program_data_pda, false),
