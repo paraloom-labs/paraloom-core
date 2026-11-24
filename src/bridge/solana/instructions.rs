@@ -82,6 +82,9 @@ pub mod discriminators {
     /// `deposit_note`: shields a token into a note whose leaf commits the
     /// asset as `mint_to_asset(mint)`, not the raw mint bytes.
     pub const DEPOSIT_NOTE_SPL: [u8; 8] = [244, 219, 167, 106, 7, 120, 254, 253];
+    pub const INIT_ASSET_VAULT: [u8; 8] = [178, 96, 79, 76, 25, 81, 167, 109];
+    pub const SET_ASSET_DEPOSIT_CAP: [u8; 8] = [209, 129, 220, 235, 236, 193, 22, 135];
+    pub const SET_MIN_TOKEN_STAKE: [u8; 8] = [13, 125, 2, 121, 78, 212, 10, 46];
     /// `sha256("global:initialize_merkle_tree")[..8]` (#350). One-time,
     /// upgrade-authority-gated tree account creation.
     #[allow(dead_code)]
@@ -401,6 +404,41 @@ pub fn create_init_stake_token_vault_instruction(
     })
 }
 
+/// Build an `init_asset_vault` instruction for an SPL mint (#779).
+/// Upgrade-authority-signed (#204). Creates the program-owned per-asset vault
+/// PDA and the `asset_config` PDA (fail-closed deposit cap, starts at 0).
+/// Account order matches the on-chain `InitAssetVault` context:
+/// authority(signer), mint(ro), asset_vault(mut), asset_vault_authority(ro),
+/// asset_config(mut), program_data(ro), token_program(ro), system_program(ro),
+/// rent(ro).
+pub fn create_init_asset_vault_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<Instruction> {
+    let (asset_vault, _) = derive_asset_vault(program_id, mint);
+    let (asset_vault_authority, _) = derive_asset_vault_authority(program_id);
+    let (asset_config, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(asset_vault, false),
+            AccountMeta::new_readonly(asset_vault_authority, false),
+            AccountMeta::new(asset_config, false),
+            AccountMeta::new_readonly(program_data_pda, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(RENT_SYSVAR_ID, false),
+        ],
+        data: discriminators::INIT_ASSET_VAULT.to_vec(),
+    })
+}
+
 /// Build a `migrate_bridge_state` instruction — grow a `BridgeState` created
 /// before the `deposit_cap` field to the current layout. Upgrade-authority-
 /// signed. Account order matches the on-chain `MigrateBridgeState` context:
@@ -421,6 +459,34 @@ pub fn create_migrate_bridge_state_instruction(
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data: discriminators::MIGRATE_BRIDGE_STATE.to_vec(),
+    })
+}
+
+/// Build a `set_asset_deposit_cap` instruction — open/adjust one mint's SPL
+/// deposit cap. Upgrade-authority-signed (#204). The `asset_config` PDA holds
+/// the per-asset cap (fail-closed: 0 = deposits closed).
+/// Account order matches the on-chain `SetAssetDepositCap` context:
+/// asset_config(mut), authority(signer), program_data(ro).
+pub fn create_set_asset_deposit_cap_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    mint: &Pubkey,
+    new_cap: u64,
+) -> Result<Instruction> {
+    let (asset_config, _) = derive_asset_config(program_id, mint);
+    let (program_data_pda, _) = derive_program_data(program_id);
+
+    let mut data = discriminators::SET_ASSET_DEPOSIT_CAP.to_vec();
+    data.extend_from_slice(&new_cap.to_le_bytes());
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(asset_config, false),
+            AccountMeta::new(*authority, true),
+            AccountMeta::new_readonly(program_data_pda, false),
+        ],
+        data,
     })
 }
 
@@ -730,6 +796,63 @@ pub fn create_deposit_note_instruction(
     })
 }
 
+/// Create the `deposit_note_spl` instruction (#779): the SPL twin of
+/// [`create_deposit_note_instruction`]. Shields an SPL token into a note whose
+/// leaf commits `mint_to_asset(mint)`; pays out of `mint`'s per-asset vault.
+///
+/// Account order matches the on-chain `DepositNoteSpl` accounts struct exactly:
+/// bridge_state(ro), asset_config(mut), mint(ro), asset_vault(mut),
+/// depositor_token_account(mut), merkle_tree(mut), depositor(signer),
+/// token_program(ro).
+#[allow(clippy::too_many_arguments)]
+pub fn create_deposit_note_spl_instruction(
+    program_id: &Pubkey,
+    depositor: &Pubkey,
+    mint: &Pubkey,
+    depositor_token_account: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+    pubkey: [u8; 32],
+    blinding: [u8; 32],
+) -> Result<Instruction> {
+    let (bridge_state_pda, _) = derive_bridge_state(program_id);
+    let (asset_config_pda, _) = derive_asset_config(program_id, mint);
+    let (asset_vault_pda, _) = derive_asset_vault(program_id, mint);
+    let (merkle_tree_pda, _) = derive_merkle_tree(program_id);
+
+    #[derive(BorshSerialize)]
+    struct DepositNoteSplData {
+        amount: u64,
+        pubkey: [u8; 32],
+        blinding: [u8; 32],
+    }
+
+    let data = DepositNoteSplData {
+        amount,
+        pubkey,
+        blinding,
+    };
+    let mut instruction_data = discriminators::DEPOSIT_NOTE_SPL.to_vec();
+    instruction_data.extend_from_slice(
+        &borsh::to_vec(&data).map_err(|e| BridgeError::Serialization(e.to_string()))?,
+    );
+
+    Ok(Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(bridge_state_pda, false),
+            AccountMeta::new(asset_config_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(asset_vault_pda, false),
+            AccountMeta::new(*depositor_token_account, false),
+            AccountMeta::new(merkle_tree_pda, false),
+            AccountMeta::new(*depositor, true),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: instruction_data,
+    })
+}
+
 /// Create the `initialize_merkle_tree` instruction (circuit v3, #350).
 ///
 /// One-time creation of the on-chain incremental tree, gated to the program
@@ -825,6 +948,29 @@ pub fn create_set_bridge_authority_instruction(
     })
 }
 
+/// Build a `set_min_token_stake` instruction — sets the minimum token stake
+/// required to register a validator. Registry-authority-signed.
+/// Account order matches the on-chain `SetMinTokenStake` context:
+/// validator_registry(mut), authority(signer).
+pub fn create_set_min_token_stake_instruction(
+    program_id: &Pubkey,
+    authority: &Pubkey,
+    new_min: u64,
+) -> Instruction {
+    let (registry_pda, _) = derive_validator_registry(program_id);
+    let mut data = discriminators::SET_MIN_TOKEN_STAKE.to_vec();
+    data.extend_from_slice(&new_min.to_le_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(registry_pda, false),
+            AccountMeta::new(*authority, true),
+        ],
+        data,
+    }
+}
+
 /// Create a `set_deposit_cap` instruction (admin: set the TVL cap).
 ///
 /// Sets `bridge_state.deposit_cap = new_cap` — the maximum the vault's current
@@ -906,6 +1052,13 @@ pub fn derive_asset_vault_authority(program_id: &Pubkey) -> (Pubkey, u8) {
 /// (`seeds = [b"asset_vault", mint]`). Custody for one SPL asset.
 pub fn derive_asset_vault(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"asset_vault", mint.as_ref()], program_id)
+}
+
+/// Derive the per-asset config PDA for `mint`
+/// (`seeds = [b"asset_config", mint]`). Holds the fail-closed deposit cap
+/// (`0` = deposits closed) plus per-asset accounting. One PDA per enabled mint.
+pub fn derive_asset_config(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"asset_config", mint.as_ref()], program_id)
 }
 
 /// Derive the canonical Associated Token Account address for `owner` + `mint`,
