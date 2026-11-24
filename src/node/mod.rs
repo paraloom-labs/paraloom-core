@@ -2127,8 +2127,14 @@ impl Node {
         // Settle consensus-approved unified transacts (#350). The `transact`
         // instruction settles exclusively through the #260 co-signing quorum
         // (no single-key fallback), so a node without a settlement keypair logs
-        // each approval's failure rather than settling it single-key.
-        if let (Some(_bridge), Some(coordinator), Some(rx)) = (
+        // each approval's failure rather than settling it single-key. Honoring
+        // `bridge.use_cosign_settlement` allows operators to disable the local
+        // co-sign settlement submitter when set to `false` (#1689).
+        if !self.settings.bridge.use_cosign_settlement {
+            log::warn!(
+                "bridge.use_cosign_settlement is false — transact co-sign settlement submitter disabled (#1689)"
+            );
+        } else if let (Some(_bridge), Some(coordinator), Some(rx)) = (
             self.bridge.clone(),
             self.transact_coordinator.clone(),
             self.transact_approval_rx.lock().await.take(),
