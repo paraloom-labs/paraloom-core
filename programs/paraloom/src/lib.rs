@@ -678,6 +678,16 @@ pub mod paraloom_program {
                     fee,
                     ctx.accounts.mint.decimals,
                 )?;
+                // The SPL fee is paid inline (there is no separate
+                // `claim_rewards` step for SPL withdrawals), so credit it to the
+                // validator's `total_earnings` here, mirroring the native path
+                // that accumulates into `pending_rewards` and realizes it on
+                // claim. Without this, `ValidatorAccount.total_earnings`
+                // permanently understates SPL withdrawal fee earnings.
+                validator_account.total_earnings = validator_account
+                    .total_earnings
+                    .checked_add(fee)
+                    .ok_or(BridgeError::InvalidAmount)?;
             }
         }
 
@@ -1237,6 +1247,34 @@ pub mod paraloom_program {
     /// account, and the registry's pinned mint to all agree.
     pub fn init_stake_token_vault(ctx: Context<InitStakeTokenVault>) -> Result<()> {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
+        let registry_ai = ctx.accounts.validator_registry.to_account_info();
+
+        // Confirm the pinned PDA is actually a ValidatorRegistry owned by this
+        // program, so a wrong account cannot be bound to the singleton vault.
+        {
+            let data = registry_ai.try_borrow_data()?;
+            require!(data.len() >= 8, BridgeError::UnauthorizedInit);
+            require!(
+                data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
+                BridgeError::UnauthorizedInit
+            );
+            require!(registry_ai.owner == &crate::ID, BridgeError::UnauthorizedInit);
+        }
+
+        // If the registry already pins a dual-stake mint, bind the vault to it;
+        // a mismatched stake_mint would permanently brick register_validator.
+        if registry_ai.data_len() >= 8 + ValidatorRegistry::INIT_SPACE {
+            let data = registry_ai.try_borrow_data()?;
+            let registry = ValidatorRegistry::try_deserialize(&mut &data[..])?;
+            if registry.stake_mint != Pubkey::default() {
+                require!(
+                    ctx.accounts.stake_mint.key() == registry.stake_mint,
+                    BridgeError::InvalidAmount,
+                );
+            }
+        }
+
         msg!(
             "Stake token vault initialized (mint {})",
             ctx.accounts.stake_mint.key()
@@ -2184,6 +2222,13 @@ pub struct InitStakeTokenVault<'info> {
     /// The dual-stake mint the vault holds. Must match the mint
     /// `reset_validator_registry` pins into the registry.
     pub stake_mint: InterfaceAccount<'info, Mint>,
+
+    /// The validator registry PDA (`seeds = [b"validator_registry"]`). Bound to
+    /// the vault so `stake_mint` cannot disagree with `registry.stake_mint`.
+    ///
+    /// CHECK: validated in `init_stake_token_vault` body (owner + discriminator).
+    #[account(seeds = [b"validator_registry"], bump)]
+    pub validator_registry: UncheckedAccount<'info>,
 
     /// Shared vault holding every validator's locked token stake, owned by the
     /// `stake_vault_authority` PDA. Same seeds `register_validator` derives.
