@@ -1506,9 +1506,18 @@ pub mod paraloom_program {
         check_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
 
         let registry_ai = ctx.accounts.validator_registry.to_account_info();
+        let new_len = 8 + ValidatorRegistry::INIT_SPACE;
+
+        require!(
+            stake_mint != Pubkey::default(),
+            BridgeError::InvalidAmount
+        );
 
         // Confirm the pinned PDA actually is a ValidatorRegistry, so a wrong
-        // account cannot be reshaped into one.
+        // account cannot be reshaped into one. If the registry is already at the
+        // dual-stake layout with a non-default `stake_mint`, forbid changing it
+        // because the singleton `stake_token_vault` PDA (`[b"stake_token_vault"]`)
+        // is permanently bound to the original mint at creation (#1686).
         {
             let data = registry_ai.try_borrow_data()?;
             require!(data.len() >= 8, BridgeError::UnauthorizedInit);
@@ -1516,10 +1525,18 @@ pub mod paraloom_program {
                 data[0..8] == *ValidatorRegistry::DISCRIMINATOR,
                 BridgeError::UnauthorizedInit
             );
+            if data.len() >= new_len {
+                let existing = ValidatorRegistry::try_deserialize(&mut &data[..])?;
+                if existing.stake_mint != Pubkey::default() {
+                    require!(
+                        stake_mint == existing.stake_mint,
+                        BridgeError::StakeMintImmutable
+                    );
+                }
+            }
         }
 
         // Grow to the current layout, topping up rent for the extra bytes.
-        let new_len = 8 + ValidatorRegistry::INIT_SPACE;
         let rent = Rent::get()?;
         let min_balance = rent.minimum_balance(new_len);
         let current = registry_ai.lamports();
@@ -2916,4 +2933,7 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+
+    #[msg("Dual-stake mint is already pinned to the singleton stake token vault and cannot be changed")]
+    StakeMintImmutable,
 }
