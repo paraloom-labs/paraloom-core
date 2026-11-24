@@ -92,6 +92,12 @@ struct PollerState {
     /// [`SIGNATURE_BATCH_LIMIT`]; tests set it small to exercise pagination
     /// without synthesising a thousand transactions.
     batch_limit: usize,
+    /// Maximum number of signature pages a single poll walks back toward the
+    /// cursor. Production uses [`MAX_SIGNATURE_PAGES`].
+    max_pages: usize,
+    /// Set by `fetch_events` when the page cap truncated an older backlog tail
+    /// before reaching the cursor (#1678); freezes cursor advance for that poll.
+    page_cap_truncated: Arc<RwLock<bool>>,
     /// Where to persist the scan cursor after each advance. `None` keeps the
     /// cursor in memory only (the default and what tests use).
     cursor_path: Option<PathBuf>,
@@ -159,6 +165,8 @@ impl EventListener {
             last_processed_slot: Arc::clone(&self.last_processed_slot),
             lag_warn_threshold_slots: self.config.event_lag_warn_threshold_slots,
             batch_limit: SIGNATURE_BATCH_LIMIT,
+            max_pages: MAX_SIGNATURE_PAGES,
+            page_cap_truncated: Arc::new(RwLock::new(false)),
             cursor_path: self.config.cursor_path.clone(),
         };
         let running = Arc::clone(&self.running);
@@ -361,7 +369,14 @@ impl EventListener {
             }
         }
 
-        let (cursor_advance, failed) = Self::contiguous_cursor(&outcomes);
+        let (mut cursor_advance, failed) = Self::contiguous_cursor(&outcomes);
+        // If `fetch_events` hit `max_pages` before reaching the prior cursor,
+        // the older tail between `cursor` and the oldest fetched page has not
+        // been indexed yet. Do not advance `last_signature` past that un-scanned
+        // gap (#1678).
+        if *state.page_cap_truncated.read().await {
+            cursor_advance = None;
+        }
 
         // Un-see the failed signatures so the next poll re-fetches and retries
         // them. The cursor stays below the first failure, so the re-fetch's
@@ -475,13 +490,16 @@ impl EventListener {
         let mut signatures = Vec::new();
         let mut before: Option<Signature> = None;
         let mut pages = 0usize;
+        *state.page_cap_truncated.write().await = false;
         // The cursor is the `until` boundary. If it ages out of the RPC's
         // queryable history (some providers retain devnet signatures only
         // briefly), the RPC rejects it as a boundary with a "Transaction not
         // found" (-32020) error, and every poll fails forever — the listener
         // stalls and stops indexing deposits. Detect that, drop the stale
-        // cursor, and resume from the latest page (a cold start) so the listener
-        // self-heals. `effective_cursor` may be reset to `None` mid-loop.
+        // cursor, and paginate back through the RPC's available history so no
+        // surviving deposits between the aged-out cursor and the newest page
+        // are dropped (#1678). `effective_cursor` may be reset to `None` mid-loop.
+        let initial_cold_start = cursor.is_none();
         let mut effective_cursor = cursor;
         loop {
             let batch = match state
@@ -539,17 +557,24 @@ impl EventListener {
             if batch_len < state.batch_limit {
                 break;
             }
-            // Cold start: take only the newest page, do not walk all history.
-            if effective_cursor.is_none() {
+            // True initial cold start (`cursor == None`): take only the newest
+            // page, do not walk all history. When recovering from an aged-out
+            // cursor (`!initial_cold_start && effective_cursor.is_none()`), keep
+            // paginating back through the RPC's retained history so older
+            // deposits beyond page 1 are not dropped (#1678).
+            if initial_cold_start {
                 break;
             }
-            if pages >= MAX_SIGNATURE_PAGES {
+            if pages >= state.max_pages {
                 log::warn!(
                     target: "paraloom::bridge::solana",
-                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll",
-                    MAX_SIGNATURE_PAGES,
-                    MAX_SIGNATURE_PAGES * state.batch_limit
+                    "deposit listener hit the {}-page scan cap (~{} transactions) before reaching the cursor; deposits older than this window are skipped this poll and cursor advance is frozen",
+                    state.max_pages,
+                    state.max_pages * state.batch_limit
                 );
+                if effective_cursor.is_some() {
+                    *state.page_cap_truncated.write().await = true;
+                }
                 break;
             }
             match oldest {
@@ -838,6 +863,8 @@ mod tests {
             last_processed_slot: Arc::new(RwLock::new(0)),
             lag_warn_threshold_slots: 100,
             batch_limit: SIGNATURE_BATCH_LIMIT,
+            max_pages: MAX_SIGNATURE_PAGES,
+            page_cap_truncated: Arc::new(RwLock::new(false)),
             cursor_path: None,
         }
     }
@@ -1545,5 +1572,66 @@ mod tests {
             0
         );
         assert_eq!(pool.commitment_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn page_cap_truncation_freezes_cursor_so_older_tail_is_not_skipped() {
+        use crate::bridge::solana::test_support::{synth_deposit_tx, MockBridgeRpc};
+        use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
+
+        let program_id = Pubkey::new_unique();
+        let depositor = Pubkey::new_unique();
+        let resume_cursor = Signature::new_unique();
+        let newest = Signature::new_unique();
+        let middle = Signature::new_unique();
+
+        let status = |sig: &Signature, slot: u64| RpcConfirmedTransactionStatusWithSignature {
+            signature: sig.to_string(),
+            slot,
+            err: None,
+            memo: None,
+            block_time: None,
+            confirmation_status: None,
+        };
+
+        let mock = Arc::new(MockBridgeRpc::new());
+        // Full page of 2 signatures hits `max_pages = 1` before reaching `resume_cursor`.
+        mock.get_signatures_pages
+            .lock()
+            .unwrap()
+            .push_back(Ok(vec![status(&newest, 20), status(&middle, 15)]));
+        for (i, sig) in [newest, middle].iter().enumerate() {
+            mock.get_transactions.lock().unwrap().insert(
+                *sig,
+                synth_deposit_tx(
+                    *sig,
+                    20 - i as u64 * 5,
+                    &program_id,
+                    &depositor,
+                    1_000,
+                    [9u8; 32],
+                    [21u8 + i as u8; 32],
+                ),
+            );
+        }
+        *mock.next_get_slot.lock().unwrap() = Some(Ok(20));
+
+        let mut state = make_state(mock);
+        state.program_id = program_id;
+        state.batch_limit = 2;
+        state.max_pages = 1;
+        *state.last_signature.write().await = Some(resume_cursor);
+
+        let processed = EventListener::poll_events(&state).await.unwrap();
+        assert_eq!(processed, 2);
+        assert!(
+            *state.page_cap_truncated.read().await,
+            "hitting max_pages before reaching cursor must flag truncation"
+        );
+        assert_eq!(
+            *state.last_signature.read().await,
+            Some(resume_cursor),
+            "cursor must remain frozen at resume_cursor when older pages were truncated (#1678)"
+        );
     }
 }
