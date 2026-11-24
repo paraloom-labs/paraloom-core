@@ -145,12 +145,12 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub ingress_token: String,
 
-    /// When true (the default) the node settles consensus-approved withdrawals
-    /// by gathering a #260 validator co-signing quorum
-    /// (`Node::cosign_settlement_tx`) and submitting the multi-sig transaction,
-    /// rather than signing single-key. The single-key path is still used when no
-    /// `cosign_keypair` is configured (a solo operator with no peers to
-    /// co-sign), so this flag only takes effect on a node set up to co-sign.
+    /// When true (the default) the node starts the co-sign settlement submitter
+    /// task (`Node::settle_transact_via_cosign`) to gather a #260 validator
+    /// co-signing quorum and submit approved `transact` settlements on-chain.
+    /// The on-chain `transact` instruction settles exclusively through the #260
+    /// co-signing quorum (no single-key fallback exists); setting this flag to
+    /// `false` disables the co-sign settlement submitter on this node (#1689).
     #[serde(default = "default_use_cosign_settlement")]
     pub use_cosign_settlement: bool,
 
@@ -253,10 +253,17 @@ impl Default for BridgeConfig {
 }
 
 /// Default for [`BridgeConfig::use_cosign_settlement`] — co-signing is the
-/// intended settlement path (#260); the single-key fallback is automatic when
-/// no co-signing keypair is configured.
+/// required on-chain settlement path (#260 / #1689).
 fn default_use_cosign_settlement() -> bool {
     true
+}
+
+impl BridgeConfig {
+    /// Whether this node should launch the co-sign settlement submitter task
+    /// (#1689). Requires both the bridge and `use_cosign_settlement` to be enabled.
+    pub fn should_start_cosign_submitter(&self) -> bool {
+        self.enabled && self.use_cosign_settlement
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +304,22 @@ mod tests {
         assert_eq!(cfg.consensus_min_validators, Some(2));
         assert_eq!(cfg.consensus_total_validators, Some(3));
         assert_eq!(cfg.consensus_min_reputation, None);
+    }
+
+    #[test]
+    fn use_cosign_settlement_controls_submitter_activation() {
+        let mut cfg = BridgeConfig {
+            enabled: true,
+            ..BridgeConfig::default()
+        };
+        assert!(cfg.use_cosign_settlement);
+        assert!(cfg.should_start_cosign_submitter());
+
+        cfg.use_cosign_settlement = false;
+        assert!(
+            !cfg.should_start_cosign_submitter(),
+            "disabling use_cosign_settlement must disable the co-sign submitter (#1689)"
+        );
     }
 }
 
