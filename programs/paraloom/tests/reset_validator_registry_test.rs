@@ -304,3 +304,68 @@ async fn reset_rejects_non_upgrade_authority() {
     let err = banks.process_transaction(tx).await;
     assert!(err.is_err(), "non-authority reset must fail");
 }
+
+#[tokio::test]
+async fn reset_rejects_repinning_stake_mint_after_vault_initialized() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint_a = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let stake_mint_b = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, _payer, blockhash) = pt.start().await;
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"validator_registry"], &program_id);
+
+    let init_ix = Instruction {
+        program_id,
+        data: instruction::InitializeValidatorRegistry {}.data(),
+        accounts: accounts::InitializeValidatorRegistry {
+            stake_mint: stake_mint_a,
+            stake_token_vault: Pubkey::find_program_address(&[b"stake_token_vault"], &program_id).0,
+            stake_vault_authority: Pubkey::find_program_address(
+                &[b"stake_vault_authority"],
+                &program_id,
+            )
+            .0,
+            token_program: spl_token::id(),
+            rent: solana_sdk::sysvar::rent::ID,
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[init_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Attempting to re-pin the registry to stake_mint_b while stake_token_vault
+    // holds stake_mint_a must fail so register_validator/slash_validator cannot
+    // be bricked with MintMismatch (#1686).
+    let reset_diff_mint_ix = Instruction {
+        program_id,
+        data: instruction::ResetValidatorRegistry {
+            stake_mint: stake_mint_b,
+            expected_active_validators: 0,
+        }
+        .data(),
+        accounts: accounts::ResetValidatorRegistry {
+            validator_registry: registry_pda,
+            authority: upgrade_authority.pubkey(),
+            program_data: program_data_pda,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx =
+        Transaction::new_with_payer(&[reset_diff_mint_ix], Some(&upgrade_authority.pubkey()));
+    tx.sign(&[&upgrade_authority], blockhash);
+    assert!(
+        banks.process_transaction(tx).await.is_err(),
+        "re-pinning stake_mint to a different mint must be rejected (#1686)"
+    );
+
+    let raw = banks.get_account(registry_pda).await.unwrap().unwrap();
+    let reg = ValidatorRegistry::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(reg.stake_mint, stake_mint_a);
+}
