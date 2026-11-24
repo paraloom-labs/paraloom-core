@@ -837,26 +837,11 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                 println!("  Label: {}", label_text);
             }
 
-            // Save keypair to .paraloom/keys directory
-            let keys_dir = std::path::Path::new(".paraloom/keys");
-            if !keys_dir.exists() {
-                std::fs::create_dir_all(keys_dir).context("Failed to create keys directory")?;
-                // The directory holds spending keys — restrict it to the owner.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700))
-                        .context("Failed to restrict keys directory permissions")?;
-                }
-            }
-
             let filename = if let Some(label_text) = &label {
                 format!("{}.key", label_text.replace(" ", "_"))
             } else {
                 format!("key_{}.key", hex::encode(&public_key[..4]))
             };
-
-            let key_path = keys_dir.join(&filename);
 
             // Save in JSON format for easy parsing
             let key_data = serde_json::json!({
@@ -870,26 +855,9 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     .as_secs()
             });
 
-            // The file contains the private spending key — create it readable and
-            // writable only by the owner (0600) so it never lands world-readable
-            // at the process umask. Non-Unix platforms fall back to a plain write.
             let key_json = serde_json::to_string_pretty(&key_data)?;
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&key_path)
-                    .context("Failed to create key file")?;
-                f.write_all(key_json.as_bytes())
-                    .context("Failed to save keypair")?;
-            }
-            #[cfg(not(unix))]
-            std::fs::write(&key_path, key_json).context("Failed to save keypair")?;
+            let key_path =
+                save_wallet_keypair(std::path::Path::new(".paraloom/keys"), &filename, &key_json)?;
 
             println!("\nKeypair saved to: {}", key_path.display());
             println!("\n[WARNING] Keep your private key safe! Anyone with access to this file can spend your funds.");
@@ -2130,7 +2098,13 @@ async fn handle_init_command(path: PathBuf, force: bool) -> Result<()> {
     std::fs::create_dir_all(&path)?;
     std::fs::create_dir_all(path.join(".paraloom/logs"))?;
     std::fs::create_dir_all(path.join(".paraloom/storage"))?;
-    std::fs::create_dir_all(path.join(".paraloom/keys"))?;
+    let keys_dir = path.join(".paraloom/keys");
+    std::fs::create_dir_all(&keys_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700));
+    }
 
     let default_config = r#"
 # Paraloom Configuration
@@ -2178,4 +2152,117 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+/// Save a wallet keypair to the specified directory and filename in JSON format.
+///
+/// Restricts permissions on Unix so that:
+/// - The keys directory is chmod 0700 unconditionally (even if pre-existing at loose permissions).
+/// - The key file is opened with 0600 and chmod 0600 unconditionally (even if pre-existing at loose permissions).
+fn save_wallet_keypair(
+    keys_dir: &std::path::Path,
+    filename: &str,
+    key_json: &str,
+) -> Result<std::path::PathBuf> {
+    if !keys_dir.exists() {
+        std::fs::create_dir_all(keys_dir).context("Failed to create keys directory")?;
+    }
+    // The directory holds spending keys — restrict it to the owner (0700)
+    // unconditionally, so even a pre-existing directory at loose permissions
+    // is locked down (#1690).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(keys_dir, std::fs::Permissions::from_mode(0o700))
+            .context("Failed to restrict keys directory permissions")?;
+    }
+
+    let key_path = keys_dir.join(filename);
+
+    // The file contains the private spending key — create it readable and
+    // writable only by the owner (0600) so it never lands world-readable
+    // at the process umask. Restrict permissions unconditionally so even
+    // a pre-existing key file (e.g. from a reused label) is locked down (#1690).
+    // Non-Unix platforms fall back to a plain write.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .context("Failed to create key file")?;
+        f.write_all(key_json.as_bytes())
+            .context("Failed to save keypair")?;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to restrict key file permissions")?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&key_path, key_json).context("Failed to save keypair")?;
+
+    Ok(key_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_save_wallet_keypair_fresh_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let keys_dir = temp.path().join(".paraloom/keys");
+        let dummy_json = r#"{"address":"paraloom1test","private_key":"abcd"}"#;
+
+        let key_path = save_wallet_keypair(&keys_dir, "fresh.key", dummy_json).unwrap();
+
+        let dir_mode = std::fs::metadata(&keys_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "keys dir must be 0700, got {:o}", dir_mode);
+
+        let file_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "key file must be 0600, got {:o}",
+            file_mode
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_save_wallet_keypair_preexisting_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let keys_dir = temp.path().join(".paraloom/keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pre_key = keys_dir.join("test.key");
+        std::fs::write(&pre_key, b"old dummy key").unwrap();
+        std::fs::set_permissions(&pre_key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let dummy_json = r#"{"address":"paraloom1reused","private_key":"1234"}"#;
+        let key_path = save_wallet_keypair(&keys_dir, "test.key", dummy_json).unwrap();
+
+        let dir_mode = std::fs::metadata(&keys_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "pre-existing keys dir must be tightened to 0700, got {:o}",
+            dir_mode
+        );
+
+        let file_mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "pre-existing key file must be tightened to 0600, got {:o}",
+            file_mode
+        );
+
+        let content = std::fs::read_to_string(&key_path).unwrap();
+        assert_eq!(content, dummy_json);
+    }
 }
