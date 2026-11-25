@@ -157,6 +157,15 @@ impl VoteTally {
         now > self.deadline
     }
 
+    /// Refresh the consensus deadline and start time, extending the verification
+    /// window (e.g. on coordinator restart or client re-submission) while
+    /// preserving all collected votes.
+    pub fn refresh_deadline(&mut self) {
+        let now = crate::utils::now_unix_seconds();
+        self.started_at = now;
+        self.deadline = now + 30;
+    }
+
     /// Number of submitted votes whose wallet is in `eligible_wallets`.
     async fn count_eligible_votes(&self, eligible_wallets: &HashSet<String>) -> usize {
         let votes = self.votes.read().await;
@@ -357,5 +366,30 @@ mod tests {
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_deadline_updates_window_and_preserves_votes() {
+        let mut tally = VoteTally::new("req-1".to_string(), 2, 3);
+        tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![1],
+            )
+            .await
+            .unwrap();
+        // Simulate an expired deadline
+        tally.deadline = 100;
+        assert!(tally.is_timed_out());
+
+        tally.refresh_deadline();
+        assert!(!tally.is_timed_out());
+        assert!(tally.deadline > crate::utils::now_unix_seconds());
+
+        let (valid, invalid) = tally.vote_counts().await;
+        assert_eq!(valid, 1);
+        assert_eq!(invalid, 0);
     }
 }

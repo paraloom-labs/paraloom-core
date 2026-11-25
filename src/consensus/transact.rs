@@ -817,16 +817,23 @@ impl TransactVerificationCoordinator {
             self.total_validators,
         );
 
-        // Insert-if-absent: a duplicate start for an already in-flight canonical
-        // id (a client retry or a re-broadcast) must not discard the votes
-        // already collected for this round. The id is content-bound
-        // (`canonical_id`), so an existing entry is the same settlement — keep
-        // collecting on it rather than resetting the tally.
-        self.pending
-            .write()
-            .await
-            .entry(request_id.clone())
-            .or_insert(consensus);
+        // A duplicate start or re-submission for an already in-flight canonical
+        // id (a client retry, coordinator restart, or a re-broadcast) must not
+        // discard the votes already collected for this round. The id is
+        // content-bound (`canonical_id`), so an existing entry is the same
+        // settlement — keep collecting on it and refresh its deadline rather
+        // than letting an expired timeout wipe the votes.
+        // Also prune the emitted set so a re-submitted or restarted verification
+        // can reach quorum and re-emit.
+        {
+            let mut pending = self.pending.write().await;
+            if let Some(existing) = pending.get_mut(&request_id) {
+                existing.tally.refresh_deadline();
+            } else {
+                pending.insert(request_id.clone(), consensus);
+            }
+        }
+        self.emitted.write().await.remove(&request_id);
 
         log::info!("Started transact verification: {}", request_id);
         Ok(request_id)
@@ -984,6 +991,7 @@ impl TransactVerificationCoordinator {
     /// Remove a completed verification's state.
     pub async fn cleanup(&self, request_id: &str) -> Result<()> {
         self.pending.write().await.remove(request_id);
+        self.emitted.write().await.remove(request_id);
         log::debug!("Cleaned up transact verification: {}", request_id);
         Ok(())
     }
@@ -1454,6 +1462,89 @@ mod tests {
         assert!(
             approvals.try_recv().is_ok(),
             "the first vote must survive the duplicate start"
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmission_refreshes_timeout_and_preserves_cast_votes() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req.clone()).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_err(),
+            "one of two votes is not a quorum"
+        );
+
+        // Simulate that the verification timed out before peer voted.
+        {
+            let mut pending = coord.pending.write().await;
+            pending.get_mut(&id).unwrap().tally.deadline = 100;
+        }
+        assert!(
+            coord.check_consensus(&id).await.is_err(),
+            "verification should be timed out"
+        );
+
+        // Coordinator restart / re-submission must refresh the deadline and preserve votes.
+        coord.start_verification(req).await.unwrap();
+        assert!(
+            coord.check_consensus(&id).await.is_ok(),
+            "verification deadline must be refreshed after re-submission"
+        );
+
+        // Second vote arrives and completes the quorum.
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "quorum must complete and emit approval after re-submission"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_prunes_emitted_and_allows_reemit() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req.clone()).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok(), "first approval fires");
+
+        // Clean up the completed verification.
+        coord.cleanup(&id).await.unwrap();
+        assert!(
+            !coord.emitted.read().await.contains(&id),
+            "cleanup must prune the emitted set"
+        );
+
+        // Re-start verification for the same canonical id and verify it can re-emit.
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "after cleanup and re-submission, the request must be able to re-emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmission_without_cleanup_prunes_emitted_and_allows_reemit() {
+        let (coord, mut approvals) = coord_2of2().await;
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        coord.start_verification(req.clone()).await.unwrap();
+        coord.submit_result(vote(&id, 0, "W0", true)).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(approvals.try_recv().is_ok(), "first approval fires");
+
+        // Re-submission without prior cleanup must also prune emitted set and allow re-emission.
+        coord.start_verification(req).await.unwrap();
+        coord.submit_result(vote(&id, 1, "W1", true)).await.unwrap();
+        assert!(
+            approvals.try_recv().is_ok(),
+            "re-submission must prune emitted set and allow re-emission"
         );
     }
 
