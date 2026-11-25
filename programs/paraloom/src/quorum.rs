@@ -398,4 +398,58 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn orphaned_active_pda_in_cosign_set_vetoes_honest_supermajority() {
+        let p = prog();
+        let sys = anchor_lang::solana_program::system_program::ID;
+
+        // Registry records 2 active validators (1 SOL each, 2 SOL total active stake).
+        // The 2/3 threshold is 2 SOL (floor(2*2/3) + 1 = 2 SOL).
+        let w0 = Pubkey::new_unique();
+        let w1 = Pubkey::new_unique();
+        let (pda0, _) = Pubkey::find_program_address(&[b"validator", w0.as_ref()], &p);
+        let (pda1, _) = Pubkey::find_program_address(&[b"validator", w1.as_ref()], &p);
+        let mut d0 = validator_data_staked(w0, true, 1_000_000_000);
+        let mut d1 = validator_data_staked(w1, true, 1_000_000_000);
+        let (mut l0, mut l1, mut lp0, mut lp1) = (0u64, 0u64, 0u64, 0u64);
+        let (mut e0, mut e1) = ([0u8; 0], [0u8; 0]);
+        let s0 = AccountInfo::new(&w0, true, false, &mut l0, &mut e0, &sys, false, 0);
+        let a0 = AccountInfo::new(&pda0, false, false, &mut lp0, &mut d0, &p, false, 0);
+        let s1 = AccountInfo::new(&w1, true, false, &mut l1, &mut e1, &sys, false, 0);
+        let a1 = AccountInfo::new(&pda1, false, false, &mut lp1, &mut d1, &p, false, 0);
+
+        // When only honest supermajority (w0 + w1) signs, quorum succeeds (2 SOL >= 2 SOL, <= 2 SOL).
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(2, 2_000_000_000),
+            &Pubkey::default(),
+            0,
+            &[s0.clone(), a0.clone(), s1.clone(), a1.clone()]
+        )
+        .is_ok());
+
+        // A third validator (w_orphan) was registered with 1 SOL and left active,
+        // but dropped from the registry in reset_validator_registry without deactivation.
+        let w_orphan = Pubkey::new_unique();
+        let (pda_orphan, _) = Pubkey::find_program_address(&[b"validator", w_orphan.as_ref()], &p);
+        let mut d_orphan = validator_data_staked(w_orphan, true, 1_000_000_000);
+        let (mut lo, mut lpo) = (0u64, 0u64);
+        let mut eo = [0u8; 0];
+        let so = AccountInfo::new(&w_orphan, true, false, &mut lo, &mut eo, &sys, false, 0);
+        let ao = AccountInfo::new(&pda_orphan, false, false, &mut lpo, &mut d_orphan, &p, false, 0);
+
+        // If the orphaned active PDA is included in the co-sign set alongside the
+        // honest supermajority, counted_stake becomes 3 SOL > eligible_stake (2 SOL).
+        // The counted <= eligible bound triggers, rejecting the settlement (#1677).
+        let co_signed_with_orphan = [s0, a0, s1, a1, so, ao];
+        assert!(verify_validator_quorum(
+            &p,
+            &registry_with_stake(2, 2_000_000_000),
+            &Pubkey::default(),
+            0,
+            &co_signed_with_orphan
+        )
+        .is_err());
+    }
 }

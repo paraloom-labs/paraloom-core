@@ -9,6 +9,34 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-11
+
+- **Orphaned active validator PDA in the co-sign set vetoes an honest supermajority settlement**
+  (external security audit, M-05 / C-05). #1677 — following an administrative
+  `reset_validator_registry` that rebuilds the active validator set and stake
+  counters to drop one or more validators, any excluded validator whose PDA is
+  not deactivated via `deactivate_validator` remains marked `is_active: true`
+  with positive `stake_amount`. If this orphaned active PDA co-signs and is
+  included in `quorum_accounts` during settlement alongside an honest
+  supermajority, `verify_validator_quorum` counts its stake in `counted_stake`.
+  Because the registry's `total_active_stake` was rebuilt without that validator,
+  `counted_stake` exceeds `eligible_stake`.
+
+  The `counted_stake <= eligible_stake` bound (added in PR #373 to prevent
+  orphaned PDAs from satisfying a stale-low denominator) then fails-closed,
+  returning `BridgeError::QuorumNotMet`. Consequently, an honest supermajority of
+  active registered validators (even 100% of the active registry stake) cannot
+  settle if an orphaned active PDA is present in the co-sign set, halting
+  settlement liveness until the operator explicitly runs `deactivate_validator`
+  to mark the orphaned account inactive or the off-chain co-sign assembler
+  drops the stale signer.
+
+  No pool funds or safety invariants were compromised: the check enforces
+  strict consistency and prevents under-quorum settlements, but constitutes a
+  liveness failure under stale or un-reconciled registry state. Medium severity
+  per `docs/bug-bounty.md` ("griefing/liveness halt of settlement"). Documented
+  and tested in `programs/paraloom/src/quorum.rs`.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
