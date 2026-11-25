@@ -1126,6 +1126,98 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
     matches!(e, crate::bridge::BridgeError::AlreadySettled)
 }
 
+/// Anchor program errors that are deterministic for a given settlement
+/// transaction (#1717): a retry resubmits byte-identical inputs, so it can
+/// never succeed — each attempt only burns a co-sign round, a reverted
+/// on-chain submit (fees paid by the leader) and a nullifier-spent RPC check.
+///
+/// The rule is "fixed inputs or monotonic state": the proof, nullifiers and
+/// field elements are baked into the signed transaction; a spent nullifier
+/// never un-spends; the current slot only advances past an expiry; and a
+/// Merkle root absent from the append-only root history is not going to
+/// appear for the same proof. Deliberately NOT included: state-dependent
+/// errors a retry could outlast (`BridgePaused`, `InsufficientFunds`,
+/// `QuorumNotMet`, `DepositCapExceeded`, ...).
+///
+/// Codes are `6000 + declaration index` of the `#[error_code] BridgeError`
+/// enum in `programs/paraloom/src/lib.rs` (Anchor's `ERROR_CODE_OFFSET` is
+/// 6000 and the macro assigns codes in declaration order with no explicit
+/// offset). The table is pinned to that enum at 9e8c8e6 — inserting a variant
+/// above one of these renumbers it, and this table must move with it. The
+/// name is kept alongside the code for the same reason: the runtime renders
+/// the name next to the code in some client versions, and a name survives
+/// renumbering.
+const DETERMINISTIC_PROGRAM_ERRORS: &[(u32, &str)] = &[
+    (6001, "InvalidAmount"),
+    (6002, "InvalidProof"),
+    (6003, "ProofTooLarge"),
+    (6005, "NullifierAlreadyUsed"),
+    (6009, "WithdrawalExpired"),
+    (6010, "DuplicateNullifier"),
+    (6011, "NonCanonicalNullifier"),
+    (6012, "NonCanonicalFieldElement"),
+    (6018, "UnknownMerkleRoot"),
+];
+
+/// Whether a submit error is a deterministic on-chain rejection (#1717) —
+/// the program refused the transaction itself, so retrying the identical
+/// bytes is pure burn. This is the error-taxonomy surfacing the issue calls
+/// for: today every submit failure collapses into
+/// `BridgeError::SolanaRpc(String)`, so the program error code/name is
+/// extracted from the RPC error string here, at the settler that owns the
+/// retry decision.
+///
+/// Both renderings the runtime produces are accepted: the code-only shape
+/// (`... custom program error: 0x1782`) and the name-annotated shape
+/// (`... custom program error: 0x1770 (UnknownMerkleRoot)`). The match is
+/// anchored on the literal `custom program error:` marker plus an exact
+/// code/name from the table above, so a bare mention of an error name
+/// elsewhere in the string cannot false-positive. (The issue's own harness
+/// string writes `0x1770` for `UnknownMerkleRoot`; per the enum that code is
+/// `BridgePaused` — the name arm is what classifies that string, which is
+/// why both arms exist instead of trusting one hand-counted hex.)
+fn is_deterministic_error(e: &crate::bridge::BridgeError) -> bool {
+    let crate::bridge::BridgeError::SolanaRpc(msg) = e else {
+        return false;
+    };
+    // `to_ascii_lowercase` preserves byte length, so indices found in the
+    // lowered copy are valid in the original; the name is read from the
+    // original to keep its case.
+    let lower = msg.to_ascii_lowercase();
+    let Some(marker) = lower.find("custom program error:") else {
+        return false;
+    };
+    let rest = &msg[marker + "custom program error:".len()..];
+    // Code arm: `custom program error: 0x1782`.
+    if let Some(hex_pos) = rest.find("0x") {
+        let digits: String = rest[hex_pos + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        if let Ok(code) = u32::from_str_radix(&digits, 16) {
+            if DETERMINISTIC_PROGRAM_ERRORS
+                .iter()
+                .any(|(c, _)| *c == code)
+            {
+                return true;
+            }
+        }
+    }
+    // Name arm: `custom program error: 0x.... (UnknownMerkleRoot)`.
+    if let Some(open) = rest.find('(') {
+        if let Some(close) = rest[open..].find(')') {
+            let name = &rest[open + 1..open + close];
+            if DETERMINISTIC_PROGRAM_ERRORS
+                .iter()
+                .any(|(_, n)| *n == name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Decide which admitted validators to deactivate on one connectivity-reconcile
 /// tick, applying HYSTERESIS: a validator is deactivated only after it has been
 /// absent from `connected` for `threshold` CONSECUTIVE ticks.
@@ -1189,7 +1281,9 @@ async fn settle_approved_transacts<F, Fut>(
     // client re-proving into a new canonical id). Retry the whole cosign+submit
     // a few times with a short backoff. Re-settling an attempt that actually
     // landed on-chain is safe — its nullifier is already spent, so the retry
-    // returns a replay error and is skipped here.
+    // returns a replay error and is skipped here. A deterministic program
+    // rejection is NOT retried (#1717): the identical bytes can never settle,
+    // so the approval is failed fast and un-emitted after a single attempt.
     const MAX_SETTLE_ATTEMPTS: u32 = 3;
     const SETTLE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
     while let Some(approved) = rx.recv().await {
@@ -1205,6 +1299,22 @@ async fn settle_approved_transacts<F, Fut>(
                         "transact {} already settled (nullifier spent), skipping",
                         request_id
                     );
+                    break;
+                }
+                Err(e) if is_deterministic_error(&e) => {
+                    // #1717: the program rejected the transaction itself, so
+                    // the identical bytes can never settle — retrying only
+                    // burns co-sign rounds and fees. Fail fast after this
+                    // single attempt, but still un-emit so the client can
+                    // re-prove with corrected inputs instead of wedging.
+                    log::warn!(
+                        "transact {} rejected deterministically by the program, not retrying: {}",
+                        request_id,
+                        e
+                    );
+                    if let Some(coord) = &coordinator {
+                        coord.clear_emitted(&request_id).await;
+                    }
                     break;
                 }
                 Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
@@ -3525,6 +3635,179 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    // A deterministic on-chain rejection (#1717) must NOT burn the 3 settle
+    // attempts: the identical bytes can never succeed, so one co-sign round
+    // + one submit is the whole cost. True production shape: the runtime
+    // renders the Anchor error as its code only — `custom program error:
+    // 0x1782` (`UnknownMerkleRoot` = 6000 + 18, the 19th variant of the
+    // program's `#[error_code] BridgeError`).
+    #[tokio::test(start_paused = true)]
+    async fn deterministic_program_revert_is_not_retried() {
+        // The exact production error shape for a deterministic revert.
+        let revert = crate::bridge::BridgeError::SolanaRpc(
+            "sendAndConfirmTransaction: Transaction simulation failed: \
+             Error processing Instruction 0: custom program error: 0x1782"
+                .to_string(),
+        );
+        // A deterministic revert is not a replay: there is no
+        // deterministic-error arm in `is_replay_error`.
+        assert!(
+            !is_replay_error(&revert),
+            "a deterministic program revert must not classify as a replay"
+        );
+        assert!(
+            is_deterministic_error(&revert),
+            "a deterministic program revert must classify as deterministic"
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("doomed-root")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err::<String, _>(crate::bridge::BridgeError::SolanaRpc(
+                        "sendAndConfirmTransaction: Transaction simulation failed: \
+                         Error processing Instruction 0: custom program error: 0x1782"
+                            .to_string(),
+                    ))
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic revert must burn exactly one settle attempt"
+        );
+    }
+
+    // The issue's own harness string carries the Anchor name alongside a
+    // wrong code: `0x1770` is `BridgePaused`, the first variant — the
+    // reporter hand-built the hex. The name arm classifies it anyway, so
+    // the fix also holds for the name-annotated rendering.
+    #[tokio::test(start_paused = true)]
+    async fn deterministic_program_revert_with_error_name_is_not_retried() {
+        let revert = crate::bridge::BridgeError::SolanaRpc(
+            "sendAndConfirmTransaction: Transaction simulation failed: \
+             Error processing Instruction 0: custom program error: 0x1770 \
+             (UnknownMerkleRoot)"
+                .to_string(),
+        );
+        assert!(
+            is_deterministic_error(&revert),
+            "the name-annotated rendering must classify as deterministic"
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("doomed-root-named")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err::<String, _>(crate::bridge::BridgeError::SolanaRpc(
+                        "sendAndConfirmTransaction: Transaction simulation failed: \
+                         Error processing Instruction 0: custom program error: 0x1770 \
+                         (UnknownMerkleRoot)"
+                            .to_string(),
+                    ))
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a name-annotated deterministic revert must burn exactly one settle attempt"
+        );
+    }
+
+    // The classifier must accept every deterministic error by code and by
+    // name, and must NOT swallow transient failures or state-dependent
+    // program errors — those still get their retries.
+    #[test]
+    fn deterministic_error_classifier_matches_codes_and_names_but_not_transients() {
+        for (code, name) in DETERMINISTIC_PROGRAM_ERRORS {
+            // Code-only shape, as the runtime renders it.
+            let by_code = crate::bridge::BridgeError::SolanaRpc(format!(
+                "sendAndConfirmTransaction: Transaction simulation failed: \
+                 Error processing Instruction 0: custom program error: {code:#x}"
+            ));
+            assert!(
+                is_deterministic_error(&by_code),
+                "{name} ({code:#x}) must classify as deterministic by code"
+            );
+            // Name-annotated shape, with an unrelated code so only the
+            // name can classify it.
+            let by_name = crate::bridge::BridgeError::SolanaRpc(format!(
+                "sendAndConfirmTransaction: Transaction simulation failed: \
+                 Error processing Instruction 0: custom program error: 0x1234 ({name})"
+            ));
+            assert!(
+                is_deterministic_error(&by_name),
+                "{name} must classify as deterministic by name"
+            );
+        }
+
+        // State-dependent program errors: a retry could outlast them.
+        for (code, name) in [
+            (6000, "BridgePaused"),
+            (6004, "InsufficientFunds"),
+            (6014, "QuorumNotMet"),
+            (6019, "DepositCapExceeded"),
+        ] {
+            let e = crate::bridge::BridgeError::SolanaRpc(format!(
+                "sendAndConfirmTransaction: Transaction simulation failed: \
+                 Error processing Instruction 0: custom program error: {code:#x} ({name})"
+            ));
+            assert!(
+                !is_deterministic_error(&e),
+                "{name} ({code:#x}) must NOT classify as deterministic"
+            );
+        }
+
+        // Transient failures carry no program error at all.
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::SolanaRpc(
+                "sendAndConfirmTransaction: blockhash not found".to_string()
+            )
+        ));
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::SolanaRpc(
+                "sendAndConfirmTransaction timed out after 30s".to_string()
+            )
+        ));
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::InvalidTransaction("still failing".to_string())
+        ));
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::AlreadySettled
+        ));
+        // A bare mention of the name outside the `custom program error:`
+        // marker must not classify — the marker is what anchors the match.
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::SolanaRpc(
+                "program log: UnknownMerkleRoot seen while scanning".to_string()
+            )
+        ));
     }
 
     // With the bridge disabled (the default), a node owns neither a
