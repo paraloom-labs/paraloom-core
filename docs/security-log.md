@@ -9,6 +9,22 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-11
+
+- **Deposit decoder resolved only static keys, missing LUT-loaded SPL mints**
+  (external bug-bounty report, Sucimaru). #1633 — In `src/bridge/solana/decoder.rs`,
+  `extract_deposit_events` resolved compiled instruction account indexes strictly
+  against the static `account_keys` parsed from `raw.account_keys`. In a Solana v0
+  transaction using Address Lookup Tables (ALTs), instruction account indexes point
+  into the unified account sequence: static keys followed by LUT-loaded writable
+  and readonly addresses (`meta.loaded_addresses`). When a `deposit_note_spl`
+  instruction referenced an SPL mint loaded via a lookup table (e.g. index >= static
+  keys length), `decode_compiled_deposit` failed to resolve the mint account,
+  silently dropping the deposit event and blinding the bridge node to the SPL
+  deposit. Fixed by combining static account keys with `meta.loaded_addresses`
+  (writable then readonly) prior to instruction decoding. Covered by unit test
+  `decodes_deposit_note_spl_with_lookup_table_mint`. Devnet, pre-mainnet.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
