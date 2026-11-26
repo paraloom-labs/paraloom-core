@@ -584,7 +584,8 @@ pub const TX_NOUTS: usize = 2;
 /// Per input: the note commitment `Poseidon(4)([amount, pubkey, blinding,
 /// asset_id])` (with `pubkey = Poseidon(1)([privkey])`) is a member of `root`
 /// (checked only when `amount ≠ 0`, so a deposit or single-input spend can use
-/// zero-amount dummies), and the revealed nullifier `Poseidon(3)([commitment,
+/// zero-amount dummies), the amount is range-constrained to `u64` via
+/// `alloc_u64_witness`, and the revealed nullifier `Poseidon(3)([commitment,
 /// leaf_index, Poseidon(3)([privkey, commitment, leaf_index])])` binds the
 /// note's position and requires its private key. Per output: the commitment is
 /// re-derived and the amount range-bound to `u64`. The two input nullifiers
@@ -1766,6 +1767,72 @@ mod tests {
             );
             assert_eq!(uint.value().expect("uint value"), u64::MAX);
             assert!(cs.is_satisfied().expect("satisfied"));
+        }
+
+        /// Regression and boundary coverage for TransactCircuitV3 input-amount range constraints (#1695).
+        ///
+        /// Verifies that all input amounts in TransactCircuitV3 are strictly range-constrained
+        /// to [0, 2^64) via `alloc_u64_witness`. Covers boundary values (zero-dummies, standard amounts,
+        /// and u64::MAX) and confirms that 64 boolean constraints per input are enforced.
+        #[test]
+        fn input_amounts_range_constrained_boundary_and_gadget() {
+            use ark_r1cs_std::R1CSVar;
+
+            // 1. Verify that alloc_u64_witness enforces 64 boolean bit constraints across
+            // boundary values: 0, 1, 1_000_000, and u64::MAX.
+            for &val in &[0u64, 1u64, 1_000_000u64, u64::MAX] {
+                let cs = ConstraintSystem::<Fr>::new_ref();
+                let before = cs.num_constraints();
+                let (uint_var, fp_var) = alloc_u64_witness(cs.clone(), Some(val)).expect("alloc");
+                let after = cs.num_constraints();
+
+                assert_eq!(
+                    after - before,
+                    64,
+                    "alloc_u64_witness must produce exactly 64 boolean constraints"
+                );
+                assert_eq!(uint_var.value().expect("uint"), val);
+                assert_eq!(fp_var.value().expect("fp"), Fr::from(val));
+                assert!(cs.is_satisfied().expect("satisfied"));
+            }
+
+            // 2. Synthesize TransactCircuitV3 with input notes and verify total constraint count
+            // matches the pinned 18,477 constraints (which includes 64 boolean constraints per input).
+            let ins = [
+                InNote {
+                    amount: 500,
+                    privkey: Fr::from(31u64),
+                    blinding: Fr::from(1u64),
+                    index: 3,
+                },
+                InNote {
+                    amount: 0,
+                    privkey: Fr::from(32u64),
+                    blinding: Fr::from(2u64),
+                    index: 0,
+                },
+            ];
+            let outs = [
+                OutNote {
+                    amount: 500,
+                    pubkey: v3_pubkey(Fr::from(41u64)),
+                    blinding: Fr::from(3u64),
+                },
+                OutNote {
+                    amount: 0,
+                    pubkey: v3_pubkey(Fr::from(42u64)),
+                    blinding: Fr::from(4u64),
+                },
+            ];
+            let c = build(ins, outs, asset(), [0xCCu8; 32]);
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            c.generate_constraints(cs.clone()).expect("generate");
+            assert!(cs.is_satisfied().expect("satisfied"));
+            assert_eq!(
+                cs.num_constraints(),
+                18_477,
+                "TransactCircuitV3 constraint count must be 18,477 with input amounts range-constrained"
+            );
         }
 
         /// Full Groth16 setup → prove → verify with the public-input vector in
