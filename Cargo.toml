@@ -18,6 +18,9 @@ resolver = "2"
 [profile.release]
 overflow-checks = true
 
+[lints.clippy]
+double_must_use = "allow"
+
 [package]
 name = "paraloom"
 version = "0.6.0"
