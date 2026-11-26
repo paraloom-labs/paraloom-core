@@ -9,6 +9,38 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-10
+
+- **Wallet Withdraw modal locked out shielded SPL tokens by filtering only native SOL**
+  (external bug-bounty report, Ariyachan). #867 — In `paraloom-wallet`, round-trip
+  private swaps and `depositSpl` (#779) enable users to hold shielded SPL tokens
+  (such as USDC). While the settlement engine (`spendV3` in `transactFlow.ts`) was
+  updated to accept `mintHex` and derive SPL asset commitments for on-chain
+  `transact_spl` settlements, the frontend UI and note selection helper in
+  `src/components/Home.tsx` strictly hardcoded native SOL for all withdrawals:
+  `spendableSolNotes()` and `selectSolWithdrawNotes()` filtered exclusively for
+  `(!n.assetId || n.assetId === NATIVE_ASSET_HEX)`, unconditionally discarding
+  all shielded SPL notes.
+
+  As a result, when a user held shielded SPL token balances without any unspent
+  native SOL notes, the modal permanently disabled the Withdraw button with
+  "No spendable notes — deposit first", completely locking users out of
+  withdrawing shielded tokens to their Solana wallet. Furthermore, `handleWithdraw()`
+  hardcoded amount conversion to `1e9` (SOL lamports) rather than the token's
+  native decimal precision (e.g. `1e6` for USDC), did not derive the recipient's
+  Associated Token Account (ATA) for `transact_spl` settlement, omitted `mintHex`,
+  and confirmed settlement by polling native SOL balance rather than the token
+  account. Rated Medium per `docs/bug-bounty.md` (liveness halt on withdrawal of
+  shielded assets through the UI).
+
+  Fixed in `paraloom-wallet` (PR #43): generalized note selection
+  (`spendableWithdrawNotes` and `selectWithdrawNotes` in `lib/paraloom/notes.ts`)
+  with per-mint filtering while maintaining the native dust cutoff, added an
+  asset selector to the Withdraw modal in `src/popup/Home.tsx` that dynamically
+  scales by token decimals and formats amounts, and implemented recipient ATA
+  derivation, self-withdraw ATA creation, 32-byte hex binding for `transact_spl`,
+  and token-balance settlement polling.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
