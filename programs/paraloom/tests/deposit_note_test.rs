@@ -439,3 +439,227 @@ async fn set_deposit_cap_requires_the_cold_authority() {
         "cap must be unchanged after a rejected set"
     );
 }
+
+/// A deposit below `MIN_DEPOSIT_AMOUNT` (e.g. 1 lamport) is rejected (#1661).
+/// This prevents root eviction griefing where an attacker floods 64 x 1-lamport
+/// deposits to evict honest users' roots from the 64-root history ring buffer.
+#[tokio::test]
+async fn deposit_note_rejects_sub_minimum_deposit() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    // Fund the bridge vault so it is rent-exempt.
+    let fund_vault = solana_sdk::system_instruction::transfer(
+        &payer.pubkey(),
+        &bridge_vault_pda,
+        1_000_000_000,
+    );
+    let mut fund_tx = Transaction::new_with_payer(&[fund_vault], Some(&payer.pubkey()));
+    fund_tx.sign(&[&payer], blockhash);
+    banks.process_transaction(fund_tx).await.unwrap();
+
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 7;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 9;
+
+    // Test 1: 1 lamport deposit (the attack vector from #1661)
+    let deposit_1 = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: 1,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deposit_1], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    let result = banks.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "a 1-lamport dust deposit must be rejected by the minimum deposit floor"
+    );
+
+    // Test 2: deposit strictly below MIN_DEPOSIT_AMOUNT (MIN_DEPOSIT_AMOUNT - 1)
+    let deposit_sub_min = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: paraloom_program::MIN_DEPOSIT_AMOUNT - 1,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deposit_sub_min], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    let result = banks.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "a deposit below MIN_DEPOSIT_AMOUNT must be rejected"
+    );
+
+    // Verify tree remains empty: no leaf was appended
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 0, "no leaf appended on rejected dust deposits");
+
+    // Test 3: deposit exactly equal to MIN_DEPOSIT_AMOUNT succeeds
+    let deposit_min = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: paraloom_program::MIN_DEPOSIT_AMOUNT,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[deposit_min], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 1, "exactly MIN_DEPOSIT_AMOUNT appends one leaf");
+    assert!(tree.is_known_root(tree.root));
+}
+
+/// Verify that 64 x 1-lamport deposit attempts fail to evict an honest user's root (#1661).
+#[tokio::test]
+async fn root_eviction_griefing_attempt_neutralized() {
+    let program_id = paraloom_program::ID;
+    let mut pt = ProgramTest::new("paraloom_program", program_id, processor!(entry));
+    let (program_data_pda, upgrade_authority) = add_program_data(&mut pt, program_id);
+    let stake_mint = add_stake_mint(&mut pt, Pubkey::new_unique());
+    let (mut banks, payer, blockhash) = pt.start().await;
+
+    init_tree_and_state(
+        &mut banks,
+        program_id,
+        &upgrade_authority,
+        program_data_pda,
+        blockhash,
+        stake_mint,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], &program_id);
+    let (bridge_vault_pda, _) = Pubkey::find_program_address(&[b"bridge_vault"], &program_id);
+    let (tree_pda, _) = Pubkey::find_program_address(&[b"merkle_tree"], &program_id);
+
+    // Honest user deposits a valid note
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 42;
+    let mut blinding = [0u8; 32];
+    blinding[0] = 99;
+
+    let honest_deposit = Instruction {
+        program_id,
+        data: instruction::DepositNote {
+            amount: AMOUNT,
+            pubkey,
+            blinding,
+        }
+        .data(),
+        accounts: accounts::DepositNote {
+            bridge_state: bridge_state_pda,
+            bridge_vault: bridge_vault_pda,
+            merkle_tree: tree_pda,
+            depositor: payer.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    };
+    let mut tx = Transaction::new_with_payer(&[honest_deposit], Some(&payer.pubkey()));
+    tx.sign(&[&payer], blockhash);
+    banks.process_transaction(tx).await.unwrap();
+
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    let honest_root = tree.root;
+    assert_eq!(tree.next_index, 1);
+    assert!(tree.is_known_root(honest_root));
+
+    // Attacker attempts 64 x 1-lamport deposits to evict honest_root
+    for i in 0..64u8 {
+        let mut evil_pubkey = [0u8; 32];
+        evil_pubkey[0] = i;
+        let mut evil_blinding = [0u8; 32];
+        evil_blinding[0] = i.wrapping_add(1);
+
+        let evil_deposit = Instruction {
+            program_id,
+            data: instruction::DepositNote {
+                amount: 1,
+                pubkey: evil_pubkey,
+                blinding: evil_blinding,
+            }
+            .data(),
+            accounts: accounts::DepositNote {
+                bridge_state: bridge_state_pda,
+                bridge_vault: bridge_vault_pda,
+                merkle_tree: tree_pda,
+                depositor: payer.pubkey(),
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        };
+        let mut tx = Transaction::new_with_payer(&[evil_deposit], Some(&payer.pubkey()));
+        tx.sign(&[&payer], blockhash);
+        let res = banks.process_transaction(tx).await;
+        assert!(res.is_err(), "attacker 1-lamport deposit must be rejected");
+    }
+
+    // Check tree state: next_index is still 1, and honest_root is still known!
+    let raw = banks.get_account(tree_pda).await.unwrap().unwrap();
+    let tree = IncrementalMerkleTree::try_deserialize(&mut raw.data.as_slice()).unwrap();
+    assert_eq!(tree.next_index, 1, "attacker could not advance tree index");
+    assert_eq!(tree.root, honest_root, "tree root was not modified");
+    assert!(
+        tree.is_known_root(honest_root),
+        "honest root was not evicted from 64-root history"
+    );
+}
