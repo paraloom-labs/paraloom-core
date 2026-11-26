@@ -2454,16 +2454,35 @@ impl Node {
         };
         // SPL settlement (#779) takes the transact_spl path; `recipient` is the
         // recipient token account and the vault is the mint's asset vault.
+        // #1722: resolve the token program from the mint account's owner at
+        // request admission and pin it in the payload — the co-signed message
+        // must name the program that actually owns the mint, or a Token-2022
+        // settlement is built with the classic program and can never land.
         let params = match request.mint {
-            Some(mint) => SettlementParams::TransactSpl {
-                recipient_token_account: request.recipient,
-                mint,
-                nullifiers: request.nullifiers,
-                output_commitments: request.output_commitments,
-                root: request.root,
-                ext_amount: request.ext_amount,
-                proof: onchain_proof.to_vec(),
-            },
+            Some(mint) => {
+                let mint_pk = Pubkey::new_from_array(mint);
+                let bridge = self.bridge.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "no bridge configured: cannot resolve token program for SPL mint {mint_pk}"
+                    )
+                })?;
+                let token_program = bridge
+                    .lock()
+                    .await
+                    .mint_token_program(&mint_pk)
+                    .await
+                    .map_err(|e| anyhow!("cannot resolve token program for mint {mint_pk}: {e}"))?;
+                SettlementParams::TransactSpl {
+                    recipient_token_account: request.recipient,
+                    mint,
+                    token_program: token_program.to_bytes(),
+                    nullifiers: request.nullifiers,
+                    output_commitments: request.output_commitments,
+                    root: request.root,
+                    ext_amount: request.ext_amount,
+                    proof: onchain_proof.to_vec(),
+                }
+            }
             None => SettlementParams::Transact {
                 recipient: request.recipient,
                 nullifiers: request.nullifiers,

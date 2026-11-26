@@ -18,7 +18,9 @@
 //! amount past a validator: the validator only ever signs a message it built
 //! from parameters it verified.
 
-use super::instructions::create_transact_instruction;
+use super::instructions::{
+    create_transact_instruction, SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+};
 use crate::bridge::{BridgeError, Result};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
@@ -54,11 +56,17 @@ pub enum SettlementParams {
     /// An SPL-token `transact_spl` settlement (#779): the same 2-in/2-out spend
     /// but the payout leaves `mint`'s per-asset vault and `recipient` is the
     /// recipient **token account**. The settling validator's fee token account
-    /// is derived from the payload `authority` + `mint` (its ATA), so every
-    /// co-signer builds the same instruction without an extra field.
+    /// is derived from the payload `authority` + `mint` + `token_program`
+    /// (its ATA), so every co-signer builds the same instruction. The
+    /// `token_program` is the program that owns `mint` — classic SPL or
+    /// Token-2022 (#1722) — resolved from the mint account at request
+    /// admission; hardcoding classic here made Token-2022 settlements
+    /// unbuildable, since the fee ATA and the instruction's token-program
+    /// account must both key off the program that actually owns the mint.
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        token_program: [u8; 32],
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +198,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -198,12 +207,29 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            let token_program_pk = Pubkey::new_from_array(*token_program);
+            // The payload's token program must be one of the two real SPL
+            // token programs (#1722): a co-signer must never sign a
+            // settlement message naming a program that cannot own the mint,
+            // and a leader-supplied garbage id is declined here rather than
+            // signed and submitted to fail on-chain.
+            if token_program_pk != SPL_TOKEN_PROGRAM_ID
+                && token_program_pk != SPL_TOKEN_2022_PROGRAM_ID
+            {
+                return Err(BridgeError::InvalidTransaction(format!(
+                    "co-sign TransactSpl token_program {token_program_pk} is not a known SPL token program"
+                )));
+            }
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
+            // The ATA seeds include the token program, so a Token-2022 mint
+            // resolves to a different ATA than a classic-SPL mint — the fee
+            // account and the instruction's token_program account must both
+            // key off the program that actually owns the mint (#1722).
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +237,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -325,5 +351,103 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    fn sample_transact_spl_payload(token_program: [u8; 32]) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [13u8; 32],
+                token_program,
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    /// The `transact_spl` instruction's account order: bridge_state(0),
+    /// merkle_tree(1), mint(2), asset_vault(3), asset_vault_authority(4),
+    /// recipient_token_account(5), fee_token_account(6), nullifier_0(7),
+    /// nullifier_1(8), validator(9), validator_registry(10), authority(11),
+    /// token_program(12), system_program(13).
+    fn transact_spl_ix_account(message: &Message, index: usize) -> Pubkey {
+        // instructions[0] is the compute-budget ix; [1] is transact_spl.
+        let ix = &message.instructions[1];
+        message.account_keys[ix.accounts[index] as usize]
+    }
+
+    #[test]
+    fn transact_spl_message_uses_payload_token_program() {
+        // #1722 regression: a Token-2022 mint must settle with the Token-2022
+        // program and the Token-2022 ATA as the fee account — the pre-fix
+        // builder hardcoded the classic program for both, so the co-signed
+        // message could never succeed on-chain.
+        let payload = sample_transact_spl_payload(SPL_TOKEN_2022_PROGRAM_ID.to_bytes());
+        let message = build_settlement_message(&payload).expect("build Token-2022");
+        assert_eq!(
+            transact_spl_ix_account(&message, 12),
+            SPL_TOKEN_2022_PROGRAM_ID,
+            "token_program account must be Token-2022, not classic SPL"
+        );
+        let authority = Pubkey::new_from_array(payload.authority);
+        let mint = Pubkey::new_from_array([13u8; 32]);
+        let expected_fee_ta = super::super::instructions::derive_associated_token_address(
+            &authority,
+            &mint,
+            &SPL_TOKEN_2022_PROGRAM_ID,
+        );
+        assert_eq!(
+            transact_spl_ix_account(&message, 6),
+            expected_fee_ta,
+            "fee account must be the Token-2022 ATA"
+        );
+        // And it must NOT be the classic ATA the old code derived.
+        let classic_fee_ta = super::super::instructions::derive_associated_token_address(
+            &authority,
+            &mint,
+            &SPL_TOKEN_PROGRAM_ID,
+        );
+        assert_ne!(
+            transact_spl_ix_account(&message, 6),
+            classic_fee_ta,
+            "fee account must not be the classic-program ATA for a Token-2022 mint"
+        );
+
+        // A classic-SPL mint keeps the classic program and classic ATA.
+        let payload = sample_transact_spl_payload(SPL_TOKEN_PROGRAM_ID.to_bytes());
+        let message = build_settlement_message(&payload).expect("build classic");
+        assert_eq!(transact_spl_ix_account(&message, 12), SPL_TOKEN_PROGRAM_ID);
+        assert_eq!(transact_spl_ix_account(&message, 6), classic_fee_ta);
+    }
+
+    #[test]
+    fn transact_spl_rejects_unknown_token_program() {
+        // A payload naming a program that is neither SPL Token nor
+        // Token-2022 is declined at build time, never signed.
+        let payload = sample_transact_spl_payload(Pubkey::new_unique().to_bytes());
+        let err = build_settlement_message(&payload)
+            .expect_err("an unknown token program must be rejected");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
+    }
+
+    #[test]
+    fn transact_spl_payload_round_trips_through_bytes() {
+        // The new `token_program` field must survive the bincode transport
+        // a validator rebuilds from, byte-identical.
+        let payload = sample_transact_spl_payload(SPL_TOKEN_2022_PROGRAM_ID.to_bytes());
+        let bytes = payload.to_bytes().expect("serialize");
+        let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded, payload);
+        let leader = build_settlement_message(&payload).expect("leader build");
+        let validator = build_settlement_message(&decoded).expect("validator build");
+        assert_eq!(leader.serialize(), validator.serialize());
     }
 }
