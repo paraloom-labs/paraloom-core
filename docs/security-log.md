@@ -9,6 +9,31 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-11
+
+- **Shielded note secrets (amount and blinding) stored in plaintext in wallet local storage**
+  (external bug-bounty report, globalcuan). #1646 — In `paraloom-wallet`,
+  `lib/paraloom/notes.ts` stored the entire shielded-note map in
+  `chrome.storage.local` under `paraloom_notes` as unencrypted JSON. While the
+  wallet's master keys are protected in an encrypted vault (`keyManagement.ts`),
+  each stored `ShieldedNote` record exposed the exact note `amount`, the 32-byte
+  per-note randomizer (`blinding`), `assetId`, `commitment`, and `leafIndex`.
+
+  Local malware, backup inspection, or an unauthorized extension script reading
+  `chrome.storage.local` could correlate the note parameters with on-chain
+  Merkle leaves, resulting in complete deanonymization of deposit amounts and
+  timing for private addresses. It also exposed one of the two secrets (the
+  blinding factor) required alongside the account spend private key to authorize
+  spends. Rated Low per `docs/bug-bounty.md` (privacy-weakening information leak
+  without direct unauthorized spend capability, as the spend private key remains
+  in the encrypted vault).
+
+  Fixed in `paraloom-wallet` (PR #299): the note store at rest is sealed using
+  NaCl secretbox encryption keyed with material derived from the authenticated
+  vault session (`SHA-256("paraloom-notes-v1" || spend_privkey)`), legacy
+  plaintext note maps are migrated upon first unlocked read, and locked-state
+  writes fail closed.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
