@@ -48,14 +48,16 @@ use crate::relayer::{JupiterSwapProvider, RelayerError};
 /// router can be unit-tested with a stub instead of a live Jupiter client.
 #[async_trait]
 pub trait SwapQuoter: Send + Sync {
-    /// Route `amount` of `asset_in` -> `asset_out` for `user` and return the
-    /// unsigned swap transaction plus the quoted output.
+    /// Route `amount` of `asset_in` -> `asset_out` for `user` with optional
+    /// `slippage_bps` tolerance and return the unsigned swap transaction plus
+    /// the quoted output.
     async fn quote_swap(
         &self,
         asset_in: AssetId,
         asset_out: AssetId,
         amount: u64,
         user: &Pubkey,
+        slippage_bps: Option<u16>,
     ) -> Result<SwapQuote, RelayerError>;
 }
 
@@ -67,8 +69,10 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> SwapQuoter for JupiterSwapProvider<
         asset_out: AssetId,
         amount: u64,
         user: &Pubkey,
+        slippage_bps: Option<u16>,
     ) -> Result<SwapQuote, RelayerError> {
-        self.build_swap(asset_in, asset_out, amount, user).await
+        self.build_swap_with_slippage(asset_in, asset_out, amount, user, slippage_bps)
+            .await
     }
 }
 
@@ -78,6 +82,8 @@ struct RouteRequest {
     output_mint: String,
     amount: u64,
     user_public_key: String,
+    #[serde(default, alias = "slippageBps")]
+    slippage_bps: Option<u16>,
 }
 
 #[derive(Serialize)]
@@ -99,9 +105,17 @@ async fn route_handler(
     if req.amount == 0 {
         return Err((StatusCode::BAD_REQUEST, "amount must be > 0".to_string()));
     }
+    if let Some(bps) = req.slippage_bps {
+        if bps > 10_000 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "slippage_bps must be <= 10000".to_string(),
+            ));
+        }
+    }
 
     match quoter
-        .quote_swap(asset_in, asset_out, req.amount, &user)
+        .quote_swap(asset_in, asset_out, req.amount, &user, req.slippage_bps)
         .await
     {
         Ok(quote) => Ok(Json(RouteResponse {
@@ -158,10 +172,22 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt; // for oneshot
 
+    use std::sync::Mutex;
+
     /// Stub quoter: returns a canned unsigned tx, or a chosen error, without any
     /// network — so the router's parsing and status mapping test in isolation.
     struct StubQuoter {
         outcome: Result<SwapQuote, RelayerError>,
+        seen_slippage: Mutex<Option<Option<u16>>>,
+    }
+
+    impl StubQuoter {
+        fn new(outcome: Result<SwapQuote, RelayerError>) -> Self {
+            Self {
+                outcome,
+                seen_slippage: Mutex::new(None),
+            }
+        }
     }
 
     #[async_trait]
@@ -172,7 +198,9 @@ mod tests {
             _asset_out: AssetId,
             _amount: u64,
             _user: &Pubkey,
+            slippage_bps: Option<u16>,
         ) -> Result<SwapQuote, RelayerError> {
+            *self.seen_slippage.lock().unwrap() = Some(slippage_bps);
             self.outcome
                 .as_ref()
                 .map(|q| q.clone())
@@ -184,7 +212,7 @@ mod tests {
     }
 
     fn app(outcome: Result<SwapQuote, RelayerError>) -> Router {
-        router(Arc::new(StubQuoter { outcome }))
+        router(Arc::new(StubQuoter::new(outcome)))
     }
 
     fn body(json: serde_json::Value) -> Body {
@@ -313,5 +341,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_passes_explicit_slippage_bps_to_quoter() {
+        let quoter = Arc::new(StubQuoter::new(Ok(SwapQuote {
+            out_amount: 1,
+            swap_transaction: "tx".into(),
+        })));
+        let app = router(quoter.clone());
+        let mut b = valid_body();
+        b["slippage_bps"] = serde_json::json!(120u16);
+        let (status, _) = post_route(app, b).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(*quoter.seen_slippage.lock().unwrap(), Some(Some(120)));
+    }
+
+    #[tokio::test]
+    async fn route_passes_camel_case_slippage_bps_to_quoter() {
+        let quoter = Arc::new(StubQuoter::new(Ok(SwapQuote {
+            out_amount: 1,
+            swap_transaction: "tx".into(),
+        })));
+        let app = router(quoter.clone());
+        let mut b = valid_body();
+        b["slippageBps"] = serde_json::json!(75u16);
+        let (status, _) = post_route(app, b).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(*quoter.seen_slippage.lock().unwrap(), Some(Some(75)));
+    }
+
+    #[tokio::test]
+    async fn route_omitted_slippage_passes_none_to_quoter() {
+        let quoter = Arc::new(StubQuoter::new(Ok(SwapQuote {
+            out_amount: 1,
+            swap_transaction: "tx".into(),
+        })));
+        let app = router(quoter.clone());
+        let (status, _) = post_route(app, valid_body()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(*quoter.seen_slippage.lock().unwrap(), Some(None));
+    }
+
+    #[tokio::test]
+    async fn route_slippage_bps_exceeding_10000_is_400() {
+        let mut b = valid_body();
+        b["slippage_bps"] = serde_json::json!(10_001u16);
+        let (status, body) = post_route(
+            app(Ok(SwapQuote {
+                out_amount: 1,
+                swap_transaction: "x".into(),
+            })),
+            b,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("slippage_bps"));
     }
 }
