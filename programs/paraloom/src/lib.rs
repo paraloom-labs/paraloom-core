@@ -106,14 +106,117 @@ fn require_canonical_nullifier(nullifier: &[u8; 32]) -> Result<()> {
 fn require_canonical_field(value: &[u8; 32], error: BridgeError) -> Result<()> {
     use ark_ff::{BigInteger, PrimeField};
     let reduced = ark_bn254::Fr::from_le_bytes_mod_order(value);
-    let canonical = reduced.into_bigint().to_bytes_le();
+    let le = reduced.into_bigint().to_bytes_le();
+    let mut canonical = [0u8; 32];
+    let n = le.len().min(32);
+    canonical[..n].copy_from_slice(&le[..n]);
     // `require!` only accepts a literal error variant, so return explicitly to
     // let the caller pass the field-specific error code.
-    if canonical.as_slice() != value.as_slice() {
+    if &canonical != value {
         return Err(error.into());
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    const BN254_FR_MODULUS_LE: [u8; 32] = [
+        0x01, 0x00, 0x00, 0xf0, 0x93, 0xf5, 0xe1, 0x43, 0x91, 0x70, 0xb9, 0x79, 0x48, 0xe8, 0x33, 0x28,
+        0x5d, 0x58, 0x81, 0x81, 0xb6, 0x45, 0x50, 0xb8, 0x29, 0xa0, 0x31, 0xe1, 0x72, 0x4e, 0x64, 0x30,
+    ];
+
+    const BN254_FR_MODULUS_MINUS_ONE_LE: [u8; 32] = [
+        0x00, 0x00, 0x00, 0xf0, 0x93, 0xf5, 0xe1, 0x43, 0x91, 0x70, 0xb9, 0x79, 0x48, 0xe8, 0x33, 0x28,
+        0x5d, 0x58, 0x81, 0x81, 0xb6, 0x45, 0x50, 0xb8, 0x29, 0xa0, 0x31, 0xe1, 0x72, 0x4e, 0x64, 0x30,
+    ];
+
+    fn add_modulus(n: &[u8; 32]) -> Option<[u8; 32]> {
+        let mut out = [0u8; 32];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = n[i] as u16 + BN254_FR_MODULUS_LE[i] as u16 + carry;
+            out[i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        if carry == 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn test_canonical_field_accepts_valid_scalars() {
+        // Zero is canonical
+        let val_zero = [0u8; 32];
+        assert!(require_canonical_field(&val_zero, BridgeError::NonCanonicalFieldElement).is_ok());
+
+        // Value 1 is canonical
+        let mut val_1 = [0u8; 32];
+        val_1[0] = 1;
+        assert!(require_canonical_field(&val_1, BridgeError::NonCanonicalFieldElement).is_ok());
+
+        // Values below 2^248 (top byte zero, arbitrary non-zero lower bytes)
+        for i in 0..31 {
+            let mut val = [0u8; 32];
+            val[i] = 0xab;
+            assert!(require_canonical_field(&val, BridgeError::NonCanonicalFieldElement).is_ok());
+        }
+
+        // Top byte 0 (i.e. < 2^248), all other 31 bytes 0xff
+        let mut val_248 = [0xffu8; 32];
+        val_248[31] = 0;
+        assert!(require_canonical_field(&val_248, BridgeError::NonCanonicalFieldElement).is_ok());
+
+        // Max canonical field element: r - 1
+        assert!(require_canonical_field(
+            &BN254_FR_MODULUS_MINUS_ONE_LE,
+            BridgeError::NonCanonicalFieldElement
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_canonical_field_rejects_non_canonical_scalars() {
+        // The modulus r itself must be rejected (r mod r = 0 != r)
+        assert!(require_canonical_field(&BN254_FR_MODULUS_LE, BridgeError::NonCanonicalFieldElement).is_err());
+
+        // All 0xFF (2^256 - 1) must be rejected
+        let val_all_ff = [0xffu8; 32];
+        assert!(require_canonical_field(&val_all_ff, BridgeError::NonCanonicalFieldElement).is_err());
+
+        // n + r for various small scalars n must be rejected
+        for small_n in [0u8, 1u8, 2u8, 42u8, 255u8] {
+            let mut canonical = [0u8; 32];
+            canonical[0] = small_n;
+            if let Some(non_canonical) = add_modulus(&canonical) {
+                assert!(
+                    require_canonical_field(&non_canonical, BridgeError::NonCanonicalFieldElement).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_canonical_nullifier_accepts_and_rejects() {
+        let mut valid_nullifier = [0u8; 32];
+        valid_nullifier[0] = 42;
+        assert!(require_canonical_nullifier(&valid_nullifier).is_ok());
+
+        // Nullifier below 2^248
+        let mut nullifier_below_248 = [0x77u8; 32];
+        nullifier_below_248[31] = 0;
+        assert!(require_canonical_nullifier(&nullifier_below_248).is_ok());
+
+        // Non-canonical nullifier (n + r)
+        let non_canonical = add_modulus(&valid_nullifier).unwrap();
+        let err = require_canonical_nullifier(&non_canonical).unwrap_err();
+        assert_eq!(err, BridgeError::NonCanonicalNullifier.into());
+    }
+}
+
 
 /// Asset id of native SOL (#235): the all-zero 32 bytes. SPL assets use their
 /// mint's pubkey bytes instead.
