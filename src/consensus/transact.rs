@@ -563,6 +563,31 @@ impl TransactVerificationCoordinator {
         self.total_validators = total_validators;
     }
 
+    /// Minimum eligible-vote count for the BFT quorum.
+    pub fn min_validators_for_consensus(&self) -> usize {
+        self.min_validators_for_consensus
+    }
+
+    /// Returns the on-chain stake threshold that co-signing peers must collectively satisfy,
+    /// or None if the stake gate is disabled (unconfigured or unit test environment).
+    pub async fn required_cosign_stake(&self) -> Option<u64> {
+        let local = self.local_wallet.as_ref()?;
+        let onchain_stakes = self.onchain_stakes.read().await;
+        let registry_total = *self.onchain_registry_total.read().await;
+        let authority_stake = onchain_stakes.get(local).copied().unwrap_or(0);
+        let eligible_stake = registry_total.saturating_sub(authority_stake);
+        if eligible_stake == 0 {
+            return None;
+        }
+        Some(eligible_stake.saturating_mul(2) / 3 + 1)
+    }
+
+    /// Look up the on-chain stake for a validator wallet.
+    pub async fn validator_stake(&self, wallet: &str) -> u64 {
+        let onchain_stakes = self.onchain_stakes.read().await;
+        onchain_stakes.get(wallet).copied().unwrap_or(0)
+    }
+
     /// Reference to the slashing-evidence log (tests/pipelines read it).
     pub fn slashing_tracker(&self) -> &Arc<SlashingTracker> {
         &self.slashing_tracker

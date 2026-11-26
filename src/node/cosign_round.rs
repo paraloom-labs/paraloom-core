@@ -100,6 +100,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::find_quorum_subsets;
 
     fn transact_params() -> SettlementParams {
         SettlementParams::Transact {
@@ -195,5 +196,116 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "an unmet quorum must error, not submit");
+    }
+
+    #[tokio::test]
+    async fn assembles_with_quorum_subset_without_demanding_all_valid_voters() {
+        // #1679: When multiple voters approved, the leader assembles a transaction with only
+        // a quorum subset as required signers. Other valid voters being offline does not fail
+        // the round or invalidate the transaction.
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let _p2 = Keypair::new();
+
+        let program_id = Pubkey::new_from_array([10u8; 32]);
+        let vault = Pubkey::new_from_array([11u8; 32]);
+
+        // Leader chooses subset containing only p1, even though p1 and p2 both voted
+        let quorum_wallets = vec![leader.pubkey(), p1.pubkey()];
+        let subset_peers = vec![(p1.pubkey(), NodeId(vec![1]))];
+
+        // p1 signs, p2 is offline
+        let tx = run_cosign_round(
+            &leader,
+            program_id,
+            vault,
+            [4u8; 32],
+            "req-1679",
+            SettlementKind::Transact,
+            transact_params(),
+            quorum_wallets,
+            &subset_peers,
+            2,
+            |peer, req| {
+                let p1_kp = p1.insecure_clone();
+                async move {
+                    if peer == NodeId(vec![1]) {
+                        Some(honest_response(&p1_kp, &req))
+                    } else {
+                        None
+                    }
+                }
+            },
+        )
+        .await
+        .expect("round with quorum subset must succeed");
+
+        assert_eq!(tx.signatures.len(), 2, "only leader and p1 must be required signers");
+        assert!(tx.verify().is_ok(), "the assembled transaction must verify");
+    }
+
+    #[tokio::test]
+    async fn retries_alternative_candidate_subsets_when_peer_declines() {
+        // #1679: When the first candidate subset fails (e.g. peer declines/offline),
+        // alternative candidate subsets are attempted and succeed.
+        let leader = Keypair::new();
+        let p1 = Keypair::new();
+        let p2 = Keypair::new();
+
+        let program_id = Pubkey::new_from_array([10u8; 32]);
+        let vault = Pubkey::new_from_array([11u8; 32]);
+
+        let peers = vec![
+            (p1.pubkey(), NodeId(vec![1]), 0u64),
+            (p2.pubkey(), NodeId(vec![2]), 0u64),
+        ];
+
+        let candidate_subsets = find_quorum_subsets(&peers, 1, None, 4);
+        assert_eq!(candidate_subsets.len(), 3); // [p1], [p2], [p1, p2]
+
+        let mut tx_opt = None;
+        for subset in candidate_subsets {
+            let mut quorum_wallets = vec![leader.pubkey()];
+            quorum_wallets.extend(subset.iter().map(|(w, _)| *w));
+            let threshold = quorum_wallets.len();
+
+            let res = run_cosign_round(
+                &leader,
+                program_id,
+                vault,
+                [5u8; 32],
+                "req-retry",
+                SettlementKind::Transact,
+                transact_params(),
+                quorum_wallets,
+                &subset,
+                threshold,
+                |peer, req| {
+                    let p2_kp = p2.insecure_clone();
+                    async move {
+                        // p1 declines, p2 signs
+                        if peer == NodeId(vec![2]) {
+                            Some(honest_response(&p2_kp, &req))
+                        } else {
+                            Some(CoSignResponse {
+                                request_id: req.request_id,
+                                wallet_pubkey: String::new(),
+                                signature: None,
+                            })
+                        }
+                    }
+                },
+            )
+            .await;
+
+            if let Ok(tx) = res {
+                tx_opt = Some(tx);
+                break;
+            }
+        }
+
+        let tx = tx_opt.expect("must successfully settle using alternative candidate subset");
+        assert_eq!(tx.signatures.len(), 2);
+        assert!(tx.verify().is_ok());
     }
 }
