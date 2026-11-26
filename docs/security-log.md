@@ -9,6 +9,31 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-11
+
+- **Same-slot deposit and transact events broke client Merkle tree index inference**
+  (external bug-bounty report, random-solver). #1670 — `fetchV3Leaves` in
+  `paraloom-wallet` reconstructed the client-side Merkle tree by scanning program
+  signatures in reverse (`[...sigs].reverse()`). While `DepositNoteEvent` and
+  `DepositNoteSplEvent` carried an explicit `leaf_index`, `TransactEvent` omitted
+  it, forcing the client to track an inferred `transactLeafCursor`. When a deposit
+  and transact landed in the same Solana slot, non-deterministic RPC signature
+  ordering could present the deposit before the transact, advancing the cursor
+  prematurely and creating a positional mismatch (`"leaf history is not contiguous"`),
+  permanently freezing wallet spends until manual intervention. Additionally,
+  event payload lengths lacked bounds checks before reading.
+
+  Fixed on-chain and in the client:
+  1. `TransactEvent` in `programs/paraloom` now explicitly carries `leaf_index: u64`
+     (the Merkle tree position of the first output commitment `out_commitment0`,
+     with `out_commitment1` landing at `leaf_index + 1`), providing an authoritative
+     positional anchor at parity with `DepositNoteEvent`.
+  2. The wallet's `fetchV3Leaves` in `paraloom-wallet` guards payload byte lengths
+     before slicing and robustly slots consecutive output commitments into unoccupied
+     tree indices when replaying older events.
+
+  Stage 1 bug bounty, Medium finding, credited to random-solver. Devnet, pre-mainnet.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
