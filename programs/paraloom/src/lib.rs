@@ -20,6 +20,13 @@ declare_id!("8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP");
 
 pub const MIN_VALIDATOR_STAKE: u64 = 1_000_000_000; // 1 SOL for devnet testing
 
+/// Minimum deposit floor on native SOL deposits: 1000 lamports.
+/// Enforces a minimum deposit floor to prevent root eviction griefing (#1661),
+/// where an attacker floods 64 x 1-lamport deposits to evict legitimate users'
+/// roots from the 64-root history ring buffer at negligible cost and block their
+/// spend settlements with UnknownMerkleRoot.
+pub const MIN_DEPOSIT_AMOUNT: u64 = 1000;
+
 /// Recommended PARALOOM-token stake floor for the dual-stake (tokenomics.mdx):
 /// 1,000,000 PARALOOM = 1e12 base units at 6 decimals, roughly at parity with
 /// the 1-SOL floor at launch prices. The token is slashable collateral and a
@@ -207,7 +214,9 @@ pub mod paraloom_program {
         blinding: [u8; 32],
     ) -> Result<()> {
         require!(!ctx.accounts.bridge_state.paused, BridgeError::BridgePaused);
-        require!(amount > 0, BridgeError::InvalidAmount);
+        // Minimum deposit floor (#1661): reject dust deposits (< 1000 lamports)
+        // to prevent root eviction griefing in the 64-root history ring buffer.
+        require!(amount >= MIN_DEPOSIT_AMOUNT, BridgeError::InvalidAmount);
 
         // The commitment is a Poseidon hash of `pubkey`/`blinding`, and the
         // syscall reduces any input >= the field modulus mod p. A non-canonical
