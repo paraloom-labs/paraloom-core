@@ -1126,6 +1126,83 @@ fn is_replay_error(e: &crate::bridge::BridgeError) -> bool {
     matches!(e, crate::bridge::BridgeError::AlreadySettled)
 }
 
+/// Anchor custom-program error codes for the settle path that are a function
+/// of the submitted transaction alone: retrying the identical transaction can
+/// never change the verdict, so retrying only burns co-sign rounds, reverted
+/// submits and leader fees (#1717). Anchor assigns 6000 + the variant's
+/// 0-based index in `programs/paraloom/src/lib.rs` `#[error_code] enum
+/// BridgeError`.
+///
+/// Deliberately NOT included: state-dependent rejections that a later attempt
+/// could pass — `BridgePaused` (an admin can unpause) and `InsufficientFunds`
+/// / `DepositCapExceeded` (the bridge balance / cap can move). Those keep
+/// the old retry behaviour.
+const DETERMINISTIC_PROGRAM_ERROR_CODES: [u32; 8] = [
+    6001, // InvalidAmount
+    6002, // InvalidProof
+    6003, // ProofTooLarge
+    6005, // NullifierAlreadyUsed
+    6010, // DuplicateNullifier
+    6011, // NonCanonicalNullifier
+    6012, // NonCanonicalFieldElement
+    6018, // UnknownMerkleRoot
+];
+
+/// The Anchor error names for the same variants. Solana's simulation-failure
+/// text carries the code (`custom program error: 0x1782`); the transaction
+/// logs echoed in the RPC error also carry the name (`UnknownMerkleRoot`), so
+/// match on either signal. A name match is safe to add: these names are
+/// specific to this program's errors, and a false positive only moves the
+/// approval to the same outcome as exhausting all attempts (un-emitted so
+/// the client can re-prove), just without burning the extra co-sign rounds.
+const DETERMINISTIC_PROGRAM_ERROR_NAMES: [&str; 8] = [
+    "InvalidAmount",
+    "InvalidProof",
+    "ProofTooLarge",
+    "NullifierAlreadyUsed",
+    "DuplicateNullifier",
+    "NonCanonicalNullifier",
+    "NonCanonicalFieldElement",
+    "UnknownMerkleRoot",
+];
+
+/// Whether a submit error is a deterministic on-chain rejection of this
+/// transaction — one that can never succeed on retry (#1717). Such errors
+/// arrive as `BridgeError::SolanaRpc` (or `InvalidTransaction`) strings
+/// because `rpc_err` maps every `ClientError` there, so the check parses
+/// the Anchor custom-program error code (`custom program error: 0x1782`)
+/// and the error name from the string. It is a code/name check on text the
+/// program itself produces, not a guess at wording: the replay check above
+/// is structural because nothing produces its old string (#703); here the
+/// code and the name ARE what the RPC error carries.
+fn is_deterministic_error(e: &crate::bridge::BridgeError) -> bool {
+    let msg = match e {
+        crate::bridge::BridgeError::SolanaRpc(s)
+        | crate::bridge::BridgeError::InvalidTransaction(s) => s,
+        _ => return false,
+    };
+    if DETERMINISTIC_PROGRAM_ERROR_NAMES
+        .iter()
+        .any(|name| msg.contains(name))
+    {
+        return true;
+    }
+    const MARKER: &str = "custom program error: 0x";
+    let mut rest = msg.as_str();
+    while let Some(idx) = rest.find(MARKER) {
+        rest = &rest[idx + MARKER.len()..];
+        let hex_len = rest.bytes().take_while(|b| b.is_ascii_hexdigit()).count();
+        if hex_len > 0 {
+            if let Ok(code) = u32::from_str_radix(&rest[..hex_len], 16) {
+                if DETERMINISTIC_PROGRAM_ERROR_CODES.contains(&code) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Decide which admitted validators to deactivate on one connectivity-reconcile
 /// tick, applying HYSTERESIS: a validator is deactivated only after it has been
 /// absent from `connected` for `threshold` CONSECUTIVE ticks.
@@ -1205,6 +1282,24 @@ async fn settle_approved_transacts<F, Fut>(
                         "transact {} already settled (nullifier spent), skipping",
                         request_id
                     );
+                    break;
+                }
+                Err(e) if is_deterministic_error(&e) => {
+                    // A deterministic on-chain rejection can never succeed
+                    // on retry: the error is a function of the submitted
+                    // transaction alone (#1717). Do not burn further co-sign
+                    // rounds, reverted submits and leader fees on it — one
+                    // attempt is enough. Un-emit like the exhausted-attempts
+                    // arm below so the client can re-prove instead of the
+                    // approval being wedged (approved-once, never settled).
+                    log::warn!(
+                        "transact {} submit failed with a deterministic on-chain error, not retrying: {}",
+                        request_id,
+                        e
+                    );
+                    if let Some(coord) = &coordinator {
+                        coord.clear_emitted(&request_id).await;
+                    }
                     break;
                 }
                 Err(e) if attempt < MAX_SETTLE_ATTEMPTS => {
@@ -3525,6 +3620,188 @@ mod tests {
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    // A deterministic on-chain program revert must NOT be retried (#1717):
+    // the error is a function of the submitted transaction alone, so every
+    // further attempt would burn another full co-sign round, another
+    // reverted submit and more leader fees for an approval that can never
+    // settle. One attempt, then the drain moves on.
+    //
+    // The error shape is the exact production shape: `submit_signed_
+    // transaction` -> `send_and_confirm_transaction` -> `rpc_err` maps
+    // every `ClientError` to `BridgeError::SolanaRpc(String)`, so a program
+    // revert arrives as SolanaRpc, never AlreadySettled. Note the code here
+    // is 0x1782 = 6018 = UnknownMerkleRoot (6000 + its 0-based index in the
+    // program's `#[error_code]` enum); the R8 harness spelled it 0x1770,
+    // which is BridgePaused (6000) — the name in that string still
+    // classified it, but the code was wrong, so this test uses the correct
+    // one.
+    #[tokio::test(start_paused = true)]
+    async fn deterministic_program_revert_is_not_retried() {
+        let revert = crate::bridge::BridgeError::SolanaRpc(
+            "sendAndConfirmTransaction: Transaction simulation failed: \
+             Error processing Instruction 0: custom program error: 0x1782 \
+             (UnknownMerkleRoot)"
+                .to_string(),
+        );
+        assert!(
+            !is_replay_error(&revert),
+            "a deterministic program revert must not classify as a replay"
+        );
+        assert!(
+            is_deterministic_error(&revert),
+            "a deterministic program revert must classify as deterministic"
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("doomed-root")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err::<String, _>(crate::bridge::BridgeError::SolanaRpc(
+                        "sendAndConfirmTransaction: Transaction simulation failed: \
+                         Error processing Instruction 0: custom program error: 0x1782 \
+                         (UnknownMerkleRoot)"
+                            .to_string(),
+                    ))
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic revert must burn exactly one settle attempt"
+        );
+    }
+
+    // A deterministic failure must not stall later approvals: the drain
+    // moves on to the next approval after the single doomed attempt.
+    #[tokio::test(start_paused = true)]
+    async fn deterministic_error_does_not_stall_later_approvals() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ta_approval("doomed")).unwrap();
+        tx.send(ta_approval("fresh")).unwrap();
+        drop(tx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        settle_approved_transacts(
+            rx,
+            move |_approved| {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(crate::bridge::BridgeError::SolanaRpc(
+                            "sendAndConfirmTransaction: Transaction simulation failed: \
+                             Error processing Instruction 0: custom program error: 0x177a \
+                             (DuplicateNullifier)"
+                                .to_string(),
+                        ))
+                    } else {
+                        Ok("signature".to_string())
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // The classifier itself, over the production shapes: true for every
+    // deterministic settle-path error (by code and by name), false for the
+    // transient shapes the retry loop exists for and for state-dependent
+    // rejections a later attempt could pass.
+    #[test]
+    fn deterministic_error_classifier_matches_production_shapes() {
+        // By code (Anchor: 6000 + 0-based enum index).
+        for (code, name) in [
+            (0x1771, "InvalidAmount"),
+            (0x1772, "InvalidProof"),
+            (0x1773, "ProofTooLarge"),
+            (0x1775, "NullifierAlreadyUsed"),
+            (0x177a, "DuplicateNullifier"),
+            (0x177b, "NonCanonicalNullifier"),
+            (0x177c, "NonCanonicalFieldElement"),
+            (0x1782, "UnknownMerkleRoot"),
+        ] {
+            let err = crate::bridge::BridgeError::SolanaRpc(format!(
+                "sendAndConfirmTransaction: Transaction simulation failed: \
+                 Error processing Instruction 0: custom program error: 0x{code:x}"
+            ));
+            assert!(
+                is_deterministic_error(&err),
+                "{name} (0x{code:x}) must classify as deterministic"
+            );
+        }
+        // By name, as it appears in the transaction logs echoed in the RPC
+        // error (Anchor logs "Error Code: UnknownMerkleRoot. Error Number:
+        // 6018. ...").
+        let named = crate::bridge::BridgeError::SolanaRpc(
+            "Transaction simulation failed: Error processing Instruction 0: \
+             custom program error: 0x1770; Program log: AnchorError thrown in \
+             programs/paraloom/src/lib.rs:347. Error Code: UnknownMerkleRoot. \
+             Error Number: 6018. Error Message: Merkle root is not in the \
+             on-chain root history."
+                .to_string(),
+        );
+        assert!(is_deterministic_error(&named));
+        // Transient shapes: expired blockhash, RPC timeout, co-signer offline.
+        for transient in [
+            "blockhash not found",
+            "sendAndConfirmTransaction timed out after 30s",
+            "connection refused",
+            "co-signer briefly offline",
+            "Network error: request timed out",
+        ] {
+            let err = crate::bridge::BridgeError::SolanaRpc(transient.to_string());
+            assert!(
+                !is_deterministic_error(&err),
+                "{transient:?} must still be retried"
+            );
+            let err = crate::bridge::BridgeError::InvalidTransaction(transient.to_string());
+            assert!(
+                !is_deterministic_error(&err),
+                "{transient:?} must still be retried"
+            );
+        }
+        // State-dependent rejections a later attempt could pass: paused
+        // bridge (an admin can unpause), bridge funds / deposit cap (the
+        // balance can move). These keep the old retry behaviour.
+        for stateful in [
+            "custom program error: 0x1770 (BridgePaused)",
+            "custom program error: 0x1774 (InsufficientFunds)",
+            "custom program error: 0x1783 (DepositCapExceeded)",
+            "custom program error: 0x9999",
+        ] {
+            let err = crate::bridge::BridgeError::SolanaRpc(format!(
+                "Transaction simulation failed: {stateful}"
+            ));
+            assert!(
+                !is_deterministic_error(&err),
+                "{stateful:?} must still be retried"
+            );
+        }
+        // Non-string variants never classify.
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::AlreadySettled
+        ));
+        assert!(!is_deterministic_error(
+            &crate::bridge::BridgeError::SignatureVerification
+        ));
     }
 
     // With the bridge disabled (the default), a node owns neither a
