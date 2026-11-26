@@ -11,6 +11,26 @@ issue, email security@paraloom.network.
 
 ## 2026-08
 
+- **The prover-wasm crate's only round-trip test does not compile — the SPL
+  asset_id wiring has no executable end-to-end coverage** (external bug-bounty
+  report, globalcuan). #1647 — `prove_transact` in `paraloom-prover-wasm` gained
+  a seventh parameter, `asset_id_hex`, when SPL asset support was added (#779,
+  commit `91426ed`). The crate's only end-to-end test, `tests/v3_native_smoke.rs`,
+  was never updated: both call sites (lines 109 and 244) passed six arguments,
+  failing `cargo test` with compiler error E0061 before any test could run.
+  Because the prover crate had no CI workflow, the breakage went unnoticed and
+  the crate shipped with zero executable coverage of its full transact
+  round-trip.
+
+  The wiring that broke the test is security-critical: `asset_id_hex` binds an
+  SPL note's asset into the Groth16 proof's public inputs. In `paraloom-prover-wasm`,
+  both `prove_transact` call sites are updated to provide the canonical `asset_id_hex`
+  (including native SOL and non-zero SPL asset cases). In `paraloom-core`, explicit
+  unit and integration tests are added for `TransactCircuitV3` proving and constraint
+  generation, locking down that mismatched public `asset_id` inputs are rejected during
+  synthesis and proof verification fails when verified against an incorrect asset.
+
+
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
   gone blind to every SPL deposit** (external bug-bounty report, nyiru79). #795 —
   #779 added the SPL deposit and settlement instructions to the program, but the
