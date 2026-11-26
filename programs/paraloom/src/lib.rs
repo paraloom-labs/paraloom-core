@@ -412,6 +412,7 @@ pub mod paraloom_program {
         // pre-append root the proof was checked against) is untouched; the new
         // notes extend the tree for future spends.
         let mut tree = ctx.accounts.merkle_tree.load_mut()?;
+        let leaf_index = tree.next_index;
         tree.append(output_commitments[0])?;
         let new_root = tree.append(output_commitments[1])?;
         drop(tree);
@@ -491,6 +492,7 @@ pub mod paraloom_program {
             nullifier1: nullifiers[1],
             out_commitment0: output_commitments[0],
             out_commitment1: output_commitments[1],
+            leaf_index,
             new_root,
             ext_amount,
             fee,
@@ -616,6 +618,7 @@ pub mod paraloom_program {
         nf1.withdrawal_id = settlement_id;
 
         let mut tree = ctx.accounts.merkle_tree.load_mut()?;
+        let leaf_index = tree.next_index;
         tree.append(output_commitments[0])?;
         let new_root = tree.append(output_commitments[1])?;
         drop(tree);
@@ -693,6 +696,7 @@ pub mod paraloom_program {
             nullifier1: nullifiers[1],
             out_commitment0: output_commitments[0],
             out_commitment1: output_commitments[1],
+            leaf_index,
             new_root,
             ext_amount,
             fee,
@@ -2789,12 +2793,16 @@ pub struct DepositNoteSplEvent {
     pub timestamp: i64,
 }
 
+/// Emitted by `transact` and `transact_spl` (circuit v3): the spent nullifiers,
+/// appended output note commitments and their starting leaf index in the tree,
+/// so indexers and clients do not have to infer tree positions from RPC signature order (#1670).
 #[event]
 pub struct TransactEvent {
     pub nullifier0: [u8; 32],
     pub nullifier1: [u8; 32],
     pub out_commitment0: [u8; 32],
     pub out_commitment1: [u8; 32],
+    pub leaf_index: u64,
     pub new_root: [u8; 32],
     pub ext_amount: i64,
     pub fee: u64,
@@ -2916,4 +2924,82 @@ pub enum BridgeError {
 
     #[msg("Registry reset rebuilt fewer active validators than the caller declared (incomplete remaining_accounts list)")]
     RegistryResetCountMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::AnchorSerialize;
+
+    #[test]
+    fn test_transact_event_leaf_index_and_offsets() {
+        let recipient = Pubkey::new_unique();
+        let ev = TransactEvent {
+            nullifier0: [0x11; 32],
+            nullifier1: [0x22; 32],
+            out_commitment0: [0x33; 32],
+            out_commitment1: [0x44; 32],
+            leaf_index: 42,
+            new_root: [0x55; 32],
+            ext_amount: -500,
+            fee: 10,
+            recipient,
+            timestamp: 1700000000,
+            settlement_id: 7,
+        };
+
+        let mut data = Vec::new();
+        ev.serialize(&mut data).unwrap();
+
+        // 32 (nf0) + 32 (nf1) + 32 (oc0) + 32 (oc1) + 8 (leaf_index) + 32 (new_root) + 8 (ext_amount) + 8 (fee) + 32 (recipient) + 8 (ts) + 8 (settlement_id) = 232
+        assert_eq!(data.len(), 232);
+
+        // Verify offsets for fetchV3Leaves compatibility:
+        // oc0 at offset 64..96
+        assert_eq!(&data[64..96], &[0x33; 32]);
+        // oc1 at offset 96..128
+        assert_eq!(&data[96..128], &[0x44; 32]);
+        // leaf_index at offset 128..136 (little-endian u64)
+        let leaf_index_bytes = u64::from_le_bytes(data[128..136].try_into().unwrap());
+        assert_eq!(leaf_index_bytes, 42);
+
+        // Deserialization round-trip
+        let mut slice = data.as_slice();
+        let decoded = TransactEvent::deserialize(&mut slice).unwrap();
+        assert_eq!(decoded.leaf_index, 42);
+        assert_eq!(decoded.nullifier0, [0x11; 32]);
+        assert_eq!(decoded.nullifier1, [0x22; 32]);
+        assert_eq!(decoded.out_commitment0, [0x33; 32]);
+        assert_eq!(decoded.out_commitment1, [0x44; 32]);
+        assert_eq!(decoded.new_root, [0x55; 32]);
+        assert_eq!(decoded.ext_amount, -500);
+        assert_eq!(decoded.fee, 10);
+        assert_eq!(decoded.recipient, recipient);
+        assert_eq!(decoded.timestamp, 1700000000);
+        assert_eq!(decoded.settlement_id, 7);
+    }
+
+    #[test]
+    fn test_deposit_note_event_offsets() {
+        let depositor = Pubkey::new_unique();
+        let ev = DepositNoteEvent {
+            depositor,
+            amount: 1_000_000,
+            commitment: [0xaa; 32],
+            leaf_index: 5,
+            timestamp: 1700000000,
+        };
+
+        let mut data = Vec::new();
+        ev.serialize(&mut data).unwrap();
+
+        // 32 (depositor) + 8 (amount) + 32 (commitment) + 8 (leaf_index) + 8 (timestamp) = 88
+        assert_eq!(data.len(), 88);
+
+        // commitment at offset 40..72
+        assert_eq!(&data[40..72], &[0xaa; 32]);
+        // leaf_index at offset 72..80
+        let leaf_index = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        assert_eq!(leaf_index, 5);
+    }
 }
