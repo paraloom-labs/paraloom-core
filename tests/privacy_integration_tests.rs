@@ -145,3 +145,28 @@ fn test_commitment_scheme() {
     let c4 = CommitmentGenerator::commit(value, &[43u8; 32]);
     assert_ne!(c1, c4);
 }
+
+#[test]
+fn test_transact_spl_asset_commitment_and_wiring() {
+    use ark_bn254::Fr;
+    use ark_ff::PrimeField;
+    use paraloom::privacy::poseidon_circom::{v3_commit, v3_pubkey};
+
+    let spl_mint = [0x55u8; 32];
+    let asset = Fr::from_le_bytes_mod_order(&spl_mint);
+
+    let sk = Fr::from(100u64);
+    let pk = v3_pubkey(sk);
+    let blinding = Fr::from(200u64);
+    let amount = Fr::from(5000u64);
+
+    // Asset-aware note commitment binds the SPL asset_id
+    let commitment = v3_commit(amount, pk, blinding, asset);
+
+    // Commitment under a different asset (e.g. native SOL) must differ
+    let native_commitment = v3_commit(amount, pk, blinding, Fr::from(0u64));
+    assert_ne!(
+        commitment, native_commitment,
+        "asset_id must be bound into commitment"
+    );
+}

@@ -1828,6 +1828,120 @@ mod tests {
             bad[0] = Fr::from(123u64);
             assert!(!Groth16ProofSystem::verify(&vk, &bad, &proof).expect("verify"));
         }
+
+        /// When notes are committed under an asset, claiming a different public
+        /// asset_id makes in-circuit commitments differ from the input/output notes,
+        /// failing constraint satisfaction (#1647).
+        #[test]
+        fn transact_v3_binds_the_public_asset_id() {
+            let spl_asset = Fr::from_le_bytes_mod_order(&[0x33u8; 32]);
+            let mut c = build(
+                [
+                    InNote {
+                        amount: 1000,
+                        privkey: Fr::from(21u64),
+                        blinding: Fr::from(31u64),
+                        index: 2,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(22u64),
+                        blinding: Fr::from(32u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 600,
+                        pubkey: v3_pubkey(Fr::from(23u64)),
+                        blinding: Fr::from(33u64),
+                    },
+                    OutNote {
+                        amount: 400,
+                        pubkey: v3_pubkey(Fr::from(24u64)),
+                        blinding: Fr::from(34u64),
+                    },
+                ],
+                spl_asset,
+                [5u8; 32],
+            );
+            // Valid witness satisfies constraint system
+            assert!(synth(c.clone()));
+
+            // Claiming native SOL (all-zero) or another asset must fail
+            c.asset_id = Some([0u8; 32]);
+            assert!(!synth(c.clone()));
+
+            c.asset_id = Some([0xEEu8; 32]);
+            assert!(!synth(c));
+        }
+
+        /// Full Groth16 setup → prove → verify with an explicit non-zero SPL asset,
+        /// confirming SPL asset_id wiring has executable end-to-end roundtrip coverage (#1647).
+        #[test]
+        fn full_groth16_roundtrip_spl_asset() {
+            use ark_std::rand::{rngs::StdRng, SeedableRng};
+            let mut rng = StdRng::seed_from_u64(0x8B4D);
+
+            let spl_asset = Fr::from_le_bytes_mod_order(&[0x42u8; 32]);
+            let circuit = build(
+                [
+                    InNote {
+                        amount: 1000,
+                        privkey: Fr::from(51u64),
+                        blinding: Fr::from(5u64),
+                        index: 7,
+                    },
+                    InNote {
+                        amount: 0,
+                        privkey: Fr::from(52u64),
+                        blinding: Fr::from(6u64),
+                        index: 0,
+                    },
+                ],
+                [
+                    OutNote {
+                        amount: 400,
+                        pubkey: v3_pubkey(Fr::from(61u64)),
+                        blinding: Fr::from(1u64),
+                    },
+                    OutNote {
+                        amount: 100,
+                        pubkey: v3_pubkey(Fr::from(62u64)),
+                        blinding: Fr::from(2u64),
+                    },
+                ],
+                spl_asset,
+                [7u8; 32],
+            );
+
+            let (pk, vk) =
+                Groth16ProofSystem::setup(TransactCircuitV3::blank(), &mut rng).expect("setup");
+            let proof = Groth16ProofSystem::prove(&pk, circuit.clone(), &mut rng).expect("prove");
+
+            let to_fr = |b: [u8; 32]| Fr::from_le_bytes_mod_order(&b);
+            let public_inputs: Vec<Fr> = vec![
+                to_fr(circuit.root.unwrap()),
+                to_fr(circuit.public_amount.unwrap()),
+                to_fr(circuit.ext_data_hash.unwrap()),
+                to_fr(circuit.asset_id.unwrap()),
+                to_fr(circuit.input_nullifiers[0].unwrap()),
+                to_fr(circuit.input_nullifiers[1].unwrap()),
+                to_fr(circuit.output_commitments[0].unwrap()),
+                to_fr(circuit.output_commitments[1].unwrap()),
+            ];
+            assert_eq!(public_inputs[3], spl_asset);
+            assert!(Groth16ProofSystem::verify(&vk, &public_inputs, &proof).expect("verify"));
+
+            // A different asset_id (e.g. native SOL sentinel or another mint) must not verify.
+            let mut bad_asset = public_inputs.clone();
+            bad_asset[3] = Fr::from(0u64); // claimed as native SOL
+            assert!(!Groth16ProofSystem::verify(&vk, &bad_asset, &proof).expect("verify"));
+
+            let mut bad_other = public_inputs.clone();
+            bad_other[3] = Fr::from_le_bytes_mod_order(&[0x99u8; 32]);
+            assert!(!Groth16ProofSystem::verify(&vk, &bad_other, &proof).expect("verify"));
+        }
     }
 }
 
