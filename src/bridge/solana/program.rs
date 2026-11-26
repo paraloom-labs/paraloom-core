@@ -215,6 +215,27 @@ impl ProgramInterface {
         Ok(self.rpc.get_latest_blockhash().await?.to_bytes())
     }
 
+    /// Resolve the token program that owns `mint` (#1722): read the mint
+    /// account and return its owner, requiring it to be one of the two
+    /// known SPL token programs. The co-sign settlement builder keys the
+    /// fee ATA and the `transact_spl` token-program account off this value,
+    /// so a Token-2022 mint settles under Token-2022 instead of the classic
+    /// program. An RPC failure propagates; a mint owned by anything else
+    /// (or a missing mint, which the RPC reports as an error) is a typed
+    /// error so the settlement is refused rather than built unbuildable.
+    pub async fn mint_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        use super::instructions::{SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID};
+        let account = self.rpc.get_account(mint).await?;
+        let owner = account.owner;
+        if owner == SPL_TOKEN_PROGRAM_ID || owner == SPL_TOKEN_2022_PROGRAM_ID {
+            Ok(owner)
+        } else {
+            Err(BridgeError::InvalidTransaction(format!(
+                "mint {mint} is owned by {owner}, not a known SPL token program"
+            )))
+        }
+    }
+
     /// Submit a transaction the caller already assembled and signed — the
     /// co-signed settlement multi-sig tx (#260) — and confirm it on-chain.
     pub async fn submit_signed_transaction(&self, transaction: &Transaction) -> Result<String> {
@@ -409,6 +430,64 @@ mod tests {
         *mock.next_get_slot.lock().unwrap() = Some(Ok(987_654_321));
         let program = program_with_mock(mock);
         assert_eq!(program.get_slot().await.unwrap(), 987_654_321);
+    }
+
+    /// `mint_token_program` (#1722) resolves the token program from the
+    /// mint account's owner: a Token-2022 mint returns Token-2022, a
+    /// classic mint returns classic SPL — the value the co-sign builder
+    /// keys the fee ATA and the `transact_spl` token-program account off.
+    #[tokio::test]
+    async fn mint_token_program_returns_mint_owner_for_known_programs() {
+        use crate::bridge::solana::instructions::{
+            SPL_TOKEN_2022_PROGRAM_ID, SPL_TOKEN_PROGRAM_ID,
+        };
+        for expected in [SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID] {
+            let mock = Arc::new(MockBridgeRpc::new());
+            *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+                lamports: 1,
+                data: vec![],
+                owner: expected,
+                executable: false,
+                rent_epoch: 0,
+            }));
+            let program = program_with_mock(mock);
+            assert_eq!(
+                program
+                    .mint_token_program(&Pubkey::new_unique())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    /// A mint owned by anything other than the two known token programs
+    /// is refused, not silently settled under the wrong program; an RPC
+    /// failure (e.g. a missing mint) propagates as an error.
+    #[tokio::test]
+    async fn mint_token_program_rejects_unknown_owner_and_rpc_errors() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1,
+            data: vec![],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        }));
+        let program = program_with_mock(mock);
+        assert!(matches!(
+            program
+                .mint_token_program(&Pubkey::new_unique())
+                .await
+                .expect_err("unknown owner must be rejected"),
+            BridgeError::InvalidTransaction(_)
+        ));
+
+        let program = program_with_mock(Arc::new(MockBridgeRpc::new()));
+        assert!(program
+            .mint_token_program(&Pubkey::new_unique())
+            .await
+            .is_err());
     }
 
     /// Synthesise a BridgeState account: 8 bytes of discriminator

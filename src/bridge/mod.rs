@@ -108,6 +108,22 @@ impl Bridge {
         }
     }
 
+    /// Token program owning `mint` (#1722), read from the mint account's
+    /// owner. The co-sign settlement builder keys the fee ATA and the
+    /// `transact_spl` token-program account off this value.
+    pub async fn mint_token_program(
+        &self,
+        mint: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<solana_sdk::pubkey::Pubkey> {
+        if let Some(ref bridge) = self.solana_bridge {
+            bridge.mint_token_program(mint).await
+        } else {
+            Err(BridgeError::ConfigError(
+                "Solana bridge not initialized".to_string(),
+            ))
+        }
+    }
+
     /// Current slot, for deriving a settlement's expiration window.
     pub async fn current_slot(&self) -> Result<u64> {
         if let Some(ref bridge) = self.solana_bridge {
