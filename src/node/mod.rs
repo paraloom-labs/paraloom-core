@@ -1236,6 +1236,88 @@ async fn settle_approved_transacts<F, Fut>(
     }
 }
 
+/// Find valid quorum subsets from the available candidate peers (#1679).
+/// Subsets are ordered by size (preferring smaller subsets with fewer required signers)
+/// and by stake descending within each size.
+pub(crate) fn find_quorum_subsets(
+    peers: &[(Pubkey, NodeId, u64)],
+    min_peers: usize,
+    required_stake: Option<u64>,
+    max_subsets: usize,
+) -> Vec<Vec<(Pubkey, NodeId)>> {
+    let mut sorted = peers.to_vec();
+    // Sort peers by stake descending, then by pubkey bytes for deterministic ordering
+    sorted.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut results: Vec<Vec<(Pubkey, NodeId)>> = Vec::new();
+    let max_k = sorted.len();
+
+    for k in min_peers..=max_k {
+        let mut current = Vec::new();
+        combinations(
+            &sorted,
+            0,
+            k,
+            0,
+            required_stake,
+            &mut current,
+            &mut results,
+            max_subsets,
+        );
+        if results.len() >= max_subsets {
+            break;
+        }
+    }
+
+    results
+}
+
+fn combinations(
+    peers: &[(Pubkey, NodeId, u64)],
+    start: usize,
+    k: usize,
+    current_stake: u64,
+    required_stake: Option<u64>,
+    current: &mut Vec<(Pubkey, NodeId, u64)>,
+    results: &mut Vec<Vec<(Pubkey, NodeId)>>,
+    max_subsets: usize,
+) {
+    if results.len() >= max_subsets {
+        return;
+    }
+    if current.len() == k {
+        if let Some(req) = required_stake {
+            if current_stake < req {
+                return;
+            }
+        }
+        results.push(current.iter().map(|(pk, id, _)| (*pk, id.clone())).collect());
+        return;
+    }
+
+    let remaining_needed = k - current.len();
+    for i in start..=peers.len().saturating_sub(remaining_needed) {
+        if i >= peers.len() {
+            break;
+        }
+        current.push(peers[i].clone());
+        combinations(
+            peers,
+            i + 1,
+            k,
+            current_stake.saturating_add(peers[i].2),
+            required_stake,
+            current,
+            results,
+            max_subsets,
+        );
+        current.pop();
+        if results.len() >= max_subsets {
+            break;
+        }
+    }
+}
+
 impl Node {
     /// The cluster tag mixed into transact-vote signature domain separation.
     /// Byte-identical on every validator in a cohort (config), so a signed vote
@@ -2416,24 +2498,46 @@ impl Node {
             .map_err(|e| anyhow!("invalid program id: {e}"))?;
         let (vault, _) = derive_bridge_vault(&program_id);
 
-        // The validators that approved this transact become the co-signer
-        // quorum, mapped to their advertised settlement wallets; the leader
-        // signs as itself and is excluded from the peers it requests from.
+        // The validators that approved this transact become candidate co-signers,
+        // mapped to their advertised settlement wallets; the leader signs as itself
+        // and is excluded from the peers it requests from.
+        // Instead of demanding ALL valid voters as required signers (#1679),
+        // we select sufficient quorum subsets (satisfying both min validator count
+        // and on-chain stake threshold) and try them until one succeeds.
         let self_id = self.node_info.id.clone();
-        let mut peers: Vec<(Pubkey, NodeId)> = Vec::new();
-        for voter in coordinator.valid_voters(&request.request_id).await {
-            if voter == self_id {
+        let valid_voters = coordinator.valid_voters(&request.request_id).await;
+        let leader_voted = valid_voters.contains(&self_id);
+
+        let mut seen_wallets = std::collections::HashSet::new();
+        seen_wallets.insert(leader.pubkey());
+
+        let mut peer_candidates: Vec<(Pubkey, NodeId, u64)> = Vec::new();
+        for voter in &valid_voters {
+            if *voter == self_id {
                 continue;
             }
-            if let Some(wallet) = coordinator.validator_wallet(&voter).await {
-                if let Ok(pubkey) = wallet.parse::<Pubkey>() {
-                    peers.push((pubkey, voter));
+            if let Some(wallet_str) = coordinator.validator_wallet(voter).await {
+                if let Ok(pubkey) = wallet_str.parse::<Pubkey>() {
+                    if seen_wallets.insert(pubkey) {
+                        let stake = coordinator.validator_stake(&wallet_str).await;
+                        peer_candidates.push((pubkey, voter.clone(), stake));
+                    }
                 }
             }
         }
-        let mut quorum_wallets = vec![leader.pubkey()];
-        quorum_wallets.extend(peers.iter().map(|(w, _)| *w));
-        let threshold = quorum_wallets.len();
+
+        let min_validators = coordinator.min_validators_for_consensus();
+        let min_peers = if leader_voted {
+            min_validators.saturating_sub(1)
+        } else {
+            min_validators
+        };
+        let required_stake = coordinator.required_cosign_stake().await;
+
+        let candidate_subsets = find_quorum_subsets(&peer_candidates, min_peers, required_stake, 8);
+        if candidate_subsets.is_empty() {
+            return Err(anyhow!("not enough valid voters to form a co-sign quorum"));
+        }
 
         // The on-chain program verifies the proof in its 256-byte alt_bn128
         // wire form; strip the L2 suite tag and convert the compressed body.
@@ -2475,24 +2579,46 @@ impl Node {
         };
 
         let network = self.network.clone();
-        cosign_round::run_cosign_round(
-            leader,
-            program_id,
-            vault,
-            blockhash,
-            &request.request_id,
-            SettlementKind::Transact,
-            params,
-            quorum_wallets,
-            &peers,
-            threshold,
-            |peer, request| {
-                let network = network.clone();
-                async move { network.send_cosign_request(peer, request).await.ok() }
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("co-signing round failed: {e}"))
+        let mut last_err = anyhow!("co-signing round failed: no candidate subset succeeded");
+
+        for subset in candidate_subsets {
+            let mut quorum_wallets = vec![leader.pubkey()];
+            quorum_wallets.extend(subset.iter().map(|(w, _)| *w));
+            let threshold = quorum_wallets.len();
+
+            let network = network.clone();
+            match cosign_round::run_cosign_round(
+                leader,
+                program_id,
+                vault,
+                blockhash,
+                &request.request_id,
+                SettlementKind::Transact,
+                params.clone(),
+                quorum_wallets,
+                &subset,
+                threshold,
+                |peer, req| {
+                    let network = network.clone();
+                    async move { network.send_cosign_request(peer, req).await.ok() }
+                },
+            )
+            .await
+            {
+                Ok(tx) => return Ok(tx),
+                Err(e) => {
+                    log::warn!(
+                        "co-signing round failed with candidate subset of {} peers for request {}: {}; trying next candidate",
+                        subset.len(),
+                        request.request_id,
+                        e
+                    );
+                    last_err = anyhow!("co-signing round failed: {e}");
+                }
+            }
+        }
+
+        Err(last_err)
     }
 
     /// Settle a quorum-approved unified transact via the #260 co-signing path,
@@ -3633,5 +3759,94 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    // --- #1679: Quorum subset selection tests ---
+
+    #[test]
+    fn find_quorum_subsets_prefers_minimal_size_and_high_stake() {
+        let pk_a = Pubkey::new_from_array([1u8; 32]);
+        let pk_b = Pubkey::new_from_array([2u8; 32]);
+        let pk_c = Pubkey::new_from_array([3u8; 32]);
+
+        let id_a = NodeId(vec![1]);
+        let id_b = NodeId(vec![2]);
+        let id_c = NodeId(vec![3]);
+
+        // A has stake 10, B has stake 10, C has stake 70
+        let peers = vec![
+            (pk_a, id_a.clone(), 10u64),
+            (pk_b, id_b.clone(), 10u64),
+            (pk_c, id_c.clone(), 70u64),
+        ];
+
+        // Need at least 1 peer, and stake >= 60
+        let subsets = find_quorum_subsets(&peers, 1, Some(60), 8);
+        assert!(!subsets.is_empty(), "subsets must not be empty");
+
+        // The first candidate must be the minimal single peer C (stake 70 >= 60)
+        assert_eq!(subsets[0].len(), 1);
+        assert_eq!(subsets[0][0].0, pk_c);
+
+        // Neither [A] nor [B] should appear alone because their stake (10) < 60
+        for s in &subsets {
+            if s.len() == 1 {
+                assert_eq!(s[0].0, pk_c);
+            }
+        }
+
+        // Size 2 subsets must include C as well because A+B = 20 < 60
+        for s in &subsets {
+            if s.len() == 2 {
+                assert!(s.iter().any(|(pk, _)| *pk == pk_c));
+            }
+        }
+    }
+
+    #[test]
+    fn find_quorum_subsets_head_count_ordering() {
+        let pk1 = Pubkey::new_from_array([1u8; 32]);
+        let pk2 = Pubkey::new_from_array([2u8; 32]);
+        let pk3 = Pubkey::new_from_array([3u8; 32]);
+
+        let peers = vec![
+            (pk1, NodeId(vec![1]), 0u64),
+            (pk2, NodeId(vec![2]), 0u64),
+            (pk3, NodeId(vec![3]), 0u64),
+        ];
+
+        // min_peers = 1, no stake requirement
+        let subsets = find_quorum_subsets(&peers, 1, None, 10);
+        assert_eq!(subsets.len(), 7); // 3 of size 1, 3 of size 2, 1 of size 3
+
+        // First 3 candidates must be size 1
+        assert_eq!(subsets[0].len(), 1);
+        assert_eq!(subsets[1].len(), 1);
+        assert_eq!(subsets[2].len(), 1);
+
+        // Next 3 candidates must be size 2
+        assert_eq!(subsets[3].len(), 2);
+        assert_eq!(subsets[4].len(), 2);
+        assert_eq!(subsets[5].len(), 2);
+
+        // Last candidate must be size 3
+        assert_eq!(subsets[6].len(), 3);
+    }
+
+    #[test]
+    fn find_quorum_subsets_empty_when_insufficient_peers_or_stake() {
+        let pk1 = Pubkey::new_from_array([1u8; 32]);
+        let pk2 = Pubkey::new_from_array([2u8; 32]);
+
+        let peers = vec![
+            (pk1, NodeId(vec![1]), 20u64),
+            (pk2, NodeId(vec![2]), 20u64),
+        ];
+
+        // Insufficient peer count (needs 3, only 2 available)
+        assert!(find_quorum_subsets(&peers, 3, None, 8).is_empty());
+
+        // Insufficient stake (total 40 < 50 required)
+        assert!(find_quorum_subsets(&peers, 1, Some(50), 8).is_empty());
     }
 }
