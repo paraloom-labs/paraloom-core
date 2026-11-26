@@ -54,11 +54,13 @@ pub enum SettlementParams {
     /// An SPL-token `transact_spl` settlement (#779): the same 2-in/2-out spend
     /// but the payout leaves `mint`'s per-asset vault and `recipient` is the
     /// recipient **token account**. The settling validator's fee token account
-    /// is derived from the payload `authority` + `mint` (its ATA), so every
-    /// co-signer builds the same instruction without an extra field.
+    /// is derived from the payload `authority` + `mint` and `token_program` (its ATA),
+    /// so every co-signer builds the same instruction targeting the right program
+    /// (classic SPL or Token-2022, #1722).
     TransactSpl {
         recipient_token_account: [u8; 32],
         mint: [u8; 32],
+        token_program: [u8; 32],
         nullifiers: [[u8; 32]; 2],
         output_commitments: [[u8; 32]; 2],
         root: [u8; 32],
@@ -190,6 +192,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         SettlementParams::TransactSpl {
             recipient_token_account,
             mint,
+            token_program,
             nullifiers,
             output_commitments,
             root,
@@ -198,12 +201,20 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
         } => {
             let mint_pk = Pubkey::new_from_array(*mint);
             let recipient_ta = Pubkey::new_from_array(*recipient_token_account);
+            let token_program_pk = Pubkey::new_from_array(*token_program);
+            if token_program_pk != super::instructions::SPL_TOKEN_PROGRAM_ID
+                && token_program_pk != super::instructions::SPL_TOKEN_2022_PROGRAM_ID
+            {
+                return Err(BridgeError::InvalidTransaction(format!(
+                    "unsupported token program: {token_program_pk}"
+                )));
+            }
             // The settling validator's fee lands in its own ATA for the mint,
             // derived deterministically so every co-signer builds the same ix.
             let fee_ta = super::instructions::derive_associated_token_address(
                 &authority,
                 &mint_pk,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
             );
             super::instructions::create_transact_spl_instruction(
                 &program_id,
@@ -211,7 +222,7 @@ pub fn build_settlement_message(payload: &CoSignPayload) -> Result<Message> {
                 &mint_pk,
                 &recipient_ta,
                 &fee_ta,
-                &super::instructions::SPL_TOKEN_PROGRAM_ID,
+                &token_program_pk,
                 *nullifiers,
                 *output_commitments,
                 *root,
@@ -325,5 +336,104 @@ mod tests {
         // A quorum exactly at the cap still builds (the bound is inclusive).
         payload.quorum_validators = vec![[7u8; 32]; MAX_QUORUM_COSIGNERS];
         build_settlement_message(&payload).expect("a quorum at the cap still builds");
+    }
+
+    fn sample_transact_spl_payload(token_program: [u8; 32]) -> CoSignPayload {
+        CoSignPayload {
+            program_id: [1u8; 32],
+            authority: [2u8; 32],
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![[2u8; 32], [5u8; 32]],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: [6u8; 32],
+                mint: [7u8; 32],
+                token_program,
+                nullifiers: [[8u8; 32], [9u8; 32]],
+                output_commitments: [[10u8; 32], [11u8; 32]],
+                root: [12u8; 32],
+                ext_amount: -500,
+                proof: vec![0u8; 256],
+            },
+        }
+    }
+
+    #[test]
+    fn transact_spl_payload_round_trips_through_bytes() {
+        let payload = sample_transact_spl_payload(
+            super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        );
+        let bytes = payload.to_bytes().expect("serialize");
+        let decoded = CoSignPayload::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn transact_spl_message_targets_token_2022() {
+        let token_2022 = super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID;
+        let payload = sample_transact_spl_payload(token_2022.to_bytes());
+        let msg = build_settlement_message(&payload).expect("build token 2022 settlement");
+
+        // The second instruction is the TransactSpl instruction (first is ComputeBudget).
+        let ix = &msg.instructions[1];
+        // Account 12 in transact_spl is token_program.
+        let token_program_account_idx = ix.accounts[12] as usize;
+        let token_program_pk = msg.account_keys[token_program_account_idx];
+        assert_eq!(token_program_pk, token_2022);
+
+        // Account 6 in transact_spl is fee_token_account, which must be the ATA derived with Token-2022.
+        let fee_ta_account_idx = ix.accounts[6] as usize;
+        let fee_ta_pk = msg.account_keys[fee_ta_account_idx];
+        let expected_fee_ta = super::super::instructions::derive_associated_token_address(
+            &Pubkey::new_from_array(payload.authority),
+            &Pubkey::new_from_array([7u8; 32]),
+            &token_2022,
+        );
+        assert_eq!(fee_ta_pk, expected_fee_ta);
+    }
+
+    #[test]
+    fn transact_spl_message_targets_classic_spl() {
+        let spl_token = super::super::instructions::SPL_TOKEN_PROGRAM_ID;
+        let payload = sample_transact_spl_payload(spl_token.to_bytes());
+        let msg = build_settlement_message(&payload).expect("build classic spl settlement");
+
+        let ix = &msg.instructions[1];
+        let token_program_account_idx = ix.accounts[12] as usize;
+        let token_program_pk = msg.account_keys[token_program_account_idx];
+        assert_eq!(token_program_pk, spl_token);
+
+        let fee_ta_account_idx = ix.accounts[6] as usize;
+        let fee_ta_pk = msg.account_keys[fee_ta_account_idx];
+        let expected_fee_ta = super::super::instructions::derive_associated_token_address(
+            &Pubkey::new_from_array(payload.authority),
+            &Pubkey::new_from_array([7u8; 32]),
+            &spl_token,
+        );
+        assert_eq!(fee_ta_pk, expected_fee_ta);
+    }
+
+    #[test]
+    fn switching_token_program_changes_transact_spl_message() {
+        let classic_payload = sample_transact_spl_payload(
+            super::super::instructions::SPL_TOKEN_PROGRAM_ID.to_bytes(),
+        );
+        let token_2022_payload = sample_transact_spl_payload(
+            super::super::instructions::SPL_TOKEN_2022_PROGRAM_ID.to_bytes(),
+        );
+
+        let classic_msg = build_settlement_message(&classic_payload).expect("classic");
+        let token_2022_msg = build_settlement_message(&token_2022_payload).expect("token-2022");
+
+        assert_ne!(classic_msg.serialize(), token_2022_msg.serialize());
+    }
+
+    #[test]
+    fn unsupported_token_program_is_rejected() {
+        let rogue_token_program = [88u8; 32];
+        let payload = sample_transact_spl_payload(rogue_token_program);
+        let err = build_settlement_message(&payload)
+            .expect_err("unsupported token program must error");
+        assert!(matches!(err, BridgeError::InvalidTransaction(_)));
     }
 }
