@@ -1385,6 +1385,69 @@ mod tests {
         );
     }
 
+    /// Two Invalid votes differing only in the reason string must not be
+    /// treated as equivocation (false positive #1681).
+    #[tokio::test]
+    async fn two_invalid_votes_differing_only_in_reason_do_not_ban_wallet_or_slash() {
+        let (c, _rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string());
+        c.set_consensus_thresholds(2, 3);
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string()))
+            .await;
+        c.register_validator_with_wallet(NodeId(vec![2]), Some("W2".to_string()))
+            .await;
+        c.sync_onchain_stakes(
+            stakes(&[("W1", 1_000_000_000), ("W2", 1_000_000_000)]),
+            2_000_000_000,
+        )
+        .await;
+
+        let req = canonical_request();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // W1 submits first Invalid vote with reason "proof failed"
+        let vote1 = TransactVerificationResult {
+            request_id: id.clone(),
+            validator: NodeId(vec![1]),
+            vote: VerificationVote::Invalid {
+                reason: "proof failed".to_string(),
+            },
+            timestamp: 1,
+            wallet_pubkey: "W1".to_string(),
+            signature: vec![1],
+        };
+        c.submit_result(vote1).await.unwrap();
+
+        // W1 submits second Invalid vote with reason "circuit constraint error"
+        let vote2 = TransactVerificationResult {
+            request_id: id.clone(),
+            validator: NodeId(vec![9]),
+            vote: VerificationVote::Invalid {
+                reason: "circuit constraint error".to_string(),
+            },
+            timestamp: 2,
+            wallet_pubkey: "W1".to_string(),
+            signature: vec![2],
+        };
+        c.submit_result(vote2).await.unwrap();
+
+        // W1 must remain eligible (not banned as an equivocator) (#1681)
+        let eligible = c.eligible_wallets().await;
+        assert!(
+            eligible.contains("W1"),
+            "W1 must remain eligible and not be banned for re-worded Invalid votes"
+        );
+        // Slashing tracker must have 0 evidence records
+        assert_eq!(
+            c.slashing_tracker().total_count().await,
+            0,
+            "no slashing evidence should be recorded for differing reason strings"
+        );
+    }
+
     /// A vote from a wallet absent from the on-chain staked set is dropped
     /// (re-expression of #408 + Sybil): only staked wallets count.
     /// Arm-the-guard: count regardless of onchain_wallets membership.

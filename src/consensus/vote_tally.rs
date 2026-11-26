@@ -38,6 +38,14 @@ impl VerificationVote {
     pub fn is_valid(&self) -> bool {
         matches!(self, VerificationVote::Valid)
     }
+
+    /// Check if two votes represent the same verification decision.
+    ///
+    /// Equivocation is a flip between `Valid` and `Invalid`, not two `Invalid`
+    /// votes whose free-text `reason` differs (#1681).
+    pub fn same_decision(&self, other: &Self) -> bool {
+        self.is_valid() == other.is_valid()
+    }
 }
 
 /// One validator's recorded vote, keyed in the tally by its co-sign wallet.
@@ -118,10 +126,10 @@ impl VoteTally {
     ) -> Result<Option<SlashingEvidence>> {
         let mut votes = self.votes.write().await;
         if let Some(previous) = votes.get(&wallet) {
-            if previous.vote.is_valid() == vote.is_valid() {
+            if previous.vote.same_decision(&vote) {
                 // Same decision — idempotent. Equivocation is a *flip* between
                 // Valid and Invalid, not two Invalid votes whose free-text
-                // `reason` differs.
+                // `reason` differs (#1681).
                 return Ok(None);
             }
             let evidence = SlashingEvidence::Equivocation {
@@ -356,6 +364,65 @@ mod tests {
                 assert_eq!(new_signature, vec![8, 8]);
             }
             _ => panic!("expected wallet-keyed equivocation evidence"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_invalid_votes_differing_in_reason_do_not_equivocate() {
+        let tally = VoteTally::new("req-1".to_string(), 1, 2);
+        // First Invalid vote
+        assert!(tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Invalid {
+                    reason: "proof verification failed: invalid commitment".to_string(),
+                },
+                vec![1, 2, 3],
+            )
+            .await
+            .unwrap()
+            .is_none());
+
+        // Second Invalid vote from the same wallet with a different reason string
+        assert!(
+            tally
+                .submit_vote(
+                    "W1".into(),
+                    NodeId(vec![1]),
+                    VerificationVote::Invalid {
+                        reason: "self-verify error: connection timed out".to_string(),
+                    },
+                    vec![4, 5, 6],
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "two Invalid votes differing only in reason string must be idempotent, not equivocation (#1681)"
+        );
+
+        // Third vote flipping to Valid MUST be detected as equivocation
+        let evidence = tally
+            .submit_vote(
+                "W1".into(),
+                NodeId(vec![1]),
+                VerificationVote::Valid,
+                vec![7, 8, 9],
+            )
+            .await
+            .unwrap();
+        match evidence {
+            Some(SlashingEvidence::Equivocation {
+                wallet_pubkey,
+                previous_vote,
+                new_vote,
+                ..
+            }) => {
+                assert_eq!(wallet_pubkey, "W1");
+                assert!(matches!(previous_vote, VerificationVote::Invalid { .. }));
+                assert_eq!(new_vote, VerificationVote::Valid);
+            }
+            _ => panic!("flipping from Invalid to Valid must produce equivocation evidence"),
         }
     }
 }
