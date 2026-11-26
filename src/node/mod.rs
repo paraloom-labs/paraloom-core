@@ -1024,6 +1024,7 @@ async fn cosign_settlement(
             SettlementParams::TransactSpl {
                 recipient_token_account,
                 mint,
+                token_program,
                 nullifiers,
                 output_commitments,
                 root,
@@ -1033,8 +1034,12 @@ async fn cosign_settlement(
         ) => {
             let cache = verified_transacts.lock().await;
             let approved = cache.get(&request.request_id).is_some_and(|req| {
+                let expected_tp = req
+                    .token_program
+                    .unwrap_or_else(|| crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes());
                 req.recipient == *recipient_token_account
                     && req.mint == Some(*mint)
+                    && expected_tp == *token_program
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -2458,6 +2463,9 @@ impl Node {
             Some(mint) => SettlementParams::TransactSpl {
                 recipient_token_account: request.recipient,
                 mint,
+                token_program: request
+                    .token_program
+                    .unwrap_or_else(|| crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes()),
                 nullifiers: request.nullifiers,
                 output_commitments: request.output_commitments,
                 root: request.root,
@@ -2907,6 +2915,7 @@ mod tests {
             request_id: id.to_string(),
             recipient,
             mint: None,
+            token_program: None,
             nullifiers,
             output_commitments,
             root,
@@ -3382,6 +3391,77 @@ mod tests {
         assert_eq!(
             resp.signature, None,
             "a substituted ext_amount must be declined"
+        );
+    }
+
+    #[tokio::test]
+    async fn cosign_signs_transact_spl_token_2022() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let mint = [77u8; 32];
+        let token_program = crate::bridge::solana::SPL_TOKEN_2022_PROGRAM_ID.to_bytes();
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+
+        let mut req = ta_request("t-spl", recipient, nullifiers, outputs, root, ext_amount);
+        req.mint = Some(mint);
+        req.token_program = Some(token_program);
+        tas.lock().await.insert("t-spl".to_string(), req);
+
+        let payload = CoSignPayload {
+            program_id: [1u8; 32],
+            authority: kp.pubkey().to_bytes(),
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![kp.pubkey().to_bytes()],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: recipient,
+                mint,
+                token_program,
+                nullifiers,
+                output_commitments: outputs,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+
+        let resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t-spl", SettlementKind::Transact, &payload),
+        )
+        .await;
+
+        assert_eq!(resp.request_id, "t-spl");
+        assert!(resp.signature.is_some(), "must sign Token-2022 transact settlement");
+
+        // Now test mismatch: leader attempts to settle Token-2022 with classic SPL token program
+        let mut mismatched_payload = payload.clone();
+        if let SettlementParams::TransactSpl {
+            ref mut token_program,
+            ..
+        } = mismatched_payload.params
+        {
+            *token_program = crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes();
+        }
+        let mismatched_resp = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("t-spl", SettlementKind::Transact, &mismatched_payload),
+        )
+        .await;
+        assert_eq!(
+            mismatched_resp.signature, None,
+            "mismatched token_program must be declined"
         );
     }
 

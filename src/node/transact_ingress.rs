@@ -112,6 +112,11 @@ struct SubmitRequest {
     /// and `recipient` is the recipient token account.
     #[serde(default)]
     mint: Option<String>,
+    /// SPL token program managing `mint` (#1722), 32-byte hex. Omitted for
+    /// classic SPL Token (defaults to `SPL_TOKEN_PROGRAM_ID`). Required for
+    /// Token-2022 mints.
+    #[serde(default)]
+    token_program: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +179,30 @@ async fn submit_handler(
         .as_ref()
         .map(|m| parse_hex32("mint", m))
         .transpose()?;
+    let token_program = req
+        .token_program
+        .as_ref()
+        .map(|tp| parse_hex32("token_program", tp))
+        .transpose()?;
+
+    if token_program.is_some() && mint.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "token_program can only be specified for SPL mint settlements".to_string(),
+        ));
+    }
+
+    if let Some(tp) = token_program {
+        let tp_pk = solana_sdk::pubkey::Pubkey::new_from_array(tp);
+        if tp_pk != crate::bridge::solana::SPL_TOKEN_PROGRAM_ID
+            && tp_pk != crate::bridge::solana::SPL_TOKEN_2022_PROGRAM_ID
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "token_program must be either SPL Token or Token-2022 program id".to_string(),
+            ));
+        }
+    }
     let nullifiers = parse_hex32_pair("nullifiers", &req.nullifiers)?;
     let output_commitments = parse_hex32_pair("output_commitments", &req.output_commitments)?;
     let root = parse_hex32("root", &req.root)?;
@@ -222,6 +251,7 @@ async fn submit_handler(
         request_id: String::new(),
         recipient,
         mint,
+        token_program,
         nullifiers,
         output_commitments,
         root,
@@ -529,6 +559,80 @@ mod tests {
         let notes: Vec<DeliveredNote> = serde_json::from_slice(&body).unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].output_commitment, "33".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn token_program_without_mint_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"],"token_program":"{}"}}"#,
+            "66".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd),
+            hex::encode(crate::bridge::solana::SPL_TOKEN_PROGRAM_ID.to_bytes())
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unsupported_token_program_is_400() {
+        let app = router(Arc::new(StubIngress { accept: true }), None);
+        let body = format!(
+            r#"{{"recipient":"{}","mint":"{}","token_program":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "77".repeat(32),
+            "88".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn valid_token_2022_is_accepted_and_passed_to_node() {
+        let stub = Arc::new(CaptureStub {
+            seen: tokio::sync::Mutex::new(None),
+        });
+        let app = router(stub.clone(), None);
+        let token_2022_hex =
+            hex::encode(crate::bridge::solana::SPL_TOKEN_2022_PROGRAM_ID.to_bytes());
+        let body = format!(
+            r#"{{"recipient":"{}","mint":"{}","token_program":"{}","nullifiers":["{}","{}"],"output_commitments":["{}","{}"],"root":"{}","ext_amount":0,"proof":"{}","ciphertexts":["{}","{}"]}}"#,
+            "66".repeat(32),
+            "77".repeat(32),
+            token_2022_hex,
+            "11".repeat(32),
+            "22".repeat(32),
+            "33".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
+            "01".repeat(192),
+            v1_ciphertext_hex(0xab),
+            v1_ciphertext_hex(0xcd)
+        );
+        let resp = app.oneshot(post_json(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = stub.seen.lock().await.clone().expect("request forwarded");
+        assert_eq!(
+            seen.token_program,
+            Some(crate::bridge::solana::SPL_TOKEN_2022_PROGRAM_ID.to_bytes())
+        );
+        assert_eq!(seen.mint, Some([0x77u8; 32]));
     }
 
     /// The carrier rule at the HTTP layer: core relays a version it cannot

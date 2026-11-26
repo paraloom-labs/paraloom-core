@@ -62,6 +62,13 @@ pub struct TransactVerificationRequest {
     #[serde(default)]
     pub mint: Option<[u8; 32]>,
 
+    /// The SPL token program managing `mint` (#1722), or `None` for classic
+    /// SPL Token (defaults to `SPL_TOKEN_PROGRAM_ID`). Required for Token-2022
+    /// mints (`SPL_TOKEN_2022_PROGRAM_ID`) so settlement transfers and fee ATA
+    /// derivation target the right program.
+    #[serde(default)]
+    pub token_program: Option<[u8; 32]>,
+
     /// Input note nullifiers (one may be a random dummy for a 1-real-input spend)
     pub nullifiers: [[u8; 32]; 2],
 
@@ -127,6 +134,10 @@ impl TransactVerificationRequest {
         if let Some(mint) = self.mint {
             h.update(b"spl");
             h.update(mint);
+            if let Some(token_program) = self.token_program {
+                h.update(b"token_program");
+                h.update(token_program);
+            }
         }
         format!("transact-{}", hex::encode(h.finalize()))
     }
@@ -1026,6 +1037,7 @@ mod tests {
             request_id: "attacker-chosen".to_string(),
             recipient: [1u8; 32],
             mint: None,
+            token_program: None,
             nullifiers: [[2u8; 32], [3u8; 32]],
             output_commitments: [[4u8; 32], [5u8; 32]],
             root: [6u8; 32],
@@ -1501,6 +1513,25 @@ mod tests {
         let mut b = a.clone();
         b.proof[0] = 2;
         assert_ne!(a.canonical_id(), b.canonical_id());
+    }
+
+    #[test]
+    fn canonical_id_binds_the_token_program() {
+        let base = sample_request();
+        let mut with_mint = base.clone();
+        with_mint.mint = Some([42u8; 32]);
+        let id_no_tp = with_mint.canonical_id();
+
+        let mut with_tp1 = with_mint.clone();
+        with_tp1.token_program = Some([1u8; 32]);
+        let id_tp1 = with_tp1.canonical_id();
+
+        let mut with_tp2 = with_mint.clone();
+        with_tp2.token_program = Some([2u8; 32]);
+        let id_tp2 = with_tp2.canonical_id();
+
+        assert_ne!(id_no_tp, id_tp1);
+        assert_ne!(id_tp1, id_tp2);
     }
 
     // ---- registration gating / flap preservation ----
