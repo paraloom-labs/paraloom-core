@@ -9,6 +9,22 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-11
+
+- **Swap router silently discarded user-requested slippage tolerance, falling
+  back to server defaults** (external bug-bounty report). #1723 — When building
+  an unsigned swap via `POST /swap/route`, the wallet UI allowed users to select
+  a custom `slippageBps` tolerance, but `RouteRequest` did not accept this field
+  and `JupiterSwapProvider` routed all quotes using its server-configured default
+  `slippage_bps`. Swaps could execute with higher (or tighter) tolerance than the
+  user reviewed and signed off on.
+
+  Fixed by adding `slippage_bps` (with `slippageBps` camelCase alias) to
+  `RouteRequest`, validating that tolerance does not exceed 10,000 basis points
+  (100%), and threading the per-request slippage through `SwapQuoter` into the
+  upstream Jupiter `/quote` query. When omitted, quotes fall back safely to the
+  server-configured default tolerance.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have

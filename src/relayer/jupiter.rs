@@ -485,11 +485,18 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
     }
 
     /// Build the `/quote (v1)` query string for the given pair/amount, folding in
-    /// the configured slippage and platform fee.
-    fn quote_query(&self, input_mint: &str, output_mint: &str, amount: u64) -> String {
+    /// the requested (or configured default) slippage and platform fee.
+    pub fn quote_query_with_slippage(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: Option<u16>,
+    ) -> String {
+        let slippage = slippage_bps.unwrap_or(self.slippage_bps);
         let mut q = format!(
             "inputMint={}&outputMint={}&amount={}&slippageBps={}",
-            input_mint, output_mint, amount, self.slippage_bps
+            input_mint, output_mint, amount, slippage
         );
         if self.platform_fee_bps > 0 {
             q.push_str(&format!("&platformFeeBps={}", self.platform_fee_bps));
@@ -501,6 +508,12 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
             q.push_str(&format!("&dexes={}", dexes));
         }
         q
+    }
+
+    /// Build the `/quote (v1)` query string for the given pair/amount, folding in
+    /// the configured slippage and platform fee.
+    fn quote_query(&self, input_mint: &str, output_mint: &str, amount: u64) -> String {
+        self.quote_query_with_slippage(input_mint, output_mint, amount, None)
     }
 
     /// Parse a `/quote (v1)` body into the realized gross output, treating an
@@ -545,13 +558,34 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         amount: u64,
         user: &Pubkey,
     ) -> Result<(u64, serde_json::Value)> {
+        self.quote_and_swap_raw_with_slippage(asset_in, asset_out, amount, user, None)
+            .await
+    }
+
+    /// Shared quote-then-build step accepting an optional custom `slippage_bps`
+    /// tolerance overriding the default.
+    async fn quote_and_swap_raw_with_slippage(
+        &self,
+        asset_in: AssetId,
+        asset_out: AssetId,
+        amount: u64,
+        user: &Pubkey,
+        slippage_bps: Option<u16>,
+    ) -> Result<(u64, serde_json::Value)> {
         if amount == 0 {
             return Err(RelayerError::InvalidAmount(0));
+        }
+        if let Some(bps) = slippage_bps {
+            if bps > 10_000 {
+                return Err(RelayerError::SwapFailed(format!(
+                    "slippage_bps {bps} exceeds 10000 (100%)"
+                )));
+            }
         }
         let input_mint = asset_to_mint(asset_in);
         let output_mint = asset_to_mint(asset_out);
 
-        let query = self.quote_query(&input_mint, &output_mint, amount);
+        let query = self.quote_query_with_slippage(&input_mint, &output_mint, amount, slippage_bps);
         let quote_raw = self.http.get_quote(&query).await?;
         let out_amount = Self::parse_quote(&quote_raw)?;
 
@@ -582,8 +616,23 @@ impl<H: JupiterHttpClient, S: SwapSubmitter> JupiterSwapProvider<H, S> {
         amount: u64,
         user: &Pubkey,
     ) -> Result<SwapQuote> {
+        self.build_swap_with_slippage(asset_in, asset_out, amount, user, None)
+            .await
+    }
+
+    /// Build a swap for `user` with optional custom `slippage_bps` tolerance
+    /// **without** signing or submitting it. When `slippage_bps` is `None`,
+    /// defaults to the configured `slippage_bps`.
+    pub async fn build_swap_with_slippage(
+        &self,
+        asset_in: AssetId,
+        asset_out: AssetId,
+        amount: u64,
+        user: &Pubkey,
+        slippage_bps: Option<u16>,
+    ) -> Result<SwapQuote> {
         let (out_amount, swap_raw) = self
-            .quote_and_swap_raw(asset_in, asset_out, amount, user)
+            .quote_and_swap_raw_with_slippage(asset_in, asset_out, amount, user, slippage_bps)
             .await?;
         let resp: SwapTxResponse = serde_json::from_value(swap_raw)
             .map_err(|e| RelayerError::SwapFailed(format!("malformed swap response: {e}")))?;
@@ -801,6 +850,21 @@ mod tests {
         assert!(q.contains("slippageBps=75"), "query: {q}");
         assert!(q.contains("platformFeeBps=30"), "query: {q}");
         assert!(q.contains("amount=1000"), "query: {q}");
+    }
+
+    #[test]
+    fn custom_slippage_overrides_default_in_quote_query() {
+        let http = CannedClient::new(serde_json::json!({}), serde_json::json!({}));
+        let provider =
+            JupiterSwapProvider::new(http, RecordingSubmitter::default(), 50, 0, None).unwrap();
+        // None uses default (50)
+        let q_default = provider.quote_query_with_slippage("In", "Out", 1000, None);
+        assert!(q_default.contains("slippageBps=50"), "query: {q_default}");
+
+        // Explicit slippage overrides default (e.g. 100)
+        let q_custom = provider.quote_query_with_slippage("In", "Out", 1000, Some(100));
+        assert!(q_custom.contains("slippageBps=100"), "query: {q_custom}");
+        assert!(!q_custom.contains("slippageBps=50"), "query: {q_custom}");
     }
 
     #[test]
