@@ -11,6 +11,24 @@ issue, email security@paraloom.network.
 
 ## 2026-08
 
+- **Private swap exit addresses were cross-readable between approved origins**
+  (external bug-bounty report, #1665). The wallet's `GET_SWAP_STATUS` message
+  handler previously verified only that the requesting sender was an authorized
+  origin (`isAuthorizedSender`), but retrieved state from an unscoped global
+  `swapJob` session key in storage. If a user had approved multiple origins (or
+  an injected context under a matching wildcard domain), any second approved
+  origin could query `GET_SWAP_STATUS` to observe the ongoing or completed swap
+  result `{ freshAddress, swapSignature, outAmount, reshielded }`. This leaked
+  the unlinkable fresh exit address to an unrelated third-party site, defeating
+  the anonymity set of the swap's exit leg.
+
+  Addressed in `paraloom-wallet` (PR #315) by binding the initiating origin
+  directly to `SwapJob` (`origin: senderOrigin(sender)`) upon swap creation and
+  execution, and filtering `GET_SWAP_STATUS` queries through
+  `filterSwapJobForOrigin` so that requests from any non-initiating origin return
+  `null`. Logged in the core repository security log for tracking and audit
+  completeness across releases. Devnet, pre-mainnet.
+
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
   gone blind to every SPL deposit** (external bug-bounty report, nyiru79). #795 —
   #779 added the SPL deposit and settlement instructions to the program, but the

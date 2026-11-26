@@ -24,6 +24,12 @@
 //!   "swap_transaction": base64 }` (unsigned versioned tx), `400` on malformed
 //!   input, `422` when Jupiter finds no route, or `502` on an upstream failure.
 //! - `GET /swap/health` — `200 "ok"`.
+//!
+//! Note on swap lifecycle & status: The routing service is intentionally
+//! stateless and non-custodial; it does not track active swaps or expose an
+//! origin-facing status endpoint. Swap execution lifecycle, polling
+//! (`GET_SWAP_STATUS`), and origin-scoped access control are held exclusively
+//! within the client extension (`paraloom-wallet`, #1665).
 
 use async_trait::async_trait;
 use axum::{
@@ -313,5 +319,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_not_found() {
+        let resp = app(Ok(SwapQuote {
+            out_amount: 1,
+            swap_transaction: "x".into(),
+        }))
+        .oneshot(
+            Request::builder()
+                .uri("/swap/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
