@@ -233,6 +233,21 @@ impl ProgramInterface {
         parse_program_version(&account.data)
     }
 
+    /// Check whether the on-chain program's executable `ProgramData` account
+    /// is active and has not been closed.
+    ///
+    /// When an upgrade authority closes a program via `bpf_loader_upgradeable::close`,
+    /// the `ProgramData` account is closed and its rent reclaimed, while the program
+    /// account may still exist with `executable = true`. Calling this method checks
+    /// whether the executable data account actually exists on-chain (#1624).
+    pub async fn is_program_active(&self) -> Result<bool> {
+        let (program_data_pda, _) = super::derive_program_data(&self.program_id);
+        match self.rpc.get_account(&program_data_pda).await {
+            Ok(acc) => Ok(!acc.data.is_empty() && acc.lamports > 0),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Compare the on-chain program version against the binary's
     /// expected version (#69, audit #9). Returns `Ok(())` on a match,
     /// `Err(BridgeError::ConfigError)` on a mismatch with both values
@@ -481,5 +496,37 @@ mod tests {
     fn parse_program_version_rejects_empty_buffer() {
         let err = parse_program_version(&[]).expect_err("empty buffer");
         assert!(matches!(err, BridgeError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn is_program_active_returns_true_when_program_data_exists() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Ok(Account {
+            lamports: 1_000_000,
+            data: vec![1, 2, 3],
+            owner: solana_sdk::bpf_loader_upgradeable::id(),
+            executable: false,
+            rent_epoch: 0,
+        }));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        assert!(program.is_program_active().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_program_active_returns_false_when_program_data_is_closed() {
+        let mock = Arc::new(MockBridgeRpc::new());
+        *mock.next_get_account.lock().unwrap() = Some(Err(BridgeError::SolanaRpc(
+            "AccountNotFound".to_string(),
+        )));
+        let config = BridgeConfig {
+            program_id: "11111111111111111111111111111111".to_string(),
+            ..Default::default()
+        };
+        let program = ProgramInterface::new(config, mock).unwrap();
+        assert!(!program.is_program_active().await.unwrap());
     }
 }

@@ -9,6 +9,30 @@ risk, and entries after it say plainly what was and was not exposed.
 This is the log referenced by [`SECURITY.md`](../SECURITY.md). To report a new
 issue, email security@paraloom.network.
 
+## 2026-09
+
+- **Mainnet program closed by upgrade authority, locking remaining vault balances
+  with no on-chain recovery path** (external report, #1624). On 2026-09-23 at
+  13:33:43 UTC (slot 449,718,232, tx `JZqfj9bpT5YEVAbfN7wwT2AzPqYgWgUuYipgWxLogJxmvAaG9zw3UjudiSGqhsLxKVYnCRf5T8SvYtxZoJpBceS`),
+  the upgrade authority closed the `BPFLoaderUpgradeable` program data account
+  (`GdPRq7G1fmVmpAkJJb2xNaziroW1QjaGcAZ3B5e1awAK`) for the mainnet program
+  (`8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP`) to reclaim the ~4.89 SOL
+  rent reserve.
+
+  Closing the program data account permanently halts instruction execution on
+  the program ID. Because bridge vaults (`bridge_vault` holding ~3.34 SOL and
+  the SPL `asset_vault` holding 2.597771 USDC from the four unspent deposits
+  recorded in #795) are Program Derived Addresses (PDAs) owned by the program,
+  funds can only be transferred via cross-program invocation (`invoke_signed`)
+  originating from the program itself. Without an executable program data account
+  or a pre-authorized recovery path prior to closing, the remaining on-chain
+  vault funds (~3.3 SOL and ~2.6 USDC) are irrevocably locked on mainnet-beta.
+  Confirmed as an intentional decommission following the devnet cutover and
+  ceremony finalization, with no active settlement or user funds remaining
+  in transit. Added `is_program_active` to `ProgramInterface` so nodes and
+  tooling verify that the on-chain executable program data exists and is not
+  closed.
+
 ## 2026-08
 
 - **The bridge decoder could not read `deposit_note_spl`, so nodes would have
