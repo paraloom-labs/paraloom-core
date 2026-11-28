@@ -130,7 +130,7 @@ pub struct BridgeConfig {
     /// the consensus mesh. Triggers consensus, so it defaults to an empty
     /// string (disabled). `#[serde(default)]` so a config predating this
     /// field still parses (and stays disabled) instead of failing to load.
-    #[serde(default)]
+    #[serde(default = "default_transact_ingress_address")]
     pub transact_ingress_address: String,
 
     /// Shared bearer token the write-surface ingress endpoints
@@ -140,9 +140,9 @@ pub struct BridgeConfig {
     /// ingress exposed beyond loopback cannot be driven by an unauthenticated
     /// caller. Empty (the default) keeps the historical
     /// no-auth behaviour, which is only safe on a loopback/management interface.
-    /// `#[serde(default)]` so a config predating this field still parses (and
-    /// gets the empty, no-auth default) instead of failing to load.
-    #[serde(default)]
+    /// `#[serde(default = "default_ingress_token")]` honors `BRIDGE_INGRESS_TOKEN`
+    /// when a `[bridge]` TOML table omits `ingress_token`, matching `Default`.
+    #[serde(default = "default_ingress_token")]
     pub ingress_token: String,
 
     /// When true (the default) the node settles consensus-approved withdrawals
@@ -198,9 +198,34 @@ pub struct BridgeConfig {
     pub cluster_tag: String,
 }
 
-/// Default cluster tag ([`BridgeConfig::cluster_tag`]).
+/// Default for [`BridgeConfig::transact_ingress_address`], honoring
+/// `BRIDGE_TRANSACT_INGRESS_ADDRESS` when omitted from `[bridge]` TOML.
+fn default_transact_ingress_address() -> String {
+    std::env::var("BRIDGE_TRANSACT_INGRESS_ADDRESS")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Default for [`BridgeConfig::ingress_token`], honoring `BRIDGE_INGRESS_TOKEN`
+/// when omitted from `[bridge]` TOML so secrets injected via environment still
+/// gate consensus write endpoints.
+fn default_ingress_token() -> String {
+    std::env::var("BRIDGE_INGRESS_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Default cluster tag ([`BridgeConfig::cluster_tag`]). Honors non-empty
+/// `BRIDGE_CLUSTER_TAG` so TOML-loaded validators match `BridgeConfig::default()`
+/// and preserve cross-cluster vote domain separation.
 fn default_cluster_tag() -> String {
-    "mainnet-beta".to_string()
+    std::env::var("BRIDGE_CLUSTER_TAG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "mainnet-beta".to_string())
 }
 
 impl Default for BridgeConfig {
@@ -238,16 +263,14 @@ impl Default for BridgeConfig {
                 .unwrap_or_default(),
             transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
                 .unwrap_or_default(),
-            transact_ingress_address: std::env::var("BRIDGE_TRANSACT_INGRESS_ADDRESS")
-                .unwrap_or_default(),
-            ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
+            transact_ingress_address: default_transact_ingress_address(),
+            ingress_token: default_ingress_token(),
             use_cosign_settlement: default_use_cosign_settlement(),
             consensus_min_validators: None,
             consensus_total_validators: None,
             consensus_min_reputation: None,
             cursor_path: None,
-            cluster_tag: std::env::var("BRIDGE_CLUSTER_TAG")
-                .unwrap_or_else(|_| default_cluster_tag()),
+            cluster_tag: default_cluster_tag(),
         }
     }
 }
@@ -297,6 +320,78 @@ mod tests {
         assert_eq!(cfg.consensus_min_validators, Some(2));
         assert_eq!(cfg.consensus_total_validators, Some(3));
         assert_eq!(cfg.consensus_min_reputation, None);
+    }
+
+    #[test]
+    fn toml_deserialization_honors_env_defaults_for_ingress_token_and_cluster_tag() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prev_token = std::env::var("BRIDGE_INGRESS_TOKEN").ok();
+        let prev_tag = std::env::var("BRIDGE_CLUSTER_TAG").ok();
+        let prev_addr = std::env::var("BRIDGE_TRANSACT_INGRESS_ADDRESS").ok();
+
+        std::env::set_var("BRIDGE_INGRESS_TOKEN", "  env-secret-token  ");
+        std::env::set_var("BRIDGE_CLUSTER_TAG", "  devnet  ");
+        std::env::set_var("BRIDGE_TRANSACT_INGRESS_ADDRESS", "127.0.0.1:9199");
+
+        let cfg: BridgeConfig = toml::from_str(
+            r#"
+            solana_rpc_url = "https://api.devnet.solana.com"
+            program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP"
+            poll_interval_secs = 5
+            enabled = true
+            event_lag_warn_threshold_slots = 1500
+            withdrawal_expiration_window_slots = 150
+            merkle_path_query_address = "127.0.0.1:9090"
+            withdrawal_ingress_address = ""
+            transfer_ingress_address = ""
+            "#,
+        )
+        .expect("bridge config parses");
+
+        assert_eq!(cfg.ingress_token, "env-secret-token");
+        assert_eq!(cfg.cluster_tag, "devnet");
+        assert_eq!(cfg.transact_ingress_address, "127.0.0.1:9199");
+
+        let def_cfg = BridgeConfig::default();
+        assert_eq!(cfg.ingress_token, def_cfg.ingress_token);
+        assert_eq!(cfg.cluster_tag, def_cfg.cluster_tag);
+        assert_eq!(
+            cfg.transact_ingress_address,
+            def_cfg.transact_ingress_address
+        );
+
+        // Blank env var falls back to canonical "mainnet-beta" cluster_tag.
+        std::env::set_var("BRIDGE_CLUSTER_TAG", "   ");
+        let fallback_cfg: BridgeConfig = toml::from_str(
+            r#"
+            solana_rpc_url = "https://api.devnet.solana.com"
+            program_id = "8gPsRSm1CAw38mfzc1bcLMUXyFN7LnS8k6CV5hPUTWrP"
+            poll_interval_secs = 5
+            enabled = true
+            event_lag_warn_threshold_slots = 1500
+            withdrawal_expiration_window_slots = 150
+            merkle_path_query_address = "127.0.0.1:9090"
+            withdrawal_ingress_address = ""
+            transfer_ingress_address = ""
+            "#,
+        )
+        .expect("bridge config parses with blank cluster tag env");
+        assert_eq!(fallback_cfg.cluster_tag, "mainnet-beta");
+
+        match prev_token {
+            Some(v) => std::env::set_var("BRIDGE_INGRESS_TOKEN", v),
+            None => std::env::remove_var("BRIDGE_INGRESS_TOKEN"),
+        }
+        match prev_tag {
+            Some(v) => std::env::set_var("BRIDGE_CLUSTER_TAG", v),
+            None => std::env::remove_var("BRIDGE_CLUSTER_TAG"),
+        }
+        match prev_addr {
+            Some(v) => std::env::set_var("BRIDGE_TRANSACT_INGRESS_ADDRESS", v),
+            None => std::env::remove_var("BRIDGE_TRANSACT_INGRESS_ADDRESS"),
+        }
     }
 }
 

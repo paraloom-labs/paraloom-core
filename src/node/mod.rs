@@ -1241,7 +1241,12 @@ impl Node {
     /// Byte-identical on every validator in a cohort (config), so a signed vote
     /// from one cluster never verifies on another.
     fn cluster_tag(&self) -> &str {
-        &self.settings.bridge.cluster_tag
+        let tag = self.settings.bridge.cluster_tag.trim();
+        if tag.is_empty() {
+            "mainnet-beta"
+        } else {
+            tag
+        }
     }
 
     /// Build a signed transact vote for `request_id`, or `None` if this node has
