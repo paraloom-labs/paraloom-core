@@ -122,15 +122,20 @@ fn test_discovery_message() {
 
     let message = Message::Discovery {
         node_info: node_info.clone(),
+        wallet_proof: None,
     };
 
     let serialized = bincode::serialize(&message).unwrap();
     let deserialized: Message = bincode::deserialize(&serialized).unwrap();
 
     match deserialized {
-        Message::Discovery { node_info: info } => {
+        Message::Discovery {
+            node_info: info,
+            wallet_proof,
+        } => {
             assert_eq!(info.id, node_info.id);
             assert_eq!(info.resources.cpu_cores, 4);
+            assert!(wallet_proof.is_none());
         }
         _ => panic!("Expected Discovery"),
     }
