@@ -128,9 +128,9 @@ pub struct BridgeConfig {
     /// `transfer_ingress_address`. A client POSTs a 2-in/2-out transact (pure
     /// shielded transfer or withdrawal) here and the node broadcasts it into
     /// the consensus mesh. Triggers consensus, so it defaults to an empty
-    /// string (disabled). `#[serde(default)]` so a config predating this
-    /// field still parses (and stays disabled) instead of failing to load.
-    #[serde(default)]
+    /// string (disabled). `#[serde(default = "default_transact_ingress_address")]`
+    /// keeps TOML loading consistent with the environment-driven default.
+    #[serde(default = "default_transact_ingress_address")]
     pub transact_ingress_address: String,
 
     /// Shared bearer token the write-surface ingress endpoints
@@ -140,9 +140,9 @@ pub struct BridgeConfig {
     /// ingress exposed beyond loopback cannot be driven by an unauthenticated
     /// caller. Empty (the default) keeps the historical
     /// no-auth behaviour, which is only safe on a loopback/management interface.
-    /// `#[serde(default)]` so a config predating this field still parses (and
-    /// gets the empty, no-auth default) instead of failing to load.
-    #[serde(default)]
+    /// `#[serde(default = "default_ingress_token")]` keeps TOML loading
+    /// consistent with the environment-driven default.
+    #[serde(default = "default_ingress_token")]
     pub ingress_token: String,
 
     /// When true (the default) the node settles consensus-approved withdrawals
@@ -200,7 +200,19 @@ pub struct BridgeConfig {
 
 /// Default cluster tag ([`BridgeConfig::cluster_tag`]).
 fn default_cluster_tag() -> String {
-    "mainnet-beta".to_string()
+    std::env::var("BRIDGE_CLUSTER_TAG")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "mainnet-beta".to_string())
+}
+
+fn default_ingress_token() -> String {
+    std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default()
+}
+
+fn default_transact_ingress_address() -> String {
+    std::env::var("BRIDGE_TRANSACT_INGRESS_ADDRESS").unwrap_or_default()
 }
 
 impl Default for BridgeConfig {
@@ -238,16 +250,14 @@ impl Default for BridgeConfig {
                 .unwrap_or_default(),
             transfer_ingress_address: std::env::var("BRIDGE_TRANSFER_INGRESS_ADDRESS")
                 .unwrap_or_default(),
-            transact_ingress_address: std::env::var("BRIDGE_TRANSACT_INGRESS_ADDRESS")
-                .unwrap_or_default(),
-            ingress_token: std::env::var("BRIDGE_INGRESS_TOKEN").unwrap_or_default(),
+            transact_ingress_address: default_transact_ingress_address(),
+            ingress_token: default_ingress_token(),
             use_cosign_settlement: default_use_cosign_settlement(),
             consensus_min_validators: None,
             consensus_total_validators: None,
             consensus_min_reputation: None,
             cursor_path: None,
-            cluster_tag: std::env::var("BRIDGE_CLUSTER_TAG")
-                .unwrap_or_else(|_| default_cluster_tag()),
+            cluster_tag: default_cluster_tag(),
         }
     }
 }
