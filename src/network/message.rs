@@ -13,6 +13,9 @@ pub enum Message {
     Discovery {
         /// Node information
         node_info: crate::types::NodeInfo,
+        /// Signature by the advertised wallet over the authenticated peer id
+        /// and wallet, proving possession of the co-signing key.
+        wallet_proof: Option<Vec<u8>>,
     },
     /// Resource update
     ResourceUpdate {

@@ -28,7 +28,7 @@ use crate::resource::ResourceMonitor;
 use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
 use crate::validator::Validator;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 
 pub mod cosign_round;
@@ -226,7 +226,10 @@ impl crate::network::protocol::NetworkEventHandler for Node {
             Message::Pong => {
                 info!("Received Pong from {}", source);
             }
-            Message::Discovery { node_info } => {
+            Message::Discovery {
+                node_info,
+                wallet_proof,
+            } => {
                 info!("Discovered node {}: {:?}", source, node_info);
 
                 // If we're a coordinator, register this validator
@@ -250,11 +253,24 @@ impl crate::network::protocol::NetworkEventHandler for Node {
                 // compute Coordinator.
                 if let Some(transact) = &self.transact_coordinator {
                     if node_info.node_type == NodeType::ResourceProvider {
+                        let wallet = node_info.wallet_pubkey.clone();
+                        let wallet = wallet.filter(|wallet| {
+                            node_info.id == source
+                                && wallet_proof.as_deref().is_some_and(|proof| {
+                                    let Ok(pubkey) = wallet.parse::<Pubkey>() else {
+                                        return false;
+                                    };
+                                    let Ok(signature) = Signature::try_from(proof.as_slice()) else {
+                                        return false;
+                                    };
+                                    pubkey.verify_message(
+                                        &discovery_wallet_proof_message(&source, wallet),
+                                        &signature,
+                                    )
+                                })
+                        });
                         transact
-                            .register_validator_with_wallet(
-                                source.clone(),
-                                node_info.wallet_pubkey.clone(),
-                            )
+                            .register_validator_with_wallet(source.clone(), wallet)
                             .await;
                     }
                 }
@@ -1237,6 +1253,17 @@ async fn settle_approved_transacts<F, Fut>(
 }
 
 impl Node {
+    fn discovery_wallet_proof(&self) -> Option<Vec<u8>> {
+        let wallet = self.node_info.wallet_pubkey.as_ref()?;
+        let keypair = self.cosign_keypair.as_ref()?;
+        Some(
+            keypair
+                .sign_message(&discovery_wallet_proof_message(&self.node_info.id, wallet))
+                .as_ref()
+                .to_vec(),
+        )
+    }
+
     /// The cluster tag mixed into transact-vote signature domain separation.
     /// Byte-identical on every validator in a cohort (config), so a signed vote
     /// from one cluster never verifies on another.
@@ -1705,6 +1732,7 @@ impl Node {
                     tick.tick().await;
                     let msg = Message::Discovery {
                         node_info: me.node_info.clone(),
+                        wallet_proof: me.discovery_wallet_proof(),
                     };
                     if let Err(e) = me.network.send_message(NodeId(vec![]), msg).await {
                         log::debug!("periodic discovery re-announce failed: {e}");
@@ -2723,6 +2751,20 @@ impl Node {
         }
         Ok(matches!(result, crate::privacy::VerificationResult::Valid))
     }
+}
+
+const DISCOVERY_WALLET_PROOF_DOMAIN: &[u8] = b"paraloom/discovery-wallet-proof/v1";
+
+fn discovery_wallet_proof_message(source: &NodeId, wallet: &str) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        DISCOVERY_WALLET_PROOF_DOMAIN.len() + source.0.len() + wallet.len() + 2,
+    );
+    message.extend_from_slice(DISCOVERY_WALLET_PROOF_DOMAIN);
+    message.extend_from_slice(&(source.0.len() as u32).to_le_bytes());
+    message.extend_from_slice(&source.0);
+    message.extend_from_slice(&(wallet.len() as u32).to_le_bytes());
+    message.extend_from_slice(wallet.as_bytes());
+    message
 }
 
 // Clone is needed for the async_trait implementation
